@@ -538,12 +538,10 @@ class EagleDraftWorker(BaseDraftWorker):
             # select_index = cumsum - 1 = [2, 4]
             # ─────────────────────────────────────────────────────────────
             #
-            # [⚠️ CPU-GPU SYNC] .cpu() forces GPU→CPU transfer
-            # This sync is currently unavoidable for cumsum computation.
-            # Potential optimization: compute cumsum on GPU, only .item() at end
-            accept_lens_cpu = batch_result.accept_lens.cpu()  # [⚠️ SYNC]
-            cumsum = torch.cumsum(accept_lens_cpu, dim=0)
-            select_index = (cumsum - 1).to(self.device)
+            # [OPTIMIZATION] Calculate select_index on GPU (0 syncs)
+            # accept_lens is already on GPU from verify()
+            cumsum = torch.cumsum(batch_result.accept_lens, dim=0)
+            select_index = cumsum - 1
 
             # Dense KV slot IDs prepared in verify()
             # Shape: [sum(accept_lens)] e.g., [5]
@@ -862,63 +860,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
             #   [tok0, tok3, tok15, tok32, tok34]
             # ─────────────────────────────────────────────────────────────────
             #
-            # [⚠️ CPU-GPU SYNC] Boolean mask indexing has DATA-DEPENDENT OUTPUT SIZE.
-            # PyTorch must count True values in valid_mask to allocate the output tensor.
-            # Internally this uses torch.nonzero() which synchronizes CPU↔GPU.
-            #
-            # This sync is currently unavoidable with this approach. Alternative:
-            # Pre-compute sum(accept_lens) and use scatter/gather with known sizes.
-            flat_accept_index = accept_index.flatten()    # [bs * 6] = [12], no sync
-            valid_mask = flat_accept_index != -1          # Boolean tensor, no sync
-            valid_indices = flat_accept_index[valid_mask] # [⚠️ SYNC] Gather valid, [5]
+            # STRATEGY: Boolean Masking
+            # [⚠️ CPU-GPU SYNC] Boolean indexing has DATA-DEPENDENT OUTPUT SIZE.
+            # PyTorch uses `nonzero()` internally, which causes a sync.
+            # This is currently unavoidable without writing a custom kernel.
 
-            # Repack predict tokens using gathered indices
-            # [NO SYNC] Output size is known (valid_indices.shape[0])
-            dense_predict = predict[valid_indices]  # [sum(accept_lens)] = [5]
+            flat_accept_index = accept_index.flatten()       # [bs * 6] = [12]
+            valid_mask = flat_accept_index != -1             # Boolean tensor
+            valid_indices = flat_accept_index[valid_mask]    # [⚠️ SYNC] → [5]
+
+            # Repack predict tokens
+            dense_predict = predict[valid_indices]           # [5]
 
             # Repack hidden_states and out_cache_loc (only needed for tree mode)
             if self.topk > 1:
-                # [NO SYNC] Output size known from valid_indices
-                # hidden_states: [bs * tree_size, hidden_dim] → [sum(accept_lens), hidden_dim]
-                # Example: [64, 4096] → [5, 4096]
+                # hidden_states: [64, 4096] → [5, 4096]
                 dense_hidden_states = logits_output.hidden_states[valid_indices]
 
-                # ─────────────────────────────────────────────────────────────
-                # Repack out_cache_loc using Triton kernel
-                # ─────────────────────────────────────────────────────────────
-                # WHY: The attention backend uses out_cache_loc to determine
-                # WHERE to write KV cache (see triton_backend.py line 910:
-                # `extend_kv_indices = forward_batch.out_cache_loc`).
-                # We must provide ONLY the slots for accepted positions.
-                #
-                # KERNEL SEMANTICS: fill_accepted_out_cache_loc iterates over
-                # accept_index elements (not out_cache_loc elements!).
-                #   - Thread pid reads accept_index[pid]
-                #   - If accept_index[pid] != -1, writes out_cache_loc[accept_index[pid]]
-                #
-                # CRITICAL: Grid size = accept_index.numel() = bs * (num_steps+1)
-                #           NOT bs * tree_size (would cause OOB reads!)
-                #
-                # Example: bs=2, num_steps=5 → grid_size = 2*6 = 12
-                #          NOT 2*32 = 64 (wrong!)
-                # ─────────────────────────────────────────────────────────────
-                accept_index_flat = accept_index.flatten()  # [bs * 6] = [12]
-                grid_size = accept_index_flat.numel()       # = 12, no sync (known from accept_index.shape)
-                # valid_indices.shape[0] reads cached metadata (sync already happened above)
-                total_accepted = valid_indices.shape[0]     # = 5
-
-                dense_out_cache_loc = torch.zeros(
-                    total_accepted, dtype=torch.int64, device=self.device
-                )
-                # [NO CPU-GPU SYNC] Triton kernel runs on GPU
-                fill_accepted_out_cache_loc[(grid_size,)](
-                    accept_index_flat,   # [12] - indices into out_cache_loc
-                    batch.out_cache_loc, # [64] - sparse slot IDs
-                    dense_out_cache_loc, # [5]  - output: dense slot IDs
-                    next_power_of_2(grid_size),  # size_upper for kernel
-                )
+                # out_cache_loc: gather slot IDs at accepted positions
+                # [64] → [5]
+                dense_out_cache_loc = batch.out_cache_loc[valid_indices]
             else:
-                # Chain mode: acceptance is always contiguous [0,1,2,...], no repacking needed
                 dense_hidden_states = None
                 dense_out_cache_loc = None
 
@@ -1023,15 +985,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         Now seq_lens += 3 works: positions 0,1,2 have the accepted KV data.
         =======================================================================
 
-        [⚠️ CPU-GPU SYNC WARNING]
-        This function has MULTIPLE CPU-GPU syncs per request:
-          - .item() calls to get req_idx and seq_len (2 syncs per req)
-          - .tolist() to get accept_index row (1 sync per req)
-          - .clone() to copy slots (no sync, but memory alloc)
-          - Direct tensor indexing with Python list (may cause sync)
-
-        For bs=2, this is ~6 syncs. For large batches, this is expensive!
-        TODO: Optimize with GPU-only Triton kernel for slot reordering.
+        [⚠️ CPU-GPU SYNC]
+        This vectorized implementation has 1 sync (boolean masking to filter -1s).
+        This is O(1) regardless of batch size, unlike the old O(bs) loop approach.
 
         Args:
             batch: The batch containing req_pool_indices, seq_lens, out_cache_loc
@@ -1043,48 +999,88 @@ class EAGLEWorkerV2(BaseSpecWorker):
         tree_size = self.speculative_num_draft_tokens  # = 32
         req_to_token = self.req_to_token_pool.req_to_token
 
-        for i in range(bs):
-            # [⚠️ CPU-GPU SYNC] .item() forces GPU→CPU transfer
-            req_idx = batch.req_pool_indices[i].item()
-            seq_len = batch.seq_lens[i].item()
+        # =====================================================================
+        # VECTORIZED COMPACTION (No per-request loop, minimal syncs)
+        # =====================================================================
+        # Goal: Reorder req_to_token window so accepted slots are at the front.
+        # CRITICAL: Must preserve the SEQUENCE ORDER of accepted tokens!
+        #
+        # Old approach: argsort(mask=1) sorted by tree index, destroying sequence order
+        # if the tree path was not monotonic (e.g. 0 -> 15 -> 3).
+        #
+        # New approach: Scatter PRIORITIES based on sequence position.
+        #   p[token_0] > p[token_1] > ... > p[rejected]
+        #   argsort(descending) then restores the correct sequence 0 -> 1 -> ...
+        # =====================================================================
 
-            # Get current verify window slots: req_to_token[req, seq_len:seq_len+32]
-            # Example: slots [500, 501, 502, ..., 531]
-            old_slots = req_to_token[req_idx, seq_len : seq_len + tree_size].clone()
+        # Step 1: Create priority mask [bs, tree_size] initialized to 0 (rejected)
+        # We use a large base value for accepted tokens to sort them first
+        mask = torch.zeros((bs, tree_size), dtype=torch.int32, device=self.device)
+        BASE_PRIORITY = tree_size * 2  # Sufficiently large
 
-            # Convert FLAT accept_index to LOCAL positions within this request's window
-            # [⚠️ CPU-GPU SYNC] .tolist() forces GPU→CPU transfer
-            # Example: accept_index[0] = [0, 3, 15, -1, -1, -1] (flat indices)
-            #          For req 0: local_pos = flat_idx - 0*32 = flat_idx
-            #          Result: acc_local_positions = [0, 3, 15]
-            acc_flat_indices = accept_index[i].tolist()
-            acc_local_positions = []
-            for idx in acc_flat_indices:
-                if idx != -1:
-                    local_pos = idx - i * tree_size  # Convert flat→local
-                    acc_local_positions.append(local_pos)
+        # Step 2: Prepare scatter data
+        # accept_index: [bs, num_steps+1], flat indices into tree
+        flat_accept = accept_index.flatten()
+        valid_mask = flat_accept != -1
+        valid_flat = flat_accept[valid_mask]  # [total_accepted]
 
-            # Build compacted reorder: [accepted positions] ++ [rejected positions]
-            # Example: accepted = {0, 3, 15}
-            #          rejected = [1, 2, 4, 5, ..., 14, 16, ..., 31]
-            #          compacted_order = [0, 3, 15, 1, 2, 4, 5, ..., 31]
-            accepted_set = set(acc_local_positions)
-            rejected_positions = [p for p in range(tree_size) if p not in accepted_set]
-            compacted_order = acc_local_positions + rejected_positions
+        # Calculate (row, col) for scatter
+        # row = flat_idx // tree_size (which request)
+        # col = flat_idx % tree_size  (local position in tree)
+        rows = torch.div(valid_flat, tree_size, rounding_mode='floor')
+        cols = valid_flat % tree_size
 
-            # Reorder slots according to compacted_order
-            # [NO ADDITIONAL SYNC] Python list indexing converts list→tensor then indexes.
-            # Output size is known (len(compacted_order)), so no data-dependent sync.
-            # NOTE: The syncs already happened above via .item() and .tolist() calls.
-            # Example: old_slots[[0,3,15,1,2,...]] = [500, 503, 515, 501, 502, ...]
-            new_slots = old_slots[compacted_order]
+        # Calculate sequence priorities: 0, 1, 2... for each request
+        # We can simply use the column index of accept_index!
+        # accept_index shape is [bs, W], so flattened is [0,1,..,W-1, 0,1,..]
+        # This naturally gives the sequence index.
+        # accept_index width W = accept_index.shape[1]
+        width = accept_index.shape[1]
+        seq_ids = torch.arange(width, device=self.device).repeat(bs)
+        valid_seq_ids = seq_ids[valid_mask]  # [0,1,2, 0,1] correctly extracted!
 
-            # Write back to req_to_token (in-place update)
-            req_to_token[req_idx, seq_len : seq_len + tree_size] = new_slots
+        # Priority = BASE - seq_id (so 0 is highest priority)
+        # Result: p[tok0]=MAX, p[tok1]=MAX-1...
+        priorities = BASE_PRIORITY - valid_seq_ids
 
-            if os.environ.get("EAGLE3_DEBUG"):
-                print(f"[EAGLE3_DEBUG compact] req {i}: acc_pos={acc_local_positions}, "
-                      f"slots: old={old_slots[:4].tolist()} -> new={new_slots[:4].tolist()}")
+        # Scatter priorities into mask
+        # mask[rows, cols] = priorities
+        # [NO SYNC] scatter is async
+        mask[rows, cols] = priorities.to(torch.int32)
+
+        # Step 3: Sort to move accepted (high priority) to front
+        # stable=True is good practice but strict ordering is enforced by priorities
+        perm = torch.argsort(mask, dim=1, descending=True, stable=True)
+
+        # Step 4: Gather old slots and reorder
+        # Build window indices: req_to_token[req_idx, seq_len : seq_len+tree_size]
+        req_rows = batch.req_pool_indices.unsqueeze(1).expand(bs, tree_size)
+        offsets = torch.arange(tree_size, device=self.device).unsqueeze(0)
+        window_cols = batch.seq_lens.unsqueeze(1) + offsets
+
+        old_slots = req_to_token[req_rows, window_cols]
+        new_slots = torch.gather(old_slots, 1, perm)
+
+        # Write back to req_to_token
+        req_to_token.index_put_((req_rows, window_cols), new_slots)
+
+        if os.environ.get("EAGLE3_DEBUG"):
+            # Diagnostic: Show ordering for first request
+            if bs > 0:
+                # accepted_tree_positions: where in tree the accepted tokens were
+                req0_accept = accept_index[0].tolist()
+                req0_valid = [x for x in req0_accept if x != -1]
+                req0_local = [x % tree_size for x in req0_valid]
+
+                # perm shows the reorder: perm[0] is which tree position goes to slot 0
+                req0_perm = perm[0, :len(req0_valid)].tolist()
+
+                # Verify: perm should equal req0_local (sequence-ordered tree positions)
+                order_ok = req0_perm == req0_local
+
+                print(f"[EAGLE3_DEBUG compact] bs={bs}, req0: "
+                      f"tree_positions={req0_local}, perm_prefix={req0_perm}, "
+                      f"order_preserved={order_ok}")
 
     def move_accepted_tokens_to_target_kvcache(
         self,

@@ -1720,11 +1720,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
+        """
+        Prepare batch for decode iteration.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW (EAGLE3 V2 Speculative Decoding)
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: Scheduler.run_batch() or Scheduler.prepare_dp_attn_batch()
+        Next step: Batch sent to EAGLEWorkerV2.forward_batch_generation()
+
+        For EAGLE V2 (self.is_v2_eagle), this delegates to:
+          EagleDraftInputV2Mixin.prepare_for_decode() in eagle_info_v2.py
+          └─► Over-allocates KV slots (2 * ALLOC_LEN_PER_DECODE ahead)
+          └─► Writes slots to req_to_token mapping
+
+        This pre-allocation is KEY to V2's performance - it avoids per-iteration
+        slot allocation calls by allocating ~2 iterations worth of slots ahead.
+        ═══════════════════════════════════════════════════════════════════════
+        """
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
         if self.is_v2_eagle:
-            # TODO(spec-v2): all v2 spec should go through this path
+            # ═══════════════════════════════════════════════════════════════
+            # EAGLE V2: Delegate to EagleDraftInputV2Mixin.prepare_for_decode()
+            # This over-allocates KV slots and writes them to req_to_token.
+            # ═══════════════════════════════════════════════════════════════
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -1908,6 +1929,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
+        """
+        Create ModelWorkerBatch to send to worker.
+
+        For EAGLE V2: spec_info (EagleDraftInput) is passed to worker, containing
+        topk_p, topk_index, hidden_states from the previous iteration. The worker
+        uses these in draft() to generate the next tree of draft tokens.
+
+        IMPORTANT: self.reqs is passed by REFERENCE (via spec_info), so the worker's
+        modifications to req objects (e.g., req.kv_allocated_len in _shift_prealloc_slots)
+        are visible to the scheduler.
+        """
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

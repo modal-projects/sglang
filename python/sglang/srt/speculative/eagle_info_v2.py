@@ -80,7 +80,57 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    """
+    Mixin for EagleDraftInput that provides V2 (overlap mode) preparation methods.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    This mixin adds methods used during the speculative decoding iteration:
+
+    1. prepare_for_decode() - Scheduler calls before sending to worker
+       └─► Over-allocates KV slots, writes to req_to_token
+
+    2. prepare_for_v2_draft() - Called by EagleDraftWorker.draft()
+       └─► Sets up batch for draft model forward
+
+    3. prepare_for_extend_to_fill_draft_kvcache() - Chain mode draft extend
+       └─► Uniform extend by tree_size for all requests
+
+    4. prepare_for_extend_with_accept_lens() - Tree mode draft extend [NEW]
+       └─► Variable extend by accept_lens per request (uses DENSE tensors)
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        """
+        Prepare batch for decode iteration: over-allocate KV slots.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: Scheduler.prepare_for_decode() before get_model_worker_batch()
+        Next step: Batch sent to EAGLEWorkerV2.forward_batch_generation()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        V2 uses over-allocation to avoid per-iteration slot allocation calls.
+        This function allocates 2 * ALLOC_LEN_PER_DECODE slots ahead of time:
+          - First tree_size: for current verification
+          - Second tree_size: pre-allocated for next iteration
+
+        The slots are written to req_to_token mapping so the worker can read
+        them via prepare_for_v2_draft() and prepare_for_v2_verify().
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY FORMULA
+        ═══════════════════════════════════════════════════════════════════════
+        needed = kv_committed + 2 * ALLOC_LEN - kv_allocated
+        kv_allocated += needed
+
+        This ensures kv_allocated is always 2 * ALLOC_LEN ahead of kv_committed.
+        """
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
@@ -145,6 +195,24 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        """
+        Prepare batch for draft model forward.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EagleDraftWorker.draft()
+        Next step: draft_forward() or cuda_graph_runner.replay()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        Sets up out_cache_loc for draft model by reading from req_to_token.
+        The draft model will write KV to these slots during draft_forward().
+
+        Reads: req_to_token[req, seq_lens : seq_lens + topk * num_steps]
+        This region was pre-allocated by prepare_for_decode().
+        """
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
@@ -182,6 +250,32 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        """
+        Prepare draft extend with UNIFORM num_draft_tokens (for chain mode).
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EagleDraftWorker._draft_extend_for_decode() (chain mode only)
+        Next step: draft_runner.forward() writes KV to draft cache
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        In chain mode (topk=1), all requests extend by the same amount (tree_size).
+        This is because accepted positions are always contiguous [0, 1, 2, ...].
+
+        Uses SPARSE predict tensor directly - prefix is valid for chain mode.
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY DIFFERENCE FROM prepare_for_extend_with_accept_lens()
+        ═══════════════════════════════════════════════════════════════════════
+        - extend_seq_lens: UNIFORM [32, 32, 32] vs VARIABLE [3, 2, 4]
+        - seq_lens += tree_size vs seq_lens += accept_lens
+        - Uses sparse predict vs dense repacked predict
+
+        For tree mode, use prepare_for_extend_with_accept_lens() instead!
+        """
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -213,13 +307,23 @@ class EagleDraftInputV2Mixin:
         dense_out_cache_loc: torch.Tensor,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        accept_lens_cpu: list = None,
     ):
         """
         Prepare draft extend with VARIABLE accept_lens per request (for tree mode).
 
-        =======================================================================
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW                                                    [NEW FUNCTION]
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EagleDraftWorker._draft_extend_for_decode() (tree mode only)
+        Next step: draft_runner.forward() writes KV to draft cache
+
+        This function handles tree mode's variable-length acceptance, using
+        DENSE repacked tensors prepared by verify().
+
+        ═══════════════════════════════════════════════════════════════════════
         WHY THIS EXISTS (vs prepare_for_extend_to_fill_draft_kvcache)
-        =======================================================================
+        ═══════════════════════════════════════════════════════════════════════
 
         Chain mode:
           - All requests extend by same num_draft_tokens
@@ -252,41 +356,48 @@ class EagleDraftInputV2Mixin:
           req1: slots 600, 605 at positions 200, 201
         =======================================================================
 
-        [⚠️ CPU-GPU SYNC]
-          - accept_lens.cpu() - GPU→CPU transfer
-          - .sum().item() - reduction + scalar extraction
-          - .tolist() - tensor to Python list
+        SYNC OPTIMIZATION:
+          - If accept_lens_cpu is provided, no GPU→CPU sync needed (pre-computed in verify())
+          - Otherwise, falls back to accept_lens.cpu() which syncs
 
         Args:
             batch: The batch to prepare
             dense_predict: DENSE repacked tokens
                 Shape: [sum(accept_lens)] e.g., [5] for accept_lens=[3,2]
-            accept_lens: Accept length per request
+            accept_lens: Accept length per request (GPU tensor)
                 Shape: [bs] e.g., [3, 2]
             dense_out_cache_loc: DENSE repacked KV slot IDs
                 Shape: [sum(accept_lens)] e.g., [5]
             draft_model_runner: The draft model runner
             cuda_graph_runner: The CUDA graph runner
+            accept_lens_cpu: Pre-computed CPU list from verify() (optional, avoids sync)
+                Shape: list of length bs e.g., [3, 2]
         """
         seq_lens_cpu_ = batch.seq_lens_cpu  # Already on CPU
 
-        # [⚠️ CPU-GPU SYNC] accept_lens.cpu() forces GPU→CPU transfer
-        accept_lens_cpu = accept_lens.cpu()
-
-        # [⚠️ CPU-GPU SYNC] .sum().item() forces sync to get scalar
-        extend_num_tokens = accept_lens_cpu.sum().item()
+        # Use pre-computed CPU tensor if provided, otherwise sync
+        if accept_lens_cpu is None:
+            # [⚠️ CPU-GPU SYNC] Fallback: accept_lens.cpu() forces GPU→CPU transfer
+            accept_lens_cpu = accept_lens.cpu().tolist()
+            extend_num_tokens = sum(accept_lens_cpu)
+        else:
+            # No sync needed - already computed in verify()
+            extend_num_tokens = sum(accept_lens_cpu)
 
         # Set batch fields for draft extend
         batch.spec_info = self
         batch.input_ids = dense_predict              # DENSE: [sum(accept_lens)]
         batch.out_cache_loc = dense_out_cache_loc    # DENSE: [sum(accept_lens)]
-        batch.seq_lens = batch.seq_lens + accept_lens  # Advance by VARIABLE amount
-        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+        batch.seq_lens = batch.seq_lens + accept_lens  # Advance by VARIABLE amount (GPU)
+
+        # Update CPU tensor: add accept_lens_cpu (list) to seq_lens_cpu (tensor)
+        accept_lens_cpu_tensor = torch.tensor(accept_lens_cpu, device='cpu')
+        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu_tensor
 
         batch.seq_lens_sum += extend_num_tokens
 
-        # [⚠️ CPU-GPU SYNC] .tolist() on CPU tensor (no sync, already on CPU)
-        batch.extend_seq_lens = accept_lens_cpu.tolist()    # VARIABLE: [3, 2]
+        # accept_lens_cpu is already a list, no .tolist() needed
+        batch.extend_seq_lens = accept_lens_cpu          # VARIABLE: [3, 2]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()   # Where KV starts
         batch.extend_num_tokens = extend_num_tokens         # Total: 5
 
@@ -298,7 +409,7 @@ class EagleDraftInputV2Mixin:
         )
 
         if os.environ.get("EAGLE3_DEBUG"):
-            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens.tolist()}, "
+            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens_cpu}, "
                   f"dense: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, "
                   f"new_seq_lens={batch.seq_lens.tolist()}")
 
@@ -311,6 +422,20 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    """
+    Mixin for EagleVerifyInput that provides V2 verification methods.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    1. prepare_for_v2_verify() - Called by EAGLEWorkerV2.verify()
+       └─► Sets up batch for target model verification
+
+    2. sample() - Called by EAGLEWorkerV2.verify() after target forward
+       └─► Tree greedy sampling, returns SPARSE predict + accept_index
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,

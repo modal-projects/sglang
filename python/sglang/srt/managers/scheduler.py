@@ -1914,7 +1914,12 @@ class Scheduler(
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """
+        Update the current running decoding batch.
+
+        For EAGLE V2: Calls batch.prepare_for_decode() which delegates to
+        EagleDraftInputV2Mixin.prepare_for_decode() to over-allocate KV slots.
+        """
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -2012,6 +2017,16 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    # ═══════════════════════════════════════════════════════════
+                    # WORKER INVOCATION
+                    # ═══════════════════════════════════════════════════════════
+                    # For EAGLE V2: This calls EAGLEWorkerV2.forward_batch_generation()
+                    #   └─► draft() → verify() → _draft_extend_for_decode()
+                    # For tree mode (topk > 1), verify() does:
+                    #   - Dense repack (predict, hidden_states, out_cache_loc)
+                    #   - req_to_token compaction (accepted slots → prefix)
+                    # Returns batch_result with DENSE next_token_ids for tree mode
+                    # ═══════════════════════════════════════════════════════════
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
@@ -2029,9 +2044,18 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_v2_eagle:
-                    # FIXME(lsyin): tmp code for eagle v2
-                    # We only keep future indices for next draft input
-
+                    # ═══════════════════════════════════════════════════════════
+                    # EAGLE V2: Update spec_info for next iteration
+                    # ═══════════════════════════════════════════════════════════
+                    # batch_result.next_draft_input contains:
+                    #   - verified_id: Last verified token per request
+                    #   - topk_p, topk_index: Top-k probs/indices for next draft
+                    #   - hidden_states: Hidden states for draft model input
+                    #   - new_seq_lens: Updated sequence lengths
+                    #   - (tree mode) dense_out_cache_loc: Dense KV slot IDs
+                    #
+                    # This becomes the input for next iteration's draft()
+                    # ═══════════════════════════════════════════════════════════
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
 
@@ -2112,7 +2136,22 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        """
+        Process batch result from worker and dispatch to appropriate handler.
+
+        ═══════════════════════════════════════════════════════════════════════
+        EAGLE V2 SPECULATIVE DECODE PATH
+        ═══════════════════════════════════════════════════════════════════════
+        For decode batches with EAGLE V2:
+          process_batch_result_decode()
+            └─► _resolve_spec_overlap_token_ids()  [TREE MODE FIX]
+                └─► Cumulative offset extraction from DENSE tensor
+            └─► req.output_ids.extend() with all accepted tokens
+            └─► stream_output() → detokenizer → user
+        ═══════════════════════════════════════════════════════════════════════
+        """
         if batch.forward_mode.is_decode():
+            # For EAGLE V2 tree mode: result.next_token_ids is DENSE tensor
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():

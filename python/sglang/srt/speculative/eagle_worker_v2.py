@@ -73,6 +73,33 @@ def _get_plan_stream(
 
 
 class EagleDraftWorker(BaseDraftWorker):
+    """
+    Draft model worker for EAGLE3 speculative decoding.
+
+    ═══════════════════════════════════════════════════════════════════════════
+    FLOW OVERVIEW
+    ═══════════════════════════════════════════════════════════════════════════
+    This worker handles the draft model operations in the speculative decoding
+    pipeline. The main entry points are:
+
+    1. draft() - Called by EAGLEWorkerV2.forward_batch_generation()
+       └─► Produces a tree of draft tokens for verification
+
+    2. _draft_extend_for_decode() - Called after verify() completes
+       └─► Fills draft KV cache with accepted tokens for next iteration
+
+    3. _draft_extend_for_prefill() - Called during prefill phase
+       └─► Initializes draft KV cache
+
+    TREE MODE vs CHAIN MODE:
+    - Chain mode (topk=1): Single path, accepted positions are contiguous
+    - Tree mode (topk>1): Multiple paths, accepted positions are scattered
+
+    Tree mode requires special handling in _draft_extend_for_decode() to
+    use dense repacked tensors and variable-length extend.
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -268,6 +295,43 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Build a tree of draft tokens for target model verification.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() (decode mode)
+        Next step: Returns EagleVerifyInput → used by EAGLEWorkerV2.verify()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PROCESS
+        ═══════════════════════════════════════════════════════════════════════
+        1. prepare_for_v2_draft() - Set up batch, read out_cache_loc from req_to_token
+        2. draft_forward() - Run multiple steps of draft model
+           └─► Each step: generate topk tokens, write KV to out_cache_loc
+        3. build_tree_kernel_efficient() - Build tree mask for verification
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        Input:
+          - model_worker_batch.seq_lens: [bs] current sequence lengths
+          - draft_input.verified_id: [bs] last verified token per request
+          - draft_input.hidden_states: [bs, hidden_dim] hidden states from prev iter
+
+        Output (EagleVerifyInput):
+          - draft_token: [bs, tree_size-1] draft tokens for verification
+          - custom_mask: Tree attention mask
+          - positions: Token positions in the tree
+          - retrive_index/next_token/next_sibling: Tree traversal indices
+
+        Args:
+            model_worker_batch: Batch containing spec_info (EagleDraftInput)
+
+        Returns:
+            EagleVerifyInput containing draft tokens and tree structure
+        """
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -479,6 +543,62 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
+        """
+        Fill draft model's KV cache with accepted tokens after verification.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() after verify()
+        Next step: Returns updated next_draft_input → used in next iteration's draft()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PURPOSE
+        ═══════════════════════════════════════════════════════════════════════
+        The target model verified the draft tree and accepted some tokens.
+        Now we need to update the draft model's KV cache so it can generate
+        the next tree of draft tokens. This function:
+
+        1. Takes accepted token IDs and hidden states from verification
+        2. Runs draft model forward to write KV at accepted positions
+        3. Updates spec_info (topk_p, topk_index, hidden_states) for next draft()
+
+        ═══════════════════════════════════════════════════════════════════════
+        TREE vs CHAIN MODE (KEY DIFFERENCE!)
+        ═══════════════════════════════════════════════════════════════════════
+        CHAIN MODE (topk=1):
+          - Accepted positions are contiguous [0, 1, 2, ...]
+          - Use sparse tensors directly (prefix is valid)
+          - Uniform extend: all requests extend by tree_size
+          - select_index: stride-based (i * tree_size + accept_len - 1)
+
+        TREE MODE (topk>1):  [MODIFIED FOR TREE SUPPORT]
+          - Accepted positions are scattered [0, 3, 15, ...]
+          - Use DENSE repacked tensors from verify()
+          - Variable extend: each request extends by its accept_len
+          - select_index: cumulative (cumsum(accept_lens) - 1)
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        Input (from batch_result):
+          - next_token_ids: Token IDs (dense for tree, sparse for chain)
+          - accept_lens: [bs] number of accepted tokens per request
+          - next_draft_input.hidden_states: Hidden states (dense for tree)
+          - next_draft_input.dense_out_cache_loc: KV slots (tree mode only)
+
+        select_index: [bs] - Index of LAST accepted token per request
+          Used to select hidden_state for next iteration's draft input
+
+        Args:
+            batch: Current ModelWorkerBatch
+            batch_result: Result from verify() containing accepted tokens
+
+        Side effects:
+            - Updates batch.seq_lens by accept_lens (tree) or tree_size (chain)
+            - Writes KV to draft model's cache
+            - Updates batch_result.next_draft_input with topk_p, topk_index, hidden_states
+        """
         bs = len(batch.seq_lens)
         is_tree_mode = self.topk > 1
 
@@ -548,6 +668,8 @@ class EagleDraftWorker(BaseDraftWorker):
             dense_out_cache_loc = batch_result.next_draft_input.dense_out_cache_loc
 
             with self.plan_stream_ctx:
+                # Use pre-computed accept_lens_cpu from verify() to avoid re-syncing
+                accept_lens_cpu = batch_result.next_draft_input.accept_lens_cpu
                 forward_batch = draft_input.prepare_for_extend_with_accept_lens(
                     batch,
                     batch_result.next_token_ids,  # Dense: [5]
@@ -555,6 +677,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     dense_out_cache_loc,          # Dense: [5]
                     self.draft_runner,
                     self.cuda_graph_runner_for_draft_extend,
+                    accept_lens_cpu=accept_lens_cpu,  # Pre-computed, no sync needed
                 )
         else:
             # =============================================================
@@ -688,6 +811,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Main entry point for EAGLE3 speculative decoding with V2 overlap.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: TpWorker.forward_batch_generation() (via spec worker dispatch)
+        Next step: Returns to scheduler → _resolve_spec_overlap_token_ids()
+
+        ═══════════════════════════════════════════════════════════════════════
+        PREFILL MODE (is_extend)
+        ═══════════════════════════════════════════════════════════════════════
+        1. target_worker.forward_batch_generation() - Process prefill
+        2. draft_worker._draft_extend_for_prefill() - Initialize draft KV cache
+
+        ═══════════════════════════════════════════════════════════════════════
+        DECODE MODE
+        ═══════════════════════════════════════════════════════════════════════
+        1. draft_worker.draft()              - Generate draft tree
+        2. self.verify()                     - Target verifies (MODIFIED for tree)
+        3. draft_worker._draft_extend_for_decode() - Update draft KV (MODIFIED for tree)
+
+        The verify() step is where tree mode fixes are applied:
+          - Dense repack of predict, hidden_states, out_cache_loc
+          - Compaction of req_to_token verify window
+
+        Args:
+            model_worker_batch: Batch prepared by scheduler
+
+        Returns:
+            GenerationBatchResult with accepted tokens and updated draft input
+        """
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -732,6 +887,63 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        """
+        Run target model verification and handle tree mode post-processing.
+
+        ═══════════════════════════════════════════════════════════════════════
+        FLOW
+        ═══════════════════════════════════════════════════════════════════════
+        Called by: EAGLEWorkerV2.forward_batch_generation() (decode mode)
+        Next step: Returns → _draft_extend_for_decode() → scheduler
+
+        ═══════════════════════════════════════════════════════════════════════
+        PROCESS
+        ═══════════════════════════════════════════════════════════════════════
+        1. prepare_for_v2_verify() - Set up batch with tree mask
+        2. target_worker.forward_batch_generation() - Run target model
+        3. verify_input.sample() - Tree greedy sampling
+           └─► Returns: predict (SPARSE!), accept_index, accept_length
+
+        ═══════════════════════════════════════════════════════════════════════
+        TREE MODE FIXES (topk > 1)                           [MODIFIED]
+        ═══════════════════════════════════════════════════════════════════════
+        After sampling, tree mode needs special handling:
+
+        FIX #1-3: DENSE REPACK
+          - predict is SPARSE [bs * tree_size] - only accept_index positions valid
+          - Repack to DENSE [sum(accept_lens)] using valid_indices
+          - Also repack hidden_states and out_cache_loc
+
+        FIX #4: req_to_token COMPACTION
+          - Call _compact_req_to_token_verify_window()
+          - Reorders verify window so accepted slots form prefix
+          - Makes tree mode behave like chain mode
+
+        ═══════════════════════════════════════════════════════════════════════
+        KEY TENSORS
+        ═══════════════════════════════════════════════════════════════════════
+        From sample():
+          predict: SPARSE [bs * tree_size] - only accept_index positions have tokens
+          accept_index: [bs, num_steps+1] - FLAT indices or -1 for padding
+          accept_length: [bs] - count of accepted tokens (includes bonus)
+
+        After repack (tree mode):
+          dense_predict: [sum(accept_lens)] - only accepted tokens
+          dense_hidden_states: [sum(accept_lens), hidden_dim]
+          dense_out_cache_loc: [sum(accept_lens)]
+
+        Returns:
+          GenerationBatchResult with:
+            - next_token_ids: dense_predict (DENSE for tree, sparse for chain)
+            - accept_lens: [bs]
+            - next_draft_input: Contains dense_hidden_states, dense_out_cache_loc
+
+        Args:
+            batch: ModelWorkerBatch with spec_info (EagleVerifyInput)
+
+        Returns:
+            GenerationBatchResult with accepted tokens and draft model inputs
+        """
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -833,91 +1045,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             # =================================================================
-            # FIX #1-3: Repack sparse tensors to dense for tree mode
+            # UNIFIED COMPACTION: Repack all sparse tensors + req_to_token
             # =================================================================
             # WHY: Tree mode verification produces SPARSE tensors where only
             # accept_index positions contain valid data. Downstream consumers
             # (scheduler, draft model) expect DENSE tensors.
             #
-            # TENSORS REPACKED:
-            #   1. predict       → dense_predict       (token IDs for scheduler)
-            #   2. hidden_states → dense_hidden_states (input to draft model)
-            #   3. out_cache_loc → dense_out_cache_loc (KV write locations)
+            # STRATEGY: Unified Compaction (gather + slice)
+            # ─────────────────────────────────────────────────────────────────
+            # 1. Build permutation that moves accepted to front (SYNC-FREE)
+            # 2. Apply permutation via gather() to all tensors (SYNC-FREE)
+            # 3. Slice to [:total_accepted] (requires 1 sync to get size)
+            # 4. Apply same permutation to req_to_token (SYNC-FREE)
+            #
+            # This reduces syncs from ~4 (boolean mask per tensor) to ~1.
+            # ─────────────────────────────────────────────────────────────────
             #
             # EXAMPLE CONFIG: steps=5, topk=10, tree_size=32, bs=2
             # ─────────────────────────────────────────────────────────────────
             # accept_lens = [3, 2] (total accepted = 5)
             #
-            # SPARSE predict: shape [bs * tree_size] = [64]
-            #   [tok0, 0, 0, tok3, 0, ..., 0, tok15, 0, ...  | tok32, 0, tok34, 0, ...]
-            #    ^req0 accepted at positions 0,3,15          ^req1 accepted at 32,34
-            #
-            # accept_index: shape [bs, num_steps+1] = [2, 6]
-            #   [[0, 3, 15, -1, -1, -1],    # req0: 3 valid indices, 3 padding
-            #    [32, 34, -1, -1, -1, -1]]  # req1: 2 valid indices, 4 padding
-            #
-            # DENSE predict: shape [sum(accept_lens)] = [5]
-            #   [tok0, tok3, tok15, tok32, tok34]
+            # SPARSE predict: [64] with valid at scattered positions
+            # AFTER gather(perm): [64] with valid at prefix [0:5]
+            # AFTER slice[:5]: [5] dense tensor
             # ─────────────────────────────────────────────────────────────────
-            #
-            # STRATEGY: Boolean Masking
-            # [⚠️ CPU-GPU SYNC] Boolean indexing has DATA-DEPENDENT OUTPUT SIZE.
-            # PyTorch uses `nonzero()` internally, which causes a sync.
-            # This is currently unavoidable without writing a custom kernel.
 
-            flat_accept_index = accept_index.flatten()       # [bs * 6] = [12]
-            valid_mask = flat_accept_index != -1             # Boolean tensor
-            valid_indices = flat_accept_index[valid_mask]    # [⚠️ SYNC] → [5]
+            # [⚠️ CPU-GPU SYNC] Only sync: get accept_lens to CPU for slicing
+            accept_lens_cpu = accept_length.cpu().tolist()
+            total_accepted = sum(accept_lens_cpu)
 
-            # Repack predict tokens
-            dense_predict = predict[valid_indices]           # [5]
+            if self.topk > 1:  # Tree mode: use unified compaction
+                tree_size = self.speculative_num_draft_tokens
 
-            # Repack hidden_states and out_cache_loc (only needed for tree mode)
-            if self.topk > 1:
-                # hidden_states: [64, 4096] → [5, 4096]
-                dense_hidden_states = logits_output.hidden_states[valid_indices]
+                # Build permutation (SYNC-FREE)
+                flat_perm, per_req_perm = self._build_compaction_perm(
+                    accept_index, accept_length, tree_size
+                )
 
-                # out_cache_loc: gather slot IDs at accepted positions
-                # [64] → [5]
-                dense_out_cache_loc = batch.out_cache_loc[valid_indices]
-            else:
+                # Compact all tensors: gather + slice (SYNC-FREE)
+                # predict: [bs * tree_size] → [total_accepted]
+                dense_predict = predict.gather(0, flat_perm)[:total_accepted]
+
+                # hidden_states: [bs * tree_size, H] → [total_accepted, H]
+                hidden_dim = logits_output.hidden_states.shape[-1]
+                flat_perm_2d = flat_perm.unsqueeze(1).expand(-1, hidden_dim)
+                dense_hidden_states = logits_output.hidden_states.gather(0, flat_perm_2d)[:total_accepted]
+
+                # out_cache_loc: [bs * tree_size] → [total_accepted]
+                dense_out_cache_loc = batch.out_cache_loc.gather(0, flat_perm)[:total_accepted]
+
+                # Compact req_to_token verify window (SYNC-FREE)
+                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
+
+            else:  # Chain mode: simple prefix slice (already contiguous)
+                dense_predict = predict[:total_accepted]
                 dense_hidden_states = None
                 dense_out_cache_loc = None
-
-            # =================================================================
-            # FIX #4: Compact req_to_token verify window for tree mode
-            # =================================================================
-            # WHY: After tree verification, accepted positions are SCATTERED
-            # (e.g., [0, 3, 15]) but req_to_token mapping is still LINEAR.
-            # Next iteration reads from seq_len+accept_len, expecting accepted
-            # slots at prefix positions. Without compaction, it reads garbage!
-            #
-            # CHAIN MODE: Always accepts [0,1,2,...], naturally contiguous
-            # TREE MODE:  Accepts scattered [0,3,15,...], needs compaction
-            #
-            # EXAMPLE: steps=5, topk=10, tree_size=32, accept at [0, 3, 15]
-            # ─────────────────────────────────────────────────────────────────
-            # BEFORE compaction:
-            #   req_to_token[req, seq_len:seq_len+32] = [A,B,C,D,E,...,P,Q,...]
-            #   Accepted slots: A (pos 0), D (pos 3), P (pos 15)
-            #
-            # AFTER compaction:
-            #   req_to_token[req, seq_len:seq_len+32] = [A,D,P,B,C,E,F,...]
-            #   First 3 slots are accepted, rest are rejected (reusable)
-            # ─────────────────────────────────────────────────────────────────
-            #
-            # [⚠️ CPU-GPU SYNC] This function calls .item() and .tolist() which
-            # cause GPU→CPU transfers. This is a known performance issue but
-            # necessary for correct tree mode operation. See _compact_req_to_token_verify_window.
-            if self.topk > 1:  # Only needed for tree mode
-                self._compact_req_to_token_verify_window(
-                    batch, accept_index, accept_length
-                )
         else:
+            # Idle mode: no accept_lens, empty tensors
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
             dense_predict = predict  # Empty tensor for idle
             dense_hidden_states = None
             dense_out_cache_loc = None
+            accept_lens_cpu = None
+            total_accepted = 0
 
         # Construct the next draft input
         # For tree mode, include dense tensors for draft_extend
@@ -927,14 +1118,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verify_done=verify_done,
             hidden_states=dense_hidden_states,  # Dense for tree mode, None for chain
         )
-        # Store dense_out_cache_loc separately (not a field in EagleDraftInput)
-        # Will be used in _draft_extend_for_decode for tree mode
+        # Store additional fields for tree mode (not in EagleDraftInput dataclass)
         next_draft_input.dense_out_cache_loc = dense_out_cache_loc
+        # Pass pre-computed CPU tensor to avoid re-syncing in prepare_for_extend
+        next_draft_input.accept_lens_cpu = accept_lens_cpu if not batch.forward_mode.is_idle() else None
 
-        # DEBUG: Concise verify logging with key shape checks
+        # DEBUG: Concise verify logging (uses already-synced values)
         if os.environ.get("EAGLE3_DEBUG") and not batch.forward_mode.is_idle():
-            total_accepted = sum(accept_length.tolist())
-            print(f"[EAGLE3_DEBUG verify] bs={bs}, accept_lens={accept_length.tolist()}, total={total_accepted}")
+            print(f"[EAGLE3_DEBUG verify] bs={bs}, accept_lens={accept_lens_cpu}, total={total_accepted}")
             print(f"[EAGLE3_DEBUG verify] dense shapes: predict={dense_predict.shape[0]}, "
                   f"hidden={dense_hidden_states.shape[0] if dense_hidden_states is not None else 'N/A'}, "
                   f"out_cache_loc={dense_out_cache_loc.shape[0] if dense_out_cache_loc is not None else 'N/A'}")
@@ -947,140 +1138,132 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens=accept_length,
         )
 
-    def _compact_req_to_token_verify_window(
+    def _build_compaction_perm(
         self,
-        batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
-    ):
+        tree_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compact the req_to_token verify window so accepted slots form a prefix.
+        Build permutation to compact accepted indices to prefix (sync-free).
 
-        =======================================================================
-        PURPOSE: Make tree mode behave like chain mode after verification
-        =======================================================================
+        ═══════════════════════════════════════════════════════════════════════
+        UNIFIED COMPACTION PRIMITIVE
+        ═══════════════════════════════════════════════════════════════════════
+        This function builds TWO permutations:
+          1. flat_perm [bs * tree_size]: For compacting data tensors (predict, etc.)
+          2. per_req_perm [bs, tree_size]: For compacting req_to_token window
 
-        PROBLEM: Tree verification accepts tokens at scattered positions (e.g.,
-        [0, 3, 15]) but req_to_token mapping is linear [0, 1, 2, 3, ...].
-        When seq_lens advances by accept_len, the next iteration expects
-        accepted KV at positions [0..accept_len-1], but they're scattered!
+        Both permutations move accepted positions to the prefix while preserving
+        sequence order. Rejected positions fill the suffix.
 
-        SOLUTION: Reorder req_to_token[verify_window] so accepted slots are
-        at the prefix and rejected slots follow. This is a "stable partition"
-        that preserves the mapping consistency.
+        ═══════════════════════════════════════════════════════════════════════
+        SYNC-FREE DESIGN
+        ═══════════════════════════════════════════════════════════════════════
+        All operations have FIXED output sizes (no data-dependent shapes):
+          - torch.zeros() - fixed shape
+          - comparison (!=, <) - same shape as input
+          - scatter_() - in-place, no allocation
+          - argsort() - same shape as input
+          - clamp() - same shape as input
 
-        =======================================================================
-        EXAMPLE: steps=5, topk=10, tree_size=32, accept at positions [0, 3, 15]
-        =======================================================================
-        BEFORE compaction (req_to_token[req, 100:132]):
-          Position: [0,   1,   2,   3,   4, ..., 15, ..., 31]
-          Slot ID:  [500, 501, 502, 503, 504, ..., 515, ..., 531]
-          Status:   [ACC, rej, rej, ACC, rej, ..., ACC, ..., rej]
+        The only sync needed is AFTER this function, to get total_accepted for slicing.
 
-        AFTER compaction (req_to_token[req, 100:132]):
-          Position: [0,   1,   2,   3,   4, ..., 31]
-          Slot ID:  [500, 503, 515, 501, 502, ..., 531]  # Accepted first!
-          Status:   [ACC, ACC, ACC, rej, rej, ..., rej]
-
-        Now seq_lens += 3 works: positions 0,1,2 have the accepted KV data.
-        =======================================================================
-
-        [⚠️ CPU-GPU SYNC]
-        This vectorized implementation has 1 sync (boolean masking to filter -1s).
-        This is O(1) regardless of batch size, unlike the old O(bs) loop approach.
+        ═══════════════════════════════════════════════════════════════════════
+        ALGORITHM: Priority-Based Sorting
+        ═══════════════════════════════════════════════════════════════════════
+        1. Create priority tensor [bs * tree_size] initialized to 0 (rejected)
+        2. For each valid entry in accept_index:
+           - Scatter priority = BASE - seq_id to its flat position
+           - seq_id ensures sequence order (first accepted = highest priority)
+        3. argsort(descending) gives permutation: accepted first, in sequence order
 
         Args:
-            batch: The batch containing req_pool_indices, seq_lens, out_cache_loc
-            accept_index: Shape [bs, num_steps+1] = [bs, 6] for steps=5
-                          Contains FLAT indices into [bs * tree_size] tensor
-            accept_length: Shape [bs], number of accepted tokens per request
+            accept_index: [bs, num_steps+1], flat indices into [bs*tree_size] or -1
+            accept_length: [bs], number of accepted per request (on GPU)
+            tree_size: Number of tree positions per request
+
+        Returns:
+            flat_perm: [bs * tree_size] - use with tensor.gather(0, flat_perm)
+            per_req_perm: [bs, tree_size] - use with tensor.gather(1, per_req_perm)
+        """
+        bs = accept_index.shape[0]
+        max_accept = accept_index.shape[1]  # num_steps + 1
+        flat_size = bs * tree_size
+
+        # Priority: accepted get high priority (BASE - seq_id), rejected get 0
+        # This ensures argsort(descending) puts accepted first, in sequence order
+        priorities = torch.zeros(flat_size, dtype=torch.int64, device=self.device)
+        BASE = flat_size + 1
+
+        # Build valid mask: which entries in accept_index are valid [bs, max_accept]
+        col_ids = torch.arange(max_accept, device=self.device)
+        valid_mask = col_ids < accept_length.unsqueeze(1)  # [bs, max_accept]
+
+        # Flatten accept_index and valid_mask
+        flat_accept = accept_index.flatten()  # [bs * max_accept]
+        flat_valid = valid_mask.flatten()     # [bs * max_accept]
+
+        # Sequence IDs: 0, 1, 2, ..., max_accept-1, 0, 1, 2, ... (per request)
+        # These determine priority within each request
+        flat_seq_ids = torch.arange(bs * max_accept, device=self.device)
+
+        # Priorities: BASE - seq_id for valid entries, 0 for invalid
+        # Using scatter with reduce='max' handles any edge cases
+        flat_priorities = (BASE - flat_seq_ids) * flat_valid.long()
+
+        # Scatter to flat_size priority tensor
+        # Clamp -1 to 0 so invalid entries scatter harmlessly (with priority 0)
+        scatter_idx = flat_accept.clamp(min=0)
+
+        # Use scatter_reduce for 'max' operation (scatter_ only supports add/multiply)
+        priorities.scatter_reduce_(0, scatter_idx, flat_priorities, reduce='amax', include_self=True)
+
+        # argsort: high priority (accepted) comes first, in sequence order
+        flat_perm = torch.argsort(priorities, descending=True, stable=True)
+
+        # Also build per-request permutation for req_to_token compaction
+        # This is just the flat_perm reshaped and converted to local indices
+        per_req_perm = flat_perm.view(bs, tree_size) % tree_size
+
+        return flat_perm, per_req_perm
+
+    def _compact_req_to_token_with_perm(
+        self,
+        batch: ModelWorkerBatch,
+        per_req_perm: torch.Tensor,
+        tree_size: int,
+    ):
+        """
+        Apply pre-computed permutation to compact req_to_token verify window.
+
+        ═══════════════════════════════════════════════════════════════════════
+        SYNC-FREE: All operations are fixed-size, no data-dependent allocation.
+        ═══════════════════════════════════════════════════════════════════════
+
+        After compaction:
+          req_to_token[req, seq_len : seq_len + tree_size] has accepted slots
+          at the prefix positions [0..accept_len-1], rejected at suffix.
+
+        This makes tree mode's req_to_token look like chain mode's.
+
+        Args:
+            batch: Contains req_pool_indices, seq_lens
+            per_req_perm: [bs, tree_size] - local permutation indices
+            tree_size: Verify window size
         """
         bs = len(batch.seq_lens)
-        tree_size = self.speculative_num_draft_tokens  # = 32
         req_to_token = self.req_to_token_pool.req_to_token
 
-        # =====================================================================
-        # VECTORIZED COMPACTION (No per-request loop, minimal syncs)
-        # =====================================================================
-        # Goal: Reorder req_to_token window so accepted slots are at the front.
-        # CRITICAL: Must preserve the SEQUENCE ORDER of accepted tokens!
-        #
-        # Old approach: argsort(mask=1) sorted by tree index, destroying sequence order
-        # if the tree path was not monotonic (e.g. 0 -> 15 -> 3).
-        #
-        # New approach: Scatter PRIORITIES based on sequence position.
-        #   p[token_0] > p[token_1] > ... > p[rejected]
-        #   argsort(descending) then restores the correct sequence 0 -> 1 -> ...
-        # =====================================================================
-
-        # Step 1: Create priority mask [bs, tree_size] initialized to 0 (rejected)
-        # We use a large base value for accepted tokens to sort them first
-        mask = torch.zeros((bs, tree_size), dtype=torch.int32, device=self.device)
-        BASE_PRIORITY = tree_size * 2  # Sufficiently large
-
-        # Step 2: Prepare scatter data
-        # accept_index: [bs, num_steps+1], flat indices into tree
-        flat_accept = accept_index.flatten()
-        valid_mask = flat_accept != -1
-        valid_flat = flat_accept[valid_mask]  # [total_accepted]
-
-        # Calculate (row, col) for scatter
-        # row = flat_idx // tree_size (which request)
-        # col = flat_idx % tree_size  (local position in tree)
-        rows = torch.div(valid_flat, tree_size, rounding_mode='floor')
-        cols = valid_flat % tree_size
-
-        # Calculate sequence priorities: 0, 1, 2... for each request
-        # We can simply use the column index of accept_index!
-        # accept_index shape is [bs, W], so flattened is [0,1,..,W-1, 0,1,..]
-        # This naturally gives the sequence index.
-        # accept_index width W = accept_index.shape[1]
-        width = accept_index.shape[1]
-        seq_ids = torch.arange(width, device=self.device).repeat(bs)
-        valid_seq_ids = seq_ids[valid_mask]  # [0,1,2, 0,1] correctly extracted!
-
-        # Priority = BASE - seq_id (so 0 is highest priority)
-        # Result: p[tok0]=MAX, p[tok1]=MAX-1...
-        priorities = BASE_PRIORITY - valid_seq_ids
-
-        # Scatter priorities into mask
-        # mask[rows, cols] = priorities
-        # [NO SYNC] scatter is async
-        mask[rows, cols] = priorities.to(torch.int32)
-
-        # Step 3: Sort to move accepted (high priority) to front
-        # stable=True is good practice but strict ordering is enforced by priorities
-        perm = torch.argsort(mask, dim=1, descending=True, stable=True)
-
-        # Step 4: Gather old slots and reorder
         # Build window indices: req_to_token[req_idx, seq_len : seq_len+tree_size]
         req_rows = batch.req_pool_indices.unsqueeze(1).expand(bs, tree_size)
         offsets = torch.arange(tree_size, device=self.device).unsqueeze(0)
         window_cols = batch.seq_lens.unsqueeze(1) + offsets
 
+        # Read current slots, reorder by permutation, write back
         old_slots = req_to_token[req_rows, window_cols]
-        new_slots = torch.gather(old_slots, 1, perm)
-
-        # Write back to req_to_token
+        new_slots = torch.gather(old_slots, 1, per_req_perm.long())
         req_to_token.index_put_((req_rows, window_cols), new_slots)
-
-        if os.environ.get("EAGLE3_DEBUG"):
-            # Diagnostic: Show ordering for first request
-            if bs > 0:
-                # accepted_tree_positions: where in tree the accepted tokens were
-                req0_accept = accept_index[0].tolist()
-                req0_valid = [x for x in req0_accept if x != -1]
-                req0_local = [x % tree_size for x in req0_valid]
-
-                # perm shows the reorder: perm[0] is which tree position goes to slot 0
-                req0_perm = perm[0, :len(req0_valid)].tolist()
-
-                # Verify: perm should equal req0_local (sequence-ordered tree positions)
-                order_ok = req0_perm == req0_local
-
-                print(f"[EAGLE3_DEBUG compact] bs={bs}, req0: "
-                      f"tree_positions={req0_local}, perm_prefix={req0_perm}, "
-                      f"order_preserved={order_ok}")
 
     def move_accepted_tokens_to_target_kvcache(
         self,

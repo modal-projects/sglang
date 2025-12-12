@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -204,6 +205,58 @@ class EagleDraftInputV2Mixin:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
+    def prepare_for_extend_with_accept_lens(
+        self,
+        batch: ModelWorkerBatch,
+        dense_predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        dense_out_cache_loc: torch.Tensor,
+        draft_model_runner: Any,
+        cuda_graph_runner: Any,
+    ):
+        """
+        Prepare draft extend with variable accept_lens per request (for tree mode).
+
+        Unlike prepare_for_extend_to_fill_draft_kvcache which uses uniform num_draft_tokens,
+        this handles dense repacked tokens where each request has different accept_len.
+
+        Args:
+            batch: The batch to prepare
+            dense_predict: Dense repacked tokens, shape [sum(accept_lens)]
+            accept_lens: Accept length per request, shape [bs]
+            dense_out_cache_loc: Dense repacked KV slot IDs, shape [sum(accept_lens)]
+            draft_model_runner: The draft model runner
+            cuda_graph_runner: The CUDA graph runner
+        """
+        seq_lens_cpu_ = batch.seq_lens_cpu
+        accept_lens_cpu = accept_lens.cpu()
+        extend_num_tokens = accept_lens_cpu.sum().item()
+
+        batch.spec_info = self
+        batch.input_ids = dense_predict
+        batch.out_cache_loc = dense_out_cache_loc  # Use dense repacked slots!
+        batch.seq_lens = batch.seq_lens + accept_lens  # Variable per request
+        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+        batch.seq_lens_sum += extend_num_tokens
+        batch.extend_seq_lens = accept_lens_cpu.tolist()  # Variable per request
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        batch.extend_num_tokens = extend_num_tokens
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.DRAFT_EXTEND_V2
+        )
+
+        if os.environ.get("EAGLE3_DEBUG"):
+            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens.tolist()}, dense_shapes: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, new_seq_lens={batch.seq_lens.tolist()}")
+
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if not batch.forward_mode.is_idle() and not can_cuda_graph:
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        return forward_batch
+
 
 @dataclass
 class EagleVerifyInputV2Mixin:
@@ -368,6 +421,12 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
+        # DEBUG: Concise logging - key invariants already validated
+        if os.environ.get("EAGLE3_DEBUG"):
+            valid_counts = [(accept_index[i] != -1).sum().item() for i in range(bs)]
+            print(f"\n[EAGLE3_DEBUG sample] bs={bs}, accept_lens={accept_length.tolist()}, valid_counts={valid_counts}")
+
         return predict, accept_length, accept_index
 
 

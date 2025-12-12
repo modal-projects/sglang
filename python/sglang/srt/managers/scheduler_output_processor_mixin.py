@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -260,7 +261,17 @@ class SchedulerOutputProcessorMixin:
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """
+        Extract per-request accepted tokens from DENSE repacked tensor.
+
+        The worker repacks sparse predict to dense:
+          sparse: [tok0, 0, 0, 0, 0, 0, 0, tok7, 0, ..., tok32, 0, ...]
+          dense:  [tok0, tok7, tok32]
+
+        We use CUMULATIVE OFFSET extraction (not stride-based!):
+          req 0: tokens[0 : accept_lens[0]]
+          req 1: tokens[sum(accept_lens[:1]) : sum(accept_lens[:2])]
+        """
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
@@ -269,15 +280,27 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
 
+        # DEBUG: Concise scheduler logging
+        if os.environ.get("EAGLE3_DEBUG"):
+            expected = sum(accept_lens)
+            actual = len(next_token_ids)
+            status = "DENSE ✓" if actual == expected else f"MISMATCH! {actual}!={expected}"
+            kv_before = [r.kv_committed_len for r in batch.reqs]
+            print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, tensor_size={actual} ({status}), kv_committed={kv_before}")
+
+        # CUMULATIVE OFFSET extraction for dense tensor
+        offset = 0
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            acc_len = accept_lens[i]
+            tokens = next_token_ids[offset : offset + acc_len]
+
+            req.kv_committed_len += acc_len
+            predict_tokens.append(tokens)
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i] - 1
+            req.spec_accepted_tokens += acc_len - 1
+
+            offset += acc_len
 
         return predict_tokens
 

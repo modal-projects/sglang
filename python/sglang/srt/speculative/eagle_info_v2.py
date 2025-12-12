@@ -215,32 +215,81 @@ class EagleDraftInputV2Mixin:
         cuda_graph_runner: Any,
     ):
         """
-        Prepare draft extend with variable accept_lens per request (for tree mode).
+        Prepare draft extend with VARIABLE accept_lens per request (for tree mode).
 
-        Unlike prepare_for_extend_to_fill_draft_kvcache which uses uniform num_draft_tokens,
-        this handles dense repacked tokens where each request has different accept_len.
+        =======================================================================
+        WHY THIS EXISTS (vs prepare_for_extend_to_fill_draft_kvcache)
+        =======================================================================
+
+        Chain mode:
+          - All requests extend by same num_draft_tokens
+          - batch.extend_seq_lens = [N, N, N, ...] (uniform)
+          - Uses sparse tensor with valid prefix
+
+        Tree mode:
+          - Each request has different accept_len (scattered acceptance)
+          - batch.extend_seq_lens = [3, 2, 4, ...] (variable!)
+          - Uses DENSE repacked tensors
+
+        This function handles the variable-length case.
+
+        =======================================================================
+        EXAMPLE: steps=5, topk=10, tree_size=32, bs=2, accept_lens=[3, 2]
+        =======================================================================
+        BEFORE (seq_lens=[100, 200]):
+          Input tensors are DENSE (only accepted tokens):
+            dense_predict:      [tok0, tok1, tok2, tok3, tok4]  # shape [5]
+            dense_out_cache_loc: [500, 503, 515, 600, 605]      # shape [5]
+
+        AFTER (seq_lens=[103, 202]):
+          batch.input_ids = dense_predict           # [5] tokens total
+          batch.out_cache_loc = dense_out_cache_loc # [5] slot IDs
+          batch.extend_seq_lens = [3, 2]            # VARIABLE per request!
+          batch.extend_prefix_lens = [100, 200]     # Where to start writing
+
+        The attention backend will write KV at:
+          req0: slots 500, 503, 515 at positions 100, 101, 102
+          req1: slots 600, 605 at positions 200, 201
+        =======================================================================
+
+        [⚠️ CPU-GPU SYNC]
+          - accept_lens.cpu() - GPU→CPU transfer
+          - .sum().item() - reduction + scalar extraction
+          - .tolist() - tensor to Python list
 
         Args:
             batch: The batch to prepare
-            dense_predict: Dense repacked tokens, shape [sum(accept_lens)]
-            accept_lens: Accept length per request, shape [bs]
-            dense_out_cache_loc: Dense repacked KV slot IDs, shape [sum(accept_lens)]
+            dense_predict: DENSE repacked tokens
+                Shape: [sum(accept_lens)] e.g., [5] for accept_lens=[3,2]
+            accept_lens: Accept length per request
+                Shape: [bs] e.g., [3, 2]
+            dense_out_cache_loc: DENSE repacked KV slot IDs
+                Shape: [sum(accept_lens)] e.g., [5]
             draft_model_runner: The draft model runner
             cuda_graph_runner: The CUDA graph runner
         """
-        seq_lens_cpu_ = batch.seq_lens_cpu
+        seq_lens_cpu_ = batch.seq_lens_cpu  # Already on CPU
+
+        # [⚠️ CPU-GPU SYNC] accept_lens.cpu() forces GPU→CPU transfer
         accept_lens_cpu = accept_lens.cpu()
+
+        # [⚠️ CPU-GPU SYNC] .sum().item() forces sync to get scalar
         extend_num_tokens = accept_lens_cpu.sum().item()
 
+        # Set batch fields for draft extend
         batch.spec_info = self
-        batch.input_ids = dense_predict
-        batch.out_cache_loc = dense_out_cache_loc  # Use dense repacked slots!
-        batch.seq_lens = batch.seq_lens + accept_lens  # Variable per request
+        batch.input_ids = dense_predict              # DENSE: [sum(accept_lens)]
+        batch.out_cache_loc = dense_out_cache_loc    # DENSE: [sum(accept_lens)]
+        batch.seq_lens = batch.seq_lens + accept_lens  # Advance by VARIABLE amount
         batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = accept_lens_cpu.tolist()  # Variable per request
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
-        batch.extend_num_tokens = extend_num_tokens
+
+        # [⚠️ CPU-GPU SYNC] .tolist() on CPU tensor (no sync, already on CPU)
+        batch.extend_seq_lens = accept_lens_cpu.tolist()    # VARIABLE: [3, 2]
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()   # Where KV starts
+        batch.extend_num_tokens = extend_num_tokens         # Total: 5
+
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -249,7 +298,9 @@ class EagleDraftInputV2Mixin:
         )
 
         if os.environ.get("EAGLE3_DEBUG"):
-            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens.tolist()}, dense_shapes: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, new_seq_lens={batch.seq_lens.tolist()}")
+            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens.tolist()}, "
+                  f"dense: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, "
+                  f"new_seq_lens={batch.seq_lens.tolist()}")
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)

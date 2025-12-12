@@ -486,13 +486,33 @@ class EagleDraftWorker(BaseDraftWorker):
         if os.environ.get("EAGLE3_DEBUG"):
             print(f"[EAGLE3_DEBUG draft_extend] bs={bs}, tree={is_tree_mode}, accept_lens={batch_result.accept_lens.tolist()}, seq_lens={batch.seq_lens.tolist()}")
 
-        # Batch 2: Draft extend
-        # For tree mode, use dense repacked hidden_states from next_draft_input
-        # For chain mode, use the original sparse hidden_states from logits_output
+        # =================================================================
+        # DRAFT EXTEND: Fill draft KV cache with accepted tokens
+        # =================================================================
+        # PURPOSE: After verify(), the draft model needs to see the accepted
+        # tokens in its KV cache for the next speculative iteration.
+        #
+        # TREE vs CHAIN MODE DIFFERENCES:
+        # ─────────────────────────────────────────────────────────────────
+        # CHAIN MODE (topk=1):
+        #   - Accepted positions: always [0, 1, 2, ...] (contiguous)
+        #   - hidden_states: use sparse tensor directly (prefix is valid)
+        #   - extend: uniform num_draft_tokens for all requests
+        #   - select_index: stride-based (i * stride + accept_len - 1)
+        #
+        # TREE MODE (topk>1):
+        #   - Accepted positions: scattered [0, 3, 15, ...] (non-contiguous)
+        #   - hidden_states: MUST use DENSE repacked tensor from verify()
+        #   - extend: VARIABLE accept_lens per request
+        #   - select_index: cumulative offset (sum(accept_lens[:i+1]) - 1)
+        # ─────────────────────────────────────────────────────────────────
         if is_tree_mode:
-            # Dense hidden_states were prepared in verify()
+            # Tree mode: Use dense tensors prepared in verify()
+            # Shape: [sum(accept_lens), hidden_dim] e.g., [5, 4096]
             hidden_states_for_draft = batch_result.next_draft_input.hidden_states
         else:
+            # Chain mode: Sparse tensor prefix is valid
+            # Shape: [bs * tree_size, hidden_dim] e.g., [64, 4096]
             hidden_states_for_draft = batch_result.logits_output.hidden_states
 
         draft_input = EagleDraftInput(
@@ -501,29 +521,58 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_batch=1,
         )
 
-        # For tree mode, use variable-length extend with dense repacked tokens
-        # For chain mode, use the original uniform-length extend
         if is_tree_mode:
-            # Dense tensor: select_index uses cumulative offset
-            # Last accepted token for req i is at: sum(accept_lens[:i]) + accept_lens[i] - 1
-            accept_lens_cpu = batch_result.accept_lens.cpu()
+            # =============================================================
+            # TREE MODE: Variable-length extend with dense tensors
+            # =============================================================
+            # select_index: Find the LAST accepted token for each request
+            # to use as input for the next draft iteration.
+            #
+            # EXAMPLE: steps=5, topk=10, bs=2, accept_lens=[3, 2]
+            # ─────────────────────────────────────────────────────────────
+            # Dense next_token_ids: [tok0, tok1, tok2, tok3, tok4] (5 tokens)
+            #   req0: positions 0,1,2 → last is position 2 (tok2)
+            #   req1: positions 3,4   → last is position 4 (tok4)
+            #
+            # cumsum([3, 2]) = [3, 5]
+            # select_index = cumsum - 1 = [2, 4]
+            # ─────────────────────────────────────────────────────────────
+            #
+            # [⚠️ CPU-GPU SYNC] .cpu() forces GPU→CPU transfer
+            # This sync is currently unavoidable for cumsum computation.
+            # Potential optimization: compute cumsum on GPU, only .item() at end
+            accept_lens_cpu = batch_result.accept_lens.cpu()  # [⚠️ SYNC]
             cumsum = torch.cumsum(accept_lens_cpu, dim=0)
             select_index = (cumsum - 1).to(self.device)
 
-            # Get dense_out_cache_loc from next_draft_input (set in verify())
+            # Dense KV slot IDs prepared in verify()
+            # Shape: [sum(accept_lens)] e.g., [5]
             dense_out_cache_loc = batch_result.next_draft_input.dense_out_cache_loc
 
             with self.plan_stream_ctx:
                 forward_batch = draft_input.prepare_for_extend_with_accept_lens(
                     batch,
-                    batch_result.next_token_ids,  # Dense repacked
-                    batch_result.accept_lens,
-                    dense_out_cache_loc,  # Dense repacked KV slots
+                    batch_result.next_token_ids,  # Dense: [5]
+                    batch_result.accept_lens,     # [bs]: [3, 2]
+                    dense_out_cache_loc,          # Dense: [5]
                     self.draft_runner,
                     self.cuda_graph_runner_for_draft_extend,
                 )
         else:
-            # Chain mode: original sparse tensor with uniform stride
+            # =============================================================
+            # CHAIN MODE: Uniform-length extend with sparse tensors
+            # =============================================================
+            # select_index: Stride-based indexing into sparse tensor
+            #
+            # EXAMPLE: bs=2, tree_size=32, accept_lens=[3, 2]
+            # ─────────────────────────────────────────────────────────────
+            # Sparse next_token_ids: [tok0, tok1, tok2, 0, 0, ..., tok32, tok33, 0, ...]
+            #   req0 at positions 0..31 → last accepted is position 2 (accept_len-1)
+            #   req1 at positions 32..63 → last accepted is position 33 (32+accept_len-1)
+            #
+            # select_index[i] = i * stride + accept_lens[i] - 1
+            # select_index = [0*32+3-1, 1*32+2-1] = [2, 33]
+            # ─────────────────────────────────────────────────────────────
             select_index = (
                 torch.arange(bs, device=self.device)
                 * self.speculative_num_draft_tokens
@@ -534,7 +583,7 @@ class EagleDraftWorker(BaseDraftWorker):
             with self.plan_stream_ctx:
                 forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                     batch,
-                    batch_result.next_token_ids,
+                    batch_result.next_token_ids,  # Sparse: [bs * tree_size]
                     self.speculative_num_draft_tokens,
                     self.draft_runner,
                     self.cuda_graph_runner_for_draft_extend,
@@ -786,64 +835,118 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             # =================================================================
-            # FIX: Repack sparse tensors to dense for tree mode
+            # FIX #1-3: Repack sparse tensors to dense for tree mode
             # =================================================================
-            # Problem: predict and hidden_states are sparse [bs * tree_size] with
-            # valid data only at accept_index positions. We need dense tensors.
+            # WHY: Tree mode verification produces SPARSE tensors where only
+            # accept_index positions contain valid data. Downstream consumers
+            # (scheduler, draft model) expect DENSE tensors.
             #
-            # Example (bs=2, tree_size=32, accept_lens=[2, 1]):
-            #   sparse predict: [tok0, 0, 0, 0, 0, 0, 0, tok7, 0, ..., tok32, 0, ...]
-            #   accept_index[0]: [0, 7, -1, -1, -1, -1]
-            #   accept_index[1]: [32, -1, -1, -1, -1, -1]
-            #   dense predict: [tok0, tok7, tok32]
-            flat_accept_index = accept_index.flatten()
-            valid_mask = flat_accept_index != -1
-            valid_indices = flat_accept_index[valid_mask]
+            # TENSORS REPACKED:
+            #   1. predict       → dense_predict       (token IDs for scheduler)
+            #   2. hidden_states → dense_hidden_states (input to draft model)
+            #   3. out_cache_loc → dense_out_cache_loc (KV write locations)
+            #
+            # EXAMPLE CONFIG: steps=5, topk=10, tree_size=32, bs=2
+            # ─────────────────────────────────────────────────────────────────
+            # accept_lens = [3, 2] (total accepted = 5)
+            #
+            # SPARSE predict: shape [bs * tree_size] = [64]
+            #   [tok0, 0, 0, tok3, 0, ..., 0, tok15, 0, ...  | tok32, 0, tok34, 0, ...]
+            #    ^req0 accepted at positions 0,3,15          ^req1 accepted at 32,34
+            #
+            # accept_index: shape [bs, num_steps+1] = [2, 6]
+            #   [[0, 3, 15, -1, -1, -1],    # req0: 3 valid indices, 3 padding
+            #    [32, 34, -1, -1, -1, -1]]  # req1: 2 valid indices, 4 padding
+            #
+            # DENSE predict: shape [sum(accept_lens)] = [5]
+            #   [tok0, tok3, tok15, tok32, tok34]
+            # ─────────────────────────────────────────────────────────────────
+            #
+            # [⚠️ CPU-GPU SYNC] Boolean mask indexing has DATA-DEPENDENT OUTPUT SIZE.
+            # PyTorch must count True values in valid_mask to allocate the output tensor.
+            # Internally this uses torch.nonzero() which synchronizes CPU↔GPU.
+            #
+            # This sync is currently unavoidable with this approach. Alternative:
+            # Pre-compute sum(accept_lens) and use scatter/gather with known sizes.
+            flat_accept_index = accept_index.flatten()    # [bs * 6] = [12], no sync
+            valid_mask = flat_accept_index != -1          # Boolean tensor, no sync
+            valid_indices = flat_accept_index[valid_mask] # [⚠️ SYNC] Gather valid, [5]
 
-            # Repack predict tokens
-            dense_predict = predict[valid_indices]  # Shape: [sum(accept_lens)]
+            # Repack predict tokens using gathered indices
+            # [NO SYNC] Output size is known (valid_indices.shape[0])
+            dense_predict = predict[valid_indices]  # [sum(accept_lens)] = [5]
 
-            # Repack hidden_states and out_cache_loc (needed for draft model in tree mode)
+            # Repack hidden_states and out_cache_loc (only needed for tree mode)
             if self.topk > 1:
+                # [NO SYNC] Output size known from valid_indices
+                # hidden_states: [bs * tree_size, hidden_dim] → [sum(accept_lens), hidden_dim]
+                # Example: [64, 4096] → [5, 4096]
                 dense_hidden_states = logits_output.hidden_states[valid_indices]
 
-                # Repack out_cache_loc using existing Triton kernel
-                # This tells the draft model WHERE to write KV for each accepted token
+                # ─────────────────────────────────────────────────────────────
+                # Repack out_cache_loc using Triton kernel
+                # ─────────────────────────────────────────────────────────────
+                # WHY: The attention backend uses out_cache_loc to determine
+                # WHERE to write KV cache (see triton_backend.py line 910:
+                # `extend_kv_indices = forward_batch.out_cache_loc`).
+                # We must provide ONLY the slots for accepted positions.
                 #
-                # IMPORTANT: The kernel iterates over accept_index elements with thread pid.
-                # Grid size MUST be accept_index.numel(), NOT bs * tree_size!
-                # accept_index shape: [bs, num_steps+1], e.g., [1, 6] → 6 elements
-                # Launching with bs * tree_size (32) would cause OOB reads.
-                accept_index_flat = accept_index.flatten()
-                grid_size = accept_index_flat.numel()  # = bs * (num_steps + 1)
-                total_accepted = valid_indices.shape[0]  # = sum(accept_lens)
-
-                if os.environ.get("EAGLE3_DEBUG"):
-                    # Key check: grid_size must match accept_index size, NOT bs * tree_size
-                    print(f"[EAGLE3_DEBUG fill_out_cache] grid={grid_size}, accept_index.numel={accept_index_flat.numel()}, total_accepted={total_accepted}")
+                # KERNEL SEMANTICS: fill_accepted_out_cache_loc iterates over
+                # accept_index elements (not out_cache_loc elements!).
+                #   - Thread pid reads accept_index[pid]
+                #   - If accept_index[pid] != -1, writes out_cache_loc[accept_index[pid]]
+                #
+                # CRITICAL: Grid size = accept_index.numel() = bs * (num_steps+1)
+                #           NOT bs * tree_size (would cause OOB reads!)
+                #
+                # Example: bs=2, num_steps=5 → grid_size = 2*6 = 12
+                #          NOT 2*32 = 64 (wrong!)
+                # ─────────────────────────────────────────────────────────────
+                accept_index_flat = accept_index.flatten()  # [bs * 6] = [12]
+                grid_size = accept_index_flat.numel()       # = 12, no sync (known from accept_index.shape)
+                # valid_indices.shape[0] reads cached metadata (sync already happened above)
+                total_accepted = valid_indices.shape[0]     # = 5
 
                 dense_out_cache_loc = torch.zeros(
                     total_accepted, dtype=torch.int64, device=self.device
                 )
+                # [NO CPU-GPU SYNC] Triton kernel runs on GPU
                 fill_accepted_out_cache_loc[(grid_size,)](
-                    accept_index_flat,
-                    batch.out_cache_loc,
-                    dense_out_cache_loc,
-                    next_power_of_2(grid_size),
+                    accept_index_flat,   # [12] - indices into out_cache_loc
+                    batch.out_cache_loc, # [64] - sparse slot IDs
+                    dense_out_cache_loc, # [5]  - output: dense slot IDs
+                    next_power_of_2(grid_size),  # size_upper for kernel
                 )
             else:
-                dense_hidden_states = None  # Chain mode doesn't need this
+                # Chain mode: acceptance is always contiguous [0,1,2,...], no repacking needed
+                dense_hidden_states = None
                 dense_out_cache_loc = None
 
             # =================================================================
-            # FIX: Compact req_to_token verify window for tree mode
+            # FIX #4: Compact req_to_token verify window for tree mode
             # =================================================================
-            # Problem: After scattered acceptance, req_to_token has:
-            #   [slot0, slot1, slot2, ...] but only [slot0, slot7] are accepted
-            # This leaves duplicate/garbage slots that corrupt attention.
+            # WHY: After tree verification, accepted positions are SCATTERED
+            # (e.g., [0, 3, 15]) but req_to_token mapping is still LINEAR.
+            # Next iteration reads from seq_len+accept_len, expecting accepted
+            # slots at prefix positions. Without compaction, it reads garbage!
             #
-            # Solution: Reorder to [accepted_slots] + [rejected_slots]
-            # so accepted form a prefix (like chain mode).
+            # CHAIN MODE: Always accepts [0,1,2,...], naturally contiguous
+            # TREE MODE:  Accepts scattered [0,3,15,...], needs compaction
+            #
+            # EXAMPLE: steps=5, topk=10, tree_size=32, accept at [0, 3, 15]
+            # ─────────────────────────────────────────────────────────────────
+            # BEFORE compaction:
+            #   req_to_token[req, seq_len:seq_len+32] = [A,B,C,D,E,...,P,Q,...]
+            #   Accepted slots: A (pos 0), D (pos 3), P (pos 15)
+            #
+            # AFTER compaction:
+            #   req_to_token[req, seq_len:seq_len+32] = [A,D,P,B,C,E,F,...]
+            #   First 3 slots are accepted, rest are rejected (reusable)
+            # ─────────────────────────────────────────────────────────────────
+            #
+            # [⚠️ CPU-GPU SYNC] This function calls .item() and .tolist() which
+            # cause GPU→CPU transfers. This is a known performance issue but
+            # necessary for correct tree mode operation. See _compact_req_to_token_verify_window.
             if self.topk > 1:  # Only needed for tree mode
                 self._compact_req_to_token_verify_window(
                     batch, accept_index, accept_length
@@ -891,47 +994,97 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """
         Compact the req_to_token verify window so accepted slots form a prefix.
 
-        This makes tree mode behave like chain mode: accepted slots are contiguous
-        at the start, rejected slots follow. Next iteration can safely reuse/overwrite
-        the suffix slots.
+        =======================================================================
+        PURPOSE: Make tree mode behave like chain mode after verification
+        =======================================================================
+
+        PROBLEM: Tree verification accepts tokens at scattered positions (e.g.,
+        [0, 3, 15]) but req_to_token mapping is linear [0, 1, 2, 3, ...].
+        When seq_lens advances by accept_len, the next iteration expects
+        accepted KV at positions [0..accept_len-1], but they're scattered!
+
+        SOLUTION: Reorder req_to_token[verify_window] so accepted slots are
+        at the prefix and rejected slots follow. This is a "stable partition"
+        that preserves the mapping consistency.
+
+        =======================================================================
+        EXAMPLE: steps=5, topk=10, tree_size=32, accept at positions [0, 3, 15]
+        =======================================================================
+        BEFORE compaction (req_to_token[req, 100:132]):
+          Position: [0,   1,   2,   3,   4, ..., 15, ..., 31]
+          Slot ID:  [500, 501, 502, 503, 504, ..., 515, ..., 531]
+          Status:   [ACC, rej, rej, ACC, rej, ..., ACC, ..., rej]
+
+        AFTER compaction (req_to_token[req, 100:132]):
+          Position: [0,   1,   2,   3,   4, ..., 31]
+          Slot ID:  [500, 503, 515, 501, 502, ..., 531]  # Accepted first!
+          Status:   [ACC, ACC, ACC, rej, rej, ..., rej]
+
+        Now seq_lens += 3 works: positions 0,1,2 have the accepted KV data.
+        =======================================================================
+
+        [⚠️ CPU-GPU SYNC WARNING]
+        This function has MULTIPLE CPU-GPU syncs per request:
+          - .item() calls to get req_idx and seq_len (2 syncs per req)
+          - .tolist() to get accept_index row (1 sync per req)
+          - .clone() to copy slots (no sync, but memory alloc)
+          - Direct tensor indexing with Python list (may cause sync)
+
+        For bs=2, this is ~6 syncs. For large batches, this is expensive!
+        TODO: Optimize with GPU-only Triton kernel for slot reordering.
 
         Args:
             batch: The batch containing req_pool_indices, seq_lens, out_cache_loc
-            accept_index: Shape [bs, num_steps+1], flat indices into out_cache_loc
+            accept_index: Shape [bs, num_steps+1] = [bs, 6] for steps=5
+                          Contains FLAT indices into [bs * tree_size] tensor
             accept_length: Shape [bs], number of accepted tokens per request
         """
         bs = len(batch.seq_lens)
-        tree_size = self.speculative_num_draft_tokens
+        tree_size = self.speculative_num_draft_tokens  # = 32
         req_to_token = self.req_to_token_pool.req_to_token
 
         for i in range(bs):
+            # [⚠️ CPU-GPU SYNC] .item() forces GPU→CPU transfer
             req_idx = batch.req_pool_indices[i].item()
             seq_len = batch.seq_lens[i].item()
 
-            # Get current verify window slots
+            # Get current verify window slots: req_to_token[req, seq_len:seq_len+32]
+            # Example: slots [500, 501, 502, ..., 531]
             old_slots = req_to_token[req_idx, seq_len : seq_len + tree_size].clone()
 
-            # Get accepted positions (local to this request's tree window)
+            # Convert FLAT accept_index to LOCAL positions within this request's window
+            # [⚠️ CPU-GPU SYNC] .tolist() forces GPU→CPU transfer
+            # Example: accept_index[0] = [0, 3, 15, -1, -1, -1] (flat indices)
+            #          For req 0: local_pos = flat_idx - 0*32 = flat_idx
+            #          Result: acc_local_positions = [0, 3, 15]
             acc_flat_indices = accept_index[i].tolist()
             acc_local_positions = []
             for idx in acc_flat_indices:
                 if idx != -1:
-                    local_pos = idx - i * tree_size  # Convert flat to local
+                    local_pos = idx - i * tree_size  # Convert flat→local
                     acc_local_positions.append(local_pos)
 
-            # Build compacted order: [accepted positions] + [rejected positions]
+            # Build compacted reorder: [accepted positions] ++ [rejected positions]
+            # Example: accepted = {0, 3, 15}
+            #          rejected = [1, 2, 4, 5, ..., 14, 16, ..., 31]
+            #          compacted_order = [0, 3, 15, 1, 2, 4, 5, ..., 31]
             accepted_set = set(acc_local_positions)
             rejected_positions = [p for p in range(tree_size) if p not in accepted_set]
             compacted_order = acc_local_positions + rejected_positions
 
-            # Reorder slots
+            # Reorder slots according to compacted_order
+            # [NO ADDITIONAL SYNC] Python list indexing converts list→tensor then indexes.
+            # Output size is known (len(compacted_order)), so no data-dependent sync.
+            # NOTE: The syncs already happened above via .item() and .tolist() calls.
+            # Example: old_slots[[0,3,15,1,2,...]] = [500, 503, 515, 501, 502, ...]
             new_slots = old_slots[compacted_order]
 
-            # Write back to req_to_token
+            # Write back to req_to_token (in-place update)
             req_to_token[req_idx, seq_len : seq_len + tree_size] = new_slots
 
             if os.environ.get("EAGLE3_DEBUG"):
-                print(f"[EAGLE3_DEBUG compact] req {i}: acc_pos={acc_local_positions}, first_slots: old={old_slots[:4].tolist()} -> new={new_slots[:4].tolist()}")
+                print(f"[EAGLE3_DEBUG compact] req {i}: acc_pos={acc_local_positions}, "
+                      f"slots: old={old_slots[:4].tolist()} -> new={new_slots[:4].tolist()}")
 
     def move_accepted_tokens_to_target_kvcache(
         self,

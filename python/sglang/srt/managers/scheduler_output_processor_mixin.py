@@ -264,42 +264,81 @@ class SchedulerOutputProcessorMixin:
         """
         Extract per-request accepted tokens from DENSE repacked tensor.
 
-        The worker repacks sparse predict to dense:
-          sparse: [tok0, 0, 0, 0, 0, 0, 0, tok7, 0, ..., tok32, 0, ...]
-          dense:  [tok0, tok7, tok32]
+        =======================================================================
+        FIX #5: CUMULATIVE OFFSET EXTRACTION (replaces stride-based)
+        =======================================================================
 
-        We use CUMULATIVE OFFSET extraction (not stride-based!):
-          req 0: tokens[0 : accept_lens[0]]
-          req 1: tokens[sum(accept_lens[:1]) : sum(accept_lens[:2])]
+        WHY: Tree mode worker repacks sparse predict to DENSE tensor.
+        The old stride-based extraction assumed sparse layout (broken for tree).
+
+        CHAIN MODE (old, stride-based, BROKEN for tree):
+          sparse: [tok0, tok1, tok2, 0, 0, ..., tok32, tok33, 0, 0, ...]
+          Extract req0 as: tokens[0*32 : 0*32+3] = [tok0, tok1, tok2] ✓
+          But for tree: tokens[0*32 : 0*32+3] = [tok0, 0, 0] ✗ (garbage!)
+
+        TREE MODE (new, cumulative offset):
+          dense: [tok0, tok7, tok15, tok32, tok34]  # Only accepted tokens
+          Extract req0 as: tokens[0 : 3]     = [tok0, tok7, tok15] ✓
+          Extract req1 as: tokens[3 : 3+2]   = [tok32, tok34] ✓
+
+        =======================================================================
+        EXAMPLE: steps=5, topk=10, bs=2, accept_lens=[3, 2]
+        =======================================================================
+        Dense next_token_ids: [tok0, tok7, tok15, tok32, tok34] (size=5)
+
+        Extraction:
+          offset=0, req0: tokens[0:3] = [tok0, tok7, tok15], offset→3
+          offset=3, req1: tokens[3:5] = [tok32, tok34], offset→5
+
+        kv_committed_len update:
+          req0: 100 → 103 (+3)
+          req1: 200 → 202 (+2)
+        =======================================================================
+
+        [NO CPU-GPU SYNC] All tensors are already on CPU (worker sends CPU tensors)
+        The asserts below verify this invariant.
         """
-        assert result.next_token_ids.is_cpu
-        assert result.accept_lens.is_cpu
+        # Verify tensors are on CPU (no GPU access needed)
+        assert result.next_token_ids.is_cpu, "next_token_ids should be CPU tensor"
+        assert result.accept_lens.is_cpu, "accept_lens should be CPU tensor"
 
+        # [NO SYNC] .tolist() on CPU tensor is fast
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
+
+        # Statistics: total accepted minus bonus tokens (one per request)
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
 
-        # DEBUG: Concise scheduler logging
+        # DEBUG: Verify tensor is dense (size == sum of accept_lens)
         if os.environ.get("EAGLE3_DEBUG"):
-            expected = sum(accept_lens)
-            actual = len(next_token_ids)
-            status = "DENSE ✓" if actual == expected else f"MISMATCH! {actual}!={expected}"
+            expected_size = sum(accept_lens)
+            actual_size = len(next_token_ids)
+            status = "DENSE ✓" if actual_size == expected_size else f"MISMATCH! {actual_size}!={expected_size}"
             kv_before = [r.kv_committed_len for r in batch.reqs]
-            print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, tensor_size={actual} ({status}), kv_committed={kv_before}")
+            print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, "
+                  f"tensor_size={actual_size} ({status}), kv_committed={kv_before}")
 
-        # CUMULATIVE OFFSET extraction for dense tensor
+        # =================================================================
+        # CUMULATIVE OFFSET EXTRACTION
+        # =================================================================
+        # Dense tensor layout: [req0_tok0, req0_tok1, ..., req1_tok0, req1_tok1, ...]
+        # offset tracks where each request's tokens start
         offset = 0
         for i, req in enumerate(batch.reqs):
             acc_len = accept_lens[i]
+
+            # Extract this request's tokens from dense tensor
             tokens = next_token_ids[offset : offset + acc_len]
 
-            req.kv_committed_len += acc_len
+            # Update request state
+            req.kv_committed_len += acc_len  # KV cache advanced by accept_len
             predict_tokens.append(tokens)
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += acc_len - 1
+            req.spec_accepted_tokens += acc_len - 1  # Exclude bonus token
 
+            # Move offset for next request
             offset += acc_len
 
         return predict_tokens

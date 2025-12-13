@@ -311,14 +311,17 @@ class SchedulerOutputProcessorMixin:
 
         predict_tokens = []
 
-        # DEBUG: Verify tensor is dense (size == sum of accept_lens)
+        # DEBUG: Verify tensor is dense (only log for bs>1 or mismatches)
         if os.environ.get("EAGLE3_DEBUG"):
             expected_size = sum(accept_lens)
             actual_size = len(next_token_ids)
-            status = "DENSE ✓" if actual_size == expected_size else f"MISMATCH! {actual_size}!={expected_size}"
-            kv_before = [r.kv_committed_len for r in batch.reqs]
-            print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, "
-                  f"tensor_size={actual_size} ({status}), kv_committed={kv_before}")
+            is_dense = actual_size == expected_size
+            # Always log mismatches, only log bs>1 for normal cases
+            if not is_dense or len(batch.reqs) > 1:
+                status = "DENSE ✓" if is_dense else f"MISMATCH! {actual_size}!={expected_size}"
+                kv_before = [r.kv_committed_len for r in batch.reqs]
+                print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, "
+                      f"tensor_size={actual_size} ({status}), kv_committed={kv_before}")
 
         # =================================================================
         # CUMULATIVE OFFSET EXTRACTION

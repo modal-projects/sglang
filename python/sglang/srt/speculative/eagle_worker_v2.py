@@ -602,8 +602,8 @@ class EagleDraftWorker(BaseDraftWorker):
         bs = len(batch.seq_lens)
         is_tree_mode = self.topk > 1
 
-        # DEBUG: Concise draft_extend logging
-        if os.environ.get("EAGLE3_DEBUG"):
+        # DEBUG: draft_extend logging (only for bs>1)
+        if os.environ.get("EAGLE3_DEBUG") and bs > 1:
             print(f"[EAGLE3_DEBUG draft_extend] bs={bs}, tree={is_tree_mode}, accept_lens={batch_result.accept_lens.tolist()}, seq_lens={batch.seq_lens.tolist()}")
 
         # =================================================================
@@ -1123,12 +1123,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Pass pre-computed CPU tensor to avoid re-syncing in prepare_for_extend
         next_draft_input.accept_lens_cpu = accept_lens_cpu if not batch.forward_mode.is_idle() else None
 
-        # DEBUG: Concise verify logging (uses already-synced values)
+        # DEBUG: Concise verify logging (only detailed for bs>1)
         if os.environ.get("EAGLE3_DEBUG") and not batch.forward_mode.is_idle():
-            print(f"[EAGLE3_DEBUG verify] bs={bs}, accept_lens={accept_lens_cpu}, total={total_accepted}")
-            print(f"[EAGLE3_DEBUG verify] dense shapes: predict={dense_predict.shape[0]}, "
-                  f"hidden={dense_hidden_states.shape[0] if dense_hidden_states is not None else 'N/A'}, "
-                  f"out_cache_loc={dense_out_cache_loc.shape[0] if dense_out_cache_loc is not None else 'N/A'}")
+            if bs > 1:
+                # Detailed logging for multi-request batches
+                print(f"[EAGLE3_DEBUG verify] bs={bs}, accept_lens={accept_lens_cpu}, total={total_accepted}")
+                print(f"[EAGLE3_DEBUG verify] dense shapes: predict={dense_predict.shape[0]}, "
+                      f"hidden={dense_hidden_states.shape[0] if dense_hidden_states is not None else 'N/A'}, "
+                      f"out_cache_loc={dense_out_cache_loc.shape[0] if dense_out_cache_loc is not None else 'N/A'}")
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1154,8 +1156,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
           1. flat_perm [bs * tree_size]: For compacting data tensors (predict, etc.)
           2. per_req_perm [bs, tree_size]: For compacting req_to_token window
 
-        Both permutations move accepted positions to the prefix while preserving
-        sequence order. Rejected positions fill the suffix.
+        CRITICAL: These are computed DIFFERENTLY!
+          - flat_perm: Global sort across all requests (for concatenated data tensors)
+          - per_req_perm: Per-row sort (for per-request req_to_token windows)
 
         ═══════════════════════════════════════════════════════════════════════
         SYNC-FREE DESIGN
@@ -1176,7 +1179,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         2. For each valid entry in accept_index:
            - Scatter priority = BASE - seq_id to its flat position
            - seq_id ensures sequence order (first accepted = highest priority)
-        3. argsort(descending) gives permutation: accepted first, in sequence order
+        3. For flat_perm: argsort GLOBALLY (all requests together)
+        4. For per_req_perm: argsort PER ROW (within each request)
+
+        ═══════════════════════════════════════════════════════════════════════
+        EXAMPLE: bs=2, tree_size=32, accept_lens=[3, 2]
+        ═══════════════════════════════════════════════════════════════════════
+        accept_index = [[0, 3, 15, -1, -1, -1], [32, 34, -1, -1, -1, -1]]
+
+        priorities (flat): HIGH at positions 0,3,15,32,34; 0 elsewhere
+
+        flat_perm (global argsort): [0, 3, 15, 32, 34, 1, 2, 4, ...]
+          → Used for: predict.gather(0, flat_perm)[:5] = [tok0, tok3, tok15, tok32, tok34]
+
+        per_req_perm (per-row argsort):
+          Row 0: [0, 3, 15, 1, 2, 4, 5, ...]  (positions 0,3,15 have high priority)
+          Row 1: [0, 2, 1, 3, 4, 5, ...]      (positions 0,2 have high priority, local!)
+          → Used for: req_to_token gather within each request's window
 
         Args:
             accept_index: [bs, num_steps+1], flat indices into [bs*tree_size] or -1
@@ -1209,22 +1228,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
         flat_seq_ids = torch.arange(bs * max_accept, device=self.device)
 
         # Priorities: BASE - seq_id for valid entries, 0 for invalid
-        # Using scatter with reduce='max' handles any edge cases
         flat_priorities = (BASE - flat_seq_ids) * flat_valid.long()
 
         # Scatter to flat_size priority tensor
         # Clamp -1 to 0 so invalid entries scatter harmlessly (with priority 0)
         scatter_idx = flat_accept.clamp(min=0)
 
-        # Use scatter_reduce for 'max' operation (scatter_ only supports add/multiply)
+        # Use scatter_reduce for 'amax' operation
         priorities.scatter_reduce_(0, scatter_idx, flat_priorities, reduce='amax', include_self=True)
 
-        # argsort: high priority (accepted) comes first, in sequence order
+        # =====================================================================
+        # flat_perm: GLOBAL sort for data tensors (predict, hidden, out_cache)
+        # =====================================================================
+        # This gives the correct ordering for concatenated data:
+        # [req0_tok0, req0_tok1, ..., req1_tok0, req1_tok1, ...]
         flat_perm = torch.argsort(priorities, descending=True, stable=True)
 
-        # Also build per-request permutation for req_to_token compaction
-        # This is just the flat_perm reshaped and converted to local indices
-        per_req_perm = flat_perm.view(bs, tree_size) % tree_size
+        # =====================================================================
+        # per_req_perm: PER-ROW sort for req_to_token compaction
+        # =====================================================================
+        # CRITICAL FIX: Cannot derive from flat_perm! For bs>1, flat_perm mixes
+        # indices from different requests. We need to sort within each row.
+        #
+        # Reshape priorities to [bs, tree_size] and sort along dim=1
+        priorities_2d = priorities.view(bs, tree_size)
+        per_req_perm = torch.argsort(priorities_2d, dim=1, descending=True, stable=True)
 
         return flat_perm, per_req_perm
 

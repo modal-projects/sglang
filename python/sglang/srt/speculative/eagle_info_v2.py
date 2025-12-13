@@ -408,7 +408,7 @@ class EagleDraftInputV2Mixin:
             else ForwardMode.DRAFT_EXTEND_V2
         )
 
-        if os.environ.get("EAGLE3_DEBUG"):
+        if os.environ.get("EAGLE3_DEBUG") and len(accept_lens_cpu) > 1:
             print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens_cpu}, "
                   f"dense: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, "
                   f"new_seq_lens={batch.seq_lens.tolist()}")
@@ -598,8 +598,8 @@ class EagleVerifyInputV2Mixin:
         # Include the bonus token
         accept_length.add_(1)
 
-        # DEBUG: Concise logging - key invariants already validated
-        if os.environ.get("EAGLE3_DEBUG"):
+        # DEBUG: Concise logging (only for bs>1)
+        if os.environ.get("EAGLE3_DEBUG") and bs > 1:
             valid_counts = [(accept_index[i] != -1).sum().item() for i in range(bs)]
             print(f"\n[EAGLE3_DEBUG sample] bs={bs}, accept_lens={accept_length.tolist()}, valid_counts={valid_counts}")
 

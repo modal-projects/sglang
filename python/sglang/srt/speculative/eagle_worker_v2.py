@@ -600,115 +600,58 @@ class EagleDraftWorker(BaseDraftWorker):
             - Updates batch_result.next_draft_input with topk_p, topk_index, hidden_states
         """
         bs = len(batch.seq_lens)
-        is_tree_mode = self.topk > 1
-
-        # DEBUG: draft_extend logging (only for bs>1)
-        if os.environ.get("EAGLE3_DEBUG") and bs > 1:
-            print(f"[EAGLE3_DEBUG draft_extend] bs={bs}, tree={is_tree_mode}, accept_lens={batch_result.accept_lens.tolist()}, seq_lens={batch.seq_lens.tolist()}")
+        stride = self.speculative_num_draft_tokens
 
         # =================================================================
-        # DRAFT EXTEND: Fill draft KV cache with accepted tokens
+        # UNIFIED DRAFT EXTEND: Same path for tree and chain mode
         # =================================================================
-        # PURPOSE: After verify(), the draft model needs to see the accepted
-        # tokens in its KV cache for the next speculative iteration.
+        # TREE-AS-CHAIN: After verify() compaction, both modes have:
+        #   - next_token_ids: PADDED [bs * tree_size], prefix valid per request
+        #   - logits_output.hidden_states: PADDED [bs * tree_size, H]
+        #   - batch.out_cache_loc: PADDED [bs * tree_size] (compacted for tree)
         #
-        # TREE vs CHAIN MODE DIFFERENCES:
-        # ─────────────────────────────────────────────────────────────────
-        # CHAIN MODE (topk=1):
-        #   - Accepted positions: always [0, 1, 2, ...] (contiguous)
-        #   - hidden_states: use sparse tensor directly (prefix is valid)
-        #   - extend: uniform num_draft_tokens for all requests
-        #   - select_index: stride-based (i * stride + accept_len - 1)
+        # UNIFIED select_index formula (works for both):
+        #   select_index[i] = i * stride + accept_lens[i] - 1
         #
-        # TREE MODE (topk>1):
-        #   - Accepted positions: scattered [0, 3, 15, ...] (non-contiguous)
-        #   - hidden_states: MUST use DENSE repacked tensor from verify()
-        #   - extend: VARIABLE accept_lens per request
-        #   - select_index: cumulative offset (sum(accept_lens[:i+1]) - 1)
+        # EXAMPLE: bs=2, stride=32, accept_lens=[3, 2]
         # ─────────────────────────────────────────────────────────────────
-        if is_tree_mode:
-            # Tree mode: Use dense tensors prepared in verify()
-            # Shape: [sum(accept_lens), hidden_dim] e.g., [5, 4096]
-            hidden_states_for_draft = batch_result.next_draft_input.hidden_states
-        else:
-            # Chain mode: Sparse tensor prefix is valid
-            # Shape: [bs * tree_size, hidden_dim] e.g., [64, 4096]
-            hidden_states_for_draft = batch_result.logits_output.hidden_states
+        # PADDED: [tok0, tok1, tok2, G, G, ..., tok32, tok33, G, ...]
+        #   req0: valid at [0:3], last at position 2 = 0*32 + 3 - 1
+        #   req1: valid at [32:34], last at position 33 = 1*32 + 2 - 1
+        #
+        # select_index = [2, 33]  (entirely on GPU, no CPU sync!)
+        # ─────────────────────────────────────────────────────────────────
 
+        # Unified select_index (GPU computation, no sync)
+        select_index = (
+            torch.arange(bs, device=self.device) * stride
+            + batch_result.accept_lens
+            - 1
+        )
+
+        # Use compacted hidden_states from verify() (same for both modes)
         draft_input = EagleDraftInput(
-            hidden_states=hidden_states_for_draft,
+            hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_batch=1,
         )
 
-        if is_tree_mode:
-            # =============================================================
-            # TREE MODE: Variable-length extend with dense tensors
-            # =============================================================
-            # select_index: Find the LAST accepted token for each request
-            # to use as input for the next draft iteration.
-            #
-            # EXAMPLE: steps=5, topk=10, bs=2, accept_lens=[3, 2]
-            # ─────────────────────────────────────────────────────────────
-            # Dense next_token_ids: [tok0, tok1, tok2, tok3, tok4] (5 tokens)
-            #   req0: positions 0,1,2 → last is position 2 (tok2)
-            #   req1: positions 3,4   → last is position 4 (tok4)
-            #
-            # cumsum([3, 2]) = [3, 5]
-            # select_index = cumsum - 1 = [2, 4]
-            # ─────────────────────────────────────────────────────────────
-            #
-            # [OPTIMIZATION] Calculate select_index on GPU (0 syncs)
-            # accept_lens is already on GPU from verify()
-            cumsum = torch.cumsum(batch_result.accept_lens, dim=0)
-            select_index = cumsum - 1
-
-            # Dense KV slot IDs prepared in verify()
-            # Shape: [sum(accept_lens)] e.g., [5]
-            dense_out_cache_loc = batch_result.next_draft_input.dense_out_cache_loc
-
-            with self.plan_stream_ctx:
-                # Use pre-computed accept_lens_cpu from verify() to avoid re-syncing
-                accept_lens_cpu = batch_result.next_draft_input.accept_lens_cpu
-                forward_batch = draft_input.prepare_for_extend_with_accept_lens(
-                    batch,
-                    batch_result.next_token_ids,  # Dense: [5]
-                    batch_result.accept_lens,     # [bs]: [3, 2]
-                    dense_out_cache_loc,          # Dense: [5]
-                    self.draft_runner,
-                    self.cuda_graph_runner_for_draft_extend,
-                    accept_lens_cpu=accept_lens_cpu,  # Pre-computed, no sync needed
-                )
-        else:
-            # =============================================================
-            # CHAIN MODE: Uniform-length extend with sparse tensors
-            # =============================================================
-            # select_index: Stride-based indexing into sparse tensor
-            #
-            # EXAMPLE: bs=2, tree_size=32, accept_lens=[3, 2]
-            # ─────────────────────────────────────────────────────────────
-            # Sparse next_token_ids: [tok0, tok1, tok2, 0, 0, ..., tok32, tok33, 0, ...]
-            #   req0 at positions 0..31 → last accepted is position 2 (accept_len-1)
-            #   req1 at positions 32..63 → last accepted is position 33 (32+accept_len-1)
-            #
-            # select_index[i] = i * stride + accept_lens[i] - 1
-            # select_index = [0*32+3-1, 1*32+2-1] = [2, 33]
-            # ─────────────────────────────────────────────────────────────
-            select_index = (
-                torch.arange(bs, device=self.device)
-                * self.speculative_num_draft_tokens
-                + batch_result.accept_lens
-                - 1
+        with self.plan_stream_ctx:
+            # Unified: uniform extension by stride (no variable-length path)
+            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+                batch,
+                batch_result.next_token_ids,  # PADDED [bs * stride]
+                stride,
+                self.draft_runner,
+                self.cuda_graph_runner_for_draft_extend,
             )
 
-            with self.plan_stream_ctx:
-                forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
-                    batch,
-                    batch_result.next_token_ids,  # Sparse: [bs * tree_size]
-                    self.speculative_num_draft_tokens,
-                    self.draft_runner,
-                    self.cuda_graph_runner_for_draft_extend,
-                )
+        # DEBUG: Only log for bs>1 or if tree mode
+        if os.environ.get("EAGLE3_DEBUG"):
+            is_tree_mode = self.topk > 1
+            if bs > 1 or is_tree_mode:
+                print(f"[EAGLE3_DEBUG draft_extend] bs={bs}, tree={is_tree_mode}, "
+                      f"select_index={select_index.tolist()}, seq_lens={batch.seq_lens.tolist()}")
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -1045,96 +988,105 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             # =================================================================
-            # UNIFIED COMPACTION: Repack all sparse tensors + req_to_token
+            # TREE-AS-CHAIN: Unified padded tensor approach (ZERO BLOCKING SYNCS)
             # =================================================================
-            # WHY: Tree mode verification produces SPARSE tensors where only
-            # accept_index positions contain valid data. Downstream consumers
-            # (scheduler, draft model) expect DENSE tensors.
+            # PHILOSOPHY: Make tree mode behave like chain mode by using
+            # fixed-size padded tensors [bs * tree_size] instead of
+            # variable-size dense tensors [sum(accept_lens)].
             #
-            # STRATEGY: Unified Compaction (gather + slice)
+            # KEY INSIGHT: No CPU sync needed!
             # ─────────────────────────────────────────────────────────────────
-            # 1. Build permutation that moves accepted to front (SYNC-FREE)
-            # 2. Apply permutation via gather() to all tensors (SYNC-FREE)
-            # 3. Slice to [:total_accepted] (requires 1 sync to get size)
-            # 4. Apply same permutation to req_to_token (SYNC-FREE)
-            #
-            # This reduces syncs from ~4 (boolean mask per tensor) to ~1.
+            # - Chain: Accepted positions are contiguous [0,1,2,...], prefix valid
+            # - Tree: Accepted positions are scattered [0,3,15,...], needs compaction
+            # - Both: Return PADDED [bs * tree_size] tensors, valid prefix, garbage suffix
+            # - Scheduler uses stride-based extraction (same for both)
+            # - Draft extend uses uniform tree_size (same for both)
             # ─────────────────────────────────────────────────────────────────
             #
-            # EXAMPLE CONFIG: steps=5, topk=10, tree_size=32, bs=2
+            # EXAMPLE: steps=5, topk=10, tree_size=32, bs=2, accept_lens=[3, 2]
             # ─────────────────────────────────────────────────────────────────
-            # accept_lens = [3, 2] (total accepted = 5)
-            #
-            # SPARSE predict: [64] with valid at scattered positions
-            # AFTER gather(perm): [64] with valid at prefix [0:5]
-            # AFTER slice[:5]: [5] dense tensor
+            # PADDED predict: [64] with valid at prefix [0:3] and [32:34]
+            # Scheduler extracts: req0=[0:3], req1=[32:34] using stride=32
             # ─────────────────────────────────────────────────────────────────
 
-            # [⚠️ CPU-GPU SYNC] Only sync: get accept_lens to CPU for slicing
-            accept_lens_cpu = accept_length.cpu().tolist()
-            total_accepted = sum(accept_lens_cpu)
+            tree_size = self.speculative_num_draft_tokens
+            is_tree_mode = self.topk > 1
 
-            if self.topk > 1:  # Tree mode: use unified compaction
-                tree_size = self.speculative_num_draft_tokens
+            if is_tree_mode:
+                # =============================================================
+                # TREE MODE: Compact scattered acceptance to prefix (per request)
+                # =============================================================
+                # After compaction:
+                #   - predict[i*tree_size : i*tree_size+accept_len[i]] = valid tokens
+                #   - req_to_token[seq_len : seq_len+accept_len] = accepted slots
+                # This makes tree mode look like chain mode!
+                #
+                # CRITICAL: Use STRIDED permutation, not global!
+                # ─────────────────────────────────────────────────────────────
+                # Global flat_perm puts ALL accepted at positions [0:total_accepted]
+                # But stride-based extraction expects:
+                #   req0 valid at [0:accept_len[0]]
+                #   req1 valid at [tree_size : tree_size+accept_len[1]]
+                #
+                # Solution: Convert per_req_perm to strided flat indices
+                # ─────────────────────────────────────────────────────────────
 
-                # Build permutation (SYNC-FREE)
-                flat_perm, per_req_perm = self._build_compaction_perm(
+                # Build per-request permutation (SYNC-FREE)
+                _, per_req_perm = self._build_compaction_perm(
                     accept_index, accept_length, tree_size
                 )
 
-                # Compact all tensors: gather + slice (SYNC-FREE)
-                # predict: [bs * tree_size] → [total_accepted]
-                dense_predict = predict.gather(0, flat_perm)[:total_accepted]
+                # Convert per_req_perm [bs, tree_size] to strided flat indices
+                # Each row i gets offset by i * tree_size
+                row_offsets = torch.arange(bs, device=self.device).unsqueeze(1) * tree_size
+                strided_flat_perm = (per_req_perm + row_offsets).flatten()
 
-                # hidden_states: [bs * tree_size, H] → [total_accepted, H]
+                # Compact predict: each request's prefix now has valid tokens
+                padded_predict = predict.gather(0, strided_flat_perm)
+
+                # Compact hidden_states: [bs * tree_size, H] → [bs * tree_size, H]
                 hidden_dim = logits_output.hidden_states.shape[-1]
-                flat_perm_2d = flat_perm.unsqueeze(1).expand(-1, hidden_dim)
-                dense_hidden_states = logits_output.hidden_states.gather(0, flat_perm_2d)[:total_accepted]
+                strided_flat_perm_2d = strided_flat_perm.unsqueeze(1).expand(-1, hidden_dim)
+                logits_output.hidden_states = logits_output.hidden_states.gather(0, strided_flat_perm_2d)
 
-                # out_cache_loc: [bs * tree_size] → [total_accepted]
-                dense_out_cache_loc = batch.out_cache_loc.gather(0, flat_perm)[:total_accepted]
+                # Compact out_cache_loc: [bs * tree_size] → [bs * tree_size]
+                batch.out_cache_loc = batch.out_cache_loc.gather(0, strided_flat_perm)
 
-                # Compact req_to_token verify window (SYNC-FREE)
+                # Compact req_to_token verify window (MANDATORY - prevents KV corruption)
                 self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
 
-            else:  # Chain mode: simple prefix slice (already contiguous)
-                dense_predict = predict[:total_accepted]
-                dense_hidden_states = None
-                dense_out_cache_loc = None
-        else:
-            # Idle mode: no accept_lens, empty tensors
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
-            dense_predict = predict  # Empty tensor for idle
-            dense_hidden_states = None
-            dense_out_cache_loc = None
-            accept_lens_cpu = None
-            total_accepted = 0
+                output_predict = padded_predict
+            else:
+                # =============================================================
+                # CHAIN MODE: No compaction needed (accepted positions are prefix)
+                # =============================================================
+                output_predict = predict
+                # logits_output.hidden_states and batch.out_cache_loc already valid
 
-        # Construct the next draft input
-        # For tree mode, include dense tensors for draft_extend
+        else:
+            # Idle mode
+            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            output_predict = predict
+
+        # Construct next draft input (unified for both modes)
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
-            hidden_states=dense_hidden_states,  # Dense for tree mode, None for chain
+            hidden_states=None,  # Use logits_output.hidden_states in draft_extend
         )
-        # Store additional fields for tree mode (not in EagleDraftInput dataclass)
-        next_draft_input.dense_out_cache_loc = dense_out_cache_loc
-        # Pass pre-computed CPU tensor to avoid re-syncing in prepare_for_extend
-        next_draft_input.accept_lens_cpu = accept_lens_cpu if not batch.forward_mode.is_idle() else None
 
-        # DEBUG: Concise verify logging (only detailed for bs>1)
+        # DEBUG: Concise verify logging (only for bs>1 or tree mode)
         if os.environ.get("EAGLE3_DEBUG") and not batch.forward_mode.is_idle():
-            if bs > 1:
-                # Detailed logging for multi-request batches
-                print(f"[EAGLE3_DEBUG verify] bs={bs}, accept_lens={accept_lens_cpu}, total={total_accepted}")
-                print(f"[EAGLE3_DEBUG verify] dense shapes: predict={dense_predict.shape[0]}, "
-                      f"hidden={dense_hidden_states.shape[0] if dense_hidden_states is not None else 'N/A'}, "
-                      f"out_cache_loc={dense_out_cache_loc.shape[0] if dense_out_cache_loc is not None else 'N/A'}")
+            is_tree = self.topk > 1
+            if bs > 1 or is_tree:
+                accept_lens_list = accept_length.tolist()
+                print(f"[EAGLE3_DEBUG verify] bs={bs}, tree={is_tree}, "
+                      f"accept_lens={accept_lens_list}, output_shape={output_predict.shape[0]}")
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=dense_predict,  # Return DENSE repacked tokens
+            next_token_ids=output_predict,  # PADDED [bs * tree_size]
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,

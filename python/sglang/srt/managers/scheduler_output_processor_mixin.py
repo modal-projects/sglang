@@ -262,33 +262,34 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """
-        Extract per-request accepted tokens from DENSE repacked tensor.
+        Extract per-request accepted tokens from PADDED tensor using stride-based indexing.
 
         =======================================================================
-        FIX #5: CUMULATIVE OFFSET EXTRACTION (replaces stride-based)
+        TREE-AS-CHAIN: Unified stride-based extraction for both modes
         =======================================================================
 
-        WHY: Tree mode worker repacks sparse predict to DENSE tensor.
-        The old stride-based extraction assumed sparse layout (broken for tree).
+        After worker's TREE-AS-CHAIN unification, both tree and chain mode
+        return PADDED tensors [bs * stride] where each request's valid tokens
+        are at positions [i * stride : i * stride + accept_lens[i]].
 
-        CHAIN MODE (old, stride-based, BROKEN for tree):
-          sparse: [tok0, tok1, tok2, 0, 0, ..., tok32, tok33, 0, 0, ...]
-          Extract req0 as: tokens[0*32 : 0*32+3] = [tok0, tok1, tok2] ✓
-          But for tree: tokens[0*32 : 0*32+3] = [tok0, 0, 0] ✗ (garbage!)
+        PADDED LAYOUT (same for both tree and chain):
+          [tok0, tok1, tok2, G, G, ..., tok32, tok33, G, G, ...]
+           |----req0-----|              |----req1----|
+           valid prefix   garbage       valid prefix  garbage
 
-        TREE MODE (new, cumulative offset):
-          dense: [tok0, tok7, tok15, tok32, tok34]  # Only accepted tokens
-          Extract req0 as: tokens[0 : 3]     = [tok0, tok7, tok15] ✓
-          Extract req1 as: tokens[3 : 3+2]   = [tok32, tok34] ✓
+        EXTRACTION (stride-based, same for both):
+          stride = speculative_num_draft_tokens
+          req0: tokens[0*stride : 0*stride+3] = [tok0, tok1, tok2] ✓
+          req1: tokens[1*stride : 1*stride+2] = [tok32, tok33] ✓
 
         =======================================================================
-        EXAMPLE: steps=5, topk=10, bs=2, accept_lens=[3, 2]
+        EXAMPLE: stride=32, bs=2, accept_lens=[3, 2]
         =======================================================================
-        Dense next_token_ids: [tok0, tok7, tok15, tok32, tok34] (size=5)
+        PADDED next_token_ids: [tok0, tok1, tok2, G, ..., tok32, tok33, G, ...]
 
         Extraction:
-          offset=0, req0: tokens[0:3] = [tok0, tok7, tok15], offset→3
-          offset=3, req1: tokens[3:5] = [tok32, tok34], offset→5
+          req0: tokens[0:3] = [tok0, tok1, tok2]
+          req1: tokens[32:34] = [tok32, tok33]
 
         kv_committed_len update:
           req0: 100 → 103 (+3)
@@ -296,7 +297,6 @@ class SchedulerOutputProcessorMixin:
         =======================================================================
 
         [NO CPU-GPU SYNC] All tensors are already on CPU (worker sends CPU tensors)
-        The asserts below verify this invariant.
         """
         # Verify tensors are on CPU (no GPU access needed)
         assert result.next_token_ids.is_cpu, "next_token_ids should be CPU tensor"
@@ -311,38 +311,38 @@ class SchedulerOutputProcessorMixin:
 
         predict_tokens = []
 
-        # DEBUG: Verify tensor is dense (only log for bs>1 or mismatches)
+        # Get stride from server args
+        stride = self.server_args.speculative_num_draft_tokens
+
+        # DEBUG: Verify tensor is padded (only log for bs>1 or mismatches)
         if os.environ.get("EAGLE3_DEBUG"):
-            expected_size = sum(accept_lens)
+            expected_size = len(batch.reqs) * stride
             actual_size = len(next_token_ids)
-            is_dense = actual_size == expected_size
+            is_padded = actual_size == expected_size
             # Always log mismatches, only log bs>1 for normal cases
-            if not is_dense or len(batch.reqs) > 1:
-                status = "DENSE ✓" if is_dense else f"MISMATCH! {actual_size}!={expected_size}"
+            if not is_padded or len(batch.reqs) > 1:
+                status = "PADDED ✓" if is_padded else f"SIZE MISMATCH! {actual_size}!={expected_size}"
                 kv_before = [r.kv_committed_len for r in batch.reqs]
-                print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, "
+                print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, stride={stride}, "
                       f"tensor_size={actual_size} ({status}), kv_committed={kv_before}")
 
         # =================================================================
-        # CUMULATIVE OFFSET EXTRACTION
+        # STRIDE-BASED EXTRACTION (unified for tree and chain)
         # =================================================================
-        # Dense tensor layout: [req0_tok0, req0_tok1, ..., req1_tok0, req1_tok1, ...]
-        # offset tracks where each request's tokens start
-        offset = 0
+        # Padded tensor layout: each request has stride positions
+        # Valid tokens at [i * stride : i * stride + accept_lens[i]]
         for i, req in enumerate(batch.reqs):
             acc_len = accept_lens[i]
 
-            # Extract this request's tokens from dense tensor
-            tokens = next_token_ids[offset : offset + acc_len]
+            # Extract this request's tokens using stride indexing
+            start = i * stride
+            tokens = next_token_ids[start : start + acc_len]
 
             # Update request state
             req.kv_committed_len += acc_len  # KV cache advanced by accept_len
             predict_tokens.append(tokens)
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += acc_len - 1  # Exclude bonus token
-
-            # Move offset for next request
-            offset += acc_len
 
         return predict_tokens
 

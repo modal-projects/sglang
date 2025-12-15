@@ -564,39 +564,36 @@ class EagleDraftWorker(BaseDraftWorker):
         3. Updates spec_info (topk_p, topk_index, hidden_states) for next draft()
 
         ═══════════════════════════════════════════════════════════════════════
-        TREE vs CHAIN MODE (KEY DIFFERENCE!)
+        TREE-AS-CHAIN UNIFICATION
         ═══════════════════════════════════════════════════════════════════════
-        CHAIN MODE (topk=1):
-          - Accepted positions are contiguous [0, 1, 2, ...]
-          - Use sparse tensors directly (prefix is valid)
-          - Uniform extend: all requests extend by tree_size
-          - select_index: stride-based (i * tree_size + accept_len - 1)
+        After verify() compaction, BOTH tree and chain modes have identical
+        tensor layouts (PADDED [bs * tree_size]) and use the same code path:
 
-        TREE MODE (topk>1):  [MODIFIED FOR TREE SUPPORT]
-          - Accepted positions are scattered [0, 3, 15, ...]
-          - Use DENSE repacked tensors from verify()
-          - Variable extend: each request extends by its accept_len
-          - select_index: cumulative (cumsum(accept_lens) - 1)
+          - next_token_ids: PADDED [bs * tree_size], prefix valid per request
+          - logits_output.hidden_states: PADDED [bs * tree_size, H]
+          - batch.out_cache_loc: PADDED [bs * tree_size] (compacted for tree)
+          - Uniform extend by tree_size ("blind extend")
+          - Unified select_index: i * stride + accept_lens[i] - 1
 
         ═══════════════════════════════════════════════════════════════════════
         KEY TENSORS
         ═══════════════════════════════════════════════════════════════════════
         Input (from batch_result):
-          - next_token_ids: Token IDs (dense for tree, sparse for chain)
+          - next_token_ids: PADDED [bs * tree_size] with valid prefix
           - accept_lens: [bs] number of accepted tokens per request
-          - next_draft_input.hidden_states: Hidden states (dense for tree)
-          - next_draft_input.dense_out_cache_loc: KV slots (tree mode only)
+          - logits_output.hidden_states: PADDED [bs * tree_size, H]
 
         select_index: [bs] - Index of LAST accepted token per request
-          Used to select hidden_state for next iteration's draft input
+          Computed on GPU: i * stride + accept_lens[i] - 1
 
         Args:
             batch: Current ModelWorkerBatch
             batch_result: Result from verify() containing accepted tokens
 
         Side effects:
-            - Updates batch.seq_lens by accept_lens (tree) or tree_size (chain)
-            - Writes KV to draft model's cache
+            - Updates batch.seq_lens by tree_size (uniform "blind extend")
+            - Writes KV to draft model's cache (including garbage suffix)
+            - Scheduler rewinds seq_lens to correct values later
             - Updates batch_result.next_draft_input with topk_p, topk_index, hidden_states
         """
         bs = len(batch.seq_lens)
@@ -848,19 +845,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
            └─► Returns: predict (SPARSE!), accept_index, accept_length
 
         ═══════════════════════════════════════════════════════════════════════
-        TREE MODE FIXES (topk > 1)                           [MODIFIED]
+        TREE-AS-CHAIN: PADDED TENSOR COMPACTION (topk > 1)
         ═══════════════════════════════════════════════════════════════════════
-        After sampling, tree mode needs special handling:
+        After sampling, tree mode compacts to PADDED [bs * tree_size] tensors:
 
-        FIX #1-3: DENSE REPACK
-          - predict is SPARSE [bs * tree_size] - only accept_index positions valid
-          - Repack to DENSE [sum(accept_lens)] using valid_indices
-          - Also repack hidden_states and out_cache_loc
+        1. STRIDED COMPACTION (SYNC-FREE)
+          - Build per_req_perm via _build_compaction_perm()
+          - Gather predict, hidden_states, out_cache_loc with strided perm
+          - Each request's valid tokens are now at prefix positions
 
-        FIX #4: req_to_token COMPACTION
-          - Call _compact_req_to_token_verify_window()
-          - Reorders verify window so accepted slots form prefix
-          - Makes tree mode behave like chain mode
+        2. req_to_token COMPACTION (MANDATORY)
+          - Reorder verify window so accepted slots form prefix
+          - Prevents KV corruption in next iteration
+
+        After compaction, tree mode tensors look like chain mode!
 
         ═══════════════════════════════════════════════════════════════════════
         KEY TENSORS
@@ -870,16 +868,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
           accept_index: [bs, num_steps+1] - FLAT indices or -1 for padding
           accept_length: [bs] - count of accepted tokens (includes bonus)
 
-        After repack (tree mode):
-          dense_predict: [sum(accept_lens)] - only accepted tokens
-          dense_hidden_states: [sum(accept_lens), hidden_dim]
-          dense_out_cache_loc: [sum(accept_lens)]
+        After compaction (UNIFIED for both modes):
+          padded_predict: [bs * tree_size] - valid prefix per request, garbage suffix
+          hidden_states: [bs * tree_size, H] - valid prefix per request
+          out_cache_loc: [bs * tree_size] - compacted KV slots
 
         Returns:
           GenerationBatchResult with:
-            - next_token_ids: dense_predict (DENSE for tree, sparse for chain)
+            - next_token_ids: PADDED [bs * tree_size], prefix valid
             - accept_lens: [bs]
-            - next_draft_input: Contains dense_hidden_states, dense_out_cache_loc
+            - logits_output.hidden_states: PADDED (for _draft_extend_for_decode)
 
         Args:
             batch: ModelWorkerBatch with spec_info (EagleVerifyInput)

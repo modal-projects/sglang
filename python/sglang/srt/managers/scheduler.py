@@ -2050,11 +2050,11 @@ class Scheduler(
                     # batch_result.next_draft_input contains:
                     #   - verified_id: Last verified token per request
                     #   - topk_p, topk_index: Top-k probs/indices for next draft
-                    #   - hidden_states: Hidden states for draft model input
-                    #   - new_seq_lens: Updated sequence lengths
-                    #   - (tree mode) dense_out_cache_loc: Dense KV slot IDs
+                    #   - hidden_states: None (use logits_output.hidden_states)
+                    #   - new_seq_lens: Updated sequence lengths (REWIND!)
                     #
                     # This becomes the input for next iteration's draft()
+                    # NOTE: new_seq_lens implements "rewind" for Tree-as-Chain
                     # ═══════════════════════════════════════════════════════════
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices

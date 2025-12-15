@@ -94,11 +94,9 @@ class EagleDraftInputV2Mixin:
     2. prepare_for_v2_draft() - Called by EagleDraftWorker.draft()
        └─► Sets up batch for draft model forward
 
-    3. prepare_for_extend_to_fill_draft_kvcache() - Chain mode draft extend
+    3. prepare_for_extend_to_fill_draft_kvcache() - UNIFIED draft extend (both modes)
        └─► Uniform extend by tree_size for all requests
-
-    4. prepare_for_extend_with_accept_lens() - Tree mode draft extend [NEW]
-       └─► Variable extend by accept_lens per request (uses DENSE tensors)
+       └─► With Tree-as-Chain, tree mode uses this too (after compaction)
     ═══════════════════════════════════════════════════════════════════════════
     """
 
@@ -251,30 +249,25 @@ class EagleDraftInputV2Mixin:
         cuda_graph_runner: Any,
     ):
         """
-        Prepare draft extend with UNIFORM num_draft_tokens (for chain mode).
+        Prepare draft extend with UNIFORM num_draft_tokens (UNIFIED for both modes).
 
         ═══════════════════════════════════════════════════════════════════════
         FLOW
         ═══════════════════════════════════════════════════════════════════════
-        Called by: EagleDraftWorker._draft_extend_for_decode() (chain mode only)
+        Called by: EagleDraftWorker._draft_extend_for_decode() (BOTH tree & chain)
         Next step: draft_runner.forward() writes KV to draft cache
 
         ═══════════════════════════════════════════════════════════════════════
-        PURPOSE
+        TREE-AS-CHAIN UNIFICATION
         ═══════════════════════════════════════════════════════════════════════
-        In chain mode (topk=1), all requests extend by the same amount (tree_size).
-        This is because accepted positions are always contiguous [0, 1, 2, ...].
+        After verify() compaction, BOTH tree and chain modes have:
+          - PADDED predict tensor [bs * tree_size] with valid prefix per request
+          - Compacted out_cache_loc and req_to_token
 
-        Uses SPARSE predict tensor directly - prefix is valid for chain mode.
+        This allows unified "blind extend" by tree_size for all requests.
+        Garbage KV is written but scheduler rewinds seq_lens to correct values.
 
-        ═══════════════════════════════════════════════════════════════════════
-        KEY DIFFERENCE FROM prepare_for_extend_with_accept_lens()
-        ═══════════════════════════════════════════════════════════════════════
-        - extend_seq_lens: UNIFORM [32, 32, 32] vs VARIABLE [3, 2, 4]
-        - seq_lens += tree_size vs seq_lens += accept_lens
-        - Uses sparse predict vs dense repacked predict
-
-        For tree mode, use prepare_for_extend_with_accept_lens() instead!
+        Uses PADDED predict tensor - prefix is valid for both modes after compaction.
         """
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
@@ -293,126 +286,6 @@ class EagleDraftInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
-        if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-        return forward_batch
-
-    def prepare_for_extend_with_accept_lens(
-        self,
-        batch: ModelWorkerBatch,
-        dense_predict: torch.Tensor,
-        accept_lens: torch.Tensor,
-        dense_out_cache_loc: torch.Tensor,
-        draft_model_runner: Any,
-        cuda_graph_runner: Any,
-        accept_lens_cpu: list = None,
-    ):
-        """
-        Prepare draft extend with VARIABLE accept_lens per request (for tree mode).
-
-        ═══════════════════════════════════════════════════════════════════════
-        FLOW                                                    [NEW FUNCTION]
-        ═══════════════════════════════════════════════════════════════════════
-        Called by: EagleDraftWorker._draft_extend_for_decode() (tree mode only)
-        Next step: draft_runner.forward() writes KV to draft cache
-
-        This function handles tree mode's variable-length acceptance, using
-        DENSE repacked tensors prepared by verify().
-
-        ═══════════════════════════════════════════════════════════════════════
-        WHY THIS EXISTS (vs prepare_for_extend_to_fill_draft_kvcache)
-        ═══════════════════════════════════════════════════════════════════════
-
-        Chain mode:
-          - All requests extend by same num_draft_tokens
-          - batch.extend_seq_lens = [N, N, N, ...] (uniform)
-          - Uses sparse tensor with valid prefix
-
-        Tree mode:
-          - Each request has different accept_len (scattered acceptance)
-          - batch.extend_seq_lens = [3, 2, 4, ...] (variable!)
-          - Uses DENSE repacked tensors
-
-        This function handles the variable-length case.
-
-        =======================================================================
-        EXAMPLE: steps=5, topk=10, tree_size=32, bs=2, accept_lens=[3, 2]
-        =======================================================================
-        BEFORE (seq_lens=[100, 200]):
-          Input tensors are DENSE (only accepted tokens):
-            dense_predict:      [tok0, tok1, tok2, tok3, tok4]  # shape [5]
-            dense_out_cache_loc: [500, 503, 515, 600, 605]      # shape [5]
-
-        AFTER (seq_lens=[103, 202]):
-          batch.input_ids = dense_predict           # [5] tokens total
-          batch.out_cache_loc = dense_out_cache_loc # [5] slot IDs
-          batch.extend_seq_lens = [3, 2]            # VARIABLE per request!
-          batch.extend_prefix_lens = [100, 200]     # Where to start writing
-
-        The attention backend will write KV at:
-          req0: slots 500, 503, 515 at positions 100, 101, 102
-          req1: slots 600, 605 at positions 200, 201
-        =======================================================================
-
-        SYNC OPTIMIZATION:
-          - If accept_lens_cpu is provided, no GPU→CPU sync needed (pre-computed in verify())
-          - Otherwise, falls back to accept_lens.cpu() which syncs
-
-        Args:
-            batch: The batch to prepare
-            dense_predict: DENSE repacked tokens
-                Shape: [sum(accept_lens)] e.g., [5] for accept_lens=[3,2]
-            accept_lens: Accept length per request (GPU tensor)
-                Shape: [bs] e.g., [3, 2]
-            dense_out_cache_loc: DENSE repacked KV slot IDs
-                Shape: [sum(accept_lens)] e.g., [5]
-            draft_model_runner: The draft model runner
-            cuda_graph_runner: The CUDA graph runner
-            accept_lens_cpu: Pre-computed CPU list from verify() (optional, avoids sync)
-                Shape: list of length bs e.g., [3, 2]
-        """
-        seq_lens_cpu_ = batch.seq_lens_cpu  # Already on CPU
-
-        # Use pre-computed CPU tensor if provided, otherwise sync
-        if accept_lens_cpu is None:
-            # [⚠️ CPU-GPU SYNC] Fallback: accept_lens.cpu() forces GPU→CPU transfer
-            accept_lens_cpu = accept_lens.cpu().tolist()
-            extend_num_tokens = sum(accept_lens_cpu)
-        else:
-            # No sync needed - already computed in verify()
-            extend_num_tokens = sum(accept_lens_cpu)
-
-        # Set batch fields for draft extend
-        batch.spec_info = self
-        batch.input_ids = dense_predict              # DENSE: [sum(accept_lens)]
-        batch.out_cache_loc = dense_out_cache_loc    # DENSE: [sum(accept_lens)]
-        batch.seq_lens = batch.seq_lens + accept_lens  # Advance by VARIABLE amount (GPU)
-
-        # Update CPU tensor: add accept_lens_cpu (list) to seq_lens_cpu (tensor)
-        accept_lens_cpu_tensor = torch.tensor(accept_lens_cpu, device='cpu')
-        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu_tensor
-
-        batch.seq_lens_sum += extend_num_tokens
-
-        # accept_lens_cpu is already a list, no .tolist() needed
-        batch.extend_seq_lens = accept_lens_cpu          # VARIABLE: [3, 2]
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()   # Where KV starts
-        batch.extend_num_tokens = extend_num_tokens         # Total: 5
-
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.DRAFT_EXTEND_V2
-        )
-
-        if os.environ.get("EAGLE3_DEBUG") and len(accept_lens_cpu) > 1:
-            print(f"[EAGLE3_DEBUG extend_prep] accept_lens={accept_lens_cpu}, "
-                  f"dense: predict={dense_predict.shape[0]}, out_cache_loc={dense_out_cache_loc.shape[0]}, "
-                  f"new_seq_lens={batch.seq_lens.tolist()}")
-
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:

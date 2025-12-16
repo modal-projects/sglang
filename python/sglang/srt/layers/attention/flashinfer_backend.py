@@ -739,6 +739,17 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        """Stub for overlap plan stream compatibility."""
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        """Stub for overlap plan stream compatibility.
+        Full implementation in flashinfer_backend_timmy.py."""
+        pass
+
     def forward_extend(
         self,
         q: torch.Tensor,

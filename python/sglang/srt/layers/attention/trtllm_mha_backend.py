@@ -415,6 +415,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        """Return buffers for verify attention that need to be filled after draft."""
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        """Update verify buffers after draft - no-op for TRTLLM MHA."""
+        pass
+
     def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn

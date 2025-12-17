@@ -634,11 +634,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # CRITICAL STREAM SYNC: plan_stream must wait for verify() compaction!
-        # ─────────────────────────────────────────────────────────────────────
         # verify() runs compaction (req_to_token, out_cache_loc) in main stream.
         # prepare_for_extend... reads req_to_token in plan_stream.
         # Without this wait, plan_stream reads STALE/CORRUPTED req_to_token!
-        # ─────────────────────────────────────────────────────────────────────
         if self.plan_stream:
             self.plan_stream.wait_stream(
                 torch.get_device_module(self.device).current_stream()
@@ -817,19 +815,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            # CRITICAL STREAM SYNC for Tree Mode:
-            # ─────────────────────────────────────────────────────────────────────
-            # draft()'s prepare_for_v2_draft() runs in plan_stream and reads req_to_token.
-            # If the PREVIOUS iteration compacted req_to_token (in main_stream),
-            # plan_stream must wait to see the compacted state!
-            # Without this sync: plan_stream reads stale/pre-compaction req_to_token
-            #                    → wrong KV cache slots → GARBAGE OUTPUT
-            # ─────────────────────────────────────────────────────────────────────
-            if self.plan_stream:
-                self.plan_stream.wait_stream(
-                    torch.get_device_module(self.device).current_stream()
-                )
-
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
@@ -914,19 +899,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        # CRITICAL STREAM SYNC: plan_stream must wait for PREVIOUS iteration's main_stream!
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Problem: prepare_for_v2_verify() runs in plan_stream and reads req_to_token.
-        # The PREVIOUS iteration's _draft_extend_for_decode() modified req_to_token via
+        # CRITICAL STREAM SYNC: plan_stream must wait for previous iteration's main_stream!
+        # prepare_for_v2_verify() runs in plan_stream and reads req_to_token.
+        # The previous iteration's _draft_extend_for_decode() modified req_to_token via
         # draft model forward (which allocated new KV slots in main_stream).
         # Without this sync, plan_stream races against prev iteration's main_stream.
-        # ─────────────────────────────────────────────────────────────────────────────────
         if self.plan_stream:
             self.plan_stream.wait_stream(
                 torch.get_device_module(self.device).current_stream()
             )
-            if os.environ.get("EAGLE3_DEBUG") and self.topk > 1:
-                print(f"[ITER {self._debug_iter}] SYNC #2: plan_stream waited for main_stream BEFORE verify (draft output)")
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream

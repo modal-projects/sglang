@@ -7,6 +7,12 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.eagle_debug import (
+    debug_checkpoint,
+    debug_data_move_trace,
+    debug_next_iter,
+    get_debug_state,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
@@ -57,6 +63,18 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+
+# Data Move approach: Move KV data instead of compacting indices
+# This eliminates stream sync for plan_stream reads of req_to_token
+# Set EAGLE3_USE_DATA_MOVE=1 to enable
+# Data move approach: move KV data to contiguous positions instead of
+# compacting req_to_token indices. This keeps req_to_token static,
+# potentially allowing plan_stream to proceed without waiting.
+#
+# Note: Positions beyond accept_len are treated as garbage (like V2 chain).
+# Whether they have duplicates (data move) or rejected KV (index compaction)
+# shouldn't matter since the scheduler only commits accept_len positions.
+USE_DATA_MOVE = os.environ.get("EAGLE3_USE_DATA_MOVE", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +161,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -169,9 +191,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -621,9 +645,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Unified select_index (GPU computation, no sync)
         select_index = (
-            torch.arange(bs, device=self.device) * stride
-            + batch_result.accept_lens
-            - 1
+            torch.arange(bs, device=self.device) * stride + batch_result.accept_lens - 1
         )
 
         # Use compacted hidden_states from verify() (same for both modes)
@@ -633,15 +655,52 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_batch=1,
         )
 
+        debug_checkpoint("EXTEND_START", stream="main", bs=bs, stride=stride)
+
+        # DEBUG: Log out_cache_loc to verify alignment with req_to_token
+        debug_state = get_debug_state()
+        if debug_state.config.level >= 2 and bs > 0:
+            req_idx = batch.req_pool_indices[0].item()
+            seq_len = (
+                batch.seq_lens[0] - stride
+            ).item()  # seq_lens already incremented
+            r2t = self.req_to_token_pool.req_to_token
+            ocl_sample = batch.out_cache_loc[:5].tolist()
+            r2t_sample = r2t[req_idx, seq_len : seq_len + 5].tolist()
+            print(
+                f"[DRAFT_EXTEND_DEBUG] seq_len={seq_len}, "
+                f"out_cache_loc[:5]={ocl_sample}, "
+                f"r2t[{seq_len}:{seq_len + 5}]={r2t_sample}, "
+                f"USE_DATA_MOVE={USE_DATA_MOVE}"
+            )
+
         # CRITICAL STREAM SYNC: plan_stream must wait for verify() compaction!
-        # verify() runs compaction (req_to_token, out_cache_loc) in main stream.
-        # prepare_for_extend... reads req_to_token in plan_stream.
-        # Without this wait, plan_stream reads STALE/CORRUPTED req_to_token!
-        if self.plan_stream:
+        # ═══════════════════════════════════════════════════════════════════════
+        # ROOT CAUSE: accept_index dependency
+        # - main_stream: sampling → accept_index → compaction → req_to_token write
+        # - plan_stream: prepare_for_extend → reads req_to_token
+        # Without sync, plan_stream reads PRE-COMPACTION (stale) req_to_token!
+        #
+        # WITH DATA_MOVE: req_to_token is NOT modified, so no sync needed!
+        # plan_stream can read the static req_to_token immediately.
+        # The KV data has been moved to match the unchanged indices.
+        # ═══════════════════════════════════════════════════════════════════════
+        if self.plan_stream and not USE_DATA_MOVE:
             self.plan_stream.wait_stream(
                 torch.get_device_module(self.device).current_stream()
             )
+            debug = get_debug_state()
+            debug.stream_sync(
+                sync_id=3,
+                wait_stream="plan",
+                signal_stream="main",
+                reason="plan_stream must see verify() req_to_token compaction (accept_index dependency)",
+            )
+        elif self.plan_stream and USE_DATA_MOVE:
+            # DATA MOVE: Skip sync! req_to_token is never modified by worker.
+            debug_checkpoint("SYNC_3_SKIPPED_DATA_MOVE", stream="plan", level=2)
 
+        debug_checkpoint("EXTEND_PREPARE_START", stream="plan")
         with self.plan_stream_ctx:
             # Unified: uniform extension by stride (no variable-length path)
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
@@ -656,8 +715,10 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+        debug_checkpoint("EXTEND_PREPARE_DONE", stream="main")
 
         # Run draft extend batch in the main compute stream
+        debug_checkpoint("EXTEND_FORWARD_START", stream="main")
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
@@ -693,6 +754,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        debug_checkpoint("EXTEND_DONE", stream="main")
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -739,6 +801,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+        # Debug state (shared with draft worker)
+        self._debug = get_debug_state()
 
     @property
     def target_worker(self):
@@ -797,7 +862,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -807,6 +875,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            # Decode mode: draft → verify → draft_extend
+            iter_num = debug_next_iter()
+            bs = len(model_worker_batch.seq_lens)
+            is_tree = self.topk > 1
+
+            debug_checkpoint(
+                "DECODE_START",
+                stream="main",
+                iter=iter_num,
+                bs=bs,
+                is_tree=is_tree,
+                seq_lens=model_worker_batch.seq_lens.tolist()[:4] if bs <= 4 else "...",
+            )
+
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -815,17 +897,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+            debug_checkpoint("DRAFT_START", stream="main")
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+            debug_checkpoint("DRAFT_DONE", stream="main")
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+
+            debug_checkpoint(
+                "DECODE_DONE",
+                stream="main",
+                accept_lens=batch_output.accept_lens.tolist()
+                if batch_output.accept_lens is not None
+                else None,
+            )
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -899,15 +1000,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
+        debug_checkpoint("VERIFY_START", stream="main", bs=bs)
+
         # CRITICAL STREAM SYNC: plan_stream must wait for previous iteration's main_stream!
-        # prepare_for_v2_verify() runs in plan_stream and reads req_to_token.
-        # The previous iteration's _draft_extend_for_decode() modified req_to_token via
-        # draft model forward (which allocated new KV slots in main_stream).
-        # Without this sync, plan_stream races against prev iteration's main_stream.
-        if self.plan_stream:
+        # ═══════════════════════════════════════════════════════════════════════
+        # ROOT CAUSE: Cross-iteration dependency
+        # - PREV iter's main_stream: verify() compaction → writes req_to_token
+        # - THIS iter's plan_stream: prepare_for_v2_verify → reads req_to_token
+        # Without sync, plan_stream reads STALE req_to_token from before compaction!
+        #
+        # WITH DATA_MOVE: req_to_token is NOT modified by verify(), so no sync needed!
+        # The worker never writes to req_to_token - it stays as CPU allocated.
+        # ═══════════════════════════════════════════════════════════════════════
+        if self.plan_stream and not USE_DATA_MOVE:
             self.plan_stream.wait_stream(
                 torch.get_device_module(self.device).current_stream()
             )
+            self._debug.stream_sync(
+                sync_id=2,
+                wait_stream="plan",
+                signal_stream="main",
+                reason="plan_stream must see prev iter's verify() req_to_token compaction",
+            )
+        elif self.plan_stream and USE_DATA_MOVE:
+            # DATA MOVE: Skip sync! req_to_token is never modified by worker.
+            debug_checkpoint("SYNC_2_SKIPPED_DATA_MOVE", stream="plan", level=2)
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -987,6 +1104,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
+        debug_checkpoint(
+            "VERIFY_SAMPLE_DONE",
+            stream="main",
+            accept_lens=accept_length.tolist(),
+        )
+
+        # NEW: Trace accept_index lifecycle - this is THE ROOT DEPENDENCY
+        self._debug.accept_trace(
+            "COMPUTED",
+            accept_index,
+            accept_length,
+            stream="main",
+            context="after_sampling",
+        )
+
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
@@ -1041,14 +1173,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # Solution: Convert per_req_perm to strided flat indices
                 # ─────────────────────────────────────────────────────────────
 
+                debug_checkpoint("COMPACT_START", stream="main", tree_size=tree_size)
+
+                # NEW: Trace accept_index consumption - this is WHERE we need the sync
+                self._debug.accept_trace(
+                    "CONSUMED",
+                    accept_index,
+                    accept_length,
+                    stream="main",
+                    context="compaction_build_perm",
+                )
+
                 # Build per-request permutation (SYNC-FREE)
                 _, per_req_perm = self._build_compaction_perm(
                     accept_index, accept_length, tree_size
                 )
+                debug_checkpoint("COMPACT_BUILD_PERM", stream="main")
 
                 # Convert per_req_perm [bs, tree_size] to strided flat indices
                 # Each row i gets offset by i * tree_size
-                row_offsets = torch.arange(bs, device=self.device).unsqueeze(1) * tree_size
+                row_offsets = (
+                    torch.arange(bs, device=self.device).unsqueeze(1) * tree_size
+                )
                 strided_flat_perm = (per_req_perm + row_offsets).flatten()
 
                 # Compact predict: each request's prefix now has valid tokens
@@ -1056,16 +1202,117 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
                 # Compact hidden_states: [bs * tree_size, H] → [bs * tree_size, H]
                 hidden_dim = logits_output.hidden_states.shape[-1]
-                strided_flat_perm_2d = strided_flat_perm.unsqueeze(1).expand(-1, hidden_dim)
-                logits_output.hidden_states = logits_output.hidden_states.gather(0, strided_flat_perm_2d)
+                strided_flat_perm_2d = strided_flat_perm.unsqueeze(1).expand(
+                    -1, hidden_dim
+                )
+                logits_output.hidden_states = logits_output.hidden_states.gather(
+                    0, strided_flat_perm_2d
+                )
 
                 # Compact out_cache_loc: [bs * tree_size] → [bs * tree_size]
-                batch.out_cache_loc = batch.out_cache_loc.gather(0, strided_flat_perm)
+                # NOTE: With DATA_MOVE, we DON'T compact out_cache_loc!
+                # - req_to_token stays unchanged: [P0, P1, P2, ...]
+                # - out_cache_loc must also stay unchanged so draft_extend writes
+                #   to the same slots that req_to_token points to
+                # - Data move has already put valid KV at [P0, P1, P2, ...]
+                if not USE_DATA_MOVE:
+                    batch.out_cache_loc = batch.out_cache_loc.gather(
+                        0, strided_flat_perm
+                    )
+                debug_checkpoint("COMPACT_GATHER_TENSORS", stream="main")
 
-                # Compact req_to_token verify window (MANDATORY - prevents KV corruption)
-                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
+                if USE_DATA_MOVE:
+                    # =========================================================
+                    # DATA MOVE APPROACH (ZERO-SYNC)
+                    # =========================================================
+                    # Instead of compacting req_to_token (index compaction),
+                    # we move KV DATA from scattered to contiguous positions.
+                    #
+                    # This allows plan_stream to read req_to_token immediately
+                    # without waiting for compaction to complete.
+                    # =========================================================
+                    debug_checkpoint("DATA_MOVE_START", stream="main")
+                    debug_data_move_trace(
+                        "BUILD_INDICES", context="building move indices"
+                    )
+
+                    src_slots, dst_slots, move_mask = self._build_data_move_indices(
+                        accept_index, accept_length, tree_size, batch
+                    )
+
+                    # DEBUG: Log detailed move info
+                    if self._debug.config.level >= 2:
+                        accept_idx_sample = (
+                            accept_index[0, :4].tolist()
+                            if accept_index.numel() >= 4
+                            else []
+                        )
+                        src_sample = (
+                            src_slots[:4].tolist()
+                            if src_slots.numel() >= 4
+                            else src_slots.tolist()
+                        )
+                        dst_sample = (
+                            dst_slots[:4].tolist()
+                            if dst_slots.numel() >= 4
+                            else dst_slots.tolist()
+                        )
+                        seq_len = batch.seq_lens[0].item()
+                        req_idx = batch.req_pool_indices[0].item()
+                        r2t = self.req_to_token_pool.req_to_token
+                        r2t_window = r2t[req_idx, seq_len : seq_len + 5].tolist()
+                        # Also log out_cache_loc to compare
+                        ocl_sample = (
+                            batch.out_cache_loc[:5].tolist()
+                            if batch.out_cache_loc.numel() >= 5
+                            else batch.out_cache_loc.tolist()
+                        )
+                        print(
+                            f"[DATA_MOVE_DEBUG] accept_idx={accept_idx_sample}, "
+                            f"src={src_sample}, dst={dst_sample}, "
+                            f"r2t[{seq_len}:{seq_len + 5}]={r2t_window}, "
+                            f"out_cache_loc[:5]={ocl_sample}"
+                        )
+
+                    self._execute_data_move(src_slots, dst_slots, move_mask)
+
+                    debug_checkpoint("DATA_MOVE_DONE", stream="main")
+                    # NOTE: req_to_token is NOT modified - it stays static
+                else:
+                    # =========================================================
+                    # INDEX COMPACTION (requires stream sync)
+                    # =========================================================
+                    # Compact req_to_token verify window (MANDATORY - prevents KV corruption)
+                    # KV trace: log the req_to_token state before and after compaction
+                    if self._debug.config.kv_trace and bs > 0:
+                        req_idx = batch.req_pool_indices[0].item()
+                        seq_len = batch.seq_lens[0].item()
+                        self._debug.kv_trace(
+                            "write",
+                            "req_to_token",
+                            req_idx,
+                            seq_len,
+                            seq_len + tree_size,
+                            stream="main",
+                        )
+                    self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
+                    debug_checkpoint("COMPACT_REQ_TO_TOKEN", stream="main")
+
+                    # DEBUG: Log state after index compaction for comparison
+                    if self._debug.config.level >= 2 and bs > 0:
+                        req_idx = batch.req_pool_indices[0].item()
+                        seq_len = batch.seq_lens[0].item()
+                        r2t = self.req_to_token_pool.req_to_token
+                        r2t_after = r2t[req_idx, seq_len : seq_len + 5].tolist()
+                        ocl_after = batch.out_cache_loc[:5].tolist()
+                        print(
+                            f"[INDEX_COMPACT_DEBUG] after compaction: "
+                            f"r2t[{seq_len}:{seq_len + 5}]={r2t_after}, "
+                            f"out_cache_loc[:5]={ocl_after}"
+                        )
 
                 output_predict = padded_predict
+                debug_checkpoint("COMPACT_DONE", stream="main")
             else:
                 # =============================================================
                 # CHAIN MODE: No compaction needed (accepted positions are prefix)
@@ -1085,6 +1332,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verify_done=verify_done,
             hidden_states=None,  # Use logits_output.hidden_states in draft_extend
         )
+
+        debug_checkpoint("VERIFY_DONE", stream="main")
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1175,7 +1424,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Flatten accept_index and valid_mask
         flat_accept = accept_index.flatten()  # [bs * max_accept]
-        flat_valid = valid_mask.flatten()     # [bs * max_accept]
+        flat_valid = valid_mask.flatten()  # [bs * max_accept]
 
         # Sequence IDs: 0, 1, 2, ..., max_accept-1, 0, 1, 2, ... (per request)
         # These determine priority within each request
@@ -1189,7 +1438,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         scatter_idx = flat_accept.clamp(min=0)
 
         # Use scatter_reduce for 'amax' operation
-        priorities.scatter_reduce_(0, scatter_idx, flat_priorities, reduce='amax', include_self=True)
+        priorities.scatter_reduce_(
+            0, scatter_idx, flat_priorities, reduce="amax", include_self=True
+        )
 
         # =====================================================================
         # flat_perm: GLOBAL sort for data tensors (predict, hidden, out_cache)
@@ -1246,6 +1497,244 @@ class EAGLEWorkerV2(BaseSpecWorker):
         old_slots = req_to_token[req_rows, window_cols]
         new_slots = torch.gather(old_slots, 1, per_req_perm.long())
         req_to_token.index_put_((req_rows, window_cols), new_slots)
+
+    # =========================================================================
+    # DATA MOVE APPROACH (Zero-Sync Tree Mode)
+    # =========================================================================
+    # Instead of compacting indices (req_to_token), we move KV DATA.
+    # This allows plan_stream to read req_to_token immediately without waiting.
+    # =========================================================================
+
+    def _build_data_move_indices(
+        self,
+        accept_index: torch.Tensor,  # [bs, num_steps+1], flat indices or -1
+        accept_length: torch.Tensor,  # [bs]
+        tree_size: int,
+        batch: "ModelWorkerBatch",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build source and destination slot indices for KV cache data move.
+
+        ═══════════════════════════════════════════════════════════════════════
+        DATA MOVE APPROACH
+        ═══════════════════════════════════════════════════════════════════════
+        Instead of modifying req_to_token (index compaction), we MOVE KV data
+        from scattered positions to contiguous positions.
+
+        This eliminates stream sync because req_to_token stays STATIC.
+        plan_stream can read it immediately without waiting for compaction.
+
+        ═══════════════════════════════════════════════════════════════════════
+        ALGORITHM
+        ═══════════════════════════════════════════════════════════════════════
+        For each request, we have:
+          - accept_index[i] = [a0, a1, a2, ...] (tree positions that were accepted)
+          - req_to_token[req, seq_len+j] = P_j (physical slot for position j)
+
+        After verification:
+          - P_{a0}, P_{a1}, P_{a2}, ... have valid KV data
+          - P_0, P_1, P_2, ... should have valid KV data (contiguous)
+
+        So we copy:
+          - P_{a0} → P_0 (if a0 != 0)
+          - P_{a1} → P_1 (if a1 != 1)
+          - P_{a2} → P_2 (if a2 != 2)
+          - ...
+
+        ═══════════════════════════════════════════════════════════════════════
+        SAFETY: No Clobbering
+        ═══════════════════════════════════════════════════════════════════════
+        Tree Mode acceptance is typically monotonically increasing (0 < 3 < 15).
+        This means src_pos > dst_pos for all non-trivial copies:
+          - Copy P_3 → P_1 (3 > 1)
+          - Copy P_15 → P_2 (15 > 2)
+
+        Processing in increasing dst order is safe (no source clobbering).
+
+        We add validation to detect any violations.
+
+        Args:
+            accept_index: [bs, num_steps+1] flat indices into tree, -1 for padding
+            accept_length: [bs] number of accepted tokens per request
+            tree_size: tree positions per request
+            batch: contains req_pool_indices, seq_lens
+
+        Returns:
+            src_slots: [total_moves] physical slots to read FROM
+            dst_slots: [total_moves] physical slots to write TO
+            move_mask: [total_moves] which copies are non-trivial (src != dst)
+        """
+        bs = accept_index.shape[0]
+        max_accept = accept_index.shape[1]
+        device = accept_index.device
+
+        req_to_token = self.req_to_token_pool.req_to_token
+
+        # Build indices for all potential moves [bs, max_accept]
+        # dst_local: [0, 1, 2, ...] for each request (contiguous positions)
+        # src_local: accept_index % tree_size (scattered positions in tree)
+        dst_local = torch.arange(max_accept, device=device).unsqueeze(0).expand(bs, -1)
+        src_local = accept_index % tree_size  # Convert flat to local tree position
+
+        # Mask for valid positions (not padding and within accept_length)
+        col_ids = torch.arange(max_accept, device=device)
+        valid_mask = (col_ids < accept_length.unsqueeze(1)) & (accept_index >= 0)
+
+        # Get physical slots from req_to_token
+        # req_to_token[req_idx, seq_len + local_pos] = physical_slot
+        req_rows = batch.req_pool_indices.unsqueeze(1).expand(bs, max_accept)
+        src_cols = batch.seq_lens.unsqueeze(1) + src_local
+        dst_cols = batch.seq_lens.unsqueeze(1) + dst_local
+
+        # Read physical slots (valid positions only)
+        src_slots_2d = req_to_token[req_rows, src_cols]  # [bs, max_accept]
+        dst_slots_2d = req_to_token[req_rows, dst_cols]  # [bs, max_accept]
+
+        # Flatten and filter to valid positions
+        src_slots = src_slots_2d[valid_mask]
+        dst_slots = dst_slots_2d[valid_mask]
+
+        # Move mask: non-trivial copies (src != dst)
+        move_mask = src_slots != dst_slots
+
+        # Safety check: detect potential clobbering
+        # If src_local < dst_local for any valid position, we might clobber
+        # This would indicate accept_index is not monotonically increasing
+        if (src_local[valid_mask] < dst_local[valid_mask]).any():
+            # Log warning but don't fail - the kernel might handle this
+            from sglang.srt.speculative.eagle_debug import debug_checkpoint
+
+            debug_checkpoint(
+                "DATA_MOVE_CLOBBER_WARNING",
+                stream="main",
+                level=1,
+                message="accept_index not monotonically increasing, may cause clobbering",
+            )
+
+        return src_slots, dst_slots, move_mask
+
+    def _execute_data_move(
+        self,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+        move_mask: torch.Tensor,
+    ):
+        """
+        Execute KV cache data moves.
+
+        Args:
+            src_slots: physical slots to read FROM
+            dst_slots: physical slots to write TO
+            move_mask: which copies are non-trivial
+        """
+        from sglang.srt.speculative.eagle_debug import debug_data_move_trace
+
+        # CRITICAL: Only compute sync-dependent stats if debugging is enabled!
+        # .item() causes a CPU-GPU sync.
+        if self._debug.config.data_move_trace:
+            num_moves = move_mask.sum().item()
+            debug_data_move_trace(
+                "EXECUTE",
+                src_slots=src_slots,
+                dst_slots=dst_slots,
+                num_moves=num_moves,
+                context=f"total_slots={len(src_slots)}",
+            )
+            if num_moves == 0:
+                debug_data_move_trace(
+                    "SKIP", num_moves=0, context="all positions matched"
+                )
+
+        # Execute the KV cache SWAP (not just copy!)
+        #
+        # ════════════════════════════════════════════════════════════════════
+        # WHY SWAP, NOT COPY (see eagle3_overlap_exploration.md)
+        # ════════════════════════════════════════════════════════════════════
+        #
+        # COPY creates DUPLICATES that corrupt attention:
+        # - After copy(31→30): slot 30 has accepted KV, slot 31 ALSO has it!
+        # - Position 24 (slot 31) is a DUPLICATE of position 23 (slot 30)
+        # - During attention, model sees same KV at two positions
+        # - This causes wrong attention weights → wrong outputs
+        #
+        # SWAP ensures each position has unique KV:
+        # - After swap(31, 30): slot 30 has accepted KV, slot 31 has rejected KV
+        # - No duplicates, attention is coherent
+        #
+        # ════════════════════════════════════════════════════════════════════
+        # IMPLEMENTATION: Triple-copy with temp slots
+        # ════════════════════════════════════════════════════════════════════
+        #
+        # PROBLEM: Parallel bidirectional move has RACE CONDITIONS!
+        # If we do move_kv_cache([dst, src], [src, dst]), the kernel processes
+        # entries in parallel. If thread A writes src→dst before thread B reads
+        # dst, then thread B reads the WRONG value (src's data, not dst's).
+        #
+        # SOLUTION: Triple-copy using temp slots (no overlapping indices):
+        #   1. move_kv_cache(temp, src)  # src → temp
+        #   2. move_kv_cache(src, dst)   # dst → src
+        #   3. move_kv_cache(dst, temp)  # temp → dst
+        #
+        # Each step has non-overlapping src/dst, so it's safe.
+        #
+        # ════════════════════════════════════════════════════════════════════
+
+        actual_src = src_slots[move_mask]
+        actual_dst = dst_slots[move_mask]
+
+        if actual_src.numel() > 0:
+            num_swaps = actual_src.numel()
+            target_kv = self.target_worker.model_runner.token_to_kv_pool
+            draft_kv = self.draft_worker.draft_runner.token_to_kv_pool
+
+            # Allocate temp slots for the swap
+            # Use target allocator - both KV pools have same slot indexing
+            allocator = self.token_to_kv_pool_allocator
+            temp_slots = allocator.alloc(num_swaps)
+
+            if temp_slots is None:
+                raise RuntimeError(
+                    f"[DATA_MOVE] Failed to allocate {num_swaps} temp slots for swap"
+                )
+
+            # Convert to tensor if needed (some allocators return lists)
+            if isinstance(temp_slots, list):
+                temp_slots = torch.tensor(
+                    temp_slots, device=self.device, dtype=torch.int64
+                )
+
+            try:
+                # Triple-copy swap (each step has non-overlapping indices):
+                # Step 1: src → temp (save src values)
+                target_kv.move_kv_cache(temp_slots, actual_src)
+                draft_kv.move_kv_cache(temp_slots, actual_src)
+
+                # Step 2: dst → src (overwrite src with dst values)
+                target_kv.move_kv_cache(actual_src, actual_dst)
+                draft_kv.move_kv_cache(actual_src, actual_dst)
+
+                # Step 3: temp → dst (write saved src values to dst)
+                target_kv.move_kv_cache(actual_dst, temp_slots)
+                draft_kv.move_kv_cache(actual_dst, temp_slots)
+
+            finally:
+                # CRITICAL: Must sync before freeing temp_slots!
+                # The move_kv_cache operations are async CUDA ops. If we free
+                # temp_slots before they complete, the allocator might reuse
+                # those indices for other requests, causing data corruption.
+                #
+                # NOTE: This sync is unavoidable for the data move approach.
+                # It's still better than the 2 syncs in index compaction IF
+                # the swap is rare (e.g., only when accept_idx is non-contiguous).
+                torch.cuda.current_stream().synchronize()
+                allocator.free(temp_slots)
+
+            # Debug: verify swap was performed
+            if self._debug.config.data_move_trace:
+                print(
+                    f"[DATA_MOVE_SWAP] Swapped {num_swaps} slot pairs (triple-copy): "
+                    f"src={actual_src[:4].tolist()}, dst={actual_dst[:4].tolist()}"
+                )
 
     def move_accepted_tokens_to_target_kvcache(
         self,

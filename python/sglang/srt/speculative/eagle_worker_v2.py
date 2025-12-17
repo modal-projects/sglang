@@ -914,6 +914,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
+        # CRITICAL STREAM SYNC: plan_stream must wait for PREVIOUS iteration's main_stream!
+        # ─────────────────────────────────────────────────────────────────────────────────
+        # Problem: prepare_for_v2_verify() runs in plan_stream and reads req_to_token.
+        # The PREVIOUS iteration's _draft_extend_for_decode() modified req_to_token via
+        # draft model forward (which allocated new KV slots in main_stream).
+        # Without this sync, plan_stream races against prev iteration's main_stream.
+        # ─────────────────────────────────────────────────────────────────────────────────
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+            if os.environ.get("EAGLE3_DEBUG") and self.topk > 1:
+                print(f"[ITER {self._debug_iter}] SYNC #2: plan_stream waited for main_stream BEFORE verify (draft output)")
+
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:

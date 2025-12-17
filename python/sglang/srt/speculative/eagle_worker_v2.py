@@ -633,6 +633,17 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_batch=1,
         )
 
+        # CRITICAL STREAM SYNC: plan_stream must wait for verify() compaction!
+        # ─────────────────────────────────────────────────────────────────────
+        # verify() runs compaction (req_to_token, out_cache_loc) in main stream.
+        # prepare_for_extend... reads req_to_token in plan_stream.
+        # Without this wait, plan_stream reads STALE/CORRUPTED req_to_token!
+        # ─────────────────────────────────────────────────────────────────────
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
         with self.plan_stream_ctx:
             # Unified: uniform extension by stride (no variable-length path)
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
@@ -642,13 +653,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
-
-        # DEBUG: Only log for bs>1 or if tree mode
-        if os.environ.get("EAGLE3_DEBUG"):
-            is_tree_mode = self.topk > 1
-            if bs > 1 or is_tree_mode:
-                print(f"[EAGLE3_DEBUG draft_extend] bs={bs}, tree={is_tree_mode}, "
-                      f"select_index={select_index.tolist()}, seq_lens={batch.seq_lens.tolist()}")
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -813,6 +817,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+            # CRITICAL STREAM SYNC for Tree Mode:
+            # ─────────────────────────────────────────────────────────────────────
+            # draft()'s prepare_for_v2_draft() runs in plan_stream and reads req_to_token.
+            # If the PREVIOUS iteration compacted req_to_token (in main_stream),
+            # plan_stream must wait to see the compacted state!
+            # Without this sync: plan_stream reads stale/pre-compaction req_to_token
+            #                    → wrong KV cache slots → GARBAGE OUTPUT
+            # ─────────────────────────────────────────────────────────────────────
+            if self.plan_stream:
+                self.plan_stream.wait_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
+
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
@@ -1073,14 +1090,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verify_done=verify_done,
             hidden_states=None,  # Use logits_output.hidden_states in draft_extend
         )
-
-        # DEBUG: Concise verify logging (only for bs>1 or tree mode)
-        if os.environ.get("EAGLE3_DEBUG") and not batch.forward_mode.is_idle():
-            is_tree = self.topk > 1
-            if bs > 1 or is_tree:
-                accept_lens_list = accept_length.tolist()
-                print(f"[EAGLE3_DEBUG verify] bs={bs}, tree={is_tree}, "
-                      f"accept_lens={accept_lens_list}, output_shape={output_predict.shape[0]}")
 
         return GenerationBatchResult(
             logits_output=logits_output,

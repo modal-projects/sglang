@@ -565,6 +565,62 @@ def fill_accepted_out_cache_loc(
 
 
 @triton.jit
+def compact_data_tensors_kernel(
+    accept_index,
+    accept_length,
+    predict,
+    hidden_states,
+    out_cache_loc,
+    out_predict,
+    out_hidden,
+    out_cache,
+    stride: tl.constexpr,
+    max_accept: tl.constexpr,
+    hidden_dim: tl.constexpr,
+):
+    """Compact predict, hidden_states, and out_cache_loc into fixed-stride buffers.
+
+    IMPORTANT: accept_length includes the bonus token (+1), but accept_index only
+    contains indices for matched draft tokens. We must check src_idx >= 0 to avoid
+    reading from -1 padding.
+    """
+    BLOCK_H: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    acc_len = tl.load(accept_length + pid)
+
+    accept_row = accept_index + pid * max_accept
+    out_base = pid * stride
+
+    for col in tl.static_range(max_accept):
+        if col < acc_len:
+            src_idx = tl.load(accept_row + col)
+            # CRITICAL: accept_index may have -1 padding if accept_length includes
+            # the bonus token but accept_index doesn't have an entry for it.
+            # Skip invalid indices to avoid OOB access.
+            if src_idx >= 0:
+                dst_idx = out_base + col
+
+                tok = tl.load(predict + src_idx)
+                tl.store(out_predict + dst_idx, tok)
+
+                cache_loc = tl.load(out_cache_loc + src_idx)
+                tl.store(out_cache + dst_idx, cache_loc)
+
+                # Blocked copy over hidden dimension
+                for h_start in tl.static_range(0, hidden_dim, BLOCK_H):
+                    h_offsets = h_start + tl.arange(0, BLOCK_H)
+                    h_mask = h_offsets < hidden_dim
+                    h_vals = tl.load(
+                        hidden_states + src_idx * hidden_dim + h_offsets, mask=h_mask
+                    )
+                    tl.store(
+                        out_hidden + dst_idx * hidden_dim + h_offsets,
+                        h_vals,
+                        mask=h_mask,
+                    )
+
+
+@triton.jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,
@@ -644,3 +700,74 @@ def assign_extend_cache_locs_func(
         out_cache_loc = out_cache_loc.to(dtype=torch.int64)
 
         return out_cache_loc
+
+
+def compact_data_tensors_func(
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    tree_size: int,
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+):
+    """
+    Compact scattered acceptance into prefix form for data tensors (CUDA/HIP).
+
+    Uses a fused Triton kernel to compact predict, hidden_states, and out_cache_loc
+    in a single pass. This replaces 3 separate gather operations.
+
+    NOTE: req_to_token compaction is handled separately by the caller using
+    _compact_req_to_token_with_perm() because in-place array reordering with
+    dynamic indexing is not efficiently expressible in Triton.
+
+    Args:
+        accept_index: [bs, max_accept] - flat indices into [bs*tree_size], -1 padded
+        accept_length: [bs] - count of valid entries per request
+        tree_size: number of draft tokens per request
+        predict: [bs * tree_size] - sparse token predictions
+        hidden_states: [bs * tree_size, H] - sparse hidden states
+        out_cache_loc: [bs * tree_size] - sparse KV cache locations
+
+    Returns:
+        packed_predict: [bs * tree_size] - compacted, prefix valid per request
+        packed_hidden: [bs * tree_size, H] - compacted hidden states
+        packed_cache: [bs * tree_size] - compacted cache locations
+    """
+    if not (_is_cuda or _is_hip):
+        raise RuntimeError("compact_data_tensors_func requires CUDA or HIP backend")
+
+    bs = accept_index.shape[0]
+    max_accept = accept_index.shape[1]
+    stride = tree_size
+    hidden_dim = hidden_states.shape[-1]
+
+    assert stride >= max_accept, "tree_size must be >= max accepted tokens"
+
+    # Use zeros (not empty!) to avoid garbage in unwritten suffix positions
+    packed_predict = torch.zeros(
+        (bs * stride,), device=predict.device, dtype=predict.dtype
+    )
+    packed_hidden = torch.zeros(
+        (bs * stride, hidden_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    packed_cache = torch.zeros(
+        (bs * stride,), device=out_cache_loc.device, dtype=out_cache_loc.dtype
+    )
+
+    compact_data_tensors_kernel[(bs,)](
+        accept_index,
+        accept_length,
+        predict,
+        hidden_states,
+        out_cache_loc,
+        packed_predict,
+        packed_hidden,
+        packed_cache,
+        stride=stride,
+        max_accept=max_accept,
+        hidden_dim=hidden_dim,
+    )
+
+    return packed_predict, packed_hidden, packed_cache

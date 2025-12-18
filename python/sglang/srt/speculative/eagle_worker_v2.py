@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import os
 import time
 from typing import List, Optional, Tuple
 
@@ -34,6 +33,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
     select_top_k_tokens_tmp,
@@ -988,7 +988,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
+            # CRITICAL FIX: accept_index contains -1 padding. Direct indexing predict[accept_index]
+            # causes OOB access. We clamp -1 to 0 to safely gather (garbage at padding is ignored later).
+            all_verified_id = predict[accept_index.long().clamp(min=0)]
+
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
@@ -1024,48 +1027,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if is_tree_mode:
                 # =============================================================
-                # TREE MODE: Compact scattered acceptance to prefix (per request)
+                # TREE MODE: Compact scattered acceptance to prefix
                 # =============================================================
-                # After compaction:
-                #   - predict[i*tree_size : i*tree_size+accept_len[i]] = valid tokens
-                #   - req_to_token[seq_len : seq_len+accept_len] = accepted slots
-                # This makes tree mode look like chain mode!
-                #
-                # CRITICAL: Use STRIDED permutation, not global!
-                # ─────────────────────────────────────────────────────────────
-                # Global flat_perm puts ALL accepted at positions [0:total_accepted]
-                # But stride-based extraction expects:
-                #   req0 valid at [0:accept_len[0]]
-                #   req1 valid at [tree_size : tree_size+accept_len[1]]
-                #
-                # Solution: Convert per_req_perm to strided flat indices
-                # ─────────────────────────────────────────────────────────────
+                # Hybrid approach:
+                #   - Data tensors (predict, hidden, cache): Fused Triton kernel
+                #   - req_to_token: argsort-based permutation (PyTorch)
 
-                # Build per-request permutation (SYNC-FREE)
-                _, per_req_perm = self._build_compaction_perm(
-                    accept_index, accept_length, tree_size
+                # Fused kernel for data tensors
+                (
+                    padded_predict,
+                    packed_hidden,
+                    packed_cache,
+                ) = compact_data_tensors_func(
+                    accept_index,
+                    accept_length,
+                    tree_size,
+                    predict,
+                    logits_output.hidden_states,
+                    batch.out_cache_loc,
                 )
 
-                # Convert per_req_perm [bs, tree_size] to strided flat indices
-                # Each row i gets offset by i * tree_size
-                row_offsets = torch.arange(bs, device=self.device).unsqueeze(1) * tree_size
-                strided_flat_perm = (per_req_perm + row_offsets).flatten()
-
-                # Compact predict: each request's prefix now has valid tokens
-                padded_predict = predict.gather(0, strided_flat_perm)
-
-                # Compact hidden_states: [bs * tree_size, H] → [bs * tree_size, H]
-                hidden_dim = logits_output.hidden_states.shape[-1]
-                strided_flat_perm_2d = strided_flat_perm.unsqueeze(1).expand(-1, hidden_dim)
-                logits_output.hidden_states = logits_output.hidden_states.gather(0, strided_flat_perm_2d)
-
-                # Compact out_cache_loc: [bs * tree_size] → [bs * tree_size]
-                batch.out_cache_loc = batch.out_cache_loc.gather(0, strided_flat_perm)
-
-                # Compact req_to_token verify window (MANDATORY - prevents KV corruption)
-                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
-
+                logits_output.hidden_states = packed_hidden
+                batch.out_cache_loc = packed_cache
                 output_predict = padded_predict
+
+                # req_to_token compaction via argsort (robust, small data)
+                per_req_perm = self._build_compaction_perm(
+                    accept_index, accept_length, tree_size
+                )
+                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
             else:
                 # =============================================================
                 # CHAIN MODE: No compaction needed (accepted positions are prefix)
@@ -1099,52 +1089,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
         tree_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Build permutation to compact accepted indices to prefix (sync-free).
-
-        ═══════════════════════════════════════════════════════════════════════
-        UNIFIED COMPACTION PRIMITIVE
-        ═══════════════════════════════════════════════════════════════════════
-        This function builds TWO permutations:
-          1. flat_perm [bs * tree_size]: For compacting data tensors (predict, etc.)
-          2. per_req_perm [bs, tree_size]: For compacting req_to_token window
-
-        CRITICAL: These are computed DIFFERENTLY!
-          - flat_perm: Global sort across all requests (for concatenated data tensors)
-          - per_req_perm: Per-row sort (for per-request req_to_token windows)
-
-        ═══════════════════════════════════════════════════════════════════════
-        SYNC-FREE DESIGN
-        ═══════════════════════════════════════════════════════════════════════
-        All operations have FIXED output sizes (no data-dependent shapes):
-          - torch.zeros() - fixed shape
-          - comparison (!=, <) - same shape as input
-          - scatter_() - in-place, no allocation
-          - argsort() - same shape as input
-          - clamp() - same shape as input
-
-        The only sync needed is AFTER this function, to get total_accepted for slicing.
+        Build per-request permutation to compact req_to_token window (sync-free).
 
         ═══════════════════════════════════════════════════════════════════════
         ALGORITHM: Priority-Based Sorting
         ═══════════════════════════════════════════════════════════════════════
-        1. Create priority tensor [bs * tree_size] initialized to 0 (rejected)
+        1. Create priority tensor [bs, tree_size] initialized to 0 (rejected)
         2. For each valid entry in accept_index:
-           - Scatter priority = BASE - seq_id to its flat position
+           - Scatter priority = BASE - seq_id to its position
            - seq_id ensures sequence order (first accepted = highest priority)
-        3. For flat_perm: argsort GLOBALLY (all requests together)
-        4. For per_req_perm: argsort PER ROW (within each request)
+        3. argsort PER ROW to get local permutation
 
         ═══════════════════════════════════════════════════════════════════════
         EXAMPLE: bs=2, tree_size=32, accept_lens=[3, 2]
         ═══════════════════════════════════════════════════════════════════════
         accept_index = [[0, 3, 15, -1, -1, -1], [32, 34, -1, -1, -1, -1]]
-
-        priorities (flat): HIGH at positions 0,3,15,32,34; 0 elsewhere
-
-        flat_perm (global argsort): [0, 3, 15, 32, 34, 1, 2, 4, ...]
-          → Used for: predict.gather(0, flat_perm)[:5] = [tok0, tok3, tok15, tok32, tok34]
 
         per_req_perm (per-row argsort):
           Row 0: [0, 3, 15, 1, 2, 4, 5, ...]  (positions 0,3,15 have high priority)
@@ -1157,58 +1118,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
             tree_size: Number of tree positions per request
 
         Returns:
-            flat_perm: [bs * tree_size] - use with tensor.gather(0, flat_perm)
-            per_req_perm: [bs, tree_size] - use with tensor.gather(1, per_req_perm)
+            per_req_perm: [bs, tree_size] - local permutation for each request
         """
         bs = accept_index.shape[0]
-        max_accept = accept_index.shape[1]  # num_steps + 1
+        max_accept = accept_index.shape[1]
         flat_size = bs * tree_size
 
         # Priority: accepted get high priority (BASE - seq_id), rejected get 0
-        # This ensures argsort(descending) puts accepted first, in sequence order
         priorities = torch.zeros(flat_size, dtype=torch.int64, device=self.device)
         BASE = flat_size + 1
 
-        # Build valid mask: which entries in accept_index are valid [bs, max_accept]
+        # Build valid mask: which entries in accept_index are valid
         col_ids = torch.arange(max_accept, device=self.device)
-        valid_mask = col_ids < accept_length.unsqueeze(1)  # [bs, max_accept]
+        valid_mask = col_ids < accept_length.unsqueeze(1)
 
-        # Flatten accept_index and valid_mask
-        flat_accept = accept_index.flatten()  # [bs * max_accept]
-        flat_valid = valid_mask.flatten()     # [bs * max_accept]
-
-        # Sequence IDs: 0, 1, 2, ..., max_accept-1, 0, 1, 2, ... (per request)
-        # These determine priority within each request
+        # Flatten and compute priorities
+        flat_accept = accept_index.flatten()
+        flat_valid = valid_mask.flatten()
         flat_seq_ids = torch.arange(bs * max_accept, device=self.device)
-
-        # Priorities: BASE - seq_id for valid entries, 0 for invalid
         flat_priorities = (BASE - flat_seq_ids) * flat_valid.long()
 
-        # Scatter to flat_size priority tensor
-        # Clamp -1 to 0 so invalid entries scatter harmlessly (with priority 0)
-        scatter_idx = flat_accept.clamp(min=0)
+        # Scatter priorities (clamp -1 to 0 for safety)
+        priorities.scatter_reduce_(
+            0,
+            flat_accept.clamp(min=0),
+            flat_priorities,
+            reduce="amax",
+            include_self=True,
+        )
 
-        # Use scatter_reduce for 'amax' operation
-        priorities.scatter_reduce_(0, scatter_idx, flat_priorities, reduce='amax', include_self=True)
-
-        # =====================================================================
-        # flat_perm: GLOBAL sort for data tensors (predict, hidden, out_cache)
-        # =====================================================================
-        # This gives the correct ordering for concatenated data:
-        # [req0_tok0, req0_tok1, ..., req1_tok0, req1_tok1, ...]
-        flat_perm = torch.argsort(priorities, descending=True, stable=True)
-
-        # =====================================================================
-        # per_req_perm: PER-ROW sort for req_to_token compaction
-        # =====================================================================
-        # CRITICAL FIX: Cannot derive from flat_perm! For bs>1, flat_perm mixes
-        # indices from different requests. We need to sort within each row.
-        #
-        # Reshape priorities to [bs, tree_size] and sort along dim=1
+        # Per-row argsort for local permutation
         priorities_2d = priorities.view(bs, tree_size)
-        per_req_perm = torch.argsort(priorities_2d, dim=1, descending=True, stable=True)
-
-        return flat_perm, per_req_perm
+        return torch.argsort(priorities_2d, dim=1, descending=True, stable=True)
 
     def _compact_req_to_token_with_perm(
         self,

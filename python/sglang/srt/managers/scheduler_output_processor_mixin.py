@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -298,51 +297,23 @@ class SchedulerOutputProcessorMixin:
 
         [NO CPU-GPU SYNC] All tensors are already on CPU (worker sends CPU tensors)
         """
-        # Verify tensors are on CPU (no GPU access needed)
-        assert result.next_token_ids.is_cpu, "next_token_ids should be CPU tensor"
-        assert result.accept_lens.is_cpu, "accept_lens should be CPU tensor"
+        assert result.next_token_ids.is_cpu
+        assert result.accept_lens.is_cpu
 
-        # [NO SYNC] .tolist() on CPU tensor is fast
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-
-        # Statistics: total accepted minus bonus tokens (one per request)
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
+        stride = self.draft_worker.speculative_num_draft_tokens
 
-        # Get stride from server args
-        stride = self.server_args.speculative_num_draft_tokens
-
-        # DEBUG: Verify tensor is padded (only log for bs>1 or mismatches)
-        if os.environ.get("EAGLE3_DEBUG"):
-            expected_size = len(batch.reqs) * stride
-            actual_size = len(next_token_ids)
-            is_padded = actual_size == expected_size
-            # Always log mismatches, only log bs>1 for normal cases
-            if not is_padded or len(batch.reqs) > 1:
-                status = "PADDED ✓" if is_padded else f"SIZE MISMATCH! {actual_size}!={expected_size}"
-                kv_before = [r.kv_committed_len for r in batch.reqs]
-                print(f"[EAGLE3_DEBUG scheduler] accept_lens={accept_lens}, stride={stride}, "
-                      f"tensor_size={actual_size} ({status}), kv_committed={kv_before}")
-
-        # =================================================================
-        # STRIDE-BASED EXTRACTION (unified for tree and chain)
-        # =================================================================
-        # Padded tensor layout: each request has stride positions
-        # Valid tokens at [i * stride : i * stride + accept_lens[i]]
         for i, req in enumerate(batch.reqs):
-            acc_len = accept_lens[i]
-
-            # Extract this request's tokens using stride indexing
-            start = i * stride
-            tokens = next_token_ids[start : start + acc_len]
-
-            # Update request state
-            req.kv_committed_len += acc_len  # KV cache advanced by accept_len
-            predict_tokens.append(tokens)
+            req.kv_committed_len += accept_lens[i]
+            predict_tokens.append(
+                next_token_ids[i * stride : i * stride + accept_lens[i]]
+            )
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += acc_len - 1  # Exclude bonus token
+            req.spec_accepted_tokens += accept_lens[i] - 1
 
         return predict_tokens
 

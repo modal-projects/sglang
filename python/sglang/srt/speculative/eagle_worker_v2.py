@@ -612,6 +612,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
+            # Wait for Plan Stream from previous request before starting new prefill.
+            # The previous request's Plan Stream may still be accessing shared data
+            # structures (req_to_token, kv_indices) when we start a new request.
+            if self.plan_stream is not None:
+                torch.cuda.current_stream().wait_stream(self.plan_stream)
+
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(

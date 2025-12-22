@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.utils import get_compiler_backend
+
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -118,6 +121,9 @@ class FutureMap:
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
+                return
+            if draft_input.future_indices is None:
+                # No future indices set - might be first decode after prefill
                 return
             indices = draft_input.future_indices.indices
             draft_input.topk_p = self.topk_p_buf[indices]

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import bisect
+import os
 from typing import TYPE_CHECKING, Callable
 
 import torch
+
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -342,6 +345,28 @@ class EAGLEDraftCudaGraphRunner:
 
         num_tokens = bs * self.num_tokens_per_bs
 
+        # TRACE: Log before any copies and check for memory overlap
+        if _TRACE_REQ_POOL:
+            fb_ptr = forward_batch.req_pool_indices.data_ptr()
+            fb_size = forward_batch.req_pool_indices.numel() * forward_batch.req_pool_indices.element_size()
+            self_ptr = self.req_pool_indices.data_ptr()
+            self_size = self.req_pool_indices.numel() * self.req_pool_indices.element_size()
+            # Check if memory ranges overlap
+            overlap = not (fb_ptr + fb_size <= self_ptr or self_ptr + self_size <= fb_ptr)
+            print(
+                f"[TRACE] cuda_graph replay BEFORE copies: "
+                f"forward_batch.req_pool_indices={forward_batch.req_pool_indices.tolist()}, "
+                f"fb_data_ptr={fb_ptr}, fb_size={fb_size}, "
+                f"self_data_ptr={self_ptr}, self_size={self_size}, "
+                f"MEMORY_OVERLAP={overlap}",
+                flush=True,
+            )
+            if overlap:
+                print(
+                    f"[BUG] MEMORY OVERLAP DETECTED between cuda_graph buffer and input tensor!",
+                    flush=True,
+                )
+
         # Common inputs
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
@@ -352,6 +377,15 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+
+        # TRACE: Log after copy
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] cuda_graph replay AFTER copy_: "
+                f"forward_batch.req_pool_indices={forward_batch.req_pool_indices.tolist()}, "
+                f"self.req_pool_indices[:raw_bs]={self.req_pool_indices[:raw_bs].tolist()}",
+                flush=True,
+            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -382,6 +416,15 @@ class EAGLEDraftCudaGraphRunner:
         self._replay(forward_batch)
         out = self.output_buffers[bs]
 
+        # TRACE: Log after _replay
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] cuda_graph replay AFTER _replay: "
+                f"forward_batch.req_pool_indices={forward_batch.req_pool_indices.tolist()}, "
+                f"data_ptr={forward_batch.req_pool_indices.data_ptr()}",
+                flush=True,
+            )
+
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
             forward_batch.batch_size = raw_bs
@@ -390,5 +433,14 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
+
+            # TRACE: Log after reassignment
+            if _TRACE_REQ_POOL:
+                print(
+                    f"[TRACE] cuda_graph replay AFTER reassign (bs!=raw_bs): "
+                    f"forward_batch.req_pool_indices={forward_batch.req_pool_indices.tolist()}, "
+                    f"data_ptr={forward_batch.req_pool_indices.data_ptr()}",
+                    flush=True,
+                )
 
         return out

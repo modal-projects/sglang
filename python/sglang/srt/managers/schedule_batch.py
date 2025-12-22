@@ -91,6 +91,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
+import os
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
+
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
@@ -1396,6 +1399,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self
         )
 
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] prepare_for_extend: bs={len(reqs)}, "
+                f"req_pool_indices_tensor={req_pool_indices_tensor.tolist()}, "
+                f"dtype={req_pool_indices_tensor.dtype}, "
+                f"data_ptr={req_pool_indices_tensor.data_ptr()}, "
+                f"seq_lens={seq_lens[:4]}",
+                flush=True,
+            )
+
         # Set fields
         input_embeds = []
         extend_input_logprob_token_ids = []
@@ -1827,6 +1840,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if _TRACE_REQ_POOL:
+            seq_lens_list = self.seq_lens.tolist() if hasattr(self.seq_lens, 'tolist') else []
+            max_seq_len = max(seq_lens_list) if seq_lens_list else 0
+            print(
+                f"[TRACE] prepare_for_decode: bs={bs}, max_seq_len={max_seq_len}, "
+                f"is_eagle_v2={self.is_eagle_v2}, "
+                f"req_pool_indices={self.req_pool_indices.tolist() if hasattr(self.req_pool_indices, 'tolist') else self.req_pool_indices}, "
+                f"dtype={self.req_pool_indices.dtype if hasattr(self.req_pool_indices, 'dtype') else 'N/A'}, "
+                f"data_ptr={self.req_pool_indices.data_ptr() if hasattr(self.req_pool_indices, 'data_ptr') else 'N/A'}, "
+                f"numel={self.req_pool_indices.numel() if hasattr(self.req_pool_indices, 'numel') else 'N/A'}",
+                flush=True,
+            )
+
         if self.is_eagle_v2:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -1923,6 +1949,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] filter_batch ENTRY: #reqs={len(self.reqs)}, "
+                f"req_pool_indices={self.req_pool_indices.tolist() if hasattr(self.req_pool_indices, 'tolist') else 'N/A'}, "
+                f"dtype={self.req_pool_indices.dtype if hasattr(self.req_pool_indices, 'dtype') else 'N/A'}, "
+                f"data_ptr={self.req_pool_indices.data_ptr() if hasattr(self.req_pool_indices, 'data_ptr') else 'N/A'}",
+                flush=True,
+            )
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1956,6 +1991,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] filter_batch AFTER: keep_indices={keep_indices}, "
+                f"req_pool_indices={self.req_pool_indices.tolist()}, "
+                f"dtype={self.req_pool_indices.dtype}, "
+                f"data_ptr={self.req_pool_indices.data_ptr()}",
+                flush=True,
+            )
+
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
@@ -2039,6 +2084,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
+        if _TRACE_REQ_POOL:
+            numel = self.req_pool_indices.numel() if hasattr(self.req_pool_indices, 'numel') else 0
+            print(
+                f"[TRACE] get_model_worker_batch: forward_mode={self.forward_mode}, "
+                f"req_pool_indices numel={numel}, "
+                f"values={self.req_pool_indices.tolist() if numel > 0 and numel < 10 else 'large/empty'}, "
+                f"dtype={self.req_pool_indices.dtype if hasattr(self.req_pool_indices, 'dtype') else 'N/A'}, "
+                f"data_ptr={self.req_pool_indices.data_ptr() if hasattr(self.req_pool_indices, 'data_ptr') else 'N/A'}",
+                flush=True,
+            )
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

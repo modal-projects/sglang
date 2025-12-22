@@ -16,6 +16,9 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 
+import os
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -395,6 +398,14 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+
+    if _TRACE_REQ_POOL:
+        print(
+            f"[TRACE] alloc_for_extend: req_pool_indices={req_pool_indices}, "
+            f"req_pool_indices_device={req_pool_indices_device.tolist()}, "
+            f"dtype={req_pool_indices_device.dtype}, data_ptr={req_pool_indices_device.data_ptr()}",
+            flush=True,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 

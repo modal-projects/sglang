@@ -199,6 +199,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -1738,6 +1740,13 @@ class Scheduler(
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
+                    if _TRACE_REQ_POOL:
+                        print(
+                            f"[TRACE] get_next_batch_to_run: Setting running_batch=last_batch, "
+                            f"last_batch.req_pool_indices={self.last_batch.req_pool_indices.tolist() if hasattr(self.last_batch.req_pool_indices, 'tolist') else 'N/A'}, "
+                            f"data_ptr={self.last_batch.req_pool_indices.data_ptr() if hasattr(self.last_batch.req_pool_indices, 'data_ptr') else 'N/A'}",
+                            flush=True,
+                        )
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch

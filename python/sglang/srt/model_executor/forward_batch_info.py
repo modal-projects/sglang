@@ -55,6 +55,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
+import os
+_TRACE_REQ_POOL = os.environ.get("TRACE_REQ_POOL", "0") == "1"
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -397,6 +400,15 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        # TRACE: Check if we're getting the right tensor reference
+        if _TRACE_REQ_POOL:
+            print(
+                f"[TRACE] ForwardBatch.init_new: "
+                f"batch.req_pool_indices={batch.req_pool_indices.tolist() if hasattr(batch.req_pool_indices, 'tolist') else 'N/A'}, "
+                f"data_ptr={batch.req_pool_indices.data_ptr() if hasattr(batch.req_pool_indices, 'data_ptr') else 'N/A'}",
+                flush=True,
+            )
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),

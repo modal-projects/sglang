@@ -266,8 +266,7 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # FIXME cuda not support draft_extend capture
-        if self.draft_extend_attn_backend and _is_npu:
+        if self.draft_extend_attn_backend and not _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(

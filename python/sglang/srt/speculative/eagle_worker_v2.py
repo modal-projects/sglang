@@ -266,7 +266,11 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        # Only enable CUDA graphs for draft_extend when there's NO plan stream overlap.
+        # With plan stream overlap, we want init_forward_metadata to run on Plan Stream
+        # (overlapped with verify tail), not in replay() on Main Stream (blocking).
+        enable_overlap = envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        if self.draft_extend_attn_backend and not _is_npu and not enable_overlap:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(

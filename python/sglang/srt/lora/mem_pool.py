@@ -17,6 +17,7 @@ from sglang.srt.lora.utils import (
     get_hidden_dim,
     get_lm_head_lora_b_shard_size,
     get_normalized_target_modules,
+    get_runtime_lora_target_module_name,
     get_stacked_multiply,
     get_target_module_name,
 )
@@ -294,7 +295,12 @@ class LoRAMemoryPool:
             has_moe = self._get_num_experts(base_model) > 1
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
-            target_modules = target_modules - set(EMBEDDING_NAMES)
+            target_modules = set(target_modules) - set(EMBEDDING_NAMES)
+            if has_shared_experts:
+                if "gate_up_proj" in target_modules:
+                    target_modules.add("shared_expert.gate_up_proj")
+                if "down_proj" in target_modules:
+                    target_modules.add("shared_expert.down_proj")
             for module_name in target_modules:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
@@ -536,7 +542,9 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                target_module = get_runtime_lora_target_module_name(
+                    name, self.target_modules
+                )
 
                 # Check if this is an MoE weight (has expert index in name)
                 expert_match = re.search(r"experts\.(\d+)\.", name)
@@ -597,7 +605,7 @@ class LoRAMemoryPool:
                         continue
 
                     # Handle regular modules
-                    target_module = get_target_module_name(
+                    target_module = get_runtime_lora_target_module_name(
                         module_name, self.target_modules
                     )
 

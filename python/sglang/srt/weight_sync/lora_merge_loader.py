@@ -64,13 +64,19 @@ def _apply_target_update(
             f"Unsupported fused expert runtime backend {fused_expert_runtime_backend!r}."
         )
 
+    merge_dtype = _resolve_merge_dtype(target_param)
     local_delta = _compile_local_lora_delta(
         target_param,
         target_spec,
         tensor_dict=tensor_dict,
         loader_metadata=loader_metadata,
+        merge_dtype=merge_dtype,
     )
-    target_param.data.add_(local_delta)
+    # Match a single-cast merge contract: accumulate into fp32 scratch and
+    # quantize back to the stored weight dtype only once at the end.
+    merged_weight = target_param.data.to(dtype=merge_dtype)
+    merged_weight.add_(local_delta)
+    target_param.data.copy_(merged_weight.to(dtype=target_param.data.dtype))
 
 
 def _compile_local_lora_delta(
@@ -79,10 +85,15 @@ def _compile_local_lora_delta(
     *,
     tensor_dict: Dict[str, torch.Tensor],
     loader_metadata: Dict[str, Any],
+    merge_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Compile one or more LoRA factor pairs into a local runtime delta tensor."""
     base_weight = target_param.data
-    total_delta = torch.zeros_like(base_weight)
+    total_delta = torch.zeros(
+        base_weight.shape,
+        device=base_weight.device,
+        dtype=merge_dtype,
+    )
     for component_spec in _iter_target_components(target_spec):
         lora_a_name = component_spec["lora_a_name"]
         lora_b_name = component_spec["lora_b_name"]
@@ -100,7 +111,7 @@ def _compile_local_lora_delta(
             tensor_dict[lora_a_name],
             tensor_dict[lora_b_name],
             target_device=base_weight.device,
-            target_dtype=base_weight.dtype,
+            compute_dtype=merge_dtype,
             scaling=scaling,
         )
         total_delta.add_(
@@ -109,6 +120,7 @@ def _compile_local_lora_delta(
                 base_weight,
                 component_delta,
                 component_spec,
+                placement_dtype=merge_dtype,
             )
         )
 
@@ -122,6 +134,10 @@ def _apply_flashinfer_fused_expert_update(
     tensor_dict: Dict[str, torch.Tensor],
     loader_metadata: Dict[str, Any],
 ) -> None:
+    # This hot-update path works directly on FlashInfer's packed expert layout.
+    # Without an unpack -> fp32 merge -> repack helper for the resident weight,
+    # it cannot yet provide the same single-cast merge semantics as the generic
+    # path below.
     layer = _get_weight_loader_owner(target_param)
     if layer is None:
         raise ValueError(
@@ -208,7 +224,7 @@ def _compute_component_delta(
     lora_b: torch.Tensor,
     *,
     target_device: torch.device,
-    target_dtype: torch.dtype,
+    compute_dtype: torch.dtype,
     scaling: float,
 ) -> torch.Tensor:
     """Compile a single LoRA factor pair into a delta tensor."""
@@ -224,8 +240,8 @@ def _compute_component_delta(
         )
 
     delta = torch.matmul(
-        lora_b.to(device=target_device, dtype=target_dtype),
-        lora_a.to(device=target_device, dtype=target_dtype),
+        lora_b.to(device=target_device, dtype=compute_dtype),
+        lora_a.to(device=target_device, dtype=compute_dtype),
     )
     return delta * scaling
 
@@ -235,6 +251,8 @@ def _place_component_delta(
     base_weight: torch.Tensor,
     delta: torch.Tensor,
     component_spec: Dict[str, Any],
+    *,
+    placement_dtype: torch.dtype,
 ) -> torch.Tensor:
     shard_id = _normalize_shard_id(component_spec.get("shard_id"))
     weight_loader = getattr(target_param, "weight_loader", None)
@@ -249,10 +267,14 @@ def _place_component_delta(
             delta,
             component_spec,
             shard_id=shard_id,
+            placement_dtype=placement_dtype,
         )
 
     if weight_loader is not None:
-        placed_param = _make_scratch_param_like(target_param)
+        placed_param = _make_scratch_param_like(
+            target_param,
+            dtype=placement_dtype,
+        )
         if shard_id is None:
             delta = _reshape_delta_for_target(delta, base_weight)
             weight_loader(placed_param, delta)
@@ -299,12 +321,13 @@ def _make_scratch_param_like(
     target_param: torch.nn.Parameter,
     *,
     shape: Optional[tuple[int, ...]] = None,
+    dtype: Optional[torch.dtype] = None,
 ) -> torch.nn.Parameter:
     temp_param = torch.nn.Parameter(
         torch.zeros(
             shape if shape is not None else tuple(target_param.data.shape),
             device=target_param.data.device,
-            dtype=target_param.data.dtype,
+            dtype=dtype or target_param.data.dtype,
         ),
         requires_grad=False,
     )
@@ -349,8 +372,12 @@ def _materialize_fused_expert_delta(
     component_spec: Dict[str, Any],
     *,
     shard_id: Any,
+    placement_dtype: torch.dtype,
 ) -> torch.Tensor:
-    placed_param = _make_scratch_param_like(target_param)
+    placed_param = _make_scratch_param_like(
+        target_param,
+        dtype=placement_dtype,
+    )
     _load_fused_expert_delta(
         placed_param,
         delta,
@@ -479,7 +506,10 @@ def _compute_expert_component_delta(
             "LoRA rank mismatch: "
             f"A shape {tuple(expert_a.shape)} is incompatible with B shape {tuple(expert_b.shape)}."
         )
-    return torch.matmul(expert_b, expert_a) * scaling
+    return torch.matmul(
+        expert_b.to(dtype=torch.float32),
+        expert_a.to(dtype=torch.float32),
+    ) * scaling
 
 
 def _select_expert_factor(factor: torch.Tensor, expert_id: int) -> torch.Tensor:
@@ -583,6 +613,14 @@ def _normalize_target_specs(
         normalized_specs.append(normalized_spec)
 
     return normalized_specs
+
+
+def _resolve_merge_dtype(target_param: torch.nn.Parameter) -> torch.dtype:
+    if not target_param.data.is_floating_point():
+        raise TypeError(
+            f"LoRA merge expects floating-point target weights, got {target_param.data.dtype}."
+        )
+    return torch.float32
 
 
 def _resolve_scaling(

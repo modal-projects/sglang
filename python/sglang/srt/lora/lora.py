@@ -29,6 +29,12 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import (
+    normalize_lora_gate_up_weights,
+    normalize_lora_qkv_weights,
+    rename_lora_expert_w_to_proj_name,
+    rewrite_lora_embedding_aliases_in_weight_name,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -101,10 +107,9 @@ class LoRAAdapter(nn.Module):
             self.config.target_modules
         )
 
-        # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
-        # recognized and loaded into the correct buffer.
-        if "unembed_tokens" in name:
-            name = name.replace("unembed_tokens", "lm_head")
+        # Remap PEFT aliases so the weight is recognized and loaded into the
+        # correct buffer or later normalization pass.
+        name = rewrite_lora_embedding_aliases_in_weight_name(name)
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
@@ -135,77 +140,22 @@ class LoRAAdapter(nn.Module):
     def _normalize_weights(self):
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
-            weight_names = list(layer.weights.keys())
-            self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_qkv_proj(list(layer.weights.keys()), layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
-            weight_names = list(layer.weights.keys())
-            self.normalize_gate_up_proj(weight_names, layer.weights)
+            self.normalize_gate_up_proj(list(layer.weights.keys()), layer.weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
-        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
-        target_module = set()
-        for weight_name in weight_names:
-            if "k_proj" in weight_name:
-                target_module.add("k_proj")
-            if "q_proj" in weight_name:
-                target_module.add("q_proj")
-            if "v_proj" in weight_name:
-                target_module.add("v_proj")
-            if "qkv_proj" in weight_name:
-                target_module.add("qkv_proj")
-        if len(target_module) == 0:
-            return
-
-        for weight_name in weight_names:
-            # We assume every lora adaptor should contain lora modules for q_proj
-            if "q_proj" in weight_name:
-                q_name = weight_name
-                k_name = weight_name.replace("q_proj", "k_proj")
-                v_name = weight_name.replace("q_proj", "v_proj")
-                qkv_name = weight_name.replace("q_proj", "qkv_proj")
-
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
-                )
-                weights[qkv_name] = torch.cat(
-                    (
-                        weights[q_name],
-                        k_proj_weight,
-                        weights[v_name],
-                    ),
-                    0,
-                )
-                weights.pop(q_name)
-                if "k_proj" in target_module:
-                    weights.pop(k_name)
-                weights.pop(v_name)
-            elif "qkv_proj" in weight_name:
-                # If qkv_proj is already stacked, we normalize it following the SGL convention.
-                qkv_name = weight_name
-                q_name = weight_name.replace("qkv_proj", "q_proj")
-                k_name = weight_name.replace("qkv_proj", "k_proj")
-                v_name = weight_name.replace("qkv_proj", "v_proj")
-                if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
-                # else: no-op as LoRA B weight is already stacked.
+        del weight_names
+        normalize_lora_qkv_weights(weights)
 
     def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
         """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
         normalize_gate_up_proj can stack them into gate_up_proj."""
         renames = {}
         for name in list(weights.keys()):
-            new_name = name
-            if ".w1." in name:
-                new_name = name.replace(".w1.", ".gate_proj.")
-            elif ".w3." in name:
-                new_name = name.replace(".w3.", ".up_proj.")
-            elif ".w2." in name:
-                new_name = name.replace(".w2.", ".down_proj.")
+            new_name = rename_lora_expert_w_to_proj_name(name)
             if new_name != name:
                 renames[name] = new_name
         for old_name, new_name in renames.items():
@@ -214,33 +164,12 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
-        for weight_name in weight_names:
-            if "gate_proj" in weight_name:
-                up_name = weight_name.replace("gate_proj", "up_proj")
-                gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                if up_name not in weights:
-                    weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert self.lora_backend.name in LORA_SUPPORTED_BACKENDS, (
-                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
-                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
-                        f"or consider implementing custom initialization logic for other backends."
-                    )
-                cat_dim = weights[weight_name].dim() - 2
-                weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), cat_dim
-                )
-                weights.pop(weight_name)
-                if up_name in weights:
-                    weights.pop(up_name)
-            elif "gate_up_proj" in weight_name:
-                # If gate_up_proj is already stacked, we normalize it following the SGL convention
-                gate_up_name = weight_name
-                if "lora_A" in weight_name:
-                    ndim = weights[gate_up_name].dim()
-                    repeat_dims = [1] * ndim
-                    repeat_dims[ndim - 2] = 2
-                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
-                # else: no-op as LoRA B weight is already stacked.
+        del weight_names
+        normalize_lora_gate_up_weights(
+            weights,
+            backend_name=self.lora_backend.name,
+            supported_backend_names=set(LORA_SUPPORTED_BACKENDS),
+        )
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

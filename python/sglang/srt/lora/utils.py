@@ -7,6 +7,26 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
+_TARGET_MODULE_NAME_ALIASES = {
+    "q_proj": "qkv_proj",
+    "k_proj": "qkv_proj",
+    "v_proj": "qkv_proj",
+    "gate_proj": "gate_up_proj",
+    "up_proj": "gate_up_proj",
+    "embed_tokens": "embed_tokens",
+    "vocab_emb": "embed_tokens",
+    "embeddings": "embed_tokens",
+    "word_embeddings": "embed_tokens",
+    "lm_head": "lm_head",
+    "output": "lm_head",
+    "unembed_tokens": "lm_head",
+}
+
+_SHARED_EXPERT_RUNTIME_TARGET_MODULE_ALIASES = {
+    "gate_up_proj": "shared_expert.gate_up_proj",
+    "down_proj": "shared_expert.down_proj",
+}
+
 
 @dataclass
 class LoRABatchInfo:
@@ -50,6 +70,150 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def normalize_lora_target_module_name(name: str) -> str:
+    base_name = name.split(".")[-1]
+    return _TARGET_MODULE_NAME_ALIASES.get(base_name, base_name)
+
+
+def rewrite_lora_embedding_aliases_in_weight_name(name: str) -> str:
+    if "unembed_tokens" in name:
+        return name.replace("unembed_tokens", "lm_head")
+    return name
+
+
+def rename_lora_expert_w_to_proj_name(name: str) -> str:
+    if ".w1." in name:
+        return name.replace(".w1.", ".gate_proj.")
+    if ".w3." in name:
+        return name.replace(".w3.", ".up_proj.")
+    if ".w2." in name:
+        return name.replace(".w2.", ".down_proj.")
+    return name
+
+
+def normalize_lora_qkv_weights(weights: dict[str, torch.Tensor]) -> None:
+    weight_names = list(weights.keys())
+    target_modules = set()
+    for weight_name in weight_names:
+        if "k_proj" in weight_name:
+            target_modules.add("k_proj")
+        if "q_proj" in weight_name:
+            target_modules.add("q_proj")
+        if "v_proj" in weight_name:
+            target_modules.add("v_proj")
+        if "qkv_proj" in weight_name:
+            target_modules.add("qkv_proj")
+    if not target_modules:
+        return
+
+    for weight_name in weight_names:
+        if weight_name not in weights:
+            continue
+        if "q_proj" in weight_name:
+            q_name = weight_name
+            k_name = weight_name.replace("q_proj", "k_proj")
+            v_name = weight_name.replace("q_proj", "v_proj")
+            qkv_name = weight_name.replace("q_proj", "qkv_proj")
+
+            k_proj_weight = (
+                weights[k_name]
+                if "k_proj" in target_modules and k_name in weights
+                else torch.zeros_like(weights[v_name])
+            )
+            weights[qkv_name] = torch.cat(
+                (
+                    weights[q_name],
+                    k_proj_weight,
+                    weights[v_name],
+                ),
+                0,
+            )
+            weights.pop(q_name, None)
+            if "k_proj" in target_modules:
+                weights.pop(k_name, None)
+            weights.pop(v_name, None)
+        elif "qkv_proj" in weight_name:
+            if "lora_A" in weight_name:
+                weights[weight_name] = weights[weight_name].repeat(3, 1)
+
+
+def normalize_lora_gate_up_weights(
+    weights: dict[str, torch.Tensor],
+    *,
+    backend_name: str | None = None,
+    supported_backend_names: set[str] | None = None,
+) -> None:
+    weight_names = list(weights.keys())
+    for weight_name in weight_names:
+        if weight_name not in weights:
+            continue
+        if "gate_proj" in weight_name:
+            up_name = weight_name.replace("gate_proj", "up_proj")
+            gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+            if up_name not in weights:
+                if (
+                    backend_name is not None
+                    and supported_backend_names is not None
+                    and backend_name not in supported_backend_names
+                ):
+                    raise AssertionError(
+                        "LoRA weight initialization for missing up_proj is only "
+                        f"supported for backends {sorted(supported_backend_names)}. "
+                        f"Received backend: {backend_name}."
+                    )
+                weights[up_name] = torch.zeros_like(weights[weight_name])
+            cat_dim = weights[weight_name].dim() - 2
+            weights[gate_up_name] = torch.cat(
+                (weights[weight_name], weights[up_name]), cat_dim
+            )
+            weights.pop(weight_name, None)
+            weights.pop(up_name, None)
+        elif "gate_up_proj" in weight_name:
+            if "lora_A" in weight_name:
+                ndim = weights[weight_name].dim()
+                repeat_dims = [1] * ndim
+                repeat_dims[ndim - 2] = 2
+                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+
+
+def is_shared_expert_module_name(name: str) -> bool:
+    return ".shared_expert." in name or ".shared_experts." in name
+
+
+def get_runtime_lora_target_module_name(
+    full_module_name: str, target_modules: Set[str]
+) -> str:
+    target_module = get_target_module_name(full_module_name, target_modules)
+    if is_shared_expert_module_name(full_module_name):
+        return _SHARED_EXPERT_RUNTIME_TARGET_MODULE_ALIASES.get(
+            target_module, target_module
+        )
+    return target_module
+
+
+def get_shared_expert_intermediate_size(config: AutoConfig) -> int:
+    shared_intermediate = getattr(config, "shared_expert_intermediate_size", None)
+    if shared_intermediate:
+        return shared_intermediate
+
+    shared_intermediate = getattr(config, "moe_shared_expert_intermediate_size", None)
+    if shared_intermediate:
+        return shared_intermediate
+
+    num_shared_experts = getattr(config, "n_shared_experts", None)
+    if not num_shared_experts:
+        num_shared_experts = getattr(config, "num_shared_experts", None)
+
+    moe_intermediate = getattr(config, "moe_intermediate_size", None)
+    if moe_intermediate is not None and num_shared_experts:
+        return moe_intermediate * num_shared_experts
+
+    if moe_intermediate is not None:
+        return moe_intermediate
+
+    return config.intermediate_size
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -75,8 +239,10 @@ def get_hidden_dim(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         if module_name == "qkv_proj":
+            q_proj_multiplier = 2 if getattr(config, "attn_output_gate", False) else 1
             return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
+                config.num_attention_heads * q_proj_multiplier
+                + config.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
             return (
@@ -87,6 +253,10 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "shared_expert.gate_up_proj":
+            return config.hidden_size, get_shared_expert_intermediate_size(config) * 2
+        elif module_name == "shared_expert.down_proj":
+            return get_shared_expert_intermediate_size(config), config.hidden_size
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
                 getattr(config, "moe_intermediate_size", None)
@@ -134,26 +304,9 @@ def get_normalized_target_modules(
             )
         return {"all"}
 
-    params_mapping = {
-        "q_proj": "qkv_proj",
-        "k_proj": "qkv_proj",
-        "v_proj": "qkv_proj",
-        "gate_proj": "gate_up_proj",
-        "up_proj": "gate_up_proj",
-        "embed_tokens": "embed_tokens",
-        "vocab_emb": "embed_tokens",
-        "embeddings": "embed_tokens",
-        "word_embeddings": "embed_tokens",
-        "lm_head": "lm_head",
-        "output": "lm_head",
-        "unembed_tokens": "lm_head",
-    }
-
     result = set()
     for name in target_modules:
-        base_name = name.split(".")[-1]
-        normalized_name = params_mapping.get(base_name, base_name)
-        result.add(normalized_name)
+        result.add(normalize_lora_target_module_name(name))
     return result
 
 
@@ -164,6 +317,7 @@ def get_stacked_multiply(module_name: str) -> int:
     stacked_rank = {
         "qkv_proj": 3,
         "gate_up_proj": 2,
+        "shared_expert.gate_up_proj": 2,
         "gate_up_proj_moe": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
@@ -185,7 +339,12 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "o_proj",
+    "down_proj",
+    "shared_expert.down_proj",
+    "down_proj_moe",
+]
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).

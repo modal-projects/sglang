@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import re
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -76,6 +77,12 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.qwen3_5_weight_mapping import (
+    QWEN3_5_FUSED_EXPERT_PARAMS_MAPPING,
+    QWEN3_5_IGNORE_SUFFIXES,
+    QWEN3_5_STACKED_PARAMS_MAPPING,
+    normalize_qwen3_5_checkpoint_name,
+)
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -878,6 +885,39 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
+def _get_qwen3_5_weights_by_name(
+    module: nn.Module,
+    name: str,
+    truncate_size: int = 100,
+    tp_size: int = 1,
+) -> Optional[list]:
+    """Debug-only weight inspection helper used by update-weight tests."""
+    try:
+        if name == "lm_head.weight" and getattr(module.config, "tie_word_embeddings", False):
+            logger.info(
+                "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
+            )
+            if hasattr(module, "model") and hasattr(module.model, "embed_tokens"):
+                weight = module.model.embed_tokens.weight
+            else:
+                weight = module.embed_tokens.weight
+        else:
+            params_dict = dict(module.named_parameters(remove_duplicate=False))
+            weight = params_dict[name].data
+
+        if tp_size > 1 and any(
+            proj_name in name for proj_name in ("o_proj", "down_proj", "out_proj")
+        ):
+            gathered_weights = [torch.zeros_like(weight) for _ in range(tp_size)]
+            torch.distributed.all_gather(gathered_weights, weight)
+            weight = torch.cat(gathered_weights, dim=1)
+
+        return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+    except Exception as exc:
+        logger.error("Error getting weights by name %s in Qwen3.5 model: %s", name, exc)
+        return None
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -1021,19 +1061,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
-        ]
+        stacked_params_mapping = QWEN3_5_STACKED_PARAMS_MAPPING
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1044,10 +1072,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
             if "visual" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = normalize_qwen3_5_checkpoint_name(name)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1090,6 +1115,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100, tp_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        return _get_qwen3_5_weights_by_name(
+            self, name, truncate_size=truncate_size, tp_size=tp_size
+        )
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
@@ -1109,19 +1141,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
-        ]
+        stacked_params_mapping = QWEN3_5_STACKED_PARAMS_MAPPING
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1133,24 +1153,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
-        ignore_suffixes = (
-            ".bias",
-            "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
-            ".weight_scale",
-            "_weight_scale",
-            ".input_scale",
-            "_input_scale",
-        )
+        ignore_suffixes = QWEN3_5_IGNORE_SUFFIXES
 
         is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
+        fused_expert_params_mapping = QWEN3_5_FUSED_EXPERT_PARAMS_MAPPING
 
         num_experts = self.config.num_experts
 
@@ -1187,10 +1193,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 continue
             if "visual" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = normalize_qwen3_5_checkpoint_name(name)
 
             layer_id = get_layer_id(name)
             if (
@@ -1314,6 +1317,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
         hf_to_sglang_mapper = None
 
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:"
+        r"(?:(?:self_attn\.)?(?:qkv_proj|o_proj))"
+        r"|mlp\.(?:gate_up_proj|down_proj)"
+        r"|mlp\.shared_expert\.(?:gate_up_proj|down_proj)"
+        r"|linear_attn\.(?:in_proj_qkvz|in_proj_ba|out_proj|conv1d)"
+        r")$"
+    )
+
     def __init__(
         self,
         config: Qwen3_5Config,
@@ -1348,6 +1360,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight
@@ -1359,19 +1374,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
-        ]
+        stacked_params_mapping = QWEN3_5_STACKED_PARAMS_MAPPING
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -1380,10 +1383,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = normalize_qwen3_5_checkpoint_name(name)
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -1443,6 +1443,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         return loaded_params
 
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100, tp_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        return _get_qwen3_5_weights_by_name(
+            self, name, truncate_size=truncate_size, tp_size=tp_size
+        )
+
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
@@ -1450,6 +1457,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     if _is_gfx95:
         packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
         hf_to_sglang_mapper = None
+
+    _lora_pattern = Qwen3_5ForConditionalGeneration._lora_pattern
 
     def __init__(
         self,
@@ -1471,6 +1480,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight
@@ -1482,19 +1494,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
-        ]
+        stacked_params_mapping = QWEN3_5_STACKED_PARAMS_MAPPING
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1506,22 +1506,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
-        ignore_suffixes = (
-            ".bias",
-            "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
-            "_weight_scale",
-            "_input_scale",
+        ignore_suffixes = tuple(
+            suffix
+            for suffix in QWEN3_5_IGNORE_SUFFIXES
+            if suffix not in {".weight_scale", ".input_scale"}
         )
 
         is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
+        fused_expert_params_mapping = QWEN3_5_FUSED_EXPERT_PARAMS_MAPPING
 
         num_experts = self.config.num_experts
 
@@ -1556,10 +1548,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = normalize_qwen3_5_checkpoint_name(name)
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -1706,6 +1695,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         return loaded_params
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100, tp_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        return _get_qwen3_5_weights_by_name(
+            self, name, truncate_size=truncate_size, tp_size=tp_size
+        )
 
     @property
     def routed_experts_weights_of_layer(self):

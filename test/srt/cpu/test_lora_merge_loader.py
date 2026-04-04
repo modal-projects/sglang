@@ -13,6 +13,7 @@ class DummyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.layer = nn.Linear(3, 2, bias=False)
+        self.bf16_weight = nn.Parameter(torch.tensor([[256.0]], dtype=torch.bfloat16))
         self.conv_weight = nn.Parameter(
             torch.arange(6, dtype=torch.float32).reshape(2, 1, 3)
         )
@@ -104,6 +105,47 @@ class TestLoRAMergeLoader(unittest.TestCase):
 
         expected = base_weight + 2.0 * torch.matmul(lora_b, lora_a)
         self.assertTrue(torch.allclose(model.layer.weight, expected))
+
+    def test_merge_accumulates_in_fp32_before_casting_back(self):
+        model = DummyModel()
+        base_weight = model.bf16_weight.detach().clone()
+        lora_a = torch.tensor([[1.0]], dtype=torch.float32)
+        first_lora_b = torch.tensor([[0.501]], dtype=torch.float32)
+        second_lora_b = torch.tensor([[0.501]], dtype=torch.float32)
+
+        apply_lora_merge_from_tensors(
+            model,
+            [
+                ("first_a", lora_a),
+                ("first_b", first_lora_b),
+                ("second_a", lora_a),
+                ("second_b", second_lora_b),
+            ],
+            loader_metadata={
+                "targets": [
+                    {
+                        "target_name": "bf16_weight",
+                        "components": [
+                            {
+                                "lora_a_name": "first_a",
+                                "lora_b_name": "first_b",
+                            },
+                            {
+                                "lora_a_name": "second_a",
+                                "lora_b_name": "second_b",
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+
+        expected = (
+            base_weight.to(torch.float32)
+            + torch.tensor([[1.002]], dtype=torch.float32)
+        ).to(torch.bfloat16)
+        self.assertEqual(model.bf16_weight.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(model.bf16_weight, expected))
 
     def test_merge_supports_singleton_middle_dim_weights(self):
         model = DummyModel()

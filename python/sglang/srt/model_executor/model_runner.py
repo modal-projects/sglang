@@ -1727,7 +1727,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
-            base_hf_config=self.model_config.hf_config,
+            # LoRA shape logic expects the language/text config, not the parent
+            # multimodal wrapper config.
+            base_hf_config=self.model_config.hf_text_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,

@@ -38,7 +38,7 @@ from sglang.srt.lora.utils import (
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
-    get_target_module_name,
+    get_runtime_lora_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -347,7 +347,7 @@ class LoRAManager:
                     )
                     continue
 
-                target_module = get_target_module_name(
+                target_module = get_runtime_lora_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
 

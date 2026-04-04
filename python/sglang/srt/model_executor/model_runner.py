@@ -1643,69 +1643,126 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
         loader_metadata: Optional[Dict[str, Any]] = None,
+        transport_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
+        if transport_format is None and load_format == "flattened_bucket":
+            inner_load_format = None
+            if loader_metadata is not None:
+                inner_load_format = loader_metadata.get("inner_load_format")
+            load_format = inner_load_format
+            transport_format = "flattened_bucket"
 
         # We need to get device after patch otherwise the device would be wrong
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
+        sync_after_update = bool(
+            loader_metadata and loader_metadata.get("synchronize_after_update")
+        )
+        if transport_format == "flattened_bucket":
+            self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors,
+                load_format=load_format,
+                loader_metadata=loader_metadata,
+                infered_device=infered_device,
+            )
+        elif transport_format is None:
+            self._apply_named_tensor_batch(
+                named_tensors=named_tensors,
+                load_format=load_format,
+                loader_metadata=loader_metadata,
+                infered_device=infered_device,
+            )
+        else:
+            raise NotImplementedError(f"Unknown transport_format={transport_format}")
+        if sync_after_update:
+            with torch.profiler.record_function("weight_sync.device_synchronize"):
+                self.device_module.synchronize()
+        return True, "Success"
+
+    def _apply_named_tensor_batch(
+        self,
+        *,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        load_format: Optional[str],
+        loader_metadata: Optional[Dict[str, Any]],
+        infered_device: Union[int, str, torch.device],
+    ) -> None:
+        with torch.profiler.record_function("weight_sync.unwrap_tensors"):
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
+
         if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
+            with torch.profiler.record_function("weight_sync.load_weights_direct"):
+                _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            _call_custom_weight_loader(
-                custom_loader,
-                self.model,
-                named_tensors,
-                loader_metadata=loader_metadata,
-            )
+            with torch.profiler.record_function("weight_sync.custom_loader"):
+                _call_custom_weight_loader(
+                    custom_loader,
+                    self.model,
+                    named_tensors,
+                    loader_metadata=loader_metadata,
+                )
         elif load_format is None:
-            self.model.load_weights(named_tensors)
+            with torch.profiler.record_function("weight_sync.model_load_weights"):
+                self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
 
     def _update_weights_from_flattened_bucket(
         self,
         flattened_tensor_bucket_dict,
+        *,
+        load_format: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        infered_device: Optional[Union[int, str, torch.device]] = None,
     ):
         """Handle flattened bucket format for weight updates"""
-        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
-        metadata = flattened_tensor_bucket_dict["metadata"]
-
-        # Convert metadata dict to our format
-        converted_metadata = []
-        for meta in metadata:
-            converted_meta = FlattenedTensorMetadata(
-                name=meta.name,
-                shape=meta.shape,
-                dtype=meta.dtype,
-                start_idx=meta.start_idx,
-                end_idx=meta.end_idx,
-                numel=meta.numel,
-            )
-            converted_metadata.append(converted_meta)
-
-        # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(
-            flattened_tensor=flattened_tensor, metadata=converted_metadata
+        if infered_device is None:
+            infered_device = self.device_module.current_device()
+        bucket_payloads = (
+            flattened_tensor_bucket_dict
+            if isinstance(flattened_tensor_bucket_dict, list)
+            else [flattened_tensor_bucket_dict]
         )
-        reconstructed_tensors = bucket.reconstruct_tensors()
 
-        # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
+        for bucket_payload in bucket_payloads:
+            flattened_tensor = bucket_payload["flattened_tensor"]
+            metadata = bucket_payload["metadata"]
 
-        return True, "Success"
+            converted_metadata = []
+            for meta in metadata:
+                converted_meta = FlattenedTensorMetadata(
+                    name=meta.name,
+                    shape=meta.shape,
+                    dtype=meta.dtype,
+                    start_idx=meta.start_idx,
+                    end_idx=meta.end_idx,
+                    numel=meta.numel,
+                )
+                converted_metadata.append(converted_meta)
+
+            with torch.profiler.record_function(
+                "weight_sync.reconstruct_flattened_bucket"
+            ):
+                bucket = FlattenedTensorBucket(
+                    flattened_tensor=flattened_tensor, metadata=converted_metadata
+                )
+                reconstructed_tensors = bucket.reconstruct_tensors()
+
+            self._apply_named_tensor_batch(
+                named_tensors=reconstructed_tensors,
+                load_format=load_format,
+                loader_metadata=loader_metadata,
+                infered_device=infered_device,
+            )
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100

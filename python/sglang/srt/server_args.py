@@ -95,6 +95,10 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+WEIGHT_SYNC_CONSISTENCY_MODE_CHOICES = [
+    "strict",
+    "unsafe_reuse_kv",
+]
 
 QUANTIZATION_CHOICES = [
     "awq",
@@ -430,6 +434,9 @@ class ServerArgs:
     admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
+    weight_sync_consistency_mode: str = os.getenv(
+        "SGLANG_WEIGHT_SYNC_CONSISTENCY_MODE", "strict"
+    )
     chat_template: Optional[str] = None
     hf_chat_template_name: Optional[str] = None
     completion_template: Optional[str] = None
@@ -4455,6 +4462,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Version identifier for the model weights. Defaults to 'default' if not specified.",
+        )
+        parser.add_argument(
+            "--weight-sync-consistency-mode",
+            type=str,
+            default=ServerArgs.weight_sync_consistency_mode,
+            choices=WEIGHT_SYNC_CONSISTENCY_MODE_CHOICES,
+            help="Controls post-update engine semantics. 'strict' preserves the current correctness-oriented behavior. "
+            "'unsafe_reuse_kv' skips KV-cache flush after weight sync so stale KV may be reused across policy versions.",
         )
         parser.add_argument(
             "--chat-template",

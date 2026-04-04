@@ -7,7 +7,6 @@ import os
 import time
 import uuid
 from collections import deque
-from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -21,6 +20,7 @@ from typing import (
 )
 
 import fastapi
+import torch
 import zmq
 
 from sglang.srt.managers.io_struct import (
@@ -241,6 +241,91 @@ class TokenizerCommunicatorMixin:
         )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
+
+    def _weight_sync_consistency_mode(self: TokenizerManager) -> str:
+        return getattr(
+            self.server_args,
+            "weight_sync_consistency_mode",
+            os.getenv("SGLANG_WEIGHT_SYNC_CONSISTENCY_MODE", "strict"),
+        )
+
+    def _should_bypass_model_update_writer_lock(self: TokenizerManager) -> bool:
+        return self._weight_sync_consistency_mode() == "unsafe_reuse_kv"
+
+    def _store_last_weight_update_timing(
+        self: TokenizerManager, timing: Dict[str, Any]
+    ) -> None:
+        self.last_weight_update_timing = dict(timing)
+
+    async def _run_with_model_update_writer_lock(
+        self: TokenizerManager,
+        *,
+        is_paused: bool,
+        wait_scope: str,
+        locked_scope: str,
+        fn,
+    ):
+        consistency_mode = self._weight_sync_consistency_mode()
+        timing: Dict[str, Any] = {
+            "consistency_mode": consistency_mode,
+            "writer_lock_wait_ms": 0.0,
+            "tokenizer_critical_section_ms": 0.0,
+            "resume_admissions_ms": 0.0,
+            "writer_lock_bypassed": False,
+            "engine_paused": bool(is_paused),
+        }
+        overall_start = time.perf_counter()
+        if is_paused:
+            locked_start = time.perf_counter()
+            try:
+                with torch.profiler.record_function(locked_scope):
+                    return await fn()
+            finally:
+                timing["tokenizer_critical_section_ms"] = (
+                    time.perf_counter() - locked_start
+                ) * 1000.0
+                timing["tokenizer_gate_total_ms"] = (
+                    time.perf_counter() - overall_start
+                ) * 1000.0
+                self._last_model_update_lock_timing = timing
+
+        if self._should_bypass_model_update_writer_lock():
+            timing["writer_lock_bypassed"] = True
+            locked_start = time.perf_counter()
+            with torch.profiler.record_function("weight_sync.unsafe_skip_writer_lock"):
+                try:
+                    return await fn()
+                finally:
+                    timing["tokenizer_critical_section_ms"] = (
+                        time.perf_counter() - locked_start
+                    ) * 1000.0
+                    timing["tokenizer_gate_total_ms"] = (
+                        time.perf_counter() - overall_start
+                    ) * 1000.0
+                    self._last_model_update_lock_timing = timing
+
+        wait_start = time.perf_counter()
+        with torch.profiler.record_function(wait_scope):
+            await self.model_update_lock.acquire_writer()
+        timing["writer_lock_wait_ms"] = (time.perf_counter() - wait_start) * 1000.0
+        try:
+            locked_start = time.perf_counter()
+            with torch.profiler.record_function(locked_scope):
+                return await fn()
+        finally:
+            timing["tokenizer_critical_section_ms"] = (
+                time.perf_counter() - locked_start
+            ) * 1000.0
+            resume_start = time.perf_counter()
+            with torch.profiler.record_function("weight_sync.resume_admissions"):
+                await self.model_update_lock.release_writer()
+            timing["resume_admissions_ms"] = (
+                time.perf_counter() - resume_start
+            ) * 1000.0
+            timing["tokenizer_gate_total_ms"] = (
+                time.perf_counter() - overall_start
+            ) * 1000.0
+            self._last_model_update_lock_timing = timing
 
     def _get_communicator_dispatcher(self: TokenizerManager):
         return TypeBasedDispatcher(
@@ -517,18 +602,39 @@ class TokenizerCommunicatorMixin:
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
+        timing: Dict[str, Any] = {
+            "update_api": "update_weights_from_distributed",
+            "abort_all_requests": bool(obj.abort_all_requests),
+        }
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
+        async def _perform_update():
+            communicator_start = time.perf_counter()
             results = await self.update_weights_from_distributed_communicator(obj)
+            timing["communicator_roundtrip_ms"] = (
+                time.perf_counter() - communicator_start
+            ) * 1000.0
+            timing["scheduler_result_count"] = len(results)
+            return results
+
+        results = await self._run_with_model_update_writer_lock(
+            is_paused=is_paused,
+            wait_scope="weight_sync.wait_for_writer_lock",
+            locked_scope="weight_sync.tokenizer_update_distributed",
+            fn=_perform_update,
+        )
 
         success, message = _Communicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+        timing.update(self._last_model_update_lock_timing or {})
+        if success:
+            self._record_successful_weight_update(
+                weight_version=obj.weight_version,
+                payload_digest=getattr(obj, "payload_digest", None),
+            )
+            if obj.weight_version is not None:
+                message += f" Weight version updated to {obj.weight_version}."
 
+        timing["success"] = success
+        self._store_last_weight_update_timing(timing)
         return success, message
 
     async def init_weights_send_group_for_remote_instance(
@@ -575,31 +681,63 @@ class TokenizerCommunicatorMixin:
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
+        timing: Dict[str, Any] = {
+            "update_api": "update_weights_from_tensor",
+            "abort_all_requests": bool(obj.abort_all_requests),
+        }
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
+        async def _perform_update():
+            validation_start = time.perf_counter()
             success, message, is_noop = self._validate_weight_update_request(obj)
+            timing["validation_ms"] = (time.perf_counter() - validation_start) * 1000.0
+            timing["validation_noop"] = bool(is_noop)
             if not success:
-                return success, message
+                timing["communicator_roundtrip_ms"] = 0.0
+                return success, message, is_noop
             if is_noop:
-                return True, message
+                timing["communicator_roundtrip_ms"] = 0.0
+                return True, message, is_noop
+            communicator_start = time.perf_counter()
             results = await self.update_weights_from_tensor_communicator(obj)
+            timing["communicator_roundtrip_ms"] = (
+                time.perf_counter() - communicator_start
+            ) * 1000.0
+            timing["scheduler_result_count"] = len(results)
+            return results
+
+        tensor_update_result = await self._run_with_model_update_writer_lock(
+            is_paused=is_paused,
+            wait_scope="weight_sync.wait_for_writer_lock",
+            locked_scope="weight_sync.tokenizer_update_tensor",
+            fn=_perform_update,
+        )
+        timing.update(self._last_model_update_lock_timing or {})
+        if isinstance(tensor_update_result, tuple):
+            success, message, _ = tensor_update_result
+            timing["success"] = success
+            self._store_last_weight_update_timing(timing)
+            return success, message
+        results = tensor_update_result
 
         success, message = _Communicator.merge_results(results)
-        if not success and obj.crash_on_error:
+        if not success and getattr(obj, "crash_on_error", False):
+            timing["success"] = success
+            self._store_last_weight_update_timing(timing)
             logger.critical(
                 "Crashing after failed weight update because crash_on_error=True: %s",
                 message,
             )
             kill_process_tree(os.getpid())
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(
-                obj.weight_version, payload_digest=obj.payload_digest
+        if success:
+            self._record_successful_weight_update(
+                weight_version=obj.weight_version,
+                payload_digest=getattr(obj, "payload_digest", None),
             )
-            message += f" Weight version updated to {obj.weight_version}."
+            if obj.weight_version is not None:
+                message += f" Weight version updated to {obj.weight_version}."
 
+        timing["success"] = success
+        self._store_last_weight_update_timing(timing)
         return success, message
 
     async def update_weights_from_ipc(
@@ -615,19 +753,49 @@ class TokenizerCommunicatorMixin:
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
-            # This means that weight sync cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
-                result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                success, message = result.success, result.message
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+            timing: Dict[str, Any] = {
+                "update_api": "update_weights_from_ipc",
+                "abort_all_requests": False,
+            }
+
+            async def _perform_update():
+                communicator_start = time.perf_counter()
+                results = await self.update_weights_from_ipc_communicator(obj)
+                timing["communicator_roundtrip_ms"] = (
+                    time.perf_counter() - communicator_start
+                ) * 1000.0
+                timing["scheduler_result_count"] = len(results)
+                result = results[0]
+                return result.success, result.message
+
+            success, message = await self._run_with_model_update_writer_lock(
+                is_paused=is_paused,
+                wait_scope="weight_sync.wait_for_writer_lock",
+                locked_scope="weight_sync.tokenizer_update_ipc",
+                fn=_perform_update,
+            )
+            timing.update(self._last_model_update_lock_timing or {})
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
             success, message = False, error_msg
+            timing = {
+                "update_api": "update_weights_from_ipc",
+                "abort_all_requests": False,
+            }
 
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+        if success:
+            self._record_successful_weight_update(
+                weight_version=obj.weight_version,
+                payload_digest=getattr(obj, "payload_digest", None),
+            )
+            if obj.weight_version is not None:
+                message += f" Weight version updated to {obj.weight_version}."
 
+        timing["success"] = success
+        self._store_last_weight_update_timing(timing)
         return success, message
 
     async def _unload_lora_adapter_locked(
@@ -984,15 +1152,29 @@ class TokenizerCommunicatorMixin:
             self.server_args.weight_version = weight_version
             self.weight_update_payload_digest = payload_digest
 
+    def _record_successful_weight_update(
+        self: TokenizerManager,
+        *,
+        weight_version: Optional[str],
+        payload_digest: Optional[str] = None,
+    ) -> None:
+        self.weight_update_epoch = getattr(self, "weight_update_epoch", 0) + 1
+        if weight_version is not None:
+            self.server_args.weight_version = weight_version
+        self.weight_update_payload_digest = payload_digest
+
     def _validate_weight_update_request(
         self: TokenizerManager, obj: UpdateWeightsFromTensorReqInput
     ) -> Tuple[bool, str, bool]:
         """Validate version / digest constraints for tensor-based weight updates."""
         current_version = self.server_args.weight_version
-        current_digest = self.weight_update_payload_digest
+        current_digest = getattr(self, "weight_update_payload_digest", None)
+        target_version = getattr(obj, "weight_version", None)
+        payload_digest = getattr(obj, "payload_digest", None)
+        base_weight_version = getattr(obj, "base_weight_version", None)
 
-        if obj.weight_version is not None and current_version == obj.weight_version:
-            if obj.payload_digest is None or current_digest is None:
+        if target_version is not None and current_version == target_version:
+            if payload_digest is None or current_digest is None:
                 return (
                     False,
                     "Target weight version is already active. "
@@ -1000,7 +1182,7 @@ class TokenizerCommunicatorMixin:
                     False,
                 )
 
-            if current_digest == obj.payload_digest:
+            if current_digest == payload_digest:
                 return (
                     True,
                     "Weight update already applied; payload digest matches the active version.",
@@ -1013,14 +1195,11 @@ class TokenizerCommunicatorMixin:
                 False,
             )
 
-        if (
-            obj.base_weight_version is not None
-            and obj.base_weight_version != current_version
-        ):
+        if base_weight_version is not None and base_weight_version != current_version:
             return (
                 False,
                 "Base weight version mismatch: "
-                f"expected {obj.base_weight_version}, current {current_version}.",
+                f"expected {base_weight_version}, current {current_version}.",
                 False,
             )
 

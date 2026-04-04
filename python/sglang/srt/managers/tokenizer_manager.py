@@ -24,6 +24,8 @@ import signal
 import socket
 import sys
 import threading
+import time
+import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -114,6 +116,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.weight_sync.update_bytes import (
+    build_update_weights_request_from_named_tensors,
+    load_named_tensors_from_bytes,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -136,6 +142,8 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    weight_version_before: Optional[str] = None
+    weight_update_epoch_before: int = 0
 
     # For streaming output
     last_output_offset: int = 0
@@ -374,8 +382,117 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             None
         )
         self.weight_update_payload_digest: Optional[str] = None
+        self.weight_update_epoch: int = 0
+        self.last_weight_update_timing: Optional[Dict[str, Any]] = None
+        self._last_model_update_lock_timing: Optional[Dict[str, Any]] = None
+        self.prepared_weight_updates: Dict[str, Dict[str, Any]] = {}
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+
+    async def prepare_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        crash_on_error: bool = False,
+        disable_draft_model: Optional[bool] = None,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
+        request: Optional[fastapi.Request] = None,
+    ) -> Dict[str, Any]:
+        self.auto_create_handle_loop()
+
+        decode_start = time.perf_counter()
+        named_tensors = await asyncio.to_thread(
+            load_named_tensors_from_bytes,
+            weights_bytes,
+            tensor_format=tensor_format,
+        )
+        decode_done = time.perf_counter()
+
+        update_req = await asyncio.to_thread(
+            build_update_weights_request_from_named_tensors,
+            named_tensors,
+            tp_size=self.server_args.tp_size,
+            load_format=load_format,
+            transport_format=transport_format,
+            transport_bucket_bytes=transport_bucket_bytes,
+            flush_cache=flush_cache,
+            abort_all_requests=abort_all_requests,
+            base_weight_version=base_weight_version,
+            weight_version=weight_version,
+            payload_digest=payload_digest,
+            loader_metadata=loader_metadata,
+            crash_on_error=crash_on_error,
+            disable_draft_model=disable_draft_model,
+        )
+        request_done = time.perf_counter()
+
+        update_handle = uuid.uuid4().hex
+        prepare_stats = {
+            "payload_bytes": len(weights_bytes),
+            "tensor_count": len(named_tensors),
+            "decode_ms": (decode_done - decode_start) * 1000.0,
+            "request_build_ms": (request_done - decode_done) * 1000.0,
+            "prepare_ms": (request_done - decode_start) * 1000.0,
+            "load_format": update_req.load_format,
+            "transport_format": getattr(update_req, "transport_format", None),
+            "transport_metadata": getattr(update_req, "transport_metadata", None),
+            "tensor_format": tensor_format,
+        }
+        self.prepared_weight_updates[update_handle] = {
+            "update_req": update_req,
+            "prepare_stats": prepare_stats,
+        }
+        return {
+            "success": True,
+            "message": "Prepared weight update from bytes.",
+            "update_handle": update_handle,
+            "prepare_stats": prepare_stats,
+        }
+
+    async def commit_prepared_weight_update(
+        self,
+        update_handle: str,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        prepared = self.prepared_weight_updates.get(update_handle)
+        if prepared is None:
+            return False, f"Unknown prepared weight update handle: {update_handle}."
+        return await self.update_weights_from_tensor(prepared["update_req"], request)
+
+    async def discard_prepared_weight_update(
+        self,
+        update_handle: str,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        prepared = self.prepared_weight_updates.pop(update_handle, None)
+        if prepared is None:
+            return False, f"Unknown prepared weight update handle: {update_handle}."
+        return True, f"Discarded prepared weight update handle: {update_handle}."
+
+    def _build_request_weight_update_meta(self, state: ReqState) -> Dict[str, Any]:
+        after_version = self.server_args.weight_version
+        after_epoch = getattr(self, "weight_update_epoch", 0)
+        before_version = state.weight_version_before
+        before_epoch = state.weight_update_epoch_before
+        return {
+            "weight_version": after_version,
+            "weight_version_before": before_version,
+            "weight_version_after": after_version,
+            "weight_update_epoch_before": before_epoch,
+            "weight_update_epoch_after": after_epoch,
+            "weight_update_crossed": after_epoch != before_epoch,
+        }
 
     def init_lora(self):
         # LoRA
@@ -1411,17 +1528,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.is_pause_cond:
             is_paused = self.is_pause
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
+        lock_context = nullcontext()
+        if not is_paused and not self._should_bypass_model_update_writer_lock():
+            lock_context = self.model_update_lock.writer_lock
         async with lock_context:
             success, message, num_paused_requests = (
                 await self._wait_for_model_update_from_disk(obj)
             )
 
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+        if success:
+            self._record_successful_weight_update(weight_version=obj.weight_version)
+            if obj.weight_version is not None:
+                message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests
 
@@ -1542,9 +1660,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
             }
+            meta_info.update(self._build_request_weight_update_meta(state))
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2178,9 +2296,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        meta_info.update(self._build_request_weight_update_meta(state))
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
@@ -2312,7 +2430,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         if not hasattr(obj, "is_single") or obj.is_single:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-            state = ReqState([], False, asyncio.Event(), obj, time_stats)
+            state = ReqState(
+                [],
+                False,
+                asyncio.Event(),
+                obj,
+                time_stats,
+                weight_version_before=self.server_args.weight_version,
+                weight_update_epoch_before=self.weight_update_epoch,
+            )
             self.rid_to_state[obj.rid] = state
 
             if self.server_args.enable_trace:
@@ -2328,7 +2454,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             for i in range(len(obj.rid)):
                 time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-                state = ReqState([], False, asyncio.Event(), obj[i], time_stats)
+                state = ReqState(
+                    [],
+                    False,
+                    asyncio.Event(),
+                    obj[i],
+                    time_stats,
+                    weight_version_before=self.server_args.weight_version,
+                    weight_update_epoch_before=self.weight_update_epoch,
+                )
                 self.rid_to_state[obj.rid[i]] = state
 
                 if self.server_args.enable_trace:

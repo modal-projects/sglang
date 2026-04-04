@@ -47,10 +47,15 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
-from sglang.srt.model_loader.ci_weight_validation import (
-    ci_download_with_validation_and_retry,
-    ci_validate_and_cleanup_local_snapshot,
-)
+try:
+    from sglang.srt.model_loader.ci_weight_validation import (
+        ci_download_with_validation_and_retry,
+        ci_validate_and_cleanup_local_snapshot,
+    )
+except ModuleNotFoundError:
+    # Older runtime images do not ship the CI-only helper module.
+    ci_download_with_validation_and_retry = None
+    ci_validate_and_cleanup_local_snapshot = None
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -157,7 +162,7 @@ def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
+        kwargs.setdefault("disable", True)
         super().__init__(*args, **kwargs)
 
 
@@ -413,7 +418,11 @@ def _find_local_hf_snapshot_dir_unlocked(
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
+    if (
+        is_in_ci()
+        and ci_validate_and_cleanup_local_snapshot is not None
+        and local_weight_files
+    ):
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -510,7 +519,7 @@ def download_weights_from_hf(
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
             return hf_folder
-        else:
+        elif ci_download_with_validation_and_retry is not None:
             # Only perform validation and retry in CI to avoid overhead for regular users
             return ci_download_with_validation_and_retry(
                 model_name_or_path=model_name_or_path,
@@ -520,6 +529,17 @@ def download_weights_from_hf(
                 revision=revision,
                 max_retries=max_retries,
             )
+        else:
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+            return hf_folder
 
 
 def download_safetensors_index_file_from_hf(

@@ -103,7 +103,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.srt.weight_sync.update_bytes import (
     build_update_weights_request_from_named_tensors,
-    load_named_tensors_from_bytes,
+    normalize_weight_update_transport,
 )
 from sglang.version import __version__
 
@@ -907,6 +907,8 @@ class Engine(EngineBase):
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
         flush_cache: bool = True,
         weight_version: Optional[str] = None,
         base_weight_version: Optional[str] = None,
@@ -919,16 +921,38 @@ class Engine(EngineBase):
         If there are going to be more updates, set `flush_cache=False` to avoid
         duplicated cache cleaning work.
         """
-        if load_format == "flattened_bucket":
+        load_format, transport_format = normalize_weight_update_transport(
+            load_format=load_format,
+            transport_format=transport_format,
+        )
+        if (
+            transport_format == "flattened_bucket"
+            and named_tensors
+            and isinstance(named_tensors[0], (bytes, str))
+        ):
             serialized_named_tensors = named_tensors
         else:
-            serialized_named_tensors = [
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.tp_size)
-            ]
+            obj = build_update_weights_request_from_named_tensors(
+                named_tensors,
+                tp_size=self.server_args.tp_size,
+                load_format=load_format,
+                transport_format=transport_format,
+                transport_bucket_bytes=transport_bucket_bytes,
+                flush_cache=flush_cache,
+                base_weight_version=base_weight_version,
+                weight_version=weight_version,
+                payload_digest=payload_digest,
+                loader_metadata=loader_metadata,
+                crash_on_error=crash_on_error,
+            )
+            return self.loop.run_until_complete(
+                self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            )
+
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
+            transport_format=transport_format,
             flush_cache=flush_cache,
             weight_version=weight_version,
             base_weight_version=base_weight_version,
@@ -946,31 +970,83 @@ class Engine(EngineBase):
         *,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        abort_all_requests: bool = False,
         tensor_format: str = "safetensors",
         weight_version: Optional[str] = None,
         base_weight_version: Optional[str] = None,
         payload_digest: Optional[str] = None,
         loader_metadata: Optional[Dict] = None,
         crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
     ):
         """Update model weights from a self-describing byte payload."""
-        named_tensors = load_named_tensors_from_bytes(
+        prepared = self.prepare_weights_from_bytes(
             weights_bytes,
-            tensor_format=tensor_format,
-        )
-        obj = build_update_weights_request_from_named_tensors(
-            named_tensors,
-            tp_size=self.server_args.tp_size,
             load_format=load_format,
             flush_cache=flush_cache,
-            base_weight_version=base_weight_version,
+            abort_all_requests=abort_all_requests,
+            tensor_format=tensor_format,
             weight_version=weight_version,
+            base_weight_version=base_weight_version,
             payload_digest=payload_digest,
             loader_metadata=loader_metadata,
             crash_on_error=crash_on_error,
+            transport_format=transport_format,
+            transport_bucket_bytes=transport_bucket_bytes,
         )
+        update_handle = prepared["update_handle"]
+        try:
+            return self.commit_prepared_weight_update(update_handle)
+        finally:
+            self.discard_prepared_weight_update(update_handle)
+
+    def prepare_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
+    ):
         return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            self.tokenizer_manager.prepare_weights_from_bytes(
+                weights_bytes,
+                load_format=load_format,
+                flush_cache=flush_cache,
+                abort_all_requests=abort_all_requests,
+                tensor_format=tensor_format,
+                weight_version=weight_version,
+                base_weight_version=base_weight_version,
+                payload_digest=payload_digest,
+                loader_metadata=loader_metadata,
+                crash_on_error=crash_on_error,
+                transport_format=transport_format,
+                transport_bucket_bytes=transport_bucket_bytes,
+                request=None,
+            )
+        )
+
+    def commit_prepared_weight_update(self, update_handle: str):
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.commit_prepared_weight_update(
+                update_handle, request=None
+            )
+        )
+
+    def discard_prepared_weight_update(self, update_handle: str):
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.discard_prepared_weight_update(
+                update_handle, request=None
+            )
         )
 
     def update_weights_from_disk(

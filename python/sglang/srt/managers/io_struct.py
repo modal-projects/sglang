@@ -1285,6 +1285,10 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     serialized_named_tensors: List[Union[str, bytes]]
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Optional transport encoding for serialized_named_tensors.
+    transport_format: Optional[str] = None
+    # Optional transport metadata (for example, flattened bucket statistics).
+    transport_metadata: Optional[Dict[str, Any]] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Whether to abort all requests before updating weights

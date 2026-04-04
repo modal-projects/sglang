@@ -19,6 +19,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
+import inspect
+
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -48,6 +50,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.common import dynamic_import
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -157,14 +160,100 @@ class BaseTpWorker(ABC):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
-        success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
+        with torch.profiler.record_function("weight_sync.deserialize"):
+            named_tensors = MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
-            ),
-            load_format=recv_req.load_format,
-            loader_metadata=recv_req.loader_metadata,
-        )
+            )
+        loader_metadata = getattr(recv_req, "loader_metadata", None)
+        effective_load_format = recv_req.load_format
+        transport_format = getattr(recv_req, "transport_format", None)
+        if transport_format is None and effective_load_format == "flattened_bucket":
+            inner_load_format = None
+            if loader_metadata is not None:
+                inner_load_format = loader_metadata.get("inner_load_format")
+            effective_load_format = inner_load_format
+            transport_format = "flattened_bucket"
+        if transport_format == "flattened_bucket":
+            with torch.profiler.record_function(
+                "weight_sync.reconstruct_flattened_bucket"
+            ):
+                named_tensors = self._reconstruct_flattened_bucket_payload(
+                    named_tensors
+                )
+            transport_format = None
+        with torch.profiler.record_function("weight_sync.model_runner_update"):
+            update_kwargs = {
+                "named_tensors": named_tensors,
+                "load_format": effective_load_format,
+            }
+            update_sig = inspect.signature(self.model_runner.update_weights_from_tensor)
+            supports_loader_metadata = "loader_metadata" in update_sig.parameters
+            if supports_loader_metadata:
+                update_kwargs["loader_metadata"] = loader_metadata
+            if "transport_format" in update_sig.parameters:
+                update_kwargs["transport_format"] = transport_format
+            if (
+                loader_metadata
+                and effective_load_format in (self.server_args.custom_weight_loader or [])
+                and not supports_loader_metadata
+            ):
+                success, message = self._apply_custom_loader_with_metadata_compat(
+                    load_format=effective_load_format,
+                    named_tensors=named_tensors,
+                    loader_metadata=loader_metadata,
+                )
+            else:
+                success, message = self.model_runner.update_weights_from_tensor(
+                    **update_kwargs
+                )
         return success, message
+
+    def _reconstruct_flattened_bucket_payload(self, flattened_payload):
+        bucket_payloads = (
+            flattened_payload if isinstance(flattened_payload, list) else [flattened_payload]
+        )
+        reconstructed = []
+        for bucket_dict in bucket_payloads:
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=bucket_dict["flattened_tensor"],
+                metadata=bucket_dict["metadata"],
+            )
+            reconstructed.extend(bucket.reconstruct_tensors())
+        return reconstructed
+
+    def _apply_custom_loader_with_metadata_compat(
+        self,
+        *,
+        load_format: str,
+        named_tensors,
+        loader_metadata,
+    ):
+        custom_loader = dynamic_import(load_format)
+        try:
+            signature = inspect.signature(custom_loader)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is None:
+            custom_loader(self.model_runner.model, named_tensors)
+        else:
+            accepts_loader_metadata = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                or param.name == "loader_metadata"
+                for param in signature.parameters.values()
+            )
+            if accepts_loader_metadata:
+                custom_loader(
+                    self.model_runner.model,
+                    named_tensors,
+                    loader_metadata=loader_metadata,
+                )
+            else:
+                custom_loader(self.model_runner.model, named_tensors)
+
+        if loader_metadata.get("synchronize_after_update"):
+            torch.get_device_module(self.model_runner.device).synchronize()
+        return True, "Success"
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""

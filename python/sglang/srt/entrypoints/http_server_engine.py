@@ -81,6 +81,8 @@ class HttpServerEngineAdapter(EngineBase):
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
         flush_cache: bool = False,
         weight_version: Optional[str] = None,
         base_weight_version: Optional[str] = None,
@@ -101,6 +103,8 @@ class HttpServerEngineAdapter(EngineBase):
                     for _ in range(self.server_args.tp_size)
                 ],
                 "load_format": load_format,
+                "transport_format": transport_format,
+                "transport_bucket_bytes": transport_bucket_bytes,
                 "flush_cache": flush_cache,
                 "weight_version": weight_version,
                 "base_weight_version": base_weight_version,
@@ -116,22 +120,28 @@ class HttpServerEngineAdapter(EngineBase):
         *,
         load_format: Optional[str] = None,
         flush_cache: bool = False,
+        abort_all_requests: bool = False,
         tensor_format: str = "safetensors",
         weight_version: Optional[str] = None,
         base_weight_version: Optional[str] = None,
         payload_digest: Optional[str] = None,
         loader_metadata: Optional[Dict[str, Any]] = None,
         crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
     ):
         metadata = {
             "tensor_format": tensor_format,
             "load_format": load_format,
             "flush_cache": flush_cache,
+            "abort_all_requests": abort_all_requests,
             "weight_version": weight_version,
             "base_weight_version": base_weight_version,
             "payload_digest": payload_digest,
             "loader_metadata": loader_metadata,
             "crash_on_error": crash_on_error,
+            "transport_format": transport_format,
+            "transport_bucket_bytes": transport_bucket_bytes,
         }
         response = requests.post(
             f"{self.server_args.url()}/update_weights_from_bytes",
@@ -147,6 +157,62 @@ class HttpServerEngineAdapter(EngineBase):
         )
         response.raise_for_status()
         return response.json()
+
+    def prepare_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = False,
+        abort_all_requests: bool = False,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
+    ):
+        metadata = {
+            "tensor_format": tensor_format,
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+            "abort_all_requests": abort_all_requests,
+            "weight_version": weight_version,
+            "base_weight_version": base_weight_version,
+            "payload_digest": payload_digest,
+            "loader_metadata": loader_metadata,
+            "crash_on_error": crash_on_error,
+            "transport_format": transport_format,
+            "transport_bucket_bytes": transport_bucket_bytes,
+        }
+        response = requests.post(
+            f"{self.server_args.url()}/prepare_weights_from_bytes",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "weights_file": (
+                    "weights.safetensors",
+                    weights_bytes,
+                    "application/octet-stream",
+                )
+            },
+            verify=self.server_args.ssl_verify(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def commit_prepared_weight_update(self, update_handle: str):
+        return self._make_request(
+            "commit_prepared_weight_update",
+            {"update_handle": update_handle},
+        )
+
+    def discard_prepared_weight_update(self, update_handle: str):
+        return self._make_request(
+            "discard_prepared_weight_update",
+            {"update_handle": update_handle},
+        )
 
     def update_weights_from_safetensors(
         self,

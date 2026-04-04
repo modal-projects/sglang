@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -10,31 +11,39 @@ FUSED_EXPERT_RUNTIME_BACKEND_GENERIC = "generic"
 FUSED_EXPERT_RUNTIME_BACKEND_FLASHINFER_TRTLLM = "flashinfer_trtllm"
 
 
+def _record_profile_scope(name: str):
+    profiler = getattr(torch, "profiler", None)
+    if profiler is None or not hasattr(profiler, "record_function"):
+        return nullcontext()
+    return profiler.record_function(name)
+
+
 def apply_lora_merge_from_tensors(
     model,
     named_tensors: List[tuple[str, torch.Tensor]],
     loader_metadata: Optional[Dict[str, Any]] = None,
 ):
     """Merge LoRA factors into the live model weights in place."""
-    loader_metadata = loader_metadata or {}
-    tensor_dict = dict(named_tensors)
-    inferred_targets = _infer_targets_from_tensor_names(tensor_dict)
-    target_specs = _normalize_target_specs(loader_metadata, inferred_targets)
+    with _record_profile_scope("lora_sync.apply"):
+        loader_metadata = loader_metadata or {}
+        tensor_dict = dict(named_tensors)
+        inferred_targets = _infer_targets_from_tensor_names(tensor_dict)
+        target_specs = _normalize_target_specs(loader_metadata, inferred_targets)
 
-    params_dict = dict(model.named_parameters(remove_duplicate=False))
-    for target_spec in target_specs:
-        target_name = target_spec["target_name"]
-        if target_name not in params_dict:
-            # This is expected on PP ranks that do not own the target parameter.
-            continue
+        params_dict = dict(model.named_parameters(remove_duplicate=False))
+        for target_spec in target_specs:
+            target_name = target_spec["target_name"]
+            if target_name not in params_dict:
+                # This is expected on PP ranks that do not own the target parameter.
+                continue
 
-        target_param = params_dict[target_name]
-        _apply_target_update(
-            target_param,
-            target_spec,
-            tensor_dict=tensor_dict,
-            loader_metadata=loader_metadata,
-        )
+            target_param = params_dict[target_name]
+            _apply_target_update(
+                target_param,
+                target_spec,
+                tensor_dict=tensor_dict,
+                loader_metadata=loader_metadata,
+            )
 
 
 def _apply_target_update(
@@ -44,33 +53,37 @@ def _apply_target_update(
     tensor_dict: Dict[str, torch.Tensor],
     loader_metadata: Dict[str, Any],
 ) -> None:
-    fused_expert_runtime_backend = _resolve_fused_expert_runtime_backend(
-        target_param,
-        target_spec,
-    )
-    if fused_expert_runtime_backend == FUSED_EXPERT_RUNTIME_BACKEND_FLASHINFER_TRTLLM:
-        _apply_flashinfer_fused_expert_update(
+    with _record_profile_scope("lora_sync.target_update"):
+        fused_expert_runtime_backend = _resolve_fused_expert_runtime_backend(
+            target_param,
+            target_spec,
+        )
+        if (
+            fused_expert_runtime_backend
+            == FUSED_EXPERT_RUNTIME_BACKEND_FLASHINFER_TRTLLM
+        ):
+            _apply_flashinfer_fused_expert_update(
+                target_param,
+                target_spec,
+                tensor_dict=tensor_dict,
+                loader_metadata=loader_metadata,
+            )
+            return
+        if fused_expert_runtime_backend not in (
+            None,
+            FUSED_EXPERT_RUNTIME_BACKEND_GENERIC,
+        ):
+            raise NotImplementedError(
+                f"Unsupported fused expert runtime backend {fused_expert_runtime_backend!r}."
+            )
+
+        local_delta = _compile_local_lora_delta(
             target_param,
             target_spec,
             tensor_dict=tensor_dict,
             loader_metadata=loader_metadata,
         )
-        return
-    if fused_expert_runtime_backend not in (
-        None,
-        FUSED_EXPERT_RUNTIME_BACKEND_GENERIC,
-    ):
-        raise NotImplementedError(
-            f"Unsupported fused expert runtime backend {fused_expert_runtime_backend!r}."
-        )
-
-    local_delta = _compile_local_lora_delta(
-        target_param,
-        target_spec,
-        tensor_dict=tensor_dict,
-        loader_metadata=loader_metadata,
-    )
-    target_param.data.add_(local_delta)
+        target_param.data.add_(local_delta)
 
 
 def _compile_local_lora_delta(
@@ -81,38 +94,40 @@ def _compile_local_lora_delta(
     loader_metadata: Dict[str, Any],
 ) -> torch.Tensor:
     """Compile one or more LoRA factor pairs into a local runtime delta tensor."""
-    base_weight = target_param.data
-    total_delta = torch.zeros_like(base_weight)
-    for component_spec in _iter_target_components(target_spec):
-        lora_a_name = component_spec["lora_a_name"]
-        lora_b_name = component_spec["lora_b_name"]
-        if lora_a_name not in tensor_dict:
-            raise KeyError(
-                f"Missing LoRA A tensor {lora_a_name!r} for {target_spec['target_name']!r}."
-            )
-        if lora_b_name not in tensor_dict:
-            raise KeyError(
-                f"Missing LoRA B tensor {lora_b_name!r} for {target_spec['target_name']!r}."
-            )
+    with _record_profile_scope("lora_sync.compile_local_delta"):
+        base_weight = target_param.data
+        total_delta = torch.zeros_like(base_weight)
+        for component_spec in _iter_target_components(target_spec):
+            with _record_profile_scope("lora_sync.component"):
+                lora_a_name = component_spec["lora_a_name"]
+                lora_b_name = component_spec["lora_b_name"]
+                if lora_a_name not in tensor_dict:
+                    raise KeyError(
+                        f"Missing LoRA A tensor {lora_a_name!r} for {target_spec['target_name']!r}."
+                    )
+                if lora_b_name not in tensor_dict:
+                    raise KeyError(
+                        f"Missing LoRA B tensor {lora_b_name!r} for {target_spec['target_name']!r}."
+                    )
 
-        scaling = _resolve_scaling(component_spec, target_spec, loader_metadata)
-        component_delta = _compute_component_delta(
-            tensor_dict[lora_a_name],
-            tensor_dict[lora_b_name],
-            target_device=base_weight.device,
-            target_dtype=base_weight.dtype,
-            scaling=scaling,
-        )
-        total_delta.add_(
-            _place_component_delta(
-                target_param,
-                base_weight,
-                component_delta,
-                component_spec,
-            )
-        )
+                scaling = _resolve_scaling(component_spec, target_spec, loader_metadata)
+                component_delta = _compute_component_delta(
+                    tensor_dict[lora_a_name],
+                    tensor_dict[lora_b_name],
+                    target_device=base_weight.device,
+                    target_dtype=base_weight.dtype,
+                    scaling=scaling,
+                )
+                total_delta.add_(
+                    _place_component_delta(
+                        target_param,
+                        base_weight,
+                        component_delta,
+                        component_spec,
+                    )
+                )
 
-    return total_delta
+        return total_delta
 
 
 def _apply_flashinfer_fused_expert_update(
@@ -122,85 +137,86 @@ def _apply_flashinfer_fused_expert_update(
     tensor_dict: Dict[str, torch.Tensor],
     loader_metadata: Dict[str, Any],
 ) -> None:
-    layer = _get_weight_loader_owner(target_param)
-    if layer is None:
-        raise ValueError(
-            f"Unable to resolve fused expert layer for {target_spec.get('target_name')!r}."
-        )
-
-    target_attr_name = _get_fused_expert_param_attr_name(layer, target_param)
-    if target_attr_name is None:
-        raise ValueError(
-            f"Unable to resolve fused expert parameter for {target_spec.get('target_name')!r}."
-        )
-
-    canonical_shape = _get_fused_expert_canonical_shape(layer, target_attr_name)
-    packed_expert_shape = tuple(target_param.data.shape[1:])
-    temp_param = _make_scratch_param_like(
-        target_param,
-        shape=(1, *canonical_shape[1:]),
-    )
-    for component_spec in _iter_target_components(target_spec):
-        lora_a_name = component_spec["lora_a_name"]
-        lora_b_name = component_spec["lora_b_name"]
-        if lora_a_name not in tensor_dict:
-            raise KeyError(
-                f"Missing LoRA A tensor {lora_a_name!r} for {target_spec['target_name']!r}."
-            )
-        if lora_b_name not in tensor_dict:
-            raise KeyError(
-                f"Missing LoRA B tensor {lora_b_name!r} for {target_spec['target_name']!r}."
-            )
-
-        shard_id = _normalize_shard_id(component_spec.get("shard_id"))
-        if shard_id is None:
+    with _record_profile_scope("lora_sync.flashinfer_fused_expert"):
+        layer = _get_weight_loader_owner(target_param)
+        if layer is None:
             raise ValueError(
-                f"fused_experts target {target_spec['target_name']!r} requires shard_id."
+                f"Unable to resolve fused expert layer for {target_spec.get('target_name')!r}."
             )
 
-        scaling = _resolve_scaling(component_spec, target_spec, loader_metadata)
-        lora_a = tensor_dict[lora_a_name].to(
-            device=target_param.data.device,
-            dtype=target_param.data.dtype,
-        )
-        lora_b = tensor_dict[lora_b_name].to(
-            device=target_param.data.device,
-            dtype=target_param.data.dtype,
-        )
-        num_component_experts = _get_component_num_experts(lora_a, lora_b)
-        for expert_id in range(num_component_experts):
-            local_expert_id = _map_global_expert_id_to_local_expert_id_for_hot_update(
-                layer,
-                target_param,
-                expert_id,
+        target_attr_name = _get_fused_expert_param_attr_name(layer, target_param)
+        if target_attr_name is None:
+            raise ValueError(
+                f"Unable to resolve fused expert parameter for {target_spec.get('target_name')!r}."
             )
-            if local_expert_id is None:
-                continue
 
-            temp_param.data.zero_()
-            expert_delta = _compute_expert_component_delta(
-                lora_a,
-                lora_b,
-                expert_id=expert_id,
-                scaling=scaling,
-            )
-            _load_single_fused_expert_delta(
-                temp_param,
-                expert_delta,
-                component_spec,
-                shard_id=shard_id,
-            )
-            packed_delta = _pack_flashinfer_fused_expert_single_expert(
-                layer,
-                target_attr_name,
-                temp_param.data[0],
-            )
-            if tuple(packed_delta.shape) != packed_expert_shape:
-                raise ValueError(
-                    "FlashInfer fused expert packed delta shape mismatch: "
-                    f"expected {packed_expert_shape}, got {tuple(packed_delta.shape)}."
+        canonical_shape = _get_fused_expert_canonical_shape(layer, target_attr_name)
+        packed_expert_shape = tuple(target_param.data.shape[1:])
+        temp_param = _make_scratch_param_like(
+            target_param,
+            shape=(1, *canonical_shape[1:]),
+        )
+        for component_spec in _iter_target_components(target_spec):
+            lora_a_name = component_spec["lora_a_name"]
+            lora_b_name = component_spec["lora_b_name"]
+            if lora_a_name not in tensor_dict:
+                raise KeyError(
+                    f"Missing LoRA A tensor {lora_a_name!r} for {target_spec['target_name']!r}."
                 )
-            target_param.data[local_expert_id].add_(packed_delta)
+            if lora_b_name not in tensor_dict:
+                raise KeyError(
+                    f"Missing LoRA B tensor {lora_b_name!r} for {target_spec['target_name']!r}."
+                )
+
+            shard_id = _normalize_shard_id(component_spec.get("shard_id"))
+            if shard_id is None:
+                raise ValueError(
+                    f"fused_experts target {target_spec['target_name']!r} requires shard_id."
+                )
+
+            scaling = _resolve_scaling(component_spec, target_spec, loader_metadata)
+            lora_a = tensor_dict[lora_a_name].to(
+                device=target_param.data.device,
+                dtype=target_param.data.dtype,
+            )
+            lora_b = tensor_dict[lora_b_name].to(
+                device=target_param.data.device,
+                dtype=target_param.data.dtype,
+            )
+            num_component_experts = _get_component_num_experts(lora_a, lora_b)
+            for expert_id in range(num_component_experts):
+                local_expert_id = _map_global_expert_id_to_local_expert_id_for_hot_update(
+                    layer,
+                    target_param,
+                    expert_id,
+                )
+                if local_expert_id is None:
+                    continue
+
+                temp_param.data.zero_()
+                expert_delta = _compute_expert_component_delta(
+                    lora_a,
+                    lora_b,
+                    expert_id=expert_id,
+                    scaling=scaling,
+                )
+                _load_single_fused_expert_delta(
+                    temp_param,
+                    expert_delta,
+                    component_spec,
+                    shard_id=shard_id,
+                )
+                packed_delta = _pack_flashinfer_fused_expert_single_expert(
+                    layer,
+                    target_attr_name,
+                    temp_param.data[0],
+                )
+                if tuple(packed_delta.shape) != packed_expert_shape:
+                    raise ValueError(
+                        "FlashInfer fused expert packed delta shape mismatch: "
+                        f"expected {packed_expert_shape}, got {tuple(packed_delta.shape)}."
+                    )
+                target_param.data[local_expert_id].add_(packed_delta)
 
 
 def _compute_component_delta(
@@ -212,22 +228,23 @@ def _compute_component_delta(
     scaling: float,
 ) -> torch.Tensor:
     """Compile a single LoRA factor pair into a delta tensor."""
-    if lora_a.ndim not in (2, 3) or lora_b.ndim not in (2, 3):
-        raise ValueError(
-            "LoRA merge currently expects rank-2 or rank-3 A/B tensors, "
-            f"got A.ndim={lora_a.ndim}, B.ndim={lora_b.ndim}."
-        )
-    if lora_a.shape[-2] != lora_b.shape[-1]:
-        raise ValueError(
-            "LoRA rank mismatch: "
-            f"A shape {tuple(lora_a.shape)} is incompatible with B shape {tuple(lora_b.shape)}."
-        )
+    with _record_profile_scope("lora_sync.compute_component_delta"):
+        if lora_a.ndim not in (2, 3) or lora_b.ndim not in (2, 3):
+            raise ValueError(
+                "LoRA merge currently expects rank-2 or rank-3 A/B tensors, "
+                f"got A.ndim={lora_a.ndim}, B.ndim={lora_b.ndim}."
+            )
+        if lora_a.shape[-2] != lora_b.shape[-1]:
+            raise ValueError(
+                "LoRA rank mismatch: "
+                f"A shape {tuple(lora_a.shape)} is incompatible with B shape {tuple(lora_b.shape)}."
+            )
 
-    delta = torch.matmul(
-        lora_b.to(device=target_device, dtype=target_dtype),
-        lora_a.to(device=target_device, dtype=target_dtype),
-    )
-    return delta * scaling
+        delta = torch.matmul(
+            lora_b.to(device=target_device, dtype=target_dtype),
+            lora_a.to(device=target_device, dtype=target_dtype),
+        )
+        return delta * scaling
 
 
 def _place_component_delta(
@@ -236,47 +253,48 @@ def _place_component_delta(
     delta: torch.Tensor,
     component_spec: Dict[str, Any],
 ) -> torch.Tensor:
-    shard_id = _normalize_shard_id(component_spec.get("shard_id"))
-    weight_loader = getattr(target_param, "weight_loader", None)
-    if component_spec.get("fused_experts"):
-        if weight_loader is None:
+    with _record_profile_scope("lora_sync.place_component_delta"):
+        shard_id = _normalize_shard_id(component_spec.get("shard_id"))
+        weight_loader = getattr(target_param, "weight_loader", None)
+        if component_spec.get("fused_experts"):
+            if weight_loader is None:
+                raise ValueError(
+                    f"Target parameter {component_spec.get('target_name')!r} does not expose "
+                    "a weight_loader required for shard placement."
+                )
+            return _materialize_fused_expert_delta(
+                target_param,
+                delta,
+                component_spec,
+                shard_id=shard_id,
+            )
+
+        if weight_loader is not None:
+            placed_param = _make_scratch_param_like(target_param)
+            if shard_id is None:
+                delta = _reshape_delta_for_target(delta, base_weight)
+                weight_loader(placed_param, delta)
+            else:
+                weight_loader(placed_param, delta, shard_id)
+            if placed_param.data.shape != base_weight.shape:
+                raise ValueError(
+                    "Localized LoRA delta shape mismatch: "
+                    f"expected {tuple(base_weight.shape)}, got {tuple(placed_param.data.shape)}."
+                )
+            return placed_param.data
+
+        if shard_id is not None:
             raise ValueError(
                 f"Target parameter {component_spec.get('target_name')!r} does not expose "
                 "a weight_loader required for shard placement."
             )
-        return _materialize_fused_expert_delta(
-            target_param,
-            delta,
-            component_spec,
-            shard_id=shard_id,
-        )
-
-    if weight_loader is not None:
-        placed_param = _make_scratch_param_like(target_param)
-        if shard_id is None:
-            delta = _reshape_delta_for_target(delta, base_weight)
-            weight_loader(placed_param, delta)
-        else:
-            weight_loader(placed_param, delta, shard_id)
-        if placed_param.data.shape != base_weight.shape:
+        delta = _reshape_delta_for_target(delta, base_weight)
+        if delta.shape != base_weight.shape:
             raise ValueError(
-                "Localized LoRA delta shape mismatch: "
-                f"expected {tuple(base_weight.shape)}, got {tuple(placed_param.data.shape)}."
+                "Merged LoRA delta shape mismatch: "
+                f"expected {tuple(base_weight.shape)}, got {tuple(delta.shape)}."
             )
-        return placed_param.data
-
-    if shard_id is not None:
-        raise ValueError(
-            f"Target parameter {component_spec.get('target_name')!r} does not expose "
-            "a weight_loader required for shard placement."
-        )
-    delta = _reshape_delta_for_target(delta, base_weight)
-    if delta.shape != base_weight.shape:
-        raise ValueError(
-            "Merged LoRA delta shape mismatch: "
-            f"expected {tuple(base_weight.shape)}, got {tuple(delta.shape)}."
-        )
-    return delta
+        return delta
 
 
 def _reshape_delta_for_target(

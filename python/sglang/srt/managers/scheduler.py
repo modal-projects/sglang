@@ -301,6 +301,10 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        if server_args.weight_sync_consistency_mode == "unsafe_reuse_kv":
+            logger.warning(
+                "Weight sync consistency mode is 'unsafe_reuse_kv'; KV cache will be retained across successful weight updates."
+            )
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank

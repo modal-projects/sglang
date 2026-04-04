@@ -33,15 +33,30 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+    try:
+        from flashinfer.fp4_quantization import block_scale_interleave
+    except ImportError:
+        from flashinfer import nvfp4_block_scale_interleave as block_scale_interleave
+    try:
+        from flashinfer.fused_moe import (
+            convert_to_block_layout,
+            trtllm_mxint4_block_scale_moe,
+        )
+    except ImportError:
+        from flashinfer.fused_moe import convert_to_block_layout
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_moe as trtllm_mxint4_block_scale_moe,
+        )
+    try:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+    except ImportError:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w2_permute_indices as get_w2_permute_indices_with_cache,
+        )
+        from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):

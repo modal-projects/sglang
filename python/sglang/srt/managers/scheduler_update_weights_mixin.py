@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -43,13 +44,35 @@ logger = logging.getLogger(__name__)
 
 class SchedulerUpdateWeightsMixin:
 
+    def _weight_sync_consistency_mode(self: Scheduler) -> str:
+        return getattr(
+            self.server_args,
+            "weight_sync_consistency_mode",
+            os.getenv("SGLANG_WEIGHT_SYNC_CONSISTENCY_MODE", "strict"),
+        )
+
+    def _should_flush_kv_after_weight_sync(
+        self: Scheduler, requested_flush_cache: bool
+    ) -> bool:
+        if not requested_flush_cache:
+            return False
+        consistency_mode = self._weight_sync_consistency_mode()
+        return consistency_mode != "unsafe_reuse_kv"
+
+    def _wait_for_weight_sync_step_boundary_if_needed(self: Scheduler) -> None:
+        if self._weight_sync_consistency_mode() != "unsafe_reuse_kv":
+            return
+        with torch.profiler.record_function("weight_sync.scheduler_step_boundary_wait"):
+            torch.get_device_module().synchronize()
+
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):
         """In-place update of the weights from disk."""
+        self._wait_for_weight_sync_step_boundary_if_needed()
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
-            if recv_req.flush_cache:
+            if self._should_flush_kv_after_weight_sync(recv_req.flush_cache):
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
@@ -75,9 +98,10 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self._wait_for_weight_sync_step_boundary_if_needed()
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            if recv_req.flush_cache:
+            if self._should_flush_kv_after_weight_sync(recv_req.flush_cache):
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
@@ -88,28 +112,35 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        if recv_req.disable_draft_model:
+        self._wait_for_weight_sync_step_boundary_if_needed()
+        if getattr(recv_req, "disable_draft_model", False):
             worker = self.tp_worker
         else:
             worker = self.draft_worker or self.tp_worker
-        success, message = worker.update_weights_from_tensor(recv_req)
+        with torch.profiler.record_function("weight_sync.worker_update"):
+            success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+            if self._should_flush_kv_after_weight_sync(
+                getattr(recv_req, "flush_cache", True)
+            ):
+                with torch.profiler.record_function("weight_sync.flush_cache"):
+                    flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        with torch.profiler.record_function("weight_sync.barrier"):
+            torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self._wait_for_weight_sync_step_boundary_if_needed()
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         if success:
-            if recv_req.flush_cache:
+            if self._should_flush_kv_after_weight_sync(recv_req.flush_cache):
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:

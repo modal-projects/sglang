@@ -64,14 +64,47 @@ class EngineBase(ABC):
         *,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        abort_all_requests: bool = False,
         tensor_format: str = "safetensors",
         weight_version: Optional[str] = None,
         base_weight_version: Optional[str] = None,
         payload_digest: Optional[str] = None,
         loader_metadata: Optional[Dict] = None,
         crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
     ):
         """Update model weights from a self-describing byte payload."""
+        pass
+
+    @abstractmethod
+    def prepare_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        abort_all_requests: bool = False,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
+        transport_format: Optional[str] = None,
+        transport_bucket_bytes: Optional[int] = None,
+    ):
+        """Prepare a byte payload for a later weight update commit."""
+        pass
+
+    @abstractmethod
+    def commit_prepared_weight_update(self, update_handle: str):
+        """Commit a previously prepared weight update."""
+        pass
+
+    @abstractmethod
+    def discard_prepared_weight_update(self, update_handle: str):
+        """Discard a previously prepared weight update."""
         pass
 
     def load_lora_adapter(self, lora_name: str, lora_path: str):

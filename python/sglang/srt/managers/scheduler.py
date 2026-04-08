@@ -894,6 +894,7 @@ class Scheduler(
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
+        self.current_weight_epoch: int = 0
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
@@ -1820,8 +1821,12 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                extra_key=recv_req.extra_key,
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                request_weight_epoch=recv_req.request_weight_epoch,
+                cache_epoch=recv_req.cache_epoch,
+                request_weight_version=recv_req.request_weight_version,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
             )
@@ -1870,6 +1875,10 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                extra_key=recv_req.extra_key,
+                request_weight_epoch=recv_req.request_weight_epoch,
+                cache_epoch=recv_req.cache_epoch,
+                request_weight_version=recv_req.request_weight_version,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(
@@ -2134,6 +2143,9 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
+            request_weight_epoch=recv_req.request_weight_epoch,
+            cache_epoch=recv_req.cache_epoch,
+            request_weight_version=recv_req.request_weight_version,
             time_stats=recv_req.time_stats,
         )
         req.tokenizer = self.tokenizer
@@ -2698,6 +2710,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        batch.launch_weight_epoch = self.current_weight_epoch
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2906,7 +2919,7 @@ class Scheduler(
 
         pending_req, deadline = self._pending_flush
 
-        if self.is_fully_idle():
+        if self.is_ready_for_cache_flush():
             success = self.flush_cache()
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
@@ -2969,7 +2982,7 @@ class Scheduler(
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self.flush_cache())
 
-        if self.is_fully_idle():
+        if self.is_ready_for_cache_flush():
             return FlushCacheReqOutput(success=self.flush_cache())
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
@@ -3028,6 +3041,54 @@ class Scheduler(
                     idle &= len(tc.ongoing_backup) == 0
 
         return idle
+
+    def is_ready_for_cache_flush(self) -> bool:
+        """Whether a cache flush can safely clear KV/prefix state.
+
+        During an explicit scheduler pause, queued requests are allowed to
+        survive a flush so they can recompute KV on resume. Active GPU work and
+        async cache operations must still be drained first.
+        """
+        if self.is_fully_idle():
+            return True
+
+        if not self._engine_paused:
+            return False
+
+        active_work_drained = (
+            self.running_batch.is_empty()
+            and self.chunked_req is None
+            and not self.dllm_manager.any_staging_reqs()
+            and (self.last_batch is None or self.last_batch.is_empty())
+            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        )
+        if not active_work_drained:
+            return False
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if len(self.disagg_prefill_inflight_queue) != 0:
+                return False
+            if len(self.disagg_prefill_bootstrap_queue.queue) != 0:
+                return False
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if len(self.disagg_decode_prealloc_queue.queue) != 0:
+                return False
+            if len(self.disagg_decode_transfer_queue.queue) != 0:
+                return False
+
+        if self.enable_hierarchical_cache:
+            tc = self.tree_cache
+            if len(tc.ongoing_write_through) != 0 or len(tc.ongoing_load_back) != 0:
+                return False
+            if tc.enable_storage and (
+                len(tc.ongoing_prefetch) != 0 or len(tc.ongoing_backup) != 0
+            ):
+                return False
+
+        return True
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -3128,7 +3189,7 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.is_fully_idle():
+        if self.is_ready_for_cache_flush():
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()

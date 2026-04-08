@@ -120,6 +120,14 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _append_output_token_weight_epochs(
+        req: Req, weight_epoch: int, num_tokens: int
+    ) -> None:
+        if num_tokens <= 0:
+            return
+        req.output_token_weight_epochs.extend([weight_epoch] * num_tokens)
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -182,6 +190,11 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    self._append_output_token_weight_epochs(
+                        req,
+                        getattr(batch, "launch_weight_epoch", 0),
+                        1,
+                    )
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -310,6 +323,11 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
+                    self._append_output_token_weight_epochs(
+                        req,
+                        getattr(batch, "launch_weight_epoch", 0),
+                        1,
+                    )
                     req.check_finished()
 
                     if req.finished():
@@ -448,9 +466,19 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                self._append_output_token_weight_epochs(
+                    req,
+                    getattr(batch, "launch_weight_epoch", 0),
+                    1,
+                )
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                self._append_output_token_weight_epochs(
+                    req,
+                    getattr(batch, "launch_weight_epoch", 0),
+                    new_accepted_len,
+                )
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -938,6 +966,7 @@ class SchedulerOutputProcessorMixin:
         decode_ids_list = []
         read_offsets = []
         output_ids = []
+        token_steps = []
 
         skip_special_tokens = []
         spaces_between_special_tokens = []
@@ -1033,10 +1062,14 @@ class SchedulerOutputProcessorMixin:
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
+                output_token_weight_epochs = req.output_token_weight_epochs[
+                    : len(output_ids_)
+                ]
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 output_ids.append(output_ids_[send_token_offset:])
+                token_steps.append(output_token_weight_epochs[send_token_offset:])
                 req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
@@ -1197,6 +1230,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    token_steps=token_steps,
                     load=load,
                     dp_ranks=dp_ranks,
                 )

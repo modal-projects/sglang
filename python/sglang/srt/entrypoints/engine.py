@@ -885,6 +885,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        atomic_pause_mode: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -894,6 +895,7 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            atomic_pause_mode=atomic_pause_mode,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -904,6 +906,7 @@ class Engine(EngineScoreMixin, EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        atomic_pause_mode: Optional[str] = None,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -918,6 +921,7 @@ class Engine(EngineScoreMixin, EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            atomic_pause_mode=atomic_pause_mode,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
@@ -927,6 +931,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        atomic_pause_mode: Optional[str] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -937,6 +943,8 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            flush_cache=flush_cache,
+            atomic_pause_mode=atomic_pause_mode,
         )
 
         return self.loop.run_until_complete(
@@ -947,11 +955,13 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
+        atomic_pause_mode: Optional[str] = None,
     ):
         """Update weights from IPC for checkpoint-engine integration."""
         obj = UpdateWeightsFromIPCReqInput(
             zmq_handles=zmq_handles,
             flush_cache=flush_cache,
+            atomic_pause_mode=atomic_pause_mode,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)

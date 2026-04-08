@@ -50,6 +50,9 @@ else:
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+    request_weight_epoch: Optional[int] = field(default=None, kw_only=True)
+    cache_epoch: Optional[int] = field(default=None, kw_only=True)
+    request_weight_version: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -383,6 +386,7 @@ class GenerateReqInput(BaseReq):
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_extra_key(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
@@ -419,6 +423,21 @@ class GenerateReqInput(BaseReq):
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_extra_key(self, num):
+        """Normalize extra_key for batch processing and parallel sampling."""
+        if self.extra_key is None:
+            return
+        if isinstance(self.extra_key, str):
+            self.extra_key = [self.extra_key] * num
+        elif isinstance(self.extra_key, list):
+            if len(self.extra_key) != self.batch_size:
+                raise ValueError(
+                    "The length of extra_key should be equal to the batch size."
+                )
+            self.extra_key = self.extra_key * self.parallel_sample_num
+        else:
+            raise ValueError("extra_key should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -661,7 +680,9 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=(
+                self.extra_key[i] if isinstance(self.extra_key, list) else self.extra_key
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -669,6 +690,9 @@ class GenerateReqInput(BaseReq):
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
+            request_weight_epoch=self.request_weight_epoch,
+            cache_epoch=self.cache_epoch,
+            request_weight_version=self.request_weight_version,
         )
         cache[i] = sub
         return sub
@@ -911,6 +935,9 @@ class EmbeddingReqInput(BaseReq):
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
+                request_weight_epoch=self.request_weight_epoch,
+                cache_epoch=self.cache_epoch,
+                request_weight_version=self.request_weight_version,
             )
         else:
             sub = EmbeddingReqInput(
@@ -927,6 +954,9 @@ class EmbeddingReqInput(BaseReq):
                 dimensions=self.dimensions,
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
+                request_weight_epoch=self.request_weight_epoch,
+                cache_epoch=self.cache_epoch,
+                request_weight_version=self.request_weight_version,
             )
         cache[i] = sub
         return sub
@@ -1289,10 +1319,14 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # Optionally pause the engine around the update and resume after it finishes.
+    atomic_pause_mode: Optional[Literal["abort", "retract", "in_place"]] = None
     # Whether to recapture cuda graph after weight update
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
+    # Internal monotonic epoch used to version caches and request provenance.
+    weight_epoch: Optional[int] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Tensor metadata
@@ -1316,10 +1350,14 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Optionally pause the engine around the update and resume after it finishes.
+    atomic_pause_mode: Optional[Literal["abort", "retract", "in_place"]] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Internal monotonic epoch used to version caches and request provenance.
+    weight_epoch: Optional[int] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
 
@@ -1343,10 +1381,14 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Optionally pause the engine around the update and resume after it finishes.
+    atomic_pause_mode: Optional[Literal["abort", "retract", "in_place"]] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Internal monotonic epoch used to version caches and request provenance.
+    weight_epoch: Optional[int] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
 
@@ -1381,8 +1423,12 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
     zmq_handles: Dict[str, str]
     # Whether to flush cache after weight update
     flush_cache: bool = True
+    # Optionally pause the engine around the update and resume after it finishes.
+    atomic_pause_mode: Optional[Literal["abort", "retract", "in_place"]] = None
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Internal monotonic epoch used to version caches and request provenance.
+    weight_epoch: Optional[int] = None
 
 
 @dataclass

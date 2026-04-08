@@ -1043,6 +1043,21 @@ class OpenAIServingChat(OpenAIServingBase):
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
+        metadata = {
+            key: ret[0]["meta_info"][key]
+            for key in (
+                "weight_version",
+                "weight_version_start",
+                "weight_version_end",
+                "weight_epoch_start",
+                "weight_epoch_end",
+                "cache_epoch",
+                "mixed_weight_epochs",
+                "resume_from_stale_kv",
+                "output_token_weight_epochs",
+            )
+            if key in ret[0]["meta_info"]
+        }
 
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
@@ -1050,7 +1065,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
             sglext=response_sglext,
         )
 

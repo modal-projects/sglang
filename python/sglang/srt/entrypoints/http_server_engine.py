@@ -80,6 +80,7 @@ class HttpServerEngineAdapter(EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = False,
+        atomic_pause_mode: Optional[str] = None,
     ):
         """
         Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
@@ -96,6 +97,7 @@ class HttpServerEngineAdapter(EngineBase):
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
+                "atomic_pause_mode": atomic_pause_mode,
             },
         )
 

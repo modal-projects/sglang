@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerUpdateWeightsMixin:
+    def _record_successful_weight_update(self: Scheduler, recv_req) -> None:
+        if getattr(recv_req, "weight_epoch", None) is not None:
+            self.current_weight_epoch = recv_req.weight_epoch
 
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
@@ -52,6 +55,7 @@ class SchedulerUpdateWeightsMixin:
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
+            self._record_successful_weight_update(recv_req)
         else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -80,6 +84,7 @@ class SchedulerUpdateWeightsMixin:
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
+            self._record_successful_weight_update(recv_req)
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -101,6 +106,8 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
+        if success:
+            self._record_successful_weight_update(recv_req)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(
@@ -115,6 +122,8 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
+        if success:
+            self._record_successful_weight_update(recv_req)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):

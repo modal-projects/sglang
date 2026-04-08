@@ -227,8 +227,12 @@ class Session:
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
             priority=req.priority,
+            extra_key=req.extra_key,
             routing_key=req.routing_key,
             http_worker_ipc=req.http_worker_ipc,
+            request_weight_epoch=req.request_weight_epoch,
+            cache_epoch=req.cache_epoch,
+            request_weight_version=req.request_weight_version,
             time_stats=req.time_stats,
         )
         if last_req is not None:

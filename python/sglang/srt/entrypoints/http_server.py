@@ -598,6 +598,7 @@ async def model_info():
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "weight_epoch": _global_state.tokenizer_manager.current_weight_epoch,
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
@@ -1219,14 +1220,16 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager._update_weight_version_if_provided(
+            obj.new_version
+        )
 
         return ORJSONResponse(
             {
                 "success": True,
                 "message": f"Weight version updated to {obj.new_version}",
                 "new_version": obj.new_version,
+                "weight_epoch": _global_state.tokenizer_manager.current_weight_epoch,
             },
             status_code=HTTPStatus.OK,
         )

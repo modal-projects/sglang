@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -27,11 +28,29 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch.batch_is_full = False
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
+        scheduler.enable_hierarchical_cache = False
         scheduler.req_to_token_pool = MagicMock()
         scheduler.result_queue = deque()
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.grammar_queue = []
+        scheduler.waiting_queue = []
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.pp_size = 1
+        scheduler.running_mbs = []
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = MagicMock()
+        scheduler.disagg_prefill_bootstrap_queue.queue = []
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue.queue = []
+        scheduler.disagg_decode_transfer_queue = MagicMock()
+        scheduler.disagg_decode_transfer_queue.queue = []
+        scheduler.draft_worker = None
+        scheduler.reset_metrics = MagicMock()
         scheduler.max_total_num_tokens = 1000
         scheduler._get_token_info = MagicMock(return_value=(0, 0, 1000, 0))
         return scheduler
@@ -128,6 +147,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
+
+    def test_flush_cache_allows_waiting_requests_while_paused(self):
+        """Paused requests may stay queued and recompute KV after cache flush."""
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.waiting_queue = [MagicMock()]
+
+        success = scheduler.flush_cache()
+
+        self.assertTrue(success)
+        scheduler.tree_cache.reset.assert_called_once()
+        scheduler.req_to_token_pool.clear.assert_called_once()
+        scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
+        scheduler.grammar_manager.clear.assert_called_once()
+
+    def test_flush_cache_rejects_waiting_requests_when_not_paused(self):
+        """Outside an explicit pause, waiting_queue still blocks cache flush."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = [MagicMock()]
+
+        success = scheduler.flush_cache()
+
+        self.assertFalse(success)
+        scheduler.tree_cache.reset.assert_not_called()
+        scheduler.req_to_token_pool.clear.assert_not_called()
+        scheduler.token_to_kv_pool_allocator.clear.assert_not_called()
 
 
 if __name__ == "__main__":

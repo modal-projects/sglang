@@ -10,6 +10,8 @@ from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
+    Callable,
     Deque,
     Dict,
     Generic,
@@ -63,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -78,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    ContinueGenerationReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -97,6 +101,7 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+_ATOMIC_PAUSE_MODES = {"abort", "retract", "in_place"}
 
 
 class _Communicator(Generic[T]):
@@ -620,26 +625,35 @@ class TokenizerCommunicatorMixin:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        async def run_update():
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+            await self._reserve_weight_epoch(obj)
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+            # Immediately update the weights if the engine is in paused state
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
+            lock_context = (
+                self.model_update_lock.writer_lock if not is_paused else nullcontext()
+            )
+            async with lock_context:
+                results = await self.update_weights_from_distributed_communicator(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.update_weights_from_distributed_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+            if success:
+                self._record_successful_weight_update(
+                    obj.weight_epoch, obj.weight_version
+                )
+                if obj.weight_version is not None:
+                    message += f" Weight version updated to {obj.weight_version}."
 
-        success, message = _Communicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            return success, message
 
-        return success, message
+        try:
+            return await self._run_weight_update_with_optional_pause(obj, run_update)
+        except ValueError as e:
+            return False, str(e)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -679,25 +693,35 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+        async def run_update():
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+            await self._reserve_weight_epoch(obj)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
+            # Immediately update the weights if the engine is in paused state
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.update_weights_from_tensor_communicator(obj)
+            lock_context = (
+                self.model_update_lock.writer_lock if not is_paused else nullcontext()
+            )
+            async with lock_context:
+                results = await self.update_weights_from_tensor_communicator(obj)
 
-        success, message = _Communicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            success, message = _Communicator.merge_results(results)
+            if success:
+                self._record_successful_weight_update(
+                    obj.weight_epoch, obj.weight_version
+                )
+                if obj.weight_version is not None:
+                    message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message
+            return success, message
+
+        try:
+            return await self._run_weight_update_with_optional_pause(obj, run_update)
+        except ValueError as e:
+            return False, str(e)
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -706,26 +730,45 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
         self.auto_create_handle_loop()
+        async def run_update():
+            try:
+                # For now, we only support single data parallel instance
+                assert (
+                    self.server_args.dp_size == 1
+                    or self.server_args.enable_dp_attention
+                ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+                logger.info("Starting IPC weight update")
+                await self._reserve_weight_epoch(obj)
+
+                async with self.is_pause_cond:
+                    is_paused = self.is_pause
+
+                lock_context = (
+                    self.model_update_lock.writer_lock
+                    if not is_paused
+                    else nullcontext()
+                )
+                async with lock_context:
+                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                    success, message = result.success, result.message
+            except Exception as e:
+                error_msg = f"IPC weight update failed: {str(e)}"
+                logger.error(error_msg)
+                success, message = False, error_msg
+
+            if success:
+                self._record_successful_weight_update(
+                    obj.weight_epoch, obj.weight_version
+                )
+                if obj.weight_version is not None:
+                    message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+
         try:
-            # For now, we only support single data parallel instance
-            assert (
-                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
-            logger.info("Starting IPC weight update")
-            # This means that weight sync cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
-                result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                success, message = result.success, result.message
-        except Exception as e:
-            error_msg = f"IPC weight update failed: {str(e)}"
-            logger.error(error_msg)
-            success, message = False, error_msg
-
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message
+            return await self._run_weight_update_with_optional_pause(obj, run_update)
+        except ValueError as e:
+            return False, str(e)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
@@ -1076,4 +1119,72 @@ class TokenizerCommunicatorMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
+            if not hasattr(self, "current_weight_epoch"):
+                self.current_weight_epoch = 0
+            if not hasattr(self, "weight_version_by_epoch"):
+                self.weight_version_by_epoch = {}
             self.server_args.weight_version = weight_version
+            self.weight_version_by_epoch[self.current_weight_epoch] = weight_version
+
+    async def _reserve_weight_epoch(self: TokenizerManager, obj: Any) -> None:
+        if not hasattr(self, "current_weight_epoch"):
+            self.current_weight_epoch = 0
+        if not hasattr(self, "next_weight_epoch"):
+            self.next_weight_epoch = self.current_weight_epoch + 1
+        if not hasattr(self, "weight_epoch_reservation_lock"):
+            self.weight_epoch_reservation_lock = asyncio.Lock()
+
+        async with self.weight_epoch_reservation_lock:
+            requested_epoch = getattr(obj, "weight_epoch", None)
+            if requested_epoch is None:
+                obj.weight_epoch = self.next_weight_epoch
+                self.next_weight_epoch += 1
+                return
+
+            if requested_epoch < self.next_weight_epoch:
+                raise ValueError(
+                    f"weight_epoch {requested_epoch} has already been reserved; "
+                    f"next available epoch is {self.next_weight_epoch}"
+                )
+
+            self.next_weight_epoch = requested_epoch + 1
+
+    async def _run_weight_update_with_optional_pause(
+        self: TokenizerManager,
+        obj: Any,
+        update_fn: Callable[[], Awaitable[T]],
+    ) -> T:
+        if not hasattr(self, "weight_update_orchestration_lock"):
+            self.weight_update_orchestration_lock = asyncio.Lock()
+        if not hasattr(self, "is_pause_cond"):
+            self.is_pause_cond = asyncio.Condition()
+        if not hasattr(self, "is_pause"):
+            self.is_pause = False
+
+        async with self.weight_update_orchestration_lock:
+            pause_mode = getattr(obj, "atomic_pause_mode", None)
+            if pause_mode is None:
+                return await update_fn()
+            if pause_mode not in _ATOMIC_PAUSE_MODES:
+                raise ValueError(
+                    f"Invalid atomic_pause_mode: {pause_mode!r}. "
+                    f"Expected one of {sorted(_ATOMIC_PAUSE_MODES)}."
+                )
+            if pause_mode == "in_place" and getattr(obj, "flush_cache", False):
+                raise ValueError(
+                    "flush_cache must be false when atomic_pause_mode='in_place'."
+                )
+
+            async with self.is_pause_cond:
+                already_paused = self.is_pause
+
+            paused_here = False
+            if not already_paused:
+                await self.pause_generation(PauseGenerationReqInput(mode=pause_mode))
+                paused_here = True
+
+            try:
+                return await update_fn()
+            finally:
+                if paused_here:
+                    await self.continue_generation(ContinueGenerationReqInput())

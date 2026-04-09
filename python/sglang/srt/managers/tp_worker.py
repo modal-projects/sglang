@@ -161,6 +161,7 @@ class BaseTpWorker(ABC):
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
+            manifest=recv_req.manifest,
             load_format=recv_req.load_format,
         )
         return success, message

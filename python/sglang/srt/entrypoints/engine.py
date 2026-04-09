@@ -904,6 +904,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
+        manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
         atomic_pause_mode: Optional[str] = None,
@@ -919,6 +920,7 @@ class Engine(EngineScoreMixin, EngineBase):
             ]
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
+            manifest=manifest,
             load_format=load_format,
             flush_cache=flush_cache,
             atomic_pause_mode=atomic_pause_mode,

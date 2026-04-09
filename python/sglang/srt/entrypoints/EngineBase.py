@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -46,6 +46,7 @@ class EngineBase(ABC):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
+        manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
         atomic_pause_mode: Optional[str] = None,

@@ -1,6 +1,6 @@
 import multiprocessing
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import torch
@@ -78,6 +78,7 @@ class HttpServerEngineAdapter(EngineBase):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
+        manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = False,
         atomic_pause_mode: Optional[str] = None,
@@ -95,6 +96,7 @@ class HttpServerEngineAdapter(EngineBase):
                     MultiprocessingSerializer.serialize(named_tensors, output_str=True)
                     for _ in range(self.server_args.tp_size)
                 ],
+                "manifest": manifest,
                 "load_format": load_format,
                 "flush_cache": flush_cache,
                 "atomic_pause_mode": atomic_pause_mode,

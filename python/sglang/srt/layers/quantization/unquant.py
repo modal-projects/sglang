@@ -334,10 +334,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        if not self.use_flashinfer_trtllm_moe:
             return
 
         expected_shape = None
+        permute_fn = None
         if weight_name.endswith(".experts.w13_weight"):
             w13_rows = (
                 2 * layer.intermediate_size_per_partition
@@ -345,12 +346,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 else layer.intermediate_size_per_partition
             )
             expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
+            permute_fn = "w13"
         elif weight_name.endswith(".experts.w2_weight"):
             expected_shape = (
                 layer.num_local_experts,
                 layer.hidden_size,
                 layer.intermediate_size_per_partition,
             )
+            permute_fn = "w2"
 
         if expected_shape is None or tuple(param.data.shape) == expected_shape:
             return
@@ -362,7 +365,48 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
             )
 
-        param.data = param.data.reshape(expected_shape)
+        if param.data.dim() != 4:
+            raise RuntimeError(
+                f"Cannot restore flashinfer TRT-LLM BF16 MoE weight layout for {weight_name}: "
+                f"expected 4D blocked layout, got shape={tuple(param.data.shape)}."
+            )
+
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        canonical_expert_shape = expected_shape[1:]
+        canonical_template_u8 = torch.empty(
+            canonical_expert_shape,
+            device=param.data.device,
+            dtype=param.data.dtype,
+        ).view(torch.uint8)
+        epilogue_tile_m = 128
+        if permute_fn == "w13":
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                canonical_template_u8,
+                epilogue_tile_m,
+            )
+        else:
+            permute_indices = get_w2_permute_indices_with_cache(
+                self._cache_permute_indices,
+                canonical_template_u8,
+                epilogue_tile_m,
+            )
+        inverse_permute = torch.argsort(permute_indices).to(param.data.device)
+
+        bytes_per_row = canonical_expert_shape[1] * param.data.element_size()
+        restored_u8 = (
+            param.data.contiguous()
+            .view(torch.uint8)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(expected_shape[0], canonical_expert_shape[0], bytes_per_row)
+        )
+        restored_u8 = restored_u8.index_select(1, inverse_permute)
+        param.data = restored_u8.contiguous().view(param.data.dtype)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

@@ -1377,6 +1377,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     """
 
     serialized_named_tensors: List[Union[str, bytes]]
+    # Optional structured metadata consumed by custom tensor update loaders.
+    manifest: Optional[Dict[str, Any]] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights

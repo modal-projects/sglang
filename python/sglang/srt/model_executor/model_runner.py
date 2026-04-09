@@ -1707,6 +1707,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        manifest: Optional[dict] = None,
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
@@ -1720,20 +1721,82 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
         if load_format == "direct":
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
+            uses_host_tensors = getattr(
+                custom_loader, "sglang_supports_host_tensors", False
+            )
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(
+                        tensor,
+                        tp_rank=self.tp_rank,
+                        device=None if uses_host_tensors else infered_device,
+                    ),
+                )
+                for name, tensor in named_tensors
+            ]
+            self._call_custom_weight_loader(
+                custom_loader,
+                named_tensors,
+                infered_device,
+                manifest=manifest,
+            )
         elif load_format is None:
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
+
+    def _call_custom_weight_loader(
+        self,
+        custom_loader,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        infered_device,
+        manifest: Optional[dict] = None,
+    ) -> None:
+        load_context = {
+            "manifest": manifest,
+            "model_runner": self,
+            "server_args": self.server_args,
+            "tp_rank": self.tp_rank,
+            "device": infered_device,
+        }
+
+        try:
+            signature = inspect.signature(custom_loader)
+            parameters = list(signature.parameters.values())
+            if any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters
+            ) or "load_context" in signature.parameters:
+                custom_loader(self.model, named_tensors, load_context=load_context)
+                return
+            if any(
+                param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters
+            ) or len(parameters) >= 3:
+                custom_loader(self.model, named_tensors, load_context)
+                return
+        except (TypeError, ValueError):
+            pass
+
+        custom_loader(self.model, named_tensors)
 
     def _update_weights_from_flattened_bucket(
         self,
@@ -3120,6 +3183,8 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
 def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
+    if device is None:
+        return tensor
     return tensor.to(device)
 
 

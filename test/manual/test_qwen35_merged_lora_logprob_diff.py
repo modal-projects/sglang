@@ -1,4 +1,8 @@
+import contextlib
 import gc
+import importlib.metadata
+import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -10,7 +14,7 @@ from typing import Any, Dict, Iterable, List
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 
@@ -38,7 +42,10 @@ MERGE_MEAN_ABS_THRESHOLD = float(
 )
 TORCH_DTYPE = getattr(torch, os.getenv("QWEN35_MERGE_DTYPE", "bfloat16"))
 ADAPTER_SUBSET = os.getenv("QWEN35_ADAPTER_SUBSET", "all")
+TRACE_PROMPT_INDEX = int(os.getenv("QWEN35_TRACE_PROMPT_INDEX", "2"))
+TRACE_TOP_K = int(os.getenv("QWEN35_TRACE_TOP_K", "5"))
 SGLANG_MOE_RUNNER_BACKEND = os.getenv("QWEN35_SGLANG_MOE_RUNNER_BACKEND", "").strip()
+HF_ATTN_IMPLEMENTATION = os.getenv("QWEN35_HF_ATTN_IMPLEMENTATION", "").strip()
 SGLANG_ENABLE_DETERMINISTIC_INFERENCE = os.getenv(
     "QWEN35_SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
@@ -177,117 +184,530 @@ def _cleanup_torch():
         torch.cuda.synchronize()
 
 
+def _decode_token(tokenizer, token_id: int) -> str:
+    return tokenizer.decode([int(token_id)], skip_special_tokens=False)
+
+
+def _serialize_topk_from_logprobs(
+    logprobs: torch.Tensor,
+    tokenizer,
+    top_k: int,
+) -> List[List[Dict[str, Any]]]:
+    values, indices = torch.topk(logprobs, top_k, dim=-1)
+    serialized: List[List[Dict[str, Any]]] = []
+    for row_vals, row_indices in zip(values, indices):
+        serialized.append(
+            [
+                {
+                    "logprob": float(value.item()),
+                    "token_id": int(token_id.item()),
+                    "token_text": _decode_token(tokenizer, int(token_id.item())),
+                }
+                for value, token_id in zip(row_vals, row_indices)
+            ]
+        )
+    return serialized
+
+
+def _compute_token_logprobs_and_topk(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    tokenizer,
+    *,
+    top_k: int = 0,
+) -> tuple[torch.Tensor, List[List[Dict[str, Any]]] | None]:
+    logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+    token_logprobs = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    topk = None
+    if top_k > 0:
+        topk = _serialize_topk_from_logprobs(logprobs, tokenizer, top_k)
+    return token_logprobs, topk
+
+
+def _serialize_generation_scores_topk(
+    scores: Iterable[torch.Tensor],
+    tokenizer,
+    top_k: int,
+) -> List[List[Dict[str, Any]]]:
+    serialized: List[List[Dict[str, Any]]] = []
+    for score in scores:
+        logprobs = F.log_softmax(score[0], dim=-1, dtype=torch.float32)
+        serialized.extend(_serialize_topk_from_logprobs(logprobs.unsqueeze(0), tokenizer, top_k))
+    return serialized
+
+
+def _hf_model_load_kwargs(torch_dtype: torch.dtype) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "device_map": "auto",
+    }
+    if HF_ATTN_IMPLEMENTATION:
+        kwargs["attn_implementation"] = HF_ATTN_IMPLEMENTATION
+    return kwargs
+
+
+def _hf_backend_report(
+    model,
+    *,
+    merge_mode: str,
+    output_text: str = "",
+) -> Dict[str, Any]:
+    def _module_report(module_name: str, package_name: str) -> Dict[str, Any]:
+        available = importlib.util.find_spec(module_name) is not None
+        version = None
+        if available:
+            try:
+                version = importlib.metadata.version(package_name)
+            except importlib.metadata.PackageNotFoundError:
+                version = None
+        return {
+            "module": module_name,
+            "package": package_name,
+            "available": available,
+            "version": version,
+        }
+
+    config = getattr(model, "config", None)
+    return {
+        "merge_mode": merge_mode,
+        "requested_attn_implementation": HF_ATTN_IMPLEMENTATION or None,
+        "resolved_attn_implementation": getattr(
+            config, "_attn_implementation", None
+        ),
+        "model_class": type(model).__name__,
+        "config_class": type(config).__name__ if config is not None else None,
+        "fast_path_fallback_detected": "The fast path is not available" in output_text,
+        "optional_packages": {
+            "fla": _module_report("fla", "flash-linear-attention"),
+            "causal_conv1d": _module_report("causal_conv1d", "causal-conv1d"),
+        },
+    }
+
+
 def _hf_generate_and_score(
     model_path: str,
     adapter_dir: Path,
     prompts: List[str],
     max_new_tokens: int,
     torch_dtype: torch.dtype,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     from peft import PeftModel
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-    )
-    model = PeftModel.from_pretrained(
-        model,
-        str(adapter_dir),
-        torch_dtype=torch_dtype,
-        is_trainable=False,
-    )
-    model.eval()
-
+    stream = io.StringIO()
+    model = None
     results: List[Dict[str, Any]] = []
     try:
-        for prompt in prompts:
-            prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-            outputs = model.generate(
-                input_ids=prompt_ids,
-                generation_config=GenerationConfig(
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **_hf_model_load_kwargs(torch_dtype),
+            )
+            model = PeftModel.from_pretrained(
+                model,
+                str(adapter_dir),
+                torch_dtype=torch_dtype,
+                is_trainable=False,
+            )
+            model.eval()
+            for prompt in prompts:
+                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(
+                    model.device
+                )
+                prompt_attention_mask = torch.ones_like(prompt_ids)
+                outputs = model.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_attention_mask,
                     do_sample=False,
-                    temperature=None,
-                    top_p=None,
                     max_new_tokens=max_new_tokens,
                     return_dict_in_generate=True,
                     output_scores=False,
-                    disable_compile=True,
-                ),
-            )
+                )
 
-            full_ids = outputs.sequences[0]
-            prompt_len = prompt_ids.shape[1]
-            completion_ids = full_ids[prompt_len:]
-            completion_text = tokenizer.decode(
-                completion_ids, skip_special_tokens=True
-            )
+                full_ids = outputs.sequences[0]
+                prompt_len = prompt_ids.shape[1]
+                completion_ids = full_ids[prompt_len:]
+                completion_text = tokenizer.decode(
+                    completion_ids, skip_special_tokens=True
+                )
 
-            logits = model(full_ids.unsqueeze(0)).logits[0, :-1]
-            target_ids = full_ids[1:]
-            token_logprobs = F.log_softmax(
-                logits, dim=-1, dtype=torch.float32
-            ).gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-            prefill_logprobs = token_logprobs[: prompt_len - 1].cpu()
-            completion_logprobs = token_logprobs[prompt_len - 1 :].cpu()
+                full_ids_batched = full_ids.unsqueeze(0)
+                full_attention_mask = torch.ones_like(full_ids_batched)
+                logits = model(
+                    full_ids_batched,
+                    attention_mask=full_attention_mask,
+                ).logits[0, :-1]
+                target_ids = full_ids[1:]
+                token_logprobs, _ = _compute_token_logprobs_and_topk(
+                    logits,
+                    target_ids,
+                    tokenizer,
+                )
+                prefill_logprobs = token_logprobs[: prompt_len - 1].cpu()
+                completion_logprobs = token_logprobs[prompt_len - 1 :].cpu()
 
-            results.append(
-                {
-                    "prompt": prompt,
-                    "prompt_len": prompt_len,
-                    "full_ids": full_ids.cpu().tolist(),
-                    "completion_ids": completion_ids.cpu().tolist(),
-                    "completion_text": completion_text,
-                    "hf_prefill_logprobs": prefill_logprobs,
-                    "hf_completion_logprobs": completion_logprobs,
-                }
-            )
+                results.append(
+                    {
+                        "prompt": prompt,
+                        "prompt_len": prompt_len,
+                        "full_ids": full_ids.cpu().tolist(),
+                        "completion_ids": completion_ids.cpu().tolist(),
+                        "completion_text": completion_text,
+                        "hf_prefill_logprobs": prefill_logprobs,
+                        "hf_completion_logprobs": completion_logprobs,
+                    }
+                )
+        backend_report = _hf_backend_report(
+            model,
+            merge_mode="peft_runtime",
+            output_text=stream.getvalue(),
+        )
     finally:
-        del model
+        if model is not None:
+            del model
         _cleanup_torch()
 
-    return results
+    return results, backend_report
+
+
+def _hf_generate_and_score_with_materialized_comparison(
+    model_path: str,
+    adapter_dir: Path,
+    prompts: List[str],
+    max_new_tokens: int,
+    torch_dtype: torch.dtype,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    from peft import PeftModel
+
+    stream = io.StringIO()
+    model = None
+    runtime_results: List[Dict[str, Any]] = []
+    materialized_results: List[Dict[str, Any]] = []
+    try:
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **_hf_model_load_kwargs(torch_dtype),
+            )
+            model = PeftModel.from_pretrained(
+                model,
+                str(adapter_dir),
+                torch_dtype=torch_dtype,
+                is_trainable=False,
+            )
+            model.eval()
+            for prompt_index, prompt in enumerate(prompts):
+                trace_this_prompt = (
+                    TRACE_TOP_K > 0 and prompt_index == TRACE_PROMPT_INDEX
+                )
+                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(
+                    model.device
+                )
+                prompt_attention_mask = torch.ones_like(prompt_ids)
+                outputs = model.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_attention_mask,
+                    do_sample=False,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=trace_this_prompt,
+                )
+
+                full_ids = outputs.sequences[0]
+                prompt_len = prompt_ids.shape[1]
+                completion_ids = full_ids[prompt_len:]
+                completion_text = tokenizer.decode(
+                    completion_ids, skip_special_tokens=True
+                )
+
+                full_ids_batched = full_ids.unsqueeze(0)
+                full_attention_mask = torch.ones_like(full_ids_batched)
+                logits = model(
+                    full_ids_batched,
+                    attention_mask=full_attention_mask,
+                ).logits[0, :-1]
+                target_ids = full_ids[1:]
+                token_logprobs, topk = _compute_token_logprobs_and_topk(
+                    logits,
+                    target_ids,
+                    tokenizer,
+                    top_k=TRACE_TOP_K if trace_this_prompt else 0,
+                )
+                runtime_results.append(
+                    {
+                        "prompt": prompt,
+                        "prompt_len": prompt_len,
+                        "full_ids": full_ids.cpu().tolist(),
+                        "completion_ids": completion_ids.cpu().tolist(),
+                        "completion_text": completion_text,
+                        "hf_prefill_logprobs": token_logprobs[: prompt_len - 1].cpu(),
+                        "hf_completion_logprobs": token_logprobs[
+                            prompt_len - 1 :
+                        ].cpu(),
+                        **(
+                            {
+                                "trace_prompt_data": {
+                                    "prompt_index": prompt_index,
+                                    "prompt": prompt,
+                                    "prompt_len": prompt_len,
+                                    "full_ids": full_ids.cpu().tolist(),
+                                    "full_token_texts": [
+                                        _decode_token(tokenizer, token_id)
+                                        for token_id in full_ids.cpu().tolist()
+                                    ],
+                                    "completion_ids": completion_ids.cpu().tolist(),
+                                    "completion_token_texts": [
+                                        _decode_token(tokenizer, token_id)
+                                        for token_id in completion_ids.cpu().tolist()
+                                    ],
+                                    "hf_runtime_prefill_top_logprobs": topk[
+                                        : prompt_len - 1
+                                    ],
+                                    "hf_runtime_completion_top_logprobs": topk[
+                                        prompt_len - 1 :
+                                    ],
+                                    "hf_runtime_free_run_top_logprobs": _serialize_generation_scores_topk(
+                                        outputs.scores,
+                                        tokenizer,
+                                        TRACE_TOP_K,
+                                    ),
+                                }
+                            }
+                            if trace_this_prompt and topk is not None
+                            else {}
+                        ),
+                    }
+                )
+            runtime_backend_report = _hf_backend_report(
+                model,
+                merge_mode="peft_runtime",
+                output_text=stream.getvalue(),
+            )
+
+            model = model.merge_and_unload()
+            model.eval()
+            for item in runtime_results:
+                trace_this_prompt = "trace_prompt_data" in item
+                full_ids = torch.tensor(
+                    item["full_ids"],
+                    dtype=torch.long,
+                    device=model.device,
+                )
+                full_ids_batched = full_ids.unsqueeze(0)
+                full_attention_mask = torch.ones_like(full_ids_batched)
+                logits = model(
+                    full_ids_batched,
+                    attention_mask=full_attention_mask,
+                ).logits[0, :-1]
+                target_ids = full_ids[1:]
+                token_logprobs, topk = _compute_token_logprobs_and_topk(
+                    logits,
+                    target_ids,
+                    tokenizer,
+                    top_k=TRACE_TOP_K if trace_this_prompt else 0,
+                )
+                prompt_len = item["prompt_len"]
+                materialized_results.append(
+                    {
+                        "prompt": item["prompt"],
+                        "hf_materialized_prefill_logprobs": token_logprobs[
+                            : prompt_len - 1
+                        ].cpu(),
+                        "hf_materialized_completion_logprobs": token_logprobs[
+                            prompt_len - 1 :
+                        ].cpu(),
+                        **(
+                            {
+                                "trace_prompt_materialized_data": {
+                                    "hf_materialized_prefill_top_logprobs": topk[
+                                        : prompt_len - 1
+                                    ],
+                                    "hf_materialized_completion_top_logprobs": topk[
+                                        prompt_len - 1 :
+                                    ],
+                                }
+                            }
+                            if trace_this_prompt and topk is not None
+                            else {}
+                        ),
+                    }
+                )
+            materialized_backend_report = _hf_backend_report(
+                model,
+                merge_mode="merged_materialized",
+                output_text=stream.getvalue(),
+            )
+    finally:
+        if model is not None:
+            del model
+        _cleanup_torch()
+
+    return (
+        runtime_results,
+        materialized_results,
+        runtime_backend_report,
+        materialized_backend_report,
+    )
 
 
 def _hf_score_sequences_base(
     model_path: str,
     prompt_results: List[Dict[str, Any]],
     torch_dtype: torch.dtype,
-) -> List[Dict[str, Any]]:
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-    )
-    model.eval()
-
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    stream = io.StringIO()
+    model = None
     results: List[Dict[str, Any]] = []
     try:
-        for item in prompt_results:
-            full_ids = torch.tensor(
-                item["full_ids"],
-                dtype=torch.long,
-                device=model.device,
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **_hf_model_load_kwargs(torch_dtype),
             )
-            logits = model(full_ids.unsqueeze(0)).logits[0, :-1]
-            target_ids = full_ids[1:]
-            token_logprobs = F.log_softmax(
-                logits, dim=-1, dtype=torch.float32
-            ).gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-            prompt_len = item["prompt_len"]
-            results.append(
-                {
-                    "prompt": item["prompt"],
-                    "hf_base_prefill_logprobs": token_logprobs[: prompt_len - 1].cpu(),
-                    "hf_base_completion_logprobs": token_logprobs[prompt_len - 1 :].cpu(),
-                }
-            )
+            model.eval()
+            for prompt_index, item in enumerate(prompt_results):
+                trace_this_prompt = (
+                    TRACE_TOP_K > 0 and prompt_index == TRACE_PROMPT_INDEX
+                )
+                full_ids = torch.tensor(
+                    item["full_ids"],
+                    dtype=torch.long,
+                    device=model.device,
+                )
+                full_ids_batched = full_ids.unsqueeze(0)
+                full_attention_mask = torch.ones_like(full_ids_batched)
+                logits = model(
+                    full_ids_batched,
+                    attention_mask=full_attention_mask,
+                ).logits[0, :-1]
+                target_ids = full_ids[1:]
+                token_logprobs, topk = _compute_token_logprobs_and_topk(
+                    logits,
+                    target_ids,
+                    tokenizer,
+                    top_k=TRACE_TOP_K if trace_this_prompt else 0,
+                )
+                prompt_len = item["prompt_len"]
+                results.append(
+                    {
+                        "prompt": item["prompt"],
+                        "hf_base_prefill_logprobs": token_logprobs[
+                            : prompt_len - 1
+                        ].cpu(),
+                        "hf_base_completion_logprobs": token_logprobs[
+                            prompt_len - 1 :
+                        ].cpu(),
+                        **(
+                            {
+                                "trace_prompt_base_data": {
+                                    "hf_base_prefill_top_logprobs": topk[
+                                        : prompt_len - 1
+                                    ],
+                                    "hf_base_completion_top_logprobs": topk[
+                                        prompt_len - 1 :
+                                    ],
+                                }
+                            }
+                            if trace_this_prompt and topk is not None
+                            else {}
+                        ),
+                    }
+                )
+        backend_report = _hf_backend_report(
+            model,
+            merge_mode="base",
+            output_text=stream.getvalue(),
+        )
     finally:
-        del model
+        if model is not None:
+            del model
         _cleanup_torch()
 
-    return results
+    return results, backend_report
+
+
+def _hf_score_sequences_materialized_merged(
+    model_path: str,
+    adapter_dir: Path,
+    prompt_results: List[Dict[str, Any]],
+    torch_dtype: torch.dtype,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from peft import PeftModel
+
+    stream = io.StringIO()
+    model = None
+    results: List[Dict[str, Any]] = []
+    try:
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **_hf_model_load_kwargs(torch_dtype),
+            )
+            model = PeftModel.from_pretrained(
+                model,
+                str(adapter_dir),
+                torch_dtype=torch_dtype,
+                is_trainable=False,
+            )
+            model = model.merge_and_unload()
+            model.eval()
+            for prompt_index, item in enumerate(prompt_results):
+                trace_this_prompt = (
+                    TRACE_TOP_K > 0 and prompt_index == TRACE_PROMPT_INDEX
+                )
+                full_ids = torch.tensor(
+                    item["full_ids"],
+                    dtype=torch.long,
+                    device=model.device,
+                )
+                logits = model(full_ids.unsqueeze(0)).logits[0, :-1]
+                target_ids = full_ids[1:]
+                token_logprobs, topk = _compute_token_logprobs_and_topk(
+                    logits,
+                    target_ids,
+                    tokenizer,
+                    top_k=TRACE_TOP_K if trace_this_prompt else 0,
+                )
+                prompt_len = item["prompt_len"]
+                results.append(
+                    {
+                        "prompt": item["prompt"],
+                        "hf_materialized_prefill_logprobs": token_logprobs[
+                            : prompt_len - 1
+                        ].cpu(),
+                        "hf_materialized_completion_logprobs": token_logprobs[
+                            prompt_len - 1 :
+                        ].cpu(),
+                        **(
+                            {
+                                "trace_prompt_materialized_data": {
+                                    "hf_materialized_prefill_top_logprobs": topk[
+                                        : prompt_len - 1
+                                    ],
+                                    "hf_materialized_completion_top_logprobs": topk[
+                                        prompt_len - 1 :
+                                    ],
+                                }
+                            }
+                            if trace_this_prompt and topk is not None
+                            else {}
+                        ),
+                    }
+                )
+        backend_report = _hf_backend_report(
+            model,
+            merge_mode="merged_materialized",
+            output_text=stream.getvalue(),
+        )
+    finally:
+        if model is not None:
+            del model
+        _cleanup_torch()
+
+    return results, backend_report
 
 
 def _unwrap_single_response(response):
@@ -436,7 +856,7 @@ class TestQwen35MergedLoRALogprobDiff(unittest.TestCase):
         self.assertFalse(adapter_config.get("lora_bias", False))
 
         with _adapter_dir_for_subset(adapter_config, adapter_tensors) as adapter_dir:
-            hf_results = _hf_generate_and_score(
+            hf_results, _, _, _ = _hf_generate_and_score_with_materialized_comparison(
                 model_path=BASE_MODEL,
                 adapter_dir=adapter_dir,
                 prompts=PROMPTS,

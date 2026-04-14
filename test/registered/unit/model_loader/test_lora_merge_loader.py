@@ -17,11 +17,23 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 class PackedLinear(torch.nn.Module):
-    def __init__(self, input_size, output_sizes):
+    def __init__(
+        self,
+        input_size,
+        output_sizes,
+        *,
+        fill_value=0.0,
+        dtype=torch.float32,
+    ):
         super().__init__()
         self.output_sizes = list(output_sizes)
         self.weight = torch.nn.Parameter(
-            torch.zeros(sum(output_sizes), input_size), requires_grad=False
+            torch.full(
+                (sum(output_sizes), input_size),
+                fill_value,
+                dtype=dtype,
+            ),
+            requires_grad=False,
         )
         setattr(self.weight, "weight_loader", self.weight_loader)
 
@@ -183,6 +195,18 @@ class WeightLoaderPrecisionModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.probe = WeightLoaderProbe(fill_value=1000.0, dtype=torch.bfloat16)
+
+
+class PackedWeightPrecisionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.probe = torch.nn.Module()
+        self.probe.gate_up_proj = PackedLinear(
+            1,
+            [1, 1],
+            fill_value=1000.0,
+            dtype=torch.bfloat16,
+        )
 
 
 class FlashinferDummyLayer(torch.nn.Module):
@@ -736,6 +760,31 @@ class TestLoRAMergeLoader(unittest.TestCase):
 
         expected = torch.tensor([[0.400390625]], dtype=torch.bfloat16)
         self.assertTrue(torch.equal(model.probe.weight, expected))
+
+    def test_packed_target_addition_accumulates_in_fp32(self):
+        model = PackedWeightPrecisionModel()
+        named_tensors = [
+            (
+                "base_model.model.probe.gate_proj.lora_A.weight",
+                torch.tensor([[1.0]]),
+            ),
+            (
+                "base_model.model.probe.gate_proj.lora_B.weight",
+                torch.tensor([[-999.6]]),
+            ),
+        ]
+
+        merge_lora_tensors_inplace(
+            model,
+            named_tensors,
+            load_context={"manifest": self._unit_manifest()},
+        )
+
+        expected = torch.tensor(
+            [[0.400390625], [1000.0]],
+            dtype=torch.bfloat16,
+        )
+        self.assertTrue(torch.equal(model.probe.gate_up_proj.weight, expected))
 
     def test_merge_moe_expert_targets(self):
         model = DummyModel()

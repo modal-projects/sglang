@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import pathlib
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,7 +31,24 @@ SOURCE_DIRS = [
         REPO_ROOT / "python/sglang",
         "/sgl-workspace/sglang/python/sglang",
     ),
+    (
+        REPO_ROOT / "test/registered/unit/managers",
+        "/sgl-workspace/sglang/test/registered/unit/managers",
+    ),
+    (
+        REPO_ROOT / "test/registered/unit/model_executor",
+        "/sgl-workspace/sglang/test/registered/unit/model_executor",
+    ),
 ]
+REMOTE_REPO_ROOT = pathlib.Path("/sgl-workspace/sglang")
+SCHEDULER_PAUSE_TEST_FILE = (
+    REMOTE_REPO_ROOT
+    / "test/registered/unit/managers/test_scheduler_pause_generation.py"
+)
+MODEL_RUNNER_WEIGHT_UPDATE_TEST_FILE = (
+    REMOTE_REPO_ROOT
+    / "test/registered/unit/model_executor/test_model_runner_weight_update.py"
+)
 
 app = modal.App(name=APP_NAME)
 image = modal.Image.from_registry(SGLANG_IMAGE_TAG)
@@ -274,12 +292,42 @@ def run_review_fix_validation() -> dict[str, Any]:
 
     serialization_result = asyncio.run(_run_serialization_probe())
     engine_api_result = _run_engine_api_probe()
+    scheduler_pause_proc = subprocess.run(
+        [
+            "python",
+            str(SCHEDULER_PAUSE_TEST_FILE),
+        ],
+        env=_py_env(),
+        capture_output=True,
+        text=True,
+        timeout=10 * 60,
+    )
+    model_runner_weight_update_proc = subprocess.run(
+        [
+            "python",
+            str(MODEL_RUNNER_WEIGHT_UPDATE_TEST_FILE),
+        ],
+        env=_py_env(),
+        capture_output=True,
+        text=True,
+        timeout=10 * 60,
+    )
 
     return {
         "image_tag": os.getenv("SGLANG_MODAL_IMAGE_TAG", SGLANG_IMAGE_TAG),
         "gpu": os.getenv("SGLANG_MODAL_GPU", GPU),
         "serialization_probe": serialization_result,
         "engine_api_probe": engine_api_result,
+        "scheduler_pause_unit_test": {
+            "returncode": scheduler_pause_proc.returncode,
+            "stdout": scheduler_pause_proc.stdout,
+            "stderr": scheduler_pause_proc.stderr,
+        },
+        "model_runner_weight_update_unit_test": {
+            "returncode": model_runner_weight_update_proc.returncode,
+            "stdout": model_runner_weight_update_proc.stdout,
+            "stderr": model_runner_weight_update_proc.stderr,
+        },
     }
 
 

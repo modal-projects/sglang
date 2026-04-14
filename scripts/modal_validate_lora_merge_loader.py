@@ -22,6 +22,7 @@ SGLANG_IMAGE_TAG = os.getenv(
     "SGLANG_MODAL_IMAGE_TAG",
     "lmsysorg/sglang:nightly-dev-cu13-20260407-5cc246e0",
 )
+VALIDATION_GPU = os.getenv("LORA_MERGE_VALIDATION_GPU", "L4")
 
 RUNTIME_CONFIG_SECRET = modal.Secret.from_dict(
     {
@@ -73,7 +74,12 @@ def _load_test_module() -> Any:
     return module
 
 
-@app.function(image=image, timeout=30 * 60, secrets=[RUNTIME_CONFIG_SECRET])
+@app.function(
+    image=image,
+    gpu=VALIDATION_GPU,
+    timeout=30 * 60,
+    secrets=[RUNTIME_CONFIG_SECRET],
+)
 def run_lora_merge_loader_validation() -> dict[str, Any]:
     remote_pythonpath = _remote_pythonpath()
     os.environ["PYTHONPATH"] = remote_pythonpath
@@ -91,6 +97,7 @@ def run_lora_merge_loader_validation() -> dict[str, Any]:
 
     return {
         "image_tag": os.getenv("SGLANG_MODAL_IMAGE_TAG", SGLANG_IMAGE_TAG),
+        "gpu": VALIDATION_GPU,
         "pythonpath": remote_pythonpath,
         "test_file": str(REMOTE_TEST_FILE),
         "test_ids": test_ids,

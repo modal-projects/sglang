@@ -19,7 +19,7 @@ HF_CACHE_PATH = "/root/.cache/huggingface"
 HF_CACHE_VOLUME_NAME = os.getenv("HF_CACHE_VOLUME_NAME", "huggingface-cache")
 SGLANG_IMAGE_TAG = os.getenv(
     "SGLANG_MODAL_IMAGE_TAG",
-    "lmsysorg/sglang:nightly-dev-cu13-20260401-b6fe0cca",
+    "lmsysorg/sglang:nightly-dev-cu13-20260407-5cc246e0",
 )
 GPU = os.getenv("SGLANG_MODAL_GPU", "A10G")
 RUNTIME_CONFIG_SECRET = modal.Secret.from_dict(
@@ -35,6 +35,9 @@ HF_IMAGE_ENV = {
     "HF_HUB_ENABLE_HF_TRANSFER": "1",
     "TOKENIZERS_PARALLELISM": "false",
 }
+
+LEGACY_SMALL_PROFILE = "legacy_small"
+QWEN35_PROD_PROFILE = "qwen35_prod"
 
 SOURCE_DIRS = [
     (
@@ -131,8 +134,13 @@ def _wait_ready(
     )
 
 
-def _server_cmd(model_path: str, weight_version: str) -> list[str]:
-    return [
+def _server_cmd(
+    model_path: str,
+    weight_version: str,
+    *,
+    server_profile: str,
+) -> list[str]:
+    cmd = [
         "python",
         "-m",
         "sglang.launch_server",
@@ -144,19 +152,70 @@ def _server_cmd(model_path: str, weight_version: str) -> list[str]:
         str(PORT),
         "--weight-version",
         weight_version,
-        "--mem-fraction-static",
-        "0.72",
-        "--chunked-prefill-size",
-        "2048",
-        "--max-prefill-tokens",
-        "2048",
-        "--cuda-graph-max-bs",
-        "4",
-        "--max-running-requests",
-        "8",
         "--log-level-http",
         "warning",
     ]
+
+    if server_profile == LEGACY_SMALL_PROFILE:
+        cmd.extend(
+            [
+                "--mem-fraction-static",
+                "0.72",
+                "--chunked-prefill-size",
+                "2048",
+                "--max-prefill-tokens",
+                "2048",
+                "--cuda-graph-max-bs",
+                "4",
+                "--max-running-requests",
+                "8",
+            ]
+        )
+        return cmd
+
+    if server_profile == QWEN35_PROD_PROFILE:
+        cmd.extend(
+            [
+                "--revision",
+                "main",
+                "--served-model-name",
+                model_path,
+                "--context-length",
+                "262144",
+                "--enable-multimodal",
+                "--mem-fraction-static",
+                "0.85",
+                "--reasoning-parser",
+                "qwen3",
+                "--chunked-prefill-size",
+                "8192",
+                "--max-prefill-tokens",
+                "8192",
+                "--prefill-attention-backend",
+                "trtllm_mha",
+                "--decode-attention-backend",
+                "trtllm_mha",
+                "--kv-cache-dtype",
+                "bf16",
+                "--page-size",
+                "64",
+                "--moe-runner-backend",
+                "flashinfer_trtllm",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--mamba-ssm-dtype",
+                "bfloat16",
+                "--cuda-graph-bs",
+                *[str(bs) for bs in range(1, 33)],
+                "--cuda-graph-max-bs",
+                "32",
+                "--max-running-requests",
+                "32",
+            ]
+        )
+        return cmd
+
+    raise ValueError(f"Unknown server_profile={server_profile!r}")
 
 
 def _request_json(
@@ -240,6 +299,7 @@ def _run_non_blocking_update(
     next_model: str,
     next_weight_version: str,
     flush_cache: bool,
+    recapture_cuda_graph: bool,
     request_count: int,
     max_new_tokens: int,
     logs: list[str],
@@ -274,6 +334,7 @@ def _run_non_blocking_update(
         update_payload = {
             "model_path": next_model,
             "flush_cache": flush_cache,
+            "recapture_cuda_graph": recapture_cuda_graph,
             "weight_version": next_weight_version,
         }
         if atomic_pause_mode is not None:
@@ -338,6 +399,8 @@ def run_validation(
     max_new_tokens: int = 512,
     require_mixed_in_place: bool = True,
     run_retract: bool = True,
+    server_profile: str = LEGACY_SMALL_PROFILE,
+    recapture_cuda_graph: bool = False,
 ) -> dict[str, Any]:
     runtime_image_tag = os.getenv("SGLANG_MODAL_IMAGE_TAG", SGLANG_IMAGE_TAG)
     runtime_gpu = os.getenv("SGLANG_MODAL_GPU", GPU)
@@ -364,7 +427,11 @@ def run_validation(
     logs: list[str] = []
     try:
         proc = subprocess.Popen(
-            _server_cmd(instruct_model, "modal-instruct"),
+            _server_cmd(
+                instruct_model,
+                "modal-instruct",
+                server_profile=server_profile,
+            ),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -433,6 +500,7 @@ def run_validation(
             next_model=base_model,
             next_weight_version="modal-base",
             flush_cache=False,
+            recapture_cuda_graph=recapture_cuda_graph,
             request_count=request_count,
             max_new_tokens=max_new_tokens,
             logs=logs,
@@ -497,6 +565,7 @@ def run_validation(
                 next_model=instruct_model,
                 next_weight_version="modal-instruct-return",
                 flush_cache=True,
+                recapture_cuda_graph=recapture_cuda_graph,
                 request_count=request_count,
                 max_new_tokens=max_new_tokens,
                 logs=logs,
@@ -524,6 +593,8 @@ def run_validation(
             "gpu": runtime_gpu,
             "instruct_model": instruct_model,
             "base_model": base_model,
+            "server_profile": server_profile,
+            "recapture_cuda_graph": recapture_cuda_graph,
             "unit_tests": [
                 {
                     "cmd": result["cmd"],
@@ -575,6 +646,8 @@ def main(
     max_new_tokens: int = 512,
     require_mixed_in_place: bool = True,
     run_retract: bool = True,
+    server_profile: str = LEGACY_SMALL_PROFILE,
+    recapture_cuda_graph: bool = False,
 ) -> None:
     with modal.enable_output():
         result = run_validation.remote(
@@ -584,5 +657,7 @@ def main(
             max_new_tokens=max_new_tokens,
             require_mixed_in_place=require_mixed_in_place,
             run_retract=run_retract,
+            server_profile=server_profile,
+            recapture_cuda_graph=recapture_cuda_graph,
         )
     print(json.dumps(result, indent=2, sort_keys=True))

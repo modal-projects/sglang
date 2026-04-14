@@ -3410,16 +3410,6 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
-        if recv_req.mode == "in_place":
-            # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
-            return
-
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3445,6 +3435,13 @@ class Scheduler(
 
         self.last_batch = None
         self.cur_batch = None
+
+        if recv_req.mode == "in_place":
+            # In-place pause still needs to quiesce scheduler-owned GPU work
+            # before the weight mutation runs. Preserve running requests and
+            # chunked state, but drain overlap results and merge the finished
+            # prefill batch so resume starts from a consistent checkpoint.
+            return
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)

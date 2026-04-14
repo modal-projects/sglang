@@ -1216,3 +1216,4 @@ def _finalize_flashinfer_moe_layer_after_merge(layer: torch.nn.Module) -> None:
 
 
 merge_lora_tensors_inplace.sglang_supports_host_tensors = True
+merge_lora_tensors_inplace.sglang_requires_cuda_graph_recapture = True

@@ -1393,6 +1393,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     weight_epoch: Optional[int] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
+    # Whether to recapture device graphs after weight update.
+    recapture_cuda_graph: bool = False
 
 
 @dataclass

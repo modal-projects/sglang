@@ -1403,6 +1403,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
+        self._clear_pending_cuda_graph_recapture_marks()
+        device_graph_tensor_snapshot = self._snapshot_graph_tracked_tensors()
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
@@ -1452,8 +1454,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        if recapture_cuda_graph and (self.device == "cuda" or self.device == "musa"):
-            self.init_device_graphs()
+        self._maybe_rebuild_device_graphs_after_weight_update(
+            update_source="disk",
+            force_recapture=recapture_cuda_graph,
+            before_snapshot=device_graph_tensor_snapshot,
+        )
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1709,13 +1714,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         manifest: Optional[dict] = None,
         load_format: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         monkey_patch_torch_reductions()
+        self._clear_pending_cuda_graph_recapture_marks()
+        device_graph_tensor_snapshot = self._snapshot_graph_tracked_tensors()
+        should_recapture_device_graphs = recapture_cuda_graph
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
+            success, message = self._update_weights_from_flattened_bucket(
                 flattened_tensor_bucket_dict=named_tensors
             )
+            if success:
+                self._maybe_rebuild_device_graphs_after_weight_update(
+                    update_source="tensor/flattened_bucket",
+                    force_recapture=should_recapture_device_graphs,
+                    before_snapshot=device_graph_tensor_snapshot,
+                )
+            return success, message
 
         # We need to get device after patch otherwise the device would be wrong
         self.device_module = torch.get_device_module(self.device)
@@ -1732,6 +1748,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
+            should_recapture_device_graphs = (
+                should_recapture_device_graphs
+                or getattr(custom_loader, "sglang_requires_cuda_graph_recapture", False)
+            )
             uses_host_tensors = getattr(
                 custom_loader, "sglang_supports_host_tensors", False
             )
@@ -1763,7 +1783,158 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+
+        self._maybe_rebuild_device_graphs_after_weight_update(
+            update_source="tensor",
+            force_recapture=should_recapture_device_graphs,
+            before_snapshot=device_graph_tensor_snapshot,
+        )
         return True, "Success"
+
+    def _snapshot_graph_tracked_tensors(
+        self,
+    ) -> Optional[dict[str, tuple[int, tuple[int, ...], tuple[int, ...], torch.dtype, str, Optional[int]]]]:
+        """Capture tensor identities that existing device graphs may have closed over."""
+        if (
+            getattr(self, "graph_runner", None) is None
+            and getattr(self, "piecewise_cuda_graph_runner", None) is None
+        ):
+            return None
+
+        target_device = torch.device(self.device)
+        snapshots = {}
+        for kind, tensors in (
+            ("param", self.model.named_parameters()),
+            ("buffer", self.model.named_buffers()),
+        ):
+            for name, tensor in tensors:
+                if tensor.device != target_device:
+                    continue
+                snapshots[f"{kind}:{name}"] = (
+                    tensor.data_ptr(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device.type,
+                    tensor.device.index,
+                )
+        return snapshots
+
+    def _collect_changed_graph_tracked_tensors(
+        self,
+        before_snapshot: Optional[
+            dict[
+                str,
+                tuple[
+                    int,
+                    tuple[int, ...],
+                    tuple[int, ...],
+                    torch.dtype,
+                    str,
+                    Optional[int],
+                ],
+            ]
+        ],
+    ) -> list[str]:
+        if before_snapshot is None:
+            return []
+
+        after_snapshot = self._snapshot_graph_tracked_tensors()
+        if after_snapshot is None:
+            return []
+
+        changed_names = []
+        for name in sorted(before_snapshot.keys() | after_snapshot.keys()):
+            if before_snapshot.get(name) != after_snapshot.get(name):
+                changed_names.append(name)
+        return changed_names
+
+    def _clear_pending_cuda_graph_recapture_marks(self) -> None:
+        if not hasattr(self.model, "named_modules"):
+            return
+        for _, module in self.model.named_modules():
+            if hasattr(module, "_sglang_cuda_graph_recapture_required"):
+                module._sglang_cuda_graph_recapture_required = False
+
+    def _consume_cuda_graph_recapture_marks(self) -> list[str]:
+        if not hasattr(self.model, "named_modules"):
+            return []
+        marked_modules = []
+        for name, module in self.model.named_modules():
+            if getattr(module, "_sglang_cuda_graph_recapture_required", False):
+                marked_modules.append(name or module.__class__.__name__)
+                module._sglang_cuda_graph_recapture_required = False
+        return marked_modules
+
+    def _maybe_rebuild_device_graphs_after_weight_update(
+        self,
+        *,
+        update_source: str,
+        force_recapture: bool,
+        before_snapshot: Optional[
+            dict[
+                str,
+                tuple[
+                    int,
+                    tuple[int, ...],
+                    tuple[int, ...],
+                    torch.dtype,
+                    str,
+                    Optional[int],
+                ],
+            ]
+        ],
+    ) -> None:
+        if force_recapture:
+            logger.info(
+                "Rebuild device graphs after %s weight update because recapture was requested.",
+                update_source,
+            )
+            self.rebuild_device_graphs_after_weight_update()
+            return
+
+        marked_modules = self._consume_cuda_graph_recapture_marks()
+        if marked_modules:
+            logger.info(
+                "Rebuild device graphs after %s weight update because %d modules requested it. sample=%s",
+                update_source,
+                len(marked_modules),
+                marked_modules[:8],
+            )
+            self.rebuild_device_graphs_after_weight_update()
+            return
+
+        changed_names = self._collect_changed_graph_tracked_tensors(before_snapshot)
+        if not changed_names:
+            return
+
+        logger.info(
+            "Rebuild device graphs after %s weight update because %d graph-tracked tensors changed. sample=%s",
+            update_source,
+            len(changed_names),
+            changed_names[:8],
+        )
+        self.rebuild_device_graphs_after_weight_update()
+
+    def rebuild_device_graphs_after_weight_update(self) -> None:
+        """Rebuild decode and piecewise graphs after a weight mutation changed storage."""
+        tic = time.perf_counter()
+        logger.info("Rebuild device graphs after weight update begin.")
+        self.graph_runner = None
+        self.piecewise_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+
+        gc.collect()
+        device_module = torch.get_device_module(self.device)
+        if hasattr(device_module, "empty_cache"):
+            device_module.empty_cache()
+
+        self.init_device_graphs()
+        self.init_piecewise_cuda_graphs()
+        logger.info(
+            "Rebuild device graphs after weight update end. elapsed=%.2f s",
+            time.perf_counter() - tic,
+        )
 
     def _call_custom_weight_loader(
         self,

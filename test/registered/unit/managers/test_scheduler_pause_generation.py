@@ -55,48 +55,59 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler._get_token_info = MagicMock(return_value=(0, 0, 1000, 0))
         return scheduler
 
-    def test_inplace_only_sets_flag(self):
-        """in_place pause should only set _engine_paused and return."""
+    def test_inplace_clears_scheduler_batch_pointers(self):
+        """in_place pause should leave the scheduler quiescent for the update."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
+        scheduler.last_batch.forward_mode.is_extend.return_value = False
         scheduler.cur_batch = MagicMock()
         scheduler.chunked_req = MagicMock()
 
-        original_last_batch = scheduler.last_batch
-        original_cur_batch = scheduler.cur_batch
         original_chunked_req = scheduler.chunked_req
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        # All state must be preserved — no mutation
-        self.assertIs(scheduler.last_batch, original_last_batch)
-        self.assertIs(scheduler.cur_batch, original_cur_batch)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.cur_batch)
+        # In-place pause preserves chunked state and running requests.
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
-    def test_inplace_does_not_drain_overlap_queue(self):
-        """in_place should not process the overlap result_queue."""
+    def test_inplace_drains_overlap_queue(self):
+        """in_place pause should finish CPU-side processing for the last batch."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         scheduler.last_batch = MagicMock()
+        scheduler.last_batch.forward_mode.is_extend.return_value = False
+        scheduler.cur_batch = MagicMock()
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        scheduler.process_batch_result = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        self.assertEqual(len(scheduler.result_queue), 1)
+        scheduler.process_batch_result.assert_called_once()
+        self.assertEqual(len(scheduler.result_queue), 0)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.cur_batch)
 
-    def test_inplace_does_not_merge_batch(self):
-        """in_place should not filter or merge last_batch into running_batch."""
+    def test_inplace_merges_extend_batch_without_retract(self):
+        """in_place pause should preserve surviving requests without retracting them."""
         scheduler = self._new_scheduler()
         last_batch = MagicMock()
         last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
         scheduler.last_batch = last_batch
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.filter_batch = MagicMock()
+        scheduler.running_batch.retract_all = MagicMock()
+        scheduler.running_batch.merge_batch = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        last_batch.filter_batch.assert_not_called()
-        scheduler.running_batch.merge_batch.assert_not_called()
+        last_batch.filter_batch.assert_called_once()
+        scheduler.running_batch.merge_batch.assert_called_once_with(last_batch)
+        scheduler.running_batch.retract_all.assert_not_called()
 
     def test_abort_clears_state(self):
         """abort mode should clear last_batch and cur_batch."""

@@ -908,6 +908,7 @@ class Engine(EngineScoreMixin, EngineBase):
         load_format: Optional[str] = None,
         flush_cache: bool = True,
         atomic_pause_mode: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -924,6 +925,7 @@ class Engine(EngineScoreMixin, EngineBase):
             load_format=load_format,
             flush_cache=flush_cache,
             atomic_pause_mode=atomic_pause_mode,
+            recapture_cuda_graph=recapture_cuda_graph,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)

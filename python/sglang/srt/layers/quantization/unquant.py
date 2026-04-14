@@ -251,6 +251,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            # Hot weight reload must rebuild CUDA graphs after this layout transform.
+            layer._sglang_cuda_graph_recapture_required = True
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
@@ -336,6 +338,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         """
         if not self.use_flashinfer_trtllm_moe:
             return
+
+        layer._sglang_cuda_graph_recapture_required = True
 
         expected_shape = None
         permute_fn = None

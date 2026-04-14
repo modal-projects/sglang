@@ -163,6 +163,7 @@ class BaseTpWorker(ABC):
             ),
             manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
 

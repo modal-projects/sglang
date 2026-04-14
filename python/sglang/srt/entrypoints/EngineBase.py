@@ -50,6 +50,7 @@ class EngineBase(ABC):
         load_format: Optional[str] = None,
         flush_cache: bool = True,
         atomic_pause_mode: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         """Update model weights with in-memory tensor data."""
         pass

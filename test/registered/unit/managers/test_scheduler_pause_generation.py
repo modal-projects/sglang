@@ -37,6 +37,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.waiting_queue = []
+        scheduler.dllm_config = None
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.pp_size = 1
@@ -97,6 +98,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         last_batch = MagicMock()
         last_batch.forward_mode.is_extend.return_value = True
         last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 2]
+        last_batch.chunked_req = None
         scheduler.last_batch = last_batch
         scheduler.running_batch.is_empty.return_value = False
         scheduler.running_batch.filter_batch = MagicMock()
@@ -108,6 +111,82 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         last_batch.filter_batch.assert_called_once()
         scheduler.running_batch.merge_batch.assert_called_once_with(last_batch)
         scheduler.running_batch.retract_all.assert_not_called()
+
+    def test_inplace_excludes_active_chunked_request(self):
+        """in_place pause should stash and exclude the active chunked request."""
+        scheduler = self._new_scheduler()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 1]
+        last_batch.chunked_req = None
+        scheduler.last_batch = last_batch
+        scheduler.chunked_req = MagicMock()
+        scheduler.stash_chunked_request = MagicMock()
+        scheduler.running_batch.is_empty.return_value = False
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        scheduler.stash_chunked_request.assert_called_once_with(scheduler.chunked_req)
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(scheduler.chunked_req, excluded)
+        scheduler.running_batch.merge_batch.assert_called_once_with(last_batch)
+
+    def test_inplace_excludes_stale_last_batch_chunked_request(self):
+        """in_place pause should discard stale last_batch.chunked_req state."""
+        scheduler = self._new_scheduler()
+        stale_chunked_req = MagicMock()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 2]
+        last_batch.chunked_req = stale_chunked_req
+        scheduler.last_batch = last_batch
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(stale_chunked_req, excluded)
+
+    def test_inplace_excludes_dllm_staging_requests(self):
+        """in_place pause should mirror DLLM staging exclusions from scheduling."""
+        scheduler = self._new_scheduler()
+        scheduler.dllm_config = object()
+        staging_req = MagicMock()
+        last_req = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = True
+        scheduler.dllm_manager.staging_queue = [staging_req]
+        scheduler.stash_chunked_request = MagicMock()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = True
+        last_batch.batch_size.side_effect = [1, 0]
+        last_batch.chunked_req = None
+        last_batch.reqs = [last_req]
+        scheduler.last_batch = last_batch
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        scheduler.stash_chunked_request.assert_called_once_with(staging_req)
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(staging_req, excluded)
+        self.assertIn(last_req, excluded)
+
+    def test_inplace_clears_batch_is_full_when_filtering_shrinks_batch(self):
+        """in_place pause should reset batch_is_full if filtering removes requests."""
+        scheduler = self._new_scheduler()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [3, 1]
+        last_batch.chunked_req = None
+        scheduler.last_batch = last_batch
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.batch_is_full = True
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_abort_clears_state(self):
         """abort mode should clear last_batch and cur_batch."""

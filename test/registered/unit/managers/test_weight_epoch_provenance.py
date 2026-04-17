@@ -12,11 +12,44 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     GenerateReqInput,
     PauseGenerationReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+
+
+class _AwaitableNone:
+    def __await__(self):
+        if False:
+            yield None
+        return None
+
+
+class _RecordingSender:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, obj):
+        self.sent.append(obj)
+        return _AwaitableNone()
+
+
+class _NoopAsyncContext:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeModelUpdateLock:
+    def __init__(self):
+        self.writer_lock = _NoopAsyncContext()
+
+    async def is_locked(self) -> bool:
+        return False
 
 
 class TestWeightEpochProvenance(unittest.TestCase):
@@ -29,7 +62,19 @@ class TestWeightEpochProvenance(unittest.TestCase):
         tm.weight_update_orchestration_lock = asyncio.Lock()
         tm.is_pause = False
         tm.is_pause_cond = asyncio.Condition()
-        tm.server_args = SimpleNamespace(weight_version="v7")
+        tm.auto_create_handle_loop = lambda: None
+        tm.send_to_scheduler = _RecordingSender()
+        tm.abort_request = MagicMock()
+        tm.model_update_lock = _FakeModelUpdateLock()
+        tm.server_args = SimpleNamespace(
+            weight_version="v7",
+            load_format="auto",
+            dp_size=1,
+            enable_dp_attention=False,
+            model_path="model-v7",
+        )
+        tm.served_model_name = "model-v7"
+        tm.model_path = "model-v7"
         return tm
 
     def test_generate_req_getitem_indexes_extra_key_list(self):
@@ -217,6 +262,53 @@ class TestWeightEpochProvenance(unittest.TestCase):
             PauseGenerationReqInput(mode="retract")
         )
         tm.continue_generation.assert_awaited_once_with(ContinueGenerationReqInput())
+
+    def test_update_weights_from_disk_sends_pause_before_atomic_update(self):
+        tm = self._new_tokenizer_manager()
+        seen_updates = []
+        update_sent = asyncio.Event()
+        release_update = asyncio.Event()
+
+        async def fake_wait_for_model_update(obj):
+            tm.send_to_scheduler.send_pyobj(obj)
+            seen_updates.append(obj)
+            update_sent.set()
+            await release_update.wait()
+            return True, "ok", 0
+
+        tm._wait_for_model_update_from_disk = fake_wait_for_model_update
+        obj = UpdateWeightFromDiskReqInput(
+            model_path="atomic-model",
+            atomic_pause_mode="in_place",
+            flush_cache=False,
+            weight_version="atomic-v1",
+        )
+
+        async def run():
+            task = asyncio.create_task(tm.update_weights_from_disk(obj, None))
+            await update_sent.wait()
+            sent_before_reply = [type(item).__name__ for item in tm.send_to_scheduler.sent]
+            release_update.set()
+            result = await task
+            sent_after_reply = [type(item).__name__ for item in tm.send_to_scheduler.sent]
+            return sent_before_reply, sent_after_reply, result
+
+        sent_before_reply, sent_after_reply, result = asyncio.run(run())
+
+        self.assertEqual(
+            sent_before_reply,
+            ["PauseGenerationReqInput", "UpdateWeightFromDiskReqInput"],
+        )
+        self.assertEqual(
+            sent_after_reply,
+            [
+                "PauseGenerationReqInput",
+                "UpdateWeightFromDiskReqInput",
+                "ContinueGenerationReqInput",
+            ],
+        )
+        self.assertEqual(seen_updates, [obj])
+        self.assertEqual(result, (True, "ok Weight version updated to atomic-v1.", 0))
 
 
 if __name__ == "__main__":

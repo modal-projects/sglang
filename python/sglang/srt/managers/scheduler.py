@@ -2244,13 +2244,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        self._abort_on_waiting_timeout()
-        self._abort_on_running_timeout()
-        if self.dllm_config is not None:
-            self.dllm_manager.filter_finished_reqs()
-
-        # Merge the prefill batch into the running batch
+    def _build_extend_batch_exclusions(self) -> List[Req]:
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -2263,6 +2257,46 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
+
+        if self.last_batch is None:
+            return list(chunked_req_to_exclude)
+
+        if self.last_batch.chunked_req is not None:
+            # In the context pipeline parallelism, after the last chunk, the
+            # current microbatch can still track an outdated chunked_req.
+            chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+        if self.dllm_config is not None and self.last_batch.reqs:
+            chunked_req_to_exclude.update(self.last_batch.reqs)
+
+        return list(chunked_req_to_exclude)
+
+    def _merge_extend_last_batch_into_running_batch(
+        self, *, skip_merge: bool = False
+    ) -> None:
+        if not self.last_batch or not self.last_batch.forward_mode.is_extend():
+            return
+
+        last_bs = self.last_batch.batch_size()
+        self.last_batch.filter_batch(
+            chunked_req_to_exclude=self._build_extend_batch_exclusions()
+        )
+        if self.last_batch.batch_size() < last_bs:
+            self.running_batch.batch_is_full = False
+
+        if skip_merge or self.last_batch.is_empty():
+            return
+
+        if self.running_batch.is_empty():
+            self.running_batch = self.last_batch
+        else:
+            self.running_batch.merge_batch(self.last_batch)
+
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._abort_on_waiting_timeout()
+        self._abort_on_running_timeout()
+        if self.dllm_config is not None:
+            self.dllm_manager.filter_finished_reqs()
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2282,29 +2316,7 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
-
-            # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
-
-            # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+            self._merge_extend_last_batch_into_running_batch()
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3416,22 +3428,13 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
-            if (
-                not self.last_batch.is_empty()
-                and self.disaggregation_mode != DisaggregationMode.PREFILL
-            ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+            self._merge_extend_last_batch_into_running_batch(
+                skip_merge=self.disaggregation_mode == DisaggregationMode.PREFILL
+            )
 
         self.last_batch = None
         self.cur_batch = None

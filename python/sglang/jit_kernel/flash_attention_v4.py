@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -14,9 +15,24 @@ except Exception as _e:  # pragma: no cover
 else:
     _flash_attn_import_error = None
 
+if _flash_attn_varlen_func is None:  # pragma: no cover
+    _flash_attn_supports_fp8_descales = False
+else:
+    try:
+        _flash_attn_supports_fp8_descales = all(
+            name in inspect.signature(_flash_attn_varlen_func).parameters
+            for name in ("q_descale", "k_descale", "v_descale")
+        )
+    except (TypeError, ValueError):  # pragma: no cover
+        _flash_attn_supports_fp8_descales = False
+
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def supports_fp8_descales() -> bool:
+    return _flash_attn_supports_fp8_descales
 
 
 @debug_kernel_api
@@ -33,6 +49,9 @@ def flash_attn_varlen_func(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     softcap: Optional[float] = None,
     window_size: Tuple[Optional[int], Optional[int]] = (-1, -1),
     learnable_sink: Optional[torch.Tensor] = None,
@@ -55,12 +74,29 @@ def flash_attn_varlen_func(
     ]
     seqused_q, seqused_k = [_maybe_contiguous(t) for t in (seqused_q, seqused_k)]
     page_table = _maybe_contiguous(page_table)
+    q_descale, k_descale, v_descale = [
+        _maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)
+    ]
 
     if learnable_sink is None and sinks is not None:
         learnable_sink = sinks
 
     if window_size == (-1, -1):
         window_size = (None, None)
+
+    descale_kwargs = {}
+    if any(t is not None for t in (q_descale, k_descale, v_descale)):
+        if not supports_fp8_descales():
+            raise RuntimeError(
+                "Installed flash-attn-4 does not support FA4 FP8 descales. "
+                "Install a newer flash-attn-4 build with "
+                "q_descale/k_descale/v_descale support."
+            )
+        descale_kwargs = {
+            "q_descale": q_descale,
+            "k_descale": k_descale,
+            "v_descale": v_descale,
+        }
 
     result = _flash_attn_varlen_func(
         q=q,
@@ -83,6 +119,7 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
+        **descale_kwargs,
     )
 
     if return_softmax_lse:
@@ -137,8 +174,6 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "FA4 path does not support non-consecutive batch indices or left padding."
         )
-    if q_descale is not None or k_descale is not None or v_descale is not None:
-        raise NotImplementedError("FA4 path does not support descale.")
 
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
@@ -155,6 +190,9 @@ def flash_attn_with_kvcache(
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         softcap=softcap if softcap != 0.0 else None,
         window_size=window_size,
         num_splits=num_splits if num_splits != 0 else 1,

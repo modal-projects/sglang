@@ -648,23 +648,27 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
-        k_descale, v_descale = None, None
+        input_dtype = q.dtype
+        q_descale, k_descale, v_descale = None, None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
-        ):
+        # 3) layer.head_dim <= 256 since the fp8 path requires fp16/bf16 inputs otherwise.
+        # FA4 fp8 descale support is feature-gated in the wrapper because it depends on the
+        # installed external flash-attn-4 build.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                if self.fa_impl_ver == 4:
+                    q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        if self.use_mla and self.fa_impl_ver == 4 and self.kv_cache_dtype_str != "auto":
+            raise NotImplementedError(
+                "FA4 FP8 is only supported for standard MHA; MLA/qv is not supported."
+            )
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -760,6 +764,7 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=False if use_cascade_attn else causal,
                         window_size=window_size,
                         softcap=layer.logit_cap,
+                        q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
                         return_softmax_lse=use_cascade_attn,
@@ -780,7 +785,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # also skipped (guarded above). This eliminates store_kvcache
                 # and prepare_varlen_num_blocks overhead per layer.
                 assert k is not None, "fa_skip_kv_cache requires k to be provided"
-                assert k_descale is None and v_descale is None, (
+                assert q_descale is None and k_descale is None and v_descale is None, (
                     "fa_skip_kv_cache uses raw K/V tensors, "
                     "FP8 KV cache descaling is not supported in this mode"
                 )
@@ -813,6 +818,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -841,6 +847,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
@@ -998,6 +1005,8 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
+        if o.dtype != input_dtype:
+            o = o.to(input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -1064,18 +1073,25 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        k_descale, v_descale = None, None
+        input_dtype = q.dtype
+        q_descale, k_descale, v_descale = None, None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                if self.fa_impl_ver == 4:
+                    q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+        if self.use_mla and self.fa_impl_ver == 4 and self.kv_cache_dtype_str != "auto":
+            raise NotImplementedError(
+                "FA4 FP8 is only supported for standard MHA; MLA/qv is not supported."
+            )
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1104,6 +1120,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1125,6 +1142,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=True,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1171,6 +1189,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1195,6 +1214,7 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
+                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1289,6 +1309,8 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
+        if o.dtype != input_dtype:
+            o = o.to(input_dtype)
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):

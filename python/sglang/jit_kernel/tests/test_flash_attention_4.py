@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.jit_kernel.flash_attention_v4 import supports_fp8_descales
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu-large")
@@ -19,6 +20,9 @@ register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 
 # Skip this test on Hopper machine
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
+fa4_dtypes = [torch.bfloat16]
+if supports_fp8_descales():
+    fa4_dtypes.append(torch.float8_e4m3fn)
 
 
 def apply_rotary_emb(
@@ -555,8 +559,7 @@ def attention_ref(
 @pytest.mark.skipif(
     skip_condition, reason="FA4 Requires compute capability of 10 or above."
 )
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", fa4_dtypes)
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -823,6 +826,9 @@ def test_flash_attn_varlen_output(
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
                 sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                 pack_gqa=pack_gqa,
                 return_softmax_lse=True,
@@ -944,9 +950,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.skipif(
     skip_condition, reason="FA4 Requires compute capability of 10 or above."
 )
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", fa4_dtypes)
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -1090,6 +1094,13 @@ def test_flash_attn_kvcache(
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
             learnable_sink = None
+        if dtype == torch.float8_e4m3fn:
+            q_descale, k_descale, v_descale = [
+                torch.rand(batch_size, nheads_k, device=device, dtype=torch.float32) * 2
+                for _ in range(3)
+            ]
+        else:
+            q_descale, k_descale, v_descale = None, None, None
 
         seqlen_new = (
             seqlen_q
@@ -1304,6 +1315,9 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             learnable_sink=learnable_sink,
             attention_chunk=attention_chunk,
@@ -1317,6 +1331,9 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             learnable_sink=learnable_sink,
             attention_chunk=attention_chunk,
@@ -1381,6 +1398,9 @@ def test_flash_attn_kvcache(
                     page_table=page_table,
                     causal=causal,
                     window_size=window_size,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                     softcap=0.0,
                     pack_gqa=None,

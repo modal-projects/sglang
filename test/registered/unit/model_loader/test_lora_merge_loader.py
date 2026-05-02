@@ -5,15 +5,18 @@ import sys
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_loader.lora_merge_loader import merge_lora_tensors_inplace
+from sglang.srt.model_loader.lora_merge_loader import (
+    merge_lora_tensors_inplace,
+    prepare_lora_tensors_for_merge,
+)
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cuda_ci(est_time=20, suite="stage-b-test-1-gpu-small")
 
 
 class PackedLinear(torch.nn.Module):
@@ -158,6 +161,13 @@ class DummyModel(torch.nn.Module):
         self.model = torch.nn.Module()
         self.model.layers = torch.nn.ModuleList([DummyLayer()])
         self.lm_head = DenseHead(vocab_size=5, hidden_size=3)
+
+
+class LargeDirectModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.large0 = DenseHead(vocab_size=512, hidden_size=512)
+        self.large1 = DenseHead(vocab_size=512, hidden_size=512)
 
 
 class WeightLoaderProbe(torch.nn.Module):
@@ -345,12 +355,24 @@ def stub_flashinfer_fused_moe_core():
                 sys.modules[name] = module
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestLoRAMergeLoader(unittest.TestCase):
     def _manifest(self):
         return {"config_dict": {"lora_alpha": 2, "r": 1}}
 
     def _unit_manifest(self):
         return {"config_dict": {"lora_alpha": 1, "r": 1}}
+
+    def _merge_inplace(self, model, named_tensors, manifest=None):
+        model.cuda()
+        merge_lora_tensors_inplace(
+            model,
+            named_tensors,
+            load_context={"manifest": manifest or self._manifest()},
+        )
+        torch.cuda.synchronize()
+        model.cpu()
+        return model
 
     def _flashinfer_trtllm_merge_fixture(self):
         num_experts = 2
@@ -525,11 +547,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._manifest())
 
         q_delta = 2 * torch.tensor([[1.0, 0.0, 1.0], [2.0, 0.0, 2.0]])
         v_delta = 2 * torch.tensor([[0.0, 3.0, 3.0], [0.0, 4.0, 4.0]])
@@ -588,11 +606,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._manifest())
 
         expected_qkvz = 2 * torch.tensor(
             [
@@ -650,11 +664,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._manifest())
 
         expected_gate_up = 2 * torch.tensor(
             [
@@ -697,11 +707,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._unit_manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._unit_manifest())
 
         expected = torch.tensor([[0.400390625]], dtype=torch.bfloat16)
         self.assertTrue(torch.equal(model.model.embed_tokens.weight, expected))
@@ -720,11 +726,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._unit_manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._unit_manifest())
 
         self.assertTrue(
             torch.equal(
@@ -752,11 +754,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._unit_manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._unit_manifest())
 
         expected = torch.tensor([[0.400390625]], dtype=torch.bfloat16)
         self.assertTrue(torch.equal(model.probe.weight, expected))
@@ -774,11 +772,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._unit_manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._unit_manifest())
 
         expected = torch.tensor(
             [[0.400390625], [1000.0]],
@@ -815,11 +809,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             ),
         ]
 
-        merge_lora_tensors_inplace(
-            model,
-            named_tensors,
-            load_context={"manifest": self._manifest()},
-        )
+        self._merge_inplace(model, named_tensors, self._manifest())
 
         expected_w13 = 2 * torch.tensor(
             [
@@ -867,6 +857,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
             w13_weight=fixture["w13_init"],
             w2_weight=fixture["w2_init"],
         )
+        actual_model.cuda()
         actual_experts = actual_model.model.layers[0].mlp.experts
         expected_experts = expected_model.model.layers[0].mlp.experts
 
@@ -875,14 +866,14 @@ class TestLoRAMergeLoader(unittest.TestCase):
         with stub_flashinfer_fused_moe_core():
             actual_experts.quant_method.process_weights_after_loading(actual_experts)
             expected_experts.quant_method.process_weights_after_loading(expected_experts)
-            merge_lora_tensors_inplace(
+            self._merge_inplace(
                 actual_model,
                 [
                     tensor
                     for target in ("w1", "w3", "w2")
                     for tensor in fixture["named_tensors_by_target"][target]
                 ],
-                load_context={"manifest": self._manifest()},
+                self._manifest(),
             )
 
         self._assert_flashinfer_experts_equal(actual_experts, expected_experts)
@@ -906,6 +897,7 @@ class TestLoRAMergeLoader(unittest.TestCase):
                     w13_weight=fixture["w13_init"],
                     w2_weight=fixture["w2_init"],
                 )
+                actual_model.cuda()
                 actual_experts = actual_model.model.layers[0].mlp.experts
                 expected_experts = expected_model.model.layers[0].mlp.experts
 
@@ -918,13 +910,250 @@ class TestLoRAMergeLoader(unittest.TestCase):
                     expected_experts.quant_method.process_weights_after_loading(
                         expected_experts
                     )
-                    merge_lora_tensors_inplace(
+                    self._merge_inplace(
                         actual_model,
                         fixture["named_tensors_by_target"][target],
-                        load_context={"manifest": self._manifest()},
+                        self._manifest(),
                     )
 
                 self._assert_flashinfer_experts_equal(actual_experts, expected_experts)
+
+    def test_prestage_budget_stages_small_pairs_and_consumes_empty_update(self):
+        model = DummyModel().cuda()
+        named_tensors = [
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                torch.tensor([[1.0, 0.0, 1.0]]),
+            ),
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                torch.tensor([[1.0], [2.0]]),
+            ),
+        ]
+        request_id = "small-prestage"
+        prepare_trace = {"request_id": request_id}
+        prepare_manifest = {
+            **self._manifest(),
+            "lora_merge_prestage_request_id": request_id,
+            "peak_device_bytes": "8MB",
+        }
+        prepare_lora_tensors_for_merge(
+            model,
+            named_tensors,
+            load_context={"manifest": prepare_manifest, "trace": prepare_trace},
+        )
+        self.assertTrue(prepare_trace["lora_prestage_complete"])
+        self.assertEqual(prepare_trace["lora_prestage_staged_pair_count"], 1)
+        self.assertEqual(prepare_trace["lora_prestage_unstaged_pair_count"], 0)
+
+        merge_trace = {"request_id": request_id}
+        merge_lora_tensors_inplace(
+            model,
+            [],
+            load_context={
+                "manifest": {
+                    **self._manifest(),
+                    "lora_merge_consume_prestaged": True,
+                    "lora_merge_prestage_request_id": request_id,
+                },
+                "trace": merge_trace,
+            },
+        )
+        torch.cuda.synchronize()
+        model.cpu()
+
+        q_delta = 2 * torch.tensor([[1.0, 0.0, 1.0], [2.0, 0.0, 2.0]])
+        expected_qkv = torch.cat([q_delta, torch.zeros_like(q_delta), torch.zeros_like(q_delta)], dim=0)
+        self.assertTrue(
+            torch.equal(model.model.layers[0].qkv_proj.weight, expected_qkv)
+        )
+        self.assertEqual(merge_trace["lora_loader_prestage_hit_count"], 1)
+        self.assertEqual(merge_trace.get("lora_loader_prestage_miss_count", 0), 0)
+
+    def test_prestage_budget_keeps_oversized_pairs_on_cpu_and_applies_from_cache(self):
+        model = LargeDirectModel().cuda()
+        a = torch.ones(1, 512)
+        b = torch.ones(512, 1)
+        named_tensors = [
+            ("base_model.model.large0.lora_A.weight", a),
+            ("base_model.model.large0.lora_B.weight", b),
+            ("base_model.model.large1.lora_A.weight", a),
+            ("base_model.model.large1.lora_B.weight", b),
+        ]
+        request_id = "partial-prestage"
+        prepare_trace = {"request_id": request_id}
+        prepare_manifest = {
+            **self._unit_manifest(),
+            "lora_merge_prestage_request_id": request_id,
+            "peak_device_bytes": "1MB",
+        }
+        prepare_lora_tensors_for_merge(
+            model,
+            named_tensors,
+            load_context={"manifest": prepare_manifest, "trace": prepare_trace},
+        )
+        self.assertFalse(prepare_trace["lora_prestage_complete"])
+        self.assertEqual(prepare_trace["lora_prestage_staged_pair_count"], 0)
+        self.assertEqual(prepare_trace["lora_prestage_unstaged_pair_count"], 2)
+        self.assertGreater(
+            prepare_trace["lora_prestage_max_apply_temp_bytes"],
+            prepare_trace["lora_prestage_peak_device_budget_bytes"],
+        )
+
+        merge_trace = {"request_id": request_id}
+        merge_lora_tensors_inplace(
+            model,
+            [],
+            load_context={
+                "manifest": {
+                    **self._unit_manifest(),
+                    "lora_merge_consume_prestaged": True,
+                    "lora_merge_prestage_request_id": request_id,
+                },
+                "trace": merge_trace,
+            },
+        )
+        torch.cuda.synchronize()
+        model.cpu()
+
+        expected = torch.ones(512, 512)
+        self.assertTrue(torch.equal(model.large0.weight, expected))
+        self.assertTrue(torch.equal(model.large1.weight, expected))
+        self.assertEqual(merge_trace.get("lora_loader_prestage_hit_count", 0), 0)
+        self.assertEqual(merge_trace["lora_loader_prestage_miss_count"], 2)
+
+    def test_cuda_bucketed_core_targets_with_small_bucket(self):
+        def named_tensors():
+            return [
+                (
+                    "base_model.model.model.layers.0.linear_attn.in_proj_q.lora_A.weight",
+                    torch.tensor([[1.0, 2.0, 0.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.linear_attn.in_proj_q.lora_B.weight",
+                    torch.tensor([[1.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.linear_attn.in_proj_v.lora_A.weight",
+                    torch.tensor([[1.0, 0.0, 1.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.linear_attn.in_proj_v.lora_B.weight",
+                    torch.tensor([[3.0], [4.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.shared_expert.gate_proj.lora_A.weight",
+                    torch.tensor([[1.0, 0.0, 1.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.shared_expert.gate_proj.lora_B.weight",
+                    torch.tensor([[1.0], [2.0]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.experts.w1.lora_A.weight",
+                    torch.tensor([[[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.experts.w1.lora_B.weight",
+                    torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.experts.w2.lora_A.weight",
+                    torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]]),
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.experts.w2.lora_B.weight",
+                    torch.tensor([[[1.0], [2.0], [3.0]]]),
+                ),
+                (
+                    "base_model.model.model.unembed_tokens.lora_A.weight",
+                    torch.tensor([[1.0, 0.0, 1.0]]),
+                ),
+                (
+                    "base_model.model.model.unembed_tokens.lora_B.weight",
+                    torch.tensor([[1.0], [0.0], [2.0], [0.0], [3.0]]),
+                ),
+            ]
+
+        model = DummyModel()
+        manifest = {
+            **self._manifest(),
+            "gpu_bucket_bytes": 1024 * 1024,
+        }
+
+        self._merge_inplace(model, named_tensors(), manifest)
+
+        expected_qkvz = 2 * torch.tensor(
+            [
+                [1.0, 2.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 3.0],
+                [4.0, 0.0, 4.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        self.assertTrue(
+            torch.equal(
+                model.model.layers[0].linear_attn.in_proj_qkvz.weight, expected_qkvz
+            )
+        )
+
+        expected_gate_up = 2 * torch.tensor(
+            [
+                [1.0, 0.0, 1.0],
+                [2.0, 0.0, 2.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        self.assertTrue(
+            torch.equal(
+                model.model.layers[0].mlp.shared_expert.gate_up_proj.weight,
+                expected_gate_up,
+            )
+        )
+
+        expected_w13 = 2 * torch.tensor(
+            [
+                [
+                    [1.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                [
+                    [0.0, 3.0, 0.0],
+                    [0.0, 4.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ],
+            ]
+        )
+        self.assertTrue(
+            torch.equal(model.model.layers[0].mlp.experts.w13_weight, expected_w13)
+        )
+
+        expected_w2 = 2 * torch.tensor(
+            [
+                [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+                [[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]],
+            ]
+        )
+        self.assertTrue(
+            torch.equal(model.model.layers[0].mlp.experts.w2_weight, expected_w2)
+        )
+
+        expected_lm_head = 2 * torch.tensor(
+            [
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 2.0],
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 3.0],
+            ]
+        )
+        self.assertTrue(torch.equal(model.lm_head.weight, expected_lm_head))
 
 
 if __name__ == "__main__":

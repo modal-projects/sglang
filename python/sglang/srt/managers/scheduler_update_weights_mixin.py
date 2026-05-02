@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -21,6 +22,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PrepareWeightsFromTensorReqInput,
+    PrepareWeightsFromTensorReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -93,22 +96,96 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
+        trace = recv_req.trace if isinstance(recv_req.trace, dict) else {}
+        recv_req.trace = trace
+        scheduler_started_at = time.monotonic()
+        trace["scheduler_update_start_monotonic"] = scheduler_started_at
+        trace["scheduler_tp_rank"] = getattr(self.tp_worker, "tp_rank", None)
+        pause_trace = getattr(self, "_last_generation_pause_trace", None)
+        request_id = trace.get("request_id")
+        if (
+            pause_trace is not None
+            and request_id is not None
+            and pause_trace.get("request_id") == request_id
+        ):
+            trace["scheduler_pause_trace"] = dict(pause_trace)
+            trace["scheduler_pause_to_update_start_ms"] = round(
+                (
+                    scheduler_started_at
+                    - pause_trace["scheduler_pause_generation_start_monotonic"]
+                )
+                * 1000,
+                3,
+            )
         if recv_req.disable_draft_model:
             worker = self.tp_worker
         else:
             worker = self.draft_worker or self.tp_worker
+        trace["scheduler_worker_kind"] = (
+            "draft_worker" if worker is self.draft_worker else "tp_worker"
+        )
+        worker_started_at = time.monotonic()
         success, message = worker.update_weights_from_tensor(recv_req)
+        trace["scheduler_worker_update_ms"] = round(
+            (time.monotonic() - worker_started_at) * 1000, 3
+        )
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
+                flush_started_at = time.monotonic()
                 flush_cache_success = self.flush_cache()
+                trace["scheduler_flush_cache_ms"] = round(
+                    (time.monotonic() - flush_started_at) * 1000, 3
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        barrier_started_at = time.monotonic()
         torch.distributed.barrier(group=self.tp_cpu_group)
+        trace["scheduler_tp_barrier_ms"] = round(
+            (time.monotonic() - barrier_started_at) * 1000, 3
+        )
         if success:
             self._record_successful_weight_update(recv_req)
-        return UpdateWeightsFromTensorReqOutput(success, message)
+        trace["scheduler_success"] = success
+        trace["scheduler_update_total_ms"] = round(
+            (time.monotonic() - scheduler_started_at) * 1000, 3
+        )
+        return UpdateWeightsFromTensorReqOutput(success, message, trace=trace)
+
+    def prepare_weights_from_tensor(
+        self: Scheduler, recv_req: PrepareWeightsFromTensorReqInput
+    ):
+        """Prepare tensor-format online weight updates before pausing generation."""
+        trace = recv_req.trace if isinstance(recv_req.trace, dict) else {}
+        recv_req.trace = trace
+        scheduler_started_at = time.monotonic()
+        trace["scheduler_prestage_start_monotonic"] = scheduler_started_at
+        trace["scheduler_tp_rank"] = getattr(self.tp_worker, "tp_rank", None)
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
+        trace["scheduler_worker_kind"] = (
+            "draft_worker" if worker is self.draft_worker else "tp_worker"
+        )
+        worker_started_at = time.monotonic()
+        success, message = worker.prepare_weights_from_tensor(recv_req)
+        trace["scheduler_prestage_worker_ms"] = round(
+            (time.monotonic() - worker_started_at) * 1000, 3
+        )
+        barrier_started_at = time.monotonic()
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        trace["scheduler_prestage_tp_barrier_ms"] = round(
+            (time.monotonic() - barrier_started_at) * 1000, 3
+        )
+        trace["scheduler_prestage_success"] = success
+        trace["scheduler_prestage_total_ms"] = round(
+            (time.monotonic() - scheduler_started_at) * 1000, 3
+        )
+        if not success:
+            logger.error(message)
+        return PrepareWeightsFromTensorReqOutput(success, message, trace=trace)
 
     def update_weights_from_ipc(
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput

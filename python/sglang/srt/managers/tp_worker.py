@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -29,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareWeightsFromTensorReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -157,13 +159,52 @@ class BaseTpWorker(ABC):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
+        trace = recv_req.trace if isinstance(recv_req.trace, dict) else {}
+        recv_req.trace = trace
+        trace["tp_worker_rank"] = self.tp_rank
+        deserialize_started_at = time.monotonic()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        trace["tp_worker_deserialize_ms"] = round(
+            (time.monotonic() - deserialize_started_at) * 1000, 3
+        )
+        trace["tp_worker_tensor_count"] = len(named_tensors)
+        model_runner_started_at = time.monotonic()
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
+            named_tensors=named_tensors,
             manifest=recv_req.manifest,
             load_format=recv_req.load_format,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            trace=trace,
+        )
+        trace["tp_worker_model_runner_update_ms"] = round(
+            (time.monotonic() - model_runner_started_at) * 1000, 3
+        )
+        return success, message
+
+    def prepare_weights_from_tensor(self, recv_req: PrepareWeightsFromTensorReqInput):
+        monkey_patch_torch_reductions()
+        trace = recv_req.trace if isinstance(recv_req.trace, dict) else {}
+        recv_req.trace = trace
+        trace["tp_worker_rank"] = self.tp_rank
+        deserialize_started_at = time.monotonic()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        trace["tp_worker_prestage_deserialize_ms"] = round(
+            (time.monotonic() - deserialize_started_at) * 1000, 3
+        )
+        trace["tp_worker_prestage_tensor_count"] = len(named_tensors)
+        model_runner_started_at = time.monotonic()
+        success, message = self.model_runner.prepare_weights_from_tensor(
+            named_tensors=named_tensors,
+            manifest=recv_req.manifest,
+            load_format=recv_req.load_format,
+            trace=trace,
+        )
+        trace["tp_worker_model_runner_prestage_ms"] = round(
+            (time.monotonic() - model_runner_started_at) * 1000, 3
         )
         return success, message
 

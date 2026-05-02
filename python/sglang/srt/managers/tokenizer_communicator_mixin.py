@@ -66,6 +66,8 @@ from sglang.srt.managers.io_struct import (
     LoRAUpdateOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightsFromTensorReqInput,
+    PrepareWeightsFromTensorReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -92,7 +94,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import MultiprocessingSerializer, get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -102,6 +104,27 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 _ATOMIC_PAUSE_MODES = {"abort", "retract", "in_place"}
+
+
+def _ensure_update_trace(obj: Any) -> Dict[str, Any]:
+    trace = getattr(obj, "trace", None)
+    if trace is None:
+        trace = {}
+        setattr(obj, "trace", trace)
+    return trace
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.monotonic() - start) * 1000, 3)
+
+
+def _manifest_bool(manifest: Optional[Dict[str, Any]], key: str) -> bool:
+    if not manifest:
+        return False
+    value = manifest.get(key)
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class _Communicator(Generic[T]):
@@ -193,6 +216,9 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_tensor_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.prepare_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_ipc_communicator = _Communicator(
@@ -287,6 +313,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromTensorReqOutput,
                     self.update_weights_from_tensor_communicator.handle_recv,
+                ),
+                (
+                    PrepareWeightsFromTensorReqOutput,
+                    self.prepare_weights_from_tensor_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromIPCReqOutput,
@@ -689,26 +719,51 @@ class TokenizerCommunicatorMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
+        trace = _ensure_update_trace(obj)
+        trace.setdefault("request_id", uuid.uuid4().hex[:12])
+        trace.setdefault("tokenizer_start_monotonic", time.monotonic())
+        trace["tokenizer_update_kind"] = "tensor"
+        trace["atomic_pause_mode"] = obj.atomic_pause_mode
+        trace["flush_cache"] = obj.flush_cache
+        trace["recapture_cuda_graph"] = obj.recapture_cuda_graph
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         async def run_update():
             if obj.abort_all_requests:
+                abort_started_at = time.monotonic()
                 self.abort_request(abort_all=True)
+                trace["tokenizer_abort_all_requests_ms"] = _elapsed_ms(abort_started_at)
+            reserve_started_at = time.monotonic()
             await self._reserve_weight_epoch(obj)
+            trace["tokenizer_reserve_weight_epoch_ms"] = _elapsed_ms(reserve_started_at)
+            trace["weight_epoch"] = obj.weight_epoch
+            trace["weight_version"] = obj.weight_version
 
             # Immediately update the weights if the engine is in paused state
             async with self.is_pause_cond:
                 is_paused = self.is_pause
+            trace["tokenizer_already_paused_before_update"] = is_paused
 
             lock_context = (
                 self.model_update_lock.writer_lock if not is_paused else nullcontext()
             )
+            lock_started_at = time.monotonic()
             async with lock_context:
+                trace["tokenizer_model_update_lock_wait_ms"] = _elapsed_ms(
+                    lock_started_at
+                )
+                communicator_started_at = time.monotonic()
                 results = await self.update_weights_from_tensor_communicator(obj)
+                trace["tokenizer_scheduler_communicator_ms"] = _elapsed_ms(
+                    communicator_started_at
+                )
 
             success, message = _Communicator.merge_results(results)
+            trace["scheduler_results"] = [
+                getattr(result, "trace", None) for result in results
+            ]
             if success:
                 self._record_successful_weight_update(
                     obj.weight_epoch, obj.weight_version
@@ -718,9 +773,58 @@ class TokenizerCommunicatorMixin:
 
             return success, message
 
+        async def run_prepare():
+            if not _manifest_bool(obj.manifest, "lora_merge_prestage_before_pause"):
+                return
+
+            prepare_manifest = dict(obj.manifest or {})
+            prepare_manifest["lora_merge_prestage_request_id"] = trace["request_id"]
+            prepare_trace = {
+                "request_id": trace["request_id"],
+                "source": trace.get("source"),
+                "trace_start_monotonic": trace.get("trace_start_monotonic"),
+                "tokenizer_prepare_start_monotonic": time.monotonic(),
+            }
+            prepare_obj = PrepareWeightsFromTensorReqInput(
+                serialized_named_tensors=obj.serialized_named_tensors,
+                manifest=prepare_manifest,
+                load_format=obj.load_format,
+                disable_draft_model=obj.disable_draft_model,
+                trace=prepare_trace,
+            )
+
+            prepare_started_at = time.monotonic()
+            results = await self.prepare_weights_from_tensor_communicator(prepare_obj)
+            trace["tokenizer_lora_prestage_scheduler_communicator_ms"] = _elapsed_ms(
+                prepare_started_at
+            )
+            success, message = _Communicator.merge_results(results)
+            trace["lora_prestage_scheduler_results"] = [
+                getattr(result, "trace", None) for result in results
+            ]
+            if not success:
+                raise ValueError(message)
+
+            consume_manifest = dict(obj.manifest or {})
+            consume_manifest["lora_merge_consume_prestaged"] = True
+            consume_manifest["lora_merge_prestage_request_id"] = trace["request_id"]
+            obj.manifest = consume_manifest
+
+            empty_named_tensors = MultiprocessingSerializer.serialize([])
+            obj.serialized_named_tensors = [
+                empty_named_tensors for _ in obj.serialized_named_tensors
+            ]
+            trace["tokenizer_lora_prestage_enabled"] = True
+
         try:
-            return await self._run_weight_update_with_optional_pause(obj, run_update)
+            total_started_at = time.monotonic()
+            result = await self._run_weight_update_with_optional_pause(
+                obj, run_update, prepare_fn=run_prepare
+            )
+            trace["tokenizer_update_total_ms"] = _elapsed_ms(total_started_at)
+            return result
         except ValueError as e:
+            trace["tokenizer_update_error"] = str(e)
             return False, str(e)
 
     async def update_weights_from_ipc(
@@ -1153,6 +1257,7 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
         obj: Any,
         update_fn: Callable[[], Awaitable[T]],
+        prepare_fn: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> T:
         if not hasattr(self, "weight_update_orchestration_lock"):
             self.weight_update_orchestration_lock = asyncio.Lock()
@@ -1162,9 +1267,21 @@ class TokenizerCommunicatorMixin:
             self.is_pause = False
 
         async with self.weight_update_orchestration_lock:
+            trace = _ensure_update_trace(obj)
             pause_mode = getattr(obj, "atomic_pause_mode", None)
+            trace["tokenizer_pause_mode"] = pause_mode
             if pause_mode is None:
-                return await update_fn()
+                if prepare_fn is not None:
+                    prepare_started_at = time.monotonic()
+                    await prepare_fn()
+                    trace["tokenizer_pre_pause_prepare_ms"] = _elapsed_ms(
+                        prepare_started_at
+                    )
+                update_started_at = time.monotonic()
+                try:
+                    return await update_fn()
+                finally:
+                    trace["tokenizer_update_fn_ms"] = _elapsed_ms(update_started_at)
             if pause_mode not in _ATOMIC_PAUSE_MODES:
                 raise ValueError(
                     f"Invalid atomic_pause_mode: {pause_mode!r}. "
@@ -1179,12 +1296,48 @@ class TokenizerCommunicatorMixin:
                 already_paused = self.is_pause
 
             paused_here = False
+            trace["tokenizer_pause_already_active"] = already_paused
+            paused_started_at = None
+            if prepare_fn is not None:
+                prepare_started_at = time.monotonic()
+                await prepare_fn()
+                trace["tokenizer_pre_pause_prepare_ms"] = _elapsed_ms(
+                    prepare_started_at
+                )
+
             if not already_paused:
-                await self.pause_generation(PauseGenerationReqInput(mode=pause_mode))
+                paused_started_at = time.monotonic()
+                pause_call_started_at = time.monotonic()
+                pause_trace = {
+                    "request_id": trace.get("request_id"),
+                    "trace_start_monotonic": trace.get("trace_start_monotonic"),
+                }
+                await self.pause_generation(
+                    PauseGenerationReqInput(mode=pause_mode, trace=pause_trace)
+                )
+                trace["tokenizer_pause_generation_call_ms"] = _elapsed_ms(
+                    pause_call_started_at
+                )
                 paused_here = True
 
             try:
+                update_started_at = time.monotonic()
                 return await update_fn()
             finally:
+                trace["tokenizer_update_fn_ms"] = _elapsed_ms(update_started_at)
                 if paused_here:
-                    await self.continue_generation(ContinueGenerationReqInput())
+                    continue_started_at = time.monotonic()
+                    continue_trace = {
+                        "request_id": trace.get("request_id"),
+                        "trace_start_monotonic": trace.get("trace_start_monotonic"),
+                    }
+                    await self.continue_generation(
+                        ContinueGenerationReqInput(trace=continue_trace)
+                    )
+                    trace["tokenizer_continue_generation_call_ms"] = _elapsed_ms(
+                        continue_started_at
+                    )
+                    if paused_started_at is not None:
+                        trace["tokenizer_paused_total_ms"] = _elapsed_ms(
+                            paused_started_at
+                        )

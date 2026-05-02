@@ -124,6 +124,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightsFromTensorReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1271,6 +1272,7 @@ class Scheduler(
                     self.update_weights_from_distributed,
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+                (PrepareWeightsFromTensorReqInput, self.prepare_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
@@ -3420,43 +3422,100 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        self._engine_paused = True
+        started_at = time.monotonic()
+        request_id = (recv_req.trace or {}).get("request_id")
+        pause_trace = {
+            "request_id": request_id,
+            "mode": recv_req.mode,
+            "scheduler_pause_generation_start_monotonic": started_at,
+            "enable_overlap": self.enable_overlap,
+            "result_queue_size": (
+                len(self.result_queue) if self.enable_overlap else None
+            ),
+            "running_batch_size": (
+                len(self.running_batch.reqs)
+                if self.running_batch is not None
+                else 0
+            ),
+            "has_last_batch": self.last_batch is not None,
+            "has_cur_batch": self.cur_batch is not None,
+        }
+        self._last_generation_pause_trace = pause_trace
+        try:
+            self._engine_paused = True
 
-        if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            if self.enable_overlap and self.last_batch:
+                # Process the results of the last batch
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            self._merge_extend_last_batch_into_running_batch(
-                skip_merge=self.disaggregation_mode == DisaggregationMode.PREFILL
+            if self.last_batch and self.last_batch.forward_mode.is_extend():
+                # Skip merge for disagg prefill: completed prefill requests are
+                # already in disagg_prefill_inflight_queue. Merging them into
+                # running_batch leaks them, since the prefill event loop never
+                # calls update_running_batch to clean them up.
+                self._merge_extend_last_batch_into_running_batch(
+                    skip_merge=self.disaggregation_mode == DisaggregationMode.PREFILL
+                )
+
+            self.last_batch = None
+            self.cur_batch = None
+
+            if recv_req.mode == "in_place":
+                # In-place pause still needs to quiesce scheduler-owned GPU work
+                # before the weight mutation runs. Preserve running requests and
+                # chunked state, but drain overlap results and merge the finished
+                # prefill batch so resume starts from a consistent checkpoint.
+                if os.environ.get("SGLANG_WEIGHT_UPDATE_SYNC_ON_PAUSE", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ):
+                    sync_started_at = time.monotonic()
+                    if self.enable_overlap and hasattr(self, "forward_stream"):
+                        self.forward_stream.synchronize()
+                    if hasattr(self, "schedule_stream"):
+                        self.schedule_stream.synchronize()
+                    pause_trace["scheduler_pause_stream_sync_ms"] = round(
+                        (time.monotonic() - sync_started_at) * 1000, 3
+                    )
+                else:
+                    pause_trace["scheduler_pause_stream_sync_ms"] = None
+                return
+
+            if recv_req.mode == "retract" and not self.running_batch.is_empty():
+                self.running_batch.filter_batch(v1_spec_info_filtered=True)
+                if len(self.running_batch.reqs) != 0:
+                    retracted_reqs = self.running_batch.retract_all(self.server_args)
+                    for req in retracted_reqs:
+                        self._add_request_to_queue(req)
+
+                self.running_batch.batch_is_full = False
+                self.chunked_req = None
+        finally:
+            pause_trace["scheduler_pause_generation_handler_ms"] = round(
+                (time.monotonic() - started_at) * 1000, 3
             )
 
-        self.last_batch = None
-        self.cur_batch = None
-
-        if recv_req.mode == "in_place":
-            # In-place pause still needs to quiesce scheduler-owned GPU work
-            # before the weight mutation runs. Preserve running requests and
-            # chunked state, but drain overlap results and merge the finished
-            # prefill batch so resume starts from a consistent checkpoint.
-            return
-
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
-                for req in retracted_reqs:
-                    self._add_request_to_queue(req)
-
-            self.running_batch.batch_is_full = False
-            self.chunked_req = None
-
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        started_at = time.monotonic()
+        request_id = (recv_req.trace or {}).get("request_id")
+        pause_trace = getattr(self, "_last_generation_pause_trace", None)
+        if (
+            pause_trace is not None
+            and request_id is not None
+            and pause_trace.get("request_id") == request_id
+        ):
+            pause_trace["scheduler_pause_to_continue_start_ms"] = round(
+                (
+                    started_at
+                    - pause_trace["scheduler_pause_generation_start_monotonic"]
+                )
+                * 1000,
+                3,
+            )
+            self._last_completed_generation_pause_trace = dict(pause_trace)
         self._engine_paused = False
 
     def load_lora_adapter(

@@ -1289,6 +1289,7 @@ class PauseGenerationReqInput(BaseReq):
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
+    trace: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         allowed = ["abort", "retract", "in_place"]
@@ -1300,7 +1301,7 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1369,6 +1370,28 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 
 @dataclass
+class PrepareWeightsFromTensorReqInput(BaseReq):
+    """Prepare tensor-format weight updates before an atomic generation pause."""
+
+    serialized_named_tensors: List[Union[str, bytes]]
+    # Optional structured metadata consumed by custom tensor update loaders.
+    manifest: Optional[Dict[str, Any]] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
+    # Optional in-band timing/profiling payload populated by the prepare path.
+    trace: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PrepareWeightsFromTensorReqOutput(BaseReq):
+    success: bool
+    message: str
+    trace: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
@@ -1395,12 +1418,15 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     disable_draft_model: Optional[bool] = None
     # Whether to recapture device graphs after weight update.
     recapture_cuda_graph: bool = False
+    # Optional in-band timing/profiling payload populated by the update path.
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass

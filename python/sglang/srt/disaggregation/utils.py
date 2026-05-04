@@ -53,6 +53,13 @@ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
 def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
+    # Fixed-size all_reduce: always pad to MAX_QUEUE_SIZE so every TP worker
+    # performs exactly one gloo op per call regardless of local queue length.
+    # Without this, workers in a DP>1 decode group can diverge: some skip the
+    # all_reduce via early-return guards while others proceed, causing a gloo
+    # sequence-number mismatch and "Connection closed by peer" crashes.
+    MAX_QUEUE_SIZE = 64  # must exceed max_running_requests; kept as a constant
+    n = len(pollers)
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
@@ -63,9 +70,10 @@ def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    padded = polls + [255] * (MAX_QUEUE_SIZE - n)
+    tensor_to_reduce = torch.tensor(padded, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    return tensor_to_reduce[:n].tolist()
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -74,18 +82,18 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_tp_cpu_group: dist.ProcessGroup,
 ):
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
+    # shard observe the same status transitions.  poll_and_all_reduce always
+    # performs exactly one fixed-size gloo op so there is no size-exchange.
     polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
 
-    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
-    return tensor_to_reduce.tolist()
+    # Then sync across attn-cp ranks with the same fixed-size MIN pattern.
+    # MAX_QUEUE_SIZE must match poll_and_all_reduce so tensor shapes agree.
+    MAX_QUEUE_SIZE = 64
+    n = len(polls)
+    cp_padded = polls + [255] * (MAX_QUEUE_SIZE - n)
+    cp_tensor = torch.tensor(cp_padded, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(cp_tensor, op=dist.ReduceOp.MIN, group=attn_cp_cpu_group)
+    return cp_tensor[:n].tolist()
 
 
 def poll_and_all_reduce_with_staging(

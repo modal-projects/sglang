@@ -573,12 +573,6 @@ class DecodePreallocQueue:
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
-        if not self.queue:
-            return
-
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
-            return
-
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
@@ -1273,9 +1267,6 @@ class DecodeTransferQueue:
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        if not self.queue:
-            return []
-
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
@@ -1548,10 +1539,12 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
 
+        # Always increment polling_count unconditionally so all TP workers stay
+        # in lock-step with each other's gloo collective schedule. Returning
+        # early before the increment (e.g. on retracted_queue > 0) causes some
+        # workers to skip poll_and_all_reduce while others proceed, producing a
+        # gloo sequence-number mismatch and "Connection closed by peer" crashes.
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
             self.polling_interval = (
@@ -1561,8 +1554,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            # Call pop_transferred before checking retracted_queue so that
+            # every TP worker always performs the same gloo all_reduces on
+            # this iteration (pop_transferred → _update_handshake_waiters →
+            # poll_and_all_reduce).  Gating pop_preallocated separately is safe
+            # because it does not issue a gloo collective.
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -1573,3 +1569,11 @@ class SchedulerDisaggregationDecodeMixin:
                 self.waiting_queue.extend(transferred_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
+
+            if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+                # retracted requests still pending — skip new allocations but
+                # do NOT skip pop_transferred (already called above).
+                return
+
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            self.disagg_decode_transfer_queue.extend(req_conns)

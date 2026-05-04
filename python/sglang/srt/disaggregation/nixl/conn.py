@@ -233,6 +233,7 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._reg_events: dict = {}  # agent_name -> Event; set when add_remote_agent done
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
@@ -912,6 +913,8 @@ class NixlKVManager(CommonKVManager):
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
+            if req.agent_name in self._reg_events:
+                self._reg_events[req.agent_name].wait()
 
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
@@ -1054,11 +1057,32 @@ class NixlKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    # Async registration: store metadata immediately so that
+                    # subsequent transfer-info messages from this peer can be
+                    # processed without waiting, then run add_remote_agent in a
+                    # background thread.  With DP>1 decode, all DP workers send
+                    # their registration ZMQ messages nearly simultaneously;
+                    # blocking on add_remote_agent sequentially stalls
+                    # bootstrap_thread from processing the remaining workers.
+                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    peer_name = decode_kv_args.agent_name
+                    if peer_name not in self.decode_kv_args_table:
+                        self.decode_kv_args_table[peer_name] = decode_kv_args
+                        ev = threading.Event()
+                        self._reg_events[peer_name] = ev
+
+                        def _do_reg(kv=decode_kv_args, n=peer_name, e=ev):
+                            try:
+                                self.agent.add_remote_agent(kv.agent_metadata)
+                                logger.info(f"Registered remote agent {n}")
+                            except Exception as exc:
+                                logger.error(f"add_remote_agent({n}) failed: {exc}")
+                            finally:
+                                e.set()
+
+                        threading.Thread(target=_do_reg, daemon=True).start()
+                    else:
+                        logger.info(f"Peer {peer_name} already registered, ignoring.")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:

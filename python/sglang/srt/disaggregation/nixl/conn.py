@@ -231,6 +231,10 @@ class NixlKVManager(CommonKVManager):
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
 
         self.register_buffer_to_engine()
+        # Keep descriptor objects alive while their transfers are inflight.
+        # NIXL C++ holds raw pointers into these Python objects; GC must not
+        # free them before check_xfer_state returns DONE.
+        self._inflight_descs: Dict[int, tuple] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._reg_events: dict = {}  # agent_name -> Event; set when add_remote_agent done
@@ -483,6 +487,7 @@ class NixlKVManager(CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        self._inflight_descs[xfer_handle] = (src_descs, dst_descs, src_reqs, dst_reqs)
         return xfer_handle
 
     def send_kvcache(
@@ -637,7 +642,7 @@ class NixlKVManager(CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post sliced KV transfer")
-
+        self._inflight_descs[xfer_handle] = (src_descs, dst_descs, src_reqs, dst_reqs)
         return xfer_handle
 
     def send_aux(
@@ -676,6 +681,7 @@ class NixlKVManager(CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        self._inflight_descs[xfer_handle] = (src_descs, dst_descs)
         return xfer_handle
 
     def _send_mamba_state(
@@ -723,6 +729,7 @@ class NixlKVManager(CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state transfer")
+        self._inflight_descs[xfer_handle] = (src_descs, dst_descs)
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -1172,8 +1179,13 @@ class NixlKVSender(CommonKVSender):
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
+            for h in self.xfer_handles:
+                self.kv_mgr._inflight_descs.pop(h, None)
+            self.xfer_handles.clear()
             return KVPoll.Success  # type: ignore
         if any([x == "ERR" for x in states]):
+            for h in self.xfer_handles:
+                self.kv_mgr._inflight_descs.pop(h, None)
             raise Exception("KVSender transfer encountered an error.")
         return KVPoll.WaitingForInput  # type: ignore
 

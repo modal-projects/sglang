@@ -146,6 +146,17 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _record_output_weight_epoch(req: Req, weight_epoch: int, num_tokens: int) -> None:
+        if num_tokens <= 0:
+            return
+        if req.output_weight_epoch_start is None:
+            req.output_weight_epoch_start = weight_epoch
+        elif req.output_weight_epoch_end != weight_epoch:
+            req.mixed_weight_epochs = True
+        req.output_weight_epoch_end = weight_epoch
+        req.output_weight_epoch_recorded_len += num_tokens
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -214,6 +225,11 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    self._record_output_weight_epoch(
+                        req,
+                        getattr(batch, "launch_weight_epoch", 0),
+                        1,
+                    )
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -352,6 +368,11 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
+                    self._record_output_weight_epoch(
+                        req,
+                        getattr(batch, "launch_weight_epoch", 0),
+                        1,
+                    )
                     req.check_finished()
 
                     if req.finished():
@@ -494,6 +515,12 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if is_spec_v1:
+                accepted_len = len(req.output_ids) - req.output_weight_epoch_recorded_len
+                self._record_output_weight_epoch(
+                    req,
+                    getattr(batch, "launch_weight_epoch", 0),
+                    accepted_len,
+                )
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
@@ -510,9 +537,19 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                self._record_output_weight_epoch(
+                    req,
+                    getattr(batch, "launch_weight_epoch", 0),
+                    1,
+                )
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                self._record_output_weight_epoch(
+                    req,
+                    getattr(batch, "launch_weight_epoch", 0),
+                    new_accepted_len,
+                )
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -994,6 +1031,9 @@ class SchedulerOutputProcessorMixin:
         decode_ids_list = []
         read_offsets = []
         output_ids = []
+        weight_epoch_start = []
+        weight_epoch_end = []
+        mixed_weight_epochs = []
 
         skip_special_tokens = []
         spaces_between_special_tokens = []
@@ -1095,6 +1135,9 @@ class SchedulerOutputProcessorMixin:
                 read_offsets.append(read_offset)
                 output_ids.append(output_ids_[send_token_offset:])
                 req.send_token_offset = len(output_ids_)
+                weight_epoch_start.append(req.output_weight_epoch_start)
+                weight_epoch_end.append(req.output_weight_epoch_end)
+                mixed_weight_epochs.append(req.mixed_weight_epochs)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
@@ -1259,6 +1302,9 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    weight_epoch_start=weight_epoch_start,
+                    weight_epoch_end=weight_epoch_end,
+                    mixed_weight_epochs=mixed_weight_epochs,
                     load=load,
                     dp_ranks=dp_ranks,
                 )
@@ -1277,6 +1323,9 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         phs_list = []
         has_phs = False
+        weight_epoch_start = []
+        weight_epoch_end = []
+        mixed_weight_epochs = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -1290,6 +1339,9 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
                 time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
+                weight_epoch_start.append(req.output_weight_epoch_start)
+                weight_epoch_end.append(req.output_weight_epoch_end)
+                mixed_weight_epochs.append(req.mixed_weight_epochs)
 
                 phs = req.pooled_hidden_state
                 phs_list.append(phs)
@@ -1297,9 +1349,8 @@ class SchedulerOutputProcessorMixin:
                     has_phs = True
 
         # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
+        # calls to 1 across the ZMQ IPC boundary. We can only stack when
+        # every entry is non-None; mixed batches keep the raw list so
         # positional indexing on the receiver side stays correct.
         stacked_phs = None
         if has_phs:
@@ -1326,5 +1377,8 @@ class SchedulerOutputProcessorMixin:
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
                 pooled_hidden_states=stacked_phs,
+                weight_epoch_start=weight_epoch_start,
+                weight_epoch_end=weight_epoch_end,
+                mixed_weight_epochs=mixed_weight_epochs,
             )
         )

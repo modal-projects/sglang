@@ -199,6 +199,15 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            weight_epoch_start=_extract_field_by_index(
+                output, "weight_epoch_start", i, check_length=False
+            ),
+            weight_epoch_end=_extract_field_by_index(
+                output, "weight_epoch_end", i, check_length=False
+            ),
+            mixed_weight_epochs=_extract_field_by_index(
+                output, "mixed_weight_epochs", i, check_length=False
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -212,6 +221,22 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=_extract_field_by_index(
+                output, "retraction_counts", i, check_length=False
+            ),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i, check_length=False
+            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
+            weight_epoch_start=_extract_field_by_index(
+                output, "weight_epoch_start", i, check_length=False
+            ),
+            weight_epoch_end=_extract_field_by_index(
+                output, "weight_epoch_end", i, check_length=False
+            ),
+            mixed_weight_epochs=_extract_field_by_index(
+                output, "mixed_weight_epochs", i, check_length=False
+            ),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -286,6 +311,15 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_epoch_start=_extract_field_by_index(
+                output, "weight_epoch_start", i, check_length=False
+            ),
+            weight_epoch_end=_extract_field_by_index(
+                output, "weight_epoch_end", i, check_length=False
+            ),
+            mixed_weight_epochs=_extract_field_by_index(
+                output, "mixed_weight_epochs", i, check_length=False
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),

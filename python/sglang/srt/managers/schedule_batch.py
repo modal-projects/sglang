@@ -610,6 +610,8 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        request_weight_epoch: Optional[int] = None,
+        cache_epoch: Optional[int] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -683,6 +685,14 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.request_weight_epoch = request_weight_epoch
+        self.cache_epoch = (
+            cache_epoch if cache_epoch is not None else request_weight_epoch
+        )
+        self.output_weight_epoch_start: Optional[int] = None
+        self.output_weight_epoch_end: Optional[int] = None
+        self.mixed_weight_epochs = False
+        self.output_weight_epoch_recorded_len = 0
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -1468,6 +1478,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Stream
     has_stream: bool = False
+    launch_weight_epoch: int = 0
 
     # Has grammar
     has_grammar: bool = False
@@ -2631,6 +2642,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             forward_iter=self.forward_iter,
+            launch_weight_epoch=self.launch_weight_epoch,
         )
 
     def maybe_evict_swa(self):

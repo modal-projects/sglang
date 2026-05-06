@@ -238,6 +238,8 @@ class Session:
             extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
+            request_weight_epoch=req.request_weight_epoch,
+            cache_epoch=req.cache_epoch,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

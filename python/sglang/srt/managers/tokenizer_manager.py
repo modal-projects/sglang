@@ -171,6 +171,13 @@ class ReqState:
             out["output_ids"] = self.output_ids.copy()
         return out
 
+    # Weight provenance tracked at response granularity.
+    request_weight_epoch: Optional[int] = None
+    cache_epoch: Optional[int] = None
+    output_weight_epoch_start: Optional[int] = None
+    output_weight_epoch_end: Optional[int] = None
+    mixed_weight_epochs: bool = False
+
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
@@ -414,8 +421,134 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
+        self.current_weight_epoch = 0
+        self.next_weight_epoch = 1
+        self.weight_version_by_epoch = {0: self.server_args.weight_version}
+        self.weight_epoch_reservation_lock = asyncio.Lock()
+        self.weight_update_orchestration_lock = asyncio.Lock()
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+
+    @staticmethod
+    def _compose_weight_epoch_extra_key(
+        extra_key: Optional[str], cache_epoch: Optional[int]
+    ) -> Optional[str]:
+        if cache_epoch is None:
+            return extra_key
+        if extra_key:
+            return f"{extra_key}|wv={cache_epoch}"
+        return f"wv={cache_epoch}"
+
+    def _weight_version_for_epoch(self, weight_epoch: Optional[int]) -> Optional[str]:
+        if weight_epoch is None:
+            return None
+        return self.weight_version_by_epoch.get(weight_epoch)
+
+    def _record_successful_weight_update(
+        self, weight_epoch: Optional[int], weight_version: Optional[str]
+    ) -> None:
+        if weight_epoch is None:
+            return
+        self.current_weight_epoch = weight_epoch
+        if weight_version is not None:
+            self._update_weight_version_if_provided(weight_version)
+        else:
+            self.weight_version_by_epoch[weight_epoch] = self.server_args.weight_version
+
+    def _stamp_request_weight_context(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        request_epoch = self.current_weight_epoch
+
+        if getattr(obj, "is_single", True):
+            request_objs = [obj]
+        else:
+            request_objs = [obj[i] for i in range(len(obj.rid))]
+
+        for request_obj in request_objs:
+            request_obj.request_weight_epoch = request_epoch
+            request_obj.cache_epoch = request_epoch
+            if hasattr(request_obj, "extra_key"):
+                request_obj.extra_key = self._compose_weight_epoch_extra_key(
+                    request_obj.extra_key,
+                    request_obj.cache_epoch,
+                )
+            state = self.rid_to_state.get(request_obj.rid)
+            if state is not None:
+                state.request_weight_epoch = request_obj.request_weight_epoch
+                state.cache_epoch = request_obj.cache_epoch
+
+    def _apply_output_weight_provenance(
+        self,
+        state: ReqState,
+        recv_obj: Union[BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput],
+        i: int,
+    ) -> None:
+        starts = getattr(recv_obj, "weight_epoch_start", None)
+        ends = getattr(recv_obj, "weight_epoch_end", None)
+        mixed = getattr(recv_obj, "mixed_weight_epochs", None)
+
+        start_epoch = starts[i] if starts is not None and i < len(starts) else None
+        end_epoch = ends[i] if ends is not None and i < len(ends) else None
+        mixed_epochs = mixed[i] if mixed is not None and i < len(mixed) else False
+
+        if start_epoch is not None and state.output_weight_epoch_start is None:
+            state.output_weight_epoch_start = start_epoch
+        if end_epoch is not None:
+            if (
+                state.output_weight_epoch_end is not None
+                and state.output_weight_epoch_end != end_epoch
+            ):
+                state.mixed_weight_epochs = True
+            state.output_weight_epoch_end = end_epoch
+        state.mixed_weight_epochs = state.mixed_weight_epochs or bool(mixed_epochs)
+
+    def _add_weight_provenance_to_meta_info(
+        self, meta_info: Dict[str, Any], state: ReqState
+    ) -> None:
+        start_epoch = (
+            state.output_weight_epoch_start
+            if state.output_weight_epoch_start is not None
+            else state.request_weight_epoch
+        )
+        if start_epoch is None:
+            start_epoch = getattr(state.obj, "request_weight_epoch", None)
+        if start_epoch is None:
+            start_epoch = self.current_weight_epoch
+
+        end_epoch = (
+            state.output_weight_epoch_end
+            if state.output_weight_epoch_end is not None
+            else start_epoch
+        )
+        cache_epoch = (
+            state.cache_epoch
+            if state.cache_epoch is not None
+            else getattr(state.obj, "cache_epoch", None)
+        )
+        mixed_epochs = state.mixed_weight_epochs or (
+            start_epoch is not None
+            and end_epoch is not None
+            and start_epoch != end_epoch
+        )
+        end_version = (
+            self._weight_version_for_epoch(end_epoch) or self.server_args.weight_version
+        )
+
+        meta_info.update(
+            {
+                "weight_epoch_start": start_epoch,
+                "weight_epoch_end": end_epoch,
+                "cache_epoch": cache_epoch,
+                "mixed_weight_epochs": mixed_epochs,
+                "resume_from_stale_kv": bool(
+                    cache_epoch is not None
+                    and end_epoch is not None
+                    and cache_epoch != end_epoch
+                ),
+                "weight_version": end_version,
+            }
+        )
 
     def init_lora(self):
         # LoRA
@@ -545,6 +678,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         async with self.model_update_lock.reader_lock:
             await self._validate_and_resolve_lora(obj)
+            self._stamp_request_weight_context(obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -1024,6 +1158,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                request_weight_epoch=obj.request_weight_epoch,
+                cache_epoch=obj.cache_epoch,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1051,6 +1187,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                request_weight_epoch=obj.request_weight_epoch,
+                cache_epoch=obj.cache_epoch,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -1662,14 +1800,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            self._apply_output_weight_provenance(state, recv_obj, i)
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            self._add_weight_provenance_to_meta_info(meta_info, state)
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2371,9 +2511,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        self._add_weight_provenance_to_meta_info(meta_info, state)
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(

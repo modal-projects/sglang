@@ -29,7 +29,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -153,6 +153,9 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.weight_update_graph_tracker import (
+    WeightUpdateGraphTracker,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -1695,6 +1698,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
+        graph_tracker = WeightUpdateGraphTracker(self)
+        graph_tracker.clear_pending_recapture_marks()
+        graph_tensor_snapshot = graph_tracker.snapshot()
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
@@ -1743,15 +1749,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
-            or (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            )
-        ):
-            self.init_device_graphs()
+        graph_tracker.maybe_rebuild(
+            update_source="disk",
+            force_recapture=recapture_cuda_graph,
+            before_snapshot=graph_tensor_snapshot,
+        )
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -2005,7 +2007,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
@@ -2018,20 +2022,165 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
+        graph_tracker = WeightUpdateGraphTracker(self)
+        graph_tracker.clear_pending_recapture_marks()
+        graph_tensor_snapshot = graph_tracker.snapshot()
+        should_recapture = recapture_cuda_graph
+
         if load_format == "direct":
+            named_tensors = [
+                (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+                for name, tensor in named_tensors
+            ]
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
+            should_recapture = should_recapture or getattr(
+                custom_loader, "sglang_requires_cuda_graph_recapture", False
+            )
+            supports_host_tensors = getattr(
+                custom_loader, "sglang_supports_host_tensors", False
+            )
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(
+                        tensor,
+                        tp_rank=self.tp_rank,
+                        device=None if supports_host_tensors else infered_device,
+                    ),
+                )
+                for name, tensor in named_tensors
+            ]
+            self._call_custom_weight_loader(
+                custom_loader,
+                named_tensors,
+                infered_device,
+                manifest=manifest,
+            )
         elif load_format is None:
+            named_tensors = [
+                (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+                for name, tensor in named_tensors
+            ]
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        graph_tracker.maybe_rebuild(
+            update_source="tensor",
+            force_recapture=should_recapture,
+            before_snapshot=graph_tensor_snapshot,
+        )
         return True, "Success"
+
+    def prepare_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        manifest: Optional[Dict[str, Any]] = None,
+        load_format: Optional[str] = None,
+    ):
+        if load_format not in self.server_args.custom_weight_loader:
+            raise NotImplementedError(
+                f"Weight update preparation requires a custom load_format; got {load_format}"
+            )
+
+        monkey_patch_torch_reductions()
+        self.device_module = torch.get_device_module(self.device)
+        infered_device = self.device_module.current_device()
+        custom_loader = dynamic_import(load_format)
+        prepare_fn = getattr(custom_loader, "sglang_prepare_tensors", None)
+        if prepare_fn is None:
+            return False, f"Custom loader {load_format} does not support preparation"
+
+        supports_host_tensors = getattr(custom_loader, "sglang_supports_host_tensors", False)
+        named_tensors = [
+            (
+                name,
+                _unwrap_tensor(
+                    tensor,
+                    tp_rank=self.tp_rank,
+                    device=None if supports_host_tensors else infered_device,
+                ),
+            )
+            for name, tensor in named_tensors
+        ]
+        self._call_custom_weight_loader(
+            prepare_fn,
+            named_tensors,
+            infered_device,
+            manifest=manifest,
+        )
+        return True, "Success"
+
+    def discard_prepared_weights_from_tensor(
+        self,
+        manifest: Optional[Dict[str, Any]] = None,
+        load_format: Optional[str] = None,
+    ):
+        if load_format not in self.server_args.custom_weight_loader:
+            raise NotImplementedError(
+                f"Prepared weight cleanup requires a custom load_format; got {load_format}"
+            )
+
+        custom_loader = dynamic_import(load_format)
+        discard_fn = getattr(custom_loader, "sglang_discard_prepared_tensors", None)
+        if discard_fn is None:
+            return False, f"Custom loader {load_format} does not support preparation cleanup"
+
+        self.device_module = torch.get_device_module(self.device)
+        infered_device = self.device_module.current_device()
+        self._call_custom_weight_loader(
+            discard_fn,
+            [],
+            infered_device,
+            manifest=manifest,
+        )
+        return True, "Success"
+
+    def rebuild_device_graphs_after_weight_update(self) -> None:
+        logger.info("Rebuild device graphs after weight update begin.")
+        self.graph_runner = None
+        self.piecewise_cuda_graph_runner = None
+        self.graph_mem_usage = 0
+
+        gc.collect()
+        device_module = torch.get_device_module(self.device)
+        if hasattr(device_module, "empty_cache"):
+            device_module.empty_cache()
+
+        self.init_device_graphs()
+        self.init_piecewise_cuda_graphs()
+        logger.info("Rebuild device graphs after weight update end.")
+
+    def _call_custom_weight_loader(
+        self,
+        custom_loader,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        infered_device,
+        manifest: Optional[dict] = None,
+    ) -> None:
+        load_context = {
+            "manifest": manifest,
+            "model_runner": self,
+            "server_args": self.server_args,
+            "tp_rank": self.tp_rank,
+            "device": infered_device,
+        }
+
+        signature = inspect.signature(custom_loader)
+        parameters = list(signature.parameters.values())
+        if any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters
+        ) or "load_context" in signature.parameters:
+            custom_loader(self.model, named_tensors, load_context=load_context)
+            return
+        if any(
+            param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters
+        ) or len(parameters) >= 3:
+            custom_loader(self.model, named_tensors, load_context)
+            return
+
+        custom_loader(self.model, named_tensors)
 
     def _update_weights_from_flattened_bucket(
         self,
@@ -3575,9 +3724,11 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         default_weight_loader(params_dict[name], tensor)
 
 
-def _unwrap_tensor(tensor, tp_rank, device):
+def _unwrap_tensor(tensor, tp_rank, device=None):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
+    if device is None:
+        return tensor
     return tensor.to(device)
 
 

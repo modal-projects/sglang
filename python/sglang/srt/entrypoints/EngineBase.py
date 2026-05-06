@@ -46,8 +46,12 @@ class EngineBase(ABC):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
+        manifest: Optional[dict] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        atomic_pause_mode: Optional[str] = None,
+        weight_version: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         """Update model weights with in-memory tensor data."""
         pass

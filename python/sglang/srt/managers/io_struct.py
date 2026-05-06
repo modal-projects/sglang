@@ -248,6 +248,10 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
+    # Internal weight epoch stamps for cache isolation and response provenance.
+    request_weight_epoch: Optional[int] = None
+    cache_epoch: Optional[int] = None
+
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
@@ -686,7 +690,9 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
-            extra_key=self.extra_key,
+            extra_key=(
+                self.extra_key[i] if isinstance(self.extra_key, list) else self.extra_key
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -699,6 +705,8 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            request_weight_epoch=self.request_weight_epoch,
+            cache_epoch=self.cache_epoch,
         )
         cache[i] = sub
         return sub
@@ -789,6 +797,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    request_weight_epoch: Optional[int] = None
+    cache_epoch: Optional[int] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -877,6 +887,10 @@ class EmbeddingReqInput(BaseReq):
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Internal weight epoch stamps for cache isolation and response provenance.
+    request_weight_epoch: Optional[int] = None
+    cache_epoch: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -985,6 +999,8 @@ class EmbeddingReqInput(BaseReq):
                     if self.multi_item_delimiter_indices is not None
                     else None
                 ),
+                request_weight_epoch=self.request_weight_epoch,
+                cache_epoch=self.cache_epoch,
             )
         else:
             sub = EmbeddingReqInput(
@@ -1014,6 +1030,8 @@ class EmbeddingReqInput(BaseReq):
                     if self.multi_item_delimiter_indices is not None
                     else None
                 ),
+                request_weight_epoch=self.request_weight_epoch,
+                cache_epoch=self.cache_epoch,
             )
         cache[i] = sub
         return sub
@@ -1044,6 +1062,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     lora_id: Optional[str] = None  # None means just use the base model
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
+    request_weight_epoch: Optional[int] = None
+    cache_epoch: Optional[int] = None
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
@@ -1121,6 +1141,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+    weight_epoch_start: Optional[List[Optional[int]]] = None
+    weight_epoch_end: Optional[List[Optional[int]]] = None
+    mixed_weight_epochs: Optional[List[bool]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1186,6 +1209,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+    weight_epoch_start: Optional[List[Optional[int]]] = None
+    weight_epoch_end: Optional[List[Optional[int]]] = None
+    mixed_weight_epochs: Optional[List[bool]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1221,6 +1247,11 @@ class BatchEmbeddingOutput(BaseBatchReq):
     retraction_counts: List[int]
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # Compact response-level weight provenance.
+    weight_epoch_start: Optional[List[Optional[int]]] = None
+    weight_epoch_end: Optional[List[Optional[int]]] = None
+    mixed_weight_epochs: Optional[List[bool]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1455,6 +1486,33 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 
 @dataclass
+class PrepareWeightsFromTensorReqInput(BaseReq):
+    serialized_named_tensors: List[Union[str, bytes]]
+    manifest: Optional[Dict[str, Any]] = None
+    load_format: Optional[str] = None
+    disable_draft_model: Optional[bool] = None
+
+
+@dataclass
+class PrepareWeightsFromTensorReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class DiscardPreparedWeightsFromTensorReqInput(BaseReq):
+    manifest: Optional[Dict[str, Any]] = None
+    load_format: Optional[str] = None
+    disable_draft_model: Optional[bool] = None
+
+
+@dataclass
+class DiscardPreparedWeightsFromTensorReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
@@ -1463,18 +1521,26 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     """
 
     serialized_named_tensors: List[Union[str, bytes]]
+    # Optional structured metadata consumed by custom tensor update loaders.
+    manifest: Optional[Dict[str, Any]] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Optionally pause generation around the update and resume after it finishes.
+    atomic_pause_mode: Optional[Literal["abort", "retract", "in_place"]] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Internal monotonic epoch used to version caches and response provenance.
+    weight_epoch: Optional[int] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Whether to recapture device graphs after weight update.
+    recapture_cuda_graph: bool = False
 
 
 @dataclass

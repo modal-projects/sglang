@@ -100,6 +100,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DiscardPreparedWeightsFromTensorReqInput,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertDistributionReq,
@@ -124,6 +125,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightsFromTensorReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1046,6 +1048,7 @@ class Scheduler(
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
+        self.current_weight_epoch: int = 0
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
@@ -1438,6 +1441,11 @@ class Scheduler(
                 (
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
+                ),
+                (PrepareWeightsFromTensorReqInput, self.prepare_weights_from_tensor),
+                (
+                    DiscardPreparedWeightsFromTensorReqInput,
+                    self.discard_prepared_weights_from_tensor,
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
@@ -2019,6 +2027,8 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                request_weight_epoch=recv_req.request_weight_epoch,
+                cache_epoch=recv_req.cache_epoch,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
@@ -2078,6 +2088,8 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                request_weight_epoch=recv_req.request_weight_epoch,
+                cache_epoch=recv_req.cache_epoch,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -2341,6 +2353,8 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
+            request_weight_epoch=recv_req.request_weight_epoch,
+            cache_epoch=recv_req.cache_epoch,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
@@ -2438,13 +2452,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        self._abort_on_waiting_timeout()
-        self._abort_on_running_timeout()
-        if self.dllm_config is not None:
-            self.dllm_manager.filter_finished_reqs()
-
-        # Merge the prefill batch into the running batch
+    def _build_extend_batch_exclusions(self) -> List[Req]:
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -2453,12 +2461,50 @@ class Scheduler(
                 self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
             if self._chunked_req_scheduled_last_iter:
                 self.stash_chunked_request(self.chunked_req)
+
+        if self.last_batch is None:
+            return list(chunked_req_to_exclude)
+
+        if self.last_batch.chunked_req is not None:
+            # Context pipeline parallelism can leave a stale chunked_req on the
+            # current microbatch after the last chunk.
+            chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+        if self.dllm_config is not None and self.last_batch.reqs:
+            chunked_req_to_exclude.update(self.last_batch.reqs)
+
+        return list(chunked_req_to_exclude)
+
+    def _merge_extend_last_batch_into_running_batch(
+        self, *, skip_merge: bool = False
+    ) -> None:
+        if not self.last_batch or not self.last_batch.forward_mode.is_extend():
+            return
+
+        last_bs = self.last_batch.batch_size()
+        self.last_batch.filter_batch(
+            chunked_req_to_exclude=self._build_extend_batch_exclusions()
+        )
+        if self.last_batch.batch_size() < last_bs:
+            self.running_batch.batch_is_full = False
+
+        if skip_merge or self.last_batch.is_empty():
+            return
+
+        if self.running_batch.is_empty():
+            self.running_batch = self.last_batch
+        else:
+            self.running_batch.merge_batch(self.last_batch)
+
+    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._abort_on_waiting_timeout()
+        self._abort_on_running_timeout()
+        if self.dllm_config is not None:
+            self.dllm_manager.filter_finished_reqs()
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2478,29 +2524,7 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
-
-            # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
-
-            # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+            self._merge_extend_last_batch_into_running_batch()
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2952,6 +2976,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        batch.launch_weight_epoch = self.current_weight_epoch
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -3232,7 +3257,9 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(
+        self, for_health_check: bool = False, ignore_waiting_queue: bool = False
+    ) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -3250,7 +3277,8 @@ class Scheduler(
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        if not ignore_waiting_queue:
+            idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -3381,7 +3409,8 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush the memory pool and cache."""
-        if self.is_fully_idle():
+        ignore_waiting_queue = bool(getattr(self, "_engine_paused", False))
+        if self.is_fully_idle(ignore_waiting_queue=ignore_waiting_queue):
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -3600,41 +3629,35 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
-        if recv_req.mode == "in_place":
-            # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
-            return
-
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
-            if (
-                not self.last_batch.is_empty()
-                and self.disaggregation_mode != DisaggregationMode.PREFILL
-            ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+            self._merge_extend_last_batch_into_running_batch(
+                skip_merge=self.disaggregation_mode == DisaggregationMode.PREFILL
+            )
 
         self.last_batch = None
         self.cur_batch = None
+
+        if recv_req.mode == "in_place":
+            if os.environ.get("SGLANG_WEIGHT_UPDATE_SYNC_ON_PAUSE", "").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                if self.enable_overlap and hasattr(self, "forward_stream"):
+                    self.forward_stream.synchronize()
+                if hasattr(self, "schedule_stream"):
+                    self.schedule_stream.synchronize()
+            return
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)

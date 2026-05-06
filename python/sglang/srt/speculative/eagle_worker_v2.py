@@ -23,6 +23,8 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
+    DiscardPreparedWeightsFromTensorReqInput,
+    PrepareWeightsFromTensorReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1207,13 +1209,53 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
+            manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         if not success:
             return success, message
 
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
+            manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def prepare_weights_from_tensor(self, recv_req: PrepareWeightsFromTensorReqInput):
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        success, message = self.draft_worker.draft_runner.prepare_weights_from_tensor(
+            named_tensors=named_tensors,
+            manifest=recv_req.manifest,
+            load_format=recv_req.load_format,
+        )
+        if not success:
+            return success, message
+
+        return self.target_worker.model_runner.prepare_weights_from_tensor(
+            named_tensors=named_tensors,
+            manifest=recv_req.manifest,
+            load_format=recv_req.load_format,
+        )
+
+    def discard_prepared_weights_from_tensor(
+        self, recv_req: DiscardPreparedWeightsFromTensorReqInput
+    ):
+        success, message = (
+            self.draft_worker.draft_runner.discard_prepared_weights_from_tensor(
+                manifest=recv_req.manifest,
+                load_format=recv_req.load_format,
+            )
+        )
+        target_success, target_message = (
+            self.target_worker.model_runner.discard_prepared_weights_from_tensor(
+                manifest=recv_req.manifest,
+                load_format=recv_req.load_format,
+            )
+        )
+        return success and target_success, " | ".join([message, target_message])

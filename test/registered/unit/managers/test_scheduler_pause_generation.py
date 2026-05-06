@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_runtime_checker_mixin import PoolStats
@@ -22,17 +23,38 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None
+        scheduler._chunked_req_scheduled_last_iter = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
         scheduler.running_batch.batch_is_full = False
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_hisparse = False
         scheduler.req_to_token_pool = MagicMock()
         scheduler.result_queue = deque()
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.grammar_queue = []
+        scheduler.waiting_queue = []
+        scheduler.dllm_config = None
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.pp_size = 1
+        scheduler.running_mbs = []
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = MagicMock()
+        scheduler.disagg_prefill_bootstrap_queue.queue = []
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue.queue = []
+        scheduler.disagg_decode_transfer_queue = MagicMock()
+        scheduler.disagg_decode_transfer_queue.queue = []
+        scheduler.draft_worker = None
+        scheduler.reset_metrics = MagicMock()
         scheduler.max_total_num_tokens = 1000
         scheduler._get_token_info = MagicMock(
             return_value=PoolStats(
@@ -44,48 +66,138 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         return scheduler
 
-    def test_inplace_only_sets_flag(self):
-        """in_place pause should only set _engine_paused and return."""
+    def test_inplace_clears_scheduler_batch_pointers(self):
+        """in_place pause should leave the scheduler quiescent for the update."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
+        scheduler.last_batch.forward_mode.is_extend.return_value = False
         scheduler.cur_batch = MagicMock()
         scheduler.chunked_req = MagicMock()
 
-        original_last_batch = scheduler.last_batch
-        original_cur_batch = scheduler.cur_batch
         original_chunked_req = scheduler.chunked_req
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        # All state must be preserved — no mutation
-        self.assertIs(scheduler.last_batch, original_last_batch)
-        self.assertIs(scheduler.cur_batch, original_cur_batch)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.cur_batch)
+        # In-place pause preserves chunked state and running requests.
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
-    def test_inplace_does_not_drain_overlap_queue(self):
-        """in_place should not process the overlap result_queue."""
+    def test_inplace_drains_overlap_queue(self):
+        """in_place pause should finish CPU-side processing for the last batch."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         scheduler.last_batch = MagicMock()
+        scheduler.last_batch.forward_mode.is_extend.return_value = False
+        scheduler.cur_batch = MagicMock()
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        scheduler.process_batch_result = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        self.assertEqual(len(scheduler.result_queue), 1)
+        scheduler.process_batch_result.assert_called_once()
+        self.assertEqual(len(scheduler.result_queue), 0)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertIsNone(scheduler.cur_batch)
 
-    def test_inplace_does_not_merge_batch(self):
-        """in_place should not filter or merge last_batch into running_batch."""
+    def test_inplace_merges_extend_batch_without_retract(self):
+        """in_place pause should preserve surviving requests without retracting them."""
         scheduler = self._new_scheduler()
         last_batch = MagicMock()
         last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 2]
+        last_batch.chunked_req = None
+        scheduler.last_batch = last_batch
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.filter_batch = MagicMock()
+        scheduler.running_batch.retract_all = MagicMock()
+        scheduler.running_batch.merge_batch = MagicMock()
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        last_batch.filter_batch.assert_called_once()
+        scheduler.running_batch.merge_batch.assert_called_once_with(last_batch)
+        scheduler.running_batch.retract_all.assert_not_called()
+
+    def test_inplace_excludes_active_chunked_request(self):
+        """in_place pause should stash and exclude the active chunked request."""
+        scheduler = self._new_scheduler()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 1]
+        last_batch.chunked_req = None
+        scheduler.last_batch = last_batch
+        scheduler.chunked_req = MagicMock()
+        scheduler._chunked_req_scheduled_last_iter = True
+        scheduler.stash_chunked_request = MagicMock()
+        scheduler.running_batch.is_empty.return_value = False
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        scheduler.stash_chunked_request.assert_called_once_with(scheduler.chunked_req)
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(scheduler.chunked_req, excluded)
+        scheduler.running_batch.merge_batch.assert_called_once_with(last_batch)
+
+    def test_inplace_excludes_stale_last_batch_chunked_request(self):
+        """in_place pause should discard stale last_batch.chunked_req state."""
+        scheduler = self._new_scheduler()
+        stale_chunked_req = MagicMock()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [2, 2]
+        last_batch.chunked_req = stale_chunked_req
         scheduler.last_batch = last_batch
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        last_batch.filter_batch.assert_not_called()
-        scheduler.running_batch.merge_batch.assert_not_called()
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(stale_chunked_req, excluded)
+
+    def test_inplace_excludes_dllm_staging_requests(self):
+        """in_place pause should mirror DLLM staging exclusions from scheduling."""
+        scheduler = self._new_scheduler()
+        scheduler.dllm_config = object()
+        staging_req = MagicMock()
+        last_req = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = True
+        scheduler.dllm_manager.staging_queue = [staging_req]
+        scheduler.stash_chunked_request = MagicMock()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = True
+        last_batch.batch_size.side_effect = [1, 0]
+        last_batch.chunked_req = None
+        last_batch.reqs = [last_req]
+        scheduler.last_batch = last_batch
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        scheduler.stash_chunked_request.assert_called_once_with(staging_req)
+        excluded = last_batch.filter_batch.call_args.kwargs["chunked_req_to_exclude"]
+        self.assertIn(staging_req, excluded)
+        self.assertIn(last_req, excluded)
+
+    def test_inplace_clears_batch_is_full_when_filtering_shrinks_batch(self):
+        """in_place pause should reset batch_is_full if filtering removes requests."""
+        scheduler = self._new_scheduler()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.batch_size.side_effect = [3, 1]
+        last_batch.chunked_req = None
+        scheduler.last_batch = last_batch
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.batch_is_full = True
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        self.assertFalse(scheduler.running_batch.batch_is_full)
 
     def test_abort_clears_state(self):
         """abort mode should clear last_batch and cur_batch."""
@@ -136,6 +248,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
+
+    def test_flush_cache_allows_waiting_requests_while_paused(self):
+        """Paused requests may stay queued and recompute KV after cache flush."""
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.waiting_queue = [MagicMock()]
+
+        success = scheduler.flush_cache()
+
+        self.assertTrue(success)
+        scheduler.tree_cache.reset.assert_called_once()
+        scheduler.req_to_token_pool.clear.assert_called_once()
+        scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
+        scheduler.grammar_manager.clear.assert_called_once()
+
+    def test_flush_cache_rejects_waiting_requests_when_not_paused(self):
+        """Outside an explicit pause, waiting_queue still blocks cache flush."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = [MagicMock()]
+
+        success = scheduler.flush_cache()
+
+        self.assertFalse(success)
+        scheduler.tree_cache.reset.assert_not_called()
+        scheduler.req_to_token_pool.clear.assert_not_called()
+        scheduler.token_to_kv_pool_allocator.clear.assert_not_called()
 
 
 if __name__ == "__main__":

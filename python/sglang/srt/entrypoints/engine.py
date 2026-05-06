@@ -970,8 +970,12 @@ class Engine(EngineScoreMixin, EngineBase):
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],
+        manifest: Optional[dict] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        atomic_pause_mode: Optional[str] = None,
+        weight_version: Optional[str] = None,
+        recapture_cuda_graph: bool = False,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -984,8 +988,12 @@ class Engine(EngineScoreMixin, EngineBase):
             ]
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
+            manifest=manifest,
             load_format=load_format,
             flush_cache=flush_cache,
+            atomic_pause_mode=atomic_pause_mode,
+            weight_version=weight_version,
+            recapture_cuda_graph=recapture_cuda_graph,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)

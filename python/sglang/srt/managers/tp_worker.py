@@ -23,12 +23,14 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
+    DiscardPreparedWeightsFromTensorReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareWeightsFromTensorReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -162,9 +164,29 @@ class BaseTpWorker(ABC):
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
+            manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def prepare_weights_from_tensor(self, recv_req: PrepareWeightsFromTensorReqInput):
+        monkey_patch_torch_reductions()
+        return self.model_runner.prepare_weights_from_tensor(
+            named_tensors=MultiprocessingSerializer.deserialize(
+                recv_req.serialized_named_tensors[self.tp_rank]
+            ),
+            manifest=recv_req.manifest,
+            load_format=recv_req.load_format,
+        )
+
+    def discard_prepared_weights_from_tensor(
+        self, recv_req: DiscardPreparedWeightsFromTensorReqInput
+    ):
+        return self.model_runner.discard_prepared_weights_from_tensor(
+            manifest=recv_req.manifest,
+            load_format=recv_req.load_format,
+        )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""

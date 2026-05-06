@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -28,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DiscardPreparedWeightsFromTensorReqInput,
+    DiscardPreparedWeightsFromTensorReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
@@ -55,6 +58,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrepareWeightsFromTensorReqInput,
+    PrepareWeightsFromTensorReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -79,8 +84,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_loader.lora_merge.options import manifest_bool
+from sglang.srt.managers.weight_update.orchestrator import WeightUpdateOrchestrator
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import MultiprocessingSerializer, get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -101,6 +108,8 @@ _COMMUNICATOR_SPECS = [
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+    ("prepare_weights_from_tensor", PrepareWeightsFromTensorReqOutput),
+    ("discard_prepared_weights_from_tensor", DiscardPreparedWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
@@ -422,15 +431,15 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Hold is_pause_cond while updating to prevent unpause from racing.
+        # Immediately update the weights if the engine is already paused.
         async with self.is_pause_cond:
             is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
 
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
@@ -477,24 +486,88 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+        prepared = False
+        prestage_request_id = uuid.uuid4().hex[:12]
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
+        async def run_prepare() -> None:
+            nonlocal prepared
+            if not manifest_bool(obj.manifest, "lora_merge_prestage_before_pause"):
+                return
+
+            prepare_manifest = dict(obj.manifest or {})
+            prepare_manifest["lora_merge_prestage_request_id"] = prestage_request_id
+            prepare_obj = PrepareWeightsFromTensorReqInput(
+                serialized_named_tensors=obj.serialized_named_tensors,
+                manifest=prepare_manifest,
+                load_format=obj.load_format,
+                disable_draft_model=obj.disable_draft_model,
+            )
+            results = await self.prepare_weights_from_tensor_communicator(prepare_obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            if not success:
+                raise ValueError(message)
+
+            consume_manifest = dict(obj.manifest or {})
+            consume_manifest["lora_merge_consume_prestaged"] = True
+            consume_manifest["lora_merge_prestage_request_id"] = prestage_request_id
+            obj.manifest = consume_manifest
+
+            empty_named_tensors = MultiprocessingSerializer.serialize([])
+            obj.serialized_named_tensors = [
+                empty_named_tensors for _ in obj.serialized_named_tensors
+            ]
+            prepared = True
+
+        async def discard_prepare() -> None:
+            if not prepared:
+                return
+            discard_manifest = dict(obj.manifest or {})
+            discard_manifest["lora_merge_prestage_request_id"] = prestage_request_id
+            discard_obj = DiscardPreparedWeightsFromTensorReqInput(
+                manifest=discard_manifest,
+                load_format=obj.load_format,
+                disable_draft_model=obj.disable_draft_model,
+            )
+            await self.discard_prepared_weights_from_tensor_communicator(discard_obj)
+
+        async def run_update() -> Tuple[bool, str]:
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+
+            await self._reserve_weight_epoch(obj)
+
+            # Immediately update the weights if the engine is already paused.
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+
+            lock_context = (
+                self.model_update_lock.writer_lock if not is_paused else nullcontext()
+            )
+            async with lock_context:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            if success:
+                self._record_successful_weight_update(
+                    obj.weight_epoch, obj.weight_version
+                )
+                if obj.weight_version is not None:
+                    message += f" Weight version updated to {obj.weight_version}."
+            else:
+                await discard_prepare()
 
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            return success, message
 
-        return success, message
+        try:
+            return await WeightUpdateOrchestrator(self).run(
+                obj,
+                run_update,
+                prepare_fn=run_prepare,
+                discard_prepare_fn=discard_prepare,
+            )
+        except ValueError as e:
+            await discard_prepare()
+            return False, str(e)
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -886,4 +959,51 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
+            if not hasattr(self, "current_weight_epoch"):
+                self.current_weight_epoch = 0
+            if not hasattr(self, "weight_version_by_epoch"):
+                self.weight_version_by_epoch = {}
             self.server_args.weight_version = weight_version
+            self.weight_version_by_epoch[self.current_weight_epoch] = weight_version
+
+    async def _reserve_weight_epoch(self: TokenizerManager, obj: Any) -> None:
+        if not hasattr(self, "current_weight_epoch"):
+            self.current_weight_epoch = 0
+        if not hasattr(self, "next_weight_epoch"):
+            self.next_weight_epoch = self.current_weight_epoch + 1
+        if not hasattr(self, "weight_epoch_reservation_lock"):
+            self.weight_epoch_reservation_lock = asyncio.Lock()
+
+        async with self.weight_epoch_reservation_lock:
+            requested_epoch = getattr(obj, "weight_epoch", None)
+            if requested_epoch is None:
+                obj.weight_epoch = self.next_weight_epoch
+                self.next_weight_epoch += 1
+                return
+
+            if requested_epoch < self.next_weight_epoch:
+                raise ValueError(
+                    f"weight_epoch {requested_epoch} has already been reserved; "
+                    f"next available epoch is {self.next_weight_epoch}"
+                )
+
+            self.next_weight_epoch = requested_epoch + 1
+
+    def _record_successful_weight_update(
+        self: TokenizerManager,
+        weight_epoch: Optional[int],
+        weight_version: Optional[str],
+    ) -> None:
+        if weight_epoch is None:
+            self._update_weight_version_if_provided(weight_version)
+            return
+
+        if not hasattr(self, "weight_version_by_epoch"):
+            self.weight_version_by_epoch = {}
+
+        self.current_weight_epoch = weight_epoch
+        if weight_version is not None:
+            self.server_args.weight_version = weight_version
+            self.weight_version_by_epoch[weight_epoch] = weight_version
+        else:
+            self.weight_version_by_epoch[weight_epoch] = self.server_args.weight_version

@@ -15,12 +15,16 @@ from sglang.srt.constants import (
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    DiscardPreparedWeightsFromTensorReqInput,
+    DiscardPreparedWeightsFromTensorReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PrepareWeightsFromTensorReqInput,
+    PrepareWeightsFromTensorReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -42,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerUpdateWeightsMixin:
+    def _record_successful_weight_update(self: Scheduler, recv_req) -> None:
+        if getattr(recv_req, "weight_epoch", None) is not None:
+            self.current_weight_epoch = recv_req.weight_epoch
 
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
@@ -109,7 +116,35 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
+        if success:
+            self._record_successful_weight_update(recv_req)
         return UpdateWeightsFromTensorReqOutput(success, message)
+
+    def prepare_weights_from_tensor(
+        self: Scheduler, recv_req: PrepareWeightsFromTensorReqInput
+    ):
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
+        success, message = worker.prepare_weights_from_tensor(recv_req)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        if not success:
+            logger.error(message)
+        return PrepareWeightsFromTensorReqOutput(success, message)
+
+    def discard_prepared_weights_from_tensor(
+        self: Scheduler, recv_req: DiscardPreparedWeightsFromTensorReqInput
+    ):
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
+        success, message = worker.discard_prepared_weights_from_tensor(recv_req)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        if not success:
+            logger.error(message)
+        return DiscardPreparedWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput

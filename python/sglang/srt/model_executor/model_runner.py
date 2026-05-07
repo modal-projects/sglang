@@ -2010,13 +2010,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
         recapture_cuda_graph: bool = False,
+        trace: Optional[dict] = None,
     ):
+        update_started_at = time.monotonic()
+        if trace is not None:
+            trace["model_runner_tp_rank"] = self.tp_rank
+            trace["model_runner_load_format"] = load_format
+            trace["model_runner_named_tensor_count"] = len(named_tensors)
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
+            success, message = self._update_weights_from_flattened_bucket(
                 flattened_tensor_bucket_dict=named_tensors
             )
+            if trace is not None:
+                trace["model_runner_update_total_ms"] = round(
+                    (time.monotonic() - update_started_at) * 1000, 3
+                )
+            return success, message
 
         # We need to get device after patch otherwise the device would be wrong
         self.device_module = torch.get_device_module(self.device)
@@ -2024,23 +2035,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         graph_tracker = WeightUpdateGraphTracker(self)
         graph_tracker.clear_pending_recapture_marks()
+        snapshot_started_at = time.monotonic()
         graph_tensor_snapshot = graph_tracker.snapshot()
+        if trace is not None:
+            trace["model_runner_graph_snapshot_ms"] = round(
+                (time.monotonic() - snapshot_started_at) * 1000, 3
+            )
         should_recapture = recapture_cuda_graph
 
         if load_format == "direct":
+            unwrap_started_at = time.monotonic()
             named_tensors = [
                 (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
                 for name, tensor in named_tensors
             ]
+            if trace is not None:
+                trace["model_runner_unwrap_tensors_ms"] = round(
+                    (time.monotonic() - unwrap_started_at) * 1000, 3
+                )
+            load_started_at = time.monotonic()
             _model_load_weights_direct(self.model, named_tensors)
+            if trace is not None:
+                trace["model_runner_direct_load_ms"] = round(
+                    (time.monotonic() - load_started_at) * 1000, 3
+                )
         elif load_format in self.server_args.custom_weight_loader:
+            import_started_at = time.monotonic()
             custom_loader = dynamic_import(load_format)
+            if trace is not None:
+                trace["model_runner_custom_loader_import_ms"] = round(
+                    (time.monotonic() - import_started_at) * 1000, 3
+                )
             should_recapture = should_recapture or getattr(
                 custom_loader, "sglang_requires_cuda_graph_recapture", False
             )
             supports_host_tensors = getattr(
                 custom_loader, "sglang_supports_host_tensors", False
             )
+            if trace is not None:
+                trace["model_runner_custom_loader_uses_host_tensors"] = (
+                    supports_host_tensors
+                )
+                trace["model_runner_should_recapture_device_graphs"] = should_recapture
+            unwrap_started_at = time.monotonic()
             named_tensors = [
                 (
                     name,
@@ -2052,25 +2089,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 for name, tensor in named_tensors
             ]
+            if trace is not None:
+                trace["model_runner_unwrap_tensors_ms"] = round(
+                    (time.monotonic() - unwrap_started_at) * 1000, 3
+                )
+            loader_started_at = time.monotonic()
             self._call_custom_weight_loader(
                 custom_loader,
                 named_tensors,
                 infered_device,
                 manifest=manifest,
+                trace=trace,
             )
+            if trace is not None:
+                trace["model_runner_custom_loader_ms"] = round(
+                    (time.monotonic() - loader_started_at) * 1000, 3
+                )
         elif load_format is None:
+            unwrap_started_at = time.monotonic()
             named_tensors = [
                 (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
                 for name, tensor in named_tensors
             ]
+            if trace is not None:
+                trace["model_runner_unwrap_tensors_ms"] = round(
+                    (time.monotonic() - unwrap_started_at) * 1000, 3
+                )
+            load_started_at = time.monotonic()
             self.model.load_weights(named_tensors)
+            if trace is not None:
+                trace["model_runner_model_load_weights_ms"] = round(
+                    (time.monotonic() - load_started_at) * 1000, 3
+                )
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         graph_tracker.maybe_rebuild(
             update_source="tensor",
             force_recapture=should_recapture,
             before_snapshot=graph_tensor_snapshot,
+            trace=trace,
         )
+        if trace is not None:
+            trace["model_runner_update_total_ms"] = round(
+                (time.monotonic() - update_started_at) * 1000, 3
+            )
         return True, "Success"
 
     def prepare_weights_from_tensor(
@@ -2078,7 +2140,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
+        trace: Optional[dict] = None,
     ):
+        prepare_started_at = time.monotonic()
+        if trace is not None:
+            trace["model_runner_prestage_tp_rank"] = self.tp_rank
+            trace["model_runner_prestage_load_format"] = load_format
+            trace["model_runner_prestage_named_tensor_count"] = len(named_tensors)
         if load_format not in self.server_args.custom_weight_loader:
             raise NotImplementedError(
                 f"Weight update preparation requires a custom load_format; got {load_format}"
@@ -2087,12 +2155,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         monkey_patch_torch_reductions()
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
+        import_started_at = time.monotonic()
         custom_loader = dynamic_import(load_format)
+        if trace is not None:
+            trace["model_runner_prestage_custom_loader_import_ms"] = round(
+                (time.monotonic() - import_started_at) * 1000, 3
+            )
         prepare_fn = getattr(custom_loader, "sglang_prepare_tensors", None)
         if prepare_fn is None:
             return False, f"Custom loader {load_format} does not support preparation"
 
         supports_host_tensors = getattr(custom_loader, "sglang_supports_host_tensors", False)
+        if trace is not None:
+            trace["model_runner_prestage_uses_host_tensors"] = supports_host_tensors
+        unwrap_started_at = time.monotonic()
         named_tensors = [
             (
                 name,
@@ -2104,19 +2180,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             for name, tensor in named_tensors
         ]
+        if trace is not None:
+            trace["model_runner_prestage_unwrap_tensors_ms"] = round(
+                (time.monotonic() - unwrap_started_at) * 1000, 3
+            )
+        loader_started_at = time.monotonic()
         self._call_custom_weight_loader(
             prepare_fn,
             named_tensors,
             infered_device,
             manifest=manifest,
+            trace=trace,
         )
+        if trace is not None:
+            trace["model_runner_prestage_custom_loader_ms"] = round(
+                (time.monotonic() - loader_started_at) * 1000, 3
+            )
+            trace["model_runner_prestage_total_ms"] = round(
+                (time.monotonic() - prepare_started_at) * 1000, 3
+            )
         return True, "Success"
 
     def discard_prepared_weights_from_tensor(
         self,
         manifest: Optional[Dict[str, Any]] = None,
         load_format: Optional[str] = None,
+        trace: Optional[dict] = None,
     ):
+        discard_started_at = time.monotonic()
         if load_format not in self.server_args.custom_weight_loader:
             raise NotImplementedError(
                 f"Prepared weight cleanup requires a custom load_format; got {load_format}"
@@ -2134,10 +2225,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             [],
             infered_device,
             manifest=manifest,
+            trace=trace,
         )
+        if trace is not None:
+            trace["model_runner_discard_prepared_total_ms"] = round(
+                (time.monotonic() - discard_started_at) * 1000, 3
+            )
         return True, "Success"
 
-    def rebuild_device_graphs_after_weight_update(self) -> None:
+    def rebuild_device_graphs_after_weight_update(
+        self, trace: Optional[dict] = None
+    ) -> None:
+        rebuild_started_at = time.monotonic()
         logger.info("Rebuild device graphs after weight update begin.")
         self.graph_runner = None
         self.piecewise_cuda_graph_runner = None
@@ -2148,8 +2247,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if hasattr(device_module, "empty_cache"):
             device_module.empty_cache()
 
+        init_device_started_at = time.monotonic()
         self.init_device_graphs()
+        if trace is not None:
+            trace["model_runner_init_device_graphs_ms"] = round(
+                (time.monotonic() - init_device_started_at) * 1000, 3
+            )
+        init_piecewise_started_at = time.monotonic()
         self.init_piecewise_cuda_graphs()
+        if trace is not None:
+            trace["model_runner_init_piecewise_cuda_graphs_ms"] = round(
+                (time.monotonic() - init_piecewise_started_at) * 1000, 3
+            )
+            trace["model_runner_rebuild_device_graphs_ms"] = round(
+                (time.monotonic() - rebuild_started_at) * 1000, 3
+            )
         logger.info("Rebuild device graphs after weight update end.")
 
     def _call_custom_weight_loader(
@@ -2158,6 +2270,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         named_tensors: List[Tuple[str, torch.Tensor]],
         infered_device,
         manifest: Optional[dict] = None,
+        trace: Optional[dict] = None,
     ) -> None:
         load_context = {
             "manifest": manifest,
@@ -2165,6 +2278,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "server_args": self.server_args,
             "tp_rank": self.tp_rank,
             "device": infered_device,
+            "trace": trace,
         }
 
         signature = inspect.signature(custom_loader)

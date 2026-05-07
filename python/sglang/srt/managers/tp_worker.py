@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.weight_update.tracing import elapsed_ms, ensure_update_trace
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -158,34 +160,45 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
+        trace = ensure_update_trace(recv_req)
         monkey_patch_torch_reductions()
+        deserialize_started_at = time.monotonic()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        trace["tp_worker_deserialize_ms"] = elapsed_ms(deserialize_started_at)
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
+            named_tensors=named_tensors,
             manifest=recv_req.manifest,
             load_format=recv_req.load_format,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            trace=trace,
         )
         return success, message
 
     def prepare_weights_from_tensor(self, recv_req: PrepareWeightsFromTensorReqInput):
+        trace = ensure_update_trace(recv_req)
         monkey_patch_torch_reductions()
+        deserialize_started_at = time.monotonic()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        trace["tp_worker_prestage_deserialize_ms"] = elapsed_ms(deserialize_started_at)
         return self.model_runner.prepare_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
+            named_tensors=named_tensors,
             manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            trace=trace,
         )
 
     def discard_prepared_weights_from_tensor(
         self, recv_req: DiscardPreparedWeightsFromTensorReqInput
     ):
+        trace = ensure_update_trace(recv_req)
         return self.model_runner.discard_prepared_weights_from_tensor(
             manifest=recv_req.manifest,
             load_format=recv_req.load_format,
+            trace=trace,
         )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):

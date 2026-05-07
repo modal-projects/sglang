@@ -1398,6 +1398,7 @@ class PauseGenerationReqInput(BaseReq):
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
+    trace: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         allowed = ["abort", "retract", "in_place"]
@@ -1409,7 +1410,7 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1491,12 +1492,14 @@ class PrepareWeightsFromTensorReqInput(BaseReq):
     manifest: Optional[Dict[str, Any]] = None
     load_format: Optional[str] = None
     disable_draft_model: Optional[bool] = None
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class PrepareWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1504,12 +1507,14 @@ class DiscardPreparedWeightsFromTensorReqInput(BaseReq):
     manifest: Optional[Dict[str, Any]] = None
     load_format: Optional[str] = None
     disable_draft_model: Optional[bool] = None
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class DiscardPreparedWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1541,12 +1546,15 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to recapture device graphs after weight update.
     recapture_cuda_graph: bool = False
+    # Optional in-band timing/profiling payload populated by the update path.
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
+    trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass

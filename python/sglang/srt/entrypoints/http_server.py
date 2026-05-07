@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import importlib
 import logging
 import os
 import tempfile
@@ -417,6 +418,16 @@ app.add_middleware(
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
+
+extra_router_imports = os.environ.get("SGLANG_EXTRA_ROUTERS", "")
+for router_import in [
+    item.strip() for item in extra_router_imports.split(",") if item.strip()
+]:
+    module_name, _, attr_name = router_import.partition(":")
+    if not attr_name:
+        attr_name = "router"
+    module = importlib.import_module(module_name)
+    app.include_router(getattr(module, attr_name))
 
 
 @app.exception_handler(HTTPException)
@@ -1182,6 +1193,8 @@ async def update_weights_from_tensor(
     )
 
     content = {"success": success, "message": message}
+    if obj.trace is not None:
+        content["trace"] = obj.trace
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
     )

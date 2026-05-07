@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -1624,6 +1625,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        trace = obj.trace
+        started_at = time.monotonic() if trace is not None else None
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
@@ -1637,12 +1640,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if not is_locked:
                         break
                     await asyncio.sleep(1.0)
+        if trace is not None and started_at is not None:
+            trace["tokenizer_pause_generation_inner_ms"] = round(
+                (time.monotonic() - started_at) * 1000, 3
+            )
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        trace = obj.trace
+        started_at = time.monotonic() if trace is not None else None
         async with self.is_pause_cond:
             self.is_pause = False
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
+        if trace is not None and started_at is not None:
+            trace["tokenizer_continue_generation_inner_ms"] = round(
+                (time.monotonic() - started_at) * 1000, 3
+            )
 
     async def update_weights_from_disk(
         self,

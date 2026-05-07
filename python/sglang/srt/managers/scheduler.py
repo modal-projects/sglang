@@ -3627,21 +3627,48 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        pause_started_at = time.monotonic()
+        request_id = (recv_req.trace or {}).get("request_id")
+        trace = {
+            "request_id": request_id,
+            "mode": recv_req.mode,
+            "scheduler_pause_generation_start_monotonic": pause_started_at,
+            "enable_overlap": self.enable_overlap,
+            "result_queue_size": (
+                len(self.result_queue) if self.enable_overlap else None
+            ),
+            "running_batch_size": (
+                len(self.running_batch.reqs) if self.running_batch is not None else 0
+            ),
+            "has_last_batch": self.last_batch is not None,
+            "has_cur_batch": self.cur_batch is not None,
+        }
+        self._last_generation_pause_trace = trace
         self._engine_paused = True
 
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
+            overlap_started_at = time.monotonic()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if trace is not None:
+                trace["scheduler_pause_overlap_result_ms"] = round(
+                    (time.monotonic() - overlap_started_at) * 1000, 3
+                )
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
+            merge_started_at = time.monotonic()
             self._merge_extend_last_batch_into_running_batch(
                 skip_merge=self.disaggregation_mode == DisaggregationMode.PREFILL
             )
+            if trace is not None:
+                trace["scheduler_pause_merge_extend_ms"] = round(
+                    (time.monotonic() - merge_started_at) * 1000, 3
+                )
 
         self.last_batch = None
         self.cur_batch = None
@@ -3653,13 +3680,23 @@ class Scheduler(
                 "yes",
                 "on",
             ):
+                sync_started_at = time.monotonic()
                 if self.enable_overlap and hasattr(self, "forward_stream"):
                     self.forward_stream.synchronize()
                 if hasattr(self, "schedule_stream"):
                     self.schedule_stream.synchronize()
+                if trace is not None:
+                    trace["scheduler_pause_stream_sync_ms"] = round(
+                        (time.monotonic() - sync_started_at) * 1000, 3
+                    )
+            trace["scheduler_pause_mode"] = recv_req.mode
+            trace["scheduler_pause_total_ms"] = round(
+                (time.monotonic() - pause_started_at) * 1000, 3
+            )
             return
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
+            retract_started_at = time.monotonic()
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
@@ -3668,9 +3705,39 @@ class Scheduler(
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
+            if trace is not None:
+                trace["scheduler_pause_retract_ms"] = round(
+                    (time.monotonic() - retract_started_at) * 1000, 3
+                )
+        trace["scheduler_pause_mode"] = recv_req.mode
+        trace["scheduler_pause_total_ms"] = round(
+            (time.monotonic() - pause_started_at) * 1000, 3
+        )
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        trace = recv_req.trace
+        started_at = time.monotonic()
+        request_id = (recv_req.trace or {}).get("request_id")
+        pause_trace = getattr(self, "_last_generation_pause_trace", None)
+        if (
+            pause_trace is not None
+            and request_id is not None
+            and pause_trace.get("request_id") == request_id
+        ):
+            pause_trace["scheduler_pause_to_continue_start_ms"] = round(
+                (
+                    started_at
+                    - pause_trace["scheduler_pause_generation_start_monotonic"]
+                )
+                * 1000,
+                3,
+            )
+            self._last_completed_generation_pause_trace = dict(pause_trace)
         self._engine_paused = False
+        if trace is not None:
+            trace["scheduler_continue_total_ms"] = round(
+                (time.monotonic() - started_at) * 1000, 3
+            )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -403,8 +404,10 @@ def prepare_lora_tensors_for_merge(
     named_tensors: List[Tuple[str, torch.Tensor]],
     load_context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    started_at = time.monotonic()
     load_context = load_context or {}
     manifest = load_context.get("manifest") or {}
+    trace = load_context.get("trace")
     model_device = _model_device(model)
     if model_device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError("LoRA merge prestage requires a CUDA model.")
@@ -420,6 +423,12 @@ def prepare_lora_tensors_for_merge(
     params = dict(model.named_parameters(remove_duplicate=False))
     memory_budget = options.memory_budget
     prestage_bucket_bytes = options.apply_bucket_bytes
+    if trace is not None:
+        trace["lora_loader_prestage_pair_count"] = len(pairs)
+        trace["lora_loader_prestage_peak_device_budget_bytes"] = int(
+            memory_budget.peak_bytes
+        )
+        trace["lora_loader_prestage_gpu_bucket_bytes"] = int(prestage_bucket_bytes)
     max_apply_temp_bytes = 0
     for pair in pairs:
         max_apply_temp_bytes = max(
@@ -436,14 +445,20 @@ def prepare_lora_tensors_for_merge(
     prestage_capacity_bytes = max(0, memory_budget.peak_bytes - max_apply_temp_bytes)
     cached_pairs: List[_LoraPair] = []
     staged_bytes = 0
+    unstaged_bytes = 0
+    staged_count = 0
+    unstaged_count = 0
     for pair in pairs:
         pair_staged_bytes = _lora_pair_fp32_bytes(pair)
         if staged_bytes + pair_staged_bytes <= prestage_capacity_bytes:
             staged_pair = _stage_lora_pair_cuda_fp32(pair, model_device)
             cached_pairs.append(staged_pair)
             staged_bytes += pair_staged_bytes
+            staged_count += 1
         else:
             cached_pairs.append(pair)
+            unstaged_bytes += pair_staged_bytes
+            unstaged_count += 1
 
     cache = getattr(model, _PRESTAGED_LORA_CACHE_ATTR, None)
     if cache is None:
@@ -453,6 +468,17 @@ def prepare_lora_tensors_for_merge(
         "pairs": cached_pairs,
         "gpu_bucket_bytes": int(prestage_bucket_bytes),
     }
+    if trace is not None:
+        trace["lora_loader_prestage_staged_pair_count"] = staged_count
+        trace["lora_loader_prestage_unstaged_pair_count"] = unstaged_count
+        trace["lora_loader_prestage_staged_bytes"] = int(staged_bytes)
+        trace["lora_loader_prestage_unstaged_bytes"] = int(unstaged_bytes)
+        trace["lora_loader_prestage_max_apply_temp_bytes"] = int(max_apply_temp_bytes)
+        trace["lora_loader_prestage_capacity_bytes"] = int(prestage_capacity_bytes)
+        trace["lora_loader_prestage_complete"] = True
+        trace["lora_loader_prestage_total_ms"] = round(
+            (time.monotonic() - started_at) * 1000, 3
+        )
 
 
 def discard_lora_tensors_for_merge(
@@ -473,8 +499,10 @@ def merge_lora_tensors_inplace(
     named_tensors: List[Tuple[str, torch.Tensor]],
     load_context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    merge_started_at = time.monotonic()
     load_context = load_context or {}
     manifest = load_context.get("manifest") or {}
+    trace = load_context.get("trace")
     model_device = _require_cuda_model_device(model)
     options = resolve_lora_merge_options(
         manifest,
@@ -501,9 +529,24 @@ def merge_lora_tensors_inplace(
             )
         lora_pairs = list(prestage_cache_entry["pairs"])
         gpu_bucket_bytes = int(prestage_cache_entry["gpu_bucket_bytes"])
+        if trace is not None:
+            staged_count = sum(1 for pair in lora_pairs if pair is not None and pair.prestaged)
+            trace["lora_loader_prestage_consumed"] = True
+            trace["lora_loader_prestage_hit_count"] = staged_count
+            trace["lora_loader_prestage_miss_count"] = len(lora_pairs) - staged_count
     else:
         gpu_bucket_bytes = options.apply_bucket_bytes
         lora_pairs = list(_collect_lora_pairs(named_tensors, strict=strict))
+        if trace is not None:
+            trace["lora_loader_prestage_consumed"] = False
+
+    if trace is not None:
+        trace["lora_loader_merge_impl"] = "bucketed_cuda"
+        trace["lora_loader_pair_count"] = sum(pair is not None for pair in lora_pairs)
+        trace["lora_loader_peak_device_budget_bytes"] = int(
+            options.memory_budget.peak_bytes
+        )
+        trace["lora_loader_gpu_bucket_bytes"] = int(gpu_bucket_bytes)
 
     def apply_pair(
         base_name: str,
@@ -524,28 +567,65 @@ def merge_lora_tensors_inplace(
             layers_needing_postprocess[id(layer)] = layer
 
     try:
+        pair_traces: List[Dict[str, Any]] = []
+        pair_apply_total_ms = 0.0
+        pair_apply_max_ms = 0.0
         for pair_index, pair in enumerate(lora_pairs):
             if pair is None:
                 continue
             lora_a = pair.lora_a
             lora_b = pair.lora_b
+            pair_started_at = time.monotonic()
             apply_pair(
                 pair.base_name,
                 lora_a,
                 lora_b,
             )
+            pair_ms = round((time.monotonic() - pair_started_at) * 1000, 3)
+            pair_apply_total_ms += pair_ms
+            pair_apply_max_ms = max(pair_apply_max_ms, pair_ms)
+            if trace is not None:
+                pair_traces.append(
+                    {
+                        "index": pair_index,
+                        "base_name": pair.base_name,
+                        "prestaged": pair.prestaged,
+                        "pair_ms": pair_ms,
+                    }
+                )
             lora_pairs[pair_index] = None
             pair = None
             lora_a = None
             lora_b = None
+        if trace is not None:
+            trace["lora_loader_pair_apply_total_ms"] = round(pair_apply_total_ms, 3)
+            trace["lora_loader_pair_apply_max_ms"] = round(pair_apply_max_ms, 3)
+            trace["lora_loader_first_pairs"] = pair_traces[:8]
+            trace["lora_loader_top_pairs"] = sorted(
+                pair_traces, key=lambda item: item["pair_ms"], reverse=True
+            )[:8]
     finally:
         lora_pairs = []
         lora_a = None
         lora_b = None
+        finalize_started_at = time.monotonic()
         for layer in layers_needing_postprocess.values():
             _finalize_flashinfer_moe_layer_after_merge(layer)
+        if trace is not None:
+            trace["lora_loader_finalize_flashinfer_ms"] = round(
+                (time.monotonic() - finalize_started_at) * 1000, 3
+            )
         if options.empty_cache_after_merge:
+            empty_cache_started_at = time.monotonic()
             torch.cuda.empty_cache()
+            if trace is not None:
+                trace["lora_loader_empty_cache_ms"] = round(
+                    (time.monotonic() - empty_cache_started_at) * 1000, 3
+                )
+        if trace is not None:
+            trace["lora_loader_merge_total_ms"] = round(
+                (time.monotonic() - merge_started_at) * 1000, 3
+            )
 
 
 def _split_lora_tensor_name(name: str) -> Tuple[str, str]:

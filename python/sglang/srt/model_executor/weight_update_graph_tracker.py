@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -53,40 +54,65 @@ class WeightUpdateGraphTracker:
         update_source: str,
         force_recapture: bool,
         before_snapshot: Optional[GraphTensorSnapshot],
+        trace: Optional[dict] = None,
     ) -> None:
         if force_recapture:
+            if trace is not None:
+                trace["model_runner_rebuild_device_graphs_reason"] = "forced"
             logger.info(
                 "Rebuild device graphs after %s weight update because recapture was requested.",
                 update_source,
             )
-            self.runner.rebuild_device_graphs_after_weight_update()
+            self.runner.rebuild_device_graphs_after_weight_update(trace=trace)
             return
 
         if not self._has_device_graphs():
+            if trace is not None:
+                trace["model_runner_rebuild_device_graphs_reason"] = "no_graphs"
             return
 
+        marks_started_at = time.monotonic()
         marked_modules = self._consume_recapture_marks()
+        if trace is not None:
+            trace["model_runner_recapture_mark_scan_ms"] = round(
+                (time.monotonic() - marks_started_at) * 1000, 3
+            )
         if marked_modules:
+            if trace is not None:
+                trace["model_runner_rebuild_device_graphs_reason"] = "module_mark"
+                trace["model_runner_recapture_marked_module_count"] = len(marked_modules)
+                trace["model_runner_recapture_marked_module_sample"] = marked_modules[:8]
             logger.info(
                 "Rebuild device graphs after %s weight update because %d modules requested it. sample=%s",
                 update_source,
                 len(marked_modules),
                 marked_modules[:8],
             )
-            self.runner.rebuild_device_graphs_after_weight_update()
+            self.runner.rebuild_device_graphs_after_weight_update(trace=trace)
             return
 
+        diff_started_at = time.monotonic()
         changed_names = self._collect_changed_tensors(before_snapshot)
+        if trace is not None:
+            trace["model_runner_graph_tensor_diff_ms"] = round(
+                (time.monotonic() - diff_started_at) * 1000, 3
+            )
         if not changed_names:
+            if trace is not None:
+                trace["model_runner_rebuild_device_graphs_reason"] = "unchanged_layout"
             return
 
+        if trace is not None:
+            trace["model_runner_rebuild_device_graphs_reason"] = "changed_layout"
+            trace["model_runner_changed_graph_tensor_count"] = len(changed_names)
+            trace["model_runner_changed_graph_tensor_sample"] = changed_names[:8]
         logger.info(
             "Rebuild device graphs after %s weight update because %d graph-tracked tensors changed. sample=%s",
             update_source,
             len(changed_names),
             changed_names[:8],
         )
-        self.runner.rebuild_device_graphs_after_weight_update()
+        self.runner.rebuild_device_graphs_after_weight_update(trace=trace)
 
     def _has_device_graphs(self) -> bool:
         return (

@@ -86,6 +86,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.model_loader.lora_merge.options import manifest_bool
 from sglang.srt.managers.weight_update.orchestrator import WeightUpdateOrchestrator
+from sglang.srt.managers.weight_update.tracing import elapsed_ms, ensure_update_trace
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -482,12 +483,18 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
+        trace = ensure_update_trace(obj)
+        trace.setdefault("request_id", uuid.uuid4().hex[:12])
+        trace.setdefault("tokenizer_start_monotonic", time.monotonic())
+        trace["tokenizer_update_kind"] = "tensor"
+        trace["flush_cache"] = obj.flush_cache
+        trace["recapture_cuda_graph"] = obj.recapture_cuda_graph
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         prepared = False
-        prestage_request_id = uuid.uuid4().hex[:12]
+        prestage_request_id = trace["request_id"]
 
         async def run_prepare() -> None:
             nonlocal prepared
@@ -501,9 +508,22 @@ class TokenizerControlMixin:
                 manifest=prepare_manifest,
                 load_format=obj.load_format,
                 disable_draft_model=obj.disable_draft_model,
+                trace={
+                    "request_id": trace["request_id"],
+                    "source": trace.get("source"),
+                    "trace_start_monotonic": trace.get("trace_start_monotonic"),
+                    "tokenizer_prepare_start_monotonic": time.monotonic(),
+                },
             )
+            prepare_started_at = time.monotonic()
             results = await self.prepare_weights_from_tensor_communicator(prepare_obj)
+            trace["tokenizer_lora_prestage_scheduler_communicator_ms"] = elapsed_ms(
+                prepare_started_at
+            )
             success, message = FanOutCommunicator.merge_results(results)
+            trace["lora_prestage_scheduler_results"] = [
+                getattr(result, "trace", None) for result in results
+            ]
             if not success:
                 raise ValueError(message)
 
@@ -532,21 +552,39 @@ class TokenizerControlMixin:
 
         async def run_update() -> Tuple[bool, str]:
             if obj.abort_all_requests:
+                abort_started_at = time.monotonic()
                 self.abort_request(abort_all=True)
+                trace["tokenizer_abort_all_requests_ms"] = elapsed_ms(abort_started_at)
 
+            reserve_started_at = time.monotonic()
             await self._reserve_weight_epoch(obj)
+            trace["tokenizer_reserve_weight_epoch_ms"] = elapsed_ms(reserve_started_at)
+            trace["weight_epoch"] = obj.weight_epoch
+            trace["weight_version"] = obj.weight_version
 
             # Immediately update the weights if the engine is already paused.
             async with self.is_pause_cond:
                 is_paused = self.is_pause
+            trace["tokenizer_already_paused_before_update"] = is_paused
 
             lock_context = (
                 self.model_update_lock.writer_lock if not is_paused else nullcontext()
             )
+            lock_started_at = time.monotonic()
             async with lock_context:
+                trace["tokenizer_model_update_lock_wait_ms"] = elapsed_ms(
+                    lock_started_at
+                )
+                communicator_started_at = time.monotonic()
                 results = await self.update_weights_from_tensor_communicator(obj)
+                trace["tokenizer_scheduler_communicator_ms"] = elapsed_ms(
+                    communicator_started_at
+                )
 
             success, message = FanOutCommunicator.merge_results(results)
+            trace["scheduler_results"] = [
+                getattr(result, "trace", None) for result in results
+            ]
             if success:
                 self._record_successful_weight_update(
                     obj.weight_epoch, obj.weight_version
@@ -559,14 +597,18 @@ class TokenizerControlMixin:
             return success, message
 
         try:
-            return await WeightUpdateOrchestrator(self).run(
+            total_started_at = time.monotonic()
+            result = await WeightUpdateOrchestrator(self).run(
                 obj,
                 run_update,
                 prepare_fn=run_prepare,
                 discard_prepare_fn=discard_prepare,
             )
+            trace["tokenizer_update_total_ms"] = elapsed_ms(total_started_at)
+            return result
         except ValueError as e:
             await discard_prepare()
+            trace["tokenizer_update_error"] = str(e)
             return False, str(e)
 
     async def update_weights_from_ipc(

@@ -88,6 +88,10 @@ class DFlashDraftInput(SpecInput):
     # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
+    mrope_positions: Optional[torch.Tensor] = None
+
+    mrope_position_delta: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
@@ -98,13 +102,20 @@ class DFlashDraftInput(SpecInput):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
+        old_mrope_positions = self.mrope_positions
 
         self.bonus_tokens = self.bonus_tokens[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
+        if self.mrope_position_delta is not None:
+            self.mrope_position_delta = self.mrope_position_delta[new_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
+            if old_mrope_positions is None or old_mrope_positions.numel() == 0:
+                self.mrope_positions = old_mrope_positions
+            else:
+                self.mrope_positions = old_mrope_positions[:, :0]
             return
 
         # Rebuild target_hidden for the filtered batch using vectorized indexing.
@@ -121,6 +132,8 @@ class DFlashDraftInput(SpecInput):
         max_len = int(seg_lens.max().item()) if seg_lens.numel() > 0 else 0
         if max_len <= 0:
             self.target_hidden = old_target_hidden[:0]
+            if old_mrope_positions is not None:
+                self.mrope_positions = old_mrope_positions[:, :0]
             return
 
         r = torch.arange(max_len, device=old_ctx_lens.device, dtype=torch.int64)[
@@ -134,6 +147,14 @@ class DFlashDraftInput(SpecInput):
             if flat_pos.numel() > 0
             else old_target_hidden[:0]
         )
+        if old_mrope_positions is not None and old_mrope_positions.numel() > 0:
+            self.mrope_positions = (
+                old_mrope_positions.index_select(1, flat_pos)
+                if flat_pos.numel() > 0
+                else old_mrope_positions[:, :0]
+            )
+        else:
+            self.mrope_positions = old_mrope_positions
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
         self.bonus_tokens = torch.cat(
@@ -151,6 +172,20 @@ class DFlashDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+
+        self_mrope = self.mrope_positions
+        other_mrope = spec_info.mrope_positions
+        if self_mrope is None or self_mrope.numel() == 0:
+            self.mrope_positions = other_mrope
+        elif other_mrope is not None and other_mrope.numel() > 0:
+            self.mrope_positions = torch.cat([self_mrope, other_mrope], dim=1)
+
+        self_delta = self.mrope_position_delta
+        other_delta = spec_info.mrope_position_delta
+        if self_delta is None:
+            self.mrope_position_delta = other_delta
+        elif other_delta is not None:
+            self.mrope_position_delta = torch.cat([self_delta, other_delta], dim=0)
 
 
 @dataclass
@@ -175,6 +210,9 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+
+    # Optional 2D mRoPE positions for Qwen-VL-style multimodal targets.
+    mrope_positions: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

@@ -47,6 +47,129 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _compute_prefix_mrope_positions_for_extend(
+    *,
+    model_worker_batch: ModelWorkerBatch,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Compute prefix mRoPE positions for the DFlash extend (prefill) stage.
+
+    Mirrors the EXTEND branch of ``ForwardBatch._compute_mrope_positions``
+    (forward_batch_info.py) so the draft worker can populate
+    ``DFlashDraftInput.mrope_positions`` without depending on the target
+    forward's internal ForwardBatch leaking out. The output shape is
+    ``[3, sum(extend_seq_lens)]`` (int64) aligned 1:1 with ``target_hidden``
+    rows. Returns ``None`` for text-only batches so the existing 1D path
+    is preserved.
+    """
+    mm_inputs = getattr(model_worker_batch, "multimodal_inputs", None)
+    if mm_inputs is None or all(mm is None for mm in mm_inputs):
+        return None
+
+    extend_seq_lens = model_worker_batch.extend_seq_lens
+    extend_prefix_lens = model_worker_batch.extend_prefix_lens
+    if extend_seq_lens is None or extend_prefix_lens is None:
+        return None
+
+    # The extend_seq_lens / extend_prefix_lens fields on ModelWorkerBatch are
+    # typically already CPU lists or tensors; normalize to CPU ints.
+    def _to_cpu_int_list(x) -> list:
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().to(torch.int64).tolist()
+        return [int(v) for v in x]
+
+    extend_seq_lens_cpu = _to_cpu_int_list(extend_seq_lens)
+    extend_prefix_lens_cpu = _to_cpu_int_list(extend_prefix_lens)
+
+    if len(extend_seq_lens_cpu) != len(mm_inputs):
+        raise RuntimeError(
+            "DFLASH mrope prefix mismatch: "
+            f"extend_seq_lens={len(extend_seq_lens_cpu)} mm_inputs={len(mm_inputs)}."
+        )
+
+    per_req: list[torch.Tensor] = []
+    for batch_idx, mm_input in enumerate(mm_inputs):
+        extend_seq_len = int(extend_seq_lens_cpu[batch_idx])
+        extend_prefix_len = int(extend_prefix_lens_cpu[batch_idx])
+        if extend_seq_len <= 0:
+            per_req.append(torch.empty((3, 0), dtype=torch.int64))
+            continue
+        if (
+            mm_input is None
+            or getattr(mm_input, "mrope_positions", None) is None
+        ):
+            # Text-only request inside a mixed batch: linear positions.
+            row = torch.arange(
+                extend_prefix_len,
+                extend_prefix_len + extend_seq_len,
+                dtype=torch.int64,
+            )
+            per_req.append(row.unsqueeze(0).expand(3, -1).contiguous())
+            continue
+        full = mm_input.mrope_positions
+        if not isinstance(full, torch.Tensor):
+            full = torch.as_tensor(full, dtype=torch.int64)
+        if full.ndim != 2 or int(full.shape[0]) != 3:
+            raise RuntimeError(
+                "DFLASH expected mm_input.mrope_positions shape [3, full_seq_len], "
+                f"got {tuple(full.shape)}."
+            )
+        sliced = full[:, extend_prefix_len : extend_prefix_len + extend_seq_len]
+        if int(sliced.shape[1]) != extend_seq_len:
+            # Mirrors forward_batch_info.py:815-818 — fall back to delta-based
+            # synthesis when the cached mrope window doesn't cover this extend.
+            delta = mm_input.mrope_position_delta
+            if isinstance(delta, torch.Tensor):
+                delta_cpu = delta.detach().cpu().to(torch.int64).flatten()
+            else:
+                delta_cpu = torch.as_tensor(delta, dtype=torch.int64).flatten()
+            base = torch.arange(
+                extend_prefix_len,
+                extend_prefix_len + extend_seq_len,
+                dtype=torch.int64,
+            )
+            sliced = (base + (delta_cpu - 1)).unsqueeze(0).expand(3, -1).contiguous()
+        per_req.append(sliced.to(dtype=torch.int64))
+
+    out = torch.cat(per_req, dim=1).to(device=device, non_blocking=True)
+    return out
+
+
+def _compute_mrope_position_delta_per_req(
+    *,
+    model_worker_batch: ModelWorkerBatch,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Per-request mRoPE position delta, shape [bs] int64, on device.
+
+    ``mrope_position_delta = max(mrope_positions) + 1 - len(input_ids)``.
+    For a draft block whose first decode token is at linear position
+    ``seq_len``, the corresponding next mRoPE position is
+    ``seq_len + mrope_position_delta`` on every axis; subsequent tokens
+    advance by +1 per axis. For text-only requests (no mm input) the delta
+    is 0, which makes mRoPE collapse to linear positions on all axes.
+    Returns ``None`` when no request in the batch has an mm input.
+    """
+    mm_inputs = getattr(model_worker_batch, "multimodal_inputs", None)
+    if mm_inputs is None or all(mm is None for mm in mm_inputs):
+        return None
+    deltas: list[int] = []
+    for mm_input in mm_inputs:
+        if mm_input is None:
+            deltas.append(0)
+            continue
+        delta = getattr(mm_input, "mrope_position_delta", None)
+        if delta is None:
+            deltas.append(0)
+            continue
+        if isinstance(delta, torch.Tensor):
+            # mrope_position_delta is conventionally a scalar tensor or [1] tensor.
+            deltas.append(int(delta.detach().cpu().reshape(-1)[0].item()))
+        else:
+            deltas.append(int(delta))
+    return torch.tensor(deltas, dtype=torch.int64, device=device)
+
+
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
 
@@ -607,6 +730,35 @@ class DFlashWorker:
             )
             positions = positions_2d.reshape(-1)
 
+            # On a Qwen3.5-class draft (model_is_mrope), the rotary embedding is
+            # an MRotaryEmbedding constructed with mrope_section. We must always
+            # provide 2D positions so that cuda-graph capture and replay traverse
+            # the same MRotaryEmbedding.forward_native branch; otherwise the
+            # buffer copy at cuda_graph_runner.py:345-347 is skipped and replay
+            # reads stale or zero positions. For text-only requests (or
+            # text-only requests inside a mixed batch) the per-request delta is
+            # 0, which makes 2D mRoPE collapse to 1D linear positions on all
+            # three axes -- mathematically identical to the plain RoPE path.
+            block_mrope_positions: Optional[torch.Tensor] = None
+            draft_is_mrope = bool(
+                getattr(self.draft_model_runner, "model_is_mrope", False)
+            )
+            if draft_is_mrope:
+                if draft_input.mrope_position_delta is not None:
+                    delta = draft_input.mrope_position_delta
+                    if delta.device != self.device:
+                        delta = delta.to(self.device, non_blocking=True)
+                    if delta.dtype != torch.int64:
+                        delta = delta.to(torch.int64)
+                else:
+                    # No multimodal requests in the batch -> zero delta per req.
+                    delta = torch.zeros(bs, dtype=torch.int64, device=self.device)
+                block_linear_int64 = positions_2d.to(torch.int64)
+                shifted = block_linear_int64 + delta.unsqueeze(1)
+                block_mrope_positions = (
+                    shifted.reshape(-1).unsqueeze(0).expand(3, -1).contiguous()
+                )
+
             block_start = draft_prefix_lens
             block_end = self._draft_block_end_buf[:bs]
             torch.add(block_start, int(self.block_size), out=block_end)
@@ -660,6 +812,7 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
+                mrope_positions=block_mrope_positions,
                 req_to_token_pool=self.draft_model_runner.req_to_token_pool,
                 token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
                 attn_backend=self.draft_model_runner.attn_backend,
@@ -1009,6 +1162,29 @@ class DFlashWorker:
             )  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
+        # When the target ran with multimodal mRoPE, the prefix mrope_positions
+        # are already aligned 1:1 with ctx_hidden rows (see
+        # _compute_prefix_mrope_positions_for_extend), so we can pass them
+        # directly as the RoPE argument. The fused KV materialize Triton kernel
+        # (triton_ops/fused_kv_materialize.py) is scalar-position-only and not
+        # mRoPE-aware; route MM through the sequential path where MRotaryEmbedding
+        # handles 2D positions natively.
+        ctx_mrope_positions = draft_input.mrope_positions
+        if ctx_mrope_positions is not None:
+            if ctx_mrope_positions.device != device:
+                ctx_mrope_positions = ctx_mrope_positions.to(device, non_blocking=True)
+            if ctx_mrope_positions.dtype != torch.int64:
+                ctx_mrope_positions = ctx_mrope_positions.to(torch.int64)
+            if (
+                ctx_mrope_positions.ndim != 2
+                or int(ctx_mrope_positions.shape[0]) != 3
+                or int(ctx_mrope_positions.shape[1]) != int(total_ctx)
+            ):
+                raise RuntimeError(
+                    "DFLASH mrope_positions shape mismatch for prefix KV append: "
+                    f"got {tuple(ctx_mrope_positions.shape)}, expected (3, {int(total_ctx)})."
+                )
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(
                 draft_input.target_hidden
@@ -1019,7 +1195,11 @@ class DFlashWorker:
                 )
 
             wrote_with_fused_kv = False
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            if (
+                self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+                and ctx_mrope_positions is None
+            ):
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden, ctx_positions, ctx_cache_loc
@@ -1034,7 +1214,10 @@ class DFlashWorker:
                     self._fused_kv_helper = None
             if not wrote_with_fused_kv:
                 self._append_target_hidden_sequential(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
+                    ctx_hidden,
+                    ctx_positions,
+                    ctx_cache_loc,
+                    rope_positions=ctx_mrope_positions,
                 )
 
         if self.use_compact_draft_cache:
@@ -1070,12 +1253,22 @@ class DFlashWorker:
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        mrope_positions: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+
+        When ``mrope_positions`` (shape ``[3, num_tokens]``, int64) is provided,
+        it is used as the RoPE positions in place of the 1D ``positions`` —
+        ``positions`` is still required and is used for the (scalar-position)
+        fused fast-path scalar lookup and for any downstream code that wants
+        token-major position indices. With ``mrope_positions`` set the fused
+        path is bypassed in favor of the sequential per-layer ``apply_k_rope``
+        call, which routes through ``MRotaryEmbedding.forward_native`` and
+        applies the interleaved Qwen3.5 mRoPE layout.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1106,6 +1299,16 @@ class DFlashWorker:
                 "DFLASH positions length mismatch: "
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
+        if mrope_positions is not None:
+            if (
+                mrope_positions.ndim != 2
+                or int(mrope_positions.shape[0]) != 3
+                or int(mrope_positions.shape[1]) != num_tokens
+            ):
+                raise ValueError(
+                    "DFLASH mrope_positions must have shape (3, num_tokens), "
+                    f"got {tuple(mrope_positions.shape)} for num_tokens={num_tokens}."
+                )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
                 raise ValueError(
@@ -1144,6 +1347,14 @@ class DFlashWorker:
                 commit_lens = commit_lens.to(device, non_blocking=True)
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
+        if mrope_positions is not None:
+            if mrope_positions.device != device:
+                mrope_positions = mrope_positions.to(device, non_blocking=True)
+            if mrope_positions.dtype != torch.int64:
+                mrope_positions = mrope_positions.to(torch.int64)
+        # Use mRoPE positions for RoPE when present; the fused Triton kernel is
+        # scalar-position-only so it's bypassed for mRoPE batches.
+        rope_input = positions if mrope_positions is None else mrope_positions
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
@@ -1157,7 +1368,11 @@ class DFlashWorker:
                     )
                 if bs == 0:
                     return
-                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                if (
+                    self._use_fused_kv_materialize
+                    and self._fused_kv_helper is not None
+                    and mrope_positions is None
+                ):
                     try:
                         self._append_target_hidden_fused(
                             ctx_hidden=ctx_hidden,
@@ -1179,7 +1394,7 @@ class DFlashWorker:
                     attn = layer.self_attn
                     k, v = attn.kv_proj_only(ctx_hidden)
                     k = attn.apply_k_norm(k)
-                    k = attn.apply_k_rope(positions, k)
+                    k = attn.apply_k_rope(rope_input, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
@@ -1194,7 +1409,11 @@ class DFlashWorker:
                     )
                 return
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            if (
+                self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+                and mrope_positions is None
+            ):
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden=ctx_hidden,
@@ -1214,6 +1433,7 @@ class DFlashWorker:
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                rope_positions=mrope_positions,
             )
 
     def _append_target_hidden_sequential(
@@ -1221,12 +1441,20 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        *,
+        rope_positions: Optional[torch.Tensor] = None,
     ) -> None:
+        # ``ctx_cache_loc`` indexes the KV cache by token (1D, token-major).
+        # ``rope_positions`` controls the rotary geometry: when None, we use the
+        # 1D ``ctx_positions`` (plain RoPE / partial rotary); when 2D
+        # [3, sum(ctx_lens)], MRotaryEmbedding.forward_native applies the
+        # interleaved per-axis mRoPE layout the Qwen3.5 draft was trained with.
+        rope_input = ctx_positions if rope_positions is None else rope_positions
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
             k = attn.apply_k_norm(k)
-            k = attn.apply_k_rope(ctx_positions, k)
+            k = attn.apply_k_rope(rope_input, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
@@ -1382,6 +1610,18 @@ class DFlashWorker:
             extend_seq_lens = _to_int32_device_tensor(
                 model_worker_batch.extend_seq_lens
             )
+            prefix_mrope_positions = _compute_prefix_mrope_positions_for_extend(
+                model_worker_batch=model_worker_batch,
+                device=device,
+            )
+            mrope_position_delta = (
+                _compute_mrope_position_delta_per_req(
+                    model_worker_batch=model_worker_batch,
+                    device=device,
+                )
+                if prefix_mrope_positions is not None
+                else None
+            )
             draft_input = DFlashDraftInput(
                 bonus_tokens=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
@@ -1391,6 +1631,8 @@ class DFlashWorker:
                     if self.use_compact_draft_cache
                     else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
+                mrope_positions=prefix_mrope_positions,
+                mrope_position_delta=mrope_position_delta,
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input

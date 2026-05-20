@@ -119,6 +119,14 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        partial_rotary_factor = float(
+            (rope_params or {}).get(
+                "partial_rotary_factor",
+                getattr(config, "partial_rotary_factor", 1.0),
+            )
+        )
+        self.partial_rotary_factor = partial_rotary_factor
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -131,6 +139,7 @@ class DFlashAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            partial_rotary_factor=partial_rotary_factor,
             is_neox_style=rope_is_neox_style,
         )
 
@@ -355,6 +364,15 @@ class DFlashDraftModel(nn.Module):
             )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
+
+        mrope_positions = getattr(forward_batch, "mrope_positions", None)
+        if mrope_positions is not None and mrope_positions.numel() > 0:
+            if (
+                mrope_positions.ndim == 2
+                and int(mrope_positions.shape[0]) == 3
+                and int(mrope_positions.shape[1]) == int(positions.shape[-1])
+            ):
+                positions = mrope_positions
 
         for layer in self.layers:
             hidden_states, residual = layer(

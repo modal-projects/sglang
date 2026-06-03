@@ -366,13 +366,14 @@ class DFlashDraftModel(nn.Module):
         residual: Optional[torch.Tensor] = None
 
         mrope_positions = getattr(forward_batch, "mrope_positions", None)
-        if mrope_positions is not None and mrope_positions.numel() > 0:
-            if (
-                mrope_positions.ndim == 2
-                and int(mrope_positions.shape[0]) == 3
-                and int(mrope_positions.shape[1]) == int(positions.shape[-1])
-            ):
-                positions = mrope_positions
+        if (
+            mrope_positions is not None
+            and mrope_positions.numel() > 0
+            and mrope_positions.ndim == 2
+            and int(mrope_positions.shape[0]) == 3
+            and int(mrope_positions.shape[1]) == int(positions.shape[-1])
+        ):
+            positions = mrope_positions
 
         for layer in self.layers:
             hidden_states, residual = layer(

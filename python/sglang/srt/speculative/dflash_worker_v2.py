@@ -25,8 +25,8 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.dflash_worker import (
     DFlashWorker,
-    _compute_mrope_position_delta_per_req,
-    _compute_prefix_mrope_positions_for_extend,
+    _build_decode_block_mrope_positions,
+    _build_prefix_mrope_positions,
 )
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -205,13 +205,13 @@ class DFlashWorkerV2(DFlashWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_seq_lens)),
             )
-            # Compute 2D mRoPE positions for the prefix when the batch contains
-            # multimodal requests. The fused KV materialize kernel is scalar-
-            # position-only, so passing mrope_positions also disables the fused
-            # path inside _append_target_hidden_to_draft_kv_by_loc.
-            prefix_mrope_positions = _compute_prefix_mrope_positions_for_extend(
-                model_worker_batch=model_worker_batch,
-                device=device,
+            prefix_mrope_positions = (
+                _build_prefix_mrope_positions(
+                    model_worker_batch=model_worker_batch,
+                    device=device,
+                )
+                if self.draft_multimodal_enabled
+                else None
             )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
@@ -357,27 +357,27 @@ class DFlashWorkerV2(DFlashWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
-        # On a Qwen3.5-class draft (model_is_mrope), the rotary embedding is an
-        # MRotaryEmbedding. We must always provide 2D positions so that
-        # cuda-graph capture and replay traverse the same MRotaryEmbedding
-        # branch; otherwise the buffer copy at cuda_graph_runner.py:345-347 is
-        # skipped and replay reads stale data. For text-only requests the
-        # per-request delta is 0, which makes 2D mRoPE collapse to 1D linear
-        # positions on all three axes.
+        # When the draft is mRoPE-architected (rope_scaling has mrope_section),
+        # the captured CUDA-graph kernel for MRotaryEmbedding reads from
+        # buffers.mrope_positions; cuda_graph_runner.py:345-347 only refreshes
+        # that buffer when forward_batch.mrope_positions is not None. Always
+        # provide a 2D tensor on this path so capture and replay stay in sync.
+        # When the multimodal flag is off (text-trained draft), force delta=0
+        # so the 2D tensor collapses to linear positions on all three axes --
+        # mathematically identical to scalar RoPE.
         block_mrope_positions: Optional[torch.Tensor] = None
         draft_is_mrope = bool(
             getattr(self.draft_model_runner, "model_is_mrope", False)
         )
         if draft_is_mrope:
-            mrope_delta = _compute_mrope_position_delta_per_req(
-                model_worker_batch=model_worker_batch,
+            block_mrope_positions = _build_decode_block_mrope_positions(
+                positions_2d=positions_2d,
+                mm_inputs=(
+                    model_worker_batch.multimodal_inputs
+                    if self.draft_multimodal_enabled
+                    else None
+                ),
                 device=device,
-            )
-            if mrope_delta is None:
-                mrope_delta = torch.zeros(bs, dtype=torch.int64, device=device)
-            shifted = positions_2d.to(torch.int64) + mrope_delta.unsqueeze(1)
-            block_mrope_positions = (
-                shifted.reshape(-1).unsqueeze(0).expand(3, -1).contiguous()
             )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]

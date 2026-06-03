@@ -90,8 +90,6 @@ class DFlashDraftInput(SpecInput):
 
     mrope_positions: Optional[torch.Tensor] = None
 
-    mrope_position_delta: Optional[torch.Tensor] = None
-
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
@@ -107,8 +105,6 @@ class DFlashDraftInput(SpecInput):
         self.bonus_tokens = self.bonus_tokens[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
-        if self.mrope_position_delta is not None:
-            self.mrope_position_delta = self.mrope_position_delta[new_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
@@ -180,13 +176,6 @@ class DFlashDraftInput(SpecInput):
         elif other_mrope is not None and other_mrope.numel() > 0:
             self.mrope_positions = torch.cat([self_mrope, other_mrope], dim=1)
 
-        self_delta = self.mrope_position_delta
-        other_delta = spec_info.mrope_position_delta
-        if self_delta is None:
-            self.mrope_position_delta = other_delta
-        elif other_delta is not None:
-            self.mrope_position_delta = torch.cat([self_delta, other_delta], dim=0)
-
 
 @dataclass
 class DFlashVerifyInput(SpecInput):
@@ -210,9 +199,6 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
-
-    # Optional 2D mRoPE positions for Qwen-VL-style multimodal targets.
-    mrope_positions: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+import math
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,12 +36,141 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _DFlashRopeConfig:
+    rope_theta: float
+    rope_scaling: Optional[dict[str, Any]]
+    partial_rotary_factor: float
+    is_mrope_enabled: bool
+
+
+def _get_dflash_rope_config(config: Any, *, head_dim: int) -> _DFlashRopeConfig:
+    """Resolve and validate DFlash draft RoPE settings without mutating config."""
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is not None:
+        if not isinstance(rope_parameters, dict):
+            raise ValueError(
+                "DFLASH draft config rope_parameters must be a dict when set, "
+                f"got {type(rope_parameters).__name__}."
+            )
+        if "rope_theta" not in rope_parameters:
+            raise ValueError(
+                "DFLASH draft config rope_parameters must include rope_theta."
+            )
+        rope_theta = rope_parameters["rope_theta"]
+        rope_scaling = deepcopy(rope_parameters)
+    else:
+        rope_theta = getattr(config, "rope_theta", 10000)
+        raw_rope_scaling = getattr(config, "rope_scaling", None)
+        if raw_rope_scaling is not None and not isinstance(raw_rope_scaling, dict):
+            raise ValueError(
+                "DFLASH draft config rope_scaling must be a dict when set, "
+                f"got {type(raw_rope_scaling).__name__}."
+            )
+        rope_scaling = deepcopy(raw_rope_scaling)
+
+    if rope_scaling is None:
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        return _DFlashRopeConfig(
+            rope_theta=rope_theta,
+            rope_scaling=None,
+            partial_rotary_factor=float(partial_rotary_factor),
+            is_mrope_enabled=False,
+        )
+
+    rope_type = rope_scaling.get("rope_type", None)
+    legacy_rope_type = rope_scaling.get("type", None)
+    is_mrope_enabled = (
+        rope_scaling.get("mrope_section") is not None
+        or str(rope_type) == "mrope"
+        or str(legacy_rope_type) == "mrope"
+    )
+    partial_rotary_factor_value = rope_scaling.get(
+        "partial_rotary_factor", getattr(config, "partial_rotary_factor", None)
+    )
+
+    if not is_mrope_enabled:
+        partial_rotary_factor = (
+            1.0
+            if partial_rotary_factor_value is None
+            else float(partial_rotary_factor_value)
+        )
+        return _DFlashRopeConfig(
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            partial_rotary_factor=partial_rotary_factor,
+            is_mrope_enabled=False,
+        )
+
+    section_value = rope_scaling.get("mrope_section", None)
+    if not isinstance(section_value, (list, tuple)):
+        raise ValueError(
+            "DFLASH draft mRoPE requires mrope_section to be a list/tuple with "
+            "exactly three entries in T,H,W order, "
+            f"got {type(section_value).__name__}."
+        )
+    mrope_section = [int(section) for section in section_value]
+    if len(mrope_section) != 3:
+        raise ValueError(
+            "DFLASH draft mRoPE requires mrope_section to contain exactly three "
+            f"entries in T,H,W order, got {mrope_section}."
+        )
+
+    if partial_rotary_factor_value is None:
+        raise ValueError(
+            "DFLASH draft mRoPE requires partial_rotary_factor in the draft "
+            "RoPE config."
+        )
+    partial_rotary_factor = float(partial_rotary_factor_value)
+    if partial_rotary_factor <= 0:
+        raise ValueError(
+            "DFLASH draft mRoPE requires partial_rotary_factor > 0, "
+            f"got {partial_rotary_factor}."
+        )
+
+    rotary_dim_value = int(head_dim) * partial_rotary_factor
+    rotary_dim = int(rotary_dim_value)
+    if not math.isclose(rotary_dim_value, float(rotary_dim), rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            "DFLASH draft mRoPE rotary_dim must be an integer, "
+            f"got head_dim={head_dim}, partial_rotary_factor={partial_rotary_factor}, "
+            f"rotary_dim={rotary_dim_value}."
+        )
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError(
+            "DFLASH draft mRoPE requires an even positive rotary_dim, "
+            f"got head_dim={head_dim}, partial_rotary_factor={partial_rotary_factor}, "
+            f"rotary_dim={rotary_dim}."
+        )
+
+    expected_pairs = rotary_dim // 2
+    if sum(mrope_section) != expected_pairs:
+        raise ValueError(
+            "DFLASH draft mRoPE mrope_section must sum to rotary_dim // 2, "
+            f"got mrope_section={mrope_section}, sum={sum(mrope_section)}, "
+            f"head_dim={head_dim}, partial_rotary_factor={partial_rotary_factor}, "
+            f"rotary_dim={rotary_dim}."
+        )
+    if rope_scaling.get("mrope_interleaved") is not True:
+        raise ValueError("DFLASH draft mRoPE requires mrope_interleaved=true.")
+
+    rope_scaling["mrope_section"] = mrope_section
+    rope_scaling["rope_type"] = "default"
+    rope_scaling["type"] = "default"
+
+    return _DFlashRopeConfig(
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
+        partial_rotary_factor=partial_rotary_factor,
+        is_mrope_enabled=True,
+    )
 
 
 def _get_dflash_layer_attention_params(
@@ -122,7 +254,8 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_config = _get_dflash_rope_config(config, head_dim=head_dim)
+        self.is_mrope_enabled = rope_config.is_mrope_enabled
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -133,9 +266,10 @@ class DFlashAttention(nn.Module):
             head_dim,
             rotary_dim=head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            base=rope_config.rope_theta,
+            rope_scaling=rope_config.rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=rope_config.partial_rotary_factor,
         )
 
         self.scaling = head_dim**-0.5
@@ -320,7 +454,11 @@ class DFlashDraftModel(nn.Module):
 
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
+        total_num_heads = int(config.num_attention_heads)
+        head_dim = int(getattr(config, "head_dim", hidden_size // total_num_heads))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        rope_config = _get_dflash_rope_config(config, head_dim=head_dim)
+        self.is_mrope_enabled = rope_config.is_mrope_enabled
 
         self.layers = nn.ModuleList(
             [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
@@ -382,6 +520,13 @@ class DFlashDraftModel(nn.Module):
             )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+            if positions is None:
+                raise RuntimeError(
+                    "DFlashDraftModel mRoPE is enabled, but "
+                    "forward_batch.mrope_positions is missing."
+                )
 
         for layer in self.layers:
             hidden_states, residual = layer(

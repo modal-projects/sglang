@@ -5,15 +5,17 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 DFLASH_PREFILL_REFILL_TARGET_ENV = "SGLANG_DFLASH_PREFILL_REFILL_TARGET"
@@ -244,6 +246,147 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(logit_bias[:, None, :])
+
+
+def _normalize_dflash_mrope_inputs(
+    *,
+    positions: torch.Tensor,
+    lengths: Optional[torch.Tensor | Sequence[int]],
+    mask: Optional[torch.Tensor],
+    multimodal_inputs: Optional[Sequence[Any]],
+) -> list[torch.Tensor]:
+    if positions.dtype != torch.int64:
+        positions = positions.to(torch.int64)
+    if positions.ndim == 2:
+        if lengths is not None:
+            raise ValueError(
+                "DFLASH mRoPE positions cannot use both 2D rows and lengths."
+            )
+        if mask is not None:
+            if mask.shape != positions.shape:
+                raise ValueError(
+                    "DFLASH mRoPE mask/positions shape mismatch: "
+                    f"{tuple(mask.shape)} vs {tuple(positions.shape)}."
+                )
+            if mask.dtype != torch.bool:
+                mask = mask.to(torch.bool)
+        chunks = []
+        for batch_idx in range(int(positions.shape[0])):
+            row = positions[batch_idx]
+            chunks.append(row if mask is None else row[mask[batch_idx]])
+        return chunks
+
+    if positions.ndim != 1:
+        raise ValueError(
+            "DFLASH mRoPE positions must be 1D packed positions or 2D rows, "
+            f"got shape={tuple(positions.shape)}."
+        )
+    if mask is not None:
+        raise ValueError("DFLASH mRoPE mask is only supported with 2D positions.")
+
+    if lengths is None:
+        if multimodal_inputs is not None and len(multimodal_inputs) > 1:
+            raise ValueError(
+                "DFLASH mRoPE packed positions for multiple requests require lengths."
+            )
+        return [positions]
+
+    if isinstance(lengths, torch.Tensor):
+        lengths_list = [int(length) for length in lengths.to("cpu").tolist()]
+    else:
+        lengths_list = [int(length) for length in lengths]
+    if any(length < 0 for length in lengths_list):
+        raise ValueError(
+            f"DFLASH mRoPE lengths must be non-negative, got {lengths_list}."
+        )
+    if sum(lengths_list) != int(positions.numel()):
+        raise ValueError(
+            "DFLASH mRoPE packed positions/lengths mismatch: "
+            f"positions={int(positions.numel())}, lengths_sum={sum(lengths_list)}."
+        )
+    return list(torch.split(positions, lengths_list))
+
+
+def _dflash_mrope_delta(mm_input: Any, *, device: torch.device) -> torch.Tensor:
+    delta = getattr(mm_input, "mrope_position_delta", None)
+    if delta is None:
+        raise ValueError(
+            "DFLASH mRoPE needs mrope_position_delta for generated positions."
+        )
+    if not isinstance(delta, torch.Tensor):
+        delta = torch.as_tensor(delta, dtype=torch.int64)
+    if delta.numel() != 1:
+        raise ValueError(
+            "DFLASH mRoPE expects one mrope_position_delta per request, "
+            f"got shape={tuple(delta.shape)}."
+        )
+    return delta.reshape(-1)[0].to(device=device, dtype=torch.int64)
+
+
+def _build_dflash_mrope_positions_for_request(
+    scalar_positions: torch.Tensor,
+    mm_input: Any,
+) -> torch.Tensor:
+    scalar_positions = scalar_positions.to(torch.int64)
+    if scalar_positions.numel() == 0:
+        return scalar_positions.new_empty((3, 0))
+
+    mm_positions = (
+        None if mm_input is None else getattr(mm_input, "mrope_positions", None)
+    )
+    if mm_positions is None:
+        return scalar_positions.unsqueeze(0).repeat(3, 1)
+    if not isinstance(mm_positions, torch.Tensor):
+        mm_positions = torch.as_tensor(mm_positions, dtype=torch.int64)
+    if mm_positions.ndim != 2 or int(mm_positions.shape[0]) != 3:
+        raise ValueError(
+            "DFLASH mRoPE expects mm_input.mrope_positions with shape [3, prompt_len], "
+            f"got shape={tuple(mm_positions.shape)}."
+        )
+
+    device = scalar_positions.device
+    mm_positions = mm_positions.to(device=device, dtype=torch.int64, non_blocking=True)
+    prompt_len = int(mm_positions.shape[1])
+    delta = _dflash_mrope_delta(mm_input, device=device)
+    request_positions = (scalar_positions + delta).unsqueeze(0).repeat(3, 1)
+    if prompt_len == 0:
+        return request_positions
+
+    prompt_mask = (scalar_positions >= 0) & (scalar_positions < prompt_len)
+    prompt_indices = torch.clamp(scalar_positions, min=0, max=prompt_len - 1)
+    prompt_positions = mm_positions.index_select(1, prompt_indices)
+    return torch.where(prompt_mask.unsqueeze(0), prompt_positions, request_positions)
+
+
+def _build_dflash_mrope_positions(
+    positions: torch.Tensor,
+    *,
+    multimodal_inputs: Optional[Sequence[Any]],
+    lengths: Optional[torch.Tensor | Sequence[int]] = None,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build draft mRoPE positions shaped [3, N] from scalar absolute positions."""
+    chunks = _normalize_dflash_mrope_inputs(
+        positions=positions,
+        lengths=lengths,
+        mask=mask,
+        multimodal_inputs=multimodal_inputs,
+    )
+    if multimodal_inputs is None:
+        multimodal_inputs = [None] * len(chunks)
+    if len(multimodal_inputs) != len(chunks):
+        raise ValueError(
+            "DFLASH mRoPE multimodal input count mismatch: "
+            f"got {len(multimodal_inputs)} inputs for {len(chunks)} position chunks."
+        )
+    if not chunks:
+        return positions.new_empty((3, 0), dtype=torch.int64)
+
+    mrope_chunks = [
+        _build_dflash_mrope_positions_for_request(chunk, mm_input)
+        for chunk, mm_input in zip(chunks, multimodal_inputs)
+    ]
+    return torch.cat(mrope_chunks, dim=1).to(dtype=torch.int64)
 
 
 def _get_or_create_chain_verify_buffers(

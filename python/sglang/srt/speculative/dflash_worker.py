@@ -22,6 +22,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
+    _build_dflash_mrope_positions,
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -48,6 +49,10 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+def _should_use_dflash_fused_kv_materialize(draft_is_mrope: bool) -> bool:
+    return is_cuda() and not bool(draft_is_mrope)
 
 
 class DFlashWorker:
@@ -162,6 +167,9 @@ class DFlashWorker:
         # Keep the same alias that other spec-v2 workers expose.
         self.draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
+        self._draft_is_mrope = bool(
+            getattr(self.draft_model, "is_mrope_enabled", False)
+        )
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -237,10 +245,17 @@ class DFlashWorker:
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = _should_use_dflash_fused_kv_materialize(
+            self._draft_is_mrope
+        )
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        elif self._draft_is_mrope and self.tp_rank == 0:
+            logger.info(
+                "DFLASH fused KV materialization disabled: draft mRoPE requires "
+                "manual [3, N] RoPE positions."
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -608,6 +623,14 @@ class DFlashWorker:
                 out=positions_2d,
             )
             positions = positions_2d.reshape(-1)
+            mrope_positions = (
+                _build_dflash_mrope_positions(
+                    positions_2d,
+                    multimodal_inputs=batch.multimodal_inputs,
+                )
+                if self._draft_is_mrope
+                else None
+            )
 
             block_start = draft_prefix_lens
             block_end = self._draft_block_end_buf[:bs]
@@ -662,6 +685,7 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
+                mrope_positions=mrope_positions,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -981,6 +1005,14 @@ class DFlashWorker:
             cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]  # [1, ctx]
             ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)  # [ctx]
             ctx_positions = pos2d.reshape(-1)  # [ctx]
+            ctx_mrope_positions = (
+                _build_dflash_mrope_positions(
+                    pos2d,
+                    multimodal_inputs=batch.multimodal_inputs,
+                )
+                if self._draft_is_mrope
+                else None
+            )
         else:
             # In decode mode, ctx_lens <= block_size so we can skip the .item() sync.
             if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1007,6 +1039,15 @@ class DFlashWorker:
                 context="DFLASH target hidden KV append",
             )  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
+            ctx_mrope_positions = (
+                _build_dflash_mrope_positions(
+                    pos2d,
+                    multimodal_inputs=batch.multimodal_inputs,
+                    mask=mask,
+                )
+                if self._draft_is_mrope
+                else None
+            )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(
@@ -1033,7 +1074,10 @@ class DFlashWorker:
                     self._fused_kv_helper = None
             if not wrote_with_fused_kv:
                 self._append_target_hidden_sequential(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
+                    ctx_hidden,
+                    ctx_positions,
+                    ctx_cache_loc,
+                    mrope_positions=ctx_mrope_positions,
                 )
 
         if self.use_compact_draft_cache:
@@ -1067,6 +1111,7 @@ class DFlashWorker:
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
+        mrope_positions: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
@@ -1105,6 +1150,18 @@ class DFlashWorker:
                 "DFLASH positions length mismatch: "
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
+        if mrope_positions is not None:
+            if mrope_positions.ndim != 2 or int(mrope_positions.shape[0]) != 3:
+                raise ValueError(
+                    "DFLASH mrope_positions must have shape [3, N], "
+                    f"got shape={tuple(mrope_positions.shape)}."
+                )
+            if int(mrope_positions.shape[1]) != num_tokens:
+                raise ValueError(
+                    "DFLASH mrope_positions length mismatch: "
+                    f"mrope_positions={int(mrope_positions.shape[1])}, "
+                    f"target_hidden={num_tokens}."
+                )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
                 raise ValueError(
@@ -1133,6 +1190,11 @@ class DFlashWorker:
             cache_loc = cache_loc.to(torch.int64)
         if positions.dtype != torch.int64:
             positions = positions.to(torch.int64)
+        if mrope_positions is not None:
+            if mrope_positions.device != device:
+                mrope_positions = mrope_positions.to(device, non_blocking=True)
+            if mrope_positions.dtype != torch.int64:
+                mrope_positions = mrope_positions.to(torch.int64)
         if cache_loc_2d is not None:
             if cache_loc_2d.device != device:
                 cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
@@ -1146,6 +1208,9 @@ class DFlashWorker:
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            rope_positions = (
+                mrope_positions if mrope_positions is not None else positions
+            )
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
@@ -1156,7 +1221,11 @@ class DFlashWorker:
                     )
                 if bs == 0:
                     return
-                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                if (
+                    mrope_positions is None
+                    and self._use_fused_kv_materialize
+                    and self._fused_kv_helper is not None
+                ):
                     try:
                         self._append_target_hidden_fused(
                             ctx_hidden=ctx_hidden,
@@ -1178,7 +1247,7 @@ class DFlashWorker:
                     attn = layer.self_attn
                     k, v = attn.kv_proj_only(ctx_hidden)
                     k = attn.apply_k_norm(k)
-                    k = attn.apply_k_rope(positions, k)
+                    k = attn.apply_k_rope(rope_positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
@@ -1193,7 +1262,11 @@ class DFlashWorker:
                     )
                 return
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            if (
+                mrope_positions is None
+                and self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+            ):
                 try:
                     self._append_target_hidden_fused(
                         ctx_hidden=ctx_hidden,
@@ -1213,6 +1286,7 @@ class DFlashWorker:
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                mrope_positions=mrope_positions,
             )
 
     def _append_target_hidden_sequential(
@@ -1220,15 +1294,20 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        *,
+        mrope_positions: Optional[torch.Tensor] = None,
     ) -> None:
+        rope_positions = (
+            mrope_positions if mrope_positions is not None else ctx_positions
+        )
         for layer in self.draft_model.layers:
             attn = layer.self_attn
-            if _is_npu:
+            if _is_npu and mrope_positions is None:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, ctx_hidden)
             else:
                 k, v = attn.kv_proj_only(ctx_hidden)
                 k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(ctx_positions, k)
+                k = attn.apply_k_rope(rope_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(

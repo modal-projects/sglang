@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    _build_dflash_mrope_positions,
     apply_dflash_verify_logits_adjustments,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -249,10 +250,20 @@ class DFlashWorkerV2(DFlashWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_lens)),
             )
+            mrope_positions = (
+                _build_dflash_mrope_positions(
+                    positions,
+                    multimodal_inputs=model_worker_batch.multimodal_inputs,
+                    lengths=ctx_lens,
+                )
+                if self._draft_is_mrope
+                else None
+            )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=model_worker_batch.out_cache_loc,
                 positions=positions,
+                mrope_positions=mrope_positions,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -392,6 +403,14 @@ class DFlashWorkerV2(DFlashWorker):
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
+        mrope_positions = (
+            _build_dflash_mrope_positions(
+                positions_2d,
+                multimodal_inputs=model_worker_batch.multimodal_inputs,
+            )
+            if self._draft_is_mrope
+            else None
+        )
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -462,6 +481,7 @@ class DFlashWorkerV2(DFlashWorker):
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
+            mrope_positions=mrope_positions,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -651,6 +671,7 @@ class DFlashWorkerV2(DFlashWorker):
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
+            mrope_positions=mrope_positions,
             commit_lens=commit_lens,
         )
 

@@ -87,6 +87,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     mamba_track_seqlens: Optional[torch.Tensor]
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
+    input_deepstack_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
 
 
@@ -245,6 +246,21 @@ class PiecewiseCudaGraphRunner:
         # CUDA graph capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
+        # Deepstack models pass an extra input_deepstack_embeds tensor into the LM;
+        # pre-allocate a buffer (like input_embeds) so capture includes it and replay
+        # doesn't recompile. Size from deepstack_visual_indexes (the model's
+        # num_deepstack_embeddings can be 0 even when deepstack is active).
+        _model = self.model_runner.model
+        _deepstack_indexes = getattr(_model, "deepstack_visual_indexes", None) or []
+        self.num_deepstack_embeddings = (
+            len(_deepstack_indexes) if self.is_multimodal else 0
+        )
+        self.use_deepstack_buffer = (
+            self.is_multimodal
+            and self.num_deepstack_embeddings > 0
+            and bool(getattr(_model, "use_deepstack", None))
+        )
+
         # Graph inputs
         with torch.device(self.device):
             input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
@@ -287,6 +303,19 @@ class PiecewiseCudaGraphRunner:
                 input_embeds = None
                 mrope_positions = None
 
+            # Deepstack buffer: fixed address that model.forward copies into (like input_embeds).
+            if self.use_deepstack_buffer:
+                input_deepstack_embeds = torch.zeros(
+                    (
+                        self.max_num_tokens,
+                        self.model_runner.model_config.hidden_size
+                        * self.num_deepstack_embeddings,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+            else:
+                input_deepstack_embeds = None
+
         self.buffers = PrefillInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -295,6 +324,7 @@ class PiecewiseCudaGraphRunner:
             mamba_track_seqlens=mamba_track_seqlens,
             positions=positions,
             input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
             mrope_positions=mrope_positions,
         )
         self.buffers.share_buffers()
@@ -362,6 +392,11 @@ class PiecewiseCudaGraphRunner:
         buffers = self.buffers
         input_ids = buffers.input_ids[:num_tokens]
         input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:num_tokens]
+            if self.use_deepstack_buffer
+            else None
+        )
         positions = buffers.positions[:num_tokens]
         mrope_positions = (
             buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -388,6 +423,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -519,6 +555,11 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
         input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:num_tokens]
+            if self.use_deepstack_buffer
+            else None
+        )
 
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         mamba_track_indices = (
@@ -556,6 +597,7 @@ class PiecewiseCudaGraphRunner:
                 batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -663,6 +705,8 @@ class PiecewiseCudaGraphRunner:
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
                 buffers.input_embeds[num_tokens:static_num_tokens].zero_()
+            if self.use_deepstack_buffer:
+                buffers.input_deepstack_embeds[num_tokens:static_num_tokens].zero_()
             if forward_batch.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
@@ -714,6 +758,11 @@ class PiecewiseCudaGraphRunner:
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
         )
+        input_deepstack_embeds = (
+            buffers.input_deepstack_embeds[:static_num_tokens]
+            if self.use_deepstack_buffer
+            else None
+        )
 
         mrope_positions = (
             buffers.mrope_positions[:, :static_num_tokens]
@@ -740,6 +789,7 @@ class PiecewiseCudaGraphRunner:
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,

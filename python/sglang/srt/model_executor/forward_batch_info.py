@@ -315,6 +315,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    # For deepstack visual embeddings (piecewise CUDA graph buffer; mirrors input_embeds)
+    input_deepstack_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None

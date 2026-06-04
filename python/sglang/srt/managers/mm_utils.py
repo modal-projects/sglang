@@ -1396,9 +1396,20 @@ def general_mm_embed_routine(
                     )
                 emit_request_waypoint("waypoint.batch.mm_embed", waypoint_payload)
 
-            # add for qwen3_vl deepstack
-            if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+            # add for qwen3_vl deepstack. Skip empty tensors (e.g. Qwen3.5 with no
+            # deepstack indexes): passing the kwarg only for some batches changes the
+            # LM call signature between PCG capture and replay and forces a recompile.
+            input_deepstack_embeds = other_info.get("input_deepstack_embeds")
+            if (
+                use_deepstack
+                and input_deepstack_embeds is not None
+                and input_deepstack_embeds.numel() > 0
+            ):
+                # Use the pre-allocated buffer (cuda graph address stability), like input_embeds.
+                if forward_batch.input_deepstack_embeds is not None:
+                    forward_batch.input_deepstack_embeds.copy_(input_deepstack_embeds)
+                    input_deepstack_embeds = forward_batch.input_deepstack_embeds
+                kwargs["input_deepstack_embeds"] = input_deepstack_embeds
             # Offload GPU features to CPU instead of discarding them to balance memory
             # efficiency and data persistence.
             # In chunked-prefill, a request is processed across multiple batches, and
@@ -1431,6 +1442,13 @@ def general_mm_embed_routine(
             forward_batch.mm_input_embeds = input_embeds
         else:
             input_embeds = embed_tokens(input_ids)
+            # No multimodal data: when a piecewise-CUDA-graph deepstack buffer is
+            # present, feed it zeroed so the captured graph (which always applies
+            # the deepstack residual adds) stays a no-op here and keeps an
+            # invariant input signature.
+            if forward_batch.input_deepstack_embeds is not None:
+                forward_batch.input_deepstack_embeds.zero_()
+                kwargs["input_deepstack_embeds"] = forward_batch.input_deepstack_embeds
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
         if forward_batch.input_embeds is not None:
             forward_batch.input_embeds.copy_(input_embeds)

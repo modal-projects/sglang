@@ -378,6 +378,24 @@ class MoEGate(nn.Module):
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_DG_ENV_APPLIED = False
+
+
+def _apply_mega_moe_dg_env() -> None:
+    global _MEGA_MOE_DG_ENV_APPLIED
+    if _MEGA_MOE_DG_ENV_APPLIED:
+        return
+    if envs.SGLANG_ENABLE_MEGAMOE_KERNEL_TIMING.get():
+        os.environ.setdefault("SGLANG_ENABLE_MEGAMOE_KERNEL_TIMING", "1")
+        os.environ.setdefault(
+            "SGLANG_MEGAMOE_KERNEL_TIMING_PATH",
+            envs.SGLANG_MEGAMOE_KERNEL_TIMING_PATH.get(),
+        )
+        os.environ.setdefault(
+            "SGLANG_MEGAMOE_KERNEL_TIMING_FIELDS",
+            str(envs.SGLANG_MEGAMOE_KERNEL_TIMING_FIELDS.get()),
+        )
+    _MEGA_MOE_DG_ENV_APPLIED = True
 
 
 def _get_mega_moe_symm_buffer(
@@ -387,6 +405,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    enable_kernel_timing: bool = False,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -397,6 +416,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        enable_kernel_timing,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -409,6 +429,7 @@ def _get_mega_moe_symm_buffer(
             intermediate_hidden,
             use_fp8_dispatch=True,
             activation="swiglu",
+            enable_kernel_timing=enable_kernel_timing,
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -1163,6 +1184,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor],
         num_tokens: int,
     ) -> torch.Tensor:
+        _apply_mega_moe_dg_env()
         import deep_gemm
 
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
@@ -1201,6 +1223,7 @@ class DeepseekV2MoE(nn.Module):
         num_max_tokens_per_rank = (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
         )
+        enable_kernel_timing = envs.SGLANG_ENABLE_MEGAMOE_KERNEL_TIMING.get()
         assert num_tokens <= num_max_tokens_per_rank, (
             f"mega MoE: num_tokens={num_tokens} exceeds cap "
             f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
@@ -1215,6 +1238,7 @@ class DeepseekV2MoE(nn.Module):
             num_topk=top_k,
             hidden=hidden_size,
             intermediate_hidden=intermediate_size,
+            enable_kernel_timing=enable_kernel_timing,
         )
 
         padded_max = buf.topk_idx.shape[0]
@@ -1267,6 +1291,7 @@ class DeepseekV2MoE(nn.Module):
             activation="swiglu",
             activation_clamp=swiglu_limit,
             fast_math=True,
+            enable_kernel_timing=enable_kernel_timing,
         )
 
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:

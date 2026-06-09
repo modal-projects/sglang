@@ -59,19 +59,23 @@ logger = logging.getLogger(__name__)
 
 # Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
-_TOKENSPEED_MAX_Q_LEN = 8
+# Default covers EAGLE3 num_draft_tokens=4 plus headroom; spec configs with
+# more draft tokens (e.g. DFLASH block 16) raise it via the max_q_len arg.
+_TOKENSPEED_DEFAULT_MAX_Q_LEN = 8
 
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_q_len: int = _TOKENSPEED_DEFAULT_MAX_Q_LEN,
 ) -> torch.Tensor:
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
+        * max_q_len
         * (kv_lora_rank + 1)
         * 4
     )
@@ -116,8 +120,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            spec_q_len = model_runner.server_args.speculative_num_draft_tokens or 0
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                max_q_len=max(_TOKENSPEED_DEFAULT_MAX_Q_LEN, spec_q_len),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2

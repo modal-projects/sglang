@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -56,6 +57,12 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Debug instrumentation: per-step accept-length histogram for spec decoding
+# (token counts include the bonus token). Enable with SGLANG_SPEC_ACCEPT_HIST=1;
+# logs cumulative counts every 2000 spec decode-step samples.
+_SPEC_ACCEPT_HIST_ENABLED = os.environ.get("SGLANG_SPEC_ACCEPT_HIST", "0") == "1"
+_SPEC_ACCEPT_HIST_LOG_EVERY = 2000
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -663,6 +670,19 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                if _SPEC_ACCEPT_HIST_ENABLED:
+                    hist = getattr(self, "_spec_accept_hist", None)
+                    if hist is None:
+                        hist = self._spec_accept_hist = {}
+                        self._spec_accept_hist_ct = 0
+                    hist[new_accepted_len] = hist.get(new_accepted_len, 0) + 1
+                    self._spec_accept_hist_ct += 1
+                    if self._spec_accept_hist_ct % _SPEC_ACCEPT_HIST_LOG_EVERY == 0:
+                        logger.info(
+                            "SPEC_ACCEPT_HIST total=%d hist=%s",
+                            self._spec_accept_hist_ct,
+                            dict(sorted(hist.items())),
+                        )
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 

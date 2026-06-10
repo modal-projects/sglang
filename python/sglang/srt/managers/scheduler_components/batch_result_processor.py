@@ -60,9 +60,27 @@ logger = logging.getLogger(__name__)
 
 # Debug instrumentation: per-step accept-length histogram for spec decoding
 # (token counts include the bonus token). Enable with SGLANG_SPEC_ACCEPT_HIST=1;
-# logs cumulative counts every 2000 spec decode-step samples.
+# logs cumulative counts every 2000 spec decode-step samples. State is
+# module-level because SchedulerBatchResultProcessor is a frozen slots
+# dataclass (one scheduler process per TP rank, so module scope is per-rank).
 _SPEC_ACCEPT_HIST_ENABLED = os.environ.get("SGLANG_SPEC_ACCEPT_HIST", "0") == "1"
 _SPEC_ACCEPT_HIST_LOG_EVERY = 2000
+_spec_accept_hist: dict = {}
+_spec_accept_hist_ct = 0
+
+
+def _record_spec_accept_len(new_accepted_len: int) -> None:
+    global _spec_accept_hist_ct
+    _spec_accept_hist[new_accepted_len] = (
+        _spec_accept_hist.get(new_accepted_len, 0) + 1
+    )
+    _spec_accept_hist_ct += 1
+    if _spec_accept_hist_ct % _SPEC_ACCEPT_HIST_LOG_EVERY == 0:
+        logger.info(
+            "SPEC_ACCEPT_HIST total=%d hist=%s",
+            _spec_accept_hist_ct,
+            dict(sorted(_spec_accept_hist.items())),
+        )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -671,18 +689,7 @@ class SchedulerBatchResultProcessor:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
                 if _SPEC_ACCEPT_HIST_ENABLED:
-                    hist = getattr(self, "_spec_accept_hist", None)
-                    if hist is None:
-                        hist = self._spec_accept_hist = {}
-                        self._spec_accept_hist_ct = 0
-                    hist[new_accepted_len] = hist.get(new_accepted_len, 0) + 1
-                    self._spec_accept_hist_ct += 1
-                    if self._spec_accept_hist_ct % _SPEC_ACCEPT_HIST_LOG_EVERY == 0:
-                        logger.info(
-                            "SPEC_ACCEPT_HIST total=%d hist=%s",
-                            self._spec_accept_hist_ct,
-                            dict(sorted(hist.items())),
-                        )
+                    _record_spec_accept_len(new_accepted_len)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 

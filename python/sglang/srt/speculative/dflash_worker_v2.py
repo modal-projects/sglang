@@ -396,6 +396,25 @@ class DFlashWorkerV2(DFlashWorker):
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
+            if (
+                model_worker_batch.extend_lens is None
+                or model_worker_batch.prefix_lens is None
+            ):
+                raise RuntimeError(
+                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
+                    "but got None."
+                )
+            extend_lens = tuple(model_worker_batch.extend_lens)
+            prefix_lens = tuple(model_worker_batch.prefix_lens)
+
+            ctx_lens = torch.tensor(
+                extend_lens, dtype=torch.int32, device=self.device
+            )
+            draft_seq_lens = torch.tensor(
+                prefix_lens, dtype=torch.int32, device=self.device
+            )
+            num_extend_tokens = int(sum(extend_lens))
+
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
@@ -415,25 +434,28 @@ class DFlashWorkerV2(DFlashWorker):
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
-
             if (
                 model_worker_batch.extend_lens is None
                 or model_worker_batch.prefix_lens is None
+                or tuple(model_worker_batch.extend_lens) != extend_lens
+                or tuple(model_worker_batch.prefix_lens) != prefix_lens
             ):
                 raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
+                    "DFLASH prefill expected extend_lens / prefix_lens to remain "
+                    "stable across target prefill."
                 )
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(
-                model_worker_batch.extend_lens, dtype=torch.int32, device=device
-            )
-            draft_seq_lens = torch.tensor(
-                model_worker_batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            expected_device = torch.device(self.device)
+            if device.type != expected_device.type or (
+                expected_device.index is not None
+                and device.index != expected_device.index
+            ):
+                raise RuntimeError(
+                    f"DFLASH prefill expected target outputs on {self.device}, got {device}."
+                )
 
             if model_worker_batch.out_cache_loc is None:
                 raise RuntimeError(
@@ -443,7 +465,7 @@ class DFlashWorkerV2(DFlashWorker):
                 self.model_runner.server_args.attention_backend,
                 draft_seq_lens,
                 ctx_lens,
-                int(sum(model_worker_batch.extend_lens)),
+                num_extend_tokens,
             )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,

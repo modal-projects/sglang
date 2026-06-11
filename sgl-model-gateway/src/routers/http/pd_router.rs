@@ -604,14 +604,104 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Send both requests concurrently.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
+        // Streaming WITHOUT logprobs (the common path): do not put the prefill
+        // HTTP response on the decode streaming critical path. The decode worker
+        // gets KV through PD bootstrap/disaggregation, not through this response
+        // body, and a decode response means it has enough prefill state to begin.
+        // We still drain prefill in the background so the upstream connection is
+        // released and the prefill circuit breaker sees the real outcome.
+        if context.is_stream && !context.return_logprob {
+            let prefill_url = prefill.url().to_string();
+            let prefill_for_outcome = Arc::clone(&prefill);
+            tokio::spawn(async move {
+                match prefill_request.send().await {
+                    Ok(r) => {
+                        let s = r.status();
+                        let prefill_ok = s.is_success() || s.is_client_error();
+                        // Drain the body so the upstream connection is freed.
+                        let _ = r.bytes().await;
+                        prefill_for_outcome.record_outcome(prefill_ok);
+                        if !s.is_success() {
+                            error!(
+                                "Prefill returned {} while decode already streaming prefill_url={}",
+                                s, prefill_url
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        prefill_for_outcome.record_outcome(false);
+                        error!(
+                            "Prefill request failed while decode already streaming prefill_url={} error={}",
+                            prefill_url, e
+                        );
+                    }
+                }
+            });
+
+            let decode_result = decode_request.send().await;
+            events::RequestReceivedEvent {}.emit();
+
+            return match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
+
+                    if !status.is_success() {
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        let mut response = self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
+                        response.extensions_mut().insert(BreakerOutcomesRecorded);
+                        response
+                    } else {
+                        let response_headers =
+                            header_utils::preserve_response_headers(res.headers());
+                        let mut response = self.create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            None,
+                            false,
+                            Some(response_headers),
+                            prefill,
+                            decode,
+                        );
+                        response.extensions_mut().insert(BreakerOutcomesRecorded);
+                        response
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    decode.record_outcome(false);
+                    let mut response = error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    );
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    response
+                }
+            };
+        }
+
+        // Other paths need both responses before producing the client response:
+        // streaming logprobs require the prefill body for merging, and
+        // non-streaming responses have no token cadence to preserve.
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
 
@@ -666,42 +756,24 @@ impl PDRouter {
                     return response;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                // Process prefill response (logprob streaming + all non-streaming
+                // need the prefill status/body before responding).
+                let prefill_body = match self
+                    .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+                    .await
+                {
+                    Ok((_, body)) => body,
+                    Err(error_response) => return error_response,
                 };
 
                 if context.is_stream {
-                    // Streaming response
-                    let prefill_logprobs = if context.return_logprob {
-                        prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
-                    } else {
-                        None
-                    };
+                    // Streaming response (return_logprob path)
+                    let prefill_logprobs = prefill_body
+                        .as_ref()
+                        .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                        .and_then(|json| {
+                            json.pointer("/meta_info/input_token_logprobs").cloned()
+                        });
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 

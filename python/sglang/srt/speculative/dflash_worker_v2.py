@@ -408,10 +408,14 @@ class DFlashWorkerV2(DFlashWorker):
             prefix_lens = tuple(model_worker_batch.prefix_lens)
 
             ctx_lens = torch.tensor(
-                extend_lens, dtype=torch.int32, device=self.device
+                extend_lens,
+                dtype=torch.int32,
+                device=model_worker_batch.seq_lens.device,
             )
             draft_seq_lens = torch.tensor(
-                prefix_lens, dtype=torch.int32, device=self.device
+                prefix_lens,
+                dtype=torch.int32,
+                device=model_worker_batch.seq_lens.device,
             )
             num_extend_tokens = int(sum(extend_lens))
 

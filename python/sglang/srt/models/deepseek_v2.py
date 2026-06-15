@@ -2404,7 +2404,13 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
+        # Pack aux hidden states directly as [tokens, K * hidden] to avoid a
+        # second full-size torch.cat allocation in the logits processor.
+        aux_hidden_states = None
+        aux_hidden_state_idx = 0
+        aux_hidden_size = None
+        num_aux_hidden_states = len(self.layers_to_capture)
+        layers_to_capture = set(self.layers_to_capture)
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -2414,14 +2420,41 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if i in self.layers_to_capture:
+                if i in layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_attention_tp_group().all_gather(
                             hidden_states + residual, dim=0
                         )
-                        aux_hidden_states.append(aux_hidden_state)
+                        aux_hidden_size = int(aux_hidden_state.shape[-1])
+                        if aux_hidden_states is None:
+                            aux_hidden_states = aux_hidden_state.new_empty(
+                                (
+                                    *aux_hidden_state.shape[:-1],
+                                    aux_hidden_size * num_aux_hidden_states,
+                                )
+                            )
+                        start = aux_hidden_state_idx * aux_hidden_size
+                        aux_hidden_states[
+                            ..., start : start + aux_hidden_size
+                        ].copy_(aux_hidden_state)
                     else:
-                        aux_hidden_states.append(hidden_states + residual)
+                        aux_hidden_size = int(hidden_states.shape[-1])
+                        if aux_hidden_states is None:
+                            aux_hidden_states = hidden_states.new_empty(
+                                (
+                                    *hidden_states.shape[:-1],
+                                    aux_hidden_size * num_aux_hidden_states,
+                                )
+                            )
+                        start = aux_hidden_state_idx * aux_hidden_size
+                        aux_hidden_slot = aux_hidden_states[
+                            ..., start : start + aux_hidden_size
+                        ]
+                        if residual is None:
+                            aux_hidden_slot.copy_(hidden_states)
+                        else:
+                            torch.add(hidden_states, residual, out=aux_hidden_slot)
+                    aux_hidden_state_idx += 1
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2473,8 +2506,12 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        if len(aux_hidden_states) == 0:
+        if aux_hidden_states is None:
             return hidden_states
+        if aux_hidden_state_idx != num_aux_hidden_states:
+            aux_hidden_states = aux_hidden_states[
+                ..., : aux_hidden_state_idx * aux_hidden_size
+            ]
         return hidden_states, aux_hidden_states
 
 

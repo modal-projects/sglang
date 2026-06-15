@@ -604,104 +604,14 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently.
+        // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        // Streaming WITHOUT logprobs (the common path): do not put the prefill
-        // HTTP response on the decode streaming critical path. The decode worker
-        // gets KV through PD bootstrap/disaggregation, not through this response
-        // body, and a decode response means it has enough prefill state to begin.
-        // We still drain prefill in the background so the upstream connection is
-        // released and the prefill circuit breaker sees the real outcome.
-        if context.is_stream && !context.return_logprob {
-            let prefill_url = prefill.url().to_string();
-            let prefill_for_outcome = Arc::clone(&prefill);
-            tokio::spawn(async move {
-                match prefill_request.send().await {
-                    Ok(r) => {
-                        let s = r.status();
-                        let prefill_ok = s.is_success() || s.is_client_error();
-                        // Drain the body so the upstream connection is freed.
-                        let _ = r.bytes().await;
-                        prefill_for_outcome.record_outcome(prefill_ok);
-                        if !s.is_success() {
-                            error!(
-                                "Prefill returned {} while decode already streaming prefill_url={}",
-                                s, prefill_url
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        prefill_for_outcome.record_outcome(false);
-                        error!(
-                            "Prefill request failed while decode already streaming prefill_url={} error={}",
-                            prefill_url, e
-                        );
-                    }
-                }
-            });
-
-            let decode_result = decode_request.send().await;
-            events::RequestReceivedEvent {}.emit();
-
-            return match decode_result {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    debug!("Decode response status: {}", status);
-
-                    if !status.is_success() {
-                        error!(
-                            "Decode server returned error status decode_url={} status={}",
-                            decode.url(),
-                            status
-                        );
-
-                        let mut response = self
-                            .handle_decode_error_response(res, &context, prefill, decode)
-                            .await;
-                        response.extensions_mut().insert(BreakerOutcomesRecorded);
-                        response
-                    } else {
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-                        let mut response = self.create_streaming_response(
-                            res.bytes_stream(),
-                            status,
-                            None,
-                            false,
-                            Some(response_headers),
-                            prefill,
-                            decode,
-                        );
-                        response.extensions_mut().insert(BreakerOutcomesRecorded);
-                        response
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        decode_url = %decode.url(),
-                        error = %e,
-                        "Decode request failed"
-                    );
-                    decode.record_outcome(false);
-                    let mut response = error::bad_gateway(
-                        "decode_server_error",
-                        format!("Decode server error: {}", e),
-                    );
-                    response.extensions_mut().insert(BreakerOutcomesRecorded);
-                    response
-                }
-            };
-        }
-
-        // Other paths need both responses before producing the client response:
-        // streaming logprobs require the prefill body for merging, and
-        // non-streaming responses have no token cadence to preserve.
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
 
@@ -754,6 +664,50 @@ impl PDRouter {
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
+                }
+
+                // Streaming WITHOUT logprobs (the common path): start draining the
+                // decode SSE stream IMMEDIATELY rather than after reading the
+                // prefill response. Previously we `process_prefill_response().await`ed
+                // first, so nothing read the decode socket during that window — the
+                // worker's incrementally-yielded frames piled up in TCP buffers and
+                // the router then drained them in one burst, collapsing the client's
+                // observed inter-token timing (the decode_tps "window collapse").
+                // A decode 200 already implies prefill delivered the KV cache, so the
+                // prefill response (status check + body drain to free the connection)
+                // is handled concurrently and doesn't gate the stream. The logprob
+                // path below still needs the prefill body first, so it stays serial.
+                if context.is_stream && !context.return_logprob {
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+                    let prefill_url = prefill.url().to_string();
+                    tokio::spawn(async move {
+                        match prefill_result {
+                            Ok(r) => {
+                                let s = r.status();
+                                // Drain the body so the upstream connection is freed.
+                                let _ = r.bytes().await;
+                                if !s.is_success() {
+                                    error!(
+                                        "Prefill returned {} while decode already streaming prefill_url={}",
+                                        s, prefill_url
+                                    );
+                                }
+                            }
+                            Err(e) => error!(
+                                "Prefill request failed while decode already streaming prefill_url={} error={}",
+                                prefill_url, e
+                            ),
+                        }
+                    });
+                    return self.create_streaming_response(
+                        res.bytes_stream(),
+                        status,
+                        None,
+                        false,
+                        Some(response_headers),
+                        prefill,
+                        decode,
+                    );
                 }
 
                 // Process prefill response (logprob streaming + all non-streaming
@@ -1030,6 +984,16 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            // --- frame-cadence trace (gated by SGLANG_ROUTER_TRACE_FRAMES) ---
+            // Logs, per decode SSE frame, the wall-clock (ms since this stream's
+            // first frame) at which the router RECEIVED it from the decode worker
+            // via reqwest's bytes_stream. Compare against the worker's yield log
+            // (SGLANG_TRACE_STREAM_FRAMES) and the client arrival to localize the
+            // decode_tps "window collapse" buffer.
+            let trace_frames = std::env::var("SGLANG_ROUTER_TRACE_FRAMES").is_ok();
+            let trace_t0 = std::time::Instant::now();
+            let mut trace_idx: u64 = 0;
+            let mut trace_rid = String::new();
             loop {
                 tokio::select! {
                     biased;
@@ -1037,6 +1001,29 @@ impl PDRouter {
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                 let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+
+                                if trace_frames {
+                                    if trace_rid.is_empty() {
+                                        if let Some(p) = memmem::find(&chunk, b"\"id\":\"") {
+                                            let rest = &chunk[p + 6..];
+                                            if let Some(q) = memmem::find(rest, b"\"") {
+                                                trace_rid =
+                                                    String::from_utf8_lossy(&rest[..q]).into_owned();
+                                            }
+                                        }
+                                    }
+                                    // eprintln! (not tracing::info!) so it bypasses the
+                                    // router's EnvFilter, which only enables the "smg" target
+                                    // and would otherwise drop a custom tracing target.
+                                    eprintln!(
+                                        "ROUTERFRAME rid={} idx={} t_ms={:.3} len={}",
+                                        trace_rid,
+                                        trace_idx,
+                                        trace_t0.elapsed().as_secs_f64() * 1000.0,
+                                        chunk.len()
+                                    );
+                                    trace_idx += 1;
+                                }
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)

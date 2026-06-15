@@ -444,6 +444,8 @@ struct Router {
     tcp_keepalive_secs: u64,
     #[pyo3(get)]
     enable_wasm: bool,
+    #[pyo3(get)]
+    enable_engine_metrics_at_root: bool,
 }
 
 impl Router {
@@ -651,6 +653,7 @@ impl Router {
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
             .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .enable_wasm(self.enable_wasm)
+            .enable_engine_metrics_at_root(self.enable_engine_metrics_at_root)
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
@@ -757,6 +760,7 @@ impl Router {
         pool_max_idle_per_host = 500,
         tcp_keepalive_secs = 30,
         enable_wasm = false,
+        enable_engine_metrics_at_root = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -849,6 +853,7 @@ impl Router {
         pool_max_idle_per_host: usize,
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
+        enable_engine_metrics_at_root: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -955,6 +960,7 @@ impl Router {
             pool_max_idle_per_host,
             tcp_keepalive_secs,
             enable_wasm,
+            enable_engine_metrics_at_root,
         })
     }
 

@@ -11,13 +11,20 @@ pub struct MetricPack {
 type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
 type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 
+/// Engine metric name prefixes that use a colon separator (e.g.
+/// `sglang:gen_throughput`, `vllm:num_requests_running`). openmetrics_parser
+/// can't parse colons, so we strip them to underscores before parsing and
+/// restore just these prefixes afterwards — that's all the dashboards query.
+const COLON_PREFIXES: &[&str] = &["sglang", "vllm"];
+
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let mut expositions = vec![];
     for metric_pack in metric_packs {
         let metrics_text = &metric_pack.metrics_text;
-        // openmetrics_parser doesn't handle colons in metric names; replace with underscores
-        let metrics_text = metrics_text.replace(":", "_");
+        // openmetrics_parser doesn't handle colons in metric names; replace with
+        // underscores for parsing, then restore the engine prefix after rendering.
+        let metrics_text = metrics_text.replace(':', "_");
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
             Ok(x) => x,
@@ -36,7 +43,41 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     let text = try_reduce(expositions.into_iter(), merge_exposition)?
         .map(|x| format!("{x}"))
         .unwrap_or_default();
-    Ok(text)
+    Ok(restore_engine_colon_prefixes(&text))
+}
+
+/// Restore `engine:` colon prefixes that were stripped to `engine_` for parsing.
+/// Only rewrites the metric-name token (line start, and `# HELP`/`# TYPE` lines),
+/// never label values or help text, so a stray `sglang_` inside a label is safe.
+fn restore_engine_colon_prefixes(text: &str) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(&restore_line(line));
+        out.push('\n');
+    }
+    if !had_trailing_newline {
+        out.pop();
+    }
+    out
+}
+
+fn restore_line(line: &str) -> String {
+    for prefix in COLON_PREFIXES {
+        // Sample lines: `sglang_foo{...} 1` -> `sglang:foo{...} 1`
+        let name_prefix = format!("{prefix}_");
+        if let Some(rest) = line.strip_prefix(&name_prefix) {
+            return format!("{prefix}:{rest}");
+        }
+        // Metadata lines: `# HELP sglang_foo ...` / `# TYPE sglang_foo ...`
+        for meta in ["# HELP ", "# TYPE "] {
+            let meta_prefix = format!("{meta}{prefix}_");
+            if let Some(rest) = line.strip_prefix(&meta_prefix) {
+                return format!("{meta}{prefix}:{rest}");
+            }
+        }
+    }
+    line.to_string()
 }
 
 fn transform_metrics(

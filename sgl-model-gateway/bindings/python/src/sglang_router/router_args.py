@@ -176,6 +176,8 @@ class RouterArgs:
     tcp_keepalive_secs: int = 30
     # Enable WebAssembly support
     enable_wasm: bool = False
+    # Serve aggregated engine metrics at `/metrics` (in addition to `/engine_metrics`)
+    enable_engine_metrics_at_root: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -765,6 +767,16 @@ class RouterArgs:
             action="store_true",
             default=RouterArgs.enable_wasm,
             help="Enable WebAssembly support",
+        )
+        backend_group.add_argument(
+            f"--{prefix}enable-engine-metrics-at-root",
+            action="store_true",
+            default=RouterArgs.enable_engine_metrics_at_root,
+            help=(
+                "Serve aggregated engine metrics (fanned out across workers) at "
+                "/metrics in addition to /engine_metrics. Useful when an external "
+                "scraper only hits the conventional /metrics path."
+            ),
         )
 
         # Oracle configuration

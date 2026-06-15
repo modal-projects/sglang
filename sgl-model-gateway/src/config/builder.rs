@@ -378,6 +378,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn enable_engine_metrics_at_root(mut self, enable: bool) -> Self {
+        self.config.enable_engine_metrics_at_root = enable;
+        self
+    }
+
     pub fn model_path<S: Into<String>>(mut self, path: S) -> Self {
         self.config.model_path = Some(path.into());
         self

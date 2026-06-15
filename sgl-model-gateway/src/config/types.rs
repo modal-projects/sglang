@@ -99,6 +99,11 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// Serve aggregated engine metrics (fanned out across workers) at `/metrics`
+    /// on the main app port, in addition to `/engine_metrics`. Useful when an
+    /// external scraper only hits the conventional `/metrics` path.
+    #[serde(default)]
+    pub enable_engine_metrics_at_root: bool,
 }
 
 /// Tokenizer cache configuration
@@ -551,6 +556,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            enable_engine_metrics_at_root: false,
             server_cert: None,
             server_key: None,
         }

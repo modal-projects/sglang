@@ -1358,6 +1358,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        # --- frame-cadence trace (gated by SGLANG_TRACE_STREAM_FRAMES) -------
+        # Logs, per streamed frame, the wall-clock (ms since this request's
+        # first frame) at which engine output reached the HTTP layer. Compare
+        # against the router's per-frame receive log (SGLANG_ROUTER_TRACE_FRAMES)
+        # and the client's per-frame arrival to localize where the decode_tps
+        # "window collapse" buffer sits (engine vs worker-egress vs router vs edge).
+        _trace_frames = bool(os.environ.get("SGLANG_TRACE_STREAM_FRAMES"))
+        _frame_idx = 0
+        _frame_t0 = None
         while True:
             try:
                 await asyncio.wait_for(
@@ -1441,6 +1450,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
+                if _trace_frames:
+                    import time as _t
+
+                    _now = _t.perf_counter()
+                    if _frame_t0 is None:
+                        _frame_t0 = _now
+                    logger.info(
+                        "STREAMFRAME rid=%s idx=%d t_ms=%.3f",
+                        obj.rid,
+                        _frame_idx,
+                        (_now - _frame_t0) * 1000.0,
+                    )
+                    _frame_idx += 1
                 yield out
             else:
                 if (

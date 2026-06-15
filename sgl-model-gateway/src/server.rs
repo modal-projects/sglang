@@ -590,12 +590,22 @@ pub fn build_app(
             middleware::wasm_middleware,
         ));
 
-    let public_routes = Router::new()
+    let mut public_routes = Router::new()
         .route("/liveness", get(liveness))
         .route("/readiness", get(readiness))
         .route("/health", get(health))
         .route("/health_generate", get(health_generate))
-        .route("/engine_metrics", get(engine_metrics))
+        .route("/engine_metrics", get(engine_metrics));
+
+    // Optionally alias aggregated engine metrics onto the conventional `/metrics`
+    // path so external scrapers that only hit `/metrics` (e.g. Modal's flash
+    // metrics agent) get the fanned-out worker metrics. The router's own
+    // Prometheus exporter lives on a separate port, so this does not conflict.
+    if app_state.context.router_config.enable_engine_metrics_at_root {
+        public_routes = public_routes.route("/metrics", get(engine_metrics));
+    }
+
+    let public_routes = public_routes
         .route("/v1/models", get(v1_models))
         .route("/model_info", get(get_model_info))
         // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.

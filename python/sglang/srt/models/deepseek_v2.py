@@ -2675,10 +2675,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Minor fix for multi-modal model: input_ids is None
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        # Minor fix for multi-modal model: input_ids is None.
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        elif pp_proxy_tensors is not None:
+            # On non-first PP ranks both input_ids and input_embeds are None (the
+            # stage receives activations via pp_proxy_tensors), so fall back to the
+            # incoming hidden-state length. len_input_ids only feeds context-parallel
+            # split decisions, which are disabled when cp_size == 1.
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
+        else:
+            raise ValueError("input_ids, input_embeds, or pp_proxy_tensors must be provided")
+
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch

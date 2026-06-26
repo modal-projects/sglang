@@ -2391,7 +2391,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
+            # Draft input is none on non-last pipeline parallel ranks.
+            if draft_input is not None:
+                draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside

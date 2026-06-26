@@ -205,11 +205,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
+                        (max_num_token, hidden_size), dtype=dtype
                     )
             else:
                 pp_proxy_tensors = None

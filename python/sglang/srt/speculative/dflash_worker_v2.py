@@ -67,6 +67,8 @@ class DFlashWorkerV2(DFlashWorker):
             nccl_port=nccl_port,
             target_worker=target_worker,
         )
+        self.pp_group = target_worker.model_runner.pp_group
+        self.is_draft_rank = self.pp_group.is_last_rank
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
@@ -189,6 +191,7 @@ class DFlashWorkerV2(DFlashWorker):
         self,
         model_worker_batch: ScheduleBatch,
         on_publish=None,
+        **kwargs,
     ) -> GenerationBatchResult:
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
@@ -203,7 +206,8 @@ class DFlashWorkerV2(DFlashWorker):
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
+                model_worker_batch,
+                **kwargs,
             )
 
             logits_output, next_token_ids = (

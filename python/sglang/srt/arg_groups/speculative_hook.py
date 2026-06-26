@@ -125,11 +125,6 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Currently DFLASH speculative decoding does not support dp attention."
         )
 
-    if server_args.pp_size != 1:
-        raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
-        )
-
     if server_args.speculative_draft_model_path is None:
         raise ValueError(
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."

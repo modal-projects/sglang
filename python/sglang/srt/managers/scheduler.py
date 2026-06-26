@@ -767,7 +767,7 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or not self.tp_worker.pp_group.is_last_rank:
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -813,10 +813,7 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
-            self.model_worker = self.tp_worker
-        else:
-            self.model_worker = self.draft_worker
+        self.model_worker = self.draft_worker or self.tp_worker
 
         # Get token and memory info from the model worker
         (

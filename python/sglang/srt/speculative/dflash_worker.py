@@ -100,6 +100,7 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        draft_server_args.pp_size = 1
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:

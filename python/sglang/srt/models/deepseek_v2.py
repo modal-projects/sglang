@@ -2343,6 +2343,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
+        aux_hidden_states = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -2353,6 +2354,9 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            aux_hidden_states = pp_proxy_tensors.tensors.get(
+                "aux_hidden_states"
+            )
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -2406,11 +2410,12 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         # Pack aux hidden states directly as [tokens, K * hidden] to avoid a
         # second full-size torch.cat allocation in the logits processor.
-        aux_hidden_states = None
-        aux_hidden_state_idx = 0
-        aux_hidden_size = None
         num_aux_hidden_states = len(self.layers_to_capture)
         layers_to_capture = set(self.layers_to_capture)
+        aux_hidden_size = None
+        aux_hidden_state_idx = sum(
+            1 for layer_id in layers_to_capture if layer_id < self.start_layer
+        )
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -2482,12 +2487,13 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if aux_hidden_states is not None:
+                proxy_tensors["aux_hidden_states"] = aux_hidden_states
+            return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
@@ -2715,7 +2721,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and self.pp_group.is_last_rank:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -2773,9 +2779,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."

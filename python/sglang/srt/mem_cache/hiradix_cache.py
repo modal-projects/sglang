@@ -90,6 +90,22 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            # MLA KV is TP-rank-replicated. With SGLANG_HICACHE_TP_DEDUP=1, back the
+            # host pool with a single /dev/shm segment shared across the TP ranks so
+            # it is stored once instead of once per rank. Only the MLA branch is
+            # eligible -- MHA / DFlash-draft KV is sharded across ranks, not
+            # replicated, so deduping it would be incorrect.
+            _tp_dedup = os.environ.get("SGLANG_HICACHE_TP_DEDUP", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            _tp_rank = (
+                torch.distributed.get_rank(group=params.tp_cache_group)
+                if _tp_dedup and params.tp_cache_group is not None
+                else 0
+            )
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -97,6 +113,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                hicache_tp_dedup=_tp_dedup,
+                tp_rank=_tp_rank,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")

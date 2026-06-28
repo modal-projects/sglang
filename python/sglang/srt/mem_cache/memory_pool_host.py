@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap, alloc_mmap_shared
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -92,6 +92,42 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class SharedTPHostTensorAllocator(HostTensorAllocator):
+    """Allocate host buffers in NAMED shared memory shared across TP ranks.
+
+    For rank-replicated KV (MLA), every TP rank's host pool would otherwise hold
+    a byte-identical private copy (N rank == N copies of the same KV). This
+    allocator instead backs the buffer with a /dev/shm segment that all ranks in
+    the container map, so the KV is stored once. The creator rank (create=True,
+    i.e. attention-TP rank 0) creates + sizes each segment; the others attach it.
+
+    A per-allocator call counter makes the segment names deterministic across
+    ranks (init_kv_buffer issues the same allocate() calls in the same order on
+    every rank), so rank 1..N attach exactly what rank 0 created.
+
+    NOTE (Stage A): all ranks still *write* their (identical) KV into the shared
+    pages, so each rank's own write/ack still orders its own reads -- no
+    cross-rank read-after-write coordination is needed. This deduplicates host
+    DRAM only; deduplicating the redundant device->host writes is a later step.
+    """
+
+    def __init__(self, name_prefix: str, create: bool):
+        super().__init__()
+        self.name_prefix = name_prefix
+        self.create = create
+        self._n = 0
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"SharedTPHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        name = f"{self.name_prefix}.{self._n}"
+        self._n += 1
+        return alloc_mmap_shared(name, dims, dtype, create=self.create)
 
 
 class HiSparseHostPoolMixin:
@@ -237,13 +273,26 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        hicache_tp_dedup: bool = False,
+        tp_rank: int = 0,
+        dedup_name_prefix: str = "sglang_hicache_tp",
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        # TP dedup: back the host pool with a shared /dev/shm segment so all TP
+        # ranks map one copy of the (rank-replicated) KV instead of one each.
+        # Only valid for rank-replicated models (MLA) -- the caller gates on that.
+        self.hicache_tp_dedup = hicache_tp_dedup and allocator_type in (None, "", "default")
+        self.tp_rank = tp_rank
+        if self.hicache_tp_dedup:
+            self.allocator = SharedTPHostTensorAllocator(
+                name_prefix=dedup_name_prefix, create=(tp_rank == 0)
+            )
+        else:
+            self.allocator = get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -261,21 +310,27 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        # Verify there is enough available host memory. With TP dedup, only the
+        # creator rank (tp_rank 0) allocates the shared segment; the other ranks
+        # attach it (≈0 new host RAM), so they skip the check. This also makes the
+        # guard correct under dedup: it now reflects the single shared copy
+        # instead of N ranks each (wrongly) checking 1x against total available.
+        if not (self.hicache_tp_dedup and self.tp_rank != 0):
+            host_mem = psutil.virtual_memory()
+            requested_bytes = self.size * self.size_per_token
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+            else:
+                logger.info(
+                    f"Allocating {requested_bytes / 1e9:.2f} GB host memory for "
+                    f"hierarchical KV cache{' (TP-shared, 1 copy)' if self.hicache_tp_dedup else ''}."
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -909,6 +964,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        hicache_tp_dedup: bool = False,
+        tp_rank: int = 0,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -920,6 +977,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            hicache_tp_dedup=hicache_tp_dedup,
+            tp_rank=tp_rank,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize

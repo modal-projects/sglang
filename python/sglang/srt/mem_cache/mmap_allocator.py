@@ -4,6 +4,7 @@ import logging
 import math
 import mmap
 import os
+import time
 import weakref
 
 import torch
@@ -124,4 +125,67 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
         prot=mmap.PROT_READ | mmap.PROT_WRITE,
     )
+    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+
+
+def alloc_mmap_shared(
+    name: str,
+    dims: tuple,
+    dtype: torch.dtype,
+    create: bool,
+    attach_timeout_s: float = 180.0,
+) -> torch.Tensor:
+    """Allocate a host tensor over a NAMED POSIX shared-memory segment.
+
+    Used for TP-rank-replicated KV (MLA): all rank processes in a container map
+    the SAME physical pages instead of each holding an identical private copy.
+    The creator rank (create=True) creates + sizes the /dev/shm segment; the rest
+    attach the same name (retrying until it appears, since rank ordering is not
+    guaranteed). MAP_SHARED + MAP_POPULATE so cudaHostRegister later pins real,
+    pre-faulted physical pages (same requirement as the anonymous path above).
+
+    The tensor owns the mapping (torch.frombuffer keeps mm alive -> munmap on
+    free). The /dev/shm node persists until the creator unlinks it (see
+    HostKVCache.destroy). Hugepages are not used on this path.
+    """
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+    path = f"/dev/shm/{name}"
+
+    if create:
+        # Drop any stale segment left by a crashed run in this (reused) container.
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.ftruncate(fd, alloc_bytes)
+    else:
+        fd = None
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(path, os.O_RDWR)
+                if os.fstat(fd).st_size >= alloc_bytes:
+                    break
+                os.close(fd)
+                fd = None
+            except FileNotFoundError:
+                pass
+            if time.time() - start > attach_timeout_s:
+                raise TimeoutError(
+                    f"hicache shared segment {path} not ready (>= {alloc_bytes} B) "
+                    f"after {attach_timeout_s}s; did the creator rank fail?"
+                )
+            time.sleep(0.05)
+
+    try:
+        mm = mmap.mmap(
+            fd,
+            alloc_bytes,
+            flags=mmap.MAP_SHARED | _MAP_POPULATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+    finally:
+        os.close(fd)  # mapping persists after the fd is closed
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)

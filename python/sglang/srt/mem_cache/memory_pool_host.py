@@ -118,6 +118,13 @@ class SharedTPHostTensorAllocator(HostTensorAllocator):
         self.name_prefix = name_prefix
         self.create = create
         self._n = 0
+        # Only the creator rank cudaHostRegisters the shared pages. Registering
+        # the SAME physical pages from multiple processes is capped (~150 GB) by
+        # the driver, while a single registrant scales to ~all of RAM -- so a
+        # high-ratio (e.g. 600 GB) shared pool only fits if exactly one rank pins
+        # it. The pages stay physically pinned for every rank via that one
+        # registration; attach ranks rely on system UVA/ATS to address them.
+        self.host_register = create
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert (
@@ -224,7 +231,9 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True.
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
+    # For TP-shared dedup pools only the creator rank registers the pages (see
+    # SharedTPHostTensorAllocator.host_register); other ranks share that pinning.
+    if pin_memory and getattr(allocator, "host_register", True):
         cudart = torch.cuda.cudart()
         n_bytes = buffer.numel() * buffer.element_size()
         base = buffer.data_ptr()

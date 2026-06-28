@@ -227,14 +227,25 @@ def alloc_with_host_register(
     if pin_memory:
         cudart = torch.cuda.cudart()
         n_bytes = buffer.numel() * buffer.element_size()
-        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-        if int(rc) != 0:
-            raise RuntimeError(
-                f"cudaHostRegister failed (rc={int(rc)}, "
-                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-                f"size={n_bytes}; host buffer is not pinned and device transfers "
-                f"may silently return stale data."
-            )
+        base = buffer.data_ptr()
+        # cudaHostRegister rejects a single very large region with
+        # cudaErrorInvalidValue (observed failing at ~639 GB, OK at ~149 GB), so
+        # register in page-aligned chunks. The chunk size is a multiple of 2MB
+        # (and of the mmap page size), so chunk boundaries stay page-aligned and
+        # the whole buffer ends up pinned. Needed for large TP-shared dedup pools.
+        register_chunk = 64 * (1024**3)
+        off = 0
+        while off < n_bytes:
+            this = min(register_chunk, n_bytes - off)
+            rc = cudart.cudaHostRegister(base + off, this, 0)
+            if int(rc) != 0:
+                raise RuntimeError(
+                    f"cudaHostRegister failed (rc={int(rc)}, "
+                    f"{cudart.cudaGetErrorString(rc)}) for ptr={base + off:#x} "
+                    f"size={this} (offset {off} of {n_bytes}); host buffer is not "
+                    f"pinned and device transfers may silently return stale data."
+                )
+            off += this
     return buffer
 
 

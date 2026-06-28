@@ -1,0 +1,16 @@
+[server]
+model = "Qwen/Qwen3.5-9B"
+host = "0.0.0.0"
+port = 30000
+
+[server.args]
+
+[env]
+
+[bench]
+dataset_name = "random"
+num_prompts = 5
+request_rate = 1000
+random_input_len = 128
+random_output_len = 64
+warmup_requests = 1

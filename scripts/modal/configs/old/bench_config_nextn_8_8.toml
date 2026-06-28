@@ -1,0 +1,24 @@
+[server]
+model = "Qwen/Qwen3.5-9B"
+host = "0.0.0.0"
+port = 30000
+
+[server.args]
+speculative_algorithm = "NEXTN"
+speculative_num_steps = "8"
+speculative_eagle_topk = "1"
+mamba_scheduler_strategy = "extra_buffer"
+load_format = "dummy"
+speculative_draft_load_format = "dummy"
+
+[env]
+SGLANG_ENABLE_SPEC_V2 = "1"
+SGLANG_SIMULATE_ACC_LEN = "8"
+
+[bench]
+dataset_name = "random"
+num_prompts = 30
+request_rate = 0.5
+random_input_len = 4096
+random_output_len = 256
+warmup_requests = 10

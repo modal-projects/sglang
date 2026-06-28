@@ -16,11 +16,13 @@ import argparse
 import asyncio
 import copy
 import importlib.util
+import ipaddress as _ipaddress
 import json
 import math
 import os
 import random
 import shutil
+import socket as _socket
 import sys
 import time
 import traceback
@@ -47,8 +49,36 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import NetworkAddress
+
+FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+
+def _is_ipv6(host: str) -> bool:
+    try:
+        _ipaddress.IPv6Address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _wrap_host(host: str) -> str:
+    return f"[{host}]" if _is_ipv6(host) else host
+
+
+@dataclass(frozen=True)
+class NetworkAddress:
+    host: str
+    port: int
+
+    def __post_init__(self):
+        if self.host.startswith("[") and self.host.endswith("]"):
+            object.__setattr__(self, "host", self.host[1:-1])
+
+    def to_url(self, scheme: str = "http") -> str:
+        return f"{scheme}://{_wrap_host(self.host)}:{self.port}"
+
+    def to_host_port_str(self) -> str:
+        return f"{_wrap_host(self.host)}:{self.port}"
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 

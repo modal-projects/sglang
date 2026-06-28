@@ -1,0 +1,20 @@
+[server]
+model = "Qwen/Qwen3.5-122B-A10B"
+host = "0.0.0.0"
+port = 30000
+
+[server.args]
+load_format = "dummy"
+skip_server_warmup = true
+disable_cuda_graph = true
+tp = 8
+
+[env]
+
+[bench]
+dataset_name = "random"
+num_prompts = 5
+request_rate = 1
+random_input_len = 128
+random_output_len = 4
+warmup_requests = 0

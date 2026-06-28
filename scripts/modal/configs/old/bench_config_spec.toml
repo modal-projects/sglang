@@ -1,0 +1,24 @@
+[server]
+model = "Qwen/Qwen3.5-9B"
+host = "0.0.0.0"
+port = 30000
+
+[server.args]
+speculative_algorithm = "DFLASH"
+speculative_draft_model_path = "z-lab/Qwen3.5-9B-DFlash"
+speculative_num_draft_tokens = "8"
+speculative_dflash_block_size = "8"
+mamba_scheduler_strategy = "extra_buffer"
+trust_remote_code = true
+tp_size = "1"
+
+[env]
+SGLANG_ENABLE_SPEC_V2 = "1"
+SGLANG_ENABLE_DFLASH_SPEC_V2 = "1"
+SGLANG_ENABLE_OVERLAP_PLAN_STREAM = "1"
+SGLANG_SIMULATE_ACC_LEN = "8"
+
+[bench]
+dataset_name = "sharegpt"
+num_prompts = 5
+request_rate = 5.0

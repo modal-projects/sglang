@@ -358,7 +358,11 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
-    def on_verify_complete_cpu(self, num_accepted_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        # DFLASH is not adaptive; no controller to feed. Signature matches
+        # BaseSpecWorker (v0.5.13 added batch_size to the spec-v2 contract).
         pass
 
     def clear_cache_pool(self):

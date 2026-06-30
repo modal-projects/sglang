@@ -70,6 +70,21 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def get_cp_padding_align_size() -> int:
+    """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
+    for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
+    padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
+    #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
+    through this helper.
+    """
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+
+    attn_cp_size = get_attention_cp_size()
+    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
+        return attn_cp_size * 2
+    return attn_cp_size
+
+
 def is_mla_prefill_cp_enabled() -> bool:
     sa = get_global_server_args()
     return sa.enable_prefill_context_parallel and sa.use_mla_backend
@@ -400,10 +415,12 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     return output_tensor
 
 
-def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
+def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size, swa_loc=None):
     """
     Allgather KV cache from all CP ranks and write the full result
     into each rank's local memory pool.
+
+    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -421,14 +438,26 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    get_token_to_kv_pool().set_kv_buffer(
-        layer,
-        cache_loc,
-        key_cache_full,
-        value_cache_full,
-        layer.k_scale,
-        layer.v_scale,
-    )
+    pool = get_token_to_kv_pool()
+    if swa_loc is not None:
+        pool.set_kv_buffer(
+            layer,
+            cache_loc,
+            key_cache_full,
+            value_cache_full,
+            layer.k_scale,
+            layer.v_scale,
+            swa_loc=swa_loc,
+        )
+    else:
+        pool.set_kv_buffer(
+            layer,
+            cache_loc,
+            key_cache_full,
+            value_cache_full,
+            layer.k_scale,
+            layer.v_scale,
+        )
 
 
 def cp_attn_forward_extend(

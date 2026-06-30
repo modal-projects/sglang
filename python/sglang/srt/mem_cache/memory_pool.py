@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams

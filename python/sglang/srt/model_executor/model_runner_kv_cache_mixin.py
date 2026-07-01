@@ -1264,6 +1264,19 @@ class ModelRunnerKVCacheMixin:
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and getattr(self, "dcp_size", 1) > 1
+        ):
+            # DFLASH + DCP: the draft worker shares the target's WIDENED
+            # allocator (capacity max_total_num_tokens * dcp_size, LOGICAL
+            # locations), but unlike the target's MLA pool the draft's GQA KV
+            # is REPLICATED per rank — logical locations index the draft pool
+            # directly with no sharding, so the draft attention backend needs
+            # zero changes. Size the draft pool by the logical capacity.
+            # Memory cost is dcp_size x a few draft layers — acceptable.
+            self.max_total_num_tokens = config.max_total_num_tokens * self.dcp_size
         self.max_running_requests = config.max_running_requests
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens

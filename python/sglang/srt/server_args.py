@@ -2775,6 +2775,12 @@ class ServerArgs:
                 if (
                     self.speculative_algorithm == "DFLASH"
                     and self.attention_backend == "tokenspeed_mla"
+                    # decode/prefill overrides could otherwise route DCP
+                    # decode / target-verify to a backend with no DCP support
+                    # (runtime crash instead of a validation error here).
+                    and self.decode_attention_backend in (None, "tokenspeed_mla")
+                    and self.prefill_attention_backend
+                    in (None, "tokenspeed_mla")
                 ):
                     return
                 raise ValueError(

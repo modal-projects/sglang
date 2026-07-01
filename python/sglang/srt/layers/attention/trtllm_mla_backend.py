@@ -230,6 +230,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Decode context parallel (DCP) info; 1 / 0 when DCP is disabled.
         self.dcp_world_size = get_attention_dcp_world_size()
         self.dcp_rank = get_attention_dcp_rank()
+        if self.dcp_world_size > 1:
+            # create_flashmla_kv_indices_triton processes
+            # FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON (4096) tokens per CTA with
+            # NUM_PAGE_PER_BLOCK = 4096 // PAGED_SIZE (floor). A logical page
+            # size that does not divide 4096 silently drops trailing
+            # block-table entries -> the kernel reads garbage pages.
+            logical_page_size = self.page_size * self.dcp_world_size
+            if 4096 % logical_page_size != 0:
+                raise ValueError(
+                    f"DCP requires page_size * dcp_size to divide 4096, got "
+                    f"page_size={self.page_size} * dcp_size={self.dcp_world_size} "
+                    f"= {logical_page_size}."
+                )
+            # tokenspeed fold_sq (gathered heads < 128): q_len must divide
+            # evenly into q_chunk = min(q_len, 128 // H) work tiles. Fail at
+            # boot instead of inside CUDA-graph capture on the first verify.
+            if self.num_draft_tokens:
+                gathered_heads = self.num_q_heads * self.dcp_world_size
+                if gathered_heads < 128:
+                    q_chunk = min(self.num_draft_tokens, 128 // gathered_heads)
+                    if self.num_draft_tokens % q_chunk != 0:
+                        raise ValueError(
+                            f"DCP + speculative verify with gathered heads "
+                            f"{gathered_heads} (< 128) requires "
+                            f"speculative_num_draft_tokens divisible by "
+                            f"{q_chunk}, got {self.num_draft_tokens}."
+                        )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """

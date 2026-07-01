@@ -239,9 +239,13 @@ def _correct_attn_cp_out_kernel(
         + batch_idx * new_outputs_stride_B
         + d_offsets * new_outputs_stride_D
     )
-    # Apply correction and store
+    # Apply correction and store. A rank whose local KV shard is empty for
+    # this token contributes factor == 0, but its kernel output may be NaN
+    # (e.g. the tokenspeed non-split-KV epilogue computes 0 * inf for empty
+    # rows); NaN * 0 = NaN would poison the reduce-scatter sum, so force the
+    # zero-weight contribution to exactly 0 instead of trusting the output.
     output = tl.load(outputs_ptr + output_offsets)
-    output = output * factor
+    output = tl.where(factor == 0.0, 0.0, output * factor)
     tl.store(new_output_ptr + new_output_offsets, output)
 
 

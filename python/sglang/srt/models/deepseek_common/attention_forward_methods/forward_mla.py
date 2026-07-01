@@ -556,7 +556,16 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if dcp_enabled():
-            if forward_batch.forward_mode.is_decode():
+            # NOTE: is_target_verify must be checked before is_extend (it is a
+            # sub-mode of extend). Target verify follows the decode DCP path:
+            # gather q along heads; the backend attends the local KV shard and
+            # returns (out, lse) merged below via cp_lse_ag_out_rs_mla. The
+            # gather/merge are per-token, so bs * num_draft_tokens verify
+            # tokens flow through unchanged.
+            if (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
                 # if forward_batch.forward_mode is decode, gather q
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
@@ -709,7 +718,10 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif forward_batch.forward_mode.is_decode() and dcp_enabled():
+                elif (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ) and dcp_enabled():
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -783,7 +795,10 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ) and dcp_enabled():
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_attention_dcp_world_size(),

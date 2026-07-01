@@ -2766,12 +2766,25 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
+                # Exception: DFLASH is supported under DCP with the
+                # tokenspeed_mla attention backend (the only CUDA MLA decode
+                # kernel wired up to return the LSE needed for the cross-rank
+                # merge, plus the two-phase DCP target-verify path).
+                # NOTE: this validation runs before attention-backend
+                # auto-resolution, so tokenspeed_mla must be passed explicitly.
+                if (
+                    self.speculative_algorithm == "DFLASH"
+                    and self.attention_backend == "tokenspeed_mla"
+                ):
+                    return
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                    "only supports speculative decoding for DFLASH with an "
+                    "explicit --attention-backend tokenspeed_mla, but got "
+                    f"dcp_size={self.dcp_size} with "
+                    f"speculative_algorithm={self.speculative_algorithm} and "
+                    f"attention_backend={self.attention_backend}."
                 )
         else:
             raise ValueError(

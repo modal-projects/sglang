@@ -2748,6 +2748,17 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
 
+        if dcp_enabled():
+            # Under DCP `loc` is LOGICAL; only the set_mla_kv_buffer_triton
+            # path below applies the owner-rank filter + logical->physical
+            # translation. The DSA-fp8-with-scales path would write unfiltered
+            # logical locs into a physical-sized pool.
+            # (The HIP DSA branch is unreachable: dcp_enabled() is CUDA-only.)
+            assert not self.dsa_kv_cache_store_fp8, (
+                "DCP does not support dsa_kv_cache_store_fp8: the fp8-scale "
+                "KV write path bypasses the DCP rank filter."
+            )
+
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.

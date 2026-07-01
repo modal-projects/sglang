@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.cp.dcp import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -59,7 +60,9 @@ logger = logging.getLogger(__name__)
 
 # Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
+# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom, and DFlash
+# target-verify (num_draft_tokens=8). Note: q_len in (5..8) with return_lse
+# is only supported by the FP8-KV kernel (this backend is FP8-KV only).
 _TOKENSPEED_MAX_Q_LEN = 8
 
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
@@ -116,8 +119,29 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            if dcp_enabled():
+                # Under DCP the decode/verify kernel runs with q gathered
+                # along heads (num_q_heads * dcp_world_size), and it must
+                # return the LSE for the cross-rank merge. Fail fast if the
+                # installed tokenspeed_mla wheel predates LSE support.
+                import inspect
+
+                if (
+                    "return_lse"
+                    not in inspect.signature(
+                        tokenspeed_mla.tokenspeed_mla_decode
+                    ).parameters
+                ):
+                    raise RuntimeError(
+                        "DCP with the tokenspeed_mla backend requires a "
+                        "tokenspeed_mla wheel whose tokenspeed_mla_decode "
+                        "supports return_lse (branch jamesliu/decode-lse)."
+                    )
+            # Workspace must cover the gathered head count under DCP.
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank,
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -279,6 +303,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        return_lse: bool = False,
+        causal_mask: bool = True,
     ) -> torch.Tensor:
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
@@ -289,6 +315,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        # When return_lse=True (DCP), the kernel returns (output, lse) with
+        # lse [B, q_len, H] float32, BASE-2, softmax scale (incl. k_scale)
+        # folded, +inf sentinel for empty rows — consumable directly by
+        # cp_lse_ag_out_rs_mla / _correct_attn_cp_out_kernel.
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -300,7 +330,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            causal_mask=causal_mask,
             enable_pdl=is_arch_support_pdl(),
+            return_lse=return_lse,
         )
 
     def _run_prefill_kernel(

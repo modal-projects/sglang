@@ -132,6 +132,7 @@ def kimi_gate_triton(
     # without an extra launch.
     return biased_top8(
         gating_output.float(),
+        correction_bias,
         top_k=topk,
         routed_scaling_factor=(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0

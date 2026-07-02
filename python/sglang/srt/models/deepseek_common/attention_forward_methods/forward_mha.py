@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.fused_gemm_allreduce import maybe_fused_oproj_allreduce
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -312,7 +313,9 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output = maybe_fused_oproj_allreduce(self.o_proj, attn_output, forward_batch)
+        if output is None:
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward_normal_chunked_kv_prepare(
@@ -366,7 +369,9 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output = maybe_fused_oproj_allreduce(self.o_proj, attn_output, forward_batch)
+        if output is None:
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward_normal_one_shot_prepare(

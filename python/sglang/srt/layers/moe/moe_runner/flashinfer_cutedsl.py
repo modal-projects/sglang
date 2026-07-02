@@ -289,6 +289,14 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
 
+    # Eagerly set up the fused fc2+finalize+all-reduce path (env-gated,
+    # SGLANG_CUTEDSL_FUSED_AR=1): collective symmetric-memory init + kernel
+    # compile + warmup launch happen here, during the first (dummy-run)
+    # forward, so failures surface at startup rather than mid-serving.
+    from sglang.srt.layers.moe.cutedsl_moe_ar import maybe_init_fused_ar
+
+    maybe_init_fused_ar(layer)
+
 
 # ---------------------------------------------------------------------------
 # Dataclass + fused function for moe_runner dispatch
@@ -348,6 +356,11 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
+    from sglang.srt.layers.moe.cutedsl_moe_ar import (
+        moe_ar_take_stash,
+        pinned_moe_tactic,
+        run_fused_ar,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -371,6 +384,23 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         is_sf_swizzled_layout=False,
     )
 
+    num_tokens = topk_ids.shape[0]
+    # Fused fc2+finalize+all-reduce path (SGLANG_CUTEDSL_FUSED_AR=1): only
+    # taken when the model stashed a seed for this exact call (the stash is
+    # the rank-symmetric engagement handshake; see cutedsl_moe_ar).
+    stash = moe_ar_take_stash(num_tokens)
+    if stash is not None:
+        (seed,) = stash
+        output = run_fused_ar(
+            quant_info=quant_info,
+            x_fp4=x_fp4,
+            x_sf=x_sf,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            seed=seed,
+        )
+        return StandardCombineInput(hidden_states=output)
+
     output = quant_info.wrapper.run(
         x=x_fp4,
         x_sf=x_sf,
@@ -383,6 +413,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        tactic=pinned_moe_tactic(num_tokens),
     )
 
     return StandardCombineInput(hidden_states=output)

@@ -951,7 +951,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # dcp_world_size, via attn_mqa_for_dcp_decode); attention runs over
             # this rank's KV shard only (rank-invariant block tables +
             # rank-local lens) and returns (out, lse) for the cross-rank merge
-            # in cp_lse_ag_out_rs_mla. The LSE is base-2 with the softmax scale
+            # in cp_lse_ag_out_mla. The LSE is base-2 with the softmax scale
             # folded — exactly what _correct_attn_cp_out_kernel consumes.
             raw_out, lse = self._run_decode_kernel(
                 query=query,
@@ -1010,7 +1010,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         Phase (c): merge (a) + (b) locally per token in base-2 (max-subtracted
         log2-sum-exp2). The cross-rank merge is then done by the regular
-        cp_lse_ag_out_rs_mla call in forward_mla.py — this method just returns
+        cp_lse_ag_out_mla call in forward_mla.py — this method just returns
         one normal partial (out, lse).
 
         Phases (b)+(c) run as ONE fused Triton kernel per layer

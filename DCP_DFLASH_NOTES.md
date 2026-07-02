@@ -148,6 +148,41 @@ runtime — the backend fails fast at init if the installed wheel lacks
   widened allocator (`alloc_paged_token_slots_extend` uses the allocator's
   own widened page size). Consistent — no change needed.
 
+### 3b. Cross-rank LSE merge: all-reduce variant (`SGLANG_DCP_MERGE_AR`)
+- Motivation: per layer per decode/verify step the rs merge issues 3 exposed
+  ops — fp32 LSE all-gather, Triton `correct_attn_out`, fp32
+  `reduce_scatter_along_dim` — where the reduce-scatter/all-gather run as
+  NCCL ring-LL kernels (~15–30us each; ~5.6 % GPU time on B200 dcp=4,
+  61 layers), while the TP allreduce enjoys the custom one-shot push kernel.
+- New path `cp_lse_ag_out_ar_mla` (`layers/cp/dcp/comm.py`), default via
+  `SGLANG_DCP_MERGE_AR=1` (dispatcher `cp_lse_ag_out_mla`, the single
+  `forward_mla.py` call site; `=0` restores the rs path for A/B):
+  1. fp32 LSE all-gather unchanged (`_ag_lse`, ~12 KB).
+  2. The SAME stride-driven Triton kernel (`_correct_attn_cp_out_kernel` via
+     `correct_attn_out(..., new_output_layout="BHD")`) writes
+     `out * factor` directly in **bf16** and in the input `[B,H,D]` layout
+     (no `[H,B,D]` permutation — allreduce needs none; Triton stores
+     implicitly cast fp32→bf16). Sentinel handling (NaN/+inf LSE → -inf,
+     factor==0 → exact 0) is identical.
+  3. One `cp_group.all_reduce(out_scaled)`. The DCP group is built by
+     `init_model_parallel_group` with the default
+     `use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE`, so it already has a
+     `ca_comm` (CustomAllReduceV2 on CUDA) and the module-level
+     `graph_capture` already enters `_DCP.graph_capture` — the allreduce
+     dispatches to the custom one-shot/two-shot kernel when
+     `inp_size <= max_size` (v2 at ws=4 on B200: 16 MB pull max, 2 MB
+     one-shot-push threshold; decode 48×64×512×2 = 3 MB fits, verify bs·8
+     tokens up to ~16 MB; larger sizes fall back to NCCL automatically).
+  4. Slice this rank's head range and return `[local_H, B, D]` contiguous in
+     the input dtype — same contract as the rs path; model code unchanged.
+- Numerics: the cross-rank sum is bf16 (vs fp32 reduce-scatter). Correction
+  factors are ≤ 1 and the o_proj consumer is bf16 — acceptable; the env flag
+  is read per call so it stays runtime-selectable for A/B parity checks.
+- Unit test: `test/registered/dcp/test_dcp_merge_ar_unit.py` — (a) 1-GPU
+  Triton BHD/bf16 kernel vs torch reference incl. sentinel cases; (b) 4-GPU
+  torchrun ar-vs-rs parity to bf16 tolerance (decode- and verify-shaped
+  inputs, empty-shard rank included).
+
 ### 4. Idle / edge paths
 - IDLE: model-side gather/merge conditions exclude idle (mirrors the
   flashinfer DCP path); backend metadata build treats idle like decode
@@ -201,6 +236,14 @@ runtime — the backend fails fast at init if the installed wheel lacks
    Same for the flashinfer DCP path — not introduced here, not fixed here.
 8. **Draft pool memory** = dcp_size × draft KV. Fine for a few-layer GQA
    draft, but check `mem-fraction-static` headroom on 4×B200 with dcp=4.
+9. **bf16 all-reduce merge (`SGLANG_DCP_MERGE_AR`, default on).** The
+   cross-rank sum now rounds each rank's corrected partial to bf16 before
+   summing (rs summed in fp32). Expected harmless (factors ≤ 1, bf16
+   consumer), but confirm accept-length/GSM8K parity with
+   `SGLANG_DCP_MERGE_AR=0`. Also verify with a profiler that the dcp-group
+   allreduce actually hits the CustomAllReduceV2 kernel (not NCCL fallback)
+   at production batch sizes, and that verify-mode message sizes
+   (bs·8·H·D·2 B) stay under the 16 MB v2 max where the win matters.
 
 ## GPU validation checklist
 
@@ -219,3 +262,7 @@ runtime — the backend fails fast at init if the installed wheel lacks
 - [ ] Radix-cache prefix hits under DCP + DFlash (draft pool replication
       interacts with prefix reuse through the shared logical allocator).
 - [ ] Memory: confirm draft pool widening doesn't tip mem-fraction-static.
+- [ ] Merge A/B: `SGLANG_DCP_MERGE_AR=1` vs `=0` — temp=0 output parity,
+      accept length, and per-layer merge latency in a trace (expect the two
+      ring-LL NCCL kernels replaced by one custom-AR kernel).
+- [ ] `test/registered/dcp/test_dcp_merge_ar_unit.py` on a 4-GPU node.

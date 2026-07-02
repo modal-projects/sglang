@@ -18,7 +18,7 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
-    cp_lse_ag_out_rs_mla,
+    cp_lse_ag_out_mla,
     dcp_enabled,
     get_attention_dcp_world_size,
 )
@@ -559,7 +559,7 @@ class DeepseekMLAForwardMixin:
             # NOTE: is_target_verify must be checked before is_extend (it is a
             # sub-mode of extend). Target verify follows the decode DCP path:
             # gather q along heads; the backend attends the local KV shard and
-            # returns (out, lse) merged below via cp_lse_ag_out_rs_mla. The
+            # returns (out, lse) merged below via cp_lse_ag_out_mla. The
             # gather/merge are per-token, so bs * num_draft_tokens verify
             # tokens flow through unchanged.
             if (
@@ -804,7 +804,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+            attn_output = cp_lse_ag_out_mla(attn_output, lse, get_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

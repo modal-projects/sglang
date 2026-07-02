@@ -269,6 +269,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
+    new_output_layout: str = "HBD",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -277,6 +278,13 @@ def correct_attn_out(
         lses: Tensor of shape [ N, B, H ]
         cp_rank: Current rank in the context-parallel group
         ctx: Triton context to avoid recompilation
+        new_output: Pre-allocated output buffer. May have any dtype (the
+            Triton store implicitly casts the fp32 corrected value to the
+            buffer's element type, e.g. bf16 for the all-reduce merge path).
+        new_output_layout: "HBD" (reduce-scatter path, [H, B, D] permutation)
+            or "BHD" (all-reduce path, same [B, H, D] layout as ``out``). The
+            kernel is stride-driven, so this only remaps the strides passed
+            to it — a new layout never needs a new kernel.
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
@@ -306,7 +314,14 @@ def correct_attn_out(
     # have the same B/H stride layout as a slice of `lses`.
     o_sB, o_sH, o_sD = out.stride()
     l_sN, l_sB, l_sH = lses.stride()
-    no_sH, no_sB, no_sD = new_output.stride()
+    if new_output_layout == "HBD":
+        assert new_output.shape == (H, B, D), (new_output.shape, (H, B, D))
+        no_sH, no_sB, no_sD = new_output.stride()
+    elif new_output_layout == "BHD":
+        assert new_output.shape == (B, H, D), (new_output.shape, (B, H, D))
+        no_sB, no_sH, no_sD = new_output.stride()
+    else:
+        raise ValueError(f"unsupported new_output_layout: {new_output_layout!r}")
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
     lse = torch.empty_strided(

@@ -604,6 +604,13 @@ class Envs:
     # kernel (default) vs the unfused torch reference (set to 0/false for A/B
     # debugging).
     SGLANG_DCP_VERIFY_FUSED = EnvBool(True)
+    # DCP decode/verify cross-rank LSE merge collective. True (default): one
+    # bf16 all-reduce of the Triton-corrected output (dispatches to the custom
+    # one-shot allreduce when available) + local head slice. False: the fp32
+    # NCCL reduce-scatter path. The AR path sums bf16 across ranks instead of
+    # fp32 -- factors are <= 1 and the o_proj consumer is bf16, so this is
+    # acceptable; keep the flag for runtime A/B parity checks.
+    SGLANG_DCP_MERGE_AR = EnvBool(True)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

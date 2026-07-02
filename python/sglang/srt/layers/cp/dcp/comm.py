@@ -14,10 +14,13 @@
 
 """Group accessors, LSE-merge and all-gather collectives for decode CP (DCP).
 
-The two LSE-merge variants kept separate (bodies are backend-forced, see
+The LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
-  - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
+  - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / fp32 reduce-scatter
+  - cp_lse_ag_out_ar_mla: Triton (log2/exp2) correction / bf16 all-reduce +
+    head slice (latency-optimized; picked by SGLANG_DCP_MERGE_AR via
+    cp_lse_ag_out_mla)
 """
 
 from typing import Optional
@@ -34,6 +37,7 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_rank,
     get_dcp_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.utils import is_cuda
 
@@ -130,6 +134,81 @@ def cp_lse_ag_out_rs_mla(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out.to(cp_attn_out.dtype)
+
+
+def cp_lse_ag_out_ar_mla(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: Optional[CPTritonContext] = None,
+):
+    """Merge DCP partial attention outputs via Triton correction + all-reduce.
+
+    Latency-optimized alternative to :func:`cp_lse_ag_out_rs_mla`: the
+    corrected output is written in **bf16 (input dtype)** and in the same
+    [B, H, D] layout as the input (no [H, B, D] permutation), then summed
+    with a single ``cp_group.all_reduce`` — which dispatches to the custom
+    one-shot allreduce kernel when available (message size permitting) —
+    instead of the fp32 NCCL ring reduce-scatter. Each rank then slices its
+    own head range.
+
+    Numerics: the cross-rank sum happens in the input dtype (bf16) rather
+    than fp32. The correction factors are <= 1 and the consumer (o_proj
+    input) is bf16, so the extra rounding is acceptable; set
+    SGLANG_DCP_MERGE_AR=0 to A/B against the fp32 reduce-scatter path.
+
+    cp_attn_out: [ B, H, D ]  (B = tokens: decode q_len=1 or verify bs*draft)
+    cp_attn_lse: [ B, H ]
+
+    Returns [ local_H, B, D ] contiguous in the input dtype — the same
+    contract as the reduce-scatter path.
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    if ctx is None:
+        ctx = CPTritonContext()
+
+    with use_symmetric_memory(cp_group):
+        out_scaled = cp_attn_out.new_empty(cp_attn_out.shape)
+        cp_attn_lse = cp_attn_lse.to(torch.float32)
+    lses = _ag_lse(cp_attn_lse, cp_group)
+    # Same single Triton kernel as the rs path (stride-driven): global LSE
+    # with sentinel handling + factor==0 guard, out_scaled = out * factor,
+    # stored directly in bf16 / [B, H, D].
+    correct_attn_out(
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx,
+        out_scaled,
+        new_output_layout="BHD",
+    )
+    out = cp_group.all_reduce(out_scaled)
+    num_local_heads = out.shape[1] // cp_group.world_size
+    head_start = cp_group.rank_in_group * num_local_heads
+    out = out[:, head_start : head_start + num_local_heads, :]
+    # Match the reduce-scatter path's [local_H, B, D] contiguous contract.
+    return out.transpose(0, 1).contiguous()
+
+
+def cp_lse_ag_out_mla(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: Optional[CPTritonContext] = None,
+):
+    """DCP MLA decode/verify LSE merge — single entry point for model code.
+
+    Picks the cross-rank collective by SGLANG_DCP_MERGE_AR (read per call so
+    it stays runtime-selectable for A/B parity checks):
+      - True (default): bf16 all-reduce + head slice (cp_lse_ag_out_ar_mla)
+      - False: fp32 reduce-scatter (cp_lse_ag_out_rs_mla)
+    Both return [ local_H, B, D ] contiguous in the input dtype.
+    """
+    if envs.SGLANG_DCP_MERGE_AR.get():
+        return cp_lse_ag_out_ar_mla(cp_attn_out, cp_attn_lse, cp_group, ctx)
+    return cp_lse_ag_out_rs_mla(cp_attn_out, cp_attn_lse, cp_group, ctx)
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):

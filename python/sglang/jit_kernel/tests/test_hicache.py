@@ -30,6 +30,9 @@ NUM_LAYERS = 2
 POOL_SIZE = PAGE_SIZE * 8
 MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
+# bfloat16 -> 1152 B elements (128 B multiple); float8_e4m3fn -> 576 B elements
+# (only a 16 B multiple), the fp8 MLA production case.
+MLA_DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
 LAYOUTS = ["layer_first", "page_first"]
 
 
@@ -65,10 +68,24 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
 
 
 def _copy_tensor_with_offset(tensor: torch.Tensor, offset: int) -> None:
+    if tensor.dtype == torch.float8_e4m3fn:
+        # arange/add are not implemented for float8; fill via a byte view.
+        u8 = tensor.view(torch.uint8)
+        data = (
+            torch.arange(u8.numel(), device=u8.device, dtype=torch.int64) + offset
+        ) % 256
+        u8.copy_(data.to(torch.uint8).view_as(u8))
+        return
     data = torch.arange(
         tensor.numel(), device=tensor.device, dtype=tensor.dtype
     ).view_as(tensor)
     tensor.copy_(data + offset)
+
+
+def _tensors_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if a.dtype == torch.float8_e4m3fn:
+        return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    return torch.equal(a, b)
 
 
 def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
@@ -160,13 +177,15 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
             )
 
 
-def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
+def _run_transfer_roundtrip_mla(
+    layout: str, element_dim: int, dtype: torch.dtype = torch.bfloat16
+) -> None:
     device_pool = MLATokenToKVPool(
         size=POOL_SIZE,
         page_size=PAGE_SIZE,
         kv_lora_rank=element_dim - 64,
         qk_rope_head_dim=64,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         layer_num=NUM_LAYERS,
         device=DEVICE,
         enable_memory_saver=False,
@@ -197,7 +216,7 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
         for host_page, device_page in zip(host_pages.tolist(), device_pages.tolist()):
             host_start = host_page * PAGE_SIZE
             device_start = device_page * PAGE_SIZE
-            assert torch.equal(
+            assert _tensors_equal(
                 host_pool.data_refs[layer_id][
                     host_start : host_start + PAGE_SIZE
                 ].cpu(),
@@ -207,7 +226,7 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
             )
 
     for layer_id in range(NUM_LAYERS):
-        device_pool.kv_buffer[layer_id].zero_()
+        device_pool.kv_buffer[layer_id].view(torch.uint8).zero_()
 
     load_pages = torch.tensor([4, 5, 6], device=DEVICE, dtype=torch.int64)
     load_indices = _token_indices_for_pages(load_pages)
@@ -221,7 +240,7 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
         for host_page, device_page in zip(host_pages.tolist(), load_pages.tolist()):
             host_start = host_page * PAGE_SIZE
             device_start = device_page * PAGE_SIZE
-            assert torch.equal(
+            assert _tensors_equal(
                 device_pool.kv_buffer[layer_id][
                     device_start : device_start + PAGE_SIZE
                 ].cpu(),
@@ -239,8 +258,9 @@ def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
 
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
-def test_hicache_transfer_mla(layout: str, element_dim: int) -> None:
-    _run_transfer_roundtrip_mla(layout, element_dim)
+@pytest.mark.parametrize("dtype", MLA_DTYPES)
+def test_hicache_transfer_mla(layout: str, element_dim: int, dtype: torch.dtype) -> None:
+    _run_transfer_roundtrip_mla(layout, element_dim, dtype)
 
 
 if __name__ == "__main__":

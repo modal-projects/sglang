@@ -41,7 +41,11 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    # 16-byte alignment is enough for the vectorized copy (load_vec picks the
+    # widest 16/8/4-B package that tiles element_size); the previous %128 gate
+    # silently rejected fp8 MLA pages (576 B = 512 kv_lora + 64 rope) into a
+    # ~6x-slower fallback.
+    if element_size % 16 != 0:
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
@@ -59,14 +63,29 @@ def can_use_hicache_jit_kernel(
 
 
 def _default_unroll(element_size: int) -> int:
-    if element_size <= 512:
-        return 4
+    if element_size % 128 == 0:
+        # Original tuned defaults for 128 B-multiple element sizes.
+        if element_size <= 512:
+            return 4
 
-    if element_size <= 1024:
-        return 2
+        if element_size <= 1024:
+            return 2
 
-    # fallback: no unroll
-    return 1
+        # fallback: no unroll
+        return 1
+
+    # Non-128 B-multiple sizes (e.g. 576 B fp8 MLA): pick the smallest unroll
+    # (= most threads cooperating per element) that still lets each thread use
+    # the widest (16 B) vectorized package: element_size % (threads * 16) == 0
+    # with threads = 32 // unroll. Falls back to narrower 8/4-B packages; the
+    # %16 gate in can_use_hicache_jit_kernel guarantees unroll=32 (threads=1,
+    # 16 B package) always works.
+    for unit in (16, 8, 4):
+        for unroll in (1, 2, 4, 8, 16, 32):
+            threads = 32 // unroll
+            if element_size % (threads * unit) == 0:
+                return unroll
+    raise ValueError(f"unreachable: {element_size = } must be a multiple of 16")
 
 
 @debug_kernel_api

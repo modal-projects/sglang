@@ -75,14 +75,32 @@ SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
       "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
 
+// Widest memory package (16/8/4 B) such that kNumThreads packages evenly
+// tile kBytes. Generalizes the original fixed 128-B-per-loop scheme
+// (kUnit = 128 / kNumThreads) to element sizes that are only 16-B aligned,
+// e.g. 576 B for fp8 MLA (512 kv_lora + 64 rope).
+template <int64_t kBytes, uint32_t kNumThreads>
+inline constexpr int select_package_unit() {
+  if constexpr (kBytes % (int64_t{kNumThreads} * 16) == 0) {
+    return 16;
+  } else if constexpr (kBytes % (int64_t{kNumThreads} * 8) == 0) {
+    return 8;
+  } else {
+    return 4;
+  }
+}
+
 }  // namespace details
 
 template <int64_t kBytes, uint32_t kNumThreads>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
-  static_assert(kBytes % 128 == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
-  constexpr uint32_t kLoopCount = kBytes / 128;
-  using Package = details::PackageType<128 / kNumThreads>;
+  static_assert(kBytes % 16 == 0, "kBytes must be multiple of 16 bytes");
+  constexpr int kUnit = details::select_package_unit<kBytes, kNumThreads>();
+  static_assert(
+      kBytes % (int64_t{kNumThreads} * kUnit) == 0,
+      "kNumThreads packages must evenly tile kBytes; pick a different unroll");
+  constexpr uint32_t kLoopCount = kBytes / (int64_t{kNumThreads} * kUnit);
+  using Package = details::PackageType<kUnit>;
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);

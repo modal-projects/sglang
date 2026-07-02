@@ -65,6 +65,12 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.quantization.fp8_static_norm_quant import (
+    ENABLE_FP8_STATIC_NORM_QUANT,
+    fused_add_rmsnorm_quant_fp8,
+    rmsnorm_quant_fp8,
+    static_fp8_input_scale_of,
+)
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
@@ -455,6 +461,37 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+        # Static scalar input_scale of the fp8 qkv-latent consumer, resolved
+        # lazily on first forward (weights are quantized in
+        # process_weights_after_loading, after __init__). False = unresolved.
+        self._fp8_static_norm_quant_scale = (
+            False if ENABLE_FP8_STATIC_NORM_QUANT else None
+        )
+
+    def _get_fp8_static_norm_quant_scale(self) -> Optional[torch.Tensor]:
+        """Scale for fused RMSNorm+FP8-quant of the attn input norm, or None.
+
+        Engages only when SGLANG_FP8_STATIC_NORM_QUANT=1, the sole consumer of
+        the normed hidden states is a qkv-latent fp8 linear with a static
+        scalar input_scale, the layer is not DSA (the indexer wants the bf16
+        hidden states), and the post-norm communicate step is trivial (a
+        (fp8, scale) tuple must pass through unchanged).
+        """
+        scale = self._fp8_static_norm_quant_scale
+        if scale is not False:
+            return scale
+        scale = None
+        attn = getattr(self.qkv_latent_func, "__self__", None)
+        if (
+            attn is not None
+            and not getattr(attn, "use_dsa", False)
+            and self._communicate_simple_fn is CommunicateSimpleFn._trivial
+        ):
+            scale = static_fp8_input_scale_of(
+                getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+            )
+        self._fp8_static_norm_quant_scale = scale
+        return scale
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -587,6 +624,20 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                         )
 
+                    elif (
+                        ENABLE_FP8_STATIC_NORM_QUANT
+                        and (fp8_scale := self._get_fp8_static_norm_quant_scale())
+                        is not None
+                    ):
+                        # CUDA fused RMSNorm + static-scale fp8 quant
+                        # (flashinfer); consumer receives a (fp8, scale) tuple.
+                        hidden_states = rmsnorm_quant_fp8(
+                            hidden_states,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            fp8_scale,
+                        )
+
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
@@ -633,6 +684,22 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
+                        )
+                    elif (
+                        ENABLE_FP8_STATIC_NORM_QUANT
+                        and post_residual_addition is None
+                        and (fp8_scale := self._get_fp8_static_norm_quant_scale())
+                        is not None
+                    ):
+                        # CUDA fused add + RMSNorm + static-scale fp8 quant
+                        # (flashinfer); residual is updated in place, consumer
+                        # receives a (fp8, scale) tuple.
+                        hidden_states, residual = fused_add_rmsnorm_quant_fp8(
+                            hidden_states,
+                            residual,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                            fp8_scale,
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(

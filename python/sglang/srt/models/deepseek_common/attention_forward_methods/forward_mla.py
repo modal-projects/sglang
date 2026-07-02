@@ -13,6 +13,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.quantization.fp8_static_norm_quant import (
+    ENABLE_FP8_STATIC_NORM_QUANT,
+    rmsnorm_quant_fp8,
+    static_fp8_input_scale_of,
+)
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -219,6 +224,23 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.weight,
                             self.kv_a_layernorm.variance_epsilon,
                         )
+                    elif (
+                        ENABLE_FP8_STATIC_NORM_QUANT
+                        and not self.use_dsa
+                        and (q_b_scale := static_fp8_input_scale_of(self.q_b_proj))
+                        is not None
+                    ):
+                        # CUDA fused q_a RMSNorm + static-scale fp8 quant
+                        # (flashinfer): q_b_proj (fp8 weight, static scalar
+                        # input_scale) receives a pre-quantized (fp8, scale)
+                        # tuple. DSA excluded: the indexer needs bf16 q_lora.
+                        q = rmsnorm_quant_fp8(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            q_b_scale,
+                        )
+                        k_nope = self.kv_a_layernorm(k_nope)
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)

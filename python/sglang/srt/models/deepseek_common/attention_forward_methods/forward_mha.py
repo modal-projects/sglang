@@ -10,6 +10,11 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.fused_gemm_allreduce import maybe_fused_oproj_allreduce
+from sglang.srt.layers.quantization.fp8_static_norm_quant import (
+    ENABLE_FP8_STATIC_NORM_QUANT,
+    rmsnorm_quant_fp8,
+    static_fp8_input_scale_of,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -197,6 +202,22 @@ class DeepseekMHAForwardMixin:
                     res1=None,
                     output_unquantized_inp1=False,
                     transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            elif (
+                ENABLE_FP8_STATIC_NORM_QUANT
+                and not self.use_dsa
+                and (q_b_scale := static_fp8_input_scale_of(self.q_b_proj))
+                is not None
+            ):
+                # CUDA fused q_a RMSNorm + static-scale fp8 quant (flashinfer);
+                # mirrors forward_mla.forward_absorb_prepare — this MHA/ragged
+                # prefill path was missed in 815c40b71e (SNQ site 2 dead code).
+                q = rmsnorm_quant_fp8(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    q_b_scale,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:

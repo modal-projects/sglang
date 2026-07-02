@@ -75,7 +75,6 @@ from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -2061,13 +2060,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            getattr(self, "_gfx95_quant_format", ""),
+        # Aux capture (Eagle3/DFlash) is routed through the communicator helper
+        # so it reads the POST-allreduce residual: with flashinfer AR fusion the
+        # previous layer's MLP allreduce is deferred into this layer's fused
+        # AR+RMSNorm, and a naive pre-layer `hidden_states + residual` read
+        # captures per-rank partial sums (upstream fix sgl-project/sglang#28343).
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=getattr(self, "_gfx95_quant_format", ""),
+            )
         )
 
         hidden_states = self.self_attn(
@@ -2411,6 +2419,11 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_size = None
         num_aux_hidden_states = len(self.layers_to_capture)
         layers_to_capture = set(self.layers_to_capture)
+        # Scratch list the decoder layer appends its captured POST-allreduce
+        # residual to (via prepare_attn_and_capture_last_layer_outputs); the
+        # naive pre-layer `hidden_states + residual` read captured per-rank
+        # partial sums under flashinfer AR fusion (sgl-project/sglang#28343).
+        captured_last_layer_outputs: List[torch.Tensor] = []
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -2420,41 +2433,6 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if i in layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_attention_tp_group().all_gather(
-                            hidden_states + residual, dim=0
-                        )
-                        aux_hidden_size = int(aux_hidden_state.shape[-1])
-                        if aux_hidden_states is None:
-                            aux_hidden_states = aux_hidden_state.new_empty(
-                                (
-                                    *aux_hidden_state.shape[:-1],
-                                    aux_hidden_size * num_aux_hidden_states,
-                                )
-                            )
-                        start = aux_hidden_state_idx * aux_hidden_size
-                        aux_hidden_states[
-                            ..., start : start + aux_hidden_size
-                        ].copy_(aux_hidden_state)
-                    else:
-                        aux_hidden_size = int(hidden_states.shape[-1])
-                        if aux_hidden_states is None:
-                            aux_hidden_states = hidden_states.new_empty(
-                                (
-                                    *hidden_states.shape[:-1],
-                                    aux_hidden_size * num_aux_hidden_states,
-                                )
-                            )
-                        start = aux_hidden_state_idx * aux_hidden_size
-                        aux_hidden_slot = aux_hidden_states[
-                            ..., start : start + aux_hidden_size
-                        ]
-                        if residual is None:
-                            aux_hidden_slot.copy_(hidden_states)
-                        else:
-                            torch.add(hidden_states, residual, out=aux_hidden_slot)
-                    aux_hidden_state_idx += 1
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2465,7 +2443,27 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
+                    captured_last_layer_outputs=(
+                        captured_last_layer_outputs
+                        if i in layers_to_capture
+                        else None
+                    ),
                 )
+                if captured_last_layer_outputs:
+                    aux_hidden_state = captured_last_layer_outputs.pop()
+                    aux_hidden_size = int(aux_hidden_state.shape[-1])
+                    if aux_hidden_states is None:
+                        aux_hidden_states = aux_hidden_state.new_empty(
+                            (
+                                *aux_hidden_state.shape[:-1],
+                                aux_hidden_size * num_aux_hidden_states,
+                            )
+                        )
+                    start = aux_hidden_state_idx * aux_hidden_size
+                    aux_hidden_states[..., start : start + aux_hidden_size].copy_(
+                        aux_hidden_state
+                    )
+                    aux_hidden_state_idx += 1
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

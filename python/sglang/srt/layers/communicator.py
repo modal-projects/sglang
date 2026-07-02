@@ -162,6 +162,12 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = int(
     os.environ.get("SGLANG_FUSE_ALLREDUCE_MAX_BATCH_SIZE", "2048")
 )
+# Size-gate the fusion from below too: measured on Kimi-K2.6 4xB200 (DFLASH
+# block 8), the fused AR+RMSNorm kernel wins ~0.36ms/step at >=8 requests
+# (64+ tokens) but loses slightly at bs1 (8 tokens). Env-overridable.
+FUSE_ALLREDUCE_MIN_BATCH_SIZE = int(
+    os.environ.get("SGLANG_FUSE_ALLREDUCE_MIN_BATCH_SIZE", "32")
+)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -170,6 +176,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         # Ref: https://github.com/sgl-project/sglang/issues/17237
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
+        and batch_size >= FUSE_ALLREDUCE_MIN_BATCH_SIZE
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()

@@ -846,7 +846,6 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.attn_sink
 
-        rank = self.attn_tp_rank
         num_heads = self.n_local_heads
         padded_num_heads = 64 if num_heads <= 64 else self.n_heads
         if kernel_num_heads is None:
@@ -862,10 +861,40 @@ class MqaAttentionBase(nn.Module):
         # pointer.
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
-            sink = self.attn_sink.new_zeros(sink_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
+            self.refresh_attn_sink_cache()
+        assert self._attn_sink_local is not None
+        assert self._attn_sink_local.shape[0] == sink_num_heads
         return self._attn_sink_local[:kernel_num_heads]
+
+    @torch.no_grad()
+    def refresh_attn_sink_cache(self) -> None:
+        if self.attn_tp_size > 1:
+            rank = self.attn_tp_rank
+            tp_size = self.attn_tp_size
+        else:
+            # Context-parallel decode starts from replicated attention weights
+            # and slices them only inside the forward context. Build its local
+            # sink during post-load so staged host images include the cache.
+            ctx = get_cp_decode_attn_tp_ctx()
+            if not ctx.is_enabled:
+                return
+            rank = ctx.decode_tp_rank
+            tp_size = ctx.decode_tp_size
+
+        assert rank is not None and tp_size is not None
+        num_heads = self.n_heads // tp_size
+        sink_num_heads = 64 if num_heads <= 64 else self.n_heads
+        if self._attn_sink_local is None:
+            self._attn_sink_local = self.attn_sink.new_zeros(sink_num_heads)
+        elif self._attn_sink_local.shape != (sink_num_heads,):
+            raise RuntimeError(
+                "local attention-sink layout changed after initialization: "
+                f"current={tuple(self._attn_sink_local.shape)} "
+                f"expected={(sink_num_heads,)}"
+            )
+        self._attn_sink_local[:num_heads].copy_(
+            self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+        )
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -3543,6 +3572,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
+            self.model.decoder.self_attn.refresh_attn_sink_cache()
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
@@ -3557,6 +3587,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            self_attn.refresh_attn_sink_cache()
             layer.refresh_mhc_norm_weight_cache()
 
     @staticmethod

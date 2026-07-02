@@ -129,6 +129,10 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+# Triton biased-top8 gate for the Kimi-K2 (384 experts, n_group=1) routing
+# case: exact ids/weights match vs sgl_kernel.kimi_k2_moe_fused_gate,
+# measured 37.4us vs 84.4us at M=16384 on B200. Default off.
+_use_triton_kimi_gate = get_bool_env_var("SGLANG_TRITON_GATE")
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -1301,6 +1305,20 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
+            if _use_triton_kimi_gate and topk == 8:
+                # SGLANG_TRITON_GATE=1: triton biased-top8 gate; exact
+                # ids/weights match vs kimi_k2_moe_fused_gate (n_group=1 /
+                # topk_group=1 / top-8), 37.4us vs 84.4us at M=16384 (B200).
+                from sglang.srt.layers.moe.triton_kimi_gate import kimi_gate_triton
+
+                return kimi_gate_triton(
+                    gating_output.to(dtype=torch.float32),
+                    correction_bias,
+                    topk=topk,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,

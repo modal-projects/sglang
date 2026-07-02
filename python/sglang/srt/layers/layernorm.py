@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -132,6 +133,16 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+# Floor for the flashinfer allreduce-fusion workspace token sizing. The
+# workspace cost scales with this (and gets rounded up to NVLS multicast
+# granularity per buffer, per TP group), so decode-only deployments can set
+# SGLANG_FLASHINFER_ALLREDUCE_MAX_TOKEN_NUM=128 to reclaim GPU memory. Keep it
+# equal to SGLANG_FUSE_ALLREDUCE_MAX_BATCH_SIZE to avoid workspace re-init
+# churn on batches between the two values.
+_FUSED_AR_MAX_TOKEN_NUM_FLOOR = int(
+    os.environ.get("SGLANG_FLASHINFER_ALLREDUCE_MAX_TOKEN_NUM", "2048")
+)
+
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
@@ -183,7 +194,11 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
-                    max_token_num=max(x.shape[0], 2048),
+                    # Workspace floor: the fusion workspace (Lamport triple
+                    # buffer + staging, x2 TP groups, rounded to multicast
+                    # granularity) is sized by this, costing GBs at 2048.
+                    # Deployments that fuse only at decode sizes can shrink it.
+                    max_token_num=max(x.shape[0], _FUSED_AR_MAX_TOKEN_NUM_FLOOR),
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:

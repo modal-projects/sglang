@@ -452,12 +452,24 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
     # --- deterministic (identical on all ranks) config gates: no vote needed
     try:
         from sglang.srt.distributed import get_tp_group
-        from sglang.srt.layers.dp_attention import get_attention_dp_size
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,
             is_sbo_enabled,
             is_tbo_enabled,
         )
+
+        def get_attention_dp_size() -> int:
+            # DP attention is initialized before the first forward in a real
+            # server; if it was never initialized (e.g. layer-level benches),
+            # there is no DP.
+            try:
+                from sglang.srt.layers.dp_attention import (
+                    get_attention_dp_size as _dp_size,
+                )
+
+                return _dp_size()
+            except Exception:
+                return 1
 
         wrapper = getattr(layer, "_cutedsl_wrapper", None)
         group = get_tp_group()

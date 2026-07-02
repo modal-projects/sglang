@@ -39,6 +39,10 @@ from sglang.srt.layers.cp.dcp import (
     get_attention_dcp_world_size,
     get_dcp_lens,
 )
+from sglang.srt.layers.cp.dcp.kernels import (
+    dcp_verify_draft_merge,
+    dcp_verify_draft_merge_torch,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -140,7 +144,7 @@ class TRTLLMMLADecodeMetadata:
     dcp_max_local_seq_len: Optional[int] = None
     # target-verify: rank-local length of the committed PREFIX only (i.e.
     # seq_lens WITHOUT the draft tokens); the draft block is handled by the
-    # residue-class torch phase in _forward_target_verify_dcp.
+    # fused residue-class merge kernel in _forward_target_verify_dcp.
     dcp_local_prefix_lens: Optional[torch.Tensor] = None
     dcp_max_local_prefix_len: Optional[int] = None
 
@@ -230,6 +234,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Decode context parallel (DCP) info; 1 / 0 when DCP is disabled.
         self.dcp_world_size = get_attention_dcp_world_size()
         self.dcp_rank = get_attention_dcp_rank()
+        # Fused Triton kernel for the verify-phase residue-class block
+        # attention + LSE merge; SGLANG_DCP_VERIFY_FUSED=0 falls back to the
+        # unfused torch reference for A/B debugging.
+        self.dcp_verify_fused = envs.SGLANG_DCP_VERIFY_FUSED.get()
         if self.dcp_world_size > 1:
             # create_flashmla_kv_indices_triton processes
             # FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON (4096) tokens per CTA with
@@ -996,8 +1004,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         under causality q_i >= j. This partitions the block tokens exactly
         once across ranks, matching how the rank-filtered cache write shards
         them for future steps. Tiny [bs, q_len, H, <= q_len] masked attention
-        in fp32 torch, producing the same base-2 / scale-folded LSE
-        convention (empty rows -> lse = -inf, out = 0, which
+        in fp32, producing the same base-2 / scale-folded LSE convention
+        (empty rows -> lse = -inf, out = 0, which
         _correct_attn_cp_out_kernel treats as no contribution).
 
         Phase (c): merge (a) + (b) locally per token in base-2 (max-subtracted
@@ -1005,13 +1013,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cp_lse_ag_out_rs_mla call in forward_mla.py — this method just returns
         one normal partial (out, lse).
 
-        All ops are static-shape tensor ops (CUDA-graph capturable).
+        Phases (b)+(c) run as ONE fused Triton kernel per layer
+        (dcp_verify_draft_merge); SGLANG_DCP_VERIFY_FUSED=0 selects the
+        original unfused torch reference (dcp_verify_draft_merge_torch).
+        Both are static-shape / no host reads (CUDA-graph capturable).
         """
         bs = forward_batch.batch_size
         draft = self.num_draft_tokens
         num_heads = layer.tp_q_head_num  # gathered heads under DCP
-        neg_inf = float("-inf")
-        fp32_tiny = torch.finfo(torch.float32).tiny
 
         # ---- Phase (a): local committed prefix via the decode kernel ----
         o_a, lse_a = self._run_decode_kernel(
@@ -1027,76 +1036,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # o_a: [bs, draft, H, kv_lora_rank]; lse_a: [bs, draft, H] fp32,
         # base-2, +inf sentinel on empty rows (local prefix len == 0).
 
-        # ---- Phase (b): residue-class share of the fresh draft block ----
+        # ---- Phases (b)+(c): fused residue-class block attn + base-2 merge
         softmax_scale = self._compute_decode_bmm1_scale(layer)
         output_scale = self._decode_output_scale(layer)
-        log2e = math.log2(math.e)
 
-        q32 = q.view(bs, draft, num_heads, -1).to(torch.float32)
-        k_lat32 = k.reshape(bs, draft, self.kv_lora_rank).to(torch.float32)
-        k_pe32 = k_rope.reshape(bs, draft, self.qk_rope_head_dim).to(torch.float32)
-        k_full32 = torch.cat([k_lat32, k_pe32], dim=-1)  # [bs, draft, D_qk]
-
-        # Scores directly in the base-2 domain: s2 = log2(e) * scale * (q . k)
-        scores = torch.einsum("bqhd,bkd->bqhk", q32, k_full32) * (
-            softmax_scale * log2e
+        merge_fn = (
+            dcp_verify_draft_merge
+            if self.dcp_verify_fused
+            else dcp_verify_draft_merge_torch
+        )
+        o, merged_lse = merge_fn(
+            q=q.view(bs, draft, num_heads, -1),
+            k_latent=k.reshape(bs, draft, self.kv_lora_rank),
+            k_rope=k_rope.reshape(bs, draft, self.qk_rope_head_dim),
+            o_a=o_a.view(bs, draft, num_heads, self.kv_lora_rank),
+            lse_a=lse_a.view(bs, draft, num_heads),
+            seq_lens=forward_batch.seq_lens,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+            dcp_rank=self.dcp_rank,
+            dcp_world_size=self.dcp_world_size,
         )
 
-        j_idx = torch.arange(draft, device=q.device)
-        # owner[b, j]: this rank owns block position j of request b
-        owner = (
-            forward_batch.seq_lens.to(torch.int64).unsqueeze(1) + j_idx.unsqueeze(0)
-        ) % self.dcp_world_size == self.dcp_rank
-        # causal[i, j]: q token i may attend block token j
-        causal = j_idx.unsqueeze(1) >= j_idx.unsqueeze(0)  # [q, k]
-        mask = owner[:, None, None, :] & causal[None, :, None, :]  # [bs,q,1,k]
-
-        scores = scores.masked_fill(~mask, neg_inf)
-        m_b = scores.amax(dim=-1, keepdim=True)  # [bs, q, H, 1]
-        m_b_safe = torch.where(torch.isfinite(m_b), m_b, torch.zeros_like(m_b))
-        p = torch.exp2(scores - m_b_safe)
-        p = torch.where(mask, p, torch.zeros_like(p))
-        s_b = p.sum(dim=-1, keepdim=True)  # [bs, q, H, 1]
-        lse_b = torch.where(
-            s_b.squeeze(-1) > 0,
-            m_b_safe.squeeze(-1) + torch.log2(s_b.squeeze(-1).clamp(min=fp32_tiny)),
-            torch.full_like(m_b_safe.squeeze(-1), neg_inf),
-        )
-        # value = latent (absorbed MLA); dequant with the same output scale
-        # the FP8 decode kernel applies.
-        o_b = torch.einsum("bqhk,bkd->bqhd", p, k_lat32) * output_scale
-        o_b = o_b / s_b.clamp(min=fp32_tiny)
-        o_b = torch.where(s_b > 0, o_b, torch.zeros_like(o_b))
-
-        # ---- Phase (c): local base-2 merge of (a) and (b) ----
-        lse_a32 = lse_a.to(torch.float32)
-        # Normalize the kernel's empty-row sentinel (+inf, or NaN from
-        # degenerate rows) to -inf; guard the paired output.
-        lse_a32 = torch.where(
-            torch.isnan(lse_a32) | torch.isinf(lse_a32),
-            torch.full_like(lse_a32, neg_inf),
-            lse_a32,
-        )
-        o_a32 = torch.nan_to_num(
-            o_a.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0
-        )
-
-        m_ab = torch.maximum(lse_a32, lse_b)
-        m_ab_safe = torch.where(torch.isfinite(m_ab), m_ab, torch.zeros_like(m_ab))
-        w_a = torch.exp2(lse_a32 - m_ab_safe)  # 0 when lse_a == -inf
-        w_b = torch.exp2(lse_b - m_ab_safe)
-        denom = w_a + w_b  # [bs, q, H]
-        merged_lse = torch.where(
-            denom > 0,
-            m_ab_safe + torch.log2(denom.clamp(min=fp32_tiny)),
-            torch.full_like(denom, neg_inf),
-        )
-        o = (
-            w_a.unsqueeze(-1) * o_a32 + w_b.unsqueeze(-1) * o_b
-        ) / denom.clamp(min=fp32_tiny).unsqueeze(-1)
-        o = torch.where(denom.unsqueeze(-1) > 0, o, torch.zeros_like(o))
-
-        out = o.to(o_a.dtype).view(-1, num_heads * layer.v_head_dim)
+        out = o.view(-1, num_heads * layer.v_head_dim)
         # merged_lse: [bs, draft, H] -> [tokens, H]; -inf marks fully-empty
         # local rows (the cross-rank merge kernel zeroes their contribution).
         return out, merged_lse.view(-1, num_heads)

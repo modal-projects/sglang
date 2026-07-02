@@ -99,7 +99,7 @@ runtime — the backend fails fast at init if the installed wheel lacks
     them (logical→physical is monotonic, so local block copies sit at
     physical positions ≥ local_prefix_len).
   - (b) block: `[bs, 8, H_gathered] × [≤2 owned kv]` masked attention in
-    torch fp32 over the fresh `k`/`k_rope` produced by
+    fp32 over the fresh `k`/`k_rope` produced by
     `mla_quantize_and_rope_for_fp8` (exactly the replicated block K, no
     re-projection or threading needed). Scores computed directly in the
     base-2 domain (`* scale * log2(e)`); value = the latent (`kv_a`);
@@ -107,10 +107,28 @@ runtime — the backend fails fast at init if the installed wheel lacks
   - (c) local merge in base-2 with max-subtraction; phase-(a) `+inf`/NaN
     sentinels normalized to `-inf` and outputs `nan_to_num`ed. Returns one
     normal partial `(out, lse)`; `forward_mla` never knows it was two-phase.
+  - **Phases (b)+(c) run as ONE fused Triton kernel** —
+    `dcp_verify_draft_merge` / `_dcp_verify_draft_merge_kernel` in
+    `layers/cp/dcp/kernels.py`, one program per `(batch, head)` with an
+    `[8, 8]` score tile and vectorized 128-wide loads over the head dim.
+    The original ~25-op unfused torch chain (profiled on B200 at ~26% of
+    GPU time in fp32 elementwise kernels and 3.3× the kernel-event count
+    of non-DCP, per layer × 61 — roughly doubling TPOT) is preserved
+    verbatim as `dcp_verify_draft_merge_torch` and selectable via
+    `SGLANG_DCP_VERIFY_FUSED=0` for A/B debugging (default: fused ON).
+    fp8 q/k are loaded as fp8 in-kernel and converted to fp32 at load; all
+    math is fp32; per-row scalars fold into two output coefficients
+    (`c_a = w_a/denom`, `c_b = w_b·output_scale/(denom·s_b)`) —
+    algebraically identical to the reference. `dcp_rank`/`dcp_world_size`
+    are constexpr; `seq_lens` is read on-device. Fused-vs-reference unit
+    test (empty phase-a rows with `+inf`/NaN sentinels, ranks owning zero
+    block positions, both-empty rows, `k_scale != 1`, fp8 q/k, CUDA-graph
+    capture/replay): `test/registered/dcp/test_dcp_verify_fused_unit.py`
+    (1 GPU, no server).
   - No double KV write: the cache write happened once via the rank-filtered
     `set_mla_kv_buffer`.
-  - Everything is static-shape tensor ops → verify CUDA graphs capture fine
-    (no eager fallback needed).
+  - Everything is static-shape, no host reads → verify CUDA graphs capture
+    fine (no eager fallback needed), in both fused and torch modes.
 - `draft_extend_v2` + DCP is explicitly rejected (EAGLE-only mode; spec under
   DCP is restricted to DFLASH anyway).
 

@@ -600,6 +600,10 @@ class Envs:
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # DCP speculative-verify draft-block attention + LSE merge: fused Triton
+    # kernel (default) vs the unfused torch reference (set to 0/false for A/B
+    # debugging).
+    SGLANG_DCP_VERIFY_FUSED = EnvBool(True)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

@@ -20,6 +20,7 @@ Consolidated from the two merged DCP implementations:
   - _correct_attn_cp_out_kernel / correct_attn_out / CPTritonContext  (PR #14194)
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -335,3 +336,353 @@ def correct_attn_out(
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
+
+
+# ---------------------------------------------------------------------------
+# DCP speculative-verify: fused residue-class draft-block attention + local
+# base-2 LSE merge with the prefix-phase partial (out, lse).
+#
+# Replaces the ~25 unfused fp32 torch ops previously inlined in
+# TRTLLMMLABackend._forward_target_verify_dcp phases (b)+(c). The torch
+# reference implementation is kept below (dcp_verify_draft_merge_torch) for
+# A/B debugging via SGLANG_DCP_VERIFY_FUSED=0 and for the unit test.
+# ---------------------------------------------------------------------------
+
+_LOG2_E = math.log2(math.e)
+# torch.finfo(torch.float32).tiny — matches the .clamp(min=tiny) guards of the
+# torch reference exactly.
+_FP32_TINY = 1.1754943508222875e-38
+
+
+@triton.jit
+def _dcp_verify_draft_merge_kernel(
+    q_ptr,  # [bs, draft, H, KV_LORA + ROPE_DIM] (may be fp8/bf16/fp16)
+    k_lat_ptr,  # [bs, draft, KV_LORA] (same dtype family as q)
+    k_rope_ptr,  # [bs, draft, ROPE_DIM]
+    o_a_ptr,  # [bs, draft, H, KV_LORA] phase-(a) output (kernel out dtype)
+    lse_a_ptr,  # [bs, draft, H] fp32, base-2, +inf/NaN sentinel on empty rows
+    seq_lens_ptr,  # [bs] committed prefix lengths (device tensor)
+    out_ptr,  # [bs, draft, H, KV_LORA] merged output (o_a dtype)
+    lse_out_ptr,  # [bs, draft, H] fp32 merged base-2 LSE (-inf if empty)
+    stride_q_b,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_kl_b,
+    stride_kl_t,
+    stride_kl_d,
+    stride_kr_b,
+    stride_kr_t,
+    stride_kr_d,
+    stride_oa_b,
+    stride_oa_t,
+    stride_oa_h,
+    stride_oa_d,
+    stride_la_b,
+    stride_la_t,
+    stride_la_h,
+    stride_o_b,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lo_b,
+    stride_lo_t,
+    stride_lo_h,
+    scale_log2,  # softmax_scale * log2(e): scores land in the base-2 domain
+    output_scale,  # fp8-KV dequant scale applied to the block value path
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    DRAFT: tl.constexpr,
+    DRAFT_POW2: tl.constexpr,
+    KV_LORA: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One program per (batch, head). draft x draft score tile, vectorized
+    loads over the head dim. All math fp32; q/k/o_a converted at load."""
+    NEG_INF = float("-inf")
+    POS_INF = float("inf")
+    FP32_TINY = 1.1754943508222875e-38
+
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+
+    t = tl.arange(0, DRAFT_POW2)
+    t_mask = t < DRAFT
+
+    # keep[i, j]: q token i attends block token j iff this rank owns block
+    # position j ((seq_len + j) % dcp_world_size == dcp_rank) and i >= j.
+    seq_len = tl.load(seq_lens_ptr + b).to(tl.int64)
+    owner = ((seq_len + t) % dcp_world_size) == dcp_rank
+    keep = (
+        (t[:, None] >= t[None, :])
+        & owner[None, :]
+        & t_mask[:, None]
+        & t_mask[None, :]
+    )
+
+    # ---- scores[i, j] = log2(e) * scale * dot(q_i, concat(k_lat, k_rope)_j)
+    scores = tl.zeros([DRAFT_POW2, DRAFT_POW2], dtype=tl.float32)
+    q_base = q_ptr + b * stride_q_b + h * stride_q_h
+    for d0 in tl.static_range(0, KV_LORA, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        qb = tl.load(
+            q_base + t[:, None] * stride_q_t + d[None, :] * stride_q_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        kb = tl.load(
+            k_lat_ptr
+            + b * stride_kl_b
+            + t[:, None] * stride_kl_t
+            + d[None, :] * stride_kl_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        scores += tl.sum(qb[:, None, :] * kb[None, :, :], axis=2)
+    dr = tl.arange(0, ROPE_DIM)
+    qr = tl.load(
+        q_base + t[:, None] * stride_q_t + (KV_LORA + dr[None, :]) * stride_q_d,
+        mask=t_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    kr = tl.load(
+        k_rope_ptr
+        + b * stride_kr_b
+        + t[:, None] * stride_kr_t
+        + dr[None, :] * stride_kr_d,
+        mask=t_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    scores += tl.sum(qr[:, None, :] * kr[None, :, :], axis=2)
+
+    scores = scores * scale_log2
+    scores = tl.where(keep, scores, NEG_INF)
+
+    # ---- base-2 softmax with max subtraction; empty row -> lse_b = -inf.
+    m_b = tl.max(scores, axis=1)
+    m_b_safe = tl.where(
+        (m_b != m_b) | (m_b == POS_INF) | (m_b == NEG_INF), 0.0, m_b
+    )
+    p = tl.exp2(scores - m_b_safe[:, None])
+    p = tl.where(keep, p, 0.0)
+    s_b = tl.sum(p, axis=1)
+    lse_b = tl.where(
+        s_b > 0, m_b_safe + tl.log2(tl.maximum(s_b, FP32_TINY)), NEG_INF
+    )
+
+    # ---- sanitize phase-(a) LSE (+inf / NaN empty-row sentinel -> -inf).
+    lse_a = tl.load(
+        lse_a_ptr + b * stride_la_b + t * stride_la_t + h * stride_la_h,
+        mask=t_mask,
+        other=NEG_INF,
+    ).to(tl.float32)
+    lse_a = tl.where(
+        (lse_a != lse_a) | (lse_a == POS_INF) | (lse_a == NEG_INF),
+        NEG_INF,
+        lse_a,
+    )
+
+    # ---- base-2 merge weights.
+    m_ab = tl.maximum(lse_a, lse_b)
+    m_ab_safe = tl.where(
+        (m_ab != m_ab) | (m_ab == POS_INF) | (m_ab == NEG_INF), 0.0, m_ab
+    )
+    w_a = tl.exp2(lse_a - m_ab_safe)
+    w_b = tl.exp2(lse_b - m_ab_safe)
+    denom = w_a + w_b
+    denom_c = tl.maximum(denom, FP32_TINY)
+    merged_lse = tl.where(denom > 0, m_ab_safe + tl.log2(denom_c), NEG_INF)
+    tl.store(
+        lse_out_ptr + b * stride_lo_b + t * stride_lo_t + h * stride_lo_h,
+        merged_lse,
+        mask=t_mask,
+    )
+
+    # Fold the per-row scalars into two coefficients:
+    #   out = c_a * o_a + c_b * (sum_j p_j * v_j)
+    # with c_a = w_a / denom and c_b = w_b * output_scale / (denom * s_b),
+    # zeroed on empty rows — algebraically identical to the torch reference
+    # (o_b = p@v * output_scale / s_b; out = (w_a*o_a + w_b*o_b) / denom).
+    c_a = tl.where(denom > 0, w_a / denom_c, 0.0)
+    c_b = tl.where(
+        (denom > 0) & (s_b > 0),
+        (w_b * output_scale) / (denom_c * tl.maximum(s_b, FP32_TINY)),
+        0.0,
+    )
+
+    # ---- value pass (value = the 512-dim latent) + merge + store.
+    oa_base = o_a_ptr + b * stride_oa_b + h * stride_oa_h
+    out_base = out_ptr + b * stride_o_b + h * stride_o_h
+    for d0 in tl.static_range(0, KV_LORA, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        v = tl.load(
+            k_lat_ptr
+            + b * stride_kl_b
+            + t[:, None] * stride_kl_t
+            + d[None, :] * stride_kl_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        o_b = tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        oa = tl.load(
+            oa_base + t[:, None] * stride_oa_t + d[None, :] * stride_oa_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        # nan_to_num(nan=0, posinf=0, neginf=0) on the phase-(a) output.
+        oa = tl.where((oa != oa) | (oa == POS_INF) | (oa == NEG_INF), 0.0, oa)
+        o = c_a[:, None] * oa + c_b[:, None] * o_b
+        tl.store(
+            out_base + t[:, None] * stride_o_t + d[None, :] * stride_o_d,
+            o.to(out_ptr.dtype.element_ty),
+            mask=t_mask[:, None],
+        )
+
+
+def dcp_verify_draft_merge(
+    q: torch.Tensor,  # [bs, draft, H, kv_lora + rope_dim]
+    k_latent: torch.Tensor,  # [bs, draft, kv_lora]
+    k_rope: torch.Tensor,  # [bs, draft, rope_dim]
+    o_a: torch.Tensor,  # [bs, draft, H, kv_lora]
+    lse_a: torch.Tensor,  # [bs, draft, H] fp32
+    seq_lens: torch.Tensor,  # [bs] device tensor (graph-replay safe)
+    softmax_scale: float,
+    output_scale: float,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused DCP verify: residue-class draft-block attention + base-2 merge.
+
+    Returns (out [bs, draft, H, kv_lora] in o_a.dtype, lse [bs, draft, H]
+    fp32). Static shapes, no host reads — CUDA-graph capturable. q/k may be
+    fp8; conversion to fp32 happens inside the kernel at load time.
+    """
+    bs, draft, num_heads, d_qk = q.shape
+    kv_lora = k_latent.shape[-1]
+    rope_dim = k_rope.shape[-1]
+    assert d_qk == kv_lora + rope_dim, (d_qk, kv_lora, rope_dim)
+    BLOCK_D = 128
+    assert kv_lora % BLOCK_D == 0, kv_lora
+    assert rope_dim & (rope_dim - 1) == 0, rope_dim  # power of 2 for arange
+
+    out = torch.empty(
+        (bs, draft, num_heads, kv_lora), dtype=o_a.dtype, device=q.device
+    )
+    merged_lse = torch.empty(
+        (bs, draft, num_heads), dtype=torch.float32, device=q.device
+    )
+    _dcp_verify_draft_merge_kernel[(bs, num_heads)](
+        q,
+        k_latent,
+        k_rope,
+        o_a,
+        lse_a,
+        seq_lens,
+        out,
+        merged_lse,
+        *q.stride(),
+        *k_latent.stride(),
+        *k_rope.stride(),
+        *o_a.stride(),
+        *lse_a.stride(),
+        *out.stride(),
+        *merged_lse.stride(),
+        float(softmax_scale) * _LOG2_E,
+        float(output_scale),
+        dcp_rank=dcp_rank,
+        dcp_world_size=dcp_world_size,
+        DRAFT=draft,
+        DRAFT_POW2=triton.next_power_of_2(draft),
+        KV_LORA=kv_lora,
+        ROPE_DIM=rope_dim,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    return out, merged_lse
+
+
+def dcp_verify_draft_merge_torch(
+    q: torch.Tensor,
+    k_latent: torch.Tensor,
+    k_rope: torch.Tensor,
+    o_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float,
+    output_scale: float,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference for :func:`dcp_verify_draft_merge` (the original,
+    numerically validated unfused implementation from
+    TRTLLMMLABackend._forward_target_verify_dcp). Kept for A/B debugging
+    (SGLANG_DCP_VERIFY_FUSED=0) and as the unit-test oracle."""
+    bs, draft, num_heads, _ = q.shape
+    kv_lora = k_latent.shape[-1]
+    rope_dim = k_rope.shape[-1]
+    neg_inf = float("-inf")
+    fp32_tiny = torch.finfo(torch.float32).tiny
+
+    q32 = q.to(torch.float32)
+    k_lat32 = k_latent.reshape(bs, draft, kv_lora).to(torch.float32)
+    k_pe32 = k_rope.reshape(bs, draft, rope_dim).to(torch.float32)
+    k_full32 = torch.cat([k_lat32, k_pe32], dim=-1)  # [bs, draft, D_qk]
+
+    # Scores directly in the base-2 domain: s2 = log2(e) * scale * (q . k)
+    scores = torch.einsum("bqhd,bkd->bqhk", q32, k_full32) * (
+        softmax_scale * _LOG2_E
+    )
+
+    j_idx = torch.arange(draft, device=q.device)
+    # owner[b, j]: this rank owns block position j of request b
+    owner = (
+        seq_lens.to(torch.int64).unsqueeze(1) + j_idx.unsqueeze(0)
+    ) % dcp_world_size == dcp_rank
+    # causal[i, j]: q token i may attend block token j
+    causal = j_idx.unsqueeze(1) >= j_idx.unsqueeze(0)  # [q, k]
+    mask = owner[:, None, None, :] & causal[None, :, None, :]  # [bs,q,1,k]
+
+    scores = scores.masked_fill(~mask, neg_inf)
+    m_b = scores.amax(dim=-1, keepdim=True)  # [bs, q, H, 1]
+    m_b_safe = torch.where(torch.isfinite(m_b), m_b, torch.zeros_like(m_b))
+    p = torch.exp2(scores - m_b_safe)
+    p = torch.where(mask, p, torch.zeros_like(p))
+    s_b = p.sum(dim=-1, keepdim=True)  # [bs, q, H, 1]
+    lse_b = torch.where(
+        s_b.squeeze(-1) > 0,
+        m_b_safe.squeeze(-1) + torch.log2(s_b.squeeze(-1).clamp(min=fp32_tiny)),
+        torch.full_like(m_b_safe.squeeze(-1), neg_inf),
+    )
+    # value = latent (absorbed MLA); dequant with the same output scale
+    # the FP8 decode kernel applies.
+    o_b = torch.einsum("bqhk,bkd->bqhd", p, k_lat32) * output_scale
+    o_b = o_b / s_b.clamp(min=fp32_tiny)
+    o_b = torch.where(s_b > 0, o_b, torch.zeros_like(o_b))
+
+    # ---- local base-2 merge of (a) and (b) ----
+    lse_a32 = lse_a.to(torch.float32)
+    # Normalize the kernel's empty-row sentinel (+inf, or NaN from
+    # degenerate rows) to -inf; guard the paired output.
+    lse_a32 = torch.where(
+        torch.isnan(lse_a32) | torch.isinf(lse_a32),
+        torch.full_like(lse_a32, neg_inf),
+        lse_a32,
+    )
+    o_a32 = torch.nan_to_num(o_a.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    m_ab = torch.maximum(lse_a32, lse_b)
+    m_ab_safe = torch.where(torch.isfinite(m_ab), m_ab, torch.zeros_like(m_ab))
+    w_a = torch.exp2(lse_a32 - m_ab_safe)  # 0 when lse_a == -inf
+    w_b = torch.exp2(lse_b - m_ab_safe)
+    denom = w_a + w_b  # [bs, q, H]
+    merged_lse = torch.where(
+        denom > 0,
+        m_ab_safe + torch.log2(denom.clamp(min=fp32_tiny)),
+        torch.full_like(denom, neg_inf),
+    )
+    o = (
+        w_a.unsqueeze(-1) * o_a32 + w_b.unsqueeze(-1) * o_b
+    ) / denom.clamp(min=fp32_tiny).unsqueeze(-1)
+    o = torch.where(denom.unsqueeze(-1) > 0, o, torch.zeros_like(o))
+    return o.to(o_a.dtype), merged_lse

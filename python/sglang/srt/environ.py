@@ -580,6 +580,13 @@ class Envs:
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
+    # Memory attribution instrumentation (zero-cost when off; see
+    # sglang/srt/utils/mem_milestones.py)
+    SGLANG_MEM_MILESTONES = EnvBool(False)
+    SGLANG_TORCH_MEM_HISTORY = EnvBool(False)
+    SGLANG_TORCH_MEM_HISTORY_DIR = EnvStr("/tmp/sglang_mem_snapshots")
+    SGLANG_TORCH_MEM_HISTORY_MAX_ENTRIES = EnvInt(200000)
+
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 

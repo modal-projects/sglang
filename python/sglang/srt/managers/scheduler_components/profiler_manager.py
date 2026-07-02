@@ -233,7 +233,12 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            from sglang.srt.utils.mem_milestones import mem_history_active
+
+            # If boot-time recording (SGLANG_TORCH_MEM_HISTORY=1) is active,
+            # keep it: re-arming would drop boot allocation stacks.
+            if not mem_history_active():
+                torch.cuda.memory._record_memory_history(max_entries=100000)
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
@@ -344,7 +349,11 @@ class SchedulerProfilerManager:
                 + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
+            from sglang.srt.utils.mem_milestones import mem_history_active
+
+            # Leave boot-time recording (SGLANG_TORCH_MEM_HISTORY=1) running.
+            if not mem_history_active():
+                torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_global_server_args().base_gpu_id:

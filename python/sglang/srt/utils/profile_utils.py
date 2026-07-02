@@ -317,9 +317,16 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
 class _ProfilerMemory(_ProfilerConcreteBase):
     def start(self):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        from sglang.srt.utils.mem_milestones import mem_history_active
+
+        # If boot-time recording (SGLANG_TORCH_MEM_HISTORY=1) is active, keep
+        # it: re-arming would drop boot allocation stacks.
+        if not mem_history_active():
+            torch.cuda.memory._record_memory_history(max_entries=100000)
 
     def stop(self):
+        from sglang.srt.utils.mem_milestones import mem_history_active
+
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         memory_profile_path = os.path.join(
@@ -330,7 +337,8 @@ class _ProfilerMemory(_ProfilerConcreteBase):
             + ".pickle",
         )
         torch.cuda.memory._dump_snapshot(memory_profile_path)
-        torch.cuda.memory._record_memory_history(enabled=None)
+        if not mem_history_active():
+            torch.cuda.memory._record_memory_history(enabled=None)
 
 
 class _ProfilerCudart(_ProfilerConcreteBase):

@@ -215,6 +215,11 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
+from sglang.srt.utils.mem_milestones import (
+    log_mem_milestone,
+    maybe_dump_mem_snapshot,
+    maybe_start_torch_mem_history,
+)
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -658,6 +663,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self._mem_milestone("weights-loaded")
         self._prepare_moe_topk()
 
         # Load the expert backup client
@@ -757,6 +763,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+        self._mem_milestone("kv-pool-sized")
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_device_graphs so warmup
@@ -804,9 +811,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self.init_attention_backend()
+            self._mem_milestone("attn-backend-init")
             self.kernel_warmup()
+            self._mem_milestone("autotune-done")
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
+            self._mem_milestone("decode-graphs-captured")
         elif self.device == "cpu":
             self.init_attention_backend()
             self.init_device_graphs()
@@ -843,6 +853,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+        self._mem_milestone("init-done")
+        maybe_dump_mem_snapshot(
+            f"{'draft' if self.is_draft_worker else 'target'}-init-done",
+            self.tp_rank,
+        )
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
@@ -1070,6 +1086,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
+        if self.device == "cuda":
+            # Env-gated (SGLANG_TORCH_MEM_HISTORY): start allocator-history
+            # recording before any large allocation so live blocks carry stacks.
+            maybe_start_torch_mem_history()
+
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
@@ -1205,7 +1226,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        self._mem_milestone("torch-dist-init")
         return pre_model_load_memory
+
+    def _mem_milestone(self, tag: str):
+        """Env-gated (SGLANG_MEM_MILESTONES) memory attribution log line."""
+        role = "draft" if self.is_draft_worker else "target"
+        log_mem_milestone(f"{role}.{tag}", self.gpu_id, self.tp_rank)
 
     def init_shared_mooncake_transfer_engine(self):
         """

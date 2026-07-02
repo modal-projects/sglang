@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -205,6 +206,11 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Max M for the dsv3_router_gemm fast path in MoEGate.forward. Measured on
+# B200 (Kimi-K2.6, 384 experts): dsv3_router_gemm 9.78us vs F.linear 5.39us
+# at M=16 (1.9x WORSE); it only wins at M<=8. Env-overridable.
+DSV3_ROUTER_GEMM_MAX_M = int(os.environ.get("SGLANG_DSV3_ROUTER_GEMM_MAX_M", "8"))
 
 
 class DeepseekV2MLP(nn.Module):
@@ -473,7 +479,7 @@ class MoEGate(nn.Module):
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[0] <= DSV3_ROUTER_GEMM_MAX_M
                 and hidden_states.shape[1] == 7168
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90

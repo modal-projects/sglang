@@ -1305,7 +1305,19 @@ def biased_grouped_topk_gpu(
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
             # ===== END TO BE REFACTORED ====
-            if _use_triton_kimi_gate and topk == 8:
+            from sglang.srt.compilation.piecewise_context_manager import (
+                is_in_piecewise_cuda_graph,
+            )
+
+            # PCG: keep routing on the sgl_kernel fused gate (a registered
+            # torch op, dynamo-opaque). The triton gate is only worth it at
+            # large M (37.4us vs 84.4us @16384; ~1.5us delta at small M),
+            # and PCG only sees small-M extends.
+            if (
+                _use_triton_kimi_gate
+                and topk == 8
+                and not is_in_piecewise_cuda_graph()
+            ):
                 # SGLANG_TRITON_GATE=1: triton biased-top8 gate; exact
                 # ids/weights match vs kimi_k2_moe_fused_gate (n_group=1 /
                 # topk_group=1 / top-8), 37.4us vs 84.4us at M=16384 (B200).

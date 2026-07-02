@@ -490,6 +490,15 @@ class LayerCommunicator:
         hidden states), and the post-norm communicate step is trivial (a
         (fp8, scale) tuple must pass through unchanged).
         """
+        # PCG-traced forwards must not engage SNQ (rmsnorm_quant_cute is
+        # untraceable by dynamo); the cache below is populated by eager
+        # forwards, so gate before the cache hit.
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
+
+        if is_in_piecewise_cuda_graph():
+            return None
         scale = self._fp8_static_norm_quant_scale
         if scale is not False:
             return scale

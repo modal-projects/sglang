@@ -1044,7 +1044,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = layernorm(hidden_states)
         else:
             handled = False
-            if (
+            if getattr(hidden_states, "_sglang_fused_oproj_ar_done", False):
+                # o_proj already produced the attention-TP-reduced output via
+                # the fused GEMM+allreduce kernel (SGLANG_FUSED_OPROJ_AR=1,
+                # see sglang.srt.layers.fused_gemm_allreduce); only the
+                # layernorm remains.
+                hidden_states._sglang_fused_oproj_ar_done = False
+                hidden_states, residual = layernorm(hidden_states, residual)
+                handled = True
+            if not handled and (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):

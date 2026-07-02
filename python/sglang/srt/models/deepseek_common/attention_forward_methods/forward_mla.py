@@ -8,6 +8,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.fused_gemm_allreduce import maybe_fused_oproj_allreduce
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -690,7 +691,11 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        output = maybe_fused_oproj_allreduce(
+            self.o_proj, attn_bmm_output, forward_batch
+        )
+        if output is None:
+            output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
             return output

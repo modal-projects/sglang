@@ -510,12 +510,18 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
     state = None
     ok = False
     try:
-        state = _FusedMoeArState(
-            group=group,
-            hidden_size=layer.hidden_size,
-            max_num_tokens=wrapper.max_num_tokens,
-            device=torch.device(torch.cuda.current_device()),
-        )
+        # inference_mode(False): the first eager forward can run inside
+        # torch.inference_mode() (flashinfer autotune / PCG warmup dummy
+        # runs). State tensors created there would be inference tensors and
+        # the per-forward active.copy_(seed) in _run_fused_ar_impl then
+        # fails outside InferenceMode ("Inplace update to inference tensor").
+        with torch.inference_mode(False):
+            state = _FusedMoeArState(
+                group=group,
+                hidden_size=layer.hidden_size,
+                max_num_tokens=wrapper.max_num_tokens,
+                device=torch.device(torch.cuda.current_device()),
+            )
         ok = True
     except Exception:
         logger.exception("fused MoE+AR local allocation failed; disabling.")

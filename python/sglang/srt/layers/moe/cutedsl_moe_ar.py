@@ -103,6 +103,13 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # Fused-path kernel config (validated in moe_ar_notes runs 5-10 at mma_n=128;
 # mma_n=256 is the tactic-sweep fc2 winner and is validated end-to-end by
 # human_tools/moe_ar_integration_bench.py — env knob kept for fallback).
+# FINAL (integ_run4b, 4xB200 TP=4, Kimi-K2.6 shard @M=16384): epilogue-reg
+# sweep showed the kernel's 216-reg epilogue default is NOT the bottleneck —
+# raising num_regs_epilogue_warps to 240/256 was within noise (1767.9/1766.0
+# vs 1767.2us view-mode default) and 2 AR warps regressed (1813.8us). Defaults
+# below are locked as-shipped: (256,256) mma, (2,1) cluster, rasterM, blkred,
+# PDL, two_shot_overlap, 4 AR warps, v1_reg_alloc. View-return (serve lever,
+# TBO off) 1767.2us vs copy-out 1823.5 vs trtllm+NCCL-AR 2209.8 => ~443us/layer.
 _TILE_SIZE = 256
 _SF_VEC_SIZE = 16
 _GEMM1_MMA = (256, 256)

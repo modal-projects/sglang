@@ -54,17 +54,23 @@ disables, rank-symmetrically via an all_reduce vote) at startup instead of
 mid-serving. Local allocation happens before any collective so a single-rank
 OOM cannot strand peers inside a rendezvous.
 
-Per-rank extra memory (Kimi-K2.6 TP=4, max_num_tokens=16384): symmetric fc2
-output 16384 x 7168 bf16 = 224MB + flag buffer (1 page) + multicast mappings,
-all outside the torch caching allocator. The CuteDslMoEWrapper preallocs
-(~292MB: 224MB moe_output + ~66MB gemm1 out/scale + sort buffers) are stock
-cutedsl costs, unchanged.
+Per-rank PINNED extra memory (Kimi-K2.6 TP=4, max_num_tokens=16384):
+symmetric fc2 output 16384 x 7168 bf16 = 224MB + per-bucket flag regions
+(~2.5KB each) + multicast mappings, outside the torch caching allocator;
+plus ~2MB of persistent moe_sort index buffers (torch allocator). The gemm1
+output/scale buffers are per-call TRANSIENTS from the caching allocator
+(<= ~66MB peak at the 16k bucket) that time-share the residual HBM slice —
+the fused path no longer requires the CuteDslMoEWrapper CUDA-graph preallocs.
 
-Grid-size invariant: the AR kernel's flag-buffer layout is derived from the
-launched grid size. Every fused launch uses the wrapper's constant-size
-preallocated gemm1 buffer as fc2's A operand (m = max_permuted rows), so the
-persistent grid is always the full device and the layout never moves. The
-warmup launch goes through the same path. ``run_fused_ar`` asserts this.
+Grid-size invariant (bucketed): the AR kernel derives its flag-buffer layout
+from the launched grid at runtime; monotonic epoch flags require each flag
+REGION to only ever observe one grid size. num_tokens is bucketed on the
+host (rank-symmetric), each bucket has its own flag region, and within a
+bucket the fc2 A rows m_b = get_max_num_permuted_tokens(bucket, ...) is a
+host constant => constant grid per region. ``launch_fc2_ar`` asserts the
+per-bucket m. One compiled artifact serves all buckets (m and num_tokens
+are dynamic in the kernel wrapper signature); the eager warmup launches
+every bucket once to fail fast.
 
 Pinned stock-path tactics (see moe_tactics sweep, 2026-07-01): for
 ``num_tokens >= 512`` the stock ``CuteDslMoEWrapper.run`` gets
@@ -117,6 +123,21 @@ _NUM_AR_WARPS = 4
 _PINNED_TACTIC = (256, ((256, 256), (2, 1), False), ((256, 256), (2, 1), True))
 _PIN_ENABLED = os.getenv("SGLANG_CUTEDSL_PIN_TACTIC", "1" if _ENABLED else "0") == "1"
 _PIN_MIN_TOKENS = int(os.getenv("SGLANG_CUTEDSL_PIN_TACTIC_MIN_TOKENS", "512"))
+
+# Token buckets for the bucketed flag regions (see _FusedMoeArState). The
+# state clips this list to max_num_tokens and always appends max_num_tokens.
+_BUCKETS = tuple(
+    int(x)
+    for x in os.getenv(
+        "SGLANG_CUTEDSL_FUSED_AR_BUCKETS", "2048,4096,8192"
+    ).split(",")
+    if x.strip()
+)
+# Fallback: compile one artifact per bucket instead of relying on dynamic-m
+# reuse of a single compiled kernel (1-2 min extra startup per bucket).
+_COMPILE_PER_BUCKET = (
+    os.getenv("SGLANG_CUTEDSL_FUSED_AR_COMPILE_PER_BUCKET", "0") == "1"
+)
 
 _state: Optional["_FusedMoeArState"] = None
 _state_failed = False
@@ -217,27 +238,79 @@ class _FusedMoeArState:
     collective parts (symmetric-memory rendezvous, compile, warmup launch)
     live in collective_init() so a single-rank local failure can be voted on
     before any rank enters a collective.
+
+    Bucketed-flag redesign (kimi-v2): the AR kernel derives its flag-buffer
+    layout from the launched grid at RUNTIME, and monotonic flags (per-N-column
+    epoch flags + per-CTA epoch slots) require that any given flag REGION only
+    ever observes one grid size. Instead of forcing one constant fc2 m for all
+    launches (the old design, which required the wrapper's permanently
+    preallocated max-shape gemm1 buffers), we bucket num_tokens on the host
+    (rank-symmetric by construction) and give each bucket its own flag region:
+    per bucket the fc2 A-buffer row count m_b = get_max_num_permuted_tokens(
+    bucket, top_k, num_local_experts, tile) is a host constant, so the grid is
+    constant per region. The gemm1 output/scale buffers are then allocated
+    per-call from the torch caching allocator (transients that time-share the
+    residual HBM slice) instead of living forever; the only pinned cost is the
+    symmetric fc2 output (max_tokens x hidden bf16), the tiny flag buffer and
+    ~2MB of moe_sort index buffers.
     """
 
-    def __init__(self, group, hidden_size: int, max_num_tokens: int, device):
+    def __init__(
+        self,
+        group,
+        hidden_size: int,
+        max_num_tokens: int,
+        device,
+        top_k: int,
+        num_experts: int,
+        num_local_experts: int,
+        intermediate_size: int,
+    ):
         import torch.distributed._symmetric_memory as symm_mem
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            allocate_moe_sort_buffers,
+            get_max_num_permuted_tokens,
+        )
 
         self.group = group
         self.world_size = group.world_size
         self.rank = group.rank_in_group
         self.hidden = hidden_size
         self.device = device
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.intermediate_size = intermediate_size
         # padded so any num_tokens <= max_num_tokens can be padded up to a
         # multiple of world_size while staying in-buffer
         self.max_tokens = _round_up(max_num_tokens, 128)
 
+        # ---- token buckets (host-deterministic, rank-symmetric) ----
+        # Each bucket gets its own flag region; within a bucket every launch
+        # uses the same fc2 m (= worst-case permuted rows for the bucket's
+        # token count), so the persistent grid is constant per region.
+        buckets = sorted(
+            {b for b in _BUCKETS if b < self.max_tokens} | {self.max_tokens}
+        )
+        self.buckets = [b for b in buckets if b <= self.max_tokens]
+        self.bucket_m = [
+            get_max_num_permuted_tokens(
+                b, top_k, num_local_experts, _TILE_SIZE
+            )
+            for b in self.buckets
+        ]
+
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.num_sms = num_sms
-        # Flag layout (see kernel): [0..7] v0 slots, go [8, 8+nCTA),
+        # Per-bucket flag region (see kernel): [0..7] v0 slots, go [8, 8+nCTA),
         # DONE [8+nCTA, 8+2nCTA), v1 column counters [8+2nCTA, +n_blocks),
         # v1 column flags [+n_blocks), per-CTA epoch slots [+nCTA).
-        # nCTA <= num_sms, n_blocks <= hidden/128. +64 slack.
-        self.num_flags = 8 + 3 * num_sms + 2 * (hidden_size // 128) + 64
+        # nCTA <= num_sms, n_blocks <= hidden/128. +64 slack; rounded to a
+        # 128B boundary so region base offsets stay aligned.
+        self.num_flags = _round_up(
+            8 + 3 * num_sms + 2 * (hidden_size // 128) + 64, 32
+        )
+        total_flags = self.num_flags * len(self.buckets)
 
         # ---- local allocations (may OOM -> caught before any collective) ----
         self.out_symm = symm_mem.empty(
@@ -245,9 +318,20 @@ class _FusedMoeArState:
         )
         self.out_symm.zero_()
         self.flags = symm_mem.empty(
-            (self.num_flags,), dtype=torch.int32, device=device
+            (total_flags,), dtype=torch.int32, device=device
         )
         self.flags.zero_()
+
+        # moe_sort index buffers, sized for the largest bucket (~2MB; kept
+        # persistent — outputs are index maps reused by both GEMMs).
+        self.sort_buffers = allocate_moe_sort_buffers(
+            num_tokens=self.max_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            tile_tokens_dim=_TILE_SIZE,
+            device=str(device),
+        )
 
         self.aux_stream = torch.cuda.Stream(device=device)
         self.main_event = torch.cuda.Event()
@@ -256,9 +340,38 @@ class _FusedMoeArState:
         self._out_mc_ptr: Optional[int] = None
         self._flags_mc_ptr: Optional[int] = None
         self._kernel = None
-        self._compiled = None
+        # single compiled artifact (m/num_tokens are dynamic Int64 in the
+        # kernel wrapper signature); per-bucket compile available as a
+        # fallback via SGLANG_CUTEDSL_FUSED_AR_COMPILE_PER_BUCKET=1.
+        self._compiled: dict = {}
         self._max_active_clusters = None
-        self._m_expected: Optional[int] = None
+        # per-bucket constant-m book-keeping (grid constancy per flag region)
+        self._m_expected: dict = {}
+
+    def bucket_index(self, num_tokens: int) -> Optional[int]:
+        for i, b in enumerate(self.buckets):
+            if num_tokens <= b:
+                return i
+        return None
+
+    def alloc_gemm1_transients(self, bucket_idx: int):
+        """Per-call gemm1 output/scale from the caching allocator (fp4 packed).
+
+        Sized for the bucket's worst-case permuted rows so the fc2 m (and thus
+        the grid seen by the bucket's flag region) is a per-bucket constant.
+        """
+        m_b = self.bucket_m[bucket_idx]
+        out = torch.empty(
+            (m_b, self.intermediate_size // 2),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        out_scale = torch.empty(
+            (m_b * (self.intermediate_size // _SF_VEC_SIZE),),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        return out, out_scale
 
     # ---- collective phase ----
 
@@ -316,6 +429,7 @@ class _FusedMoeArState:
         num_non_exiting_tiles: torch.Tensor,
         token_final_scales: torch.Tensor,
         num_tokens_pad: int,
+        bucket_idx: int,
     ) -> None:
         import cutlass
         import cutlass.cute as cute
@@ -334,14 +448,14 @@ class _FusedMoeArState:
         assert n == self.hidden
         assert num_tokens_pad % self.world_size == 0
         assert num_tokens_pad <= self.max_tokens
-        # The flag-buffer layout is a function of the launched grid size,
-        # which is a function of m (see module docstring). All launches on
-        # one flag buffer must use the same m.
-        if self._m_expected is None:
-            self._m_expected = m
-        assert m == self._m_expected, (
-            f"fused MoE+AR requires a constant fc2 A-buffer size "
-            f"(got m={m}, expected {self._m_expected})"
+        # The kernel derives its flag layout from the launched grid at
+        # runtime, and the monotonic (epoch/column) flags require that one
+        # flag REGION only ever observes one grid size. m is a per-bucket
+        # host constant by construction; assert it.
+        expected = self._m_expected.setdefault(bucket_idx, m)
+        assert m == expected, (
+            f"fused MoE+AR bucket {bucket_idx} requires a constant fc2 "
+            f"A-buffer size (got m={m}, expected {expected})"
         )
 
         def _i32ptr(t):
@@ -386,24 +500,34 @@ class _FusedMoeArState:
             num_tokens_pad,
             top_k,
         ]
+        # Per-bucket flag region: byte offset into the (unicast, multicast)
+        # symmetric flag buffer. Identical on every rank by construction
+        # (same bucket list, same region size).
+        flag_off = bucket_idx * self.num_flags * 4
         extra = dict(
             c_mc_ptr=make_ptr(
                 cutlass.BFloat16, self._out_mc_ptr, cute.AddressSpace.gmem,
                 assumed_align=16,
             ),
             barrier_flag_ptr=make_ptr(
-                cutlass.Int32, self.flags.data_ptr(), cute.AddressSpace.gmem,
+                cutlass.Int32,
+                self.flags.data_ptr() + flag_off,
+                cute.AddressSpace.gmem,
                 assumed_align=4,
             ),
             barrier_flag_mc_ptr=make_ptr(
-                cutlass.Int32, self._flags_mc_ptr, cute.AddressSpace.gmem,
+                cutlass.Int32,
+                self._flags_mc_ptr + flag_off,
+                cute.AddressSpace.gmem,
                 assumed_align=4,
             ),
             num_flags=self.num_flags,
         )
         stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-        if self._compiled is None:
-            self._compiled = cute.compile(
+        compile_key = bucket_idx if _COMPILE_PER_BUCKET else 0
+        compiled = self._compiled.get(compile_key)
+        if compiled is None:
+            compiled = cute.compile(
                 self._kernel.wrapper,
                 *args,
                 tile_size=_TILE_SIZE,
@@ -412,7 +536,8 @@ class _FusedMoeArState:
                 stream=stream,
                 **extra,
             )
-        self._compiled(*args, stream=stream, **extra)
+            self._compiled[compile_key] = compiled
+        compiled(*args, stream=stream, **extra)
 
 
 # ---------------------------------------------------------------------------
@@ -485,10 +610,10 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
             reason = "a2a backend is not none"
         elif is_tbo_enabled() or is_sbo_enabled():
             reason = "TBO/SBO enabled"
-        elif wrapper is None or not wrapper.use_cuda_graph:
-            # the constant-size preallocated gemm1 buffer is what keeps the
-            # fused kernel's grid (and thus flag layout) constant
-            reason = "CuteDslMoEWrapper prealloc buffers disabled"
+        elif wrapper is None:
+            # only needed for config values (top_k, expert partition, max
+            # tokens); the fused path no longer uses its prealloc buffers
+            reason = "CuteDslMoEWrapper missing"
         elif layer.hidden_size % 128 != 0:
             reason = f"hidden_size={layer.hidden_size} not a multiple of 128"
         elif layer.moe_runner_config.params_dtype != torch.bfloat16:
@@ -521,6 +646,10 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
                 hidden_size=layer.hidden_size,
                 max_num_tokens=wrapper.max_num_tokens,
                 device=torch.device(torch.cuda.current_device()),
+                top_k=wrapper.top_k,
+                num_experts=wrapper.num_experts,
+                num_local_experts=wrapper.num_local_experts,
+                intermediate_size=wrapper.intermediate_size,
             )
         ok = True
     except Exception:
@@ -554,11 +683,13 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
 
     _state = state
     logger.info(
-        "fused MoE+AR enabled: tp=%d hidden=%d max_tokens=%d "
-        "gemm2_mma=%s symm_out=%.0fMB flags=%d ints",
+        "fused MoE+AR enabled: tp=%d hidden=%d max_tokens=%d buckets=%s "
+        "bucket_m=%s gemm2_mma=%s symm_out=%.0fMB flags=%d ints",
         state.world_size,
         state.hidden,
         state.max_tokens,
+        state.buckets,
+        state.bucket_m,
         _GEMM2_MMA,
         state.max_tokens * state.hidden * 2 / 1e6,
         state.num_flags,
@@ -572,59 +703,65 @@ def _free_state(state: Optional[_FusedMoeArState]) -> None:
 
 
 def _warmup(state: _FusedMoeArState, layer, wrapper) -> None:
-    """One real fused launch through run_fused_ar on synthetic inputs.
+    """One real fused launch PER BUCKET through _run_fused_ar_impl.
 
-    Exercises rendezvous'd buffers, the compile, and the full cross-rank flag
-    protocol at startup. Inputs (routing especially) are seeded identically on
-    all ranks; the actual values are irrelevant.
+    Exercises rendezvous'd buffers, the compile, every bucket's flag region
+    and the reuse of the single compiled artifact across bucket m values at
+    startup (fail-fast; every rank runs this in lockstep). Inputs (routing
+    especially) are seeded identically on all ranks; the values are
+    irrelevant.
     """
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     device = state.device
-    num_tokens = max(_MIN_TOKENS, 1024)
-    cpu_gen = torch.Generator().manual_seed(20260701)
-    x = (
-        0.01 * torch.randn(num_tokens, layer.hidden_size, generator=cpu_gen)
-    ).to(device=device, dtype=torch.bfloat16)
-    topk_ids = torch.randint(
-        0,
-        layer.num_experts,
-        (num_tokens, wrapper.top_k),
-        dtype=torch.int32,
-        generator=cpu_gen,
-    ).to(device)
-    topk_weights = torch.softmax(
-        torch.randn(num_tokens, wrapper.top_k, generator=cpu_gen), dim=-1
-    ).to(device=device, dtype=torch.float32)
-
     w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-    x_fp4, x_sf = fp4_quantize(
-        x, layer._cutedsl_input_scale, sf_vec_size=_SF_VEC_SIZE,
-        is_sf_swizzled_layout=False,
-    )
-    out = _run_fused_ar_impl(
-        state=state,
-        wrapper=wrapper,
-        x_fp4=x_fp4,
-        x_sf=x_sf,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        w13_weight=layer.w13_weight,
-        w13_weight_sf=getattr(
-            layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
-        ),
-        w1_alpha=w1_alpha,
-        a2_scale=fc2_input_scale,
-        w2_weight=layer.w2_weight,
-        w2_weight_sf=getattr(
-            layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
-        ),
-        w2_alpha=w2_alpha,
-        seed=None,
-    )
-    torch.cuda.synchronize()
-    if not torch.isfinite(out.float().sum()):
-        raise RuntimeError("fused MoE+AR warmup produced non-finite output")
+    for bucket in state.buckets:
+        num_tokens = min(bucket, state.max_tokens)
+        cpu_gen = torch.Generator().manual_seed(20260701 + num_tokens)
+        x = (
+            0.01 * torch.randn(num_tokens, layer.hidden_size, generator=cpu_gen)
+        ).to(device=device, dtype=torch.bfloat16)
+        topk_ids = torch.randint(
+            0,
+            layer.num_experts,
+            (num_tokens, wrapper.top_k),
+            dtype=torch.int32,
+            generator=cpu_gen,
+        ).to(device)
+        topk_weights = torch.softmax(
+            torch.randn(num_tokens, wrapper.top_k, generator=cpu_gen), dim=-1
+        ).to(device=device, dtype=torch.float32)
+
+        x_fp4, x_sf = fp4_quantize(
+            x, layer._cutedsl_input_scale, sf_vec_size=_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+        out = _run_fused_ar_impl(
+            state=state,
+            wrapper=wrapper,
+            x_fp4=x_fp4,
+            x_sf=x_sf,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=layer.w13_weight,
+            w13_weight_sf=getattr(
+                layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+            ),
+            w1_alpha=w1_alpha,
+            a2_scale=fc2_input_scale,
+            w2_weight=layer.w2_weight,
+            w2_weight_sf=getattr(
+                layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+            ),
+            w2_alpha=w2_alpha,
+            seed=None,
+        )
+        torch.cuda.synchronize()
+        if not torch.isfinite(out.float().sum()):
+            raise RuntimeError(
+                f"fused MoE+AR warmup produced non-finite output "
+                f"(bucket={bucket})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -689,19 +826,27 @@ def _run_fused_ar_impl(
     from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (  # noqa: E501
         blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4,
     )
-    from flashinfer.fused_moe.cute_dsl.moe_utils import (
-        moe_output_memset_inplace,
-        moe_sort,
-    )
+    from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+
+    try:
+        # flashinfer >= 0.6.12 (cudaMemsetAsync; ~2-3us cheaper per call)
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+    except ImportError:  # flashinfer 0.6.11: plain zero_ fill kernel
+        def moe_output_memset_inplace(t):
+            t.zero_()
 
     num_tokens = topk_ids.shape[0]
     pad = _round_up(num_tokens, state.world_size)
     assert pad <= state.max_tokens
+    bucket_idx = state.bucket_index(pad)
+    assert bucket_idx is not None
     if topk_weights.dtype != torch.float32:
         topk_weights = topk_weights.to(torch.float32)
 
-    # Step 1: moe_sort at the pinned tile size, into the wrapper's
-    # constant-size preallocated buffers (=> constant fc2 m / grid size).
+    # Step 1: moe_sort at the pinned tile size, into the state's persistent
+    # (max-bucket-sized) index buffers.
     (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
@@ -712,12 +857,12 @@ def _run_fused_ar_impl(
     ) = moe_sort(
         token_selected_experts=topk_ids,
         token_final_scales=topk_weights,
-        num_experts=wrapper.num_experts,
-        top_k=wrapper.top_k,
+        num_experts=state.num_experts,
+        top_k=state.top_k,
         local_expert_offset=wrapper.local_expert_offset,
-        num_local_experts=wrapper.num_local_experts,
+        num_local_experts=state.num_local_experts,
         tile_tokens_dim=_TILE_SIZE,
-        **(wrapper._moe_sort_buffers or {}),
+        **state.sort_buffers,
     )
 
     active = state.out_symm[:num_tokens]
@@ -727,7 +872,10 @@ def _run_fused_ar_impl(
         seed.record_stream(state.aux_stream)
 
     # Step 2: GEMM1 + SwiGLU (pinned tactic), overlapped with the aux-stream
-    # seed-copy/zero of the output slice below.
+    # seed-copy/zero of the output slice below. Output/scale are per-call
+    # TRANSIENTS from the caching allocator, sized for the bucket's
+    # worst-case permuted rows (=> per-bucket-constant fc2 m / grid size).
+    gemm1_out, gemm1_out_scale = state.alloc_gemm1_transients(bucket_idx)
     intermediate, intermediate_sf = (
         blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
             a=x_fp4,
@@ -739,10 +887,10 @@ def _run_fused_ar_impl(
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
-            out=wrapper._gemm1_output,
-            out_scale=wrapper._gemm1_output_scale,
+            out=gemm1_out,
+            out_scale=gemm1_out_scale,
             global_scale=a2_scale,
-            topk=wrapper.top_k,
+            topk=state.top_k,
             c_dtype="float4_e2m1fn",
             mma_tiler_mn=_GEMM1_MMA,
             cluster_shape_mn=_GEMM1_CLUSTER,
@@ -777,6 +925,7 @@ def _run_fused_ar_impl(
         num_non_exiting_tiles=num_non_exiting_tiles,
         token_final_scales=topk_weights,
         num_tokens_pad=pad,
+        bucket_idx=bucket_idx,
     )
 
     if _RETURN_VIEW:

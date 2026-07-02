@@ -1757,6 +1757,13 @@ class DeepseekV2AttentionMLA(
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
 
+        # DCP q-replication (SGLANG_DCP_REPLICATE_Q): full-head bf16 replicas
+        # of the q_b_proj weight and w_kc, all-gathered across the DCP group
+        # once after weight load (build_dcp_qrep_weights). None when inactive;
+        # forward_mla gates the replicated-q path on q_b_proj_dcp presence.
+        self.q_b_proj_dcp = None
+        self.w_kc_dcp = None
+
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
@@ -2012,6 +2019,119 @@ class DeepseekV2AttentionMLA(
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
+
+    def _dequant_q_b_weight_bf16(self) -> Optional[torch.Tensor]:
+        """Local q_b_proj weight shard as a bf16 [local_out, q_lora_rank] tensor.
+
+        Handles the layouts q_b_proj can be in when ``post_load_weights`` runs:
+        - bf16 (unquantized checkpoints, and the online-FP8 patch: online
+          quantization happens later, in the quant method's
+          process_weights_after_loading, so the weight is still bf16 here);
+        - fp8 block-quantized (serialized fp8 checkpoints /
+          SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN): dequant via block_quant_dequant;
+        - fp8 with per-channel / per-tensor weight_scale: multiply out.
+
+        Returns None for unsupported layouts (AWQ/mxfp4-packed etc.), which
+        disables DCP q-replication for this layer.
+        """
+        from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+        w = getattr(self.q_b_proj, "weight", None)
+        if w is None:
+            return None
+        if w.dtype == torch.bfloat16:
+            return w
+        if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            scale = getattr(self.q_b_proj, "weight_scale_inv", None)
+            if scale is None:
+                scale = getattr(self.q_b_proj, "weight_scale", None)
+            if scale is None:
+                return None
+            if scale.dim() == 2 and 1 < scale.shape[1] < w.shape[1]:
+                # blockwise: [ceil(out / block_n), ceil(in / block_k)]
+                quant_cfg = getattr(self.q_b_proj.quant_method, "quant_config", None)
+                block_size = getattr(quant_cfg, "weight_block_size", None) or [128, 128]
+                return block_quant_dequant(w, scale, block_size, torch.bfloat16)
+            w_bf16 = w.to(torch.bfloat16)
+            if scale.numel() == w.shape[0]:
+                # per-out-channel
+                return w_bf16 * scale.to(torch.bfloat16).view(-1, 1)
+            if scale.numel() == 1:
+                # per-tensor
+                return w_bf16 * scale.to(torch.bfloat16)
+        return None
+
+    def build_dcp_qrep_weights(self) -> None:
+        """Materialize full-head replicas of q_b_proj / w_kc for DCP q-replication.
+
+        Called from ``post_load_weights`` (after w_kc/w_vc are derived from
+        kv_b_proj). All-gathers the head-sharded ColumnParallel shards across
+        the DCP group along the head/output dim. The DCP group is a contiguous
+        slice of TP ranks (parallel_state: ``tp_group[start:start+dcp]``), so
+        rank-order concatenation reproduces exactly the head order that
+        ``all_gather_q_for_mla_decode`` produces and that the
+        ``cp_lse_ag_out_mla`` head slice assumes.
+
+        Replicas are kept in bf16 (fp8 shards are dequantized first): the
+        replicated q_b GEMM and absorb bmm only run at decode/verify batch
+        sizes where bf16 is cheap, and this keeps the path independent of the
+        local shards' (possibly online-fp8-quantized) layout.
+
+        This performs COLLECTIVES on the DCP group: every rank must call it
+        for the same layers in the same order.
+        """
+        if not (dcp_enabled() and envs.SGLANG_DCP_REPLICATE_Q.get()):
+            return
+        if self.q_lora_rank is None or self.w_kc is None:
+            return
+        if self.use_deep_gemm_bmm:
+            logger.warning(
+                "SGLANG_DCP_REPLICATE_Q is not supported with the DeepGEMM "
+                "masked-bmm path (fp8 block-scaled w_kc); falling back to the "
+                "per-layer q all-gather for layer %s.",
+                self.layer_id,
+            )
+            return
+
+        w_kc = self.w_kc
+        if w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            w_scale = self.w_scale if self.w_scale is not None else 1.0
+            w_kc = w_kc.to(torch.bfloat16) * w_scale
+        elif w_kc.dtype != torch.bfloat16:
+            w_kc = w_kc.to(torch.bfloat16)
+
+        q_b = self._dequant_q_b_weight_bf16()
+        if q_b is None:
+            logger.warning(
+                "SGLANG_DCP_REPLICATE_Q: unsupported q_b_proj weight layout "
+                "(dtype=%s); falling back to the per-layer q all-gather for "
+                "layer %s.",
+                getattr(getattr(self.q_b_proj, "weight", None), "dtype", None),
+                self.layer_id,
+            )
+            return
+
+        from sglang.srt.distributed.parallel_state import get_dcp_group
+
+        dcp_group = get_dcp_group()
+        # Head/output dim is dim 0 for both tensors; rank-order concat ==
+        # gathered-q head order (see docstring).
+        w_kc_full = dcp_group.all_gather(w_kc.contiguous(), dim=0)
+        q_b_full = dcp_group.all_gather(q_b.contiguous(), dim=0)
+        # Match the local w_kc's bmm-friendly layout ([H, D_nope, D_lora] with
+        # the last two dims stored transposed), same as post_load_weights.
+        w_kc_full = w_kc_full.transpose(1, 2).contiguous().transpose(1, 2)
+
+        # Keep storage stable across reloads (RL weight updates) so captured
+        # CUDA graphs keep pointing at valid memory.
+        if self.w_kc_dcp is not None and self.w_kc_dcp.shape == w_kc_full.shape:
+            self.w_kc_dcp.copy_(w_kc_full)
+        else:
+            self.w_kc_dcp = w_kc_full
+        if self.q_b_proj_dcp is not None and self.q_b_proj_dcp.shape == q_b_full.shape:
+            self.q_b_proj_dcp.copy_(q_b_full)
+        else:
+            self.q_b_proj_dcp = q_b_full
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):

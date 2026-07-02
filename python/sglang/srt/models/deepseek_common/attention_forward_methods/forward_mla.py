@@ -235,6 +235,41 @@ class DeepseekMLAForwardMixin:
             attn_output_buf=attn_output_buf,
         )
 
+    def _dcp_qrep_active(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        """True when the replicated-q DCP decode/verify path should run.
+
+        ``q_b_proj_dcp`` is only materialized (build_dcp_qrep_weights) when
+        DCP + SGLANG_DCP_REPLICATE_Q were on at load; the mode condition here
+        must stay identical to the ``all_gather_q_for_mla_decode`` gate below
+        so the replicated path activates exactly where the gather would have.
+        """
+        return (
+            getattr(self, "q_b_proj_dcp", None) is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and dcp_enabled()
+            and envs.SGLANG_DCP_REPLICATE_Q.get()
+        )
+
+    def _run_q_b_proj(
+        self: DeepseekV2AttentionMLA, q: torch.Tensor, dcp_qrep: bool
+    ) -> torch.Tensor:
+        if dcp_qrep:
+            # Replicated full-head q_b: every DCP rank's heads computed
+            # locally (bf16 GEMM against the load-time dcp-gathered weight),
+            # replacing the per-layer q all-gather. Head order == gathered
+            # order (contiguous-TP-rank concat, see build_dcp_qrep_weights).
+            return torch.nn.functional.linear(q, self.q_b_proj_dcp).view(
+                -1,
+                self.q_b_proj_dcp.shape[0] // self.qk_head_dim,
+                self.qk_head_dim,
+            )
+        return self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -249,6 +284,17 @@ class DeepseekMLAForwardMixin:
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
+        )
+        # DCP q-replication: compute ALL gathered heads' q locally from the
+        # replicated q_b_proj/w_kc built at load, skipping the per-layer
+        # all_gather_q_for_mla_decode collective. Pure GEMM/rope -- no new
+        # collectives, CUDA-graph safe. Excluded from the fused-bmm and
+        # kv_b-LoRA paths (both assume local-head shapes/weights).
+        dcp_qrep = (
+            not fuse_bmm_attention
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and self._dcp_qrep_active(forward_batch)
         )
         q_lora = None
         topk_indices = None
@@ -350,9 +396,7 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                    q = self._run_q_b_proj(q, dcp_qrep)
                 # skip_topk (shared) layers carry no indexer weights in the
                 # checkpoint, so they must reuse the carried topk and never run
                 # the indexer. Do NOT widen this to `or prev_topk_indices is
@@ -378,7 +422,7 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self._run_q_b_proj(q, dcp_qrep)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -429,7 +473,14 @@ class DeepseekMLAForwardMixin:
 
                 _kvb_q = kv_b_lora_q_prepare(self, q_nope)
 
-            if self.use_deep_gemm_bmm:
+            if dcp_qrep:
+                # Replicated full-head absorb: plain bf16 bmm against the
+                # load-time dcp-gathered w_kc (fp8 variants were dequantized
+                # to bf16 when the replica was built). Identical math to the
+                # gathered path -- same weights, same inputs; only the GEMM
+                # reduction grouping differs.
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_dcp)
+            elif self.use_deep_gemm_bmm:
                 (
                     q_nope_val,
                     q_nope_scale,
@@ -566,11 +617,16 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
             ):
-                # if forward_batch.forward_mode is decode, gather q
-                q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                    q_nope_out=q_nope_out,
-                    q_pe=q_pe,
-                )
+                # if forward_batch.forward_mode is decode, gather q -- unless
+                # q was already computed for all gathered heads locally via
+                # the replicated q_b_proj/w_kc (dcp_qrep): rope above is
+                # per-position and head-independent, so the full-head local
+                # q_pe/q_nope_out are exactly what the gather would return.
+                if not dcp_qrep:
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(

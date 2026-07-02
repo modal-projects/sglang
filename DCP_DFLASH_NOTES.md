@@ -183,6 +183,63 @@ runtime — the backend fails fast at init if the installed wheel lacks
   torchrun ar-vs-rs parity to bf16 tolerance (decode- and verify-shaped
   inputs, empty-shard rank included).
 
+### 3c. q replication — kill the per-layer q all-gather (`SGLANG_DCP_REPLICATE_Q`)
+- Motivation: profiled as the largest DCP collective —
+  `all_gather_q_for_mla_decode` runs once per layer per decode/verify step
+  (61 layers × up to ~3.5 MB bf16 at bs=6 verify on Kimi K2.6 dcp=4).
+- Idea (Helix `--dcp-replicate-q-proj`): each rank already has the
+  replicated `q_a` input (everything upstream of `q_b_proj` is replicated
+  across TP), so give it the FULL `q_b_proj` weight and FULL `w_kc` and let
+  it compute all `H_gathered = local_H * dcp` heads' absorbed q locally —
+  no gather at all. Downstream unchanged: attention still returns
+  gathered-head partials and `cp_lse_ag_out_mla` still slices this rank's
+  heads.
+- Build (`DeepseekV2AttentionMLA.build_dcp_qrep_weights`, called from
+  `deepseek_weight_loader.post_load_weights` right after w_kc/w_vc are
+  derived): all-gather the head-sharded ColumnParallel shards across the
+  DCP group along the head/output dim. The DCP group is a CONTIGUOUS slice
+  of TP ranks (`parallel_state`: `tp_group[start:start+dcp]`), so
+  rank-order concat == the head order `all_gather_q_for_mla_decode`
+  produces == the order the merge head-slice assumes. `post_load_weights`'
+  layer loop is now `sorted(layer_ids)` because the build is a collective.
+- Replicas are **bf16 always**, including under the online-FP8 patch:
+  at `post_load_weights` time online-fp8 hasn't quantized `q_b_proj` yet
+  (that happens later in the quant method's process_weights_after_loading),
+  so the bf16 weight is gathered as-is; serialized-fp8 checkpoints are
+  dequantized first (blockwise via `block_quant_dequant`, per-channel /
+  per-tensor via scale multiply); fp8 `w_kc` via `w_kc.to(bf16) * w_scale`.
+  The decode/verify q_b GEMM + absorb bmm at these batch sizes are cheap in
+  bf16, and this keeps the path independent of the local shards' layout.
+  DeepGEMM masked-bmm (`use_deep_gemm_bmm`) layers skip qrep with a warning.
+- Forward (`forward_mla.forward_absorb_prepare`): `dcp_qrep` active iff the
+  replicas exist ∧ decode/target-verify ∧ dcp ∧ env flag (identical mode
+  gate to the gather it replaces) ∧ not fused-bmm ∧ not kv_b-LoRA. Then:
+  `F.linear(q, q_b_proj_dcp)` -> split nope/rope -> bf16
+  `bmm(q_nope, w_kc_dcp)` -> rope (per-position, head-independent — roping
+  64 heads locally is exactly what the gathered 4×16-head q would contain;
+  under the trtllm fused-rope path both variants pass un-roped q and the
+  backend ropes per position) -> gather SKIPPED. Verify
+  (`_forward_target_verify_dcp`) consumes the same `[tokens, H_gathered,·]`
+  q via `attn_mqa_for_dcp_decode` — zero backend changes.
+- CUDA-graph: pure GEMM/rope, no collectives; replicas built once at load
+  (storage kept stable across RL reloads via copy_-if-same-shape).
+- Numerics: same weights, same inputs; only the GEMM reduction grouping
+  differs (full-K matmul vs sharded matmul + gather). Not bitwise, bf16-
+  equivalent.
+- **Memory price** (Kimi K2.6: q_lora 1536, 64 heads, qk_head 192, nope 128,
+  kv_lora 512, 61 layers): q_b full = 1536×12288 bf16 = 36 MiB/layer,
+  w_kc full = 64×128×512 bf16 = 8 MiB/layer → 44 MiB × 61 =
+  **2.62 GiB extra per rank** (the local shards stay). Allocated during
+  weight load, i.e. BEFORE KV-pool sizing, so mem-fraction accounting
+  auto-shrinks the KV pool rather than OOMing — but at mem-fraction 0.92
+  with the ~5.9 GiB draft-pool headroom precedent this is real KV capacity
+  lost. `SGLANG_DCP_REPLICATE_Q=0` restores the per-layer q all-gather.
+  (Possible follow-up: keep the q_b replica fp8 to halve it.)
+- Unit test: `test/registered/dcp/test_dcp_qrep_unit.py` — 4-GPU torchrun
+  (merge-test bootstrap): load-time weight-gather == full weight bitwise,
+  replicated-vs-gathered path parity with rope, and a head-stamp ordering
+  proof (head h outputs exactly h+1 in both paths).
+
 ### 4. Idle / edge paths
 - IDLE: model-side gather/merge conditions exclude idle (mirrors the
   flashinfer DCP path); backend metadata build treats idle like decode
@@ -245,6 +302,15 @@ runtime — the backend fails fast at init if the installed wheel lacks
    at production batch sizes, and that verify-mode message sizes
    (bs·8·H·D·2 B) stay under the 16 MB v2 max where the win matters.
 
+10. **q replication (`SGLANG_DCP_REPLICATE_Q`, default on).** (a) 2.62 GiB
+    less KV headroom per rank on Kimi K2.6 — check pool size / throughput
+    after load; (b) the load-time DCP all-gather assumes every rank calls
+    `build_dcp_qrep_weights` for the same layers in the same order (loop is
+    sorted; partial RL reloads with differing weight_names across ranks
+    would deadlock); (c) A/B decode/verify output parity + accept length vs
+    `SGLANG_DCP_REPLICATE_Q=0`, and confirm in a trace that the per-layer q
+    all-gather is gone.
+
 ## GPU validation checklist
 
 - [ ] Launch: `--attention-backend tokenspeed_mla --kv-cache-dtype fp8_e4m3
@@ -266,3 +332,7 @@ runtime — the backend fails fast at init if the installed wheel lacks
       accept length, and per-layer merge latency in a trace (expect the two
       ring-LL NCCL kernels replaced by one custom-AR kernel).
 - [ ] `test/registered/dcp/test_dcp_merge_ar_unit.py` on a 4-GPU node.
+- [ ] q-rep A/B: `SGLANG_DCP_REPLICATE_Q=1` vs `=0` — temp=0 output parity,
+      accept length, KV pool size after load, and trace showing the
+      per-layer `all_gather_q_for_mla_decode` eliminated.
+- [ ] `test/registered/dcp/test_dcp_qrep_unit.py` on a 4-GPU node.

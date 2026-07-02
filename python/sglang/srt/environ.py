@@ -611,6 +611,16 @@ class Envs:
     # fp32 -- factors are <= 1 and the o_proj consumer is bf16, so this is
     # acceptable; keep the flag for runtime A/B parity checks.
     SGLANG_DCP_MERGE_AR = EnvBool(True)
+    # DCP MLA decode/verify q computation ("q replication"). True (default):
+    # each rank keeps a replicated bf16 copy of the FULL q_b_proj weight and
+    # w_kc (all-gathered across the DCP group once at weight load) and
+    # computes every gathered head's absorbed q locally, eliminating the
+    # per-layer all_gather_q_for_mla_decode collective (the largest DCP
+    # collective in decode/verify profiles). Price: extra bf16 weight memory
+    # of q_lora_rank*heads*qk_head_dim + heads*qk_nope*kv_lora per layer --
+    # ~2.6 GiB/rank for Kimi K2.6 geometry at 61 layers (see
+    # DCP_DFLASH_NOTES.md). Set to 0/false to fall back to the q all-gather.
+    SGLANG_DCP_REPLICATE_Q = EnvBool(True)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

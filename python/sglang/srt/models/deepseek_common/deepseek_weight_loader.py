@@ -498,7 +498,9 @@ class DeepseekV2WeightLoaderMixin:
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
-        for layer_id in layer_ids:
+        # Deterministic order: build_dcp_qrep_weights below issues DCP-group
+        # collectives, so every rank must visit layers in the same order.
+        for layer_id in sorted(layer_ids):
             self_attn = (
                 self.model.layers[layer_id].self_attn
                 if not is_nextn
@@ -683,6 +685,13 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+            # DCP q-replication: build the full-head q_b_proj / w_kc replicas
+            # (collective over the DCP group; every rank reaches here for the
+            # same layer_ids in the same order). No-op unless DCP is enabled
+            # and SGLANG_DCP_REPLICATE_Q is on.
+            if hasattr(self_attn, "build_dcp_qrep_weights"):
+                self_attn.build_dcp_qrep_weights()
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):

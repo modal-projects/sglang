@@ -798,19 +798,39 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        # NOTE: ack_load_queue membership is rank-identical (start_loading is
+        # driven by the deterministic scheduler), so skipping the sync on an
+        # empty queue is rank-consistent — same convention as writing_check.
+        if len(self.cache_controller.ack_load_queue) == 0:
+            return
+
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
-            # no need to sync across TP workers as batch forwarding is synced
+
+        # The acks below dec_lock_ref() the loaded prefix, moving it from
+        # protected to evictable. evictable_size_ feeds prefill admission
+        # (PrefillAdder.rem_total_tokens) on every scheduler rank
+        # independently; acking on rank-local DMA completion lets ranks
+        # diverge on admit-vs-NO_TOKEN for the same request -> divergent
+        # batches -> mismatched collectives -> distributed hang. Keep the
+        # transition rank-identical with the same MIN reduction
+        # writing_check() uses. MIN guarantees every acked event is already
+        # complete locally, so synchronize() below is a no-op safeguard.
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
+        finish_count = int(queue_size.item())
+
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def evictable_size(self):
         return self.evictable_size_

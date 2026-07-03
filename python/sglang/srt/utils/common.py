@@ -1393,6 +1393,48 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def token_ids_to_wire(ids: Optional[array]) -> Optional[Union[array, "np.ndarray"]]:
+    """Convert an ``array("q")`` of token ids into a compact ndarray for IPC.
+
+    Token ids cross two pickle boundaries per request (tokenizer_manager ->
+    scheduler zmq, then scheduler rank-0 -> peer ranks ``broadcast_pyobj``).
+    ``array("q")`` pickles through a per-element machine-format codec
+    (~0.28 ms dumps / ~0.37 ms loads for ~95k ids), while an ndarray pickles
+    via its raw buffer (~0.03 / ~0.01 ms) — and int32 additionally halves the
+    wire + gloo-broadcast payload. Values are always bit-preserved: int32 is
+    used only when the value range provably fits (token ids < vocab size
+    always do); anything else stays int64.
+
+    Non-array inputs (None, lists from legacy callers) pass through unchanged.
+    The receiving side must rebuild with ``token_ids_from_wire`` — never pass
+    an ndarray to ``array("q", ...)`` directly (per-element numpy-scalar
+    iteration, ~7 ms for 95k ids).
+    """
+    if not isinstance(ids, array) or ids.typecode != "q":
+        return ids
+    a = np.frombuffer(ids, dtype=np.int64)
+    if a.size == 0 or (int(a.min()) >= 0 and int(a.max()) < np.iinfo(np.int32).max):
+        return a.astype(np.int32)
+    # Out-of-range ids (pathological but allowed upstream): keep exact int64.
+    # Copy so the wire object owns its buffer instead of viewing `ids`.
+    return a.copy()
+
+
+def token_ids_from_wire(ids) -> array:
+    """Inverse of ``token_ids_to_wire``: rebuild ``array("q")`` token ids.
+
+    ndarrays are converted with two C-speed buffer copies (astype + frombytes,
+    ~0.4 ms for 95k int32 ids). Lists/arrays fall through to the plain
+    ``array("q", ...)`` constructor, preserving its exact error semantics
+    (TypeError on non-ints, OverflowError on > 64-bit ints).
+    """
+    if isinstance(ids, np.ndarray):
+        out = array("q")
+        out.frombytes(memoryview(np.ascontiguousarray(ids, dtype=np.int64)).cast("B"))
+        return out
+    return array("q", ids)
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,

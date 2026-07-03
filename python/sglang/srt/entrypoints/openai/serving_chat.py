@@ -547,6 +547,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        from sglang.srt import iceberg_trace as _icb_trace
+
+        _icb_prep_t0 = time.perf_counter() if _icb_trace.ENABLED else 0.0
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -802,6 +805,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 if iceberg_trace.ENABLED:
                     iceberg_trace.stash(
+                        prep_ms=round((_icb_t0 - _icb_prep_t0) * 1000, 2),
                         render_ms=round((_icb_t1 - _icb_t0) * 1000, 2),
                         encode_ms=round((time.perf_counter() - _icb_t1) * 1000, 2),
                         chars=len(rendered_prompt),

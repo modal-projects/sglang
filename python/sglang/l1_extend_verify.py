@@ -28,6 +28,7 @@ import argparse
 import logging
 import multiprocessing
 import os
+from array import array
 
 import numpy as np
 import torch
@@ -56,14 +57,14 @@ CASES = [
 DECODE_STEPS = 4
 
 
-def _make_reqs(rid_base, token_ids_list, cut):
+def _make_reqs(rid_base, token_ids_list):
     sampling_params = SamplingParams(temperature=0, max_new_tokens=8)
     reqs = []
     for i, ids in enumerate(token_ids_list):
         req = Req(
             rid=rid_base + i,
             origin_input_text="",
-            origin_input_ids=ids[:cut] if cut else ids,
+            origin_input_ids=ids,
             sampling_params=sampling_params,
         )
         req.fill_ids = req.origin_input_ids
@@ -124,18 +125,16 @@ def _run_leg(mr, case, rng_ids, rid_base, use_translator):
     else:
         mr._extend_verify_translator = None
 
-    # 1) prefill the prefix (M = prefix_len > max_bs => always eager)
-    reqs = _make_reqs(rid_base, rng_ids, cut=None)
-    for i, (p_len, _m) in enumerate(case):
-        reqs[i].origin_input_ids = rng_ids[i][:p_len]
-        reqs[i].fill_ids = reqs[i].origin_input_ids
-        reqs[i].set_extend_input_len(p_len)
+    # 1) prefill the prefix (M = prefix_len > max_bs => always eager).
+    # Req.__init__ stores ids as array("q", ...) (buffer for np.frombuffer in
+    # prepare_for_extend) — never assign plain lists to fill_ids.
+    reqs = _make_reqs(rid_base, [ids[:p] for (p, _m), ids in zip(case, rng_ids)])
     _next, _logits, batch, _g = _run_extend(reqs, mr)
 
     # 2) prefix-extend by M tokens
     for i, (p_len, m) in enumerate(case):
         req = reqs[i]
-        req.fill_ids = rng_ids[i][: p_len + m]
+        req.fill_ids = array("q", rng_ids[i][: p_len + m])
         req.prefix_indices = mr.req_to_token_pool.req_to_token[
             req.req_pool_idx, :p_len
         ].to(torch.int64)

@@ -5,13 +5,21 @@ recompiles every kernel in every process (~15 s per decode q_len-bucket
 variant, 1-2 min per prefill variant), which multiplies into minutes of every
 cold boot. This module persists compiled kernels across processes/boots:
 
-  MISS: compile as usual -> ``JitCompiledFunction.dump_to_object(prefix)``
-        (ELF object: host launch entry + embedded cubin + encoded call-signature
-        metadata) -> atomic write ``<key>.o`` into the cache dir (an engine-cache
-        volume in deployments).
-  HIT:  ``cute.runtime.load_module(<key>.o)[prefix]`` reconstructs a
-        ``JitCompiledFunction`` with the identical call convention (metadata is
-        decoded from globals the dump embedded), loaded in-memory via JITLink.
+  MISS: compile as usual (tokenspeed kernels always compile with
+        ``--enable-tvm-ffi``, so ``cute.compile`` returns a
+        ``TVMFFIJitCompiledFunction``) -> ``fn.export_to_c(<key>.o,
+        function_name=<prefix>)`` (PIC ELF object: ``__tvm_ffi_<prefix>``
+        entry + host launch code + embedded cubin) -> atomic rename into the
+        cache dir (an engine-cache volume in deployments).
+  HIT:  ``cute.runtime.load_module(<key>.o, enable_tvm_ffi=True)[<prefix>]``
+        -> ``tvm_ffi.Function`` with the same call convention as the fresh
+        compile (fresh TVM-FFI functions themselves are exported to object
+        bytes and loaded through the same BinaryExecutionEngine/JITLink path
+        in-process, and the same mechanism serves tokenspeed_mla's bundled
+        binary prefill .so — this is the battle-tested route; the
+        metadata/JitCompiledFunction reload path is NOT drop-in for TVM-FFI
+        kernels because the env-stream annotation does not survive the
+        signature round-trip).
 
 Cache-key hygiene (the critical footgun: a stale AOT hit is a silently invalid
 experiment, because CuteDSL kernels are exactly what perf campaigns modify):
@@ -172,7 +180,7 @@ def _cached_compile(
     if os.path.exists(obj_path):
         try:
             t0 = time.perf_counter()
-            module = cute.runtime.load_module(obj_path)
+            module = cute.runtime.load_module(obj_path, enable_tvm_ffi=True)
             fn = module[prefix]
             _loaded_modules.append(module)
             logger.info(
@@ -196,11 +204,16 @@ def _cached_compile(
     compile_s = time.perf_counter() - t0
     try:
         t0 = time.perf_counter()
-        obj_bytes = fn.dump_to_object(prefix)
+        if not hasattr(fn, "_create_tvm_ffi_function"):
+            # Not a TVM-FFI compiled function; only the TVM-FFI export/load
+            # pair is validated, so skip persisting rather than risk it.
+            raise TypeError(f"not a TVM-FFI jit function: {type(fn).__name__}")
         os.makedirs(cache_dir, exist_ok=True)
-        tmp_path = f"{obj_path}.tmp.{os.getpid()}"
-        with open(tmp_path, "wb") as f:
-            f.write(obj_bytes)
+        # export_to_c infers format "o" from the extension; keep .o on the tmp
+        # name and atomically rename into place.
+        tmp_path = f"{obj_path}.tmp{os.getpid()}.o"
+        fn.export_to_c(tmp_path, function_name=prefix)
+        size = os.path.getsize(tmp_path)
         os.replace(tmp_path, obj_path)
         logger.info(
             "[cute-aot] MISS %s %s (compile %.1fs, dump %.2fs, %.2f MB, key %s)",
@@ -208,7 +221,7 @@ def _cached_compile(
             config_repr,
             compile_s,
             time.perf_counter() - t0,
-            len(obj_bytes) / 1e6,
+            size / 1e6,
             key[:16],
         )
     except Exception:

@@ -80,6 +80,25 @@ def log_mem_milestone(tag: str, gpu_id: int | None = None, tp_rank: int = 0) -> 
         logger.warning("[mem-milestone] %s failed: %s", tag, e)
 
 
+_last_periodic = 0.0
+
+
+def maybe_log_periodic_milestone(tag: str, gpu_id: int | None = None, tp_rank: int = 0):
+    """Time-throttled milestone line from the forward path (dark-growth
+    timeline through live traffic). No-op unless SGLANG_MEM_MILESTONES=1 AND
+    SGLANG_MEM_MILESTONES_INTERVAL_S > 0. Cost when armed: one monotonic
+    clock read per forward; one mem_get_info per interval."""
+    interval = envs.SGLANG_MEM_MILESTONES_INTERVAL_S.get()
+    if interval <= 0 or not mem_milestones_enabled():
+        return
+    global _last_periodic
+    now = time.monotonic()
+    if now - _last_periodic < interval:
+        return
+    _last_periodic = now
+    log_mem_milestone(tag, gpu_id, tp_rank)
+
+
 def _snapshot_dir() -> str:
     return envs.SGLANG_TORCH_MEM_HISTORY_DIR.get()
 

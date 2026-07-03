@@ -218,6 +218,7 @@ from sglang.srt.utils.common import ceil_align, require_mlp_sync
 from sglang.srt.utils.mem_milestones import (
     log_mem_milestone,
     maybe_dump_mem_snapshot,
+    maybe_log_periodic_milestone,
     maybe_start_torch_mem_history,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -3287,6 +3288,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+
+        maybe_log_periodic_milestone(
+            f"{'draft' if self.is_draft_worker else 'target'}"
+            f".fwd.{forward_batch.forward_mode.name}.bs{forward_batch.batch_size}"
+            f".tok{forward_batch.input_ids.numel()}",
+            self.gpu_id,
+            self.tp_rank,
+        )
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (experts_capturer := get_global_experts_capturer()) is not None:

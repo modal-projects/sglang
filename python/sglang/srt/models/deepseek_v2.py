@@ -393,6 +393,16 @@ class DeepseekV2MLP(nn.Module):
             silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
+        if not (should_allreduce_fusion or use_reduce_scatter):
+            # SGLANG_FUSED_MLP_AR=1: fold the TP all-reduce into the down_proj
+            # GEMM epilogue (two-shot multimem) on eager prefill-sized batches.
+            from sglang.srt.layers.fused_gemm_allreduce import (
+                maybe_fused_mlp_allreduce,
+            )
+
+            fused_out = maybe_fused_mlp_allreduce(self.down_proj, x)
+            if fused_out is not None:
+                return fused_out
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,

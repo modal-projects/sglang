@@ -73,6 +73,9 @@ _ENABLED = os.getenv("SGLANG_FUSED_OPROJ_AR", "0") == "1"
 _MIN_TOKENS = int(os.getenv("SGLANG_FUSED_OPROJ_AR_MIN_TOKENS", "1024"))
 _MAX_TOKENS = int(os.getenv("SGLANG_FUSED_OPROJ_AR_MAX_TOKENS", "16384"))
 _RETURN_VIEW = os.getenv("SGLANG_FUSED_OPROJ_AR_VIEW", "0") == "1"
+# Dense-layer MLP down_proj (layer 0 on Kimi) fused GEMM+AR; shares the symm C
+# buffer with the o_proj wrapper (zero marginal pinned HBM besides flags).
+_MLP_ENABLED = os.getenv("SGLANG_FUSED_MLP_AR", "0") == "1"
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 
 # Marker attribute set on the returned (already reduced) tensor; checked by
@@ -82,6 +85,30 @@ MARKER_ATTR = "_sglang_fused_oproj_ar_done"
 
 def _round_up(x: int, mult: int) -> int:
     return (x + mult - 1) // mult * mult
+
+
+# Shared symmetric-memory C buffer pool: one [max_m, n] buffer per
+# (group_name, max_m, n, dtype). Safe to time-share across fused-GEMM+AR
+# wrappers on the same stream: the kernel's final SM-wise inter-GPU barrier
+# guarantees peers' reads/writes of local C for launch N finish before launch
+# N ends on this rank, and a peer's launch N+1 sweep spins on ITS OWN flag
+# buffer (separate per wrapper) until this rank arrives. Flag buffers must NOT
+# be shared (parity/reset protocols are per wrapper).
+_SHARED_C = {}
+
+
+def _get_shared_c_symm(pg_group_name: str, max_m: int, n: int, dtype, device):
+    import torch.distributed._symmetric_memory as symm_mem
+
+    key = (pg_group_name, max_m, n, dtype)
+    entry = _SHARED_C.get(key)
+    if entry is None:
+        c_symm = symm_mem.empty((max_m, n), dtype=dtype, device=device)
+        c_symm.zero_()
+        handle = symm_mem.rendezvous(c_symm, group=pg_group_name)
+        entry = (c_symm, handle.multicast_ptr)
+        _SHARED_C[key] = entry
+    return entry
 
 
 class FusedGemmAllReduce:
@@ -101,6 +128,7 @@ class FusedGemmAllReduce:
         dtype: torch.dtype = torch.bfloat16,
         max_m: int = None,
         in_dtype: Optional[torch.dtype] = None,
+        stage_a: bool = True,
     ):
         """``dtype`` is the output (C) dtype; ``in_dtype`` the A/B operand dtype.
 
@@ -122,6 +150,11 @@ class FusedGemmAllReduce:
         self.in_dtype = in_dtype if in_dtype is not None else dtype
         assert self.in_dtype in (torch.bfloat16, torch.float8_e4m3fn)
         self.max_m = _round_up(max_m or _MAX_TOKENS, _TILE_M)
+        # stage_a=False skips the persistent A staging buffer (zero pinned A
+        # memory): per-call cute views over the caller's tensor instead, which
+        # requires M % _TILE_M == 0 (no padding possible) and costs a per-call
+        # from_dlpack. Used by the (once-per-forward) dense-MLP site.
+        self.stage_a = stage_a
 
         self.initialized = False
         self._compiled = None
@@ -160,16 +193,17 @@ class FusedGemmAllReduce:
         # pad ragged M up to the tile boundary; the copy is ~10us at M=16K).
         # In fp8 mode this doubles as the activation quant target (saturating
         # cast happens in the staging copy).
-        self._a_staging = torch.zeros(
-            self.max_m, self.k, dtype=self.in_dtype, device=device
+        if self.stage_a:
+            self._a_staging = torch.zeros(
+                self.max_m, self.k, dtype=self.in_dtype, device=device
+            )
+        else:
+            self._a_staging = None
+        # Symmetric-memory output buffer + multicast handle (SHARED across
+        # wrappers of the same group/shape — see _get_shared_c_symm).
+        self._c_symm, self._c_mc_ptr = _get_shared_c_symm(
+            pg.group_name, self.max_m, self.n, self.dtype, device
         )
-        # Symmetric-memory output buffer + multicast handle.
-        self._c_symm = symm_mem.empty(
-            (self.max_m, self.n), dtype=self.dtype, device=device
-        )
-        self._c_symm.zero_()
-        c_handle = symm_mem.rendezvous(self._c_symm, group=pg.group_name)
-        self._c_mc_ptr = c_handle.multicast_ptr
 
         # Double-buffered barrier flags: one i32 per CTA tile + one per SM for
         # the kernel's final SM-wise inter-GPU barrier.
@@ -227,16 +261,22 @@ class FusedGemmAllReduce:
             self._b_cache[weight.data_ptr()] = entry
         return entry[0]
 
+    def _make_a_cute(self, src: torch.Tensor, mpad: int):
+        # A: (M, K, L=1) K-major view over `src` (staging buffer or caller
+        # tensor in stage_a=False mode).
+        a3 = torch.as_strided(src, (mpad, self.k, 1), (self.k, 1, mpad * self.k))
+        a_cute = self._from_dlpack(a3, assumed_align=16).mark_layout_dynamic(
+            leading_dim=1
+        )
+        return a_cute, a3
+
     def _get_bundle(self, mpad: int):
         bundle = self._bundles.get(mpad)
         if bundle is None:
-            # A: (M, K, L=1) K-major view of the staging buffer.
-            a3 = torch.as_strided(
-                self._a_staging, (mpad, self.k, 1), (self.k, 1, mpad * self.k)
-            )
-            a_cute = self._from_dlpack(a3, assumed_align=16).mark_layout_dynamic(
-                leading_dim=1
-            )
+            if self.stage_a:
+                a_cute, a3 = self._make_a_cute(self._a_staging, mpad)
+            else:
+                a_cute, a3 = None, None  # built per call from the input tensor
             # C: (M, N, L=1) N-major view of the symmetric buffer (+ multicast).
             c3 = torch.as_strided(self._c_symm, (mpad, self.n, 1), (self.n, 1, 1))
             c_cute = self._from_dlpack(c3, assumed_align=16).mark_layout_dynamic(
@@ -281,13 +321,24 @@ class FusedGemmAllReduce:
         bf_cute, bf_mc_cute = self._flag_pairs[self._parity]
         self._parity ^= 1
 
-        if x.dtype == self.in_dtype:
-            self._a_staging[:m].copy_(x)
+        if self.stage_a:
+            if x.dtype == self.in_dtype:
+                self._a_staging[:m].copy_(x)
+            else:
+                # fp8 path fed bf16 activations: saturating per-tensor
+                # static-1.0 quant folded into the staging copy.
+                assert self.in_dtype == torch.float8_e4m3fn
+                self._a_staging[:m].copy_(torch.clamp(x, -448.0, 448.0))
         else:
-            # fp8 path fed bf16 activations: saturating per-tensor static-1.0
-            # quant folded into the staging copy (transient clamp buffer).
-            assert self.in_dtype == torch.float8_e4m3fn
-            self._a_staging[:m].copy_(torch.clamp(x, -448.0, 448.0))
+            # No staging: operate on the caller's tensor directly (padding is
+            # impossible, so M must already be tile-aligned).
+            assert m == mpad, f"stage_a=False needs M % {_TILE_M} == 0, got {m}"
+            if x.dtype != self.in_dtype:
+                assert self.in_dtype == torch.float8_e4m3fn
+                x = torch.clamp(x, -448.0, 448.0).to(self.in_dtype)
+            if not x.is_contiguous():
+                x = x.contiguous()
+            a_cute, _a3 = self._make_a_cute(x, mpad)
         stream = self._cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
         if self._compiled is None:
             from cutlass import cute
@@ -383,10 +434,14 @@ _FP8_ALPHA_CACHE = {}  # id(linear) -> (weight_nk, alpha)
 
 
 def _get_wrapper(
-    n: int, k: int, in_dtype: torch.dtype = torch.bfloat16
+    n: int,
+    k: int,
+    in_dtype: torch.dtype = torch.bfloat16,
+    stage_a: bool = True,
 ) -> Optional[FusedGemmAllReduce]:
-    if (n, k, in_dtype) in _WRAPPERS:
-        return _WRAPPERS[(n, k, in_dtype)]
+    key = (n, k, in_dtype, stage_a)
+    if key in _WRAPPERS:
+        return _WRAPPERS[key]
     wrapper = None
     try:
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -405,7 +460,9 @@ def _get_wrapper(
             and n % _TILE_N == 0
             and k % 64 == 0
         ):
-            wrapper = FusedGemmAllReduce(group, n, k, in_dtype=in_dtype)
+            wrapper = FusedGemmAllReduce(
+                group, n, k, in_dtype=in_dtype, stage_a=stage_a
+            )
         else:
             logger.info(
                 "SGLANG_FUSED_OPROJ_AR=1 but the fused o_proj GEMM+allreduce "
@@ -421,7 +478,7 @@ def _get_wrapper(
         logger.exception(
             "Failed to set up fused o_proj GEMM+allreduce; falling back."
         )
-    _WRAPPERS[(n, k, in_dtype)] = wrapper
+    _WRAPPERS[key] = wrapper
     return wrapper
 
 
@@ -499,7 +556,83 @@ def maybe_fused_oproj_allreduce(
         logger.exception(
             "Fused o_proj GEMM+allreduce initialization failed; disabling."
         )
-        _WRAPPERS[(n, k, in_dtype)] = None
+        _WRAPPERS[(n, k, in_dtype, True)] = None
         return None
     setattr(out, MARKER_ATTR, True)
     return out
+
+
+# ----------------------------------------------------------------------
+# dense-MLP down_proj glue (RowParallelLinear with reduce_results=True)
+# ----------------------------------------------------------------------
+
+
+def maybe_fused_mlp_allreduce(down_proj, x: torch.Tensor) -> Optional[torch.Tensor]:
+    """Fused replacement for ``down_proj(x)`` INCLUDING its internal TP
+    all-reduce (RowParallelLinear.reduce_results path, e.g. the Kimi layer-0
+    dense MLP). Returns the reduced [M, N] bf16 output or None to fall back.
+
+    Uses the attention-TP group (gated to equal the full TP group) so the
+    symmetric C buffer is shared with the o_proj wrapper — the site costs no
+    extra pinned HBM (stage_a=False: per-call A views, M must be tile-aligned).
+
+    Gates must stay rank-symmetric (M is identical across ranks at plain TP).
+    """
+    if not _MLP_ENABLED:
+        return None
+    if not isinstance(x, torch.Tensor) or x.dim() != 2 or x.dtype != torch.bfloat16:
+        return None
+    m = x.shape[0]
+    if m < _MIN_TOKENS or m > _MAX_TOKENS or m % _TILE_M != 0:
+        return None
+    if not getattr(down_proj, "reduce_results", False):
+        return None
+    if getattr(down_proj, "bias", None) is not None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+        from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+        # The MLP all-reduce runs over the FULL TP group; reuse the attn-TP
+        # group (and its shared symm buffer) only when they coincide.
+        if get_tensor_model_parallel_world_size() != get_attention_tp_group().world_size:
+            return None
+    except Exception:
+        return None
+
+    weight = getattr(down_proj, "weight", None)
+    if weight is None or not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        return None
+    alpha = 1.0
+    if weight.dtype == torch.bfloat16 and weight.is_contiguous():
+        weight_nk = weight
+        in_dtype = torch.bfloat16
+    elif weight.dtype == torch.float8_e4m3fn:
+        cached = _FP8_ALPHA_CACHE.get(id(down_proj))
+        if cached is None:
+            fp8 = _fp8_static_params(down_proj)
+            if fp8 is None:
+                return None
+            _FP8_ALPHA_CACHE[id(down_proj)] = fp8
+            cached = fp8
+        weight_nk, alpha = cached
+        in_dtype = torch.float8_e4m3fn
+    else:
+        return None
+    n, k = weight_nk.shape
+    if x.shape[1] != k:
+        return None
+
+    wrapper = _get_wrapper(n, k, in_dtype, stage_a=False)
+    if wrapper is None:
+        return None
+    try:
+        return wrapper(x, weight_nk, alpha=alpha)
+    except Exception:
+        if wrapper.initialized:
+            raise
+        logger.exception("Fused MLP GEMM+allreduce initialization failed; disabling.")
+        _WRAPPERS[(n, k, in_dtype, False)] = None
+        return None

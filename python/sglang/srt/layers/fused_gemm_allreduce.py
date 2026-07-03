@@ -529,6 +529,20 @@ def maybe_fused_oproj_allreduce(
     """
     if not _ENABLED:
         return None
+    # Piecewise CUDA graph: the CuteDSL fused GEMM+AR launcher (and the
+    # marker-attribute handshake with the communicator) cannot cross a dynamo
+    # trace — tracing the engaged branch crashes PCG compile, and a marker set
+    # inside a compiled region would be invisible to the traced consumer
+    # (silent double all-reduce). Captured extends are <= the PCG token
+    # ceiling where fusion is ~breakeven anyway; the true-eager >max-tokens
+    # path (16k chunks) keeps the fused win. Trace-stable on this fork:
+    # compiled callables run only under is_in_piecewise_cuda_graph()=True.
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
+        return None
     fm = forward_batch.forward_mode
     if (
         not fm.is_extend()
@@ -611,6 +625,14 @@ def maybe_fused_mlp_allreduce(down_proj, x: torch.Tensor) -> Optional[torch.Tens
     Gates must stay rank-symmetric (M is identical across ranks at plain TP).
     """
     if not _MLP_ENABLED:
+        return None
+    # See maybe_fused_oproj_allreduce: CuteDSL launcher + reduced-output
+    # semantics cannot cross a dynamo trace; disengage for compiled forwards.
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
         return None
     if not isinstance(x, torch.Tensor) or x.dim() != 2 or x.dtype != torch.bfloat16:
         return None

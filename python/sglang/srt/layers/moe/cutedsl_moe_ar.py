@@ -187,6 +187,23 @@ def moe_ar_should_engage(
     """
     if _state is None:
         return False
+    # Piecewise CUDA graph: the seed-stash/marker handshake is a Python side
+    # channel between the traced model region and the MoE custom op — dynamo
+    # defers the stash's global store to the graph epilogue, so a compiled
+    # forward would consume a STALE seed on the next same-shape chunk (silent
+    # shared-expert corruption) and the marker read would bake to False
+    # (double all-reduce). Disengage for compiled forwards; the MIN_TOKENS
+    # gate (4096 > PCG token ceiling 2048) already excludes captured buckets,
+    # this guard makes it explicit and ceiling-independent. True-eager
+    # >max-tokens forwards (16k chunks) keep the fused path. Trace-stable on
+    # this fork: compiled callables run only under
+    # is_in_piecewise_cuda_graph()=True.
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
+        return False
     if should_allreduce_fusion or use_reduce_scatter:
         # Downstream components expect an unreduced output to fuse/replace
         # the all-reduce themselves.

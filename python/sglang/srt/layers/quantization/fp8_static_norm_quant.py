@@ -43,6 +43,22 @@ def static_fp8_input_scale_of(linear) -> Optional[torch.Tensor]:
     """
     if not ENABLE_FP8_STATIC_NORM_QUANT or linear is None:
         return None
+    # Piecewise CUDA graph (dynamo-compiled paths): flashinfer's rmsnorm_quant
+    # falls back to the CuteDSL rmsnorm_quant_cute launcher for strided rows,
+    # which dynamo cannot trace (SymInt __imul__ graph break under
+    # fullgraph=True; PCG compile crash on kimi-bench-v2pcg 2026-07-02 — port
+    # of old-fork 6eb3305ce). On this fork the compiled callable executes ONLY
+    # under is_in_piecewise_cuda_graph() (install_torch_compiled trampoline
+    # dispatch) and true-eager forwards (16k chunks, decode capture, verify)
+    # only with it False, so this dynamic guard is trace-stable in both
+    # artifact families. PCG-captured extends are small-M where the fused
+    # norm+quant saves ~nothing; the eager >max-tokens path keeps SNQ.
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
+        return None
     weight = getattr(linear, "weight", None)
     if weight is None or weight.dtype != _FP8_DTYPE:
         return None

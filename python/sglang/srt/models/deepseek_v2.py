@@ -76,6 +76,7 @@ from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -180,6 +181,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -216,6 +218,28 @@ logger = logging.getLogger(__name__)
 # B200 (Kimi-K2.6, 384 experts): dsv3_router_gemm 9.78us vs F.linear 5.39us
 # at M=16 (1.9x WORSE); it only wins at M<=8. Env-overridable.
 DSV3_ROUTER_GEMM_MAX_M = int(os.environ.get("SGLANG_DSV3_ROUTER_GEMM_MAX_M", "8"))
+
+
+@register_custom_op(mutates_args=["aux_hidden_states"])
+@register_split_op()
+def dflash_pack_aux_hidden(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    aux_hidden_states: torch.Tensor,
+    start: int,
+    size: int,
+) -> None:
+    """In-place DFlash/EAGLE-3 aux-hidden packing: writes hidden+residual into
+    its slice of the packed [tokens, K*hidden] buffer with zero temporaries
+    (torch.add out= form). Registered as a mutable custom op AND a piecewise
+    split op so it runs eagerly between CUDA-graph pieces — dynamo cannot
+    trace out= into a non-contiguous slice, and inside a piece the mutation
+    would be auto_functionalized into a full-buffer clone."""
+    torch.add(
+        hidden_states,
+        residual,
+        out=aux_hidden_states[..., start : start + size],
+    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -2487,11 +2511,6 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_size = None
         num_aux_hidden_states = len(self.layers_to_capture)
         layers_to_capture = set(self.layers_to_capture)
-        # Scratch list the decoder layer appends its captured POST-allreduce
-        # residual to (via prepare_attn_and_capture_last_layer_outputs); the
-        # naive pre-layer `hidden_states + residual` read captured per-rank
-        # partial sums under flashinfer AR fusion (sgl-project/sglang#28343).
-        captured_last_layer_outputs: List[torch.Tensor] = []
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -2501,6 +2520,58 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                if i in layers_to_capture:
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        aux_hidden_state = get_attention_tp_group().all_gather(
+                            hidden_states + residual, dim=0
+                        )
+                        aux_hidden_size = int(aux_hidden_state.shape[-1])
+                        if aux_hidden_states is None:
+                            aux_hidden_states = aux_hidden_state.new_empty(
+                                (
+                                    *aux_hidden_state.shape[:-1],
+                                    aux_hidden_size * num_aux_hidden_states,
+                                )
+                            )
+                        start = aux_hidden_state_idx * aux_hidden_size
+                        aux_hidden_states[
+                            ..., start : start + aux_hidden_size
+                        ].copy_(aux_hidden_state)
+                    else:
+                        aux_hidden_size = int(hidden_states.shape[-1])
+                        if aux_hidden_states is None:
+                            aux_hidden_states = hidden_states.new_empty(
+                                (
+                                    *hidden_states.shape[:-1],
+                                    aux_hidden_size * num_aux_hidden_states,
+                                )
+                            )
+                        start = aux_hidden_state_idx * aux_hidden_size
+                        aux_hidden_slot = aux_hidden_states[
+                            ..., start : start + aux_hidden_size
+                        ]
+                        if residual is None:
+                            aux_hidden_slot.copy_(hidden_states)
+                        else:
+                            # In-place pack via a registered SPLIT op: dynamo
+                            # rejects torch.add(out=non-contiguous slice) when
+                            # traced directly (gb0242), and a mutable custom op
+                            # INSIDE a compiled piece would be
+                            # auto_functionalized (= full-buffer clone at
+                            # runtime; this fork's FixFunctionalizationPass
+                            # de-functionalizes nothing). As a split op it runs
+                            # eagerly between graph pieces — the original
+                            # zero-temp in-place form is preserved under eager,
+                            # PCG capture, and PCG replay alike (same pattern
+                            # as unified_attention_with_output).
+                            dflash_pack_aux_hidden(
+                                hidden_states,
+                                residual,
+                                aux_hidden_states,
+                                start,
+                                aux_hidden_size,
+                            )
+                    aux_hidden_state_idx += 1
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -2511,27 +2582,19 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
-                    captured_last_layer_outputs=(
-                        captured_last_layer_outputs
-                        if i in layers_to_capture
-                        else None
-                    ),
+                    # comp-PCG integration: aux capture stays on the PRE-layer
+                    # dflash_pack_aux_hidden split-op path (pcg-ts, zero-temp,
+                    # PCG-validated). The #28343 post-AR capture route below is
+                    # kept in the layer/communicator as the prereq-of-record for
+                    # flashinfer AR fusion, which this composite DISABLES
+                    # (--enforce-disable-flashinfer-allreduce-fusion; decode ws
+                    # verdict: fusion not shipped). With fusion off the two
+                    # routes are numerically identical; passing None here avoids
+                    # double-capture. If AR fusion is ever enabled, re-route
+                    # capture through captured_last_layer_outputs and drop the
+                    # pre-layer block.
+                    captured_last_layer_outputs=None,
                 )
-                if captured_last_layer_outputs:
-                    aux_hidden_state = captured_last_layer_outputs.pop()
-                    aux_hidden_size = int(aux_hidden_state.shape[-1])
-                    if aux_hidden_states is None:
-                        aux_hidden_states = aux_hidden_state.new_empty(
-                            (
-                                *aux_hidden_state.shape[:-1],
-                                aux_hidden_size * num_aux_hidden_states,
-                            )
-                        )
-                    start = aux_hidden_state_idx * aux_hidden_size
-                    aux_hidden_states[..., start : start + aux_hidden_size].copy_(
-                        aux_hidden_state
-                    )
-                    aux_hidden_state_idx += 1
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

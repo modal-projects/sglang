@@ -435,6 +435,18 @@ class Envs:
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
+    # tokenspeed_mla: route absorbed-MLA extends (e.g. under piecewise CUDA
+    # graphs) to the paged fp8 tokenspeed decode kernel at bucketed uniform
+    # q_len instead of the flashinfer MLA fallback (which casts the WHOLE
+    # per-layer KV pool fp8->bf16 on every forward).
+    SGLANG_TOKENSPEED_PADDED_EXTEND = EnvBool(False)
+    # Comma-separated q_len buckets for the padded-extend path. Each bucket is
+    # one CuteDSL JIT compile (~1-2 min, no disk cache) per process, so keep
+    # the list short. Must be multiples of 8 (fold factor), ascending.
+    SGLANG_TOKENSPEED_EXTEND_BUCKETS = EnvStr("64,128,256,512,1024,2048")
+    # Log each padded-extend hit (layer 0 only) — devloop verification.
+    SGLANG_TOKENSPEED_PADDED_EXTEND_LOG = EnvBool(False)
+
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)

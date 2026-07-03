@@ -207,6 +207,18 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         ] = None
         self._warned_adhoc_buckets: set[int] = set()
         if self.padded_extend_enabled:
+            # Fail LOUD on the stock image's old tokenspeed_mla (0.1.1): the
+            # padded-extend path needs the 0.1.8 decode API (tiler selection,
+            # fold helper, per-q_len causal). Silent fallback would be a
+            # silent no-op lever.
+            import tokenspeed_mla.mla_helpers as _ts_helpers
+
+            if not hasattr(_ts_helpers, "get_mla_decode_fold_sq_factor"):
+                raise RuntimeError(
+                    "SGLANG_TOKENSPEED_PADDED_EXTEND=1 requires "
+                    "tokenspeed_mla>=0.1.8 (image ships an older version — "
+                    "pip install tokenspeed_mla==0.1.8)"
+                )
             self.extend_q_len_buckets = sorted(
                 int(tok)
                 for tok in envs.SGLANG_TOKENSPEED_EXTEND_BUCKETS.get().split(",")

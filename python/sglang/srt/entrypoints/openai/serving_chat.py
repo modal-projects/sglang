@@ -599,6 +599,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
+            if _icb_trace.ENABLED:
+                # prep time = _process_messages entry -> template application
+                _icb_trace.stash(
+                    prep_ms=round((time.perf_counter() - _icb_prep_t0) * 1000, 2)
+                )
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -803,14 +808,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                if iceberg_trace.ENABLED:
-                    iceberg_trace.stash(
-                        prep_ms=round((_icb_t0 - _icb_prep_t0) * 1000, 2),
-                        render_ms=round((_icb_t1 - _icb_t0) * 1000, 2),
-                        encode_ms=round((time.perf_counter() - _icb_t1) * 1000, 2),
-                        chars=len(rendered_prompt),
-                        ntok=len(prompt_ids),
-                    )
+                # NB: this sits inside a broad `except Exception` whose handler
+                # SILENTLY re-renders with flat tools (different prompt!) —
+                # instrumentation here must be exception-proof (an earlier
+                # cross-scope NameError here changed served prompts; caught by
+                # the temp-0 quality gate).
+                try:
+                    if iceberg_trace.ENABLED:
+                        iceberg_trace.stash(
+                            render_ms=round((_icb_t1 - _icb_t0) * 1000, 2),
+                            encode_ms=round((time.perf_counter() - _icb_t1) * 1000, 2),
+                            chars=len(rendered_prompt),
+                            ntok=len(prompt_ids),
+                        )
+                except Exception:
+                    pass
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.

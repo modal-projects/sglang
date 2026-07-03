@@ -444,6 +444,8 @@ class Envs:
     # one CuteDSL JIT compile (~1-2 min, no disk cache) per process, so keep
     # the list short. Must be multiples of 8 (fold factor), ascending.
     SGLANG_TOKENSPEED_EXTEND_BUCKETS = EnvStr("64,128,256,512,1024,2048")
+    # Log each padded-extend hit (layer 0 only) — devloop verification.
+    SGLANG_TOKENSPEED_PADDED_EXTEND_LOG = EnvBool(False)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

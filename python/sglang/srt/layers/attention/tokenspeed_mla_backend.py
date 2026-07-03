@@ -592,6 +592,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # Padded-extend: fused rope + fp8 quantize (identical numerics to the
         # decode / target-verify paths), write fp8 KV, run the paged decode
         # kernel at the bucketed q_len, then unpad.
+        if layer.layer_id == 0 and envs.SGLANG_TOKENSPEED_PADDED_EXTEND_LOG.get():
+            logger.info(
+                "[tokenspeed-padded-extend] hit: bs=%d sum_q=%d bucket=%d "
+                "max_seq_len_k=%d piecewise=%s",
+                forward_batch.batch_size,
+                metadata.sum_seq_lens_q,
+                metadata.q_len_bucket,
+                metadata.max_seq_len_k,
+                is_in_piecewise_cuda_graph(),
+            )
         assert self.data_type == torch.float8_e4m3fn
         assert all(x is not None for x in (q_rope, k_rope, cos_sin_cache)), (
             "padded tokenspeed extend requires the unrotated q/k fused-rope "

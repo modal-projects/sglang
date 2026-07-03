@@ -415,6 +415,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ttft-iceberg: raw-ASGI stage tracer (SGLANG_ICEBERG_TRACE=1). Stamps
+# headers-received / body-fully-read / response-start / first-response-body
+# for /v1/chat/completions without buffering the stream (NOT BaseHTTPMiddleware).
+class _IcebergHTTPTracer:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        from sglang.srt import iceberg_trace
+
+        if (
+            not iceberg_trace.ENABLED
+            or scope["type"] != "http"
+            or not scope.get("path", "").endswith("/chat/completions")
+        ):
+            return await self.app(scope, receive, send)
+
+        key = f"h{id(scope) & 0xFFFFFF:x}"
+        scope["iceberg_key"] = key
+        iceberg_trace.trace("http_headers_recv", key)
+        nbytes = 0
+        first_body_sent = False
+
+        async def recv_wrap():
+            nonlocal nbytes
+            msg = await receive()
+            if msg["type"] == "http.request":
+                nbytes += len(msg.get("body", b""))
+                if not msg.get("more_body"):
+                    iceberg_trace.trace("http_body_done", key, bytes=nbytes)
+            return msg
+
+        async def send_wrap(msg):
+            nonlocal first_body_sent
+            rid = scope.get("iceberg_rid", key)
+            if msg["type"] == "http.response.start":
+                iceberg_trace.trace("http_resp_start", rid, status=msg.get("status"))
+            elif msg["type"] == "http.response.body" and not first_body_sent:
+                first_body_sent = True
+                iceberg_trace.trace(
+                    "http_first_body", rid, bytes=len(msg.get("body", b""))
+                )
+            await send(msg)
+
+        return await self.app(scope, recv_wrap, send_wrap)
+
+
+app.add_middleware(_IcebergHTTPTracer)
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 

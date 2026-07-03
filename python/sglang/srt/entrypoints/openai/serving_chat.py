@@ -767,6 +767,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
+                from sglang.srt import iceberg_trace
+
+                _icb_t0 = time.perf_counter() if iceberg_trace.ENABLED else 0.0
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=False,
@@ -775,9 +778,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                _icb_t1 = time.perf_counter() if iceberg_trace.ENABLED else 0.0
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
+                if iceberg_trace.ENABLED:
+                    iceberg_trace.stash(
+                        render_ms=round((_icb_t1 - _icb_t0) * 1000, 2),
+                        encode_ms=round((time.perf_counter() - _icb_t1) * 1000, 2),
+                        chars=len(rendered_prompt),
+                        ntok=len(prompt_ids),
+                    )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -952,6 +963,10 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = {}
 
         stream_started = False
+        from sglang.srt import iceberg_trace
+
+        _icb_first_content = True
+        iceberg_trace.trace("sse_gen_start", adapted_request.rid)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -961,6 +976,9 @@ class OpenAIServingChat(OpenAIServingBase):
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
+                if _icb_first_content:
+                    _icb_first_content = False
+                    iceberg_trace.trace("sse_first_content", adapted_request.rid)
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)

@@ -142,9 +142,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def event_loop(self):
         """The event loop that handles requests"""
+        from sglang.srt import iceberg_trace
+
+        _icb_seen: set = set()
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            if iceberg_trace.ENABLED:
+                for _rid in getattr(recv_obj, "rids", None) or []:
+                    if _rid not in _icb_seen:
+                        _icb_seen.add(_rid)
+                        iceberg_trace.trace("detok_first_recv", _rid)
+                        if len(_icb_seen) > 20000:
+                            _icb_seen.clear()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)

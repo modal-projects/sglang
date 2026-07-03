@@ -78,6 +78,13 @@ class OpenAIServingBase(ABC):
         """
         received_time = monotonic_time()
 
+        from sglang.srt import iceberg_trace
+
+        if iceberg_trace.ENABLED and raw_request is not None:
+            iceberg_trace.trace(
+                "handle_enter", raw_request.scope.get("iceberg_key", "")
+            )
+
         try:
             # Validate request
             error_msg = self._validate_request(request)
@@ -93,6 +100,25 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+
+            if iceberg_trace.ENABLED and isinstance(adapted_request, GenerateReqInput):
+                # pin a rid now so every downstream stage logs the same key
+                if adapted_request.rid is None:
+                    import uuid as _uuid
+
+                    adapted_request.rid = f"icb-{_uuid.uuid4().hex[:12]}"
+                if raw_request is not None:
+                    raw_request.scope["iceberg_rid"] = adapted_request.rid
+                iceberg_trace.trace(
+                    "convert_done",
+                    adapted_request.rid,
+                    key=(
+                        raw_request.scope.get("iceberg_key", "")
+                        if raw_request is not None
+                        else ""
+                    ),
+                    **iceberg_trace.pop_stash(),
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

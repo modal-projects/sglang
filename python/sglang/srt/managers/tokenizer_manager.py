@@ -1259,6 +1259,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        from sglang.srt import iceberg_trace
+
+        if iceberg_trace.ENABLED:
+            _ids = getattr(tokenized_obj, "input_ids", None)
+            iceberg_trace.trace(
+                "tm_send_sched",
+                getattr(tokenized_obj, "rid", ""),
+                ntok=len(_ids) if _ids is not None else -1,
+            )
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1766,8 +1775,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
+        from sglang.srt import iceberg_trace
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
+            if (
+                iceberg_trace.ENABLED
+                and state is not None
+                and not getattr(state, "_icb_first_out", False)
+            ):
+                state._icb_first_out = True
+                iceberg_trace.trace("tm_first_out", rid)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):

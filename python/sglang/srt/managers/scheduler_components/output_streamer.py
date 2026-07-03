@@ -95,6 +95,30 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        from sglang.srt import iceberg_trace
+
+        if iceberg_trace.ENABLED:
+            from sglang.srt.observability.req_time_stats import (
+                convert_time_to_realtime as _rt,
+            )
+
+            for req in reqs:
+                if req is skip_req or getattr(req, "_icb_streamed", False):
+                    continue
+                req._icb_streamed = True
+                ts = req.time_stats
+
+                def _f(v):
+                    return f"{_rt(v):.6f}" if v and v > 0 else 0
+
+                iceberg_trace.trace(
+                    "sched_first_stream_out",
+                    req.rid,
+                    recv=_f(getattr(ts, "scheduler_recv_time", 0)),
+                    wait_q=_f(getattr(ts, "wait_queue_entry_time", 0)),
+                    fwd_entry=_f(getattr(ts, "forward_entry_time", 0)),
+                    prefill_done=_f(getattr(ts, "prefill_finished_time", 0)),
+                )
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model

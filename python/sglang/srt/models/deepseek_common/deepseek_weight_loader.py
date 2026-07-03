@@ -465,6 +465,27 @@ class DeepseekV2WeightLoaderMixin:
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
 
+            kvb_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+            if (
+                w.dtype == torch.float8_e4m3fn
+                and kvb_scale is not None
+                and kvb_scale.numel() == 1
+                and w.shape[0] == self_attn.kv_b_proj.input_size_per_partition
+            ):
+                # ONLINE-STATIC per-tensor FP8 (SGLANG_ONLINE_FP8_STATIC) with
+                # a loader that runs process_weights_after_loading BEFORE
+                # post_load_weights (dummy / sharded-state): the weight is
+                # already quantized per-tensor and stored TRANSPOSED [K, N].
+                # Dequantize back to BF16 [N, K] so w_kc/w_vc extraction
+                # matches the default loader (which runs post_load_weights on
+                # the BF16 weight first): the MLA absorb bmm stays BF16 in
+                # both cases. The kv_b_proj *Linear* keeps its FP8 weight.
+                w = (
+                    (w.t().to(torch.float32) * kvb_scale)
+                    .to(torch.bfloat16)
+                    .contiguous()
+                )
+
             if w.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,

@@ -779,9 +779,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     **extra_template_kwargs,
                 )
                 _icb_t1 = time.perf_counter() if iceberg_trace.ENABLED else 0.0
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
+                from sglang.srt.entrypoints.openai import incremental_chat_encode
+
+                if incremental_chat_encode.ENABLED and not encode_kwargs:
+                    if getattr(self, "_incr_encoder", None) is None:
+                        self._incr_encoder = (
+                            incremental_chat_encode.IncrementalChatEncoder(
+                                self.tokenizer_manager.tokenizer
+                            )
+                        )
+                    if self._incr_encoder.ok:
+                        prompt_ids = self._incr_encoder.encode(
+                            openai_compatible_messages, rendered_prompt
+                        )
+                    else:
+                        prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                            rendered_prompt, **encode_kwargs
+                        )
+                else:
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        rendered_prompt, **encode_kwargs
+                    )
                 if iceberg_trace.ENABLED:
                     iceberg_trace.stash(
                         render_ms=round((_icb_t1 - _icb_t0) * 1000, 2),

@@ -1317,12 +1317,27 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        return self._get_quant_method(
+        method = self._get_quant_method(
             layer,
             prefix,
             Linear=ModelOptFp4LinearMethod,
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
+        # SGLANG_ONLINE_FP8_STATIC=1: any non-MoE decoder Linear this NVFP4
+        # checkpoint leaves in BF16 (fp4 dispatch -> UnquantizedLinearMethod)
+        # is upgraded to online FP8 (per-tensor weight scale, static-1.0
+        # activation scale, torch._scaled_mm cublasLt). NVFP4 layers and
+        # FusedMoE experts keep their original dispatch; exclusions compose
+        # via SGLANG_FP8_IGNORED_LAYERS. See online_fp8_static.py.
+        if isinstance(method, UnquantizedLinearMethod):
+            from sglang.srt.layers.quantization.online_fp8_static import (
+                maybe_online_fp8_static_linear_method,
+            )
+
+            fp8_method = maybe_online_fp8_static_linear_method(layer, prefix)
+            if fp8_method is not None:
+                return fp8_method
+        return method
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):

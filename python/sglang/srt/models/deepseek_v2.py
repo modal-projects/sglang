@@ -1862,6 +1862,11 @@ class DeepseekV2AttentionMLA(
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
+            # dsv3_fused_a_gemm is BF16-only and use_min_latency_fused_a_gemm
+            # is latched in __init__ from the pre-quantization dtype; online
+            # FP8 (SGLANG_ONLINE_FP8_STATIC) makes this weight FP8 in
+            # process_weights_after_loading -> live dtype guard.
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(

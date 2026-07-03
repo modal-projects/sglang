@@ -100,7 +100,16 @@ class FusedGemmAllReduce:
         k: int,
         dtype: torch.dtype = torch.bfloat16,
         max_m: int = None,
+        in_dtype: Optional[torch.dtype] = None,
     ):
+        """``dtype`` is the output (C) dtype; ``in_dtype`` the A/B operand dtype.
+
+        ``in_dtype=torch.float8_e4m3fn`` selects the fp8 path (per-tensor static
+        scales): pass the per-rank ``alpha = input_scale * weight_scale`` to
+        ``__call__`` — it is applied to the fp32 accumulator in the epilogue
+        BEFORE the bf16 partial enters the two-shot multimem reduce (scales
+        differ per rank, so post-AR scaling would be wrong).
+        """
         assert n % _TILE_N == 0, f"N={n} must be a multiple of {_TILE_N}"
         assert k % 64 == 0, f"K={k} must be a multiple of 64"
         self.group = group
@@ -110,6 +119,8 @@ class FusedGemmAllReduce:
         self.n = n
         self.k = k
         self.dtype = dtype
+        self.in_dtype = in_dtype if in_dtype is not None else dtype
+        assert self.in_dtype in (torch.bfloat16, torch.float8_e4m3fn)
         self.max_m = _round_up(max_m or _MAX_TOKENS, _TILE_M)
 
         self.initialized = False
@@ -129,7 +140,9 @@ class FusedGemmAllReduce:
         import torch.distributed._symmetric_memory as symm_mem
         from cutlass import cute
         from cutlass.cute.runtime import from_dlpack
-        from flashinfer.cute_dsl.gemm_allreduce_two_shot import (
+
+        # Vendored flashinfer kernel + runtime per-rank alpha (fp8 static scales).
+        from sglang.srt.layers.gemm_allreduce_two_shot_alpha import (
             PersistentDenseGemmKernel,
         )
 
@@ -145,8 +158,10 @@ class FusedGemmAllReduce:
 
         # Persistent input staging buffer (lets us cache per-M cute tensors and
         # pad ragged M up to the tile boundary; the copy is ~10us at M=16K).
+        # In fp8 mode this doubles as the activation quant target (saturating
+        # cast happens in the staging copy).
         self._a_staging = torch.zeros(
-            self.max_m, self.k, dtype=self.dtype, device=device
+            self.max_m, self.k, dtype=self.in_dtype, device=device
         )
         # Symmetric-memory output buffer + multicast handle.
         self._c_symm = symm_mem.empty(
@@ -177,25 +192,15 @@ class FusedGemmAllReduce:
             self._flag_pairs.append((bf_cute, bf_mc_cute))
 
         major, minor = torch.cuda.get_device_capability(device)
-        try:
-            gemm = PersistentDenseGemmKernel(
-                cutlass.Float32,
-                True,  # use_2cta_instrs
-                (256, 256),  # mma_tiler_mn
-                (2, 1),  # cluster_shape_mn
-                True,  # use_tma_store
-                all_reduce="two_shot",
-                sm_version=f"sm_{major}{minor}",
-            )
-        except TypeError:  # older flashinfer without sm_version kwarg
-            gemm = PersistentDenseGemmKernel(
-                cutlass.Float32,
-                True,
-                (256, 256),
-                (2, 1),
-                True,
-                all_reduce="two_shot",
-            )
+        gemm = PersistentDenseGemmKernel(
+            cutlass.Float32,
+            True,  # use_2cta_instrs
+            (256, 256),  # mma_tiler_mn
+            (2, 1),  # cluster_shape_mn
+            True,  # use_tma_store
+            all_reduce="two_shot",
+            sm_version=f"sm_{major}{minor}",
+        )
         # The kernel reads rank/world from the default process group; override
         # with the TP group's values (identical on single-node plain TP).
         gemm.num_ranks = self.world_size
@@ -209,6 +214,7 @@ class FusedGemmAllReduce:
     def _get_b_cute(self, weight: torch.Tensor):
         entry = self._b_cache.get(weight.data_ptr())
         if entry is None:
+            assert weight.dtype == self.in_dtype
             assert weight.shape == (self.n, self.k) and weight.stride(1) == 1
             # (N, K, L=1) view, K-major, mirroring cutlass_torch.matrix().
             w3 = torch.as_strided(
@@ -255,8 +261,13 @@ class FusedGemmAllReduce:
         x: torch.Tensor,
         weight: torch.Tensor,
         return_view: Optional[bool] = None,
+        alpha: float = 1.0,
     ) -> torch.Tensor:
-        """Return ``allreduce(x @ weight.T)`` (bf16, shape [M, N])."""
+        """Return ``allreduce(alpha * (x @ weight.T))`` (bf16, shape [M, N]).
+
+        ``alpha`` is this rank's per-tensor static scale product
+        (input_scale * weight_scale) on the fp8 path; 1.0 for bf16.
+        """
         assert x.dim() == 2 and x.shape[1] == self.k
         m = x.shape[0]
         assert 0 < m <= self.max_m
@@ -270,7 +281,13 @@ class FusedGemmAllReduce:
         bf_cute, bf_mc_cute = self._flag_pairs[self._parity]
         self._parity ^= 1
 
-        self._a_staging[:m].copy_(x)
+        if x.dtype == self.in_dtype:
+            self._a_staging[:m].copy_(x)
+        else:
+            # fp8 path fed bf16 activations: saturating per-tensor static-1.0
+            # quant folded into the staging copy (transient clamp buffer).
+            assert self.in_dtype == torch.float8_e4m3fn
+            self._a_staging[:m].copy_(torch.clamp(x, -448.0, 448.0))
         stream = self._cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
         if self._compiled is None:
             from cutlass import cute
@@ -282,6 +299,7 @@ class FusedGemmAllReduce:
                 c_cute,
                 self._max_active_clusters,
                 stream,
+                alpha,
                 c_mc=c_mc_cute,
                 barrier_flag=bf_cute,
                 barrier_flag_mc=bf_mc_cute,
@@ -291,6 +309,7 @@ class FusedGemmAllReduce:
             b_cute,
             c_cute,
             stream,
+            alpha,
             c_mc=c_mc_cute,
             barrier_flag=bf_cute,
             barrier_flag_mc=bf_mc_cute,
@@ -308,16 +327,66 @@ class FusedGemmAllReduce:
 # o_proj glue (model-side entry point)
 # ----------------------------------------------------------------------
 
-_WRAPPERS = {}  # (n, k) -> FusedGemmAllReduce | None (None = permanently off)
+_WRAPPERS = {}  # (n, k, in_dtype) -> FusedGemmAllReduce | None (None = off)
 
 
 def fused_oproj_ar_enabled() -> bool:
     return _ENABLED
 
 
-def _get_wrapper(n: int, k: int) -> Optional[FusedGemmAllReduce]:
-    if (n, k) in _WRAPPERS:
-        return _WRAPPERS[(n, k)]
+def _fp8_static_params(linear) -> Optional[tuple]:
+    """Detect a per-tensor-static fp8 linear (fp8-static workstream interface).
+
+    Returns ``(weight_nk, alpha)`` where ``weight_nk`` is the e4m3 weight as a
+    (N, K) row-major view and ``alpha = float(input_scale * weight_scale)`` is
+    this rank's scalar scale product, or None if the layer is not fp8-static.
+    """
+    try:
+        from sglang.srt.layers.quantization.fp8_static_norm_quant import (
+            static_fp8_input_scale_of,
+        )
+
+        input_scale = static_fp8_input_scale_of(linear)
+    except ImportError:
+        input_scale = getattr(linear, "input_scale", None)
+        weight = getattr(linear, "weight", None)
+        if (
+            input_scale is None
+            or weight is None
+            or weight.dtype != torch.float8_e4m3fn
+            or input_scale.numel() != 1
+        ):
+            input_scale = None
+    if input_scale is None:
+        return None
+    weight = linear.weight
+    weight_scale = getattr(linear, "weight_scale", None)
+    if weight_scale is None or weight_scale.numel() != 1:
+        return None
+    # fp8-static stores the weight transposed ([K, N], col-major for cublasLt);
+    # recover the (N, K) row-major view the kernel wants.
+    if weight.dim() != 2:
+        return None
+    if weight.stride(1) == 1 and weight.is_contiguous():
+        weight_nk = weight  # already (N, K) row-major
+    elif weight.stride(0) == 1:
+        weight_nk = weight.t()  # (K, N) col-major -> (N, K) row-major view
+    else:
+        return None
+    if not weight_nk.is_contiguous():
+        return None
+    alpha = float(input_scale.item()) * float(weight_scale.item())
+    return weight_nk, alpha
+
+
+_FP8_ALPHA_CACHE = {}  # id(linear) -> (weight_nk, alpha)
+
+
+def _get_wrapper(
+    n: int, k: int, in_dtype: torch.dtype = torch.bfloat16
+) -> Optional[FusedGemmAllReduce]:
+    if (n, k, in_dtype) in _WRAPPERS:
+        return _WRAPPERS[(n, k, in_dtype)]
     wrapper = None
     try:
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -336,7 +405,7 @@ def _get_wrapper(n: int, k: int) -> Optional[FusedGemmAllReduce]:
             and n % _TILE_N == 0
             and k % 64 == 0
         ):
-            wrapper = FusedGemmAllReduce(group, n, k)
+            wrapper = FusedGemmAllReduce(group, n, k, in_dtype=in_dtype)
         else:
             logger.info(
                 "SGLANG_FUSED_OPROJ_AR=1 but the fused o_proj GEMM+allreduce "
@@ -352,7 +421,7 @@ def _get_wrapper(n: int, k: int) -> Optional[FusedGemmAllReduce]:
         logger.exception(
             "Failed to set up fused o_proj GEMM+allreduce; falling back."
         )
-    _WRAPPERS[(n, k)] = wrapper
+    _WRAPPERS[(n, k, in_dtype)] = wrapper
     return wrapper
 
 
@@ -388,24 +457,40 @@ def maybe_fused_oproj_allreduce(
         weight is None
         or not isinstance(weight, torch.Tensor)
         or weight.dim() != 2
-        or not weight.is_contiguous()
-        or weight.dtype != torch.bfloat16
         or x.dtype != torch.bfloat16
         or getattr(o_proj, "bias", None) is not None
         or o_proj.reduce_results
     ):
         return None
-    n, k = weight.shape
+    # Pick the operand path: bf16 weights, or per-tensor-static fp8 weights
+    # (fp8-static workstream; alpha folded into the epilogue pre-reduce).
+    alpha = 1.0
+    if weight.dtype == torch.bfloat16 and weight.is_contiguous():
+        weight_nk = weight
+        in_dtype = torch.bfloat16
+    elif weight.dtype == torch.float8_e4m3fn:
+        cached = _FP8_ALPHA_CACHE.get(id(o_proj))
+        if cached is None:
+            fp8 = _fp8_static_params(o_proj)
+            if fp8 is None:
+                return None
+            _FP8_ALPHA_CACHE[id(o_proj)] = fp8
+            cached = fp8
+        weight_nk, alpha = cached
+        in_dtype = torch.float8_e4m3fn
+    else:
+        return None
+    n, k = weight_nk.shape
     if x.shape[1] != k:
         return None
     if torch.cuda.is_current_stream_capturing():
         return None
 
-    wrapper = _get_wrapper(n, k)
+    wrapper = _get_wrapper(n, k, in_dtype)
     if wrapper is None:
         return None
     try:
-        out = wrapper(x, weight)
+        out = wrapper(x, weight_nk, alpha=alpha)
     except Exception:
         if wrapper.initialized:
             # Post-init failures are not safely recoverable (peers may already
@@ -414,7 +499,7 @@ def maybe_fused_oproj_allreduce(
         logger.exception(
             "Fused o_proj GEMM+allreduce initialization failed; disabling."
         )
-        _WRAPPERS[(n, k)] = None
+        _WRAPPERS[(n, k, in_dtype)] = None
         return None
     setattr(out, MARKER_ATTR, True)
     return out

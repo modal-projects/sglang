@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -719,6 +720,16 @@ class DeepseekMLAForwardMixin:
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
+                # tokenspeed padded-extend path (absorbed-MLA extends, e.g.
+                # under piecewise CUDA graphs) consumes unrotated q/k and does
+                # the fused rope+fp8-quantize in the backend, exactly like the
+                # decode / target-verify paths above. Static (env) gate so the
+                # branch is trace-stable under dynamo.
+                or (
+                    self.current_attention_backend == "tokenspeed_mla"
+                    and envs.SGLANG_TOKENSPEED_PADDED_EXTEND.get()
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
             )
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )

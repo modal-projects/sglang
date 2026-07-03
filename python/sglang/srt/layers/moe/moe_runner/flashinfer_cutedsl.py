@@ -271,11 +271,27 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # fused MoE+AR path (cutedsl_moe_ar) sizes its own buffers from the
     # UNCAPPED bound stashed below. Example:
     # SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS=2048 -> ~45MB preallocs.
+    #
+    # SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS=0 disables the preallocs entirely
+    # (wrapper use_cuda_graph=False -> per-call torch.empty output; NO cap
+    # assert). REQUIRED when composing cutedsl MoE inside captured CUDA graphs
+    # with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: the prealloc'd
+    # _moe_output lives in VMM (cuMemMap) memory and becomes the post-MoE
+    # custom-allreduce input inside the graph; CustomAllReduceV2's capture-exit
+    # share_graph_inputs() -> cudaIpcGetMemHandle fails with 'invalid argument'
+    # on VMM pointers (jit_kernel custom_all_reduce.cuh:37). Per-call outputs
+    # allocated DURING capture come from the graph private pool (cudaMalloc,
+    # IPC-able), which is the trtllm-backend behavior that captures fine.
+    # A nonzero cap CANNOT express this: run() hard-raises
+    # "num_tokens exceeds max_num_tokens" for any captured shape above the cap
+    # while any covered shape reintroduces the VMM prealloc as the AR input.
     import os as _os
 
     layer._cutedsl_uncapped_max_num_tokens = max_num_tokens
     _cap = _os.getenv("SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS")
-    if _cap:
+    if _cap is not None and _cap.strip() == "0":
+        use_cuda_graph = False
+    elif _cap:
         max_num_tokens = min(max_num_tokens, int(_cap))
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph

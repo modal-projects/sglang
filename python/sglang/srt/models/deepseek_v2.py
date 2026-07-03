@@ -2452,6 +2452,11 @@ class DeepseekV2Model(nn.Module):
                         ]
                         if residual is None:
                             aux_hidden_slot.copy_(hidden_states)
+                        elif not get_global_server_args().disable_piecewise_cuda_graph:
+                            # Dynamo (piecewise CUDA graph tracing) rejects
+                            # out= into a non-contiguous slice; pay one
+                            # transient [tokens, hidden] add instead.
+                            aux_hidden_slot.copy_(hidden_states + residual)
                         else:
                             torch.add(hidden_states, residual, out=aux_hidden_slot)
                     aux_hidden_state_idx += 1

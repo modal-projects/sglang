@@ -311,13 +311,20 @@ class ExtendVerifyGraphTranslator:
             extend_logprob_start_lens_cpu=None,
         )
 
-        # Graph-coverage assert (footgun: silently measuring eager).
-        if not self.runner.can_run(translated):
+        # Graph-coverage assert (footgun: silently measuring eager). NOTE: do
+        # NOT use runner.can_run() here — it caps real batches at
+        # native_max_bs by design; translated batches may use the full
+        # capture list (extra SGLANG_EXTEND_GRAPH_BS buckets).
+        if bs_virtual > self.max_bs:
             raise RuntimeError(
-                "[extend-verify-graph] translated batch rejected by graph "
-                f"runner (bs_virtual={bs_virtual}, capture_bs={self.capture_bs}, "
-                f"capture_hidden_mode={self.runner.capture_hidden_mode}). "
-                "can_run() gate and runner state are out of sync."
+                f"[extend-verify-graph] bs_virtual={bs_virtual} > max capture "
+                f"bucket {self.max_bs} — can_run() gate out of sync."
+            )
+        if self.runner.capture_hidden_mode != self.required_hidden_mode:
+            raise RuntimeError(
+                "[extend-verify-graph] runner capture_hidden_mode "
+                f"{self.runner.capture_hidden_mode} != {self.required_hidden_mode} "
+                "(recaptured under a different mode?)"
             )
 
         out = self.runner.replay(translated)

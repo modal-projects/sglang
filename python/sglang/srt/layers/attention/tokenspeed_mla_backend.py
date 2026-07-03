@@ -36,6 +36,7 @@ import torch
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.attention.cute_aot_cache import install_cute_aot_cache
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -119,6 +120,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
                 self.device, self.num_q_heads, self.kv_lora_rank
             )
+
+            # Persist CuteDSL kernel compiles across processes/boots
+            # (SGLANG_CUTE_AOT_CACHE_DIR; no-op with a loud log when unset).
+            # Must run BEFORE the pre-JIT loop below reads the compile
+            # function from the module, and before any decode-kernel compile.
+            install_cute_aot_cache()
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
             # min; without warm-up the first request trips the 300 s scheduler

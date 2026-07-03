@@ -1105,12 +1105,25 @@ class FusedMoE(torch.nn.Module):
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
+            # The fused cutedsl MoE fc2+all-reduce path marks its (already
+            # TP-reduced) output; re-attach the marker across the
+            # slice/contiguous below, which returns a fresh tensor object.
+            from sglang.srt.layers.moe.cutedsl_moe_ar import MARKER_ATTR
+
+            _moe_ar_done = getattr(final_hidden_states, MARKER_ATTR, False)
+
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+            if _moe_ar_done:
+                setattr(final_hidden_states, MARKER_ATTR, True)
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+        if (
+            self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
+            and not _moe_ar_done
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

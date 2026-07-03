@@ -94,6 +94,11 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.moe.cutedsl_moe_ar import (
+    moe_ar_consume_marker,
+    moe_ar_should_engage,
+    moe_ar_stash_seed,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
@@ -954,6 +959,10 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
+        # Fused cutedsl MoE fc2+all-reduce handshake (SGLANG_CUTEDSL_FUSED_AR=1)
+        moe_ar_seed = None
+        moe_ar_stashed = False
+        moe_ar_folds_shared = False
         if hidden_states.shape[0] > 0:
             if not defer_shared and not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(
@@ -972,6 +981,28 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
+            # Fused cutedsl MoE fc2+all-reduce: fold the TP-sharded
+            # shared-expert partial output into the fused kernel's symmetric
+            # output buffer ("seed") and stash it; the cutedsl runner consumes
+            # the stash and returns an already TP-reduced, marker-tagged
+            # output (sum over ranks of routed_partial + shared_partial). All
+            # gate inputs are rank-symmetric across the TP group.
+            if not self._fuse_shared_experts_inside_sbo and moe_ar_should_engage(
+                hidden_states.shape[0], should_allreduce_fusion, use_reduce_scatter
+            ):
+                if (
+                    getattr(self, "shared_experts", None) is not None
+                    and not self._shared_expert_tp1
+                ):
+                    if not defer_shared:
+                        moe_ar_seed = shared_output
+                    else:
+                        moe_ar_seed = self._forward_shared_experts(
+                            hidden_states, gemm_output_zero_allocator
+                        )
+                    moe_ar_folds_shared = moe_ar_seed is not None
+                moe_ar_stash_seed(moe_ar_seed, hidden_states.shape[0])
+                moe_ar_stashed = True
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1010,6 +1041,12 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+        # Fused cutedsl MoE fc2+all-reduce: when the runner consumed the stash
+        # the output is already TP-reduced (with the shared-expert partial
+        # folded in when moe_ar_folds_shared); skip the shared-add and the
+        # post-MoE all-reduce below. On fallback (no marker) the seed becomes
+        # the ordinary shared output.
+        moe_ar_done = moe_ar_stashed and moe_ar_consume_marker(final_hidden_states)
         if (
             not _is_cuda
             and not _is_musa
@@ -1025,9 +1062,15 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
         ):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
+            if moe_ar_stashed and moe_ar_folds_shared:
+                shared_output = None if moe_ar_done else moe_ar_seed
+            else:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
+        elif moe_ar_done and moe_ar_folds_shared:
+            # non-deferred shared partial was folded into the fused output
+            shared_output = None
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
@@ -1036,10 +1079,14 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
+        if (
+            self.tp_size > 1
+            and not moe_ar_done
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            )
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to

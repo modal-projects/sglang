@@ -1004,12 +1004,21 @@ class CudaGraphRunner:
             # Last-row-only logits: one row per virtual request. Constant
             # per-graph gather indices (front-padded translation puts each
             # real request's final token at the last row of its segment).
+            # MUST be retained on self: the captured gather kernel reads this
+            # tensor's device memory at replay — letting it be freed after
+            # capture recycles the memory and the graph gathers garbage
+            # indices (observed as device-side OOB asserts at replay).
             next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
-            verify_last_row_indices = (
-                torch.arange(1, bs + 1, device=self.device, dtype=torch.int64)
-                * self.num_tokens_per_bs
-                - 1
-            )
+            if not hasattr(self, "_verify_last_row_indices_by_bs"):
+                self._verify_last_row_indices_by_bs = {}
+            verify_last_row_indices = self._verify_last_row_indices_by_bs.get(bs)
+            if verify_last_row_indices is None:
+                verify_last_row_indices = (
+                    torch.arange(1, bs + 1, device=self.device, dtype=torch.int64)
+                    * self.num_tokens_per_bs
+                    - 1
+                )
+                self._verify_last_row_indices_by_bs[bs] = verify_last_row_indices
         else:
             next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
             verify_last_row_indices = None

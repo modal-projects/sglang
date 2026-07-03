@@ -432,50 +432,6 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
-class PackedAuxHiddenStateCapture:
-    """List-compatible aux-hidden-state capture target that packs appends.
-
-    ``prepare_attn_and_capture_last_layer_outputs`` appends one
-    ``[tokens, hidden]`` tensor per capture layer; this target copies each
-    append into its slot of a single preallocated ``[tokens, K * hidden]``
-    buffer. Downstream (``LogitsProcessor``) consumes the packed tensor
-    directly, avoiding the second full-size ``torch.cat`` allocation the
-    list-of-tensors path needs (and the defensive ``residual.clone()`` in
-    the capture hook — see ``appends_by_copy``).
-    """
-
-    # The capture hook may skip its defensive clone: append() copies
-    # immediately, so later in-place writes to the source cannot alias.
-    appends_by_copy = True
-
-    def __init__(self, num_slots: int) -> None:
-        self._num_slots = int(num_slots)
-        self._idx = 0
-        self._width: Optional[int] = None
-        self._buf: Optional[torch.Tensor] = None
-
-    def __len__(self) -> int:
-        return self._idx
-
-    def append(self, tensor: torch.Tensor) -> None:
-        assert self._idx < self._num_slots, "more captures than declared slots"
-        if self._buf is None:
-            self._width = int(tensor.shape[-1])
-            self._buf = tensor.new_empty(
-                (*tensor.shape[:-1], self._width * self._num_slots)
-            )
-        start = self._idx * self._width
-        self._buf[..., start : start + self._width].copy_(tensor)
-        self._idx += 1
-
-    def packed(self) -> torch.Tensor:
-        """The packed ``[tokens, K * hidden]`` tensor (sliced if underfilled)."""
-        assert self._buf is not None, "packed() called with no captures"
-        if self._idx == self._num_slots:
-            return self._buf
-        return self._buf[..., : self._idx * self._width]
-
-
 class LayerCommunicator:
     def __init__(
         self,
@@ -553,7 +509,6 @@ class LayerCommunicator:
             )
             if (
                 gathered_last_layer_output is residual
-                and not getattr(captured_last_layer_outputs, "appends_by_copy", False)
                 and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()

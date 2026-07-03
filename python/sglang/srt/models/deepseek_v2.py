@@ -67,7 +67,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    PackedAuxHiddenStateCapture,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -2558,11 +2557,7 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        # Pack aux hidden states directly as [tokens, K * hidden] while they
-        # are captured (list-compatible target for the layer communicator's
-        # .append()) to avoid a second full-size torch.cat allocation in the
-        # logits processor.
-        aux_hidden_states = PackedAuxHiddenStateCapture(len(self.layers_to_capture))
+        aux_hidden_states = []
         if self.pp_group.is_first_rank:
             topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
@@ -2648,7 +2643,7 @@ class DeepseekV2Model(nn.Module):
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
-        return hidden_states, aux_hidden_states.packed()
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):

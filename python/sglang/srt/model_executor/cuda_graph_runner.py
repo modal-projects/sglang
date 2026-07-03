@@ -161,6 +161,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         max_num_token: int,
         hidden_size: int,
         vocab_size: int,
+        max_logits_rows: Optional[int] = None,
         dtype: torch.dtype,
         dp_size: int,
         pp_size: int,
@@ -188,7 +189,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dtype=torch.bool,
             )
             next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
+                # Last-row extension buckets need only one row per virtual
+                # request, so the buffer doesn't scale with extend-coverage
+                # token count (fp32 * vocab = 0.66 MB/row).
+                (max_logits_rows or max_num_token, vocab_size),
                 dtype=torch.float,
             )
             mamba_track_indices = (
@@ -665,6 +669,14 @@ class CudaGraphRunner:
                 f"(max {max(self.capture_bs) * self.num_tokens_per_bs} tokens); "
                 f"native (real-batch) max bs stays {self.native_max_bs}",
             )
+        # Verify-form extension buckets capture last-row-only logits (one row
+        # per virtual request instead of per token): the all-row fp32 logits
+        # buffer is the dominant static HBM cost of extend coverage.
+        self.last_row_buckets = (
+            {bs for bs in self.capture_bs if bs > self.native_max_bs}
+            if self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            else set()
+        )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -712,12 +724,20 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+        # Logits rows: native buckets are all-row (bs * tokens_per_bs);
+        # last-row extension buckets need one row per virtual request.
+        native_num_token = self.native_max_bs * self.num_tokens_per_bs
+        if self.last_row_buckets:
+            max_logits_rows = max(native_num_token, max(self.last_row_buckets))
+        else:
+            max_logits_rows = self.max_num_token
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             vocab_size=self.model_runner.model_config.vocab_size,
+            max_logits_rows=max_logits_rows,
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
@@ -980,7 +1000,19 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        if bs in self.last_row_buckets:
+            # Last-row-only logits: one row per virtual request. Constant
+            # per-graph gather indices (front-padded translation puts each
+            # real request's final token at the last row of its segment).
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
+            verify_last_row_indices = (
+                torch.arange(1, bs + 1, device=self.device, dtype=torch.int64)
+                * self.num_tokens_per_bs
+                - 1
+            )
+        else:
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+            verify_last_row_indices = None
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
             buffers.bootstrap_room_ids_int[:bs]
@@ -1104,6 +1136,7 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            verify_last_row_indices=verify_last_row_indices,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the
@@ -1374,8 +1407,15 @@ class CudaGraphRunner:
                 )
             else:
                 full_logits = None
+                # Last-row extension buckets emit one logits row per virtual
+                # request; native buckets emit one per token.
+                n_logits = (
+                    self.raw_bs
+                    if self.bs in self.last_row_buckets
+                    else self.raw_num_token
+                )
                 next_token_logits = (
-                    output.next_token_logits[: self.raw_num_token]
+                    output.next_token_logits[:n_logits]
                     if output.next_token_logits is not None
                     else None
                 )

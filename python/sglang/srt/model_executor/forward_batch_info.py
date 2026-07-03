@@ -379,6 +379,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
     capture_hidden_mode: CaptureHiddenMode = None
+    # Extend-as-virtual-verify extension buckets: constant per-graph row
+    # indices for last-row-only logits in TARGET_VERIFY-form captures
+    # (one logits row per virtual request instead of per token). None for
+    # real verify batches (spec decoding needs all-row logits).
+    verify_last_row_indices: Optional[torch.Tensor] = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 

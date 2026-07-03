@@ -344,7 +344,20 @@ class ExtendVerifyGraphTranslator:
 
         # Un-translate: extend contract is next-token logits per request plus
         # (for DFlash) aux hidden states aligned 1:1 with out_cache_loc rows.
-        last_rows_t = torch.tensor(last_rows, dtype=torch.int64, device=device)
+        # Contract depends on the replayed bucket: last-row extension buckets
+        # emit one logits row PER VIRTUAL REQUEST (each real request's final
+        # token is the last row of its segment = its last virtual request);
+        # native buckets emit one row per token.
+        if self.runner.bs in getattr(self.runner, "last_row_buckets", ()):
+            # last token row of req i is (v_off_i + v_i)*block - 1, whose
+            # virtual-request index is row // block = v_off_i + v_i - 1.
+            last_rows_t = torch.tensor(
+                [r // block for r in last_rows],
+                dtype=torch.int64,
+                device=device,
+            )
+        else:
+            last_rows_t = torch.tensor(last_rows, dtype=torch.int64, device=device)
         next_token_logits = out.next_token_logits.index_select(0, last_rows_t)
         hidden_states = None
         if out.hidden_states is not None:

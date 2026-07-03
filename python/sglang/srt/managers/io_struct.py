@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
 
+import numpy as np
 import torch
 from pydantic import PlainValidator
 
@@ -729,8 +730,12 @@ class GenerateReqInput(BaseReq):
 class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
-    # The input token ids
-    input_ids: Optional[array[int]]
+    # The input token ids. On the wire this is normally a compact int32/int64
+    # ndarray (see token_ids_to_wire in sglang.srt.utils — pickles via its raw
+    # buffer instead of array("q")'s per-element codec); legacy callers may
+    # still pass array("q") or a list. Consumers rebuild array("q") with
+    # token_ids_from_wire (Req.__init__ does this).
+    input_ids: Optional[Union[array[int], np.ndarray]]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -1045,8 +1050,8 @@ class EmbeddingReqInput(BaseReq):
 class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
-    # The input token ids
-    input_ids: array[int]
+    # The input token ids (ndarray wire format; see TokenizedGenerateReqInput)
+    input_ids: Union[array[int], np.ndarray]
     # The image inputs
     image_inputs: dict
     # The token type ids

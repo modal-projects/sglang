@@ -103,7 +103,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, token_ids_from_wire
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -686,10 +686,14 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = array("q", origin_input_ids)
+        # token_ids_from_wire == array("q", ids) for list/array inputs, plus a
+        # buffer-copy fast path for the ndarray wire format produced by the
+        # tokenizer (see token_ids_to_wire in sglang.srt.utils).
+        self.origin_input_ids = token_ids_from_wire(origin_input_ids)
         self.origin_input_ids_unpadded = (
-            array("q", origin_input_ids_unpadded)
-            if origin_input_ids_unpadded
+            token_ids_from_wire(origin_input_ids_unpadded)
+            if origin_input_ids_unpadded is not None
+            and len(origin_input_ids_unpadded) > 0
             else self.origin_input_ids
         )  # Before image padding
         # Each decode stage's output ids

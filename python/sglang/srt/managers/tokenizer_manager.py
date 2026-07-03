@@ -111,6 +111,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
+    token_ids_to_wire,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.hf_transformers_utils import (
@@ -1043,6 +1044,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_ids_arr: Optional[array[int]] = (
             array("q", input_ids) if input_ids is not None else None
         )
+        # Ship token ids to the scheduler as a compact ndarray: pickles via its
+        # raw buffer across the zmq + cross-rank-broadcast hops instead of
+        # array("q")'s per-element codec. Req rebuilds array("q") on arrival
+        # (token_ids_from_wire); values are bit-preserved.
+        input_ids_wire = token_ids_to_wire(input_ids_arr)
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1070,7 +1076,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
-                input_ids_arr,
+                input_ids_wire,
                 mm_inputs,
                 sampling_params,
                 obj.return_logprob,
@@ -1118,7 +1124,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
-                input_ids_arr,
+                input_ids_wire,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,

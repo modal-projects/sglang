@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.common import log_info_on_rank0, token_ids_from_wire
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -110,6 +110,12 @@ class Session:
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
         session_params = req.session_params
+
+        # Session logic below concatenates/slices/truth-tests req.input_ids
+        # with array("q") semantics; rebuild it from the ndarray wire format
+        # (see token_ids_to_wire in sglang.srt.utils) before any of that.
+        if req.input_ids is not None:
+            req.input_ids = token_ids_from_wire(req.input_ids)
 
         last_req_node = None
         last_req = None

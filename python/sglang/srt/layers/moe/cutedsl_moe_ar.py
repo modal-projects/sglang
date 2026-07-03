@@ -650,7 +650,13 @@ def maybe_init_fused_ar(layer: torch.nn.Module) -> None:
             state = _FusedMoeArState(
                 group=group,
                 hidden_size=layer.hidden_size,
-                max_num_tokens=wrapper.max_num_tokens,
+                # size for the full prefill bound even when the wrapper's own
+                # preallocs are capped (SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS)
+                max_num_tokens=getattr(
+                    layer,
+                    "_cutedsl_uncapped_max_num_tokens",
+                    wrapper.max_num_tokens,
+                ),
                 device=torch.device(torch.cuda.current_device()),
                 top_k=wrapper.top_k,
                 num_experts=wrapper.num_experts,

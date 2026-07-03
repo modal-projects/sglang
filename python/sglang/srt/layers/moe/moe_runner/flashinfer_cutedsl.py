@@ -263,6 +263,20 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # Standard allgather path: the MoE sees up to dp_size local forwards
         # gathered together, so scale the per-rank forward bound by dp_size.
         max_num_tokens = server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
+
+    # Optional cap on the wrapper's PERMANENT prealloc sizing (~300MB/rank at
+    # 16k tokens). Graph capture only needs decode/verify-scale shapes; larger
+    # eager batches fall back to per-call transient allocation inside
+    # CuteDslMoEWrapper._forward_with_tactic (use_prealloc=False), and the
+    # fused MoE+AR path (cutedsl_moe_ar) sizes its own buffers from the
+    # UNCAPPED bound stashed below. Example:
+    # SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS=2048 -> ~45MB preallocs.
+    import os as _os
+
+    layer._cutedsl_uncapped_max_num_tokens = max_num_tokens
+    _cap = _os.getenv("SGLANG_CUTEDSL_MOE_WRAPPER_MAX_TOKENS")
+    if _cap:
+        max_num_tokens = min(max_num_tokens, int(_cap))
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

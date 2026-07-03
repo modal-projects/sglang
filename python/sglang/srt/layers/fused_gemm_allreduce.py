@@ -244,6 +244,21 @@ class FusedGemmAllReduce:
         self._gemm = gemm
         self._max_active_clusters = max_active_clusters
         self.initialized = True
+        # Anti-silent-no-op: one explicit engagement line per wrapper (the
+        # fallback paths log their reasons; this is the positive signal).
+        logger.info(
+            "fused GEMM+two-shot-AR ENGAGED: n=%d k=%d in_dtype=%s stage_a=%s "
+            "world=%d rank=%d max_m=%d (symm C shared pool, %d MB pinned here)",
+            self.n,
+            self.k,
+            self.in_dtype,
+            self.stage_a,
+            self.world_size,
+            self.rank,
+            self.max_m,
+            (self._a_staging.nbytes if self._a_staging is not None else 0)
+            // (1024 * 1024),
+        )
 
     def _get_b_cute(self, weight: torch.Tensor):
         entry = self._b_cache.get(weight.data_ptr())

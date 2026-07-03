@@ -7,12 +7,14 @@ dispatch when unset). Serving a stock NVFP4 MoE checkpoint (e.g.
 lever quantizes those linears to FP8 *online at engine load*:
 
 - weight: PER-TENSOR scale (``input_to_float8`` in
-  ``Fp8LinearMethod.process_weights_after_loading``; ``cutlass_fp8_supported``
-  is forced False so the per-tensor branch is taken and ``apply`` routes to
+  ``Fp8LinearMethod.process_weights_after_loading``; the ONLINE-STATIC scheme
+  in ``Fp8LinearMethod`` takes the per-tensor branch and ``apply`` routes to
   the ``torch._scaled_mm`` cublasLt per-tensor kernel — measured 38.2ms vs
   52.6ms cutlass per-token GEMM-only per 16k chunk on B200, vs 69.5ms BF16
   nvjet).
-- activation: STATIC scale 1.0 — a bare saturating e4m3 cast. Validated for
+- activation: STATIC scale 1.0 — a bare saturating e4m3 cast; NO per-token
+  dynamic quant kernels at runtime, and the cast folds into producers where
+  wired (SGLANG_FP8_STATIC_NORM_QUANT fused RMSNorm+quant). Validated for
   MuonClip-trained Kimi-K2.6 (rel-err ~= amax-calibrated ~= per-token
   dynamic); NOT safe for arbitrary models. Any quality gate must be re-run
   when pointing this at a different checkpoint.
@@ -72,32 +74,18 @@ def maybe_online_fp8_static_linear_method(layer: torch.nn.Module, prefix: str):
 
     from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
+    # First-class ONLINE-STATIC scheme: BF16 checkpoint weights quantized
+    # per-tensor at load, activations statically quantized with scale 1.0
+    # (Fp8LinearMethod.online_static routes to the per-tensor
+    # torch._scaled_mm cublasLt kernel). No per-token dynamic quant kernels
+    # run at serve time on this path.
     method = Fp8Config(
         is_checkpoint_fp8_serialized=False,
-        activation_scheme="dynamic",
+        activation_scheme="static",
     ).get_quant_method(layer, prefix)
     if not isinstance(method, Fp8LinearMethod):
         # e.g. UnquantizedLinearMethod via SGLANG_FP8_IGNORED_LAYERS
         return None
-
-    # Route away from the cutlass GemmUniversal per-token path: with
-    # cutlass_fp8_supported=False, process_weights_after_loading quantizes the
-    # weight PER-TENSOR (input_to_float8) and apply() takes the per-tensor
-    # torch._scaled_mm (cublasLt) branch.
-    method.cutlass_fp8_supported = False
-    _orig_pwal = method.process_weights_after_loading
-
-    def _pwal_static_scale(layer: torch.nn.Module, _orig=_orig_pwal) -> None:
-        _orig(layer)
-        weight = getattr(layer, "weight", None)
-        if weight is not None and weight.dtype == torch.float8_e4m3fn:
-            # Static activation scale 1.0: bare saturating e4m3 cast.
-            layer.input_scale = torch.nn.Parameter(
-                torch.ones(1, dtype=torch.float32, device=weight.device),
-                requires_grad=False,
-            )
-
-    method.process_weights_after_loading = _pwal_static_scale
 
     if not _rerouted_prefixes:
         # Startup assert (anti-silent-no-op): exactly one loud line per rank-0

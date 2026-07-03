@@ -357,6 +357,20 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+        # ONLINE STATIC scheme (BF16 checkpoint quantized at load + static
+        # activation scale): route away from the cutlass per-channel/per-token
+        # path — the cutlass rowwise kernel rejects scalar activation scales,
+        # and per-tensor/per-tensor goes through the fast torch._scaled_mm
+        # cublasLt kernel. Weights get a PER-TENSOR scale (input_to_float8)
+        # in process_weights_after_loading, activations a fixed scale of 1.0
+        # (bare saturating e4m3 cast; see process_weights_after_loading).
+        self.online_static = (
+            not self.is_checkpoint_fp8_serialized
+            and getattr(self.quant_config, "activation_scheme", None) == "static"
+        )
+        if self.online_static:
+            self.cutlass_fp8_supported = False
+
     def validate_block_quant_shapes(
         self,
         input_size: int,
@@ -661,7 +675,22 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update the layer with the new values.
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer.input_scale = None
+                if self.online_static:
+                    # Online STATIC activation scale := 1.0 (bare saturating
+                    # e4m3 cast). There is no checkpoint scale to load and no
+                    # calibration pass; validated for MuonClip-trained models
+                    # whose activations stay within e4m3 range (Kimi-K2.6:
+                    # rel-err ~= amax-calibrated ~= per-token dynamic).
+                    # apply_fp8_linear then takes the static-quant +
+                    # per-tensor torch._scaled_mm (cublasLt) path.
+                    layer.input_scale = Parameter(
+                        torch.ones(
+                            1, dtype=torch.float32, device=layer.weight.device
+                        ),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.input_scale = None
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module

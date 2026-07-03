@@ -95,6 +95,15 @@ def _run_extend(reqs, mr):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    # This fork defers prefill input_ids H2D to resolve_forward_inputs (called
+    # by the scheduler at forward entry); materialize here since we drive
+    # model_runner.forward directly. (Stale sglang.bench_one_batch.extend()
+    # hits `None >= int` inside the embedding without this.)
+    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+        batch.input_ids = batch.prefill_input_ids_cpu.to(
+            batch.device, non_blocking=True
+        )
+        batch.prefill_input_ids_cpu = None
     _maybe_prepare_mlp_sync_batch(batch, mr)
     forward_batch = ForwardBatch.init_new(batch, mr)
     out = mr.forward(forward_batch)

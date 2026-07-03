@@ -338,8 +338,15 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+# Sentinel: extend-verify translator not yet (lazily) created.
+_UNSET_TRANSLATOR = object()
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
+
+    # Lazily created on first EXTEND forward; see _get_extend_verify_translator.
+    _extend_verify_translator = _UNSET_TRANSLATOR
 
     def __init__(
         self,
@@ -2794,10 +2801,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ignore_tokens=None,
         )
 
+    def _get_extend_verify_translator(self):
+        """Lazily create the extend-as-virtual-verify translator (created on
+        first use so it observes the fully-initialized graph runner; logs
+        ENABLED/DISABLED loudly once, during warmup)."""
+        if self._extend_verify_translator is _UNSET_TRANSLATOR:
+            from sglang.srt.model_executor.extend_verify_translator import (
+                ExtendVerifyGraphTranslator,
+            )
+
+            self._extend_verify_translator = ExtendVerifyGraphTranslator.maybe_create(
+                self
+            )
+        return self._extend_verify_translator
+
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
         self.graph_mem_usage = 0
+        self._extend_verify_translator = _UNSET_TRANSLATOR
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -3339,6 +3361,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            # Extend-as-virtual-verify: replay qualifying small-M EXTEND
+            # batches on the existing TARGET_VERIFY graphs (one monolithic
+            # graph replay instead of a fully-eager forward). Env-gated:
+            # SGLANG_EXTEND_VERIFY_GRAPH=1.
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                translator = self._get_extend_verify_translator()
+                if translator is not None and translator.can_run(forward_batch):
+                    ret = translator.forward(forward_batch)
+                    return ModelRunnerOutput(logits_output=ret, can_run_graph=True)
 
             # For MLP sync
             if forward_batch.global_num_tokens_cpu is not None:

@@ -98,7 +98,11 @@ logger = logging.getLogger(__name__)
 MARKER_ATTR = "_sglang_cutedsl_moe_ar_done"
 
 _ENABLED = os.getenv("SGLANG_CUTEDSL_FUSED_AR", "0") == "1"
-_MIN_TOKENS = int(os.getenv("SGLANG_CUTEDSL_FUSED_AR_MIN_TOKENS", "1024"))
+# Default gate from the kimi-v2 L0 win-vs-M curve (2 containers, real data,
+# vs in-container trtllm serial): -80..-152us/layer at M<=960, ~+40..+92 at
+# 4096, +410..+606 at 16384; breakeven ~2500-3000 tokens. 4096 only engages
+# where the fusion reliably wins (env-tunable).
+_MIN_TOKENS = int(os.getenv("SGLANG_CUTEDSL_FUSED_AR_MIN_TOKENS", "4096"))
 # Return a view of the symmetric buffer instead of copying out (~37us at 16k).
 # Only safe when nothing can enqueue the next MoE layer's buffer zeroing
 # before all consumers of this output ran (true for the plain eager prefill
@@ -126,10 +130,12 @@ _PIN_MIN_TOKENS = int(os.getenv("SGLANG_CUTEDSL_PIN_TACTIC_MIN_TOKENS", "512"))
 
 # Token buckets for the bucketed flag regions (see _FusedMoeArState). The
 # state clips this list to max_num_tokens and always appends max_num_tokens.
+# Default matches the _MIN_TOKENS=4096 gate (a 2048 bucket would only ever
+# serve disabled-by-default small batches).
 _BUCKETS = tuple(
     int(x)
     for x in os.getenv(
-        "SGLANG_CUTEDSL_FUSED_AR_BUCKETS", "2048,4096,8192"
+        "SGLANG_CUTEDSL_FUSED_AR_BUCKETS", "4096,8192"
     ).split(",")
     if x.strip()
 )

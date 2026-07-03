@@ -103,9 +103,17 @@ def _get_shared_c_symm(pg_group_name: str, max_m: int, n: int, dtype, device):
     key = (pg_group_name, max_m, n, dtype)
     entry = _SHARED_C.get(key)
     if entry is None:
-        c_symm = symm_mem.empty((max_m, n), dtype=dtype, device=device)
-        c_symm.zero_()
-        handle = symm_mem.rendezvous(c_symm, group=pg_group_name)
+        # inference_mode(False): the first eager forward can run inside
+        # torch.inference_mode() (flashinfer autotune dummy runs). Buffers
+        # created there would be inference tensors, and downstream torch-level
+        # in-place ops on views of them (e.g. the MoE routed-scale+shared add
+        # on a returned hidden view) then fail outside InferenceMode
+        # ("Inplace update to inference tensor"). Old-campaign lesson
+        # (kimi-bench ffe49fe318).
+        with torch.inference_mode(False):
+            c_symm = symm_mem.empty((max_m, n), dtype=dtype, device=device)
+            c_symm.zero_()
+            handle = symm_mem.rendezvous(c_symm, group=pg_group_name)
         entry = (c_symm, handle.multicast_ptr)
         _SHARED_C[key] = entry
     return entry
@@ -189,41 +197,50 @@ class FusedGemmAllReduce:
         self._cuda_driver = cuda_driver
         pg = self.group.device_group
 
-        # Persistent input staging buffer (lets us cache per-M cute tensors and
-        # pad ragged M up to the tile boundary; the copy is ~10us at M=16K).
-        # In fp8 mode this doubles as the activation quant target (saturating
-        # cast happens in the staging copy).
-        if self.stage_a:
-            self._a_staging = torch.zeros(
-                self.max_m, self.k, dtype=self.in_dtype, device=device
+        # inference_mode(False) around ALL persistent state allocation: the
+        # first eager forward can run inside torch.inference_mode()
+        # (flashinfer autotune dummy runs); tensors created there would be
+        # inference tensors and later torch-level in-place updates (staging
+        # copy_, or MoE in-place adds on returned views) fail outside
+        # InferenceMode. Old-campaign lesson (kimi-bench ffe49fe318).
+        with torch.inference_mode(False):
+            # Persistent input staging buffer (lets us cache per-M cute
+            # tensors and pad ragged M up to the tile boundary; the copy is
+            # ~10us at M=16K). In fp8 mode this doubles as the activation
+            # quant target (saturating cast happens in the staging copy).
+            if self.stage_a:
+                self._a_staging = torch.zeros(
+                    self.max_m, self.k, dtype=self.in_dtype, device=device
+                )
+            else:
+                self._a_staging = None
+            # Symmetric-memory output buffer + multicast handle (SHARED across
+            # wrappers of the same group/shape — see _get_shared_c_symm).
+            self._c_symm, self._c_mc_ptr = _get_shared_c_symm(
+                pg.group_name, self.max_m, self.n, self.dtype, device
             )
-        else:
-            self._a_staging = None
-        # Symmetric-memory output buffer + multicast handle (SHARED across
-        # wrappers of the same group/shape — see _get_shared_c_symm).
-        self._c_symm, self._c_mc_ptr = _get_shared_c_symm(
-            pg.group_name, self.max_m, self.n, self.dtype, device
-        )
 
-        # Double-buffered barrier flags: one i32 per CTA tile + one per SM for
-        # the kernel's final SM-wise inter-GPU barrier.
-        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        num_tiles_max = (self.max_m // _TILE_M) * (self.n // _TILE_N)
-        self._flag_refs = []  # keep torch tensors alive
-        self._flag_pairs = []
-        for _ in range(2):
-            bf = symm_mem.empty(
-                (num_tiles_max + num_sms,), dtype=torch.int32, device=device
-            )
-            bf.zero_()
-            handle = symm_mem.rendezvous(bf, group=pg.group_name)
-            bf_mc_torch = cutlass_torch.as_tensor(
-                handle.multicast_ptr, bf.shape, bf.dtype
-            )
-            bf_cute = from_dlpack(bf).mark_layout_dynamic()
-            bf_mc_cute = from_dlpack(bf_mc_torch).mark_layout_dynamic()
-            self._flag_refs.append((bf, bf_mc_torch))
-            self._flag_pairs.append((bf_cute, bf_mc_cute))
+            # Double-buffered barrier flags: one i32 per CTA tile + one per SM
+            # for the kernel's final SM-wise inter-GPU barrier.
+            num_sms = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
+            num_tiles_max = (self.max_m // _TILE_M) * (self.n // _TILE_N)
+            self._flag_refs = []  # keep torch tensors alive
+            self._flag_pairs = []
+            for _ in range(2):
+                bf = symm_mem.empty(
+                    (num_tiles_max + num_sms,), dtype=torch.int32, device=device
+                )
+                bf.zero_()
+                handle = symm_mem.rendezvous(bf, group=pg.group_name)
+                bf_mc_torch = cutlass_torch.as_tensor(
+                    handle.multicast_ptr, bf.shape, bf.dtype
+                )
+                bf_cute = from_dlpack(bf).mark_layout_dynamic()
+                bf_mc_cute = from_dlpack(bf_mc_torch).mark_layout_dynamic()
+                self._flag_refs.append((bf, bf_mc_torch))
+                self._flag_pairs.append((bf_cute, bf_mc_cute))
 
         major, minor = torch.cuda.get_device_capability(device)
         gemm = PersistentDenseGemmKernel(

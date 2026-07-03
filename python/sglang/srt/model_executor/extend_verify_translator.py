@@ -169,44 +169,65 @@ class ExtendVerifyGraphTranslator:
     # ------------------------------------------------------------------ gate
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
+        reason = self._reject_reason(forward_batch)
+        if reason is None:
+            return True
+        self.num_rejects += 1
+        if self.log_hits:
+            logger.info(
+                "[extend-verify-graph] reject (bs=%d, extend_lens=%s): %s",
+                forward_batch.batch_size,
+                forward_batch.extend_seq_lens_cpu,
+                reason,
+            )
+        return False
+
+    def _reject_reason(self, forward_batch: ForwardBatch) -> Optional[str]:
         if forward_batch.forward_mode != ForwardMode.EXTEND:
-            return False
+            return f"forward_mode {forward_batch.forward_mode}"
         if forward_batch.return_logprob:
-            return False
+            return "return_logprob"
         if (
             forward_batch.input_embeds is not None
             or forward_batch.replace_embeds is not None
-            or forward_batch.mm_inputs is not None
         ):
-            return False
+            return "input_embeds/replace_embeds"
+        # mm_inputs is a per-req list on multimodal-arch models (KimiK25
+        # wrapper) — all-None means a pure text batch.
+        if forward_batch.mm_inputs is not None and any(
+            x is not None for x in forward_batch.mm_inputs
+        ):
+            return "multimodal inputs"
         if forward_batch.capture_hidden_mode != self.required_hidden_mode:
             # Verify mode: DFlash target extends always request FULL aux-hidden
             # capture; anything else would mismatch the captured graphs.
             # Decode mode: only NULL is supported.
-            return False
+            return (
+                f"capture_hidden_mode {forward_batch.capture_hidden_mode} != "
+                f"{self.required_hidden_mode}"
+            )
         extend_lens = forward_batch.extend_seq_lens_cpu
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if extend_lens is None or prefix_lens is None:
-            return False
+            return "missing extend/prefix lens"
         if len(extend_lens) != forward_batch.batch_size:
-            return False
+            return "extend_lens/batch_size mismatch"
 
         block = self.block
         total_virtual = 0
         for m, p in zip(extend_lens, prefix_lens):
             m = int(m)
             if m <= 0:
-                return False
+                return "empty extend req"
             v = -(-m // block)
             pad = v * block - m
             if int(p) < pad:
                 # Front-padding borrows pad positions from the prefix.
-                return False
+                return f"prefix {int(p)} < pad {pad}"
             total_virtual += v
         if total_virtual > self.max_bs:
-            self.num_rejects += 1
-            return False
-        return True
+            return f"virtual bs {total_virtual} > max {self.max_bs}"
+        return None
 
     # -------------------------------------------------------------- translate
 

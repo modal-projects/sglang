@@ -66,6 +66,15 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Speculative-decoding (DFlash) draft KV transfer with an MLA target.
+    # The draft's (MHA, TP-sharded) K/V buffers are appended after the target
+    # buffers in kv_data_ptrs. num_target_kv_data_ptrs is the count of leading
+    # target entries, so the draft section is kv_data_ptrs[num_target:]; 0 means
+    # no draft is appended on this rank (e.g. non-last PP stages). draft_kv_head_num
+    # is the draft pool's per-rank KV head count, used to redistribute draft heads
+    # when prefill and decode TP sizes differ.
+    num_target_kv_data_ptrs: int = 0
+    draft_kv_head_num: int = 0
 
 
 class KVPoll:

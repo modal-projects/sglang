@@ -148,6 +148,9 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
+        # Number of target (MLA) buffers before any draft buffers are appended.
+        # The draft (MHA) section, if present, is kv_data_ptrs[num_target:].
+        kv_args.num_target_kv_data_ptrs = len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -157,6 +160,11 @@ class PrefillBootstrapQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            # Per-rank draft KV head count, used to slice draft heads when the
+            # last prefill PP stage's TP differs from the decode TP.
+            kv_args.draft_kv_head_num = getattr(
+                self.draft_token_to_kv_pool, "head_num", 0
+            )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

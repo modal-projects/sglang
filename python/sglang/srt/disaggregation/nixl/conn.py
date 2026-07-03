@@ -555,7 +555,30 @@ class NixlKVManager(CommonKVManager):
                                 f"{req.room}_kv_{kv_chunk.chunk_id}"
                                 f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
                             )
-                            if self.is_mla_backend or (
+                            has_draft = (
+                                self.kv_args.num_target_kv_data_ptrs
+                                and self.kv_args.num_target_kv_data_ptrs
+                                < len(self.kv_args.kv_data_ptrs)
+                            )
+                            if self.is_mla_backend and has_draft:
+                                # MLA target + DFlash draft (MHA) resident on this
+                                # (last) PP stage: the target latent copies
+                                # contiguously while the draft's per-head KV is
+                                # re-sliced when prefill/decode TP differ. Both are
+                                # packed into one transfer + notif so the receiver's
+                                # per-PP-rank arrival accounting is unchanged.
+                                kv_xfer_handle = self.send_kvcache_mla_with_draft(
+                                    req.agent_name,
+                                    kv_chunk.prefill_kv_indices,
+                                    dst_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_info.gpu_id,
+                                    notif,
+                                    prefill_tp_size=self.attn_tp_size,
+                                    decode_tp_size=decode_tp_size,
+                                    decode_tp_rank=dst_info.decode_tp_rank,
+                                )
+                            elif self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
                             ):
                                 kv_xfer_handle = self.send_kvcache(
@@ -708,6 +731,137 @@ class NixlKVManager(CommonKVManager):
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
+    @staticmethod
+    def _make_kv_reqs(addr_chunks, len_chunks, gpu_id):
+        """Stack per-layer address/length chunks into one (N, 3) uint64
+        descriptor array of (addr, len, gpu) rows for NIXL."""
+        if not addr_chunks:
+            return np.empty((0, 3), dtype=np.uint64)
+        flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
+        flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
+        return np.column_stack(
+            (flat_addrs, flat_lens, np.full_like(flat_addrs, gpu_id, dtype=np.uint64))
+        )
+
+    def _post_xfer(self, peer_name, src_reqs, dst_reqs, notif, what="KV"):
+        """Build NIXL xfer descs from req arrays and post a single WRITE."""
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception(f"KVSender failed to create {what} transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception(f"KVSender failed to post {what} transfer")
+        return xfer_handle
+
+    @staticmethod
+    def _contiguous_layer_addrs(layers_params, prefill_indices, dst_indices):
+        """Page-contiguous copy. Group indices into contiguous runs, then for
+        each (src_ptr, dst_ptr, item_len) layer emit per-block addresses and
+        lengths. Used for the MLA latent and homogeneous-TP MHA, where no
+        per-head reslicing is needed. Returns (src_addrs, src_lens, dst_addrs,
+        dst_lens) as lists of per-layer arrays."""
+        prefill_blocks, dst_blocks = group_concurrent_contiguous(
+            prefill_indices, dst_indices
+        )
+        prefill_starts = np.fromiter(
+            (block[0] for block in prefill_blocks), dtype=np.uint64
+        )
+        dst_starts = np.fromiter((block[0] for block in dst_blocks), dtype=np.uint64)
+        block_lens = np.fromiter(
+            (len(block) for block in prefill_blocks), dtype=np.uint64
+        )
+        src_addrs, src_lens, dst_addrs, dst_lens = [], [], [], []
+        for src_ptr, dst_ptr, item_len in layers_params:
+            lengths = item_len * block_lens
+            src_addrs.append(src_ptr + prefill_starts * item_len)
+            src_lens.append(lengths)
+            dst_addrs.append(dst_ptr + dst_starts * item_len)
+            dst_lens.append(lengths)
+        return src_addrs, src_lens, dst_addrs, dst_lens
+
+    @staticmethod
+    def _head_slice_offsets(
+        prefill_tp_size,
+        decode_tp_size,
+        local_tp_rank,
+        dst_tp_rank,
+        total_kv_heads,
+        bytes_per_head,
+    ):
+        """Select which KV heads this prefill rank sends to the given decode
+        rank when prefill/decode TP differ, returning byte offsets:
+        (src_head_offset, dst_head_offset, bytes_per_token_to_send)."""
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        # GQA replication: how many prefill ranks share the same KV head.
+        src_replication = max(1, prefill_tp_size // total_kv_heads)
+        if prefill_tp_size > decode_tp_size:
+            # Multiple prefill ranks feed one decode rank.
+            src_head_start = 0
+            num_heads_to_send = src_heads_per_rank
+            dst_head_start = (
+                (local_tp_rank // src_replication) * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            # One prefill rank feeds (part of) multiple decode ranks.
+            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start = 0
+        return (
+            src_head_start * bytes_per_head,
+            dst_head_start * bytes_per_head,
+            num_heads_to_send * bytes_per_head,
+        )
+
+    @staticmethod
+    def _head_slice_addrs(
+        ptr_pairs,
+        prefill_indices,
+        dst_indices,
+        src_item_len,
+        dst_item_len,
+        page_size,
+        src_head_offset,
+        dst_head_offset,
+        heads_bytes_per_token,
+    ):
+        """Per-token head-sliced copy. Expand each page index into page_size
+        token offsets and apply per-head byte offsets, for each (src_ptr,
+        dst_ptr) buffer pair. Used when KV is head-sharded and prefill/decode
+        TP differ. Returns (src_addrs, src_lens, dst_addrs, dst_lens)."""
+        prefill_idx = np.asarray(prefill_indices, dtype=np.uint64)
+        dst_idx = np.asarray(dst_indices, dtype=np.uint64)
+        token_offsets = np.arange(page_size, dtype=np.uint64)
+        bytes_per_token_prefill = src_item_len // page_size
+        bytes_per_token_decode = dst_item_len // page_size
+        src_addrs, src_lens, dst_addrs, dst_lens = [], [], [], []
+        for src_ptr, dst_ptr in ptr_pairs:
+            src_page_bases = src_ptr + prefill_idx * src_item_len
+            dst_page_bases = dst_ptr + dst_idx * dst_item_len
+            src_all = (
+                src_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_prefill
+                + src_head_offset
+            ).ravel()
+            dst_all = (
+                dst_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_decode
+                + dst_head_offset
+            ).ravel()
+            src_addrs.append(src_all)
+            src_lens.append(
+                np.full(src_all.shape, heads_bytes_per_token, dtype=np.uint64)
+            )
+            dst_addrs.append(dst_all)
+            dst_lens.append(
+                np.full(dst_all.shape, heads_bytes_per_token, dtype=np.uint64)
+            )
+        return src_addrs, src_lens, dst_addrs, dst_lens
+
     def _send_kvcache_generic(
         self,
         peer_name: str,
@@ -729,102 +883,30 @@ class NixlKVManager(CommonKVManager):
         dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
         item_lens = np.array(item_lens, dtype=np.uint64)
 
-        # group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
-        # Make descs
         if self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            src_kv_ptrs, dst_kv_ptrs, n_layers = self.get_mla_kv_ptrs_with_pp(
+                src_data_ptrs, dst_data_ptrs
             )
             layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
+                (src_kv_ptrs[i], dst_kv_ptrs[i], item_lens[i]) for i in range(n_layers)
             ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, n_layers = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-
             layers_params = [
-                (
-                    src_k_ptrs[layer_id],
-                    dst_k_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
+                (src_k_ptrs[i], dst_k_ptrs[i], item_lens[i]) for i in range(n_layers)
             ] + [
-                (
-                    src_v_ptrs[layer_id],
-                    dst_v_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
+                (src_v_ptrs[i], dst_v_ptrs[i], item_lens[i]) for i in range(n_layers)
             ]
 
-        src_addrs = []
-        src_lens = []
-        dst_addrs = []
-        dst_lens = []
-
-        # Precompute block starts/lengths to reduce Python-level loops.
-        prefill_starts = np.fromiter(
-            (block[0] for block in prefill_kv_blocks), dtype=np.uint64
+        src_addrs, src_lens, dst_addrs, dst_lens = self._contiguous_layer_addrs(
+            layers_params, prefill_data_indices, dst_data_indices
         )
-        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.uint64)
-        block_lens = np.fromiter(
-            (len(block) for block in prefill_kv_blocks), dtype=np.uint64
-        )
-
-        for src_ptr, dst_ptr, item_len in layers_params:
-            lengths = item_len * block_lens
-            src_addrs.append(src_ptr + prefill_starts * item_len)
-            src_lens.append(lengths)
-            dst_addrs.append(dst_ptr + dst_starts * item_len)
-            dst_lens.append(lengths)
-
-        def make_req_array(addr_chunks, len_chunks, gpu):
-            if not addr_chunks:
-                return np.empty((0, 3), dtype=np.uint64)
-            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
-            flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
-            return np.column_stack(
-                (
-                    flat_addrs,
-                    flat_lens,
-                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
-                )
-            )
-
-        src_reqs = make_req_array(src_addrs, src_lens, self.kv_args.gpu_id)
-        dst_reqs = make_req_array(dst_addrs, dst_lens, dst_gpu_id)
-
-        logger.debug(
-            f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
-        )
-        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
-            notif.encode("ascii"),  # type: ignore
-        )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
-        return xfer_handle
+        src_reqs = self._make_kv_reqs(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = self._make_kv_reqs(dst_addrs, dst_lens, dst_gpu_id)
+        return self._post_xfer(peer_name, src_reqs, dst_reqs, notif)
 
     def send_kvcache(
         self,
@@ -846,6 +928,125 @@ class NixlKVManager(CommonKVManager):
             notif=notif,
         )
 
+    def send_kvcache_mla_with_draft(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        notif: str,
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+    ):
+        """Send an MLA target + DFlash draft chunk in a single RDMA transfer.
+
+        Layout of the flat pointer lists (target-first, draft appended):
+          src (this last PP stage): [MLA target layers for this stage]
+                                    + [draft_K x D, draft_V x D]
+          dst (decode, PP=1):       [MLA target layers for all L]
+                                    + [draft_K x D, draft_V x D]
+
+        The MLA target latent is replicated across TP, so it is copied
+        page-contiguously and PP-sliced exactly like ``send_kvcache``. The
+        DFlash draft KV is MHA and TP-sharded, so its heads are redistributed
+        per token when ``prefill_tp_size != decode_tp_size`` (same math as
+        ``send_kvcache_slice``); the draft is fully resident here and decode
+        holds all draft layers, so draft layers map 1:1 (no PP slicing).
+
+        Both desc sets are concatenated into one ``initialize_xfer`` with a
+        single notif so the receiver's per-PP-rank arrival accounting (which
+        counts one ``_kv_`` notif per PP rank) is unchanged.
+        """
+        src_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
+        dst_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
+        item_lens = np.array(self.kv_args.kv_item_lens, dtype=np.uint64)
+
+        num_target_src = int(self.kv_args.num_target_kv_data_ptrs)
+        num_draft = len(src_ptrs) - num_target_src  # 2 * D  (K buffers + V buffers)
+        if num_draft <= 0 or num_draft % 2 != 0:
+            raise RuntimeError(
+                f"Unexpected draft pointer layout: num_target={num_target_src}, "
+                f"total={len(src_ptrs)} (expected an even, positive draft count)"
+            )
+        num_draft_layers = num_draft // 2
+        # Decode holds all target layers; the draft section has the same size on
+        # both sides, so the decode target count is total minus the draft count.
+        num_target_dst = len(dst_ptrs) - num_draft
+
+        # --- Target (MLA, replicated): page-contiguous copy, PP-sliced ---
+        src_kv_ptrs, sliced_dst_kv_ptrs, n_layers = self.get_mla_kv_ptrs_with_pp(
+            src_ptrs[:num_target_src], dst_ptrs[:num_target_dst]
+        )
+        target_item_lens = item_lens[:num_target_src]
+        layers_params = [
+            (src_kv_ptrs[i], sliced_dst_kv_ptrs[i], target_item_lens[i])
+            for i in range(n_layers)
+        ]
+        src_addrs, src_lens, dst_addrs, dst_lens = self._contiguous_layer_addrs(
+            layers_params, prefill_kv_indices, dst_kv_indices
+        )
+
+        # --- Draft (MHA, TP-sharded): per-token head slice, 1:1 layer mapping ---
+        page_size = self.kv_args.page_size
+        src_draft_item_len = int(item_lens[num_target_src])  # per-rank, per-page bytes
+        draft_heads_per_rank = int(self.kv_args.draft_kv_head_num)
+        if draft_heads_per_rank <= 0:
+            raise RuntimeError(
+                "draft_kv_head_num must be set on the prefill KVArgs to transfer "
+                "DFlash draft KV"
+            )
+        # Full (all-TP) draft KV head count. Mirrors send_kvcache_slice's
+        # kv_head_num * tp_size fallback; exact when total_kv_heads >= tp_size.
+        total_kv_heads = draft_heads_per_rank * prefill_tp_size
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        # Per-head, per-token bytes (a draft-model constant: head_dim * dtype).
+        bytes_per_head = src_draft_item_len // page_size // src_heads_per_rank
+        dst_draft_item_len = dst_heads_per_rank * bytes_per_head * page_size
+
+        src_head_off, dst_head_off, heads_bytes_per_token = self._head_slice_offsets(
+            prefill_tp_size,
+            decode_tp_size,
+            self.kv_args.engine_rank % prefill_tp_size,
+            decode_tp_rank % decode_tp_size,
+            total_kv_heads,
+            bytes_per_head,
+        )
+
+        draft_ptr_pairs = list(
+            zip(
+                src_ptrs[num_target_src : num_target_src + num_draft_layers],
+                dst_ptrs[num_target_dst : num_target_dst + num_draft_layers],
+            )
+        ) + list(
+            zip(
+                src_ptrs[num_target_src + num_draft_layers : num_target_src + num_draft],
+                dst_ptrs[num_target_dst + num_draft_layers : num_target_dst + num_draft],
+            )
+        )
+        d_src_addrs, d_src_lens, d_dst_addrs, d_dst_lens = self._head_slice_addrs(
+            draft_ptr_pairs,
+            prefill_kv_indices,
+            dst_kv_indices,
+            src_draft_item_len,
+            dst_draft_item_len,
+            page_size,
+            src_head_off,
+            dst_head_off,
+            heads_bytes_per_token,
+        )
+        src_addrs += d_src_addrs
+        src_lens += d_src_lens
+        dst_addrs += d_dst_addrs
+        dst_lens += d_dst_lens
+
+        # --- One combined transfer for target + draft ---
+        src_reqs = self._make_kv_reqs(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = self._make_kv_reqs(dst_addrs, dst_lens, dst_gpu_id)
+        return self._post_xfer(peer_name, src_reqs, dst_reqs, notif, what="MLA+draft KV")
+
     def send_kvcache_slice(
         self,
         peer_name: str,
@@ -860,9 +1061,6 @@ class NixlKVManager(CommonKVManager):
         dst_kv_item_len: int,
     ):
         # Get configuration from kv_args
-        local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
-
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
 
@@ -872,118 +1070,43 @@ class NixlKVManager(CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        bytes_per_head = dst_kv_item_len // page_size // dst_heads_per_rank
 
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
+        src_head_off, dst_head_off, heads_bytes_per_token = self._head_slice_offsets(
+            prefill_tp_size,
+            decode_tp_size,
+            self.kv_args.engine_rank % prefill_tp_size,
+            decode_tp_rank % decode_tp_size,
+            total_kv_heads,
+            bytes_per_head,
         )
-
-        # GQA replication: how many prefill ranks share the same KV head
-        src_replication = max(1, prefill_tp_size // total_kv_heads)
-
-        # Determine which heads to send
-        if prefill_tp_size > decode_tp_size:
-            # Multiple prefill ranks to one decode rank
-            src_head_start_offset = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start_offset = (
-                unique_head_idx * src_heads_per_rank
-            ) % dst_heads_per_rank
-        else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
-            src_head_start_offset = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start_offset = 0
 
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
         # 0xffff81ab54e01000). Use np.uint64 to prevent overflow on XPU.
         kv_data_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
         dst_kv_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, n_layers = (
             self.get_mha_kv_ptrs_with_pp(kv_data_ptrs, dst_kv_ptrs)
         )
-        # Calculate precise byte offset and length for the sub-slice within the token
-        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
-        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
-        heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
-
-        src_dst_ptr_pairs = [
-            (
-                src_k_ptrs[layer_id],
-                dst_k_ptrs[layer_id],
-            )
-            for layer_id in range(layers_current_pp_stage)
-        ] + [
-            (
-                src_v_ptrs[layer_id],
-                dst_v_ptrs[layer_id],
-            )
-            for layer_id in range(layers_current_pp_stage)
+        ptr_pairs = [(src_k_ptrs[i], dst_k_ptrs[i]) for i in range(n_layers)] + [
+            (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(n_layers)
         ]
 
-        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.uint64)
-        dst_indices = np.asarray(dst_kv_indices, dtype=np.uint64)
-        bytes_per_token_prefill = src_kv_item_len // page_size
-        bytes_per_token_decode = dst_kv_item_len // page_size
-        token_offsets = np.arange(page_size, dtype=np.uint64)
-
-        src_addrs = []
-        dst_addrs = []
-
-        for src_ptr, dst_ptr in src_dst_ptr_pairs:
-            src_page_bases = src_ptr + prefill_indices * src_kv_item_len
-            dst_page_bases = dst_ptr + dst_indices * dst_kv_item_len
-
-            src_all = (
-                src_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_prefill
-                + src_head_slice_offset
-            ).ravel()
-            dst_all = (
-                dst_page_bases[:, None]
-                + token_offsets[None, :] * bytes_per_token_decode
-                + dst_head_slice_offset
-            ).ravel()
-
-            src_addrs.append(src_all)
-            dst_addrs.append(dst_all)
-
-        def make_req_array(addr_chunks, size, gpu):
-            if not addr_chunks:
-                return np.empty((0, 3), dtype=np.uint64)
-            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
-            return np.column_stack(
-                (
-                    flat_addrs,
-                    np.full_like(flat_addrs, size, dtype=np.uint64),
-                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
-                )
-            )
-
-        src_reqs = make_req_array(
-            src_addrs, heads_bytes_per_token_to_send, self.kv_args.gpu_id
+        src_addrs, src_lens, dst_addrs, dst_lens = self._head_slice_addrs(
+            ptr_pairs,
+            prefill_kv_indices,
+            dst_kv_indices,
+            src_kv_item_len,
+            dst_kv_item_len,
+            page_size,
+            src_head_off,
+            dst_head_off,
+            heads_bytes_per_token,
         )
-        dst_reqs = make_req_array(dst_addrs, heads_bytes_per_token_to_send, dst_gpu_id)
-
-        # Use NIXL agent for transfer
-        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
-
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
-        )
-        if not xfer_handle:
-            raise Exception("Failed to create sliced KV transfer")
-
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post sliced KV transfer")
-
-        return xfer_handle
+        src_reqs = self._make_kv_reqs(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = self._make_kv_reqs(dst_addrs, dst_lens, dst_gpu_id)
+        return self._post_xfer(peer_name, src_reqs, dst_reqs, notif, what="sliced KV")
 
     def send_kvcache_staged(
         self,

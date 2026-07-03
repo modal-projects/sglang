@@ -644,6 +644,27 @@ class CudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
+        # Real (scheduler-formed) batches only ever replay buckets up to the
+        # native list's max — extra buckets below are extend-translation-only.
+        self.native_max_bs = max(self.capture_bs)
+        # Extra capture buckets for extend-as-virtual-verify replay
+        # (SGLANG_EXTEND_VERIFY_GRAPH). These represent VIRTUAL requests
+        # (ceil(M/block) per real extend request, sharing one page table), so
+        # they may exceed req_to_token_pool.size: real batches never reach
+        # them (can_run gates on native_max_bs), and capture only needs
+        # buffer shapes, not distinct request slots.
+        extend_bs_env = os.environ.get("SGLANG_EXTEND_GRAPH_BS", "")
+        if extend_bs_env and not model_runner.is_draft_worker:
+            extra_bs = sorted(
+                {int(x) for x in extend_bs_env.replace(",", " ").split() if int(x) > 0}
+            )
+            self.capture_bs = sorted(set(self.capture_bs) | set(extra_bs))
+            log_info_on_rank0(
+                logger,
+                f"[extend-verify-graph] extra capture bs {extra_bs} "
+                f"(max {max(self.capture_bs) * self.num_tokens_per_bs} tokens); "
+                f"native (real-batch) max bs stays {self.native_max_bs}",
+            )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -755,10 +776,14 @@ class CudaGraphRunner:
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
+        # Real batches are capped at native_max_bs: extra extend-translation
+        # buckets (SGLANG_EXTEND_GRAPH_BS) must not change decode/verify
+        # padding behavior. The extend translator bypasses can_run and may use
+        # the full capture list.
         is_bs_supported = (
             graph_key in self.graphs
             if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
+            else cuda_graph_bs <= self.native_max_bs
         )
 
         if self.require_mlp_sync:

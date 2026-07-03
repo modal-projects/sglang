@@ -448,13 +448,28 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         if self.num_draft_tokens and not self.skip_prefill:
-            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
-            # in-place so the gpu_only path needs no seq_lens_sum.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+            # DFlash on causal-path backends (this one) never reads a custom
+            # mask (chain drafts, built-in causal kernel) — skip the scratch,
+            # which scales with max_num_tokens * max_context_len (~0.26
+            # MB/token at 256k ctx: 268 MB at 1024 captured tokens).
+            skip_mask = False
+            spec_alg = get_global_server_args().speculative_algorithm
+            if spec_alg is not None and str(spec_alg).upper() == "DFLASH":
+                from sglang.srt.speculative.dflash_utils import (
+                    resolve_dflash_verify_mask_policy,
+                )
+
+                _, build_custom_mask = resolve_dflash_verify_mask_policy(self)
+                skip_mask = not build_custom_mask
+            if not skip_mask:
+                # Worst-case FULL_MASK tree-mask scratch (bool); build_tree
+                # writes it in-place so the gpu_only path needs no
+                # seq_lens_sum.
+                self.cuda_graph_custom_mask = torch.zeros(
+                    max_num_tokens * (self.max_context_len + self.num_draft_tokens),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 

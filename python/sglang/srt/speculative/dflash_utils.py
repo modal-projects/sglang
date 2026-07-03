@@ -29,6 +29,9 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        # Subclass of TRTLLMMLABackend (same built-in causal verify path); the
+        # name-based check missed it, forcing pointless mask builds/buffers.
+        "TokenspeedMLABackend",
     }
 )
 

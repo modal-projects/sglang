@@ -53,6 +53,10 @@ CASES = [
     [(128, 16)],  # exact captured-bs boundary
     [(64, 1)],  # single-token extend
     [(128, 5), (64, 9)],  # multi-req, mixed M (v_total=14 <= 16)
+    # Extra extend-only buckets (SGLANG_EXTEND_GRAPH_BS beyond the native
+    # list; skipped automatically if the env is not set):
+    [(128, 17)],  # pads into extra bucket 24
+    [(128, 24)],  # exact extra bucket
 ]
 DECODE_STEPS = 4
 
@@ -168,9 +172,19 @@ def run_test(server_args, port_args, gpu_id, tp_rank):
         f"num_tokens_per_bs={runner.num_tokens_per_bs} bs={runner.capture_bs}"
     )
 
+    # Coverage ceiling of the translator (block=1 in decode mode => M tokens
+    # need M virtual reqs). Cases beyond it are skipped (env-dependent).
+    max_virtual = max(runner.capture_bs) * runner.num_tokens_per_bs
+
     rng = np.random.RandomState(42)
     failures = 0
     for ci, case in enumerate(CASES):
+        if sum(m for (_p, m) in case) > max_virtual:
+            rank_print(
+                f"[l1] case {ci} {case}: SKIPPED (needs > {max_virtual} "
+                f"virtual reqs; set SGLANG_EXTEND_GRAPH_BS)"
+            )
+            continue
         rng_ids = [
             list(rng.randint(0, 10000, (p + m,)).astype(np.int64))
             for (p, m) in case

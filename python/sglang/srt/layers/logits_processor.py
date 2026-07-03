@@ -156,6 +156,10 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # TARGET_VERIFY-form extend graphs: gather logits only at these rows
+    # (one per virtual request). None = standard all-row verify logits.
+    verify_last_row_indices: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -207,6 +211,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            verify_last_row_indices=forward_batch.verify_last_row_indices,
         )
 
     def compute_dp_attention_metadata(self):
@@ -419,8 +424,24 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
-            pruned_states = hidden_states
-            pruned_states_before_norm = hidden_states_before_norm
+            if (
+                logits_metadata.verify_last_row_indices is not None
+                and logits_metadata.forward_mode.is_target_verify()
+            ):
+                # Extend-as-virtual-verify extension graphs: logits only at
+                # the last row of each virtual request (8x smaller lm_head +
+                # logits buffer). Aux hidden states stay ALL-row: DFlash
+                # drafting consumes every extend token's aux hidden.
+                idx = logits_metadata.verify_last_row_indices
+                pruned_states = hidden_states[idx]
+                pruned_states_before_norm = (
+                    hidden_states_before_norm[idx]
+                    if hidden_states_before_norm is not None
+                    else None
+                )
+            else:
+                pruned_states = hidden_states
+                pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
                 aux_pruned_states = (
                     aux_hidden_states

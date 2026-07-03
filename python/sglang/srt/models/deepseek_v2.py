@@ -175,6 +175,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -206,6 +207,28 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+@register_custom_op(mutates_args=["aux_hidden_states"])
+@register_split_op()
+def dflash_pack_aux_hidden(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    aux_hidden_states: torch.Tensor,
+    start: int,
+    size: int,
+) -> None:
+    """In-place DFlash/EAGLE-3 aux-hidden packing: writes hidden+residual into
+    its slice of the packed [tokens, K*hidden] buffer with zero temporaries
+    (torch.add out= form). Registered as a mutable custom op AND a piecewise
+    split op so it runs eagerly between CUDA-graph pieces — dynamo cannot
+    trace out= into a non-contiguous slice, and inside a piece the mutation
+    would be auto_functionalized into a full-buffer clone."""
+    torch.add(
+        hidden_states,
+        residual,
+        out=aux_hidden_states[..., start : start + size],
+    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -2452,13 +2475,25 @@ class DeepseekV2Model(nn.Module):
                         ]
                         if residual is None:
                             aux_hidden_slot.copy_(hidden_states)
-                        elif not get_global_server_args().disable_piecewise_cuda_graph:
-                            # Dynamo (piecewise CUDA graph tracing) rejects
-                            # out= into a non-contiguous slice; pay one
-                            # transient [tokens, hidden] add instead.
-                            aux_hidden_slot.copy_(hidden_states + residual)
                         else:
-                            torch.add(hidden_states, residual, out=aux_hidden_slot)
+                            # In-place pack via a registered SPLIT op: dynamo
+                            # rejects torch.add(out=non-contiguous slice) when
+                            # traced directly (gb0242), and a mutable custom op
+                            # INSIDE a compiled piece would be
+                            # auto_functionalized (= full-buffer clone at
+                            # runtime; this fork's FixFunctionalizationPass
+                            # de-functionalizes nothing). As a split op it runs
+                            # eagerly between graph pieces — the original
+                            # zero-temp in-place form is preserved under eager,
+                            # PCG capture, and PCG replay alike (same pattern
+                            # as unified_attention_with_output).
+                            dflash_pack_aux_hidden(
+                                hidden_states,
+                                residual,
+                                aux_hidden_states,
+                                start,
+                                aux_hidden_size,
+                            )
                     aux_hidden_state_idx += 1
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(

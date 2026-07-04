@@ -667,7 +667,20 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
-    if page_size > 1:
+    # Align with the ALLOCATOR's page size, not the server page size: under
+    # DCP the paged allocator is widened to page_size * dcp_size and its
+    # free() releases the WHOLE page containing any freed index. Rounding
+    # start_p with the physical page size can land it mid logical page, so
+    # the overallocated-tail free would release a page that (a) still holds
+    # the committed prefix owned by the radix tree, or (b) was already freed
+    # by cache_finished_req's unaligned-tail free — duplicating the page in
+    # free_pages (available_size overcount -> negative token_usage assert)
+    # and, worse, allowing one page to be handed out twice (KV corruption).
+    # For dcp_size == 1 the two page sizes coincide and this is a no-op.
+    allocator_page_size = tree_cache.token_to_kv_pool_allocator.page_size
+    if allocator_page_size > 1:
+        start_p = ceil_align(start_p, allocator_page_size)
+    elif page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:

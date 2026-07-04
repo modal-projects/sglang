@@ -166,10 +166,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                # Under DCP the target's MLA pool holds max_total PHYSICAL
+                # tokens per rank while the DFLASH draft pool is REPLICATED at
+                # LOGICAL capacity (max_total * dcp_size, see
+                # _apply_memory_pool_config) — per physical target token the
+                # draft stores dcp_size tokens of KV. Without scaling the
+                # draft budget share by dcp_size, the extra (dcp-1)x draft
+                # bytes land OUTSIDE the mem-fraction budget and eat the
+                # activation headroom (observed 4xB200 Kimi-K2.6 dcp=4
+                # @0.9455: ~4.3 GiB less free than the dcp=1 twin, hard CUDA
+                # OOM on the first 16k-chunk MoE transient — design risk #8).
+                draft_layers_budget = int(draft_num_layers) * int(
+                    getattr(mr, "dcp_size", 1) or 1
+                )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
+                    draft_num_layers=draft_layers_budget,
                 )
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:

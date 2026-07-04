@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -219,6 +220,16 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Max M for the dsv3_router_gemm fast path in MoEGate.forward. Upstream #29470
+# (98d0e702c, GLM-5 tuning) lowered the SM100/SM103 cutoff M<=16 -> M<=4, which
+# flips DFlash TARGET_VERIFY router-logit numerics (M = 8*bs) from the custom
+# kernel to F.linear and collapses acceptance length on Kimi-K2.6-NVFP4
+# (5.22 -> 2.27 prose; kimi-v2 acceptance-bisect verdict, single-commit
+# precision). Restore effective M<=16 on all SMs; env-overridable for A/B.
+_DSV3_ROUTER_GEMM_MAX_M = int(
+    os.environ.get("SGLANG_DSV3_ROUTER_GEMM_MAX_M", "16")
+)
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -495,8 +506,10 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
+            # Kimi-v3: restore M<=16 (see _DSV3_ROUTER_GEMM_MAX_M note above);
+            # upstream's `4 if _device_sm in (100, 103) else 16` collapses
+            # DFlash acceptance at verify shapes.
+            max_router_gemm_tokens = _DSV3_ROUTER_GEMM_MAX_M
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= max_router_gemm_tokens

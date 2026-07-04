@@ -497,8 +497,13 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
+            # Restore the pre-#29470 threshold on SM100: the M<=4 cutoff flips
+            # router-gemm numerics exactly at DFlash verify shapes (M=8*bs),
+            # flipping borderline top-k picks and collapsing draft acceptance
+            # (kimi-v2 acceptance bisect, 2026-07-03: 5.22 -> 2.27 prose acclen).
+            # Target quality is untouched either way; keep numerics parity with
+            # the shipping fork by using the JIT kernel through M=16.
+            max_router_gemm_tokens = 16
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= max_router_gemm_tokens

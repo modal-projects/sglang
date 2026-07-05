@@ -83,7 +83,19 @@ class LoadPlan:
                     pass  # untaggable tensor: its loads stay unrecorded -> fallback
                 yield name, tensor
 
-        wrapped: List[Tuple[torch.nn.Parameter, Any]] = []
+        # weight_loader is a plain attribute on vanilla Parameters but a
+        # read-only property over `_weight_loader` on BasevLLMParameter
+        # subclasses — wrap whichever slot actually holds the callable.
+        wrapped: List[Tuple[torch.nn.Parameter, str, Any]] = []
+
+        def swap_loader(param: torch.nn.Parameter, value: Any) -> str:
+            try:
+                param.weight_loader = value
+                return "weight_loader"
+            except AttributeError:
+                param._weight_loader = value
+                return "_weight_loader"
+
         try:
             for fqn, param in model.named_parameters():
                 loader = getattr(param, "weight_loader", None)
@@ -100,13 +112,13 @@ class LoadPlan:
 
                     return recording_loader
 
-                param.weight_loader = make_wrapper()
-                wrapped.append((param, loader))
+                slot = swap_loader(param, make_wrapper())
+                wrapped.append((param, slot, loader))
 
             model.load_weights(tagged())
         finally:
-            for param, loader in wrapped:
-                param.weight_loader = loader
+            for param, slot, loader in wrapped:
+                setattr(param, slot, loader)
 
         self.entries = recorded
         # Seen-but-unrecorded names have effects the boundary cannot represent

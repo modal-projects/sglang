@@ -1683,18 +1683,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             plan = get_or_create_plan(self.model)
 
         def model_load_weights(model, iter):
-            if plan is None:
-                loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
-                return model
-            start = time.perf_counter()
-            if plan.recorded:
-                timing.update(plan.replay(model, iter))
-            else:
-                timing.update(plan.record(model, iter))
-            timing["load_s"] = time.perf_counter() - start
-            start = time.perf_counter()
-            DefaultModelLoader.postprocess_weights(model, target_device)
-            timing["postprocess_s"] = time.perf_counter() - start
+            nonlocal plan
+            if plan is not None:
+                # A plan failure must never take down the reload (or its
+                # rollback retry): drop the plan and fall through to the
+                # legacy loader with a FRESH iterator — the failed pass may
+                # have partially consumed and partially applied this one, and
+                # the full legacy reload overwrites every weight anyway.
+                start = time.perf_counter()
+                try:
+                    if plan.recorded:
+                        timing.update(plan.replay(model, iter))
+                    else:
+                        timing.update(plan.record(model, iter))
+                    timing["load_s"] = time.perf_counter() - start
+                    start = time.perf_counter()
+                    DefaultModelLoader.postprocess_weights(model, target_device)
+                    timing["postprocess_s"] = time.perf_counter() - start
+                    return model
+                except Exception:
+                    logger.exception(
+                        "load plan pass failed; falling back to the legacy loader"
+                    )
+                    plan = None
+                    self.model._reload_load_plan = None
+                    del iter
+                    gc.collect()
+                    iter = get_weight_iter(self.model_config)
+            loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):

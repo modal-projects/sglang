@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional
 
@@ -286,6 +287,39 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        # SGLANG_SIMULATED_ACCLEN=<float>: THROUGHPUT HARNESS ONLY. Overrides the
+        # computed accept length every verify step with a deterministic cyclic
+        # pattern whose mean is the target (no RNG — reproducible run-to-run),
+        # and overwrites committed tokens with a constant id so both arms of an
+        # A/B decode IDENTICAL content. Outputs are semantically GARBAGE by
+        # design; never let this near a quality gate. Dead when the env is unset.
+        self._sim_acclen_pattern: Optional[List[int]] = None
+        self._sim_acclen_step: int = 0
+        _sim = os.environ.get("SGLANG_SIMULATED_ACCLEN", "")
+        if _sim:
+            _target = float(_sim)
+            _cap = int(self.block_size) - 1  # max draft tokens acceptable
+            _target = max(0.0, min(_target, float(_cap)))
+            _f = int(_target)
+            _n_hi = int(round((_target - _f) * 10))
+            # Largest-remainder interleave: cycle of 10, mean == _f + _n_hi/10.
+            self._sim_acclen_pattern = [
+                min(_f + (1 if ((i + 1) * _n_hi) // 10 > (i * _n_hi) // 10 else 0), _cap)
+                for i in range(10)
+            ]
+            self._sim_acclen_token = int(
+                os.environ.get("SGLANG_SIMULATED_ACCLEN_TOKEN", "9999")
+            )
+            logger.warning(
+                "SGLANG_SIMULATED_ACCLEN=%s ACTIVE: forcing accept-length pattern "
+                "%s (mean %.2f) every verify step; committed tokens overwritten "
+                "with id %d. OUTPUTS ARE GARBAGE — THROUGHPUT HARNESS ONLY.",
+                _sim,
+                self._sim_acclen_pattern,
+                sum(self._sim_acclen_pattern) / 10.0,
+                self._sim_acclen_token,
+            )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -1684,6 +1718,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens[:, int(self.block_size) - 1].fill_(0)
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                )
+
+        if self._sim_acclen_pattern is not None:
+            # THROUGHPUT HARNESS (SGLANG_SIMULATED_ACCLEN): deterministic forced
+            # accept length; identical committed content across A/B arms.
+            _forced = self._sim_acclen_pattern[
+                self._sim_acclen_step % len(self._sim_acclen_pattern)
+            ]
+            self._sim_acclen_step += 1
+            accept_len.fill_(_forced)
+            commit_lens.fill_(_forced + 1)
+            out_tokens.fill_(self._sim_acclen_token)
+            bonus.fill_(self._sim_acclen_token)
+            new_seq_lens = None  # recompute below from the forced commit_lens
+            if self._sim_acclen_step % 2000 == 0:
+                logger.warning(
+                    "SGLANG_SIMULATED_ACCLEN active: %d verify steps forced "
+                    "(pattern mean %.2f) — outputs are garbage by design.",
+                    self._sim_acclen_step,
+                    sum(self._sim_acclen_pattern) / len(self._sim_acclen_pattern),
                 )
 
         if need_mamba_verify_commit:

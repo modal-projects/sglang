@@ -1672,8 +1672,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             return time_iter_wait(iter)
 
+        # Opt-in reload fast path (SGLANG_ENABLE_RELOAD_LOAD_PLAN=1 + model
+        # declares supports_load_plan_replay): the first reload records the
+        # model's dispatch, later ones replay it directly. See
+        # model_loader/load_plan.py.
+        plan = None
+        if os.environ.get("SGLANG_ENABLE_RELOAD_LOAD_PLAN", "0") == "1":
+            from sglang.srt.model_loader.load_plan import get_or_create_plan
+
+            plan = get_or_create_plan(self.model)
+
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
+            if plan is None:
+                loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
+                return model
+            start = time.perf_counter()
+            if plan.recorded:
+                timing.update(plan.replay(model, iter))
+            else:
+                timing.update(plan.record(model, iter))
+            timing["load_s"] = time.perf_counter() - start
+            start = time.perf_counter()
+            DefaultModelLoader.postprocess_weights(model, target_device)
+            timing["postprocess_s"] = time.perf_counter() - start
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1719,6 +1740,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"postprocess={timing.get('postprocess_s', 0.0):.2f}s "
             f"total={time.perf_counter() - start_time:.2f}s"
         )
+        if "plan" in timing:
+            summary += (
+                f" plan={timing['plan']}"
+                f" plan_names={timing.get('plan_entries', timing.get('plan_hits', 0))}"
+                f" plan_fallback={timing.get('plan_fallback', 0)}"
+            )
         logger.info(f"Update weights end. {summary}")
         return True, f"Succeeded to update model weights. {summary}"
 

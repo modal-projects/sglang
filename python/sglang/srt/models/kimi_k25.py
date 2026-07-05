@@ -623,6 +623,11 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # Reload replay (model_loader/load_plan.py): delegates to the DeepSeek
+    # language model, so it inherits the same kv_b_proj tail constraint.
+    supports_load_plan_replay = True
+    load_plan_fallback_patterns = ("kv_b_proj",)
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json

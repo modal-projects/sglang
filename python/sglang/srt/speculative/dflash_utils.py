@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -18,6 +19,35 @@ from sglang.srt.utils import is_cuda, is_musa
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
+
+# ---- DFlash accept-length pin (measurement lever; PERF-ONLY) ----------------
+# SGLANG_DFLASH_SIMULATE_ACC_LEN pins the DFlash accept length to a CONSTANT so
+# speculative acceptance is identical across configs/hosts in attribution
+# experiments (ctrl2x2). Semantics match EAGLE's SGLANG_SIMULATE_ACC_LEN: the
+# value counts COMMITTED TOKENS PER VERIFY STEP (accepted drafts + bonus), so
+# 4.0 pins correct_len/accept_len to 3 and every verify step commits 4 tokens.
+# Method: plain CONSTANT (not the match-expected floor/ceil mix) — deterministic
+# accept count every step; the value is read once at import and applied with a
+# shape/dtype-preserving in-place fill (values change, never shapes/dtypes, so
+# CUDA-graph/overlap machinery stays valid). <= 0 or unset (default) = INERT:
+# the gate is skipped entirely and behavior is byte-identical to unpatched code.
+# Output text is GARBAGE under the pin (draft tokens are committed regardless of
+# target agreement) — benchmarking only; pair with ignore_eos on the client.
+# NOTE for spec-v2: DFlashWorkerV2 gates its Triton accept/bonus fast path OFF
+# when this pin is active so the greedy path routes through
+# compute_dflash_correct_drafts_and_bonus below (see dflash_worker_v2.py).
+DFLASH_SIMULATE_ACC_LEN = float(os.environ.get("SGLANG_DFLASH_SIMULATE_ACC_LEN", "-1"))
+
+
+def _pin_dflash_correct_len(correct_len: torch.Tensor, block_size: int) -> torch.Tensor:
+    """In-place pin of the accepted-draft count (see DFLASH_SIMULATE_ACC_LEN).
+
+    Pins to round(env) - 1 accepted drafts (env counts drafts + bonus), clamped
+    to [0, block_size - 1] so downstream bonus/commit indexing stays in range.
+    """
+    pinned = min(max(int(round(DFLASH_SIMULATE_ACC_LEN)) - 1, 0), block_size - 1)
+    correct_len.fill_(pinned)
+    return correct_len
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -615,6 +645,10 @@ def compute_dflash_correct_drafts_and_bonus(
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    if DFLASH_SIMULATE_ACC_LEN > 0:
+        # Pin BEFORE the bonus gather so bonus stays the target prediction at
+        # the (pinned) accept position — indices remain in range by clamping.
+        correct_len = _pin_dflash_correct_len(correct_len, block_size)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len, bonus.to(torch.int64)
 
@@ -801,6 +835,12 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     )
 
     correct_len = accept_token_num
+    if DFLASH_SIMULATE_ACC_LEN > 0:
+        # Pin BEFORE the bonus gather. accept_index entries past the truly
+        # accepted prefix are -1 (reject sentinel); predicts[-1] is a valid
+        # (wrap-around) index, so the gather stays safe — the bonus token id is
+        # garbage, which the pin already accepts (perf-only lever).
+        correct_len = _pin_dflash_correct_len(correct_len, draft_token_num)
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)

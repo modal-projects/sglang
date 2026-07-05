@@ -16,6 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    DFLASH_SIMULATE_ACC_LEN,
     apply_dflash_verify_logits_adjustments,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -69,7 +70,13 @@ class DFlashWorkerV2(DFlashWorker):
         )
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
-        self._use_triton_accept_bonus = supports_gpu_triton
+        # Accept-length pin (SGLANG_DFLASH_SIMULATE_ACC_LEN > 0): route the
+        # greedy accept/bonus computation through the eager choke point in
+        # dflash_utils (where the pin lives) instead of the fused Triton path.
+        # Inert when the pin is unset/<=0 (identical to unpatched behavior).
+        self._use_triton_accept_bonus = (
+            supports_gpu_triton and DFLASH_SIMULATE_ACC_LEN <= 0
+        )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None

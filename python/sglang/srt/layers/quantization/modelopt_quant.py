@@ -1936,12 +1936,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or self.enable_flashinfer_cutedsl_moe
             or self._is_cutedsl_v2_standard
         ):
+            logger.info(
+                "nvfp4 partial post-loading declined: non-CUTLASS runner "
+                f"(trtllm={self.enable_flashinfer_trtllm_moe} "
+                f"cutedsl={self.enable_flashinfer_cutedsl_moe} "
+                f"cutedsl_v2={self._is_cutedsl_v2_standard})"
+            )
             return False
         for name in ("w13_weight_scale", "w2_weight_scale"):
             for expert_id in sorted(touched.get(name, ())):
                 scale = getattr(layer, name).data
                 swizzled = swizzle_blockscale(scale[expert_id])
                 if swizzled.shape != scale[expert_id].shape:
+                    logger.info(
+                        f"nvfp4 partial post-loading declined: padded swizzle "
+                        f"({name}[{expert_id}] {tuple(scale[expert_id].shape)} "
+                        f"-> {tuple(swizzled.shape)})"
+                    )
                     return False  # padded layout: slots aren't raw-shaped
                 scale[expert_id].copy_(swizzled)
         # Scalar derivations are cheap; always refresh them so touched

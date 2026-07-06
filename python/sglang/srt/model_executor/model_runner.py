@@ -1713,10 +1713,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ):
                         continue  # no post-loading transform to redo
                     partial_fn = getattr(quant_method, "process_weights_after_partial_loading", None)
-                    if partial_fn is None or not partial_fn(module, param_experts):
+                    try:
+                        ok = partial_fn is not None and partial_fn(module, param_experts)
+                    except Exception:
+                        logger.exception(f"incremental post-loading raised for {module_fqn}")
+                        ok = False
+                    if not ok:
                         logger.info(
                             f"partial reload falling back to full: {module_fqn} "
-                            f"({type(quant_method).__name__}) has no incremental post-loading"
+                            f"({type(quant_method).__name__}) "
+                            f"{'lacks' if partial_fn is None else 'declined'} incremental post-loading"
                         )
                         result = None
                         break

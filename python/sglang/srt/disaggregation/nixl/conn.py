@@ -123,6 +123,11 @@ class KVArgsRegisterInfo:
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
     staging: Optional["StagingRegisterInfo"] = None
+    # Count of leading target entries in dst_kv_ptrs (the decode side's
+    # KVArgs.num_target_kv_data_ptrs); the draft (spec) section, if any, is
+    # dst_kv_ptrs[dst_num_target_kv_ptrs:]. 0 when absent (older peers or no
+    # draft).
+    dst_num_target_kv_ptrs: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -134,6 +139,10 @@ class KVArgsRegisterInfo:
         )
         dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
+        )
+        # Staging occupies indices 14-15; scalar extensions follow.
+        dst_num_target_kv_ptrs = (
+            int(msg[16].decode("ascii")) if len(msg) > 16 and len(msg[16]) > 0 else 0
         )
 
         return cls(
@@ -152,6 +161,7 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            dst_num_target_kv_ptrs=dst_num_target_kv_ptrs,
         )
 
 
@@ -577,6 +587,7 @@ class NixlKVManager(CommonKVManager):
                                     prefill_tp_size=self.attn_tp_size,
                                     decode_tp_size=decode_tp_size,
                                     decode_tp_rank=dst_info.decode_tp_rank,
+                                    dst_num_target_kv_ptrs=dst_info.dst_num_target_kv_ptrs,
                                 )
                             elif self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
@@ -939,6 +950,7 @@ class NixlKVManager(CommonKVManager):
         prefill_tp_size: int,
         decode_tp_size: int,
         decode_tp_rank: int,
+        dst_num_target_kv_ptrs: int = 0,
     ):
         """Send an MLA target + DFlash draft chunk in a single RDMA transfer.
 
@@ -971,9 +983,21 @@ class NixlKVManager(CommonKVManager):
                 f"total={len(src_ptrs)} (expected an even, positive draft count)"
             )
         num_draft_layers = num_draft // 2
-        # Decode holds all target layers; the draft section has the same size on
-        # both sides, so the decode target count is total minus the draft count.
-        num_target_dst = len(dst_ptrs) - num_draft
+        # Prefer the decode-registered split; fall back to inferring it from
+        # the local draft count for older peers that don't transmit it.
+        if dst_num_target_kv_ptrs > 0:
+            num_target_dst = int(dst_num_target_kv_ptrs)
+        else:
+            num_target_dst = len(dst_ptrs) - num_draft
+        num_draft_dst = len(dst_ptrs) - num_target_dst
+        if num_draft_dst != num_draft:
+            raise RuntimeError(
+                "Draft KV section mismatch between prefill and decode: "
+                f"prefill has {num_draft} draft ptrs "
+                f"(len(src)={len(src_ptrs)}, num_target_src={num_target_src}), "
+                f"decode has {num_draft_dst} "
+                f"(len(dst)={len(dst_ptrs)}, num_target_dst={num_target_dst})"
+            )
 
         # --- Target (MLA, replicated): page-contiguous copy, PP-sliced ---
         src_kv_ptrs, sliced_dst_kv_ptrs, n_layers = self.get_mla_kv_ptrs_with_pp(
@@ -2054,6 +2078,13 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        # Target/draft split of kv_data_ptrs, so the prefill
+                        # sender can locate the draft section without inferring
+                        # it from its own (possibly differently-sized) layout.
+                        str(
+                            getattr(self.kv_mgr.kv_args, "num_target_kv_data_ptrs", 0)
+                            or 0
+                        ).encode("ascii"),
                     ]
                 )
 

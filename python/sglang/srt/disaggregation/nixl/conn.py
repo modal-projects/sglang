@@ -648,23 +648,48 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
+                        # Only the last PP stage owns the aux payload: it is
+                        # the rank that samples and fills the metadata buffer.
+                        # Earlier stages' metadata buffers are uninitialized;
+                        # writing them to the shared decode aux slot races the
+                        # real payload and corrupts the first output token.
+                        is_aux_owner = self.pp_rank == self.pp_size - 1
                         # When no KV pages were sent (decode-side cache hit),
-                        # encode pp_rank in aux notif so receiver can mark
-                        # expected_kvs_per_pp[pp_rank] = 0.
+                        # encode the sender rank in the aux notif so the
+                        # receiver can mark expected_kvs_per_pp[sender] = 0.
+                        # Every sender must emit this marker; non-owners send
+                        # it notif-only (no payload write).
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif = (
                                 f"{req.room}_aux_nokv_{self.notif_sender_rank}"
                             )
-                        else:
-                            aux_notif = f"{req.room}_aux"
-                        aux_xfer_handle = self.send_aux(
-                            req.agent_name,
-                            kv_chunk.prefill_aux_index,
-                            dst_info.dst_aux_ptrs,
-                            req.dst_aux_index,
-                            aux_notif,
-                        )
-                        handles.append(aux_xfer_handle)
+                            if is_aux_owner:
+                                handles.append(
+                                    self.send_aux(
+                                        req.agent_name,
+                                        kv_chunk.prefill_aux_index,
+                                        dst_info.dst_aux_ptrs,
+                                        req.dst_aux_index,
+                                        aux_notif,
+                                    )
+                                )
+                            else:
+                                self.agent.send_notif(
+                                    req.agent_name, aux_notif.encode("ascii")
+                                )
+                        elif is_aux_owner:
+                            handles.append(
+                                self.send_aux(
+                                    req.agent_name,
+                                    kv_chunk.prefill_aux_index,
+                                    dst_info.dst_aux_ptrs,
+                                    req.dst_aux_index,
+                                    f"{req.room}_aux",
+                                )
+                            )
+                        # Non-owner ranks that sent KV emit no aux at all;
+                        # their kv notifs carry their per-sender completion and
+                        # received_aux is set by the owner's payload.
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.

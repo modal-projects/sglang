@@ -3134,11 +3134,16 @@ class Scheduler(
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                # PP non-last ranks emit only pp_hidden_states_proxy_tensors
+                # (no sampled tokens), so there is nothing to copy and
+                # copy_to_cpu would deref next_token_ids=None. Downstream
+                # processors guard on copy_done being set.
+                if batch_result.next_token_ids is not None:
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

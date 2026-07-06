@@ -43,6 +43,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.model_loader.utils import should_async_load
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
 
@@ -306,8 +307,13 @@ class LoadPlan:
         try:
             for fqn, param in model.named_parameters():
                 loader = getattr(param, "weight_loader", None)
-                if loader is None:
-                    continue  # default-loaded params fall back to load_weights
+                # Loader-less params (norms, plain biases) load through
+                # default_weight_loader via getattr-with-default in the model
+                # loops — installing the wrapper AS the attribute intercepts
+                # them identically (removed on restore).
+                created = loader is None
+                if created:
+                    loader = default_weight_loader
 
                 def make_wrapper(fqn: str = fqn, loader: Any = loader):
                     def recording_loader(param_arg, tensor, *args, **kwargs):
@@ -323,12 +329,15 @@ class LoadPlan:
                     return recording_loader
 
                 slot = swap_loader(param, make_wrapper())
-                wrapped.append((param, slot, loader))
+                wrapped.append((param, slot, None if created else loader))
 
             model.load_weights(tagged())
         finally:
             for param, slot, loader in wrapped:
-                setattr(param, slot, loader)
+                if loader is None:
+                    delattr(param, slot)
+                else:
+                    setattr(param, slot, loader)
 
         self.entries = recorded
         self.effects = {name: [fqn for fqn, _, _ in calls] for name, calls in recorded.items()}
@@ -385,7 +394,8 @@ class LoadPlan:
 
         def dispatch(fqn: str, tensor: torch.Tensor, args: tuple, kwargs: dict) -> None:
             param = params_dict[fqn]
-            param.weight_loader(param, tensor, *args, **kwargs)
+            loader = getattr(param, "weight_loader", None) or default_weight_loader
+            loader(param, tensor, *args, **kwargs)
 
         def run_program(tensor: torch.Tensor, copies: List[_Copy]) -> None:
             # Stage each copy's source view through this thread's pinned arena:

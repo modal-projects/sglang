@@ -271,12 +271,19 @@ class LoadPlan:
         recording the dispatch it performs."""
         start = time.perf_counter()
         recorded: Dict[str, List[Tuple[str, tuple, dict]]] = {}
+        derived_effects: Dict[str, List[str]] = {}
         seen: Set[str] = set()
         lock = threading.Lock()
+        # For loader calls whose tensor lost the tag (fused/derived), attribute
+        # the touched params to the name being consumed — but only for calls on
+        # the feeder's own thread, where "current name" is unambiguous (models
+        # dispatch derived fusions inline; async dispatch is tag-pure).
+        feeder = {"name": None, "thread": threading.get_ident()}
 
         def tagged() -> Iterable[Tuple[str, torch.Tensor]]:
             for name, tensor in weights:
                 seen.add(name)
+                feeder["name"] = name
                 try:
                     setattr(tensor, _SOURCE_TAG, name)
                 except AttributeError:
@@ -308,6 +315,9 @@ class LoadPlan:
                         if source is not None:
                             with lock:
                                 recorded.setdefault(source, []).append((fqn, args, kwargs))
+                        elif threading.get_ident() == feeder["thread"] and feeder["name"]:
+                            with lock:
+                                derived_effects.setdefault(feeder["name"], []).append(fqn)
                         return loader(param_arg, tensor, *args, **kwargs)
 
                     return recording_loader
@@ -322,6 +332,8 @@ class LoadPlan:
 
         self.entries = recorded
         self.effects = {name: [fqn for fqn, _, _ in calls] for name, calls in recorded.items()}
+        for name, fqns in derived_effects.items():
+            self.effects.setdefault(name, []).extend(fqns)
         # Seen-but-unrecorded names have effects the boundary cannot represent
         # (derived tensors, buffered fusions) or none at all (skipped names);
         # both are only correct through the model's own loader. Their observed
@@ -517,6 +529,10 @@ class LoadPlan:
         for name in touched:
             fqns = self.effects.get(name)
             if not fqns:
+                logger.info(
+                    f"[load plan] partial reload falling back to full: "
+                    f"no recorded param attribution for touched name {name!r}"
+                )
                 return None
             for fqn in fqns:
                 touched_modules.add(fqn.rsplit(".", 1)[0])
@@ -546,6 +562,10 @@ class LoadPlan:
         start = time.perf_counter()
         weights = partial_weights_iterator(checkpoint_dir, sorted(closure_names))
         if weights is None:
+            logger.info(
+                "[load plan] partial reload falling back to full: "
+                "checkpoint index missing or a closure name absent from it"
+            )
             return None
         stats = self.replay(model, weights, max_workers=max_workers, allow_compile=False)
         stats.update(

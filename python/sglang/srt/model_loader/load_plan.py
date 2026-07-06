@@ -248,6 +248,10 @@ class LoadPlan:
         self.entries: Dict[str, List[Tuple[str, tuple, dict]]] = {}
         # Names that must always go through the model's own load_weights.
         self.fallback: Set[str] = set()
+        # source name -> param fqns it (eventually) wrote, kept for EVERY name
+        # incl. fallback ones — partial reloads use this to find the modules a
+        # touched checkpoint tensor feeds.
+        self.effects: Dict[str, List[str]] = {}
         self.fallback_patterns = tuple(fallback_patterns)
         self.recorded = False
         # source name -> (input shape, input dtype, [compiled copies]) for
@@ -317,9 +321,11 @@ class LoadPlan:
                 setattr(param, slot, loader)
 
         self.entries = recorded
+        self.effects = {name: [fqn for fqn, _, _ in calls] for name, calls in recorded.items()}
         # Seen-but-unrecorded names have effects the boundary cannot represent
         # (derived tensors, buffered fusions) or none at all (skipped names);
-        # both are only correct through the model's own loader.
+        # both are only correct through the model's own loader. Their observed
+        # param effects are still kept in `effects` for module attribution.
         self.fallback = {name for name in seen if name not in recorded}
         self.fallback.update(name for name in recorded if self._forced_fallback(name))
         for name in self.fallback:
@@ -342,6 +348,7 @@ class LoadPlan:
         model: torch.nn.Module,
         weights: Iterable[Tuple[str, torch.Tensor]],
         max_workers: int = 8,
+        allow_compile: bool = True,
     ) -> Dict[str, Any]:
         """Dispatch recorded names directly; stream everything else through the
         model's own load_weights, which also runs any per-model post-load tail
@@ -360,7 +367,9 @@ class LoadPlan:
         batch: List[Tuple[torch.Tensor, List[_Copy]]] = []
         batch_bytes = [0]
         stager = _PinnedStager()  # thread-local arenas/streams, per replay pass
-        compiling = not self.compiled
+        # Partial passes never compile: a program map built from a partial
+        # stream would mark the plan compiled while covering few names.
+        compiling = allow_compile and not self.compiled
 
         def dispatch(fqn: str, tensor: torch.Tensor, args: tuple, kwargs: dict) -> None:
             param = params_dict[fqn]
@@ -491,6 +500,99 @@ class LoadPlan:
             f"{stats['plan_unknown']} unknown) in {stats['plan_replay_s']}s"
         )
         return stats
+
+
+    def module_closure(self, touched: Iterable[str]) -> "Optional[Tuple[Set[str], Set[str]]]":
+        """Expand touched checkpoint names to (touched module fqns, the full
+        set of names feeding those modules).
+
+        Postprocess consumes a module's params in their RAW loaded state, and
+        a prior postprocess may have transformed them in place — so every name
+        feeding a touched module must be reloaded, not just the changed ones.
+        Returns None when any touched name has no recorded param attribution
+        (derived-only fusions, never-seen names): the caller must fall back to
+        a full reload.
+        """
+        touched_modules: Set[str] = set()
+        for name in touched:
+            fqns = self.effects.get(name)
+            if not fqns:
+                return None
+            for fqn in fqns:
+                touched_modules.add(fqn.rsplit(".", 1)[0])
+        module_names: Set[str] = set()
+        for name, fqns in self.effects.items():
+            if any(fqn.rsplit(".", 1)[0] in touched_modules for fqn in fqns):
+                module_names.add(name)
+        return touched_modules, module_names
+
+    def partial_replay(
+        self,
+        model: torch.nn.Module,
+        checkpoint_dir: str,
+        touched: List[str],
+        max_workers: int = 8,
+    ) -> "Optional[Tuple[Dict[str, Any], Set[str]]]":
+        """Reload ONLY the modules the touched checkpoint names feed, reading
+        just their tensors from disk. Returns (stats, touched module fqns) for
+        the caller's filtered postprocess, or None when a full reload is
+        required (unattributable names, or a name missing from the index)."""
+        if not self.recorded:
+            return None
+        closure = self.module_closure(touched)
+        if closure is None:
+            return None
+        touched_modules, closure_names = closure
+        start = time.perf_counter()
+        weights = partial_weights_iterator(checkpoint_dir, sorted(closure_names))
+        if weights is None:
+            return None
+        stats = self.replay(model, weights, max_workers=max_workers, allow_compile=False)
+        stats.update(
+            plan="partial",
+            plan_touched=len(touched),
+            plan_modules=len(touched_modules),
+            plan_closure=len(closure_names),
+            plan_replay_s=round(time.perf_counter() - start, 2),
+        )
+        logger.info(
+            f"[load plan] partial pass: {stats['plan_touched']} touched names -> "
+            f"{stats['plan_modules']} modules, {stats['plan_closure']} reloaded names "
+            f"in {stats['plan_replay_s']}s"
+        )
+        return stats, touched_modules
+
+
+def partial_weights_iterator(
+    checkpoint_dir: str, names: List[str]
+) -> "Optional[Iterable[Tuple[str, torch.Tensor]]]":
+    """Random-access reads of exactly `names` from a safetensors checkpoint,
+    grouped by shard so each needed file opens once. None when the index is
+    missing or a name is absent (caller falls back to a full reload)."""
+    import json
+
+    from safetensors import safe_open
+
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    try:
+        with open(index_path) as f:
+            weight_map: Dict[str, str] = json.load(f)["weight_map"]
+    except (OSError, KeyError, ValueError):
+        return None
+    by_file: Dict[str, List[str]] = {}
+    for name in names:
+        shard = weight_map.get(name)
+        if shard is None:
+            return None
+        by_file.setdefault(shard, []).append(name)
+
+    def read() -> Iterable[Tuple[str, torch.Tensor]]:
+        for shard, shard_names in sorted(by_file.items()):
+            with safe_open(os.path.join(checkpoint_dir, shard), framework="pt", device="cpu") as f:
+                for name in shard_names:
+                    yield name, f.get_tensor(name)
+
+    return read()
 
 
 def get_or_create_plan(model: torch.nn.Module) -> "LoadPlan | None":

@@ -1620,6 +1620,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        weight_names: Optional[List[str]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -1681,6 +1682,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.model_loader.load_plan import get_or_create_plan
 
             plan = get_or_create_plan(self.model)
+
+        # O(delta) path: when the caller names the touched checkpoint tensors,
+        # reload only the modules they feed and re-postprocess exactly those
+        # modules. Any gap (no plan, unattributable name, missing tensor,
+        # failure) falls through to the ordinary full reload below.
+        if plan is not None and plan.recorded and weight_names:
+            partial_timing: dict[str, float] = {}
+            try:
+                result = plan.partial_replay(self.model, model_path, list(weight_names))
+            except Exception:
+                logger.exception("partial reload failed; falling back to a full reload")
+                result = None
+            if result is not None:
+                stats, touched_modules = result
+                partial_timing.update(stats)
+                post_start = time.perf_counter()
+                DefaultModelLoader.postprocess_weights(
+                    self.model, target_device, only_modules=touched_modules
+                )
+                partial_timing["postprocess_s"] = time.perf_counter() - post_start
+                self.model_config.model_path = model_path
+                self.server_args.model_path = model_path
+                summary = (
+                    f"[reload timing] iter_wait=0.00s "
+                    f"load={partial_timing.get('plan_replay_s', 0.0):.2f}s "
+                    f"postprocess={partial_timing.get('postprocess_s', 0.0):.2f}s "
+                    f"total={time.perf_counter() - start_time:.2f}s "
+                    f"plan=partial plan_names={partial_timing.get('plan_touched', 0)}"
+                    f" plan_modules={partial_timing.get('plan_modules', 0)}"
+                    f" plan_closure={partial_timing.get('plan_closure', 0)}"
+                )
+                logger.info(f"Update weights end. {summary}")
+                return True, f"Succeeded to update model weights. {summary}"
 
         def model_load_weights(model, iter):
             nonlocal plan

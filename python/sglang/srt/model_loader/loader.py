@@ -747,8 +747,13 @@ class DefaultModelLoader(BaseModelLoader):
             timing["postprocess_s"] = time.perf_counter() - start
 
     @staticmethod
-    def postprocess_weights(model, target_device):
-        for _, module in model.named_modules():
+    def postprocess_weights(model, target_device, only_modules=None):
+        # `only_modules` restricts the pass to the given module fqns (partial
+        # reloads re-postprocess exactly the modules whose params were
+        # refreshed raw; running it wider would re-transform stale state).
+        for fqn, module in model.named_modules():
+            if only_modules is not None and fqn not in only_modules:
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading

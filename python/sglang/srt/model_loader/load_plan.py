@@ -49,6 +49,11 @@ _SOURCE_TAG = "_load_plan_source_name"
 # Soft bound on outstanding async loader calls, so replay cannot materialize
 # unboundedly many CPU tensors ahead of the H2D copies that release them.
 _MAX_INFLIGHT = 4096
+# Compiled programs are executed in batches: one executor submit per batch, so
+# per-name queue/future churn amortizes away on 100k+-tensor checkpoints. A
+# byte cap keeps a batch's referenced CPU tensors bounded.
+_BATCH_NAMES = 256
+_BATCH_BYTES = 256 << 20
 
 # One compiled copy: dst/src expressed relative to the param's / input
 # tensor's own storage offset, so both survive storage rebinds and per-reload
@@ -294,6 +299,8 @@ class LoadPlan:
         params_dict = dict(model.named_parameters())
         counts = {"hit": 0, "fallback": 0, "unknown": 0, "compiled": 0, "dispatched": 0}
         futures: List[concurrent.futures.Future] = []
+        batch: List[Tuple[torch.Tensor, List[_Copy]]] = []
+        batch_bytes = [0]
         compiling = not self.compiled
 
         def dispatch(fqn: str, tensor: torch.Tensor, args: tuple, kwargs: dict) -> None:
@@ -311,6 +318,10 @@ class LoadPlan:
                     # was implied by the observed copy_ succeeding.
                     src = src.reshape(dst.shape)
                 dst.copy_(src, non_blocking=True)
+
+        def run_program_batch(items: List[Tuple[torch.Tensor, List[_Copy]]]) -> None:
+            for tensor, copies in items:
+                run_program(tensor, copies)
 
         observer = (
             _CallObserver({p.data.untyped_storage().data_ptr(): fqn for fqn, p in params_dict.items()}, params_dict)
@@ -351,7 +362,15 @@ class LoadPlan:
                     if program is not None and program[0] == tuple(tensor.shape) and program[1] == tensor.dtype:
                         counts["compiled"] += 1
                         if should_async_load(tensor):
-                            submit(run_program, tensor, program[2])
+                            # Batch program executions: per-name submits cost
+                            # ~1ms of executor/GIL churn, which dominates a
+                            # multi-hundred-thousand-tensor checkpoint.
+                            batch.append((tensor, program[2]))
+                            batch_bytes[0] += tensor.numel() * tensor.element_size()
+                            if len(batch) >= _BATCH_NAMES or batch_bytes[0] >= _BATCH_BYTES:
+                                submit(run_program_batch, batch[:])
+                                batch.clear()
+                                batch_bytes[0] = 0
                         else:
                             run_program(tensor, program[2])
                     else:
@@ -362,6 +381,9 @@ class LoadPlan:
                         else:
                             for fqn, args, kwargs in calls:
                                 dispatch(fqn, tensor, args, kwargs)
+                if batch:
+                    submit(run_program_batch, batch[:])
+                    batch.clear()
 
             model.load_weights(filtered())
             for future in futures:

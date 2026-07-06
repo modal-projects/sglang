@@ -1698,11 +1698,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 stats, touched_detail = result
                 partial_timing.update(stats)
                 post_start = time.perf_counter()
+                from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+
                 modules = dict(self.model.named_modules())
                 for module_fqn, param_experts in touched_detail.items():
                     module = modules.get(module_fqn)
                     quant_method = getattr(module, "quant_method", None) if module else None
-                    if quant_method is None or getattr(quant_method, "partial_reload_safe", False):
+                    if (
+                        quant_method is None
+                        or getattr(quant_method, "partial_reload_safe", False)
+                        # No override of the base's no-op: nothing to redo.
+                        or type(quant_method).process_weights_after_loading
+                        is QuantizeMethodBase.process_weights_after_loading
+                    ):
                         continue  # no post-loading transform to redo
                     partial_fn = getattr(quant_method, "process_weights_after_partial_loading", None)
                     if partial_fn is None or not partial_fn(module, param_experts):

@@ -60,7 +60,16 @@ _Copy = Tuple[str, int, tuple, tuple, int, tuple, tuple]
 class _CallObserver(TorchDispatchMode):
     """Watches one weight_loader call and extracts its effect on the model
     params as raw strided copies — or taints the call when its effect cannot
-    be expressed that way (derived temporaries, non-copy mutations)."""
+    be expressed that way.
+
+    Loaders frequently materialize an input region before copying it into the
+    param (``narrow().contiguous()``, ``.to(dtype)``, ``empty().copy_(view)``
+    staging). Those temporaries are tracked by provenance: a temp whose entire
+    contents are a row-major materialization of one strided input region maps
+    back to that region, and a whole-temp copy into a param compiles to a
+    direct copy from the original input view (``copy_`` reads strided sources
+    and casts dtypes itself, so the temp is skippable). Anything the
+    provenance can't express taints the call and it keeps dispatching."""
 
     def __init__(self, param_storage_to_fqn: Dict[int, str], params: Dict[str, torch.nn.Parameter]):
         super().__init__()
@@ -69,45 +78,79 @@ class _CallObserver(TorchDispatchMode):
         self.input_tensor: Optional[torch.Tensor] = None
         self.copies: List[_Copy] = []
         self.tainted = False
+        # temp storage ptr -> (src_off_delta, size, stride) of the ONE input
+        # region the temp's full contents materialize, in row-major order.
+        self.provenance: Dict[int, Tuple[int, tuple, tuple]] = {}
 
     def begin_call(self, input_tensor: torch.Tensor) -> None:
         self.input_tensor = input_tensor
         self.copies = []
         self.tainted = False
+        self.provenance = {}
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
         try:
-            self._observe(func, args, kwargs)
+            self._observe(func, args, kwargs, out)
         except Exception:  # noqa: BLE001 — observation must never break the load
             self.tainted = True
         return out
 
-    def _observe(self, func, args, kwargs) -> None:
-        if func is torch.ops.aten.copy_.default:
-            dst, src = args[0], args[1]
-            fqn = self.param_storage_to_fqn.get(dst.untyped_storage().data_ptr())
-            if fqn is None:
-                return  # write to a temporary: not a param effect
-            inp = self.input_tensor
-            if src.untyped_storage().data_ptr() != inp.untyped_storage().data_ptr():
-                self.tainted = True  # source is derived, not a view of the input
-                return
-            base = self.params[fqn].data
-            self.copies.append(
-                (
-                    fqn,
-                    dst.storage_offset() - base.storage_offset(),
-                    tuple(dst.shape),
-                    tuple(dst.stride()),
-                    src.storage_offset() - inp.storage_offset(),
-                    tuple(src.shape),
-                    tuple(src.stride()),
-                )
+    def _input_view_spec(self, view: torch.Tensor) -> Optional[Tuple[int, tuple, tuple]]:
+        """The input region a tensor reads: directly (a view of the input) or
+        transitively (the whole contents of a tracked temp)."""
+        ptr = view.untyped_storage().data_ptr()
+        if ptr == self.input_tensor.untyped_storage().data_ptr():
+            return (
+                view.storage_offset() - self.input_tensor.storage_offset(),
+                tuple(view.shape),
+                tuple(view.stride()),
             )
+        spec = self.provenance.get(ptr)
+        if spec is not None and _reads_whole_storage(view, spec):
+            return spec
+        return None
+
+    def _observe(self, func, args, kwargs, out) -> None:
+        aten = torch.ops.aten
+        if func is aten.copy_.default:
+            dst, src = args[0], args[1]
+            dst_ptr = dst.untyped_storage().data_ptr()
+            fqn = self.param_storage_to_fqn.get(dst_ptr)
+            src_spec = self._input_view_spec(src)
+            if fqn is not None:
+                if src_spec is None:
+                    self.tainted = True  # source underivable from the input
+                    return
+                base = self.params[fqn].data
+                self.copies.append(
+                    (
+                        fqn,
+                        dst.storage_offset() - base.storage_offset(),
+                        tuple(dst.shape),
+                        tuple(dst.stride()),
+                        *src_spec,
+                    )
+                )
+                return
+            # Staging copy into a temp (`empty().copy_(view)`): track it when
+            # the temp is written whole, in row-major order.
+            if src_spec is not None and dst.is_contiguous() and dst.storage_offset() == 0:
+                self.provenance[dst_ptr] = src_spec
+            else:
+                self.provenance.pop(dst_ptr, None)  # partially/oddly written: distrust
             return
-        # Any other mutation of a param storage is inexpressible: taint.
+        # Materializing producers: clone/contiguous/cast of an input region.
+        if func in (aten.clone.default, aten._to_copy.default, aten.contiguous.default):
+            source = args[0]
+            if isinstance(out, torch.Tensor) and isinstance(source, torch.Tensor):
+                spec = self._input_view_spec(source)
+                if spec is not None and out.is_contiguous() and out.storage_offset() == 0:
+                    self.provenance[out.untyped_storage().data_ptr()] = spec
+            return
+        # Any other mutation of a param storage is inexpressible: taint. A
+        # mutation of a tracked temp invalidates its provenance.
         schema = getattr(func, "_schema", None)
         if schema is None:
             return
@@ -115,12 +158,23 @@ class _CallObserver(TorchDispatchMode):
             if arg.alias_info is None or not arg.alias_info.is_write:
                 continue
             value = args[i] if i < len(args) else kwargs.get(arg.name)
-            if (
-                isinstance(value, torch.Tensor)
-                and value.untyped_storage().data_ptr() in self.param_storage_to_fqn
-            ):
+            if not isinstance(value, torch.Tensor):
+                continue
+            ptr = value.untyped_storage().data_ptr()
+            if ptr in self.param_storage_to_fqn:
                 self.tainted = True
                 return
+            self.provenance.pop(ptr, None)
+
+
+def _reads_whole_storage(view: torch.Tensor, spec: Tuple[int, tuple, tuple]) -> bool:
+    """True when `view` reads its temp's full materialized contents in
+    row-major order (so the temp's provenance spec substitutes exactly).
+    Shape may differ from the spec's (loaders reshape); numel must match."""
+    numel = 1
+    for dim in spec[1]:
+        numel *= dim
+    return view.is_contiguous() and view.storage_offset() == 0 and view.numel() == numel
 
 
 class LoadPlan:
@@ -251,6 +305,11 @@ class LoadPlan:
                 base = params_dict[fqn].data
                 dst = torch.as_strided(base, dst_size, dst_stride, base.storage_offset() + dst_off)
                 src = torch.as_strided(tensor, src_size, src_stride, tensor.storage_offset() + src_off)
+                if src.shape != dst.shape:
+                    # Provenance-composed sources keep the input region's shape;
+                    # the observed copy went through a reshaped temp. Equal numel
+                    # was implied by the observed copy_ succeeding.
+                    src = src.reshape(dst.shape)
                 dst.copy_(src, non_blocking=True)
 
         observer = (

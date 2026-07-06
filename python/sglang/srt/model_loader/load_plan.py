@@ -60,11 +60,12 @@ _BATCH_BYTES = 256 << 20
 # staging the source through pinned memory makes every device copy an async
 # launch. Tensors larger than the arena fall back to the pageable path.
 _ARENA_BYTES = 512 << 20
-# Stage only small copies: the per-call sync stall staging eliminates is fixed
-# cost, while staging adds a full extra CPU pass over the bytes — a large copy
-# amortizes its stall and only pays the memcpy (staging all of GLM-4.5-Air's
-# ~12MB-average copies measured 55s -> 71s).
-_STAGE_MAX_BYTES = int(os.environ.get("SGLANG_LOAD_PLAN_STAGE_MAX_BYTES", str(4 << 20)))
+# Pinned staging is OFF by default: measured across whole-tensor, per-copy,
+# size-gated, and contiguity-gated variants, the per-copy Python + memcpy it
+# adds always lost to the direct pageable path at both copy-size regimes
+# (GLM 55->71s, K2.6 390->685-860s). The machinery stays for experiments:
+# set SGLANG_LOAD_PLAN_STAGE_MAX_BYTES to a byte threshold to enable.
+_STAGE_MAX_BYTES = int(os.environ.get("SGLANG_LOAD_PLAN_STAGE_MAX_BYTES", "0"))
 
 
 class _PinnedStager(threading.local):

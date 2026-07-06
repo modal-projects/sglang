@@ -85,21 +85,26 @@ class _PinnedStager(threading.local):
             self.stream = torch.cuda.Stream()
         return True
 
-    def stage(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        """A pinned copy of `tensor`'s bytes, valid until the next arena wrap.
-        The staged tensor mirrors the source's logical layout, so recorded
-        source specs apply to it unchanged (contiguous sources only)."""
-        nbytes = tensor.numel() * tensor.element_size()
-        if nbytes > _ARENA_BYTES or not tensor.is_contiguous():
+    def stage(self, view: torch.Tensor) -> Optional[torch.Tensor]:
+        """A pinned, contiguous copy of exactly `view`'s elements, valid until
+        the next arena wrap. Staging per copy (not per source tensor) matters:
+        TP-sliced copies read a fraction of their source, and staging the whole
+        tensor amplifies CPU memcpy traffic by the TP factor."""
+        nbytes = view.numel() * view.element_size()
+        if nbytes > _ARENA_BYTES:
             return None
         self.offset = (self.offset + 15) & ~15  # dtype-view alignment
         if self.offset + nbytes > _ARENA_BYTES:
             self.stream.synchronize()  # in-flight copies still read the arena
             self.offset = 0
-        staged = self.arena[self.offset : self.offset + nbytes]
-        staged.copy_(tensor.reshape(-1).view(torch.uint8))
+        staged = (
+            self.arena[self.offset : self.offset + nbytes]
+            .view(view.dtype)
+            .reshape(view.shape)
+        )
+        staged.copy_(view)  # strided-source CPU memcpy of only the read bytes
         self.offset += nbytes
-        return staged.view(tensor.dtype).reshape(tensor.shape)
+        return staged
 
 # One compiled copy: dst/src expressed relative to the param's / input
 # tensor's own storage offset, so both survive storage rebinds and per-reload
@@ -355,23 +360,23 @@ class LoadPlan:
             param.weight_loader(param, tensor, *args, **kwargs)
 
         def run_program(tensor: torch.Tensor, copies: List[_Copy]) -> None:
-            # Stage the source through this thread's pinned arena when
-            # possible: pageable H2D copies are synchronous cudaMemcpys, and at
-            # hundreds of thousands of copies their per-call stalls dominate.
-            staged = stager.stage(tensor) if stager.ready() else None
-            source, stream = (staged, stager.stream) if staged is not None else (tensor, None)
+            # Stage each copy's source view through this thread's pinned arena:
+            # pageable H2D copies are synchronous cudaMemcpys, and at hundreds
+            # of thousands of copies their per-call stalls dominate.
+            use_stager = stager.ready()
             for fqn, dst_off, dst_size, dst_stride, src_off, src_size, src_stride in copies:
                 base = params_dict[fqn].data
                 dst = torch.as_strided(base, dst_size, dst_stride, base.storage_offset() + dst_off)
-                src = torch.as_strided(source, src_size, src_stride, source.storage_offset() + src_off)
+                src = torch.as_strided(tensor, src_size, src_stride, tensor.storage_offset() + src_off)
                 if src.shape != dst.shape:
                     # Provenance-composed sources keep the input region's shape;
                     # the observed copy went through a reshaped temp. Equal numel
                     # was implied by the observed copy_ succeeding.
                     src = src.reshape(dst.shape)
-                if stream is not None:
-                    with torch.cuda.stream(stream):
-                        dst.copy_(src, non_blocking=True)
+                staged = stager.stage(src) if use_stager else None
+                if staged is not None:
+                    with torch.cuda.stream(stager.stream):
+                        dst.copy_(staged, non_blocking=True)
                 else:
                     dst.copy_(src, non_blocking=True)
 

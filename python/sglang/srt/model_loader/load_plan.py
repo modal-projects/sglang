@@ -244,7 +244,11 @@ def _reads_whole_storage(view: torch.Tensor, spec: Tuple[int, tuple, tuple]) -> 
 class LoadPlan:
     """One model instance's recorded reload dispatch (see module docstring)."""
 
-    def __init__(self, fallback_patterns: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        fallback_patterns: Iterable[str] = (),
+        fused_aliases: Iterable[Tuple[str, str]] = (),
+    ) -> None:
         # source checkpoint name -> [(param fqn, loader args, loader kwargs)]
         self.entries: Dict[str, List[Tuple[str, tuple, dict]]] = {}
         # Names that must always go through the model's own load_weights.
@@ -254,6 +258,11 @@ class LoadPlan:
         # touched checkpoint tensor feeds.
         self.effects: Dict[str, List[str]] = {}
         self.fallback_patterns = tuple(fallback_patterns)
+        # Declared (name substring -> param substring) rewrites for buffered
+        # fusions whose loader call fires on a worker thread with no source
+        # tag (e.g. DeepSeek q/kv_a_proj -> fused_qkv_a_proj_with_mqa).
+        # Candidates are validated against real param fqns before use.
+        self.fused_aliases = tuple(fused_aliases)
         self.recorded = False
         # source name -> (input shape, input dtype, [compiled copies]) for
         # names whose loader effect reduced to raw strided copies; built by the
@@ -524,7 +533,17 @@ class LoadPlan:
         return stats
 
 
-    def module_closure(self, touched: Iterable[str]) -> "Optional[Tuple[Set[str], Set[str]]]":
+    def _alias_fqn(self, name: str, param_fqns: Set[str]) -> Optional[str]:
+        for src_sub, dst_sub in self.fused_aliases:
+            if src_sub in name:
+                candidate = name.replace(src_sub, dst_sub)
+                if candidate in param_fqns:
+                    return candidate
+        return None
+
+    def module_closure(
+        self, touched: Iterable[str], param_fqns: Set[str]
+    ) -> "Optional[Tuple[Set[str], Set[str]]]":
         """Expand touched checkpoint names to (touched module fqns, the full
         set of names feeding those modules).
 
@@ -536,20 +555,41 @@ class LoadPlan:
         a full reload.
         """
         touched_modules: Set[str] = set()
+        inert = 0
         for name in touched:
             fqns = self.effects.get(name)
             if not fqns:
-                logger.info(
-                    f"[load plan] partial reload falling back to full: "
-                    f"no recorded param attribution for touched name {name!r}"
-                )
-                return None
+                alias = self._alias_fqn(name, param_fqns)
+                if alias is not None:
+                    fqns = [alias]
+                elif name in self.fallback:
+                    # Seen at record but produced no param effect and matches
+                    # no declared fusion: the model ignores this tensor (e.g.
+                    # MTP weights on a non-speculative deployment) — a change
+                    # to it cannot affect engine state.
+                    inert += 1
+                    continue
+                else:
+                    logger.info(
+                        f"[load plan] partial reload falling back to full: "
+                        f"no recorded param attribution for touched name {name!r}"
+                    )
+                    return None
             for fqn in fqns:
                 touched_modules.add(fqn.rsplit(".", 1)[0])
+        if inert:
+            logger.info(f"[load plan] partial reload skipping {inert} inert touched names")
         module_names: Set[str] = set()
         for name, fqns in self.effects.items():
             if any(fqn.rsplit(".", 1)[0] in touched_modules for fqn in fqns):
                 module_names.add(name)
+        # Fusion inputs have no effects entries; collect them by alias so the
+        # model re-fuses from a complete part set.
+        if self.fused_aliases:
+            for name in self.fallback:
+                alias = self._alias_fqn(name, param_fqns)
+                if alias is not None and alias.rsplit(".", 1)[0] in touched_modules:
+                    module_names.add(name)
         return touched_modules, module_names
 
     def partial_replay(
@@ -565,7 +605,7 @@ class LoadPlan:
         required (unattributable names, or a name missing from the index)."""
         if not self.recorded:
             return None
-        closure = self.module_closure(touched)
+        closure = self.module_closure(touched, {fqn for fqn, _ in model.named_parameters()})
         if closure is None:
             return None
         touched_modules, closure_names = closure
@@ -631,6 +671,9 @@ def get_or_create_plan(model: torch.nn.Module) -> "LoadPlan | None":
         return None
     plan = getattr(model, "_reload_load_plan", None)
     if plan is None:
-        plan = LoadPlan(getattr(model, "load_plan_fallback_patterns", ()))
+        plan = LoadPlan(
+            getattr(model, "load_plan_fallback_patterns", ()),
+            fused_aliases=getattr(model, "load_plan_fused_aliases", ()),
+        )
         model._reload_load_plan = plan
     return plan

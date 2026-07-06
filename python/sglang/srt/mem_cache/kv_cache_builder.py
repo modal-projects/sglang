@@ -62,6 +62,15 @@ def get_draft_kv_pool(
             draft_runner = draft_worker.draft_worker.draft_runner
         return draft_runner.token_to_kv_pool, draft_runner.model_config
 
+    if spec_algorithm.is_dflash():
+        # DFlashWorker (spec v1) aliases `model_runner` to the TARGET
+        # worker's runner; returning it here would hand out the target KV
+        # pool as the "draft" pool (e.g. double-registering the target pool
+        # with the PD-disagg queues). The draft pool lives on
+        # draft_model_runner.
+        draft_runner = draft_worker.draft_model_runner
+        return draft_runner.token_to_kv_pool, draft_runner.model_config
+
     return (
         draft_worker.model_runner.token_to_kv_pool,
         draft_worker.model_config,

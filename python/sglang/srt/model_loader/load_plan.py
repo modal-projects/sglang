@@ -541,56 +541,67 @@ class LoadPlan:
                     return candidate
         return None
 
-    def module_closure(
+    def touched_plan(
         self, touched: Iterable[str], param_fqns: Set[str]
-    ) -> "Optional[Tuple[Set[str], Set[str]]]":
-        """Expand touched checkpoint names to (touched module fqns, the full
-        set of names feeding those modules).
+    ) -> "Optional[Tuple[Dict[str, Dict[str, Set[int]]], Set[str]]]":
+        """Resolve touched checkpoint names to (per-module touched detail,
+        the names to reload).
 
-        Postprocess consumes a module's params in their RAW loaded state, and
-        a prior postprocess may have transformed them in place — so every name
-        feeding a touched module must be reloaded, not just the changed ones.
-        Returns None when any touched name has no recorded param attribution
-        (derived-only fusions, never-seen names): the caller must fall back to
-        a full reload.
+        detail: module fqn -> param attr name -> expert ids whose slices the
+        touched names rewrite (empty set for whole-param / non-expert
+        touches). Reload names are the touched names themselves plus, for
+        declared fusions, every sibling input of a touched fused param (the
+        model re-fuses only from a complete part set). Inert names (seen at
+        record, zero effects, no alias) are skipped. None when any touched
+        name cannot be attributed — the caller must full-reload.
         """
-        touched_modules: Set[str] = set()
+        detail: Dict[str, Dict[str, Set[int]]] = {}
+        reload_names: Set[str] = set()
+        touched_fused: Set[str] = set()
         inert = 0
+
+        def note(fqn: str, expert_id: Optional[int]) -> None:
+            module_fqn, param_name = fqn.rsplit(".", 1)
+            experts = detail.setdefault(module_fqn, {}).setdefault(param_name, set())
+            if expert_id is not None:
+                experts.add(int(expert_id))
+
         for name in touched:
+            calls = self.entries.get(name)
+            if calls:
+                reload_names.add(name)
+                for fqn, args, kwargs in calls:
+                    note(fqn, kwargs.get("expert_id"))
+                continue
             fqns = self.effects.get(name)
-            if not fqns:
-                alias = self._alias_fqn(name, param_fqns)
-                if alias is not None:
-                    fqns = [alias]
-                elif name in self.fallback:
-                    # Seen at record but produced no param effect and matches
-                    # no declared fusion: the model ignores this tensor (e.g.
-                    # MTP weights on a non-speculative deployment) — a change
-                    # to it cannot affect engine state.
-                    inert += 1
-                    continue
-                else:
-                    logger.info(
-                        f"[load plan] partial reload falling back to full: "
-                        f"no recorded param attribution for touched name {name!r}"
-                    )
-                    return None
-            for fqn in fqns:
-                touched_modules.add(fqn.rsplit(".", 1)[0])
+            if fqns:
+                reload_names.add(name)
+                for fqn in fqns:
+                    note(fqn, None)
+                continue
+            alias = self._alias_fqn(name, param_fqns)
+            if alias is not None:
+                reload_names.add(name)
+                touched_fused.add(alias)
+                note(alias, None)
+                continue
+            if name in self.fallback:
+                inert += 1  # seen at record, provably no effect on params
+                continue
+            logger.info(
+                f"[load plan] partial reload falling back to full: "
+                f"no recorded param attribution for touched name {name!r}"
+            )
+            return None
         if inert:
             logger.info(f"[load plan] partial reload skipping {inert} inert touched names")
-        module_names: Set[str] = set()
-        for name, fqns in self.effects.items():
-            if any(fqn.rsplit(".", 1)[0] in touched_modules for fqn in fqns):
-                module_names.add(name)
-        # Fusion inputs have no effects entries; collect them by alias so the
-        # model re-fuses from a complete part set.
-        if self.fused_aliases:
+        # A touched fused param needs ALL its declared inputs streamed.
+        if touched_fused:
             for name in self.fallback:
                 alias = self._alias_fqn(name, param_fqns)
-                if alias is not None and alias.rsplit(".", 1)[0] in touched_modules:
-                    module_names.add(name)
-        return touched_modules, module_names
+                if alias in touched_fused:
+                    reload_names.add(name)
+        return detail, reload_names
 
     def partial_replay(
         self,
@@ -599,18 +610,19 @@ class LoadPlan:
         touched: List[str],
         max_workers: int = 8,
     ) -> "Optional[Tuple[Dict[str, Any], Set[str]]]":
-        """Reload ONLY the modules the touched checkpoint names feed, reading
-        just their tensors from disk. Returns (stats, touched module fqns) for
-        the caller's filtered postprocess, or None when a full reload is
-        required (unattributable names, or a name missing from the index)."""
+        """Reload ONLY the touched checkpoint names (plus fusion siblings),
+        reading just their tensors from disk. Returns (stats, per-module
+        touched detail) for the caller's incremental postprocess, or None when
+        a full reload is required (unattributable names, or a name missing
+        from the index)."""
         if not self.recorded:
             return None
-        closure = self.module_closure(touched, {fqn for fqn, _ in model.named_parameters()})
-        if closure is None:
+        resolved = self.touched_plan(touched, {fqn for fqn, _ in model.named_parameters()})
+        if resolved is None:
             return None
-        touched_modules, closure_names = closure
+        detail, reload_names = resolved
         start = time.perf_counter()
-        weights = partial_weights_iterator(checkpoint_dir, sorted(closure_names))
+        weights = partial_weights_iterator(checkpoint_dir, sorted(reload_names))
         if weights is None:
             logger.info(
                 "[load plan] partial reload falling back to full: "
@@ -621,8 +633,8 @@ class LoadPlan:
         stats.update(
             plan="partial",
             plan_touched=len(touched),
-            plan_modules=len(touched_modules),
-            plan_closure=len(closure_names),
+            plan_modules=len(detail),
+            plan_closure=len(reload_names),
             plan_replay_s=round(time.perf_counter() - start, 2),
         )
         logger.info(
@@ -630,7 +642,7 @@ class LoadPlan:
             f"{stats['plan_modules']} modules, {stats['plan_closure']} reloaded names "
             f"in {stats['plan_replay_s']}s"
         )
-        return stats, touched_modules
+        return stats, detail
 
 
 def partial_weights_iterator(

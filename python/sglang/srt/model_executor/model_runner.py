@@ -1695,13 +1695,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.exception("partial reload failed; falling back to a full reload")
                 result = None
             if result is not None:
-                stats, touched_modules = result
+                stats, touched_detail = result
                 partial_timing.update(stats)
                 post_start = time.perf_counter()
-                DefaultModelLoader.postprocess_weights(
-                    self.model, target_device, only_modules=touched_modules
-                )
+                modules = dict(self.model.named_modules())
+                for module_fqn, param_experts in touched_detail.items():
+                    module = modules.get(module_fqn)
+                    quant_method = getattr(module, "quant_method", None) if module else None
+                    if quant_method is None or getattr(quant_method, "partial_reload_safe", False):
+                        continue  # no post-loading transform to redo
+                    partial_fn = getattr(quant_method, "process_weights_after_partial_loading", None)
+                    if partial_fn is None or not partial_fn(module, param_experts):
+                        logger.info(
+                            f"partial reload falling back to full: {module_fqn} "
+                            f"({type(quant_method).__name__}) has no incremental post-loading"
+                        )
+                        result = None
+                        break
                 partial_timing["postprocess_s"] = time.perf_counter() - post_start
+            if result is not None:
                 self.model_config.model_path = model_path
                 self.server_args.model_path = model_path
                 summary = (

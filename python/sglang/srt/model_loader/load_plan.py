@@ -381,7 +381,14 @@ class LoadPlan:
                     src = src.reshape(dst.shape)
                 staged = (
                     stager.stage(src)
-                    if use_stager and src.numel() * src.element_size() <= _STAGE_MAX_BYTES
+                    if use_stager
+                    # Contiguous only: staging a strided view is an elementwise
+                    # CPU gather (~2ms per 2MB copy — measured 785s of K2.6
+                    # fast-pass load), not a memcpy. Strided sources stay on
+                    # the direct pageable path, which gathers once on device
+                    # transfer anyway.
+                    and src.is_contiguous()
+                    and src.numel() * src.element_size() <= _STAGE_MAX_BYTES
                     else None
                 )
                 if staged is not None:

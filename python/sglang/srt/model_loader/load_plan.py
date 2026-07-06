@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -59,6 +60,11 @@ _BATCH_BYTES = 256 << 20
 # staging the source through pinned memory makes every device copy an async
 # launch. Tensors larger than the arena fall back to the pageable path.
 _ARENA_BYTES = 512 << 20
+# Stage only small copies: the per-call sync stall staging eliminates is fixed
+# cost, while staging adds a full extra CPU pass over the bytes — a large copy
+# amortizes its stall and only pays the memcpy (staging all of GLM-4.5-Air's
+# ~12MB-average copies measured 55s -> 71s).
+_STAGE_MAX_BYTES = int(os.environ.get("SGLANG_LOAD_PLAN_STAGE_MAX_BYTES", str(4 << 20)))
 
 
 class _PinnedStager(threading.local):
@@ -373,7 +379,11 @@ class LoadPlan:
                     # the observed copy went through a reshaped temp. Equal numel
                     # was implied by the observed copy_ succeeding.
                     src = src.reshape(dst.shape)
-                staged = stager.stage(src) if use_stager else None
+                staged = (
+                    stager.stage(src)
+                    if use_stager and src.numel() * src.element_size() <= _STAGE_MAX_BYTES
+                    else None
+                )
                 if staged is not None:
                     with torch.cuda.stream(stager.stream):
                         dst.copy_(staged, non_blocking=True)

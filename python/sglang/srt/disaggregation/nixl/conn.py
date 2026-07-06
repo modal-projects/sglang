@@ -261,6 +261,17 @@ class NixlKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Globally-unique sender id across the prefill's PP x TP grid,
+            # used as the trailing rank field of kv/aux/state notifs. The
+            # receiver keys its per-sender arrival accounting on this field
+            # (required_prefill_response_num senders per room), so it must be
+            # unique per sender: engine_rank alone collides across PP stages
+            # (every stage has tp_rank 0..attn_tp_size-1). Degenerates to
+            # engine_rank when pp_size == 1.
+            self.notif_sender_rank = (
+                getattr(self.kv_args, "pp_rank", 0) * self.attn_tp_size
+                + self.kv_args.engine_rank
+            )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
@@ -563,7 +574,7 @@ class NixlKVManager(CommonKVManager):
                         if kv_xfer_handle is None:
                             notif = (
                                 f"{req.room}_kv_{kv_chunk.chunk_id}"
-                                f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                                f"_{int(kv_chunk.is_last_chunk)}_{self.notif_sender_rank}"
                             )
                             has_draft = (
                                 self.kv_args.num_target_kv_data_ptrs
@@ -625,7 +636,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                f"{req.room}_state_{self.notif_sender_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -642,7 +653,7 @@ class NixlKVManager(CommonKVManager):
                         # expected_kvs_per_pp[pp_rank] = 0.
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                                f"{req.room}_aux_nokv_{self.notif_sender_rank}"
                             )
                         else:
                             aux_notif = f"{req.room}_aux"
@@ -1307,7 +1318,7 @@ class NixlKVManager(CommonKVManager):
 
         notif_tag = (
             f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
-            f"_{self.kv_args.engine_rank}_{chunk_idx}"
+            f"_{self.notif_sender_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
         handle = self.send_kvcache_staged(

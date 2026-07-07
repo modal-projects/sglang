@@ -1931,18 +1931,69 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ``touched`` maps param names (e.g. "w13_weight_scale") to the expert
         ids whose slices were reloaded (empty set = non-expert param).
         """
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or self.enable_flashinfer_cutedsl_moe
-            or self._is_cutedsl_v2_standard
-        ):
+        if self.enable_flashinfer_cutedsl_moe or self._is_cutedsl_v2_standard:
             logger.info(
-                "nvfp4 partial post-loading declined: non-CUTLASS runner "
-                f"(trtllm={self.enable_flashinfer_trtllm_moe} "
-                f"cutedsl={self.enable_flashinfer_cutedsl_moe} "
-                f"cutedsl_v2={self._is_cutedsl_v2_standard})"
+                "nvfp4 partial post-loading declined: cutedsl runner "
+                "(no incremental transform implemented)"
             )
             return False
+        # Scalar derivations are cheap and read only never-transformed
+        # sources; refresh them first so touched weight_scale_2 / input_scale
+        # values propagate into the per-expert transforms below.
+        self._derive_scalar_params(layer)
+        touched_experts = sorted(
+            set().union(*(touched.get(name, set()) for name in (
+                "w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+            )))
+        )
+        if self.enable_flashinfer_trtllm_moe:
+            # The TRTLLM alignment shuffles each expert's weights+scales
+            # independently (batched over the expert dim, no padding for
+            # aligned shapes) — re-align exactly the touched slots, whose raw
+            # tensors the expert-closure reload just rewrote.
+            from sglang.srt.layers.quantization.utils import (
+                prepare_static_weights_for_trtllm_fp4_moe,
+            )
+
+            is_gated = layer.moe_runner_config.is_gated
+            for e in touched_experts:
+                g1w, g1s, g2w, g2s = prepare_static_weights_for_trtllm_fp4_moe(
+                    layer.w13_weight.data[e : e + 1],
+                    layer.w2_weight.data[e : e + 1],
+                    layer.w13_weight_scale.data[e : e + 1],
+                    layer.w2_weight_scale.data[e : e + 1],
+                    layer.w2_weight.data.size(-2),
+                    layer.intermediate_size_per_partition,
+                    1,
+                    is_gated=is_gated,
+                )
+                for param, aligned in (
+                    (layer.w13_weight, g1w), (layer.w13_weight_scale, g1s),
+                    (layer.w2_weight, g2w), (layer.w2_weight_scale, g2s),
+                ):
+                    slot = param.data[e : e + 1]
+                    if aligned.shape != slot.shape:
+                        logger.info(
+                            f"nvfp4 partial post-loading declined: padded trtllm "
+                            f"alignment ({tuple(slot.shape)} -> {tuple(aligned.shape)})"
+                        )
+                        return False
+                    slot.copy_(aligned)
+            # g1_scale_c derives from the refreshed scalars (see the full pass).
+            w2_input_scale_quant = layer.w2_input_scale_quant
+            g1_alphas = layer.g1_alphas
+            if is_gated:
+                g1_scale_c = (w2_input_scale_quant * g1_alphas).to(torch.float32)
+            else:
+                g1_scale_c = (
+                    w2_input_scale_quant.to(torch.float32)
+                    .expand(g1_alphas.shape[0])
+                    .contiguous()
+                )
+            copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
+            return True
+        # CUTLASS path: weights load final; only the touched experts' block
+        # scales need re-swizzling (per-expert-local by construction).
         for name in ("w13_weight_scale", "w2_weight_scale"):
             for expert_id in sorted(touched.get(name, ())):
                 scale = getattr(layer, name).data
@@ -1955,9 +2006,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     )
                     return False  # padded layout: slots aren't raw-shaped
                 scale[expert_id].copy_(swizzled)
-        # Scalar derivations are cheap; always refresh them so touched
-        # weight_scale_2 / input_scale values propagate.
-        self._derive_scalar_params(layer)
         return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

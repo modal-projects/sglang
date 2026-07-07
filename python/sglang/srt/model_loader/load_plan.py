@@ -263,6 +263,8 @@ class LoadPlan:
         # tag (e.g. DeepSeek q/kv_a_proj -> fused_qkv_a_proj_with_mqa).
         # Candidates are validated against real param fqns before use.
         self.fused_aliases = tuple(fused_aliases)
+        # module fqn -> expert id -> the checkpoint names feeding that expert.
+        self.expert_index: Dict[str, Dict[int, Set[str]]] = {}
         self.recorded = False
         # source name -> (input shape, input dtype, [compiled copies]) for
         # names whose loader effect reduced to raw strided copies; built by the
@@ -360,6 +362,17 @@ class LoadPlan:
         self.fallback.update(name for name in recorded if self._forced_fallback(name))
         for name in self.fallback:
             self.entries.pop(name, None)
+        # (module fqn -> expert id -> checkpoint names): per-expert transforms
+        # (fp4 shuffle/swizzle) consume an expert's weights AND scales together,
+        # so a partial reload must refresh every tensor of a touched expert.
+        self.expert_index = {}
+        for name, calls in self.entries.items():
+            for fqn, args, kwargs in calls:
+                expert_id = kwargs.get("expert_id")
+                if expert_id is None:
+                    continue
+                module_fqn = fqn.rsplit(".", 1)[0]
+                self.expert_index.setdefault(module_fqn, {}).setdefault(int(expert_id), set()).add(name)
         self.recorded = True
         stats = {
             "plan": "record",
@@ -595,6 +608,16 @@ class LoadPlan:
             return None
         if inert:
             logger.info(f"[load plan] partial reload skipping {inert} inert touched names")
+        # Expert closure: refresh every tensor of a touched expert so per-expert
+        # re-transforms consume a complete raw slot.
+        for module_fqn, param_experts in list(detail.items()):
+            experts = set().union(*param_experts.values()) if param_experts else set()
+            for expert_id in experts:
+                for name in self.expert_index.get(module_fqn, {}).get(expert_id, ()):
+                    if name not in reload_names:
+                        reload_names.add(name)
+                        for fqn, args, kwargs in self.entries.get(name, ()):
+                            note(fqn, kwargs.get("expert_id"))
         # A touched fused param needs ALL its declared inputs streamed.
         if touched_fused:
             for name in self.fallback:

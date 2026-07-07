@@ -1629,7 +1629,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(
+            load_format=load_format,
+            # Mirror the cold-start LoadConfig (see load_model): a bare
+            # LoadConfig silently drops --model-loader-extra-config, pinning
+            # every reload to the default loader thread count.
+            model_loader_extra_config=self.server_args.model_loader_extra_config,
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)

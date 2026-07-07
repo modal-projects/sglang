@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
+from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -14,23 +16,24 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
-    server_args: "ServerArgs",
-    attn_backends: Sequence["AttentionBackend"],
+    server_args: ServerArgs,
+    attn_backends: Sequence[AttentionBackend],
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO / piecewise CG
-    (they read the CPU mirror outside the backend layer).
+    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
+    CPU mirror outside the backend layer to split the batch) or ngram (its
+    USE_FULL_MASK verify path reads the host mirror regardless of backend).
     """
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    if not server_args.disable_piecewise_cuda_graph:
-        # FIXME: support PCG without seq lens cpu value
+    if SpeculativeAlgorithm.from_string(server_args.speculative_algorithm).is_ngram():
+        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
+        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.
@@ -57,25 +60,6 @@ def _assert_nonneg_and_invalidate(
     Compiled so the reduction + assert + scatter run as one kernel launch."""
     torch._assert_async((values >= 0).all())
     buf[indices] = -1
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def _gather_spec_extras(
-    indices: torch.Tensor,
-    topk_p_buf: torch.Tensor,
-    topk_index_buf: torch.Tensor,
-    output_tokens_buf: torch.Tensor,
-    hidden_states_buf: Optional[torch.Tensor],
-):
-    """Compiled gather of spec extras. `hidden_states_buf` is None when the
-    build does not capture hidden states."""
-    topk_p = topk_p_buf[indices]
-    topk_index = topk_index_buf[indices]
-    bonus_tokens = output_tokens_buf[indices]
-    hidden_states = (
-        hidden_states_buf[indices] if hidden_states_buf is not None else None
-    )
-    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
@@ -106,8 +90,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
-    # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
-    if batch.is_spec_v2:
+    # Only the overlap path relays spec extras through the future_map; the
+    # synchronous (non-overlap) V2 path installs next_draft_input directly.
+    if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
 
 
@@ -207,7 +192,19 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.draft_probs_buf = None
+        if getattr(draft_input, "draft_probs", None) is not None:
+            draft_probs0 = draft_input.draft_probs[0]
+            self.draft_probs_buf = torch.empty(
+                (self.req_pool_size, *draft_probs0.shape),
+                dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
@@ -233,7 +230,7 @@ class FutureMap:
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
-            ) = _gather_spec_extras(
+            ) = gather_spec_extras(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,
@@ -244,6 +241,8 @@ class FutureMap:
                 draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
+            if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+                draft_input.draft_probs = self.draft_probs_buf[indices]
         elif self.need_bonus_tokens:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
@@ -328,12 +327,15 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
+        if self.spec_algo.is_ngram():
+            # FIXME: remove once precomputed draft is supported.
+            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
-        # also passes a token Tensor here.
+        # Dispatch by payload type, not spec_algo: non-spec decode passes a
+        # token Tensor here.
         # FIXME(lsyin): unify this relay path with a dataclass instead of the
         # Tensor / EagleDraftInput type switch.
         if isinstance(payload, torch.Tensor):
@@ -361,3 +363,5 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
+        if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+            self.draft_probs_buf[indices] = draft_input.draft_probs

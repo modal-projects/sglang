@@ -3,8 +3,8 @@ import unittest
 import openai
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import (
@@ -21,14 +21,16 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64
-    attention_backend = "flashinfer"
+    attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
     other_launch_args = []
-    spec_v2 = False
+    # Base classes exercise the non-overlap (synchronous) scheduling path.
+    disable_overlap = True
     overlap_plan_stream = False
     model = DEFAULT_TARGET_MODEL_DFLASH
     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
@@ -50,12 +52,17 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             str(cls.page_size),
             "--max-running-requests",
             str(cls.max_running_requests),
+            # Keep headroom for the draft KV pool + piecewise cuda graph
+            # private pools on 32GB CI cards.
+            "--mem-fraction-static",
+            "0.7",
             "--cuda-graph-bs",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
+        if cls.disable_overlap:
+            launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
         with (
-            envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2),
             envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
             envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
@@ -146,7 +153,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
 
 
 class TestDFlashServerSpecV2(TestDFlashServerBase):
-    spec_v2 = True
+    disable_overlap = False
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)

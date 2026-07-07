@@ -1620,6 +1620,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        weight_names: Optional[List[str]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -1681,6 +1682,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.model_loader.load_plan import get_or_create_plan
 
             plan = get_or_create_plan(self.model)
+
+        # O(delta) path: when the caller names the touched checkpoint tensors,
+        # reload only those (plus their closures) and re-run post-loading
+        # incrementally for exactly the touched modules. Any gap (no plan,
+        # unattributable name, missing tensor, quant method without
+        # incremental support, failure) falls through to the full reload.
+        if plan is not None and plan.recorded and weight_names:
+            partial_timing: dict[str, float] = {}
+            try:
+                result = plan.partial_replay(self.model, model_path, list(weight_names))
+            except Exception:
+                logger.exception("partial reload failed; falling back to a full reload")
+                result = None
+            if result is not None:
+                stats, touched_detail = result
+                partial_timing.update(stats)
+                post_start = time.perf_counter()
+                from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+
+                modules = dict(self.model.named_modules())
+                for module_fqn, param_experts in touched_detail.items():
+                    module = modules.get(module_fqn)
+                    quant_method = getattr(module, "quant_method", None) if module else None
+                    if (
+                        quant_method is None
+                        or getattr(quant_method, "partial_reload_safe", False)
+                        # No override of the base's no-op: nothing to redo.
+                        or type(quant_method).process_weights_after_loading
+                        is QuantizeMethodBase.process_weights_after_loading
+                    ):
+                        continue  # no post-loading transform to redo
+                    partial_fn = getattr(quant_method, "process_weights_after_partial_loading", None)
+                    try:
+                        ok = partial_fn is not None and partial_fn(module, param_experts)
+                    except Exception:
+                        logger.exception(f"incremental post-loading raised for {module_fqn}")
+                        ok = False
+                    if not ok:
+                        logger.info(
+                            f"partial reload falling back to full: {module_fqn} "
+                            f"({type(quant_method).__name__}) "
+                            f"{'lacks' if partial_fn is None else 'declined'} incremental post-loading"
+                        )
+                        result = None
+                        break
+                partial_timing["postprocess_s"] = time.perf_counter() - post_start
+            if result is not None:
+                self.model_config.model_path = model_path
+                self.server_args.model_path = model_path
+                summary = (
+                    f"[reload timing] iter_wait=0.00s "
+                    f"load={partial_timing.get('plan_replay_s', 0.0):.2f}s "
+                    f"postprocess={partial_timing.get('postprocess_s', 0.0):.2f}s "
+                    f"total={time.perf_counter() - start_time:.2f}s "
+                    f"plan=partial plan_names={partial_timing.get('plan_touched', 0)}"
+                    f" plan_modules={partial_timing.get('plan_modules', 0)}"
+                    f" plan_closure={partial_timing.get('plan_closure', 0)}"
+                )
+                logger.info(f"Update weights end. {summary}")
+                return True, f"Succeeded to update model weights. {summary}"
 
         def model_load_weights(model, iter):
             nonlocal plan

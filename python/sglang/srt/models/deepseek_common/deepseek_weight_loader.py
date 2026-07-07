@@ -102,6 +102,13 @@ class DeepseekV2WeightLoaderMixin:
     # (fused q/kv_a_proj, in-flight ue8m0 quant) self-exclude at record time.
     supports_load_plan_replay = True
     load_plan_fallback_patterns = ("kv_b_proj",)
+    # Buffered q/kv_a fusion: the fused loader call fires on a worker
+    # thread with no source tag, so partial reloads attribute these names
+    # by declared rewrite (validated against real param fqns).
+    load_plan_fused_aliases = (
+        ("self_attn.q_a_proj", "self_attn.fused_qkv_a_proj_with_mqa"),
+        ("self_attn.kv_a_proj_with_mqa", "self_attn.fused_qkv_a_proj_with_mqa"),
+    )
 
     model: nn.Module
     config: PretrainedConfig

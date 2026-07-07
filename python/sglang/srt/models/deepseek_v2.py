@@ -2576,12 +2576,8 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        if aux_hidden_states is None:
+        if len(aux_hidden_states) == 0:
             return hidden_states
-        if aux_hidden_state_idx != num_aux_hidden_states:
-            aux_hidden_states = aux_hidden_states[
-                ..., : aux_hidden_state_idx * aux_hidden_size
-            ]
         return hidden_states, aux_hidden_states
 
 

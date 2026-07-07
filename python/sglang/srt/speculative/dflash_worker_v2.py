@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import List, Optional
 
@@ -24,6 +25,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
@@ -33,7 +35,11 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    assign_req_to_token_pool_func,
+)
 from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
     _compute_dflash_accept_bonus_triton_unchecked,
 )
@@ -104,6 +110,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Draft runner (separate KV cache + attention backend).
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        if draft_server_args.speculative_draft_kv_cache_dtype is not None:
+            draft_server_args.kv_cache_dtype = (
+                draft_server_args.speculative_draft_kv_cache_dtype
+            )
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:
@@ -136,6 +146,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 _fb,
             )
             draft_backend = _fb
+        if draft_backend == "fa4" and draft_server_args.kv_cache_dtype.startswith(
+            ("fp8", "fp4")
+        ):
+            logger.warning(
+                "DFLASH draft backend fa4 with draft kv_cache_dtype=%s can hit dtype "
+                "assertions because FA4 does not support FP8/FP4 q/k. Set "
+                "--speculative-draft-kv-cache-dtype=bf16 for FA4 draft experiments.",
+                draft_server_args.kv_cache_dtype,
+            )
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -192,12 +211,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s, target_kv_cache_dtype=%s, draft_kv_cache_dtype=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
+                getattr(target_worker.model_runner, "kv_cache_dtype", None),
+                getattr(self.draft_model_runner, "kv_cache_dtype", None),
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
@@ -1555,6 +1576,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1637,6 +1659,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        if SIMULATE_ACC_LEN > 0:
+            simulate_acc_token_mode = os.environ.get(
+                "SGLANG_SIMULATE_ACC_TOKEN_MODE", "real-draft-token"
+            )
+            target_predict_for_sim = target_predict
+            if (
+                simulate_acc_token_mode == "real-draft-token"
+                and target_predict_for_sim is None
+            ):
+                target_predict_for_sim = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict_for_sim,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=simulate_acc_token_mode,
+            )
+            # If the fast path precomputed this with the real accept length,
+            # discard it so the common path recomputes from forced commit_lens.
+            new_seq_lens = None
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

@@ -84,6 +84,22 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def _resolve_kv_cache_dtype_from_arg(
+    dtype_name: str, fallback_dtype: torch.dtype
+) -> torch.dtype:
+    if dtype_name == "auto":
+        return fallback_dtype
+    if dtype_name in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if dtype_name == "fp8_e4m3":
+        return torch.float8_e4m3fn
+    if dtype_name == "fp8_e5m2":
+        return torch.float8_e5m2
+    if dtype_name == "fp4_e2m1" and hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    return fallback_dtype
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -156,10 +172,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_cell_size_per_token = self._compute_dflash_draft_cell_size(
+                    mr, int(draft_num_layers)
+                )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    draft_cell_size_per_token=draft_cell_size_per_token,
                 )
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
@@ -218,6 +238,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         return cell_size
+
+    def _compute_dflash_draft_cell_size(
+        self, mr: ModelRunner, draft_num_layers: int
+    ) -> Optional[int]:
+        draft_model_config = getattr(mr, "dflash_draft_model_config", None)
+        if draft_model_config is None:
+            return None
+
+        draft_kv_cache_dtype_name = (
+            mr.server_args.speculative_draft_kv_cache_dtype
+            or mr.server_args.kv_cache_dtype
+        )
+        draft_kv_cache_dtype = _resolve_kv_cache_dtype_from_arg(
+            draft_kv_cache_dtype_name, mr.dtype
+        )
+        kv_size = torch._utils._element_size(draft_kv_cache_dtype)
+        tp_size = get_attention_tp_size()
+        num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+        head_dim = draft_model_config.head_dim
+        v_head_dim = draft_model_config.v_head_dim
+        cell_size = num_kv_heads * (head_dim + v_head_dim) * draft_num_layers * kv_size
+
+        if is_float4_e2m1fn_x2(draft_kv_cache_dtype):
+            scale_block_size = 16
+            cell_size = (cell_size // 2) + (
+                (num_kv_heads * head_dim * draft_num_layers * 2 * kv_size)
+                // scale_block_size
+            )
+
+        return int(cell_size)
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

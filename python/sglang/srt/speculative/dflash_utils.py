@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -13,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -614,6 +616,88 @@ def compute_dflash_correct_drafts_and_bonus(
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len, bonus.to(torch.int64)
+
+
+def apply_dflash_simulated_acceptance(
+    *,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    simulate_acc_token_mode: Optional[str] = None,
+    fixed_token_id: int = 100,
+) -> int:
+    """Force a DFlash accept length for benchmarking.
+
+    ``simulate_acc_len`` includes the bonus token. A value of 4 means three
+    accepted draft tokens plus one target bonus token, so ``commit_lens`` is 4
+    and ``accept_len`` is 3.
+    """
+    if simulate_acc_token_mode is None:
+        simulate_acc_token_mode = os.environ.get(
+            "SGLANG_SIMULATE_ACC_TOKEN_MODE", "real-draft-token"
+        )
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if out_tokens.shape != candidates.shape:
+        raise ValueError(
+            "out_tokens must have the same shape as candidates, "
+            f"got out_tokens={tuple(out_tokens.shape)}, candidates={tuple(candidates.shape)}"
+        )
+
+    bs, block_size = candidates.shape
+    if bs <= 0:
+        raise ValueError(f"batch size must be positive, got {bs}.")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    for name, tensor in (
+        ("accept_len", accept_len),
+        ("commit_lens", commit_lens),
+        ("bonus", bonus),
+    ):
+        if tensor.shape[0] != bs:
+            raise ValueError(
+                f"{name} first dimension must match batch size {bs}, got {tuple(tensor.shape)}."
+            )
+
+    forced_commit_len = _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, block_size
+    )
+    forced_accept_len = forced_commit_len - 1
+
+    accept_len.fill_(forced_accept_len)
+    commit_lens.fill_(forced_commit_len)
+
+    if simulate_acc_token_mode == "fixed":
+        bonus.fill_(fixed_token_id)
+        out_tokens.fill_(fixed_token_id)
+        return forced_commit_len
+
+    if simulate_acc_token_mode != "real-draft-token":
+        raise ValueError(
+            "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+            f"{simulate_acc_token_mode!r}; expected 'fixed' or 'real-draft-token'."
+        )
+    if target_predict is None:
+        raise ValueError(
+            "DFLASH real-draft-token acceptance simulation requires target predictions."
+        )
+    if target_predict.shape != candidates.shape:
+        raise ValueError(
+            "target_predict must have the same shape as candidates, "
+            f"got target_predict={tuple(target_predict.shape)}, candidates={tuple(candidates.shape)}."
+        )
+
+    out_tokens.zero_()
+    if forced_accept_len > 0:
+        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
+    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+    return forced_commit_len
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

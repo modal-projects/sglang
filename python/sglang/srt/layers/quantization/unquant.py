@@ -122,6 +122,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    # Post-loading is a no-op on CUDA: partial reloads need no re-processing.
+    partial_reload_safe = True
+
     """Linear method without quantization."""
 
     def create_weights(
@@ -177,6 +180,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+    # Post-loading is a no-op on CUDA: partial reloads need no re-processing.
+    partial_reload_safe = True
+
     """MoE method without quantization."""
 
     def __init__(

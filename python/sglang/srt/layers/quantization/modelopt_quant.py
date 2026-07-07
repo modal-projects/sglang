@@ -1820,11 +1820,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process FP4 MoE weights after loading from serialized checkpoint.
-
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
-        """
+    def _derive_scalar_params(self, layer: torch.nn.Module) -> None:
+        """Derive the per-layer scalar quant params (alphas, input-scale
+        quants, dispatcher config) from their never-transformed sources —
+        shared by the full and partial post-loading passes."""
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1916,6 +1915,105 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+
+    def process_weights_after_partial_loading(
+        self, layer: torch.nn.Module, touched: dict
+    ) -> bool:
+        """Incrementally re-process after a partial reload that rewrote only
+        some experts' params raw. Exact because the CUTLASS blockscale swizzle
+        is per-expert-local (swizzle_blockscale keeps the expert dim as an
+        untouched batch dim), so a touched expert's slot re-swizzles from just
+        its own freshly-loaded raw scales; the scalar-derived params
+        (alphas / input-scale quants) recompute from never-transformed
+        per-tensor sources. Returns False when this layer's configuration
+        needs the full pass (non-CUTLASS runners transform weights globally).
+
+        ``touched`` maps param names (e.g. "w13_weight_scale") to the expert
+        ids whose slices were reloaded (empty set = non-expert param).
+        """
+        if self.enable_flashinfer_cutedsl_moe or self._is_cutedsl_v2_standard:
+            logger.info(
+                "nvfp4 partial post-loading declined: cutedsl runner "
+                "(no incremental transform implemented)"
+            )
+            return False
+        # Scalar derivations are cheap and read only never-transformed
+        # sources; refresh them first so touched weight_scale_2 / input_scale
+        # values propagate into the per-expert transforms below.
+        self._derive_scalar_params(layer)
+        touched_experts = sorted(
+            set().union(*(touched.get(name, set()) for name in (
+                "w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+            )))
+        )
+        if self.enable_flashinfer_trtllm_moe:
+            # The TRTLLM alignment shuffles each expert's weights+scales
+            # independently (batched over the expert dim, no padding for
+            # aligned shapes) — re-align exactly the touched slots, whose raw
+            # tensors the expert-closure reload just rewrote.
+            from sglang.srt.layers.quantization.utils import (
+                prepare_static_weights_for_trtllm_fp4_moe,
+            )
+
+            is_gated = layer.moe_runner_config.is_gated
+            for e in touched_experts:
+                g1w, g1s, g2w, g2s = prepare_static_weights_for_trtllm_fp4_moe(
+                    layer.w13_weight.data[e : e + 1],
+                    layer.w2_weight.data[e : e + 1],
+                    layer.w13_weight_scale.data[e : e + 1],
+                    layer.w2_weight_scale.data[e : e + 1],
+                    layer.w2_weight.data.size(-2),
+                    layer.intermediate_size_per_partition,
+                    1,
+                    is_gated=is_gated,
+                )
+                for param, aligned in (
+                    (layer.w13_weight, g1w), (layer.w13_weight_scale, g1s),
+                    (layer.w2_weight, g2w), (layer.w2_weight_scale, g2s),
+                ):
+                    slot = param.data[e : e + 1]
+                    if aligned.shape != slot.shape:
+                        logger.info(
+                            f"nvfp4 partial post-loading declined: padded trtllm "
+                            f"alignment ({tuple(slot.shape)} -> {tuple(aligned.shape)})"
+                        )
+                        return False
+                    slot.copy_(aligned)
+            # g1_scale_c derives from the refreshed scalars (see the full pass).
+            w2_input_scale_quant = layer.w2_input_scale_quant
+            g1_alphas = layer.g1_alphas
+            if is_gated:
+                g1_scale_c = (w2_input_scale_quant * g1_alphas).to(torch.float32)
+            else:
+                g1_scale_c = (
+                    w2_input_scale_quant.to(torch.float32)
+                    .expand(g1_alphas.shape[0])
+                    .contiguous()
+                )
+            copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
+            return True
+        # CUTLASS path: weights load final; only the touched experts' block
+        # scales need re-swizzling (per-expert-local by construction).
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            for expert_id in sorted(touched.get(name, ())):
+                scale = getattr(layer, name).data
+                swizzled = swizzle_blockscale(scale[expert_id])
+                if swizzled.shape != scale[expert_id].shape:
+                    logger.info(
+                        f"nvfp4 partial post-loading declined: padded swizzle "
+                        f"({name}[{expert_id}] {tuple(scale[expert_id].shape)} "
+                        f"-> {tuple(swizzled.shape)})"
+                    )
+                    return False  # padded layout: slots aren't raw-shaped
+                scale[expert_id].copy_(swizzled)
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process FP4 MoE weights after loading from serialized checkpoint.
+
+        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        """
+        self._derive_scalar_params(layer)
         block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1

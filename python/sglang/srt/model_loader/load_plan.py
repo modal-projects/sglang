@@ -394,15 +394,19 @@ class LoadPlan:
         checkpoint_dir: str,
         touched: List[str],
         max_workers: int = 8,
+        resolved: "Optional[Tuple[Dict[str, Dict[str, Set[int]]], Set[str]]]" = None,
     ) -> "Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, Set[int]]]]]":
         """Reload ONLY the touched checkpoint names (plus their closures),
         reading just their tensors from disk. Returns (stats, per-module
         touched detail) for the caller's incremental postprocess, or None when
         a full reload is required (unattributable names, or a name missing
-        from the index)."""
+        from the index). Pass ``resolved`` (a prior ``touched_plan`` result)
+        to skip re-resolving — callers use it to pre-flight quant-method
+        support before any tensor is read."""
         if not self.recorded:
             return None
-        resolved = self.touched_plan(touched, {fqn for fqn, _ in model.named_parameters()})
+        if resolved is None:
+            resolved = self.touched_plan(touched, {fqn for fqn, _ in model.named_parameters()})
         if resolved is None:
             return None
         detail, reload_names = resolved

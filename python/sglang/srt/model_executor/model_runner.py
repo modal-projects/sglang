@@ -1690,19 +1690,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # incremental support, failure) falls through to the full reload.
         if plan is not None and plan.recorded and weight_names:
             partial_timing: dict[str, float] = {}
-            try:
-                result = plan.partial_replay(self.model, model_path, list(weight_names))
-            except Exception:
-                logger.exception("partial reload failed; falling back to a full reload")
-                result = None
-            if result is not None:
-                stats, touched_detail = result
-                partial_timing.update(stats)
-                post_start = time.perf_counter()
-                from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+            from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
-                modules = dict(self.model.named_modules())
-                for module_fqn, param_experts in touched_detail.items():
+            # Pre-flight: resolve the touched module set (no I/O) and check
+            # every touched module's quant method for incremental post-loading
+            # support BEFORE reading any tensor. A module that can never be
+            # incrementally post-processed would otherwise force the fallback
+            # only after a full partial pass — paying the load twice.
+            try:
+                resolved = plan.touched_plan(
+                    list(weight_names), {fqn for fqn, _ in self.model.named_parameters()}
+                )
+            except Exception:
+                logger.exception("touched-plan resolution failed; falling back to a full reload")
+                resolved = None
+            modules = dict(self.model.named_modules())
+            support: dict[str, object] = {}
+            if resolved is not None:
+                for module_fqn in resolved[0]:
                     module = modules.get(module_fqn)
                     quant_method = getattr(module, "quant_method", None) if module else None
                     if (
@@ -1712,18 +1717,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         or type(quant_method).process_weights_after_loading
                         is QuantizeMethodBase.process_weights_after_loading
                     ):
-                        continue  # no post-loading transform to redo
+                        support[module_fqn] = None  # no post-loading transform to redo
+                        continue
                     partial_fn = getattr(quant_method, "process_weights_after_partial_loading", None)
+                    if partial_fn is None:
+                        logger.info(
+                            f"partial reload falling back to full (pre-flight): {module_fqn} "
+                            f"({type(quant_method).__name__}) lacks incremental post-loading"
+                        )
+                        resolved = None
+                        break
+                    support[module_fqn] = partial_fn
+
+            result = None
+            if resolved is not None:
+                try:
+                    result = plan.partial_replay(
+                        self.model, model_path, list(weight_names), resolved=resolved
+                    )
+                except Exception:
+                    logger.exception("partial reload failed; falling back to a full reload")
+                    result = None
+            if result is not None:
+                stats, touched_detail = result
+                partial_timing.update(stats)
+                post_start = time.perf_counter()
+                for module_fqn, param_experts in touched_detail.items():
+                    partial_fn = support.get(module_fqn)
+                    if partial_fn is None:
+                        continue  # no post-loading transform to redo
+                    module = modules.get(module_fqn)
                     try:
-                        ok = partial_fn is not None and partial_fn(module, param_experts)
+                        ok = partial_fn(module, param_experts)
                     except Exception:
                         logger.exception(f"incremental post-loading raised for {module_fqn}")
                         ok = False
                     if not ok:
                         logger.info(
                             f"partial reload falling back to full: {module_fqn} "
-                            f"({type(quant_method).__name__}) "
-                            f"{'lacks' if partial_fn is None else 'declined'} incremental post-loading"
+                            f"({type(module.quant_method).__name__}) "
+                            f"declined incremental post-loading"
                         )
                         result = None
                         break

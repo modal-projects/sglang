@@ -892,17 +892,29 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
             )
             self._ensure_verify_bs_buffers()
+            # The bs buffers are lazily allocated; when the first allocation runs
+            # inside torch.inference_mode() (eager warmup / flashinfer-autotune
+            # forwards) they become inference tensors, and mutating them from the
+            # cuda-graph capture path (outside inference mode) raises "Inplace
+            # update to inference tensor outside InferenceMode". Inplace updates
+            # to inference tensors are legal inside inference mode, so re-enter
+            # it for the fills/copies.
+            with torch.inference_mode():
+                if ragged_layout is None:
+                    self.extend_seq_lens_buffer[:bs].fill_(
+                        self.speculative_num_draft_tokens
+                    )
+                else:
+                    self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
+                    self.extend_start_loc_buffer[:bs].copy_(
+                        ragged_layout.extend_start_loc
+                    )
             if ragged_layout is None:
-                self.extend_seq_lens_buffer[:bs].fill_(
-                    self.speculative_num_draft_tokens
-                )
                 extend_seq_lens = self.extend_seq_lens_buffer[:bs]
                 extend_start_loc = None
                 verify_lens = None
                 total_verify_tokens = self.speculative_num_draft_tokens * bs
             else:
-                self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
-                self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
                 extend_seq_lens = self.extend_seq_lens_buffer[:bs]
                 extend_start_loc = self.extend_start_loc_buffer[:bs]
                 verify_lens = self.extend_seq_lens_buffer[:bs]

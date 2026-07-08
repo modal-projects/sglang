@@ -3260,7 +3260,15 @@ class Scheduler(
                 # (no sampled tokens), so there is nothing to copy and
                 # copy_to_cpu would deref next_token_ids=None. Downstream
                 # processors guard on copy_done being set.
-                if batch_result.next_token_ids is not None:
+                # PP last rank must NOT copy either: copy_to_cpu rebinds
+                # next_token_ids to a CPU tensor before _pp_prepare_tensor_dict
+                # builds the output proxy dict, so a CPU tensor rides the PP
+                # ring (recv_tensor_dict reconstructs on the sender's device)
+                # and FutureMap.stash on the receiving rank hits a device
+                # mismatch (masked at bs==1 by torch's CPU-scalar fill). The
+                # PP loop processes results rebuilt from the recv'd dict, not
+                # this local one, so nothing downstream needs the CPU copy.
+                if batch_result.next_token_ids is not None and self.ps.pp_size == 1:
                     batch_result.copy_done = self.device_module.Event()
                     batch_result.copy_to_cpu(
                         return_logprob=batch.return_logprob,

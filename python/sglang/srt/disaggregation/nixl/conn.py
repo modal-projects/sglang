@@ -928,6 +928,26 @@ class NixlKVManager(CommonKVManager):
         peer_info.kv_xfer_segments = prepared_segments
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
+        # The prepped dlist covers "all slots x all layers" with a flat
+        # (layer, slot) indexing that assumes src and dst share one uniform
+        # layout. Two configurations break that assumption:
+        #  - PP prefill: this stage owns a layer sub-range; the flat dst
+        #    indexing has no start_layer offset and would write decode
+        #    layers [0, n) instead of this stage's range.
+        #  - Spec (DFlash) draft sections: kv_data_ptrs mixes MLA target
+        #    buffers with MHA draft buffers of different item_lens; pairing
+        #    dst ptrs with this rank's item_lens produced descriptors
+        #    outside registered memory (NIXL_ERR_NOT_FOUND) on the
+        #    draft-owning stage.
+        # Both route through the non-prepped send paths, which handle PP
+        # slicing (get_*_kv_ptrs_with_pp) and the draft section
+        # (send_kvcache_mla_with_draft); skip prep so registration cannot
+        # crash and no wrong-layer prepped sends are possible.
+        has_draft = bool(
+            getattr(self.kv_args, "num_target_kv_data_ptrs", 0)
+        ) and self.kv_args.num_target_kv_data_ptrs < len(self.kv_args.kv_data_ptrs)
+        if self.pp_size > 1 or has_draft:
+            return
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
 
@@ -2691,11 +2711,22 @@ class NixlKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    # Register new peer and save KV base pointers. Never let a
+                    # registration failure kill this thread: a dead bootstrap
+                    # thread silently stalls every future request on this rank
+                    # (requests sit in the bootstrap queue with no error).
+                    try:
+                        self._add_remote_peer(
+                            KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        )
+                        logger.debug(
+                            f"Register KVArgs from {agent_name} successfully"
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"Failed to register peer {agent_name}; "
+                            "continuing to serve the bootstrap socket"
+                        )
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:

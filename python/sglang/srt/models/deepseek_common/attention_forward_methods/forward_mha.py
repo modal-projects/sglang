@@ -490,6 +490,14 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            _kv_scale = getattr(self.attn_mha, "k_scale_float", None)
+            if (
+                _kv_scale is not None
+                and _kv_scale != 1.0
+                and latent_cache_buf.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            ):
+                # fp8 MLA cache stores latent/scale; undo for dequant reads.
+                latent_cache = latent_cache * _kv_scale
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

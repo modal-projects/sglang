@@ -1887,6 +1887,22 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+
+    def _mla_kv_write_scale(self, layer) -> float | None:
+        """Checkpoint-calibrated KV scale for fp8 MLA caches.
+
+        The tokenspeed decode kernel folds ``layer.k_scale_float`` into
+        softmax/output scales, i.e. it assumes the cached latent was DIVIDED by
+        the scale at write time. Return the divisor to apply on write (and the
+        multiplier for dequant reads), or None when not applicable.
+        """
+        if self.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return None
+        scale = getattr(layer, "k_scale_float", None)
+        if scale is None or scale == 1.0:
+            return None
+        return float(scale)
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1897,6 +1913,9 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
+            _scale = self._mla_kv_write_scale(layer)
+            if _scale is not None:
+                cache_k = cache_k / _scale
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
@@ -1944,6 +1963,10 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             if cache_k_nope.dtype != self.dtype:
+                _scale = self._mla_kv_write_scale(layer)
+                if _scale is not None:
+                    cache_k_nope = cache_k_nope / _scale
+                    cache_k_rope = cache_k_rope / _scale
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
@@ -1978,6 +2001,12 @@ class MLATokenToKVPool(KVCache):
             device=kv_buffer.device,
         )
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            _scale = self._mla_kv_write_scale(layer)
+            if _scale is not None:
+                # Cache holds latent/scale (see set_kv_buffer); undo for dequant reads.
+                cache_k_nope.mul_(_scale)
+                cache_k_rope.mul_(_scale)
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices, mamba_indices=None):

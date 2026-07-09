@@ -248,8 +248,21 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         # k_pe is shared across heads (RoPE is position-only), so head 0
         # reproduces the original [tokens, 1, qk_rope] latent layout.
-        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
-        k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+        # Checkpoint-calibrated KV scale (lives on attn_mqa; the decode kernel
+        # folds it into softmax/output scales, so the CACHE copy must be
+        # divided by it — compute copies q/k/v stay unscaled).
+        _kv_scale = getattr(layer.attn_mqa, "k_scale_float", None)
+        if _kv_scale is not None and _kv_scale != 1.0:
+            kv_a_fp8 = fp8_quantize(
+                kv_a / _kv_scale, enable_pdl=is_arch_support_pdl()
+            )
+            k_pe_fp8 = fp8_quantize(
+                k_fp8[:, 0:1, layer.qk_nope_head_dim :].to(kv_a.dtype) / _kv_scale,
+                enable_pdl=is_arch_support_pdl(),
+            )
+        else:
+            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
+            k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,

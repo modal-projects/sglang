@@ -490,19 +490,24 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
-            _kv_scale = getattr(self.attn_mha, "k_scale_float", None)
-            if (
-                _kv_scale is not None
-                and _kv_scale != 1.0
-                and latent_cache_buf.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            ):
-                # fp8 MLA cache stores latent/scale; undo for dequant reads.
-                latent_cache = latent_cache * _kv_scale
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
             kv_a = kv_a.squeeze(1).contiguous()
+        _kv_scale = getattr(self.attn_mqa, "k_scale_float", None)
+        if (
+            _kv_scale is not None
+            and _kv_scale != 1.0
+            and get_token_to_kv_pool().dtype
+            in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and dst_dtype
+            not in (torch.float8_e4m3fn, torch.float8_e5m2)
+        ):
+            # fp8 MLA cache stores latent/scale (see tokenspeed prefill write
+            # and MLATokenToKVPool.set_kv_buffer); undo for dequant reads.
+            kv_a = kv_a * _kv_scale
+            k_pe = k_pe * _kv_scale
         return kv_a, k_pe
 
     def _get_mla_kv_buffer_from_fp8_for_dsa(

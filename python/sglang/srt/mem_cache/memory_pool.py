@@ -2001,12 +2001,6 @@ class MLATokenToKVPool(KVCache):
             device=kv_buffer.device,
         )
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
-        if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            _scale = self._mla_kv_write_scale(layer)
-            if _scale is not None:
-                # Cache holds latent/scale (see set_kv_buffer); undo for dequant reads.
-                cache_k_nope.mul_(_scale)
-                cache_k_rope.mul_(_scale)
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices, mamba_indices=None):

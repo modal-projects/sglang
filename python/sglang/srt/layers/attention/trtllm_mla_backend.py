@@ -923,6 +923,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            # Checkpoint-calibrated KV scale: the fused kernel raw-casts K to
+            # fp8, but the decode kernel folds k_scale back in at read, so the
+            # cache-bound K must be divided by it. K is only used for the cache
+            # write below (attention reads the pool), and RoPE is a rotation,
+            # so dividing the bf16 inputs commutes with rope+quantize; Q stays
+            # unscaled.
+            _kv_scale = getattr(layer, "k_scale_float", None)
+            if _kv_scale is not None and _kv_scale != 1.0:
+                k = k / _kv_scale
+                k_rope = k_rope / _kv_scale
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -1030,6 +1040,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            # Checkpoint-calibrated KV scale: same correction as forward_decode
+            # (the target-verify path also raw-casts K to fp8 before the cache
+            # write while the read side folds k_scale back in).
+            _kv_scale = getattr(layer, "k_scale_float", None)
+            if _kv_scale is not None and _kv_scale != 1.0:
+                k = k / _kv_scale
+                k_rope = k_rope / _kv_scale
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,

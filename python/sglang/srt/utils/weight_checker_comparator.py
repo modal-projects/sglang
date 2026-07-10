@@ -7,10 +7,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4LinearMethod,
-    ModelOptNvFp4FusedMoEMethod,
-)
 
 # chunk to avoid too high GPU memory peak
 _CHUNK_NUMEL = 64 * 1024 * 1024
@@ -52,6 +48,10 @@ class Fp8BlockComparable(ComparableWeight):
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
         if w_s.dtype == torch.int32:
             w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            # The packed layout pads scale columns to a multiple of 4 (u8 ->
+            # int32); trim to the real UE8M0 [128,128] grid or block-size
+            # inference below reads the padding as narrower blocks.
+            w_s = w_s[..., : -(-w_q.shape[-1] // 128)]
         return w_s.to(torch.float32)
 
     @staticmethod
@@ -143,8 +143,10 @@ def select_comparable_weight(quant_method) -> Optional[type]:
     """Map a module's quant_method to its ComparableWeight subclass; None means raw
     (bit-exact) compare. fp8 block quant -> Fp8BlockComparable: load-time ue8m0
     requant yields two valid fp8 encodings, so compare in dequant space with ULP
-    tolerance. nvfp4 -> raise (non-bit-exact, unsupported). int4/mxfp8/mxfp4 and
-    unquantized -> None.
+    tolerance. nvfp4/int4/mxfp8/mxfp4 and unquantized -> None: their sources are
+    refilled verbatim and post-processing is deterministic, so identical input
+    bytes yield identical params. (Comparing weights quantized INDEPENDENTLY on
+    the trainer side would need a dequant-space comparable instead.)
     """
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
@@ -152,8 +154,4 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
-        raise NotImplementedError(
-            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
-        )
     return None

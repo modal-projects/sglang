@@ -17,6 +17,14 @@ local checkpoint through the ordinary ``update_weights_from_disk`` path.
 ``pull()`` is safe to call concurrently from every scheduler rank on a host: a
 per-host file lock serializes the work and an applied-version marker makes the
 extra calls no-ops.
+
+A pull that dies mid-mutation (preemption, power loss) never wedges the host.
+The next pull re-applies the interrupted version; a changed tensor that was
+already XORed reverts under the second XOR and so fails its checksum, which
+triggers one reseed from the newest full version (or the engine's base) plus a
+replay of the delta chain. The delta's dirty pages are msync'd before the
+applied-version marker is written, so the marker can never become durable over
+bytes that never reached disk. Only a failure on the fresh reseed raises.
 """
 
 from __future__ import annotations
@@ -62,8 +70,16 @@ def pull(
     Seeds from the newest full checkpoint at or below the target — the engine's
     own base (``base_dir``) for a pure-delta stream, a published full version
     otherwise — then applies the remaining deltas in order. A local checkpoint
-    already past the seed point just continues its delta chain. Raises on any
-    per-tensor checksum mismatch (fail loud, never serve bad weights).
+    already past the seed point just continues its delta chain.
+
+    A torn or corrupt local state — an apply interrupted mid-write, bit rot, a
+    checksum mismatch — surfaces as a mismatch on the next apply (a re-XORed
+    changed tensor cannot match its target digest), which triggers one reseed
+    from scratch plus a replay of the delta chain; a failure on that fresh
+    state raises (fail loud, never serve bad weights). A missing *source*
+    version — the publisher or a shared object store not yet caught up — is NOT
+    local corruption: reseeding cannot conjure the absent bytes, so it re-raises
+    immediately (cheap) and the caller retries once the source is visible.
     """
     # Object-store-backed shared filesystems lack cross-host read-after-write
     # consistency: the publisher's files only appear here after an explicit
@@ -72,21 +88,48 @@ def pull(
     if target_version > 0 and pre_read_hook:
         _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
-        applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
-        # Scan back from the target for the newest full version. Stop at the
-        # local state — below it a reset can never be needed (or, on a fresh
-        # host, at 0 = the engine's base).
-        floor = applied if applied is not None else 0
-        start = target_version
-        while start > floor and _is_delta(_version_dir(source_dir, start)):
-            start -= 1
-        if applied is None or start > applied:
-            seed_dir = base_dir if start == 0 else _version_dir(source_dir, start)
-            _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
-        else:
-            start = applied
-        for version in range(start + 1, target_version + 1):
-            _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
+        try:
+            _pull_locked(
+                local_checkpoint_dir, base_dir, source_dir, target_version, reseed=False
+            )
+        except FileNotFoundError:
+            # Source version not visible yet — reseed would just re-hit it, and
+            # for a large base the wasted full copy is expensive. Fail fast.
+            raise
+        except Exception:
+            logger.exception(
+                "pull to v%d failed; reseeding the local checkpoint and replaying the delta chain",
+                target_version,
+            )
+            _pull_locked(
+                local_checkpoint_dir, base_dir, source_dir, target_version, reseed=True
+            )
+
+
+def _pull_locked(
+    local_checkpoint_dir: str,
+    base_dir: str,
+    source_dir: str,
+    target_version: int,
+    reseed: bool,
+) -> None:
+    # A torn local state (reseed=True) is treated like a fresh host: the
+    # applied-version marker can't be trusted over partially-mutated files.
+    applied = None if reseed else _read_applied_version(local_checkpoint_dir)
+    # Scan back from the target for the newest full version. Stop at the
+    # local state — below it a reset can never be needed (or, on a fresh
+    # host, at 0 = the engine's base).
+    floor = applied if applied is not None else 0
+    start = target_version
+    while start > floor and _is_delta(_version_dir(source_dir, start)):
+        start -= 1
+    if applied is None or start > applied:
+        seed_dir = base_dir if start == 0 else _version_dir(source_dir, start)
+        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+    else:
+        start = applied
+    for version in range(start + 1, target_version + 1):
+        _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
 
 
 def _load_hook(path: str):
@@ -336,8 +379,12 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             raise NotImplementedError(f"delta encoding {encoding!r} not supported")
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
             list(pool.map(apply_tensor, items))
-        # no msync: the engine reads these pages via the shared cache; durability
-        # isn't needed (a host that loses the cache rebuilds from base)
+        # msync BEFORE the applied-version marker: the marker must never become
+        # durable over data pages that never made it to disk, or a power loss
+        # after a "successful" apply would silently serve stale bytes forever.
+        # Only the delta's dirty pages get written, so the cost is O(delta).
+        for _, mm in open_mmaps.values():
+            mm.flush()
     finally:
         for fh, mm in open_mmaps.values():
             mm.close()

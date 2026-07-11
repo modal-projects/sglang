@@ -799,7 +799,13 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, weights, target_device, timing=None):
+        # `timing`, when given, receives wall-clock seconds for the two phases
+        # ("load_s": model.load_weights, "postprocess_s": the global
+        # process_weights_after_loading pass) so update_weights_from_disk can
+        # report a reload breakdown.
+        start = time.perf_counter()
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -837,7 +843,10 @@ class DefaultModelLoader(BaseModelLoader):
                 "Memory increase during load_weights: %s GiB",
                 f"{memory_start - memory_end:.3f}",
             )
+        if timing is not None:
+            timing["load_s"] = time.perf_counter() - start
 
+        start = time.perf_counter()
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -848,6 +857,8 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+        if timing is not None:
+            timing["postprocess_s"] = time.perf_counter() - start
 
 
 class LayeredModelLoader(DefaultModelLoader):

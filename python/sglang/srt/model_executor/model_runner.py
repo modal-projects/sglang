@@ -1837,6 +1837,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
+        start_time = time.perf_counter()
         target_device = torch.device(self.device)
 
         if weight_name_filter is None:
@@ -1867,6 +1868,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
+        # Reload phase breakdown: iter_wait_s is time spent waiting on the
+        # weights iterator (disk read + CPU materialization the reader threads
+        # didn't hide); load_s/postprocess_s come from load_weights_and_postprocess.
+        timing: dict[str, float] = {}
+
+        def time_iter_wait(weights):
+            while True:
+                wait_start = time.perf_counter()
+                try:
+                    item = next(weights)
+                except StopIteration:
+                    return
+                timing["iter_wait_s"] = (
+                    timing.get("iter_wait_s", 0.0) + time.perf_counter() - wait_start
+                )
+                yield item
+
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.model)
@@ -1876,10 +1894,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     (name, weight) for name, weight in iter if weight_name_filter(name)
                 )
 
-            return iter
+            return time_iter_wait(iter)
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1901,6 +1919,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # again: the failed attempt may have processed some layers.
                 self.model_config.model_path = original_model_path
                 restore_weight(self.model, target_device)
+                timing.clear()
                 iter = get_weight_iter(self.model_config)
                 self.model = model_load_weights(self.model, iter)
                 return False, message
@@ -1920,8 +1939,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             self.init_decode_cuda_graph()
 
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
+        # `load` is dispatch + copy time only: load_s includes the iterator
+        # waits, which are reported separately.
+        iter_wait = timing.get("iter_wait_s", 0.0)
+        summary = (
+            f"[reload timing] iter_wait={iter_wait:.2f}s "
+            f"load={max(timing.get('load_s', 0.0) - iter_wait, 0.0):.2f}s "
+            f"postprocess={timing.get('postprocess_s', 0.0):.2f}s "
+            f"total={time.perf_counter() - start_time:.2f}s"
+        )
+        logger.info(f"Update weights end. {summary}")
+        return True, f"Succeeded to update model weights. {summary}"
 
     def init_weights_send_group_for_remote_instance(
         self,

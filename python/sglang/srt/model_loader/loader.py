@@ -847,6 +847,12 @@ class DefaultModelLoader(BaseModelLoader):
             timing["load_s"] = time.perf_counter() - start
 
         start = time.perf_counter()
+        DefaultModelLoader.postprocess_weights(model, target_device)
+        if timing is not None:
+            timing["postprocess_s"] = time.perf_counter() - start
+
+    @staticmethod
+    def postprocess_weights(model, target_device):
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -857,8 +863,6 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-        if timing is not None:
-            timing["postprocess_s"] = time.perf_counter() - start
 
 
 class LayeredModelLoader(DefaultModelLoader):

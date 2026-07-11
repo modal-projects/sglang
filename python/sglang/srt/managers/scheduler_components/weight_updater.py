@@ -97,6 +97,11 @@ class SchedulerWeightUpdaterManager:
     # Runner selector for the open session, recorded at begin_weight_update and
     # reused by end_weight_update so the same set is restored and finalized.
     _weight_update_selector: str = "all"
+    # The engine's pristine boot checkpoint (v0, what the delta chain builds on),
+    # captured on the first pull — before update_weights_from_disk repoints
+    # server_args.model_path at the local checkpoint. A reseed must reset to THIS,
+    # never the mutated model_path (which would reset the local dir onto itself).
+    _reseed_base_dir: Optional[str] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -144,10 +149,14 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weight_sync import local_checkpoint
 
         server_args = self.tp_worker.model_runner.server_args
+        if self._reseed_base_dir is None:
+            # First pull precedes the first commit, so model_path is still the
+            # pristine boot checkpoint; capture it as the stable reseed base.
+            self._reseed_base_dir = server_args.model_path
         try:
             local_checkpoint.pull(
                 local_checkpoint_dir=recv_req.local_checkpoint_dir,
-                base_dir=server_args.model_path,
+                base_dir=self._reseed_base_dir,
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
                 pre_read_hook=server_args.custom_pull_weights_pre_read_hook,

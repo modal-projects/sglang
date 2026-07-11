@@ -251,6 +251,82 @@ class PullTest(unittest.TestCase):
         self.pull(2)
         self.assert_at_version(2)
 
+    def test_incomplete_source_version_fails_fast_then_recovers(self):
+        # A version whose index is visible but whose data blob has not finished
+        # propagating (object-store read-after-write lag) must raise
+        # FileNotFoundError, NOT a checksum mismatch — otherwise it would be
+        # misread as local corruption and trigger a needless full reseed. And it
+        # must not reseed: the caller reloads + retries, and once the blob lands
+        # the same pull applies cleanly.
+        self.pull(2)
+        self.assert_at_version(2)
+        self.pub.publish_delta(
+            3, {"layer.a": np.random.default_rng(3).integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+        )
+        shard = os.path.join(self.pub.source_dir, "weight_v000003", Publisher.SHARD)
+        with open(shard, "rb") as f:
+            blob = f.read()
+        os.remove(shard)  # index present, blob not yet materialized here
+
+        reset_calls = []
+        orig_reset = local_checkpoint._reset_checkpoint
+
+        def _spy(*args, **kwargs):
+            reset_calls.append(args)
+            return orig_reset(*args, **kwargs)
+
+        local_checkpoint._reset_checkpoint = _spy
+        try:
+            with self.assertRaises(FileNotFoundError):
+                self.pull(3)
+        finally:
+            local_checkpoint._reset_checkpoint = orig_reset
+        self.assertEqual(reset_calls, [], "must not reseed on an incomplete source version")
+        self.assert_at_version(2)  # local untouched by the failed pull
+
+        with open(shard, "wb") as f:
+            f.write(blob)  # blob finishes propagating
+        self.pull(3)
+        self.assert_at_version(3)
+
+    def test_truncated_source_blob_fails_fast_then_recovers(self):
+        # A blob present but shorter than its own safetensors header declares
+        # (a half-materialized copy on an eventually-consistent mount). Staging
+        # must size-verify and reject it as not-ready (FileNotFoundError, no
+        # reseed) instead of applying a partial delta; the retry succeeds once
+        # the full bytes land.
+        self.pull(2)
+        self.assert_at_version(2)
+        self.pub.publish_delta(
+            3, {"layer.a": np.random.default_rng(5).integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+        )
+        shard = os.path.join(self.pub.source_dir, "weight_v000003", Publisher.SHARD)
+        with open(shard, "rb") as f:
+            full = f.read()
+        with open(shard, "wb") as f:
+            f.write(full[:-256])  # header still declares the full length
+
+        reset_calls = []
+        orig_reset = local_checkpoint._reset_checkpoint
+
+        def _spy(*args, **kwargs):
+            reset_calls.append(args)
+            return orig_reset(*args, **kwargs)
+
+        local_checkpoint._reset_checkpoint = _spy
+        try:
+            with self.assertRaises(FileNotFoundError):
+                self.pull(3)
+        finally:
+            local_checkpoint._reset_checkpoint = orig_reset
+        self.assertEqual(reset_calls, [], "must not reseed on a truncated (not-ready) blob")
+        self.assert_at_version(2)
+
+        with open(shard, "wb") as f:
+            f.write(full)  # full bytes materialize
+        self.pull(3)
+        self.assert_at_version(3)
+
 
 if __name__ == "__main__":
     unittest.main()

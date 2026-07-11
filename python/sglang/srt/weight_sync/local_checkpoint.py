@@ -36,7 +36,6 @@ import json
 import logging
 import mmap
 import os
-import shutil
 import struct
 import threading
 import zlib
@@ -68,37 +67,59 @@ def pull(
     """Bring the host-local checkpoint up to ``target_version``.
 
     Seeds from the newest full checkpoint at or below the target — the engine's
-    own base (``base_dir``) for a pure-delta stream, a published full version
-    otherwise — then applies the remaining deltas in order. A local checkpoint
-    already past the seed point just continues its delta chain.
+    own pristine base (``base_dir``) for a pure-delta stream, a published full
+    version otherwise — then applies the remaining deltas in order. A local
+    checkpoint already past the seed point just continues its delta chain.
 
-    A torn or corrupt local state — an apply interrupted mid-write, bit rot, a
-    checksum mismatch — surfaces as a mismatch on the next apply (a re-XORed
-    changed tensor cannot match its target digest), which triggers one reseed
-    from scratch plus a replay of the delta chain; a failure on that fresh
-    state raises (fail loud, never serve bad weights). A missing *source*
-    version — the publisher or a shared object store not yet caught up — is NOT
-    local corruption: reseeding cannot conjure the absent bytes, so it re-raises
-    immediately (cheap) and the caller retries once the source is visible.
+    Runs under a per-host lock. Every co-located TP rank calls this, but only the
+    lock winner reloads + applies; a rank that finds the checkpoint already at or
+    past the target returns immediately. So the shared volume is reloaded at most
+    once per host per pull — never by several ranks at once, which can flip one
+    rank's mount to a stale snapshot *mid-apply* and corrupt the result.
+
+    Each delta blob is read whole-file into memory and size-verified against its
+    own safetensors header before it is applied: the XOR reads from that in-memory
+    buffer, so it never streams from an eventually-consistent mount that can change
+    under it mid-apply. Two failure classes stay distinct:
+
+      * A missing or incomplete *source* version raises ``FileNotFoundError`` and
+        stops — we never reseed to paper over a not-yet-materialized source; the
+        caller reloads + retries.
+      * A checksum mismatch on staged, complete bytes == corrupt *local* state (a
+        torn mid-write apply, bit rot). That triggers one reseed from the pristine
+        base plus a replay of the chain; a failure on the fresh state re-raises
+        (fail loud, never serve bad weights).
     """
-    # Object-store-backed shared filesystems lack cross-host read-after-write
-    # consistency: the publisher's files only appear here after an explicit
-    # refresh, which the deployment supplies as this hook. POSIX shared
-    # filesystems (NFS, Lustre, ...) need none.
-    if target_version > 0 and pre_read_hook:
-        _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
+        applied = _read_applied_version(local_checkpoint_dir)
+        if applied is not None and applied >= target_version:
+            # A co-located rank already brought this host up to the target;
+            # don't reload the volume again (avoids concurrent-reload churn).
+            return
+        # Object-store-backed volumes lack cross-host read-after-write
+        # consistency: the publisher's files appear here only after an explicit
+        # refresh, which the deployment supplies as this hook. POSIX shared
+        # filesystems (NFS, Lustre, ...) pass no hook and need none.
+        if target_version > 0 and pre_read_hook:
+            _load_hook(pre_read_hook)(source_dir, target_version)
         try:
             _pull_locked(
                 local_checkpoint_dir, base_dir, source_dir, target_version, reseed=False
             )
         except FileNotFoundError:
-            # Source version not visible yet — reseed would just re-hit it, and
-            # for a large base the wasted full copy is expensive. Fail fast.
+            # A source version is missing or not fully materialized — a readiness
+            # failure the caller owns, not local corruption. Reseeding cannot
+            # conjure absent bytes, so record what the mount shows and fail fast;
+            # the caller reloads and retries.
+            _log_pull_not_found(source_dir, target_version)
             raise
         except Exception:
+            # A checksum mismatch on staged, complete bytes == corrupt local
+            # state (incomplete sources are reclassified to FileNotFoundError
+            # above and never reach here). Reseed from the pristine base and
+            # replay once; a failure on that fresh state re-raises.
             logger.exception(
-                "pull to v%d failed; reseeding the local checkpoint and replaying the delta chain",
+                "pull to v%d failed on staged sources; reseeding from base and replaying",
                 target_version,
             )
             _pull_locked(
@@ -135,6 +156,49 @@ def _pull_locked(
 def _load_hook(path: str):
     module_path, _, name = path.rpartition(".")
     return getattr(importlib.import_module(module_path), name)
+
+
+def _log_pull_not_found(source_dir: str, target_version: int) -> None:
+    """A pull reached the engine with a missing/incomplete source version — the
+    pre-read hook is supposed to block until the version is fully materialized,
+    so this should be rare. Record what the mount actually shows (visible version
+    dirs, whether the target is a dir and its contents, the `latest` pointer) to
+    tell a still-propagating source from a path/logic bug."""
+    vdir = _version_dir(source_dir, target_version)
+    try:
+        versions = sorted(n for n in os.listdir(source_dir) if n.startswith("weight_v"))
+    except OSError as e:
+        versions = [f"<listdir {source_dir} failed: {e}>"]
+    target_contents = None
+    if os.path.isdir(vdir):
+        try:
+            target_contents = sorted(os.listdir(vdir))
+        except OSError as e:
+            target_contents = [f"<listdir failed: {e}>"]
+    logger.error(
+        "[pull-diag] MISSING v%d: mount shows versions=%s ; isdir(%s)=%s contents=%s ; "
+        "latest_pointer=%s",
+        target_version,
+        versions,
+        vdir,
+        os.path.isdir(vdir),
+        target_contents,
+        _read_pointer(source_dir),
+    )
+
+
+def _read_pointer(source_dir: str):
+    # The `latest` pointer lives at the transport root (source_dir's parent).
+    for path in (
+        os.path.join(source_dir, "latest"),
+        os.path.join(os.path.dirname(source_dir.rstrip("/")), "latest"),
+    ):
+        try:
+            with open(path) as f:
+                return f"{path}={f.read().strip()!r}"
+        except OSError:
+            continue
+    return "<no latest pointer found>"
 
 
 def _version_dir(source_dir: str, version: int) -> str:
@@ -240,7 +304,19 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
     os.makedirs(local_checkpoint_dir, exist_ok=True)
     src_files = [entry for entry in os.scandir(src_dir) if entry.is_file()]
     for entry in src_files:
-        shutil.copy2(entry.path, os.path.join(local_checkpoint_dir, entry.name))
+        dst = os.path.join(local_checkpoint_dir, entry.name)
+        # Seeding from a dir that overlaps the local checkpoint (e.g. base_dir ==
+        # local_checkpoint_dir, or a shared mount surfacing the same inode) leaves
+        # the file already in place, so skip it.
+        if os.path.exists(dst) and os.path.samefile(entry.path, dst):
+            continue
+        # Whole-file read like the delta apply: fetches the lazy mount in one
+        # shot; shutil.copy2 reads in 64 KiB chunks, ~40x slower on this mount.
+        # The size check below fails loud if the mount served a short read.
+        with open(entry.path, "rb") as f:
+            data = f.read()
+        with open(dst, "wb") as f:
+            f.write(data)
         # don't let the source evict the local copy we keep resident
         _drop_page_cache(entry.path)
     names = {entry.name for entry in src_files}
@@ -273,15 +349,48 @@ def _tensor_locations(ckpt_dir: str) -> dict:
     return locations
 
 
+def _safetensors_size(blob: bytes) -> Optional[int]:
+    """Total byte length a safetensors payload must have per its own header — 8
+    (header-length prefix) + header + the largest tensor end-offset. Returns None
+    if the bytes are too short to even hold the declared header, the signal of a
+    torn or not-yet-fully-materialized read."""
+    if len(blob) < 8:
+        return None
+    header_len = struct.unpack("<Q", blob[:8])[0]
+    if len(blob) < 8 + header_len:
+        return None
+    try:
+        header = json.loads(blob[8 : 8 + header_len])
+    except ValueError:
+        return None
+    end = 0
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        end = max(end, info["data_offsets"][1])
+    return 8 + header_len + end
+
+
 def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     """Apply one version's delta in place: decompress + apply + checksum each tensor across a thread
     pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
     """
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
-        meta = json.load(f)["metadata"]
+        index = json.load(f)
+    meta = index["metadata"]
     applied = _read_applied_version(local_checkpoint_dir)
     if applied == int(meta["version"]):
         return
+    # Validate the source before reading it: every blob the index names must be
+    # present, or a half-propagated version would apply only the blobs that made
+    # it and report the rest as a checksum mismatch (misread as corruption). A
+    # missing blob is a not-ready source, so raise FileNotFoundError — the pull
+    # fails fast and the caller reloads + retries instead of reseeding.
+    for blob in sorted(set(index.get("weight_map", {}).values())):
+        if not os.path.exists(os.path.join(version_dir, blob)):
+            raise FileNotFoundError(
+                f"incomplete source version {version_dir}: missing blob {blob}"
+            )
     if applied != int(meta["base_version"]):
         raise RuntimeError(
             f"out-of-order delta: local at {applied}, delta builds on {meta['base_version']}"
@@ -301,7 +410,22 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     try:
         for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
             with open(delta_file, "rb") as f:
+                # One whole-file read: fetches the lazy volume mount in a single
+                # shot, and the XOR below reads from this in-memory buffer, so the
+                # apply is immune to the mount changing under it. (No on-disk
+                # staging step — the buffer IS the stable snapshot.)
                 blob = f.read()
+            # Verify the whole file arrived (its length matches its own
+            # safetensors header) BEFORE building any item: a short read == a
+            # not-yet-materialized source, so fail fast (FileNotFoundError ->
+            # caller reloads + retries) rather than XOR a partial delta and
+            # corrupt the checkpoint.
+            expected = _safetensors_size(blob)
+            if expected is None or len(blob) != expected:
+                raise FileNotFoundError(
+                    f"incomplete source blob {delta_file}: {len(blob)}B, header "
+                    f"declares {expected}B (not fully materialized)"
+                )
             file_bytes.append(blob)
             (header_len,) = struct.unpack("<Q", blob[:8])
             header = json.loads(blob[8 : 8 + header_len])

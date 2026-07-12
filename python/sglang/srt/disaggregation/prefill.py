@@ -231,6 +231,22 @@ class PrefillBootstrapQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
+        # Draft (spec) KV pool tensor refs for the staged draft transfer
+        # (gather + bulk RDMA in send_kvcache_mla_with_draft). Only useful
+        # when the draft is TP-sharded MHA in the standard token-major
+        # layout; the manager falls back to per-token descriptors otherwise.
+        draft_pool = self.draft_token_to_kv_pool
+        if (
+            draft_pool is not None
+            and hasattr(kv_manager, "set_draft_kv_buffer_tensors")
+            and hasattr(draft_pool, "k_buffer")
+            and hasattr(draft_pool, "v_buffer")
+        ):
+            kv_manager.set_draft_kv_buffer_tensors(
+                draft_pool.k_buffer,
+                draft_pool.v_buffer,
+                draft_pool.page_size,
+            )
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:

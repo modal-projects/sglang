@@ -427,6 +427,7 @@ class NixlKVManager(CommonKVManager):
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
+        self.draft_kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
@@ -462,15 +463,49 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_prefill_ctx()
                 self._init_staging_buffers(len(self.transfer_queues))
+            # Draft (spec) KV staging: when this rank also ships a TP-sharded
+            # MHA draft section alongside the MLA target (DFlash on the last
+            # PP stage), the draft is gathered into a local staging buffer
+            # and sent as a few bulk writes directly into the decode draft
+            # pool, instead of one descriptor per token per layer. This is
+            # independent of SGLANG_DISAGG_STAGING_BUFFER (which drives the
+            # decode-side staging ring for non-MLA models).
+            self._draft_staging_buffers: List[Any] = []
+            has_draft_section = (
+                0
+                < self.kv_args.num_target_kv_data_ptrs
+                < len(self.kv_args.kv_data_ptrs)
+            )
+            if (
+                self.is_mla_backend
+                and has_draft_section
+                and not envs.SGLANG_DISABLE_DISAGG_DRAFT_STAGING.get()
+            ):
+                from sglang.srt.disaggregation.common.staging_handler import (
+                    init_staging_buffers,
+                )
+
+                self._draft_staging_buffers = init_staging_buffers(
+                    lambda ptr, size: self._register_staging_memory(
+                        ptr, size, self.kv_args.gpu_id
+                    ),
+                    self.kv_args,
+                    len(self.transfer_queues),
+                )
             for i, queue in enumerate(self.transfer_queues):
                 staging_buffer = (
                     self._staging_ctx.buffers[i]
                     if self.enable_staging and self._staging_ctx.buffers
                     else None
                 )
+                draft_staging_buffer = (
+                    self._draft_staging_buffers[i]
+                    if self._draft_staging_buffers
+                    else None
+                )
                 threading.Thread(
                     target=self.transfer_worker,
-                    args=(queue, staging_buffer),
+                    args=(queue, staging_buffer, draft_staging_buffer),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -543,6 +578,19 @@ class NixlKVManager(CommonKVManager):
         # tensors. This setter only stashes the tensor metadata used by
         # send_kvcache_staged().
         self.kv_buffer_tensors = {
+            "k_buffers": k_buffers,
+            "v_buffers": v_buffers,
+            "page_size": page_size,
+        }
+
+    def set_draft_kv_buffer_tensors(
+        self, k_buffers: list, v_buffers: list, page_size: int
+    ):
+        """Draft (spec) KV pool tensor refs, used by the GPU gather in the
+        staged draft transfer (send_kvcache_mla_with_draft). Expects the
+        standard token-major layout: k_buffers[layer] is [tokens, heads, dim].
+        """
+        self.draft_kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
@@ -1037,7 +1085,9 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def transfer_worker(self, queue: FastQueue, staging_buffer=None):
+    def transfer_worker(
+        self, queue: FastQueue, staging_buffer=None, draft_staging_buffer=None
+    ):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
@@ -1169,6 +1219,7 @@ class NixlKVManager(CommonKVManager):
                                     decode_tp_size=decode_tp_size,
                                     decode_tp_rank=dst_info.decode_tp_rank,
                                     dst_num_target_kv_ptrs=dst_info.dst_num_target_kv_ptrs,
+                                    draft_staging_buffer=draft_staging_buffer,
                                 )
                             elif self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
@@ -1763,8 +1814,9 @@ class NixlKVManager(CommonKVManager):
         decode_tp_size: int,
         decode_tp_rank: int,
         dst_num_target_kv_ptrs: int = 0,
+        draft_staging_buffer=None,
     ):
-        """Send an MLA target + DFlash draft chunk in a single RDMA transfer.
+        """Send an MLA target + DFlash draft chunk.
 
         Layout of the flat pointer lists (target-first, draft appended):
           src (this last PP stage): [MLA target layers for this stage]
@@ -1775,13 +1827,15 @@ class NixlKVManager(CommonKVManager):
         The MLA target latent is replicated across TP, so it is copied
         page-contiguously and PP-sliced exactly like ``send_kvcache``. The
         DFlash draft KV is MHA and TP-sharded, so its heads are redistributed
-        per token when ``prefill_tp_size != decode_tp_size`` (same math as
-        ``send_kvcache_slice``); the draft is fully resident here and decode
-        holds all draft layers, so draft layers map 1:1 (no PP slicing).
+        when ``prefill_tp_size != decode_tp_size`` — preferably via the
+        staged gather + bulk-RDMA path (``_send_draft_kv_staged``), else via
+        per-token head-sliced descriptors. The draft is fully resident here
+        and decode holds all draft layers, so draft layers map 1:1 (no PP
+        slicing).
 
-        Both desc sets are concatenated into one ``initialize_xfer`` with a
-        single notif so the receiver's per-PP-rank arrival accounting (which
-        counts one ``_kv_`` notif per PP rank) is unchanged.
+        The final xfer carries the single notif; the receiver's per-PP-rank
+        arrival accounting (one ``_kv_`` notif per PP rank) is unchanged in
+        both draft paths — staged windows complete before the notif posts.
         """
         src_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
         dst_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
@@ -1851,37 +1905,237 @@ class NixlKVManager(CommonKVManager):
             bytes_per_head,
         )
 
-        draft_ptr_pairs = list(
-            zip(
-                src_ptrs[num_target_src : num_target_src + num_draft_layers],
-                dst_ptrs[num_target_dst : num_target_dst + num_draft_layers],
+        # Preferred: gather this peer's head slice into a local staging buffer
+        # and write it as page-run-sized bulk RDMAs directly into the decode
+        # draft pool — O(layers x runs) descriptors. The per-token fallback
+        # below is O(tokens x layers) descriptors per request, which
+        # dominates TTFT at long context (~180us/token observed).
+        staged = False
+        if (
+            draft_staging_buffer is not None
+            and self.draft_kv_buffer_tensors is not None
+        ):
+            staged = self._send_draft_kv_staged(
+                peer_name,
+                draft_staging_buffer,
+                prefill_kv_indices,
+                dst_kv_indices,
+                dst_draft_ptrs=dst_ptrs[num_target_dst : num_target_dst + num_draft],
+                dst_draft_item_len=dst_draft_item_len,
+                prefill_tp_size=prefill_tp_size,
+                decode_tp_size=decode_tp_size,
+                decode_tp_rank=decode_tp_rank,
+                total_kv_heads=total_kv_heads,
+                dst_gpu_id=dst_gpu_id,
             )
-        ) + list(
-            zip(
-                src_ptrs[num_target_src + num_draft_layers : num_target_src + num_draft],
-                dst_ptrs[num_target_dst + num_draft_layers : num_target_dst + num_draft],
-            )
-        )
-        d_src_addrs, d_src_lens, d_dst_addrs, d_dst_lens = self._head_slice_addrs(
-            draft_ptr_pairs,
-            prefill_kv_indices,
-            dst_kv_indices,
-            src_draft_item_len,
-            dst_draft_item_len,
-            page_size,
-            src_head_off,
-            dst_head_off,
-            heads_bytes_per_token,
-        )
-        src_addrs += d_src_addrs
-        src_lens += d_src_lens
-        dst_addrs += d_dst_addrs
-        dst_lens += d_dst_lens
 
-        # --- One combined transfer for target + draft ---
+        if not staged:
+            draft_ptr_pairs = list(
+                zip(
+                    src_ptrs[num_target_src : num_target_src + num_draft_layers],
+                    dst_ptrs[num_target_dst : num_target_dst + num_draft_layers],
+                )
+            ) + list(
+                zip(
+                    src_ptrs[
+                        num_target_src + num_draft_layers : num_target_src + num_draft
+                    ],
+                    dst_ptrs[
+                        num_target_dst + num_draft_layers : num_target_dst + num_draft
+                    ],
+                )
+            )
+            d_src_addrs, d_src_lens, d_dst_addrs, d_dst_lens = self._head_slice_addrs(
+                draft_ptr_pairs,
+                prefill_kv_indices,
+                dst_kv_indices,
+                src_draft_item_len,
+                dst_draft_item_len,
+                page_size,
+                src_head_off,
+                dst_head_off,
+                heads_bytes_per_token,
+            )
+            src_addrs += d_src_addrs
+            src_lens += d_src_lens
+            dst_addrs += d_dst_addrs
+            dst_lens += d_dst_lens
+
+        # --- One transfer for target (+ draft when not staged) ---
+        # When the draft went via staging, its window xfers were already
+        # polled to DONE (remote-visible), so the notif on this final xfer
+        # still signals arrival of BOTH sections and the receiver's per-PP
+        # arrival accounting is unchanged.
         src_reqs = self._make_kv_reqs(src_addrs, src_lens, self.kv_args.gpu_id)
         dst_reqs = self._make_kv_reqs(dst_addrs, dst_lens, dst_gpu_id)
         return self._post_xfer(peer_name, src_reqs, dst_reqs, notif, what="MLA+draft KV")
+
+    def _poll_xfer_done(self, xfer_handle, what: str, deadline_s: float = 300.0):
+        """Busy-poll a posted transfer until DONE; raise on ERR or timeout."""
+        start = time.time()
+        while True:
+            state = self.agent.check_xfer_state(xfer_handle)
+            if state == "DONE":
+                return
+            if state == "ERR":
+                raise RuntimeError(f"NIXL transfer ERR while sending {what}")
+            if time.time() - start > deadline_s:
+                raise RuntimeError(
+                    f"NIXL transfer timed out after {deadline_s}s sending {what}"
+                )
+            time.sleep(0)
+
+    def _send_draft_kv_staged(
+        self,
+        peer_name: str,
+        draft_staging_buffer,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_draft_ptrs,
+        dst_draft_item_len: int,
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+        total_kv_heads: int,
+        dst_gpu_id: int,
+    ) -> bool:
+        """Send the draft (MHA) KV section via gather + bulk RDMA.
+
+        Gathers this decode rank's head slice for a window of pages into the
+        worker-local staging buffer in the DECODE pool's page layout
+        ([tokens, dst_heads, head_dim] per (layer, K/V) section, pages in
+        dst-index order), then writes each contiguous dst-page run with one
+        descriptor per (section, run) — straight memcpys into the decode
+        draft pool. Windows larger than the staging buffer are sent
+        sequentially, each polled to DONE before the buffer is reused.
+
+        Returns True when the draft section was fully sent (caller then
+        omits it from the combined xfer); False to fall back to the
+        per-token path (buffer/layout not eligible). Raises on wire errors.
+        """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            gather_all_layers_to_staging,
+        )
+
+        k_buffers = self.draft_kv_buffer_tensors["k_buffers"]
+        v_buffers = self.draft_kv_buffer_tensors["v_buffers"]
+        page_size = self.kv_args.page_size
+        num_layers = len(k_buffers)
+        num_sections = 2 * num_layers  # [K0..KL-1, V0..VL-1]
+        if len(dst_draft_ptrs) != num_sections:
+            return False
+        if k_buffers[0].dim() != 3:
+            # Gather assumes the token-major [tokens, heads, dim] layout.
+            return False
+
+        src_head_start, num_heads, dst_head_start, _ = compute_head_slice_params(
+            prefill_tp_size,
+            decode_tp_size,
+            self.kv_args.engine_rank % prefill_tp_size,
+            decode_tp_rank % decode_tp_size,
+            total_kv_heads,
+        )
+        if dst_head_start != 0:
+            # prefill_tp > decode_tp: this sender covers only part of the
+            # decode rank's head slice, so dst pages are strided writes and
+            # the bulk page-run mapping doesn't apply.
+            return False
+
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+        per_page_bytes = num_heads * head_dim * dtype_size * page_size
+        if per_page_bytes != dst_draft_item_len:
+            # Staged sections must be byte-identical to the decode pool's
+            # per-page layout for the straight-copy mapping to hold.
+            return False
+
+        window_pages = draft_staging_buffer.get_size() // (
+            per_page_bytes * num_sections
+        )
+        if window_pages <= 0:
+            return False
+
+        prefill_idx = np.asarray(prefill_kv_indices, dtype=np.int64)
+        dst_idx = np.asarray(dst_kv_indices, dtype=np.int64)
+        staging_ptr = draft_staging_buffer.get_ptr()
+        src_gpu_id = self.kv_args.gpu_id
+
+        for w0 in range(0, len(prefill_idx), window_pages):
+            w_prefill = prefill_idx[w0 : w0 + window_pages]
+            w_dst = dst_idx[w0 : w0 + window_pages]
+            n_pages = len(w_prefill)
+            section_bytes = n_pages * per_page_bytes
+
+            gather_all_layers_to_staging(
+                k_buffers,
+                v_buffers,
+                w_prefill,
+                draft_staging_buffer,
+                src_head_start,
+                num_heads,
+                page_size,
+                src_gpu_id,
+            )
+
+            # Contiguous dst-page runs; the staging side is contiguous per
+            # section by construction (pages laid out in dst order).
+            if n_pages > 1:
+                cuts = np.flatnonzero(np.diff(w_dst) != 1) + 1
+                run_starts = np.concatenate(([0], cuts))
+                run_ends = np.concatenate((cuts, [n_pages]))
+            else:
+                run_starts = np.array([0])
+                run_ends = np.array([n_pages])
+
+            src_rows = []
+            dst_rows = []
+            for s in range(num_sections):
+                sec_base = staging_ptr + s * section_bytes
+                dst_ptr = int(dst_draft_ptrs[s])
+                for a, b in zip(run_starts, run_ends):
+                    length = int(b - a) * per_page_bytes
+                    src_rows.append((sec_base + int(a) * per_page_bytes, length))
+                    dst_rows.append((dst_ptr + int(w_dst[a]) * per_page_bytes, length))
+
+            src_reqs = np.array(
+                [[addr, length, src_gpu_id] for addr, length in src_rows],
+                dtype=np.uint64,
+            )
+            dst_reqs = np.array(
+                [[addr, length, dst_gpu_id] for addr, length in dst_rows],
+                dtype=np.uint64,
+            )
+            src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+            dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+            # Notif-less window: completion is signalled by the caller's
+            # final target xfer, which is only posted after every window
+            # here has been polled to DONE.
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE", src_descs, dst_descs, peer_name, b""
+            )
+            if not xfer_handle:
+                if w0 == 0:
+                    logger.warning(
+                        "Draft KV staging: initialize_xfer with empty notif "
+                        "failed; falling back to per-token draft descriptors"
+                    )
+                    return False
+                raise RuntimeError(
+                    "Draft KV staging: failed to create window transfer "
+                    "mid-request"
+                )
+            if self.agent.transfer(xfer_handle) == "ERR":
+                raise RuntimeError("Draft KV staging: failed to post window transfer")
+            # The staging buffer is reused by the next window (and by the
+            # next peer's call), so this window must be remote-complete
+            # before we return or loop.
+            self._poll_xfer_done(xfer_handle, "draft KV staging window")
+            release = getattr(self.agent, "release_xfer_handle", None)
+            if release is not None:
+                release(xfer_handle)
+
+        return True
 
     def send_kvcache_slice(
         self,

@@ -420,6 +420,11 @@ class Envs:
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Kill-switch for the prefill-side staged (gather + bulk RDMA) draft KV
+    # transfer used when an MLA target ships a TP-sharded MHA draft section
+    # (DFlash PD). When disabled, the draft falls back to per-token
+    # head-sliced descriptors, which is O(tokens x layers) per request.
+    SGLANG_DISABLE_DISAGG_DRAFT_STAGING = EnvBool(False)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

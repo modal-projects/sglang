@@ -1631,6 +1631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
+        start_time = time.perf_counter()
         target_device = torch.device(self.device)
 
         if weight_name_filter is None:
@@ -1647,13 +1648,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(
+            load_format=load_format,
+            # Mirror the cold-start LoadConfig (see load_model): a bare
+            # LoadConfig silently drops --model-loader-extra-config, pinning
+            # every reload to the default loader thread count.
+            model_loader_extra_config=self.server_args.model_loader_extra_config,
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
             return False, message
+
+        # Reload phase breakdown: iter_wait_s is time spent waiting on the
+        # weights iterator (disk read + CPU materialization the reader threads
+        # didn't hide); load_s/postprocess_s come from load_weights_and_postprocess.
+        timing: dict[str, float] = {}
+
+        def time_iter_wait(weights):
+            while True:
+                wait_start = time.perf_counter()
+                try:
+                    item = next(weights)
+                except StopIteration:
+                    return
+                timing["iter_wait_s"] = (
+                    timing.get("iter_wait_s", 0.0) + time.perf_counter() - wait_start
+                )
+                yield item
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
@@ -1664,10 +1688,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     (name, weight) for name, weight in iter if weight_name_filter(name)
                 )
 
-            return iter
+            return time_iter_wait(iter)
+
+        # Opt-in reload fast path (SGLANG_ENABLE_RELOAD_LOAD_PLAN=1 + model
+        # declares supports_load_plan_replay): the first reload records the
+        # model's dispatch, later ones replay it directly. See
+        # model_loader/load_plan.py.
+        plan = None
+        if os.environ.get("SGLANG_ENABLE_RELOAD_LOAD_PLAN", "0") == "1":
+            from sglang.srt.model_loader.load_plan import get_or_create_plan
+
+            plan = get_or_create_plan(self.model)
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            nonlocal plan
+            if plan is not None:
+                # A plan failure must never take down the reload (or its
+                # rollback retry): drop the plan and fall through to the
+                # legacy loader with a FRESH iterator — the failed pass may
+                # have partially consumed and partially applied this one, and
+                # the full legacy reload overwrites every weight anyway.
+                start = time.perf_counter()
+                try:
+                    if plan.recorded:
+                        timing.update(plan.replay(model, iter))
+                    else:
+                        timing.update(plan.record(model, iter))
+                    timing["load_s"] = time.perf_counter() - start
+                    start = time.perf_counter()
+                    DefaultModelLoader.postprocess_weights(model, target_device)
+                    timing["postprocess_s"] = time.perf_counter() - start
+                    return model
+                except Exception:
+                    logger.exception(
+                        "load plan pass failed; falling back to the legacy loader"
+                    )
+                    plan = None
+                    self.model._reload_load_plan = None
+                    del iter
+                    gc.collect()
+                    iter = get_weight_iter(self.model_config)
+            loader.load_weights_and_postprocess(model, iter, target_device, timing=timing)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1689,6 +1750,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # again: the failed attempt may have processed some layers.
                 self.model_config.model_path = original_model_path
                 restore_weights_before_loading(self.model, target_device)
+                timing.clear()
                 iter = get_weight_iter(self.model_config)
                 self.model = model_load_weights(self.model, iter)
                 return False, message
@@ -1708,8 +1770,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             self.init_device_graphs()
 
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
+        # `load` is dispatch + copy time only: load_s includes the iterator
+        # waits, which are reported separately.
+        iter_wait = timing.get("iter_wait_s", 0.0)
+        summary = (
+            f"[reload timing] iter_wait={iter_wait:.2f}s "
+            f"load={max(timing.get('load_s', 0.0) - iter_wait, 0.0):.2f}s "
+            f"postprocess={timing.get('postprocess_s', 0.0):.2f}s "
+            f"total={time.perf_counter() - start_time:.2f}s"
+        )
+        if "plan" in timing:
+            summary += (
+                f" plan={timing['plan']}"
+                f" plan_names={timing.get('plan_entries', timing.get('plan_hits', 0))}"
+                f" plan_fallback={timing.get('plan_fallback', 0)}"
+            )
+        logger.info(f"Update weights end. {summary}")
+        return True, f"Succeeded to update model weights. {summary}"
 
     def init_weights_send_group_for_remote_instance(
         self,

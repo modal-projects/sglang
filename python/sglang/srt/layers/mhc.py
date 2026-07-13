@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import threading
 from typing import Tuple
 
@@ -1381,7 +1382,9 @@ def mhc_fused_post_pre(
 
     # The scalar-FMA kernel wins only for small batches where launch
     # overhead dominates; beyond the threshold DeepGEMM's tensor-core path wins.
-    fma_token_threshold = 32
+    # Speculative verify batches (bs x block_size tokens) sit in the hundreds,
+    # where the crossover has not been measured — allow overriding for tuning.
+    fma_token_threshold = int(os.environ.get("SGLANG_MHC_FMA_TOKEN_THRESHOLD", "32"))
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4

@@ -772,7 +772,11 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(model, weights, target_device, timing=None):
+        # `timing`, when given, receives wall-clock seconds for the two phases
+        # ("load_s": model.load_weights, "postprocess_s": the global
+        # process_weights_after_loading pass) so update_weights_from_disk can
+        # report a reload breakdown.
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -787,6 +791,7 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
+        start = time.perf_counter()
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
@@ -800,6 +805,8 @@ class DefaultModelLoader(BaseModelLoader):
                 torch.cuda.empty_cache()
         else:
             model.load_weights(weights)
+        if timing is not None:
+            timing["load_s"] = time.perf_counter() - start
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -811,7 +818,19 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
+        start = time.perf_counter()
+        DefaultModelLoader.postprocess_weights(model, target_device)
+        if timing is not None:
+            timing["postprocess_s"] = time.perf_counter() - start
+
+    @staticmethod
+    def postprocess_weights(model, target_device, only_modules=None):
+        # `only_modules` restricts the pass to the given module fqns (partial
+        # reloads re-postprocess exactly the modules whose params were
+        # refreshed raw; running it wider would re-transform stale state).
+        for fqn, module in model.named_modules():
+            if only_modules is not None and fqn not in only_modules:
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading

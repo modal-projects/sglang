@@ -7,10 +7,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4LinearMethod,
-    ModelOptNvFp4FusedMoEMethod,
-)
 
 # chunk to avoid too high GPU memory peak
 CHUNK_NUMEL = 64 * 1024 * 1024
@@ -161,8 +157,9 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
-        raise NotImplementedError(
-            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
-        )
+    # NVFP4 (ModelOpt fp4/nvfp4) and int4/mxfp8/mxfp4/unquantized -> None (raw bit-exact
+    # compare): their sources are refilled verbatim and post-processing is deterministic,
+    # so identical input bytes yield identical params. This lets an O(delta) partial reload
+    # be checksum-verified byte-for-byte against a full reload. (v0.5.15 replaced this with a
+    # NotImplementedError; restored so NVFP4 RL reloads stay verifiable, as on v0.5.14.)
     return None

@@ -171,7 +171,11 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    restore_weights_before_loading,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
@@ -1849,6 +1853,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         target_device = torch.device(self.device)
+
+        if weight_name_filter is None:
+            # Return latched quant state (e.g. fp8 UE8M0 format flags) to its
+            # pre-processing value so load + process re-derive the kernel layout
+            # from the fresh checkpoint bytes, exactly like initial loading.
+            restore_weights_before_loading(self.model, target_device)
+        elif self.model_config.quantization is not None:
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "process_weights_after_loading re-derives kernel state for every "
+                "layer, which is only correct when all source weights were refilled."
+            )
+
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -1887,6 +1905,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 del iter
                 gc.collect()
+                # Roll back from the ORIGINAL checkpoint (model_path already
+                # points at the new one), and restore latched quant state
+                # again: the failed attempt may have processed some layers.
+                self.model_config.model_path = original_model_path
+                restore_weights_before_loading(self.model, target_device)
                 iter = get_weight_iter(self.model_config)
                 self.model = model_load_weights(self.model, iter)
                 return False, message

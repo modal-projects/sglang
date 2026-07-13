@@ -1525,6 +1525,10 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Optional: the touched checkpoint tensor names. When set (and the
+    # reload load plan is enabled), only the modules these names feed are
+    # reloaded and re-postprocessed (O(delta) partial reload).
+    weight_names: Optional[List[str]] = None
     # Tensor metadata
     manifest: Optional[Dict[str, Any]] = None
 

@@ -1163,6 +1163,10 @@ class Glm4MoeModel(nn.Module):
 
 
 class Glm4MoeForCausalLM(nn.Module):
+    # Reload dispatch is a pure name->param mapping; no name-gated post-load
+    # tail, so replay needs no fallback patterns (model_loader/load_plan.py).
+    supports_load_plan_replay = True
+
     def __init__(
         self,
         config: PretrainedConfig,

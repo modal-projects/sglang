@@ -827,6 +827,7 @@ class ServerArgs:
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
+    custom_pull_weights_pre_read_hook: Optional[str] = None
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
@@ -6913,6 +6914,12 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--custom-pull-weights-pre-read-hook",
+            type=str,
+            default=ServerArgs.custom_pull_weights_pre_read_hook,
+            help="Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
         )
         parser.add_argument(
             "--weight-loader-disable-mmap",

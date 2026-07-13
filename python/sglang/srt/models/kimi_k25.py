@@ -627,6 +627,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
     # language model, so it inherits the same kv_b_proj tail constraint.
     supports_load_plan_replay = True
     load_plan_fallback_patterns = ("kv_b_proj",)
+    load_plan_fused_aliases = (
+        ("self_attn.q_a_proj", "self_attn.fused_qkv_a_proj_with_mqa"),
+        ("self_attn.kv_a_proj_with_mqa", "self_attn.fused_qkv_a_proj_with_mqa"),
+    )
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4

@@ -142,6 +142,13 @@ NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models."""
 
+    # Reload replay (model_loader/load_plan.py): kv_b_proj must stream through
+    # load_weights so post_load_weights(weight_names=...) re-derives the MLA
+    # w_kc/w_vc split for exactly the reloaded layers. Derived-tensor loads
+    # (fused q/kv_a_proj, in-flight ue8m0 quant) self-exclude at record time.
+    supports_load_plan_replay = True
+    load_plan_fallback_patterns = ("kv_b_proj",)
+
     model: nn.Module
     config: PretrainedConfig
     quant_config: Optional[QuantizationConfig]

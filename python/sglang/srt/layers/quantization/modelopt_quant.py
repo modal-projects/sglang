@@ -2120,45 +2120,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process FP4 MoE weights after loading from serialized checkpoint.
-
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
-        """
-        # GEMM1 scale processing is deferred until the input scale is known;
-        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
-        if moe_runner_backend.is_marlin():
-            # Marlin supports only a single shared w1/w3 weight scale, so collapse
-            # the gate/up columns to the gate scale here. Other backends keep the
-            # raw scale and split the halves later (see _compute_gemm1_alphas).
-            if layer.moe_runner_config.is_gated:
-                if layer.w13_weight_scale_2.dim() == 1:
-                    # Some checkpoints store a shared scale for w1/w3.
-                    w13_weight_scale_2 = layer.w13_weight_scale_2
-                else:
-                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                        layer.w13_weight_scale_2[:, 0],
-                        layer.w13_weight_scale_2[:, 1],
-                    ):
-                        logger.warning_once(
-                            "w1_weight_scale_2 must match w3_weight_scale_2. "
-                            "Accuracy may be affected."
-                        )
-
-                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
-            else:
-                w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-            copy_or_rebind_param(
-                layer,
-                "w13_weight_scale_2",
-                w13_weight_scale_2.contiguous(),
-            )
-            prepare_moe_nvfp4_layer_for_marlin(layer)
-            return
-
+    def _derive_scalar_params(self, layer: torch.nn.Module) -> None:
+        """Derive the per-layer scalar quant params (input-scale quants, GEMM1/2
+        alphas, clamp limit, dispatcher config) from their never-transformed
+        per-tensor sources — shared by the full and the partial post-loading
+        passes, and always refreshed. Assumes a non-Marlin backend (the full
+        pass returns before this for Marlin; the partial pass declines it)."""
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
@@ -2245,6 +2212,169 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+
+    def process_weights_after_partial_loading(
+        self, layer: torch.nn.Module, touched: dict
+    ) -> bool:
+        """Incrementally re-process after a partial reload that rewrote only some
+        experts' params raw. Re-runs each touched expert's kernel transform plus the
+        always-cheap scalar derivations, instead of the full per-layer pass:
+
+        - CUTLASS: re-swizzle only the touched experts' block scales
+          (swizzle_blockscale keeps the expert dim as an untouched batch dim; the full
+          pass binds the swizzle into the raw scale's own buffer via
+          alias_or_bind_derived_param, so the re-swizzle lands in place).
+        - TRT-LLM: re-align only the touched experts via a per-expert
+          prepare_static_weights_for_trtllm_fp4_moe (the full pass aligns each expert
+          independently) + refresh g1_scale_c with the same helper the full pass uses.
+
+        Scalar-derived params (alphas, input-scale quants) recompute from
+        never-transformed per-tensor sources. Returns False (caller full-reloads) for
+        Marlin/CuteDSL, or when a per-expert result shape doesn't match the stored slot
+        (a padded / whole-layer-only layout) -- the shape guards make a decline safe.
+
+        ``touched`` maps param names (e.g. "w13_weight_scale") to the expert ids whose
+        slices were reloaded (empty set = non-expert param).
+        """
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if (
+            moe_runner_backend.is_marlin()
+            or self.enable_flashinfer_cutedsl_moe
+            or self._is_cutedsl_v2_standard
+        ):
+            logger.info(
+                "nvfp4 partial post-loading declined: no per-expert-local transform "
+                "for this backend (marlin / cutedsl)"
+            )
+            return False
+        # Scalars are cheap and read only never-transformed per-tensor sources;
+        # refresh them so touched weight_scale_2 / input_scale values propagate.
+        self._derive_scalar_params(layer)
+
+        if self.enable_flashinfer_trtllm_moe:
+            # TRT-LLM: re-align only the touched experts. The full pass
+            # (align_fp4_moe_weights_for_flashinfer_trtllm) aligns each expert
+            # independently (batched over the expert dim), so a touched expert's
+            # slot re-aligns from just its own freshly-loaded raw tensors; g1_scale_c
+            # re-derives from the refreshed scalars via the same helper the full pass
+            # uses. Any per-expert shape mismatch (a padded / whole-layer-only layout
+            # where the slot isn't raw-shaped) declines to a full reload -- safe.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                _compute_g1_scale_c,
+            )
+            from sglang.srt.layers.quantization.utils import (
+                prepare_static_weights_for_trtllm_fp4_moe,
+            )
+
+            is_gated = layer.moe_runner_config.is_gated
+            touched_experts = sorted(
+                set().union(
+                    *(
+                        touched.get(n, set())
+                        for n in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+                    )
+                )
+            )
+            for e in touched_experts:
+                g1w, g1s, g2w, g2s = prepare_static_weights_for_trtllm_fp4_moe(
+                    layer.w13_weight.data[e : e + 1],
+                    layer.w2_weight.data[e : e + 1],
+                    layer.w13_weight_scale.data[e : e + 1],
+                    layer.w2_weight_scale.data[e : e + 1],
+                    layer.w2_weight.data.size(-2),  # hidden_size
+                    layer.intermediate_size_per_partition,  # (padded) intermediate_size
+                    1,  # num_experts for this per-expert slice
+                    is_gated=is_gated,
+                )
+                for param, aligned in (
+                    (layer.w13_weight, g1w),
+                    (layer.w13_weight_scale, g1s),
+                    (layer.w2_weight, g2w),
+                    (layer.w2_weight_scale, g2s),
+                ):
+                    slot = param.data[e : e + 1]
+                    if aligned.shape != slot.shape:
+                        logger.info(
+                            "nvfp4 partial post-loading declined: trtllm per-expert "
+                            "shape %s -> %s (whole-layer/padded layout)",
+                            tuple(slot.shape),
+                            tuple(aligned.shape),
+                        )
+                        return False
+                    slot.copy_(aligned)
+            # GEMM1-output up-half scale, from the refreshed scalars (same helper the
+            # full trtllm pass uses).
+            g1_scale_c = _compute_g1_scale_c(
+                layer.w2_input_scale_quant,
+                layer.g1_alphas,
+                getattr(layer, "g1_alphas_up", layer.g1_alphas),
+                is_gated,
+            )
+            copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
+            return True
+
+        # CUTLASS: the weights themselves load final (only scales are swizzled),
+        # so a touched expert only needs its block scales re-swizzled. A padded
+        # layout means the swizzled buffer is separate/differently shaped -> decline.
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            scale = getattr(layer, name).data
+            for expert_id in sorted(touched.get(name, ())):
+                swizzled = swizzle_blockscale(scale[expert_id])
+                if swizzled.shape != scale[expert_id].shape:
+                    logger.info(
+                        "nvfp4 partial post-loading declined: padded swizzle "
+                        "(%s[%d] %s -> %s)",
+                        name,
+                        expert_id,
+                        tuple(scale[expert_id].shape),
+                        tuple(swizzled.shape),
+                    )
+                    return False
+                scale[expert_id].copy_(swizzled)
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process FP4 MoE weights after loading from serialized checkpoint.
+
+        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        """
+        # GEMM1 scale processing is deferred until the input scale is known;
+        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if moe_runner_backend.is_marlin():
+            # Marlin supports only a single shared w1/w3 weight scale, so collapse
+            # the gate/up columns to the gate scale here. Other backends keep the
+            # raw scale and split the halves later (see _compute_gemm1_alphas).
+            if layer.moe_runner_config.is_gated:
+                if layer.w13_weight_scale_2.dim() == 1:
+                    # Some checkpoints store a shared scale for w1/w3.
+                    w13_weight_scale_2 = layer.w13_weight_scale_2
+                else:
+                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                        layer.w13_weight_scale_2[:, 0],
+                        layer.w13_weight_scale_2[:, 1],
+                    ):
+                        logger.warning_once(
+                            "w1_weight_scale_2 must match w3_weight_scale_2. "
+                            "Accuracy may be affected."
+                        )
+
+                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+            else:
+                w13_weight_scale_2 = layer.w13_weight_scale_2[:]
+            copy_or_rebind_param(
+                layer,
+                "w13_weight_scale_2",
+                w13_weight_scale_2.contiguous(),
+            )
+            prepare_moe_nvfp4_layer_for_marlin(layer)
+            return
+
+        self._derive_scalar_params(layer)
         block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1

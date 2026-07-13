@@ -152,6 +152,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    # Post-loading is a no-op on CUDA, so a partial reload needs no re-processing.
+    partial_reload_safe = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -222,6 +225,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
+
+    # Post-loading is a no-op on CUDA, so a partial reload needs no re-processing.
+    partial_reload_safe = True
 
     def __init__(
         self,

@@ -2629,7 +2629,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 
-            spec_prepare_for_decode(self)
+            # spec_info is None on non-last pipeline-parallel ranks (the draft
+            # lives only on the last stage).
+            if self.spec_info is not None:
+                spec_prepare_for_decode(self)
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:

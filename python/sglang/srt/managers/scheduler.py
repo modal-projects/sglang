@@ -787,7 +787,7 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or not self.tp_worker.pp_group.is_last_rank:
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -874,10 +874,7 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
-            self.model_worker = self.tp_worker
-        else:
-            self.model_worker = self.draft_worker
+        self.model_worker = self.draft_worker or self.tp_worker
 
         # Get token and memory info from the model worker
         (
@@ -3313,7 +3310,11 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    # PP prefill: relay proxy tensors through the spec worker to
+                    # the target forward (kwargs passthrough in worker V2).
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3325,11 +3326,16 @@ class Scheduler(
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
-                )
+                # PP non-last ranks emit only pp_hidden_states_proxy_tensors
+                # (no sampled tokens), so there is nothing to copy and
+                # copy_to_cpu would deref next_token_ids=None. Downstream
+                # processors guard on copy_done being set.
+                if batch_result.next_token_ids is not None:
+                    batch_result.copy_done = self.device_module.Event()
+                    batch_result.copy_to_cpu(
+                        return_logprob=batch.return_logprob,
+                        return_hidden_states=batch.return_hidden_states,
+                    )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

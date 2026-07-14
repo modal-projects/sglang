@@ -236,6 +236,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        self.lm_head = self.language_model.embed_tokens
 
         # Tied embeddings: under PP the embed_tokens lives on the first rank
         # while logits run on the last rank, so we can't reuse the embedding

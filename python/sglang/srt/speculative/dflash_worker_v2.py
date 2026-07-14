@@ -142,6 +142,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_draft_worker=True,
             context_length=target_worker.model_runner.model_config.context_len,
         )
+        # Pipeline-parallel prefill: the draft is resident only on the last PP
+        # stage of the target; expose the grouping so PP callers can gate.
+        self.pp_group = target_worker.model_runner.pp_group
+        self.is_draft_rank = self.pp_group.is_last_rank
         self.draft_model_runner = self._draft_worker.model_runner
         self._draft_sampler = None
         # Keep the same alias that other spec-v2 workers expose.
@@ -1233,6 +1237,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        **kwargs,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -1243,7 +1248,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            # PP prefill: relay proxy tensors through to the target forward
+            # (pp_proxy_tensors rides **kwargs from the scheduler).
+            batch_output = self.target_worker.forward_batch_generation(
+                batch,
+                **kwargs,
+            )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,

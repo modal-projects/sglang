@@ -763,12 +763,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
-        if self.use_captured_attn_metadata:
+        if self.use_captured_attn_metadata and size >= 512:
             # Captured-attention graphs pull real workspace (MoE, attention
             # transients) into the shared graph pool. Release the eager
             # warmup's cached blocks first — otherwise the global allocator
             # strands ~20 GB (at 16k buckets) that the graph pool can't use
             # and capture OOMs while plenty of memory is reclaimable.
+            # Gated to big buckets: small-bucket warmups barely grow the
+            # cache, and the post-flush cudaMalloc round trips cost a fixed
+            # few hundred ms per bucket.
             torch.cuda.empty_cache()
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)

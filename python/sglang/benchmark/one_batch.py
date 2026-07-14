@@ -641,6 +641,16 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    # Same runtime-config globals latency_test sets (one_batch's two entry
+    # paths must agree). Without initialize_moe_config the global MoE runner
+    # backend stays default, so --moe-runner-backend flashinfer_trtllm_routed
+    # is ignored during model build: ModelOptNvFp4FusedMoEMethod skips the
+    # TRTLLM weight alignment (no g1_scale_c) and apply() falls through to
+    # the generic cutlass path, which crashes on Inkling's PackedTopKOutput.
+    initialize_moe_config(server_args)
+    initialize_fp8_gemm_config(server_args)
+    initialize_fp4_gemm_config(server_args)
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None

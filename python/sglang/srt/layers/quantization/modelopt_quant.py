@@ -2144,6 +2144,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
+            print(
+                f"[modelopt-debug] CUTLASS weight-processing path taken: "
+                f"enable_trtllm={self.enable_flashinfer_trtllm_moe} "
+                f"reorder_none={reorder_rows_for_gated_act_gemm is None} "
+                f"shuffle_none={shuffle_matrix_sf_a is None} layer={type(layer).__name__}",
+                flush=True,
+            )
 
             if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
                 # CuteDSL v2 only: interleave the two logical W13 halves in
@@ -2483,6 +2490,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        print(
+            f"[modelopt-debug] apply() fell through to generic cutlass: "
+            f"enable_trtllm={self.enable_flashinfer_trtllm_moe} "
+            f"has_g1_scale_c={hasattr(layer, 'g1_scale_c')} "
+            f"layer={type(layer).__name__} topk={type(topk_output).__name__}",
+            flush=True,
+        )
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         output = cutlass_moe_fp4(
             a=x,

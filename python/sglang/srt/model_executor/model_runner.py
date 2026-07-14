@@ -2498,6 +2498,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # resolution, matching the legacy server_args semantics).
         self.kv_cache_dtype_str = kv_cache_dtype_str
 
+        # Static fp8 KV scales (INKLING_FP8_KV_SCALES="k:v", e.g. "1.0:4.0"):
+        # store K/scale and V/scale in the fp8 pool, kernel descales on read
+        # (the standard checkpoint-scales path — both attrs must be set, the
+        # read gate keys on k_scale). Purpose: Inkling ships no calibrated KV
+        # scales and identity scaling saturates V (measured |V| up to 1648 in
+        # layers 36-53 vs e4m3's 448); v=4.0 covers the observed range at no
+        # relative-precision cost (e4m3 is floating point).
+        scales_env = os.environ.get("INKLING_FP8_KV_SCALES")
+        if scales_env and self.kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            from sglang.srt.layers.radix_attention import RadixAttention
+
+            k_s, v_s = (float(x) for x in scales_env.split(":"))
+            n_layers = 0
+            for module in self.model.modules():
+                if isinstance(module, RadixAttention):
+                    module.k_scale = torch.tensor(
+                        k_s, dtype=torch.float32, device=self.device
+                    )
+                    module.v_scale = torch.tensor(
+                        v_s, dtype=torch.float32, device=self.device
+                    )
+                    module.k_scale_float = k_s
+                    module.v_scale_float = v_s
+                    n_layers += 1
+            logger.info(
+                "Applied static fp8 KV scales k=%s v=%s to %d attention layers",
+                k_s,
+                v_s,
+                n_layers,
+            )
+
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16

@@ -584,6 +584,34 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def _paged_indexer_query_chunk_rows(
+        self,
+        *,
+        query_rows: int,
+        max_c4_seq_len: int,
+        forward_batch,
+    ) -> int:
+        """Query rows per paged-indexer kernel call so the (rows x max_c4_seq_len)
+        fp32 logits buffer fits a free-memory budget. Returns query_rows (no
+        chunking) outside plain extend or when auxiliary consumers (capture,
+        hisparse, external-indices debug) need the unified logits."""
+        if not forward_batch.forward_mode.is_extend():
+            return query_rows
+        if torch.cuda.is_current_stream_capturing():
+            return query_rows
+        if self.debug_use_external_c4_sparse_indices:
+            return query_rows
+        if getattr(self, "hisparse_coordinator", None) is not None:
+            return query_rows
+        if get_global_indexer_capturer() is not None:
+            return query_rows
+        logits_bytes = query_rows * max(1, max_c4_seq_len) * 4
+        free_bytes, _ = torch.cuda.mem_get_info()
+        budget = max(1 << 30, int(free_bytes * 0.5))
+        if logits_bytes <= budget:
+            return query_rows
+        return max(1024, budget // max(1, max_c4_seq_len * 4))
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -719,16 +747,68 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
+            # The kernel materializes (query_rows x max_c4_seq_len) fp32 logits;
+            # for a long-context request this single allocation can exceed free
+            # memory and kill the scheduler (one bad request = dead server).
+            # During extend, chunk the query rows so the buffer stays within a
+            # free-memory budget: seq lens, page-table rows, and top-k are all
+            # per-query-row, so query-chunking is exact.
+            q_chunk_rows = self._paged_indexer_query_chunk_rows(
+                query_rows=query_rows,
+                max_c4_seq_len=indexer_metadata.max_c4_seq_len,
+                forward_batch=forward_batch,
             )
+            if q_chunk_rows >= query_rows:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+            else:
+                from deep_gemm import get_num_sms as _dg_num_sms
+                from deep_gemm import (
+                    get_paged_mqa_logits_metadata as _dg_sched,
+                )
+
+                for start in range(0, query_rows, q_chunk_rows):
+                    end = min(start + q_chunk_rows, query_rows)
+                    q_slice = (
+                        (q[0][start:end], q[1][start:end])
+                        if use_fp4_indexer
+                        else q[start:end]
+                    )
+                    sl_slice = _c4sl[start:end]
+                    sched = _dg_sched(
+                        sl_slice,
+                        indexer_metadata.c4_page_size,
+                        _dg_num_sms(),
+                    )
+                    logits_chunk = fn(
+                        q_slice,
+                        c4_indexer_kv_cache,
+                        weights[start:end],
+                        sl_slice,
+                        page_table[start:end],
+                        sched,
+                        indexer_metadata.max_c4_seq_len,
+                        False,
+                    )
+                    topk_transform_512(
+                        logits_chunk,
+                        c4_seq_lens[start:end],
+                        page_table[start:end],
+                        c4_sparse_page_indices[start:end],
+                        indexer_metadata.c4_page_size,
+                        None,
+                    )
+                    del logits_chunk
+                assert indexer_metadata.page_table is core_metadata.page_table
+                return
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:

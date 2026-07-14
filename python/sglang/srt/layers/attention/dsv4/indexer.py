@@ -798,13 +798,18 @@ class C4IndexerBackendMixin:
                         indexer_metadata.max_c4_seq_len,
                         False,
                     )
+                    raw_indices_chunk = (
+                        core_metadata.c4_sparse_raw_indices[start:end]
+                        if core_metadata.c4_sparse_raw_indices is not None
+                        else None
+                    )
                     topk_transform_512(
                         logits_chunk,
                         c4_seq_lens[start:end],
                         page_table[start:end],
                         c4_sparse_page_indices[start:end],
                         indexer_metadata.c4_page_size,
-                        None,
+                        raw_indices_chunk,
                     )
                     del logits_chunk
                 assert indexer_metadata.page_table is core_metadata.page_table

@@ -866,6 +866,13 @@ class Envs:
     SGLANG_OPT_FA_SYNC_FREE_SEQLEN = EnvBool(True)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # Capture the Inkling attention group inside prefill breakable CUDA graphs
+    # (BCG) instead of running it as a per-layer eager break. Uses the FA4
+    # captured-metadata contract. Phase 1: single-sequence capture (only bs=1
+    # batches replay through the graph; multi-seq falls back to eager) and
+    # requires SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0 (score_mod path — the
+    # sheared-bias block-schedule prep cache is not replay-refreshable yet).
+    SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN = EnvBool(False)
     # Route symm_mem_all_reduce through the autotuned custom JIT all-reduce
     # (two-shot / multimem kernels in jit_kernel/inkling_all_reduce.py) instead of
     # torch multimem. Opt-in; falls back to multimem for shapes where it wins.

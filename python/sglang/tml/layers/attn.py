@@ -387,6 +387,10 @@ class InklingAttention(nn.Module):
             and self.alt_stream is not None
             and hidden_states.is_cuda
             and num_tokens > 0
+            # BCG attention capture: run single-stream under capture — the
+            # cached current-stream helper doesn't see the capture side
+            # stream, so the alt-stream fork would record wrong dependencies.
+            and not torch.cuda.is_current_stream_capturing()
         )
         if use_alt:
             # Alt stream runs v_sconv then rel_logits_proj, each fenced by its own

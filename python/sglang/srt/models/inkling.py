@@ -244,8 +244,20 @@ class InklingDecoderLayer(nn.Module):
         # ONE eager break; only mlp_norm + MoE stay captured. Outside a capture
         # these wrappers just run inline. `_breakable_mlp_sconv` runs the final
         # layer's deferred mlp_sconv after the layer loop.
-        self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
-        self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
+        #
+        # SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN=1: capture the attention group
+        # INSIDE the graph instead. The FA4 backend opts into the BCG
+        # captured-metadata contract (metadata tensors refreshed in place
+        # before replay) and the runner gates replay to single-seq batches,
+        # so the bs=1-baked sconv metadata concern is moot; sconv metadata
+        # itself is re-derived inside the graph from the runner's refreshed
+        # static slots (seq_lens/extend_seq_lens/extend_prefix_lens).
+        if envs.SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN.get():
+            self._breakable_attn_group = self._attn_group_impl
+            self._breakable_mlp_sconv = self._mlp_sconv_impl
+        else:
+            self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
+            self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
 
     def _attn_block(
         self,

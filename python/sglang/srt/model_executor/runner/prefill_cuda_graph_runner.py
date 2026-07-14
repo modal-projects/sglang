@@ -530,6 +530,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
             return False
+        # Backends that capture attention metadata at a bounded batch size
+        # (FA4 phase-1 captures single-seq prefill only) can't replay wider
+        # batches; DSV4 leaves the attr unset (no limit).
+        if self.use_captured_attn_metadata:
+            captured_max_bs = getattr(
+                self.model_runner.attn_backend, "bcg_captured_metadata_max_bs", None
+            )
+            if (
+                captured_max_bs is not None
+                and forward_batch.batch_size > captured_max_bs
+            ):
+                return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(

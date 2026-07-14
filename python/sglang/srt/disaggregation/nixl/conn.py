@@ -210,6 +210,11 @@ class KVArgsRegisterInfo:
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
     staging: Optional[StagingRegisterInfo] = None
+    # Count of leading target entries in dst_kv_ptrs (the decode side's
+    # KVArgs.num_target_kv_data_ptrs); the draft (spec) section, if any, is
+    # dst_kv_ptrs[dst_num_target_kv_ptrs:]. 0 when absent (older peers or no
+    # draft).
+    dst_num_target_kv_ptrs: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -239,8 +244,14 @@ class KVArgsRegisterInfo:
         dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
         )
+        # Staging occupies indices 14-15; scalar extensions follow (16: upstream
+        # dst_num_slots, 17: kv mem kinds, 18: per-buffer kv item lens,
+        # 19: target/draft split).
         dst_num_slots = (
             int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
+        )
+        dst_num_target_kv_ptrs = (
+            int(msg[19].decode("ascii")) if len(msg) > 19 and len(msg[19]) > 0 else 0
         )
 
         return cls(
@@ -262,6 +273,7 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            dst_num_target_kv_ptrs=dst_num_target_kv_ptrs,
         )
 
 
@@ -425,6 +437,17 @@ class NixlKVManager(CommonKVManager):
         self._num_slots_src: int = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Globally-unique sender id across the prefill's PP x TP grid,
+            # used as the trailing rank field of kv/aux/state notifs. The
+            # receiver keys its per-sender arrival accounting on this field
+            # (required_prefill_response_num senders per room), so it must be
+            # unique per sender: engine_rank alone collides across PP stages
+            # (every stage has tp_rank 0..attn_tp_size-1). Degenerates to
+            # engine_rank when pp_size == 1.
+            self.notif_sender_rank = (
+                getattr(self.kv_args, "pp_rank", 0) * self.attn_tp_size
+                + self.kv_args.engine_rank
+            )
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
@@ -1099,7 +1122,35 @@ class NixlKVManager(CommonKVManager):
                             # the slice path below.
 
                         if kv_xfer_handle is None:
-                            if self.is_mla_backend or (
+                            notif = (
+                                f"{req.room}_kv_{kv_chunk.chunk_id}"
+                                f"_{int(kv_chunk.is_last_chunk)}_{self.notif_sender_rank}"
+                            )
+                            has_draft = (
+                                self.kv_args.num_target_kv_data_ptrs
+                                and self.kv_args.num_target_kv_data_ptrs
+                                < len(self.kv_args.kv_data_ptrs)
+                            )
+                            if self.is_mla_backend and has_draft:
+                                # MLA target + DFlash draft (MHA) resident on this
+                                # (last) PP stage: the target latent copies
+                                # contiguously while the draft's per-head KV is
+                                # re-sliced when prefill/decode TP differ. Both are
+                                # packed into one transfer + notif so the receiver's
+                                # per-PP-rank arrival accounting is unchanged.
+                                kv_xfer_handle = self.send_kvcache_mla_with_draft(
+                                    req.agent_name,
+                                    src_prefill_kv_indices,
+                                    dst_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_info.gpu_id,
+                                    notif,
+                                    prefill_tp_size=self.attn_tp_size,
+                                    decode_tp_size=decode_tp_size,
+                                    decode_tp_rank=dst_info.decode_tp_rank,
+                                    dst_num_target_kv_ptrs=dst_info.dst_num_target_kv_ptrs,
+                                )
+                            elif self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
                             ):
                                 if dst_info.kv_xfer_segments is None:
@@ -1147,7 +1198,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                f"{req.room}_state_{self.notif_sender_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1159,23 +1210,48 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
+                        # Only the last PP stage owns the aux payload: it is
+                        # the rank that samples and fills the metadata buffer.
+                        # Earlier stages' metadata buffers are uninitialized;
+                        # writing them to the shared decode aux slot races the
+                        # real payload and corrupts the first output token.
+                        is_aux_owner = self.pp_rank == self.pp_size - 1
                         # When no KV pages were sent (decode-side cache hit),
-                        # encode pp_rank in aux notif so receiver can mark
-                        # expected_kvs_per_pp[pp_rank] = 0.
+                        # encode the sender rank in the aux notif so the
+                        # receiver can mark expected_kvs_per_pp[sender] = 0.
+                        # Every sender must emit this marker; non-owners send
+                        # it notif-only (no payload write).
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                                f"{req.room}_aux_nokv_{self.notif_sender_rank}"
                             )
-                        else:
-                            aux_notif = f"{req.room}_aux"
-                        aux_xfer_handle = self.send_aux(
-                            req.agent_name,
-                            kv_chunk.prefill_aux_index,
-                            dst_info.dst_aux_ptrs,
-                            req.dst_aux_index,
-                            aux_notif,
-                        )
-                        handles.append(aux_xfer_handle)
+                            if is_aux_owner:
+                                handles.append(
+                                    self.send_aux(
+                                        req.agent_name,
+                                        kv_chunk.prefill_aux_index,
+                                        dst_info.dst_aux_ptrs,
+                                        req.dst_aux_index,
+                                        aux_notif,
+                                    )
+                                )
+                            else:
+                                self.agent.send_notif(
+                                    req.agent_name, aux_notif.encode("ascii")
+                                )
+                        elif is_aux_owner:
+                            handles.append(
+                                self.send_aux(
+                                    req.agent_name,
+                                    kv_chunk.prefill_aux_index,
+                                    dst_info.dst_aux_ptrs,
+                                    req.dst_aux_index,
+                                    f"{req.room}_aux",
+                                )
+                            )
+                        # Non-owner ranks that sent KV emit no aux at all;
+                        # their kv notifs carry their per-sender completion and
+                        # received_aux is set by the owner's payload.
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
@@ -1292,6 +1368,137 @@ class NixlKVManager(CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+
+    @staticmethod
+    def _make_kv_reqs(addr_chunks, len_chunks, gpu_id):
+        """Stack per-layer address/length chunks into one (N, 3) uint64
+        descriptor array of (addr, len, gpu) rows for NIXL."""
+        if not addr_chunks:
+            return np.empty((0, 3), dtype=np.uint64)
+        flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
+        flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
+        return np.column_stack(
+            (flat_addrs, flat_lens, np.full_like(flat_addrs, gpu_id, dtype=np.uint64))
+        )
+
+    def _post_xfer(self, peer_name, src_reqs, dst_reqs, notif, what="KV"):
+        """Build NIXL xfer descs from req arrays and post a single WRITE."""
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception(f"KVSender failed to create {what} transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception(f"KVSender failed to post {what} transfer")
+        return xfer_handle
+
+    @staticmethod
+    def _contiguous_layer_addrs(layers_params, prefill_indices, dst_indices):
+        """Page-contiguous copy. Group indices into contiguous runs, then for
+        each (src_ptr, dst_ptr, item_len) layer emit per-block addresses and
+        lengths. Used for the MLA latent and homogeneous-TP MHA, where no
+        per-head reslicing is needed. Returns (src_addrs, src_lens, dst_addrs,
+        dst_lens) as lists of per-layer arrays."""
+        prefill_blocks, dst_blocks = group_concurrent_contiguous(
+            prefill_indices, dst_indices
+        )
+        prefill_starts = np.fromiter(
+            (block[0] for block in prefill_blocks), dtype=np.uint64
+        )
+        dst_starts = np.fromiter((block[0] for block in dst_blocks), dtype=np.uint64)
+        block_lens = np.fromiter(
+            (len(block) for block in prefill_blocks), dtype=np.uint64
+        )
+        src_addrs, src_lens, dst_addrs, dst_lens = [], [], [], []
+        for src_ptr, dst_ptr, item_len in layers_params:
+            lengths = item_len * block_lens
+            src_addrs.append(src_ptr + prefill_starts * item_len)
+            src_lens.append(lengths)
+            dst_addrs.append(dst_ptr + dst_starts * item_len)
+            dst_lens.append(lengths)
+        return src_addrs, src_lens, dst_addrs, dst_lens
+
+    @staticmethod
+    def _head_slice_offsets(
+        prefill_tp_size,
+        decode_tp_size,
+        local_tp_rank,
+        dst_tp_rank,
+        total_kv_heads,
+        bytes_per_head,
+    ):
+        """Select which KV heads this prefill rank sends to the given decode
+        rank when prefill/decode TP differ, returning byte offsets:
+        (src_head_offset, dst_head_offset, bytes_per_token_to_send)."""
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        # GQA replication: how many prefill ranks share the same KV head.
+        src_replication = max(1, prefill_tp_size // total_kv_heads)
+        if prefill_tp_size > decode_tp_size:
+            # Multiple prefill ranks feed one decode rank.
+            src_head_start = 0
+            num_heads_to_send = src_heads_per_rank
+            dst_head_start = (
+                (local_tp_rank // src_replication) * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            # One prefill rank feeds (part of) multiple decode ranks.
+            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start = 0
+        return (
+            src_head_start * bytes_per_head,
+            dst_head_start * bytes_per_head,
+            num_heads_to_send * bytes_per_head,
+        )
+
+    @staticmethod
+    def _head_slice_addrs(
+        ptr_pairs,
+        prefill_indices,
+        dst_indices,
+        src_item_len,
+        dst_item_len,
+        page_size,
+        src_head_offset,
+        dst_head_offset,
+        heads_bytes_per_token,
+    ):
+        """Per-token head-sliced copy. Expand each page index into page_size
+        token offsets and apply per-head byte offsets, for each (src_ptr,
+        dst_ptr) buffer pair. Used when KV is head-sharded and prefill/decode
+        TP differ. Returns (src_addrs, src_lens, dst_addrs, dst_lens)."""
+        prefill_idx = np.asarray(prefill_indices, dtype=np.uint64)
+        dst_idx = np.asarray(dst_indices, dtype=np.uint64)
+        token_offsets = np.arange(page_size, dtype=np.uint64)
+        bytes_per_token_prefill = src_item_len // page_size
+        bytes_per_token_decode = dst_item_len // page_size
+        src_addrs, src_lens, dst_addrs, dst_lens = [], [], [], []
+        for src_ptr, dst_ptr in ptr_pairs:
+            src_page_bases = src_ptr + prefill_idx * src_item_len
+            dst_page_bases = dst_ptr + dst_idx * dst_item_len
+            src_all = (
+                src_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_prefill
+                + src_head_offset
+            ).ravel()
+            dst_all = (
+                dst_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_decode
+                + dst_head_offset
+            ).ravel()
+            src_addrs.append(src_all)
+            src_lens.append(
+                np.full(src_all.shape, heads_bytes_per_token, dtype=np.uint64)
+            )
+            dst_addrs.append(dst_all)
+            dst_lens.append(
+                np.full(dst_all.shape, heads_bytes_per_token, dtype=np.uint64)
+            )
+        return src_addrs, src_lens, dst_addrs, dst_lens
 
     def _send_kvcache_generic(
         self,
@@ -1524,6 +1731,138 @@ class NixlKVManager(CommonKVManager):
             handles.append(xfer_handle)
         return handles
 
+    def send_kvcache_mla_with_draft(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        notif: str,
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+        dst_num_target_kv_ptrs: int = 0,
+    ):
+        """Send an MLA target + DFlash draft chunk in a single RDMA transfer.
+
+        Layout of the flat pointer lists (target-first, draft appended):
+          src (this last PP stage): [MLA target layers for this stage]
+                                    + [draft_K x D, draft_V x D]
+          dst (decode, PP=1):       [MLA target layers for all L]
+                                    + [draft_K x D, draft_V x D]
+
+        The MLA target latent is replicated across TP, so it is copied
+        page-contiguously and PP-sliced exactly like ``send_kvcache``. The
+        DFlash draft KV is MHA and TP-sharded, so its heads are redistributed
+        per token when ``prefill_tp_size != decode_tp_size`` (same math as
+        ``send_kvcache_slice``); the draft is fully resident here and decode
+        holds all draft layers, so draft layers map 1:1 (no PP slicing).
+
+        Both desc sets are concatenated into one ``initialize_xfer`` with a
+        single notif so the receiver's per-PP-rank arrival accounting (which
+        counts one ``_kv_`` notif per PP rank) is unchanged.
+        """
+        src_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
+        dst_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
+        item_lens = np.array(self.kv_args.kv_item_lens, dtype=np.uint64)
+
+        num_target_src = int(self.kv_args.num_target_kv_data_ptrs)
+        num_draft = len(src_ptrs) - num_target_src  # 2 * D  (K buffers + V buffers)
+        if num_draft <= 0 or num_draft % 2 != 0:
+            raise RuntimeError(
+                f"Unexpected draft pointer layout: num_target={num_target_src}, "
+                f"total={len(src_ptrs)} (expected an even, positive draft count)"
+            )
+        num_draft_layers = num_draft // 2
+        # Prefer the decode-registered split; fall back to inferring it from
+        # the local draft count for older peers that don't transmit it.
+        if dst_num_target_kv_ptrs > 0:
+            num_target_dst = int(dst_num_target_kv_ptrs)
+        else:
+            num_target_dst = len(dst_ptrs) - num_draft
+        num_draft_dst = len(dst_ptrs) - num_target_dst
+        if num_draft_dst != num_draft:
+            raise RuntimeError(
+                "Draft KV section mismatch between prefill and decode: "
+                f"prefill has {num_draft} draft ptrs "
+                f"(len(src)={len(src_ptrs)}, num_target_src={num_target_src}), "
+                f"decode has {num_draft_dst} "
+                f"(len(dst)={len(dst_ptrs)}, num_target_dst={num_target_dst})"
+            )
+
+        # --- Target (MLA, replicated): page-contiguous copy, PP-sliced ---
+        src_kv_ptrs, sliced_dst_kv_ptrs, n_layers = self.get_mla_kv_ptrs_with_pp(
+            src_ptrs[:num_target_src], dst_ptrs[:num_target_dst]
+        )
+        target_item_lens = item_lens[:num_target_src]
+        layers_params = [
+            (src_kv_ptrs[i], sliced_dst_kv_ptrs[i], target_item_lens[i])
+            for i in range(n_layers)
+        ]
+        src_addrs, src_lens, dst_addrs, dst_lens = self._contiguous_layer_addrs(
+            layers_params, prefill_kv_indices, dst_kv_indices
+        )
+
+        # --- Draft (MHA, TP-sharded): per-token head slice, 1:1 layer mapping ---
+        page_size = self.kv_args.page_size
+        src_draft_item_len = int(item_lens[num_target_src])  # per-rank, per-page bytes
+        draft_heads_per_rank = int(self.kv_args.draft_kv_head_num)
+        if draft_heads_per_rank <= 0:
+            raise RuntimeError(
+                "draft_kv_head_num must be set on the prefill KVArgs to transfer "
+                "DFlash draft KV"
+            )
+        # Full (all-TP) draft KV head count. Mirrors send_kvcache_slice's
+        # kv_head_num * tp_size fallback; exact when total_kv_heads >= tp_size.
+        total_kv_heads = draft_heads_per_rank * prefill_tp_size
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+        # Per-head, per-token bytes (a draft-model constant: head_dim * dtype).
+        bytes_per_head = src_draft_item_len // page_size // src_heads_per_rank
+        dst_draft_item_len = dst_heads_per_rank * bytes_per_head * page_size
+
+        src_head_off, dst_head_off, heads_bytes_per_token = self._head_slice_offsets(
+            prefill_tp_size,
+            decode_tp_size,
+            self.kv_args.engine_rank % prefill_tp_size,
+            decode_tp_rank % decode_tp_size,
+            total_kv_heads,
+            bytes_per_head,
+        )
+
+        draft_ptr_pairs = list(
+            zip(
+                src_ptrs[num_target_src : num_target_src + num_draft_layers],
+                dst_ptrs[num_target_dst : num_target_dst + num_draft_layers],
+            )
+        ) + list(
+            zip(
+                src_ptrs[num_target_src + num_draft_layers : num_target_src + num_draft],
+                dst_ptrs[num_target_dst + num_draft_layers : num_target_dst + num_draft],
+            )
+        )
+        d_src_addrs, d_src_lens, d_dst_addrs, d_dst_lens = self._head_slice_addrs(
+            draft_ptr_pairs,
+            prefill_kv_indices,
+            dst_kv_indices,
+            src_draft_item_len,
+            dst_draft_item_len,
+            page_size,
+            src_head_off,
+            dst_head_off,
+            heads_bytes_per_token,
+        )
+        src_addrs += d_src_addrs
+        src_lens += d_src_lens
+        dst_addrs += d_dst_addrs
+        dst_lens += d_dst_lens
+
+        # --- One combined transfer for target + draft ---
+        src_reqs = self._make_kv_reqs(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = self._make_kv_reqs(dst_addrs, dst_lens, dst_gpu_id)
+        return self._post_xfer(peer_name, src_reqs, dst_reqs, notif, what="MLA+draft KV")
+
     def send_kvcache_slice(
         self,
         peer_name: str,
@@ -1746,7 +2085,7 @@ class NixlKVManager(CommonKVManager):
 
         notif_tag = (
             f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
-            f"_{self.kv_args.engine_rank}_{chunk_idx}"
+            f"_{self.notif_sender_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
         handle = self.send_kvcache_staged(
@@ -2647,6 +2986,14 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(dst_num_slots).encode("ascii"),
                         packed_kv_data_mem_kinds,
                         packed_kv_item_lens,
+                        # Index 19: target/draft split of kv_data_ptrs, so the
+                        # prefill sender can locate the draft section without
+                        # inferring it from its own (possibly differently-sized)
+                        # layout.
+                        str(
+                            getattr(self.kv_mgr.kv_args, "num_target_kv_data_ptrs", 0)
+                            or 0
+                        ).encode("ascii"),
                     ]
                 )
 

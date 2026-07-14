@@ -346,8 +346,10 @@ class FlashAttentionBackend(AttentionBackend):
         # extend metadata into stable tensors and refresh them in place at
         # replay, so the attention group can live INSIDE prefill breakable
         # CUDA graphs instead of running as a per-layer eager break.
-        # Limits: fa4 only, score_mod path only (sheared-bias prep cache is
-        # not replay-refreshable yet). Batch capacity: graphs capture with
+        # Limits: fa4 only. Sheared bias is supported: its prep cache is
+        # capture-aware (interface.py), so the block-schedule kernel is
+        # captured and self-refreshes at replay. Batch capacity: graphs
+        # capture with
         # SGLANG_OPT_INKLING_BCG_CAPTURE_BS sequence slots (zero-length
         # padding seqs); wider batches fall back to eager via the runner.
         self.use_captured_forward_metadata_for_breakable_cuda_graph = (
@@ -1057,11 +1059,10 @@ class FlashAttentionBackend(AttentionBackend):
         assert (
             forward_batch.batch_size <= self.bcg_captured_metadata_max_bs
         ), "capture batch wider than SGLANG_OPT_INKLING_BCG_CAPTURE_BS"
-        assert not envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get(), (
-            "BCG attention capture requires the score_mod path "
-            "(SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0): the sheared-bias "
-            "prep cache is not replay-refreshable yet"
-        )
+        # Sheared bias composes with capture: the prep cache refuses to serve
+        # eager(warmup)-built schedules during capture (interface.py), so the
+        # CuSeqlensToBlocks launch is captured and every replay recomputes the
+        # block schedule from the refreshed static cu_seqlens_q.
         self.init_forward_metadata(forward_batch)
         metadata = self.forward_metadata
         # The zero-prefix capture batch aliases cu_seqlens_q = cu_seqlens_k

@@ -774,13 +774,24 @@ def _flash_attn_fwd(
         )
         if use_prepare_bias_kernel:
             prep_cache_key = (group_tile_bias, qhead_per_kvhead_packgqa, cu_seqlens_q.data_ptr())
+            # A cached schedule must not cross the eager/capture boundary.
+            # Under BCG captured metadata, cu_seqlens_q is a static buffer
+            # (stable data_ptr) refreshed in place at replay: a warmup-built
+            # entry hitting during capture would skip the CuSeqlensToBlocks
+            # launch, baking a stale schedule into the graph. Rejecting it
+            # forces the prep kernel INTO the capture, so every replay
+            # recomputes the schedule from the refreshed cu_seqlens_q.
+            # Within one capture, later layers reuse the capture-built entry.
+            capturing = torch.cuda.is_current_stream_capturing()
             cached_prep = (
                 rel_bias_prep_cache.get(prep_cache_key)
                 if rel_bias_prep_cache is not None
                 else None
             )
+            if cached_prep is not None and cached_prep[2] != capturing:
+                cached_prep = None
             if cached_prep is not None:
-                cu_total_m_blocks_bias, blocks_to_batch_idx = cached_prep
+                cu_total_m_blocks_bias, blocks_to_batch_idx = cached_prep[:2]
             else:
                 cu_total_m_blocks_bias = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
                 total_group_blocks_max = (
@@ -804,7 +815,7 @@ def _flash_attn_fwd(
                     )
                 if rel_bias_prep_cache is not None:
                     rel_bias_prep_cache[prep_cache_key] = (
-                        cu_total_m_blocks_bias, blocks_to_batch_idx,
+                        cu_total_m_blocks_bias, blocks_to_batch_idx, capturing,
                     )
 
         shear_compile_key = (

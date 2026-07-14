@@ -1015,6 +1015,60 @@ class Indexer(MultiPlatformOp):
                 next_n=next_n,
             )
         else:
+            # The (q_offset x max_seq_len) logits buffer is unbounded in context
+            # length; one long-context request can exceed free memory and kill
+            # the scheduler. The ragged path already guards this via
+            # _should_chunk_mqa_logits — mirror it here. Masking and top-k are
+            # per-row, so query-chunking is exact.
+            need_chunk, budget_bytes = self._should_chunk_mqa_logits(
+                q_offset, max_seq_len, q_fp8.device.index
+            )
+            rows_aligned = (
+                seqlens_32_2d.shape[0] == q_fp8.shape[0]
+                and block_tables.shape[0] == q_fp8.shape[0]
+                and seqlens_32.shape[0] >= q_offset
+            )
+            if need_chunk and rows_aligned:
+                q_chunk = max(
+                    256,
+                    budget_bytes
+                    // max(1, max_seq_len * self._MQA_LOGITS_BYTES_PER_ELEM),
+                )
+                topk_chunks = []
+                for start in range(0, q_offset, q_chunk):
+                    end = min(start + q_chunk, q_offset)
+                    sl_2d = seqlens_32_2d[start:end]
+                    sched = deep_gemm.get_paged_mqa_logits_metadata(
+                        sl_2d, blocksize, self.sm_count
+                    )
+                    logits_chunk = deepgemm_paged_mqa_logits_split(
+                        deep_gemm.fp8_paged_mqa_logits,
+                        q_fp8[start:end],
+                        kv_cache_fp8,
+                        weights[start:end],
+                        sl_2d,
+                        block_tables[start:end],
+                        sched,
+                        max_seq_len,
+                        q_offset=end - start,
+                    )
+                    self._mask_init_and_local_tokens(
+                        logits_chunk, seqlens_32[start:end]
+                    )
+                    topk_chunks.append(
+                        metadata.topk_transform(logits_chunk, self.index_topk)
+                    )
+                topk_result = torch.cat(topk_chunks, dim=0)
+                if not _is_hip and q_offset < q_fp8.shape[0]:
+                    pad_len = q_fp8.shape[0] - q_offset
+                    padding = torch.full(
+                        (pad_len, topk_result.shape[1]),
+                        -1,
+                        dtype=topk_result.dtype,
+                        device=topk_result.device,
+                    )
+                    topk_result = torch.cat([topk_result, padding], dim=0)
+                return topk_result
             logits = deepgemm_paged_mqa_logits_split(
                 deep_gemm.fp8_paged_mqa_logits,
                 q_fp8,

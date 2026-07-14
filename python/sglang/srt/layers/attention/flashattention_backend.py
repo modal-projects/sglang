@@ -399,7 +399,7 @@ class FlashAttentionBackend(AttentionBackend):
         # sheared-bias fwd/combine faults with splits>1 (open kernel bug);
         # forcing 1 split trades some decode latency for a working config.
         _num_splits_env = os.environ.get("FA4_NUM_SPLITS")
-        if _num_splits_env is not None:
+        if _num_splits_env:  # empty string = unset (image-baked env passthrough)
             self.num_splits = int(_num_splits_env)
 
         # In embedding mode with no chunked prefill and radix cache disabled,

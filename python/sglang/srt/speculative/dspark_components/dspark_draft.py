@@ -265,6 +265,14 @@ class DraftBlockProposer:
 
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        # Draft PROPOSAL strategy only affects the accept rate, never output
+        # correctness (verify enforces the target's sampling). Forcing greedy
+        # proposals keeps the whole markov chain inside the draft CUDA graph
+        # instead of the eager per-step path (full-vocab logits gather + eager
+        # launches per step), which dominates decode overhead under sampling
+        # workloads on skew-sensitive hosts.
+        if envs.SGLANG_DSPARK_FORCE_GREEDY_DRAFT.get():
+            all_greedy = True
         folded_confidence = None
         confidence_tap = None
         folded = False

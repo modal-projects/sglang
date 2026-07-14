@@ -1165,6 +1165,12 @@ class ServerArgs:
         bool,
         "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
     ] = False
+    max_req_input_tokens: A[
+        Optional[int],
+        "Reject requests whose input exceeds this many tokens with a clean 400, "
+        "without changing the model's advertised context length. An admission "
+        "policy limit, distinct from --context-length.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Streaming

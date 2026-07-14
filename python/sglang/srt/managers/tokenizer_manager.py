@@ -280,6 +280,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_lora = server_args.enable_lora
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
+        self.max_req_input_tokens = server_args.max_req_input_tokens
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -972,6 +973,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
+
+        # Admission policy limit, independent of the model's context length.
+        if (
+            self.max_req_input_tokens is not None
+            and input_token_num > self.max_req_input_tokens
+        ):
+            raise ValueError(
+                f"The input ({input_token_num} tokens) exceeds this server's "
+                f"per-request input limit ({self.max_req_input_tokens} tokens)."
+            )
 
         # Validate input length
         if input_token_num >= self.context_len:

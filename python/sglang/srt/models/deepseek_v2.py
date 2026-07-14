@@ -2573,6 +2573,13 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = []
         if self.pp_group.is_first_rank:
             topk_indices = None
+        else:
+            # Aux hidden capture (DFlash/EAGLE3) under PP: earlier stages relay
+            # their packed captures via the proxy dict; seed the list so this
+            # stage's own captures append after them in layer order.
+            _proxy_aux = pp_proxy_tensors.tensors.get("aux_hidden_states")
+            if _proxy_aux is not None:
+                aux_hidden_states.append(_proxy_aux)
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2615,6 +2622,14 @@ class DeepseekV2Model(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual,
             }
+            if aux_hidden_states:
+                # Relay this stage's (and predecessors') captures as one packed
+                # tensor; PPProxyTensors carries flat tensors only.
+                proxy_tensors["aux_hidden_states"] = (
+                    aux_hidden_states[0]
+                    if len(aux_hidden_states) == 1
+                    else torch.cat(aux_hidden_states, dim=-1)
+                )
             if (
                 self.use_dsa
                 and dsa_forward_uses_topk
@@ -2824,10 +2839,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Minor fix for multi-modal model: input_ids is None
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        # Minor fix for multi-modal model: input_ids is None.
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        elif pp_proxy_tensors is not None:
+            # On non-first PP ranks both input_ids and input_embeds are None (the
+            # stage receives activations via pp_proxy_tensors), so fall back to the
+            # incoming hidden-state length. len_input_ids only feeds context-parallel
+            # split decisions, which are disabled when cp_size == 1.
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
+        else:
+            raise ValueError("input_ids, input_embeds, or pp_proxy_tensors must be provided")
+
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch
@@ -2854,7 +2879,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and self.pp_group.is_last_rank:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -2912,9 +2937,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."

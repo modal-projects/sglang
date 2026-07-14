@@ -248,6 +248,8 @@ class FlashAttentionForwardSm100:
         self.bias_n_max = rel_extent_padded // n_block_size if has_bias else 0
         self.bias_block_size = bias_block_size
         self.bias_stage = 2 if (self.q_stage == 2 or (self.q_stage == 1 and not is_split_kv)) else 1
+        if "biasstage4" in _FA4_PROBE and self.bias_stage == 2:
+            self.bias_stage = 4
         assert self.bias_stage >= self.q_stage
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)

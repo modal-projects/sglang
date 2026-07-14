@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from dataclasses import dataclass
 
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
@@ -25,6 +26,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
+
+# Perf-attribution probes (numerics-breaking, bench only): FA4_PROBE in
+# {"norescale", "noregbump"}. Read at import; set env before importing.
+_FA4_PROBE = os.environ.get("FA4_PROBE", "")
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.blockscaled_layout as blockscaled_layout
@@ -385,7 +390,7 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
-            if self.has_bias:
+            if self.has_bias and _FA4_PROBE != "noregbump":
                 self.num_regs_softmax += 8
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
@@ -3595,7 +3600,7 @@ class FlashAttentionForwardSm100:
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(self.has_bias and not apply_bias):
+        if const_expr(self.has_bias and not apply_bias and _FA4_PROBE != "norescale"):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
             for j in cutlass.range_constexpr(cute.size(tSrS_t2r.shape)):

@@ -493,11 +493,6 @@ class FlashAttentionForwardSm100:
                 # Pre-existing constraint: sheared-bias + q_stage=2 runs with a
                 # single bf16 V buffer.
                 v_mma_stage, kv_stage = 1, kv_stage_1buf
-            elif kv_stage_2buf < 4 and kv_stage_1buf >= 4:
-                # Trade PV double-buffering for TMA pipeline depth (decode is
-                # latency-bound; dequant_v's delay_v_mma_acquire path partially
-                # recovers the overlap at v_mma_stage=1).
-                v_mma_stage, kv_stage = 1, kv_stage_1buf
             elif kv_stage_2buf >= 2:
                 v_mma_stage, kv_stage = 2, kv_stage_2buf
             else:

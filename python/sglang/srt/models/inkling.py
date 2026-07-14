@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import re
 from typing import Iterable, Optional, Set, Tuple
 
@@ -673,6 +674,13 @@ class InklingCausalLLM(nn.Module):
             bool(self._dflash_layers_to_capture)
             and not forward_batch.forward_mode.is_idle()
         )
+        # fp8-NaN bisect probe (INKLING_NAN_PROBE=1): report the first layer
+        # whose output goes non-finite. Syncs per layer — debug only. Skipped
+        # while a CUDA graph is capturing (.item() is capture-illegal).
+        nan_probe = (
+            os.environ.get("INKLING_NAN_PROBE") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        )
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states,
@@ -687,6 +695,21 @@ class InklingCausalLLM(nn.Module):
             )
             prev_mlp_sconv = layer.mlp_sconv
             prev_mlp_partial = fuse_ar_sconv and layer.mlp_ar_fusable
+            if nan_probe and not prev_mlp_partial:
+                h_bad = ~torch.isfinite(hidden_states)
+                r_bad = (
+                    ~torch.isfinite(residual) if residual is not None else None
+                )
+                if h_bad.any() or (r_bad is not None and r_bad.any()):
+                    print(
+                        f"[nan-probe] layer {layer.layer_id} "
+                        f"(local={getattr(layer, 'is_local', '?')}): "
+                        f"hidden non-finite {h_bad.sum().item()}/{h_bad.numel()}, "
+                        f"residual non-finite "
+                        f"{r_bad.sum().item() if r_bad is not None else 0}",
+                        flush=True,
+                    )
+                    nan_probe = False  # first offender only
             if capture_aux and layer.layer_id in self._dflash_layers_to_capture:
                 # Tapped layers have mlp_ar_fusable forced off, so
                 # hidden_states here is always fully reduced.

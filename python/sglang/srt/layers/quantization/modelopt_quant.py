@@ -83,6 +83,17 @@ try:
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
+    # A failed import here silently drops the TRTLLM weight alignment
+    # (g1_scale_c never created) and falls through to cutlass, which later
+    # crashes as `PackedTopKOutput has no attribute topk_weights`. Surface it.
+    import traceback
+
+    print(
+        "[modelopt_quant] flashinfer fp4 import FAILED — TRTLLM fp4 GEMM "
+        "disabled, falling back to cutlass:",
+        flush=True,
+    )
+    traceback.print_exc()
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None

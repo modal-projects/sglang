@@ -3246,6 +3246,12 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
+            if const_expr(self.has_bias and _FA4_FOLD_SCALE):
+                # Folded domain with per-tensor fp8 descales: exp2 base carries
+                # softmax_scale*qk_descale, so the (already 1/softmax_scale
+                # pre-scaled) bias still needs the 1/qk_descale factor.
+                softmax_scale_eff = 1.0 / qk_descale
+
             rescale_threshold = (
                 8.0 if const_expr(self.v_mma_dtype.width == 16) else
                 4.0 if const_expr(self.v_mma_dtype.width == 8) else
@@ -3599,7 +3605,9 @@ class FlashAttentionForwardSm100:
                     for j in cutlass.range_constexpr(cute.size(tBrS_cur.shape)):
                         if const_expr(not _FA4_FOLD_SCALE):
                             tBrS_cur[j] = tBrS_cur[j] * bias_softmax_scale
-                        tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype)
+                            tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype)
+                        else:
+                            tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype) * bias_softmax_scale
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwdSm100.Softmax) + stage, number_of_threads=128,

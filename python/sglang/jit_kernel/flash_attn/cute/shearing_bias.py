@@ -44,10 +44,11 @@ class ShearingBias:
         # tensor (total_q, h, rel_extent), take mR (total_q, h, rel_rank) and
         # mProj (h, rel_rank, rel_extent) and compute each prebias row in-kernel
         # (rel_rank-FMA dot per element) into sPreBias before the shear stage.
+        # mProj is read directly from gmem in the dot loop (it is small and
+        # L2-resident, and each warp reuses only its own head's 16 x rel_extent
+        # slice); each warp indexes the row's own q head, so pack_gqa works.
         self.fused_proj = fused_proj
         self.rel_rank = 16
-        if fused_proj:
-            assert not pack_gqa, "fused_proj is not supported with pack_gqa"
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         if self.pack_gqa:
@@ -139,12 +140,6 @@ class ShearingBias:
         sBias_layout = cute.make_ordered_layout(bias_tile_shape, order=(1, 0))
         sPreBias_size = cute.cosize(sPreBias_layout)
         sBias_size = cute.cosize(sBias_layout)
-        if const_expr(self.fused_proj):
-            proj_tile_shape = (self.rel_rank, self.rel_extent)
-            sProj_layout = cute.make_ordered_layout(proj_tile_shape, order=(1, 0))
-            sProj_size = cute.cosize(sProj_layout)
-        else:
-            sProj_layout = None
 
         in_major_size = math.gcd(256, self.rel_extent)
         assert in_major_size % 128 == 0
@@ -165,34 +160,16 @@ class ShearingBias:
             self.num_s2g_threads,
         )
 
-        if const_expr(self.fused_proj):
-
-            @cute.struct
-            class SharedStorage:
-                sPreBias: cute.struct.Align[
-                    cute.struct.MemRange[self.bias_dtype, sPreBias_size],
-                    self.buffer_align_bytes,
-                ]
-                sBias: cute.struct.Align[
-                    cute.struct.MemRange[self.bias_dtype, sBias_size],
-                    self.buffer_align_bytes,
-                ]
-                sProj: cute.struct.Align[
-                    cute.struct.MemRange[self.bias_dtype, sProj_size],
-                    self.buffer_align_bytes,
-                ]
-        else:
-
-            @cute.struct
-            class SharedStorage:
-                sPreBias: cute.struct.Align[
-                    cute.struct.MemRange[self.bias_dtype, sPreBias_size],
-                    self.buffer_align_bytes,
-                ]
-                sBias: cute.struct.Align[
-                    cute.struct.MemRange[self.bias_dtype, sBias_size],
-                    self.buffer_align_bytes,
-                ]
+        @cute.struct
+        class SharedStorage:
+            sPreBias: cute.struct.Align[
+                cute.struct.MemRange[self.bias_dtype, sPreBias_size],
+                self.buffer_align_bytes,
+            ]
+            sBias: cute.struct.Align[
+                cute.struct.MemRange[self.bias_dtype, sBias_size],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -273,7 +250,6 @@ class ShearingBias:
             mBlocksToBatchIdx,
             sPreBias_layout,
             sBias_layout,
-            sProj_layout,
             window_size_left,
             window_size_right,
             g2s_tiled_copy,
@@ -303,7 +279,6 @@ class ShearingBias:
         mBlocksToBatchIdx: Optional[cute.Tensor],
         sPreBias_layout: cute.ComposedLayout | cute.Layout,
         sBias_layout: cute.ComposedLayout | cute.Layout,
-        sProj_layout: Optional[cute.ComposedLayout | cute.Layout],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         g2s_tiled_copy: cute.TiledCopy,
@@ -320,10 +295,6 @@ class ShearingBias:
 
         sPreBias = storage.sPreBias.get_tensor(sPreBias_layout)
         sBias = storage.sBias.get_tensor(sBias_layout)
-        if const_expr(self.fused_proj):
-            sProj = storage.sProj.get_tensor(sProj_layout)
-        else:
-            sProj = None
 
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
         tile_scheduler = TileSchedulerCls()
@@ -375,22 +346,10 @@ class ShearingBias:
 
             g2s_thr_copy = g2s_tiled_copy.get_slice(tidx)
 
-            if const_expr(self.fused_proj):
-                # g2s-copy the per-head proj slab (rel_rank, rel_extent) once per CTA.
-                # The prebias rows are computed in-kernel from mR (= mPreBias) and sProj
-                # after the async copy completes.
-                gProj = mProj[head_idx, None, None]
-
-                # (V, M, N)
-                tBgProj = g2s_thr_copy.partition_S(gProj)
-                tBsProj = g2s_thr_copy.partition_D(sProj)
-
-                if (
-                    const_expr(self.num_g2s_threads == self.num_threads)
-                    or warp_idx < self.num_g2s_threads // 32
-                ):
-                    cute.copy(g2s_tiled_copy, tBgProj, tBsProj)
-            else:
+            # In fused mode there is nothing to prefetch: the prebias rows are
+            # computed below from mR (= mPreBias) and per-element gmem reads of
+            # mProj (small, L2-resident).
+            if const_expr(not self.fused_proj):
                 # (rows_per_cta, rel_extent)
                 gPreBias = cute.local_tile(mPreBias_cur, self.cta_tiler, (m_block, 0))
                 cPreBias = cute.make_identity_tensor(self.cta_tiler)

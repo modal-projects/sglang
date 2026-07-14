@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import cache
 
+import os
 import torch
 from torch import nn
 
@@ -266,6 +267,24 @@ class InklingAttention(nn.Module):
         q, k, v, r = qkvr.split(split_sizes, dim=-1)
         return q, k, v, r
 
+
+    def _fa4_rel_proj(self, dtype: torch.dtype) -> torch.Tensor:
+        """Per-head [H, d_rel, extent] proj for the W4a fused shear kernel.
+
+        The learned proj is shared across heads; expand once and cache. Under
+        FA4_FOLD_SCALE the kernel expects the bias pre-divided by
+        softmax_scale, folded here into the proj weights (x head_dim, exact).
+        """
+        cached = getattr(self, "_fa4_rel_proj_cache", None)
+        if cached is None or cached.dtype != dtype:
+            proj = self.rel_logits_proj.proj
+            if os.environ.get("FA4_FOLD_SCALE", "") == "1":
+                proj = proj * (1.0 / self.scaling)
+            self._fa4_rel_proj_cache = (
+                proj.to(dtype).unsqueeze(0).expand(self.num_tp_heads, -1, -1).contiguous()
+            )
+        return self._fa4_rel_proj_cache
+
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
         (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
@@ -346,6 +365,13 @@ class InklingAttention(nn.Module):
         r = r.view(num_tokens, -1, self.d_rel)
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
+        # W4a fused rel-bias: skip rel_logits materialization entirely; the
+        # FA4 shear kernel computes prebias rows as rel_r @ rel_proj. Rides
+        # the sheared path (score_mod keeps the materialized tensor).
+        fused_rel = (
+            envs.SGLANG_OPT_USE_INKLING_FUSED_REL_PROJ.get()
+            and envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
+        )
 
         server_args = get_global_server_args()
         assert server_args.attention_backend == "fa4"
@@ -371,13 +397,14 @@ class InklingAttention(nn.Module):
             current_stream = get_current_device_stream_fast()
             self.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.alt_stream):
-                rel_logits = self.rel_logits_proj(r)
-                if apply_log_scaling:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
-                rel_event = torch.cuda.Event()
-                rel_event.record()
+                if not fused_rel:
+                    rel_logits = self.rel_logits_proj(r)
+                    if apply_log_scaling:
+                        rel_logits = _apply_log_scaling_tau(
+                            rel_logits, log_scaling_tau.view(-1, 1, 1)
+                        )
+                    rel_event = torch.cuda.Event()
+                    rel_event.record()
             q, k, v, prologue_did_store = self._fused_attn_prologue_verify(
                 q, k, v, forward_batch
             )
@@ -407,13 +434,14 @@ class InklingAttention(nn.Module):
                     v = self.v_sconv(v, positions, forward_batch)
                 v_event = torch.cuda.Event()
                 v_event.record()
-                rel_logits = self.rel_logits_proj(r)
-                if apply_log_scaling:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
-                rel_event = torch.cuda.Event()
-                rel_event.record()
+                if not fused_rel:
+                    rel_logits = self.rel_logits_proj(r)
+                    if apply_log_scaling:
+                        rel_logits = _apply_log_scaling_tau(
+                            rel_logits, log_scaling_tau.view(-1, 1, 1)
+                        )
+                    rel_event = torch.cuda.Event()
+                    rel_event.record()
             if self.kv_conv:
                 assert self.k_sconv is not None
                 k = self.k_sconv(k, positions, forward_batch)
@@ -448,7 +476,7 @@ class InklingAttention(nn.Module):
         if use_alt:
             # v (produced on the alt stream) must be ready before attn reads it.
             current_stream.wait_event(v_event)
-        elif not fused_prologue:
+        elif not fused_prologue and not fused_rel:
             rel_logits = self.rel_logits_proj(r)
             if apply_log_scaling:
                 rel_logits = _apply_log_scaling_tau(
@@ -479,18 +507,35 @@ class InklingAttention(nn.Module):
             extra_attn_kwargs["v_descale"] = v_mxfp.scale.view(torch.float8_e8m0fnu)
 
         if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get():
-            # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
-            # it into a column-aligned pre-softmax bias.
-            attn_output = self.attn(
-                q,
-                k,
-                v,
-                forward_batch,
-                save_kv_cache=not prologue_did_store,
-                rel_bias=rel_logits,
-                rel_bias_event=rel_event,
-                **extra_attn_kwargs,
-            )
+            if fused_rel:
+                # W4a: kernel-side r @ proj. Fold the per-token log-scaling
+                # tau into rel_r (linear in the bias) instead of rel_logits.
+                rel_r = r
+                if apply_log_scaling:
+                    rel_r = rel_r * log_scaling_tau.view(-1, 1, 1)
+                attn_output = self.attn(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    save_kv_cache=not prologue_did_store,
+                    rel_r=rel_r,
+                    rel_proj=self._fa4_rel_proj(r.dtype),
+                    **extra_attn_kwargs,
+                )
+            else:
+                # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
+                # it into a column-aligned pre-softmax bias.
+                attn_output = self.attn(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    save_kv_cache=not prologue_did_store,
+                    rel_bias=rel_logits,
+                    rel_bias_event=rel_event,
+                    **extra_attn_kwargs,
+                )
         else:
             # The score_mod / aux_tensors path can't carry the event into the
             # kernel, so join rel_logits on the current stream before self.attn.

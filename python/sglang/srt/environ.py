@@ -878,6 +878,12 @@ class Envs:
     # padding seqs); replay pads real batches up to it, wider batches fall
     # back to eager. Per-bucket effective value is min(this, bucket tokens).
     SGLANG_OPT_INKLING_BCG_CAPTURE_BS = EnvInt(32)
+    # W4a fused rel-bias: pass rel_r + rel_proj to FA4's ShearingBias so the
+    # kernel computes prebias rows in-kernel (r @ proj) instead of the layer
+    # materializing rel_logits ([tokens, heads, extent] transients). Requires
+    # SGLANG_OPT_USE_INKLING_SHEARED_BIAS=1; pair with FA4_FOLD_SCALE=1 (the
+    # 1/softmax_scale prescale then folds into the cached proj weights).
+    SGLANG_OPT_USE_INKLING_FUSED_REL_PROJ = EnvBool(False)
     # Route symm_mem_all_reduce through the autotuned custom JIT all-reduce
     # (two-shot / multimem kernels in jit_kernel/inkling_all_reduce.py) instead of
     # torch multimem. Opt-in; falls back to multimem for shapes where it wins.

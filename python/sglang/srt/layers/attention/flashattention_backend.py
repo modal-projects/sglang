@@ -1155,6 +1155,8 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        rel_r=None,
+        rel_proj=None,
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1280,6 +1282,16 @@ class FlashAttentionBackend(AttentionBackend):
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
+        if rel_r is not None:
+            if self.fa_impl_ver != 4:
+                raise RuntimeError(
+                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
+                )
+            kwargs["rel_r"] = rel_r
+            kwargs["rel_proj"] = rel_proj
+            if metadata.rel_bias_prep_cache is None:
+                metadata.rel_bias_prep_cache = {}
+            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
                 raise RuntimeError("rel_bias (sheared bias) is only supported by the FA4 backend.")
@@ -1710,6 +1722,8 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        rel_r=None,
+        rel_proj=None,
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1774,6 +1788,16 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["score_mod"] = score_mod
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
+        if rel_r is not None:
+            if self.fa_impl_ver != 4:
+                raise RuntimeError(
+                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
+                )
+            kwargs["rel_r"] = rel_r
+            kwargs["rel_proj"] = rel_proj
+            if metadata.rel_bias_prep_cache is None:
+                metadata.rel_bias_prep_cache = {}
+            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
                 raise RuntimeError("rel_bias (sheared bias) is only supported by the FA4 backend.")

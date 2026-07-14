@@ -427,8 +427,16 @@ class ShearingBias:
                 # Compute the prebias rows in smem: warp `warp_idx` owns row
                 # `warp_idx`, its lanes stride over the extent dimension. Each
                 # element is a rel_rank-FMA dot of the row's r vector with the
-                # per-head proj slab (fp32 accumulate, cast to bias dtype).
+                # row's per-head proj slice, read directly from gmem (fp32
+                # accumulate, cast to bias dtype). With pack_gqa the packed row
+                # index folds the q head as (m_idx % qhead_per_kvhead), matching
+                # the pack_gqa_layout mode-0 coordinate; without pack_gqa the
+                # expression degenerates to head_idx.
                 if m_idx // self.qhead_per_kvhead_packgqa < seqlen_info.seqlen_q:
+                    proj_head_idx = (
+                        head_idx * self.qhead_per_kvhead_packgqa
+                        + m_idx % self.qhead_per_kvhead_packgqa
+                    )
                     rR = cute.make_rmem_tensor((self.rel_rank,), dtype=Float32)
                     for k in cutlass.range_constexpr(self.rel_rank):
                         rR[k] = mPreBias_cur[m_idx, k].to(Float32)
@@ -436,7 +444,7 @@ class ShearingBias:
                         e_idx = e_iter * 32 + lane_idx
                         acc = Float32(0.0)
                         for k in cutlass.range_constexpr(self.rel_rank):
-                            acc += rR[k] * sProj[k, e_idx].to(Float32)
+                            acc += rR[k] * mProj[proj_head_idx, k, e_idx].to(Float32)
                         sPreBias[warp_idx, e_idx] = self.bias_dtype(acc)
                 # The shear stage below only reads this warp's own row of
                 # sPreBias, so a warp-level sync is sufficient.

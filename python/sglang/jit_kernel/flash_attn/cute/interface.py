@@ -725,7 +725,6 @@ def _flash_attn_fwd(
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
         max_m_blocks_leq_one = False
         if fused_rel_proj:
-            assert not pack_gqa, "rel_r/rel_proj (fused projection) not supported with pack_gqa"
             rel_r = maybe_contiguous(rel_r)
             rel_proj = maybe_contiguous(rel_proj)
             assert rel_r.dtype == rel_proj.dtype

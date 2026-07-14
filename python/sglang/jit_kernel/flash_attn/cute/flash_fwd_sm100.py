@@ -390,7 +390,7 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
-            if self.has_bias and _FA4_PROBE != "noregbump":
+            if self.has_bias and "noregbump" not in _FA4_PROBE:
                 self.num_regs_softmax += 8
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
@@ -3600,7 +3600,7 @@ class FlashAttentionForwardSm100:
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(self.has_bias and not apply_bias and _FA4_PROBE != "norescale"):
+        if const_expr(self.has_bias and not apply_bias and "norescale" not in _FA4_PROBE):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
             for j in cutlass.range_constexpr(cute.size(tSrS_t2r.shape)):

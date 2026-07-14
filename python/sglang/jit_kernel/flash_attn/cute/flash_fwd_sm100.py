@@ -30,6 +30,9 @@ from cutlass.cute.nvgpu import cpasync
 # Perf-attribution probes (numerics-breaking, bench only): FA4_PROBE in
 # {"norescale", "noregbump"}. Read at import; set env before importing.
 _FA4_PROBE = os.environ.get("FA4_PROBE", "")
+# Fold softmax scale into the exp2 base even with bias: scores stay unscaled,
+# host passes rel_bias pre-multiplied by 1/softmax_scale (exact for 1/128).
+_FA4_FOLD_SCALE = os.environ.get("FA4_FOLD_SCALE", "") == "1"
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.blockscaled_layout as blockscaled_layout
@@ -392,6 +395,8 @@ class FlashAttentionForwardSm100:
                 self.num_regs_correction = 64
             if self.has_bias and "noregbump" not in _FA4_PROBE:
                 self.num_regs_softmax += 8
+                if "rebalance" in _FA4_PROBE:
+                    self.num_regs_correction -= 16
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
@@ -1165,7 +1170,7 @@ class FlashAttentionForwardSm100:
         # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
         # through the same runtime kernel argument as the score_mod path so the device
         # code sees identical operand kinds (constant vs register changes codegen).
-        if const_expr(self.has_bias):
+        if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
             base_softmax_scale = softmax_scale
             softmax_scale_log2, softmax_scale = utils.LOG2_E, None
         else:
@@ -3231,7 +3236,7 @@ class FlashAttentionForwardSm100:
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
             max_offset = 8 if cutlass.const_expr(self.v_mma_dtype.width == 8) else 0
-            if const_expr(self.has_bias):
+            if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = base_softmax_scale * qk_descale
             elif const_expr(self.score_mod is None):
@@ -3592,7 +3597,8 @@ class FlashAttentionForwardSm100:
                     tS2RrBias_cur = cute.make_fragment_like(tS2RsBias[None, 0, 0, 0])
                     cute.copy(bias_s2r_thr_copy, tS2RsBias_cur, tS2RrBias_cur)
                     for j in cutlass.range_constexpr(cute.size(tBrS_cur.shape)):
-                        tBrS_cur[j] = tBrS_cur[j] * bias_softmax_scale
+                        if const_expr(not _FA4_FOLD_SCALE):
+                            tBrS_cur[j] = tBrS_cur[j] * bias_softmax_scale
                         tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype)
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
@@ -3600,7 +3606,7 @@ class FlashAttentionForwardSm100:
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(self.has_bias and not apply_bias and "norescale" not in _FA4_PROBE):
+        if const_expr(self.has_bias and not apply_bias and "norescale" not in _FA4_PROBE and not _FA4_FOLD_SCALE):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
             for j in cutlass.range_constexpr(cute.size(tSrS_t2r.shape)):
@@ -3785,7 +3791,7 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
             qk_descale, v_descale = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
-            if const_expr(self.has_bias):
+            if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
                 softmax_scale_log2_eff = softmax_scale_log2
             elif const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale

@@ -1067,7 +1067,29 @@ class FlashAttentionForwardSm100:
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
         if const_expr(self.overlap_sO_sQ and self.has_bias):
+            # With bias, sO (recast over sQ's smem below) is allowed to spill
+            # past sQ into sK/sBias instead of inflating sQ to cosize(sO).
+            # The spill is race-free: under overlap_sO_sQ the MMA warp commits
+            # pipeline_o_acc for all stages only after the final gemms, so
+            # every K/V/bias smem read of the (single) work tile has completed
+            # before the correction epilogue writes sO. But the spill must
+            # stay inside the shared-memory struct: with split-KV (fp32
+            # partials double sO) + fp8 KV (kv_stage pinned to 2, small sK) +
+            # decode-shaped bias tiles (tile_bias < 128, tiny sBias), sQ + sK
+            # + sBias can be SMALLER than sO, and the unpredicated sO stores
+            # then land past the smem allocation -> cudaErrorIllegalAddress.
+            # Pad sQ by the shortfall so the struct always covers sO.
             sQ_size = cute.cosize(sQ_layout)
+            o_bytes = cute.cosize(sO_layout) * self.o_dtype.width // 8
+            covered_bytes = (
+                sQ_size * self.q_dtype.width // 8
+                + cute.cosize(sK_layout) * self.k_dtype.width // 8
+                + sBias_size * self.bias_dtype.width // 8
+            )
+            shortfall_bytes = cutlass.max(o_bytes - covered_bytes, 0)
+            sQ_size = sQ_size + (
+                (shortfall_bytes * 8 + self.q_dtype.width - 1) // self.q_dtype.width
+            )
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0

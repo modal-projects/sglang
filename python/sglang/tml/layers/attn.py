@@ -510,9 +510,14 @@ class InklingAttention(nn.Module):
             if fused_rel:
                 # W4a: kernel-side r @ proj. Fold the per-token log-scaling
                 # tau into rel_r (linear in the bias) instead of rel_logits.
+                # Same fp32-multiply-then-cast as the rel_logits path — a raw
+                # multiply would promote to fp32 and trip the kernel's
+                # rel_r/rel_proj dtype match.
                 rel_r = r
                 if apply_log_scaling:
-                    rel_r = rel_r * log_scaling_tau.view(-1, 1, 1)
+                    rel_r = _apply_log_scaling_tau(
+                        rel_r, log_scaling_tau.view(-1, 1, 1)
+                    )
                 attn_output = self.attn(
                     q,
                     k,

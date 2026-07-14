@@ -483,7 +483,18 @@ def extend(reqs, model_runner):
 
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
+    # Diagnosis hook (fp8 NaN-logits-print anomaly): the printed logits were
+    # all-NaN while greedy sampling was provably correct, so check whether the
+    # tensor is corrupted before or after sample().
+    _lg = logits_output.next_token_logits
+    _pre = torch.isfinite(_lg).float().mean().item()
     next_token_ids = model_runner.sample(logits_output, forward_batch)
+    _post = torch.isfinite(_lg).float().mean().item()
+    print(
+        f"[extend-debug] next_token_logits finite fraction: pre-sample={_pre:.4f} "
+        f"post-sample={_post:.4f} ptr={_lg.data_ptr():#x} dtype={_lg.dtype}",
+        flush=True,
+    )
     return next_token_ids, logits_output.next_token_logits, batch
 
 

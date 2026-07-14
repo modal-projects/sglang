@@ -26,6 +26,7 @@ import abc
 import copy
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -1783,6 +1784,19 @@ class MHATokenToKVPool(KVCache):
                 # can exceed the fp8 range — one out-of-range value poisons
                 # the whole forward (first seen: Inkling layer 47).
                 finfo = torch.finfo(self.dtype)
+                if os.environ.get("INKLING_FP8_CLIP_STATS") == "1":
+                    # Sizes the saturation distortion (syncs; debug only).
+                    k_clip = (cache_k.abs() > finfo.max).sum().item()
+                    v_clip = (cache_v.abs() > finfo.max).sum().item()
+                    if k_clip or v_clip:
+                        print(
+                            f"[fp8-clip] layer {layer_id}: "
+                            f"k {k_clip}/{cache_k.numel()} "
+                            f"v {v_clip}/{cache_v.numel()} "
+                            f"kmax {cache_k.abs().max().item():.0f} "
+                            f"vmax {cache_v.abs().max().item():.0f}",
+                            flush=True,
+                        )
                 cache_k = cache_k.clamp(finfo.min, finfo.max)
                 cache_v = cache_v.clamp(finfo.min, finfo.max)
             cache_k = cache_k.to(self.dtype)
@@ -1915,6 +1929,19 @@ class MHATokenToKVPool(KVCache):
                 # can exceed the fp8 range — one out-of-range value poisons
                 # the whole forward (first seen: Inkling layer 47).
                 finfo = torch.finfo(self.dtype)
+                if os.environ.get("INKLING_FP8_CLIP_STATS") == "1":
+                    # Sizes the saturation distortion (syncs; debug only).
+                    k_clip = (cache_k.abs() > finfo.max).sum().item()
+                    v_clip = (cache_v.abs() > finfo.max).sum().item()
+                    if k_clip or v_clip:
+                        print(
+                            f"[fp8-clip] layer {layer_id}: "
+                            f"k {k_clip}/{cache_k.numel()} "
+                            f"v {v_clip}/{cache_v.numel()} "
+                            f"kmax {cache_k.abs().max().item():.0f} "
+                            f"vmax {cache_v.abs().max().item():.0f}",
+                            flush=True,
+                        )
                 cache_k = cache_k.clamp(finfo.min, finfo.max)
                 cache_v = cache_v.clamp(finfo.min, finfo.max)
             cache_k = cache_k.to(self.dtype)

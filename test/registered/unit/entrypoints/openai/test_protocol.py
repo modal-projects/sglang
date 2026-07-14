@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
+import json
 import unittest
 from typing import List, Optional
 
@@ -31,6 +32,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -110,7 +112,7 @@ class TestCompletionRequest(unittest.TestCase):
             CompletionRequest(model="test-model")  # missing prompt
 
 
-class TestChatCompletionRequest(unittest.TestCase):
+class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
 
     def test_basic_chat_completion_request(self):
@@ -140,6 +142,46 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["max_new_tokens"], 150)
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
+
+    def test_required_tool_constraint_overrides_response_format(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "final_answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"},
+                        },
+                        "required": ["answer"],
+                    },
+                },
+            },
+        )
+        tool_schema = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": ["search"]},
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                "required": ["name", "parameters"],
+            },
+        }
+
+        params = req.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=("json_schema", tool_schema),
+        )
+
+        self.assertEqual(json.loads(params["json_schema"]), tool_schema)
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""

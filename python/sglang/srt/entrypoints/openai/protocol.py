@@ -885,6 +885,22 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        def apply_tool_call_constraint(
+            constraint: ToolCallConstraint,
+            params: Dict[str, Any],
+        ) -> None:
+            constraint_type, constraint_value = constraint
+            if constraint_type == "structural_tag":
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                )
+            elif constraint_type == "json_schema":
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value  # type: ignore
+                )
+            else:
+                params[constraint_type] = constraint_value
+
         # add per user request
         spaces_between_special_tokens = (
             True
@@ -937,19 +953,23 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
-            constraint_type, constraint_value = tool_call_constraint
-            if constraint_type == "structural_tag":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
+            if self.tool_choice == "required":
+                logger.warning(
+                    "tool_choice='required' is overriding existing constrained "
+                    "decoding parameters."
                 )
-            elif constraint_type == "json_schema":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value  # type: ignore
-                )
+                for constraint_type in (
+                    "regex",
+                    "ebnf",
+                    "structural_tag",
+                    "json_schema",
+                ):
+                    sampling_params.pop(constraint_type, None)
+                apply_tool_call_constraint(tool_call_constraint, sampling_params)
             else:
-                sampling_params[constraint_type] = constraint_value
+                logger.warning("Constrained decoding is not compatible with tool calls.")
+        elif tool_call_constraint:
+            apply_tool_call_constraint(tool_call_constraint, sampling_params)
 
         return sampling_params
 

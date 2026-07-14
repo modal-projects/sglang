@@ -1777,6 +1777,14 @@ class MHATokenToKVPool(KVCache):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Saturate: plain .to(fp8) maps overflow to NaN (e4m3fn has no
+                # inf), and with identity descales (uncalibrated ckpts) K/V
+                # can exceed the fp8 range — one out-of-range value poisons
+                # the whole forward (first seen: Inkling layer 47).
+                finfo = torch.finfo(self.dtype)
+                cache_k = cache_k.clamp(finfo.min, finfo.max)
+                cache_v = cache_v.clamp(finfo.min, finfo.max)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -1901,6 +1909,14 @@ class MHATokenToKVPool(KVCache):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Saturate: plain .to(fp8) maps overflow to NaN (e4m3fn has no
+                # inf), and with identity descales (uncalibrated ckpts) K/V
+                # can exceed the fp8 range — one out-of-range value poisons
+                # the whole forward (first seen: Inkling layer 47).
+                finfo = torch.finfo(self.dtype)
+                cache_k = cache_k.clamp(finfo.min, finfo.max)
+                cache_v = cache_v.clamp(finfo.min, finfo.max)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 

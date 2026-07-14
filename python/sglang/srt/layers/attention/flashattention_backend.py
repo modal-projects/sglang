@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import os
+
 import numpy as np
 import torch
 import triton
@@ -388,6 +390,12 @@ class FlashAttentionBackend(AttentionBackend):
             if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
             else 0
         )
+        # Debug/ops override (FA4_NUM_SPLITS=1 disables split-KV): the fp8 +
+        # sheared-bias fwd/combine faults with splits>1 (open kernel bug);
+        # forcing 1 split trades some decode latency for a working config.
+        _num_splits_env = os.environ.get("FA4_NUM_SPLITS")
+        if _num_splits_env is not None:
+            self.num_splits = int(_num_splits_env)
 
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V

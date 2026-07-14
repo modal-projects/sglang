@@ -432,10 +432,11 @@ class FlashAttentionForwardSm100:
             smem_size_k_per_stage += self.n_block_size * self.head_dim_padded // self.qk_sf_vec_size * self.sfk_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         if self.v_dequant:
-            # fp8 V scale bytes + the dequantized bf16 V (the fp8 V and its
-            # dequant target both live in smem; K and V no longer share).
+            # fp8 V scale bytes ride each kv stage (the fp8 V and K no longer
+            # share smem). The dequantized bf16 V is NOT per-kv-stage: it is a
+            # separate v_mma_stage-deep buffer (PV consumer depth), accounted
+            # as a fixed cost in the kv_stage formula below.
             smem_size_v_per_stage += self.n_block_size * self.head_dim_v_padded // self.v_sf_vec_size * self.sfv_dtype.width // 8
-            smem_size_v_per_stage += self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
         if self.v_dequant:
             # v_dequant uses separate K and V pipelines, so their smem is not shared.
             smem_size_kv_per_stage = smem_size_k_per_stage + smem_size_v_per_stage
@@ -461,10 +462,48 @@ class FlashAttentionForwardSm100:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         v_mma_stage = kv_stage
-        # TODO: revisit hard-coded stage counts for mxfp8
-        if self.v_dtype.width == 8:
+        if self.v_dtype.width == 8 and not self.v_dequant:
+            # Plain (per-tensor) fp8 V: keep the bring-up hardcode untouched.
             kv_stage = 2
             v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else kv_stage
+        elif self.v_dequant:
+            # W7-1: decoupled staging for the mxfp8 v_dequant path.
+            #   kv_stage    = depth of the fp8 K(+SFK) / V(+SFV) TMA pipelines
+            #                 (pipeline_kv / pipeline_vq): latency hiding.
+            #   v_mma_stage = depth of the dequantized bf16 V buffer
+            #                 (pipeline_v_mma): the PV consumer depth. The
+            #                 correction warps write exactly one bf16 tile per
+            #                 kv iteration, so this only needs to cover
+            #                 dequant/PV-MMA overlap, not TMA latency.
+            # Smem ledger at hd128 decode (q_stage=1, fp8 QKV, sf_vec=32), bytes:
+            #   fixed:      sQ 16384 + sSFQ 512 + sO 32768              = 49664
+            #   fixed:      bf16 sV 32768 * v_mma_stage
+            #   per stage:  K 16384 + SFK 512 + Vq 16384 + SFV 512      = 33792
+            #   v_mma_stage=2 -> kv_stage = (229376-49664-65536)//33792 = 3
+            #   v_mma_stage=1 -> kv_stage = (229376-49664-32768)//33792 = 4  <- picked
+            # (old hardcode: kv_stage=2 with the bf16 tile counted per kv stage,
+            #  i.e. 66560 B/stage).
+            bf16_v_bytes = (
+                self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
+            )
+            budget = 224 * 1024 - smem_size_q_o_bias
+            kv_stage_2buf = min((budget - 2 * bf16_v_bytes) // smem_size_kv_per_stage, 32)
+            kv_stage_1buf = min((budget - 1 * bf16_v_bytes) // smem_size_kv_per_stage, 32)
+            if self.has_bias and self.q_stage == 2:
+                # Pre-existing constraint: sheared-bias + q_stage=2 runs with a
+                # single bf16 V buffer.
+                v_mma_stage, kv_stage = 1, kv_stage_1buf
+            elif kv_stage_2buf < 4 and kv_stage_1buf >= 4:
+                # Trade PV double-buffering for TMA pipeline depth (decode is
+                # latency-bound; dequant_v's delay_v_mma_acquire path partially
+                # recovers the overlap at v_mma_stage=1).
+                v_mma_stage, kv_stage = 1, kv_stage_1buf
+            elif kv_stage_2buf >= 2:
+                v_mma_stage, kv_stage = 2, kv_stage_2buf
+            else:
+                v_mma_stage, kv_stage = 1, kv_stage_1buf
+            # Floor at the old hardcode; matches the previous smem-risk profile.
+            kv_stage = max(kv_stage, 2)
         self.kv_stage = kv_stage
         self.v_mma_stage = v_mma_stage
         # print("kv_stage", self.kv_stage)
@@ -478,6 +517,9 @@ class FlashAttentionForwardSm100:
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
+            # v_dequant keeps K and V in separate buffers; the uneven-KV trick
+            # assumes they share one, so never enable it there.
+            and not self.v_dequant
         )
         self.uneven_kv_smem_offset = (
             self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2

@@ -946,6 +946,12 @@ class InklingForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.llm.embed_tokens.weight, self.llm.lm_head.weight
 
+    @property
+    def lm_head(self):
+        # Spec-decode workers (DFLASH) address the target head generically as
+        # `model.lm_head`; delegate to the inner LLM.
+        return self.llm.lm_head
+
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         self.llm.set_dflash_layers_to_capture(layer_ids)
 

@@ -873,6 +873,11 @@ class Envs:
     # requires SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0 (score_mod path — the
     # sheared-bias block-schedule prep cache is not replay-refreshable yet).
     SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN = EnvBool(False)
+    # Batch-dimension capacity of captured-attention prefill graphs: each
+    # bucket captures with this many sequence slots (1 real + N-1 zero-length
+    # padding seqs); replay pads real batches up to it, wider batches fall
+    # back to eager. Per-bucket effective value is min(this, bucket tokens).
+    SGLANG_OPT_INKLING_BCG_CAPTURE_BS = EnvInt(32)
     # Route symm_mem_all_reduce through the autotuned custom JIT all-reduce
     # (two-shot / multimem kernels in jit_kernel/inkling_all_reduce.py) instead of
     # torch multimem. Opt-in; falls back to multimem for shapes where it wins.

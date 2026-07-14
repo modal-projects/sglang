@@ -291,6 +291,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             self.use_captured_attn_metadata = False
+        # Captured-attention graphs carry the batch dimension inside the
+        # graph, so each bucket captures with a fixed number of sequence
+        # slots (1 real + N-1 zero-length pads); replay pads real batches up
+        # to it and wider batches fall back to eager. A chunk of T tokens
+        # holds at most T sequences, hence min(cap, bucket tokens).
+        if self.use_captured_attn_metadata:
+            cap = getattr(
+                model_runner.attn_backend, "bcg_captured_metadata_max_bs", 1
+            )
+            self.bcg_capture_bs_of = {
+                n: max(1, min(cap, n, self.max_bs))
+                for n in self.capture_num_tokens
+            }
+        else:
+            self.bcg_capture_bs_of = None
         self.attn_metadata_buffers: Optional[Dict[int, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
@@ -530,19 +545,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
             return False
-        # Backends that capture attention metadata at a bounded batch size
-        # (FA4 phase-1 captures single-seq prefill only) can't replay wider
-        # batches; DSV4 leaves the attr unset (no limit).
-        if self.use_captured_attn_metadata:
-            captured_max_bs = getattr(
-                self.model_runner.attn_backend, "bcg_captured_metadata_max_bs", None
-            )
-            if (
-                captured_max_bs is not None
-                and forward_batch.batch_size > captured_max_bs
-            ):
-                return False
         num_tokens = len(forward_batch.input_ids)
+        # Captured-attention graphs carry a fixed per-bucket sequence-slot
+        # count; wider batches fall back to eager. (DSV4's captured
+        # metadata has no such limit — bcg_capture_bs_of is None there.)
+        if (
+            self.bcg_capture_bs_of is not None
+            and num_tokens <= self.max_num_tokens
+        ):
+            bucket = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+            if forward_batch.batch_size > self.bcg_capture_bs_of.get(bucket, 0):
+                return False
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -583,28 +596,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_prepare signature.
         """
         buffers = self.buffers
-        bs = 1
+        bs = (
+            self.bcg_capture_bs_of[num_tokens]
+            if self.bcg_capture_bs_of is not None
+            else 1
+        )
+
+        # Sequence layout of the capture batch: one real seq holding every
+        # token of the bucket, plus bs-1 zero-length padding seqs (their
+        # start locs sit at the end of the token range). Zero-length seqs
+        # are the same padding replay uses, so capture exercises them.
+        def _seq_pattern(first: int, rest: int = 0) -> torch.Tensor:
+            t = torch.full((bs,), rest, dtype=torch.int64, device=self.device)
+            t[0] = first
+            return t
 
         with torch.device(self.device):
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor([num_tokens], device=self.device),
-                "orig_seq_lens": torch.tensor([num_tokens], device=self.device),
-                "extend_seq_lens": torch.tensor([num_tokens], device=self.device),
-                "extend_prefix_lens": torch.tensor([0], device=self.device),
-                "extend_start_loc": torch.tensor([0], device=self.device),
+                "seq_lens": _seq_pattern(num_tokens),
+                "orig_seq_lens": _seq_pattern(num_tokens),
+                "extend_seq_lens": _seq_pattern(num_tokens),
+                "extend_prefix_lens": _seq_pattern(0),
+                "extend_start_loc": _seq_pattern(0, rest=num_tokens),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
-            s["seq_lens"][:bs].fill_(num_tokens)
-            s["extend_seq_lens"][:bs].fill_(num_tokens)
-            s["extend_prefix_lens"][:bs].zero_()
-            s["extend_start_loc"][:bs].zero_()
-            s["req_pool_indices"][:bs].copy_(
-                torch.arange(bs, device=s["req_pool_indices"].device)
-            )
-            s["orig_seq_lens"][:bs].fill_(num_tokens)
             for name in _PREFILL_STATIC_FIELDS:
+                s[name][:bs].copy_(shape_inputs[name])
                 shape_inputs[name] = s[name][:bs]
 
         registry = self.buffer_registry
@@ -652,7 +671,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                seq_lens_cpu=_seq_pattern(num_tokens).cpu(),
                 out_cache_loc=_slot("out_cache_loc"),
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=(
@@ -676,9 +695,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_prefix_lens_cpu=_seq_pattern(0).cpu(),
+                extend_seq_lens_cpu=_seq_pattern(num_tokens).cpu(),
+                extend_logprob_start_lens_cpu=_seq_pattern(
+                    num_tokens, rest=num_tokens
+                ).cpu(),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -787,11 +808,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size
+        # Captured-attention graphs read bs-shaped slots at the bucket's
+        # captured sequence-slot count: pad real batches up to it with
+        # zero-length seqs (fill_from zero-pads the bs-shaped slots).
+        if self.bcg_capture_bs_of is not None:
+            graph_bs = self.bcg_capture_bs_of[static_num_tokens]
+            assert bs <= graph_bs, f"{bs=} > captured slots {graph_bs=}"
+        else:
+            graph_bs = bs
 
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=bs,
-            padded_bs=bs,
+            padded_bs=graph_bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
         )
@@ -799,7 +828,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         registry = self.buffer_registry
 
         def _slot(name):
-            return registry.get_slot(name).slice_for(bs, static_num_tokens)
+            return registry.get_slot(name).slice_for(graph_bs, static_num_tokens)
 
         mamba_track_indices = (
             _slot("mamba_track_indices")
@@ -908,6 +937,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             s["req_pool_indices"][:bs].copy_(forward_batch.req_pool_indices)
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
+            if graph_bs > bs:
+                # Zero-length padding seqs for the captured graph's extra
+                # sequence slots: lens 0, prefix 0, start loc at the end of
+                # the real token range, dummy req slot 0. Stale values from
+                # a previous (wider) replay must not leak in.
+                for name in ("seq_lens", "extend_seq_lens", "extend_prefix_lens"):
+                    s[name][bs:graph_bs].zero_()
+                s["extend_start_loc"][bs:graph_bs].fill_(num_tokens)
+                s["req_pool_indices"][bs:graph_bs].zero_()
+                s["orig_seq_lens"][bs:graph_bs].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (

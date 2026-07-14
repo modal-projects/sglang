@@ -346,16 +346,19 @@ class FlashAttentionBackend(AttentionBackend):
         # extend metadata into stable tensors and refresh them in place at
         # replay, so the attention group can live INSIDE prefill breakable
         # CUDA graphs instead of running as a per-layer eager break.
-        # Phase 1 limits: fa4 only, single-sequence capture/replay (the
-        # runner captures prefill at bs=1; multi-seq batches fall back to
-        # eager via bcg_captured_metadata_max_bs), score_mod path only.
+        # Limits: fa4 only, score_mod path only (sheared-bias prep cache is
+        # not replay-refreshable yet). Batch capacity: graphs capture with
+        # SGLANG_OPT_INKLING_BCG_CAPTURE_BS sequence slots (zero-length
+        # padding seqs); wider batches fall back to eager via the runner.
         self.use_captured_forward_metadata_for_breakable_cuda_graph = (
             envs.SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN.get()
             and self.fa_impl_ver == 4
             and not self.use_mla
             and self.attn_cp_size <= 1
         )
-        self.bcg_captured_metadata_max_bs = 1
+        self.bcg_captured_metadata_max_bs = (
+            envs.SGLANG_OPT_INKLING_BCG_CAPTURE_BS.get()
+        )
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -1053,7 +1056,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         assert (
             forward_batch.batch_size <= self.bcg_captured_metadata_max_bs
-        ), "phase 1 captures single-sequence prefill only"
+        ), "capture batch wider than SGLANG_OPT_INKLING_BCG_CAPTURE_BS"
         assert not envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get(), (
             "BCG attention capture requires the score_mod path "
             "(SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0): the sheared-bias "
@@ -1098,13 +1101,28 @@ class FlashAttentionBackend(AttentionBackend):
         ), f"{fresh.max_seq_len_q=} exceeds capture bucket"
         assert fresh.max_seq_len_k <= capture_metadata.max_seq_len_k
 
-        for name in ("cache_seqlens_int32", "cu_seqlens_q", "cu_seqlens_k"):
-            getattr(capture_metadata, name).copy_(getattr(fresh, name))
+        # Real batch has k seqs, captured buffers have N >= k sequence
+        # slots: copy the real prefix, pad the tail with zero-length seqs
+        # (cu_seqlens repeat the final total; seqlens/page rows go to 0 =
+        # the dummy page). FA4 varlen skips zero-length segments.
+        k = fresh.cu_seqlens_q.shape[0] - 1
+        for name in ("cu_seqlens_q", "cu_seqlens_k"):
+            dst, src = getattr(capture_metadata, name), getattr(fresh, name)
+            assert src.shape[0] - 1 <= dst.shape[0] - 1, f"{name}: batch too wide"
+            dst[: k + 1].copy_(src)
+            if dst.shape[0] > k + 1:
+                dst[k + 1 :].copy_(src[-1].expand(dst.shape[0] - k - 1))
+        dst = capture_metadata.cache_seqlens_int32
+        dst[:k].copy_(fresh.cache_seqlens_int32)
+        if dst.shape[0] > k:
+            dst[k:].zero_()
 
         def _copy_page_table(dst: torch.Tensor, src: torch.Tensor) -> None:
             # Stale columns beyond the fresh width are never read: FA4 bounds
-            # per-seq reads by cache_seqlens content.
-            dst[:, : src.shape[1]].copy_(src)
+            # per-seq reads by cache_seqlens content (zeroed for pad seqs).
+            dst[: src.shape[0], : src.shape[1]].copy_(src)
+            if dst.shape[0] > src.shape[0]:
+                dst[src.shape[0] :].zero_()
 
         _copy_page_table(capture_metadata.page_table, fresh.page_table)
         if capture_metadata.swa_page_table is not None:

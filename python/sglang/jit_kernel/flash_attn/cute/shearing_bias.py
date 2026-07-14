@@ -109,6 +109,12 @@ class ShearingBias:
         assert self.vec_size <= 2
         assert 128 % self.cols_per_iter == 0
 
+        if const_expr(self.fused_proj):
+            # Vector width (in elements) for the gmem proj reads and the smem
+            # prebias writes in the fused compute stage: up to 128 bits per
+            # lane, constrained so 32 lanes x proj_vec divides rel_extent.
+            self.proj_vec = math.gcd(128 // self.bias_dtype.width, self.rel_extent // 32)
+
         max_seqlen_k = Int32(max_seqlen_k)
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
@@ -425,13 +431,15 @@ class ShearingBias:
 
             if const_expr(self.fused_proj):
                 # Compute the prebias rows in smem: warp `warp_idx` owns row
-                # `warp_idx`, its lanes stride over the extent dimension. Each
-                # element is a rel_rank-FMA dot of the row's r vector with the
-                # row's per-head proj slice, read directly from gmem (fp32
-                # accumulate, cast to bias dtype). With pack_gqa the packed row
-                # index folds the q head as (m_idx % qhead_per_kvhead), matching
-                # the pack_gqa_layout mode-0 coordinate; without pack_gqa the
-                # expression degenerates to head_idx.
+                # `warp_idx`, its lanes stride over the extent dimension in
+                # proj_vec-wide chunks. k-outer, extent-vector-inner: for each
+                # chunk, each lane vector-loads proj_vec contiguous proj values
+                # per k directly from gmem (small, L2-resident) and FMAs them
+                # against the row's r value (fp32 accumulate, cast to bias
+                # dtype). With pack_gqa the packed row index folds the q head
+                # as (m_idx % qhead_per_kvhead), matching the pack_gqa_layout
+                # mode-0 coordinate; without pack_gqa the expression
+                # degenerates to head_idx.
                 if m_idx // self.qhead_per_kvhead_packgqa < seqlen_info.seqlen_q:
                     proj_head_idx = (
                         head_idx * self.qhead_per_kvhead_packgqa
@@ -440,12 +448,35 @@ class ShearingBias:
                     rR = cute.make_rmem_tensor((self.rel_rank,), dtype=Float32)
                     for k in cutlass.range_constexpr(self.rel_rank):
                         rR[k] = mPreBias_cur[m_idx, k].to(Float32)
-                    for e_iter in cutlass.range_constexpr(self.rel_extent // 32):
-                        e_idx = e_iter * 32 + lane_idx
-                        acc = Float32(0.0)
+                    # (rel_rank, rel_extent), contiguous along the extent axis
+                    gProj = mProj[proj_head_idx, None, None]
+                    # per-k vectorized views: (proj_vec, rel_extent // proj_vec)
+                    gProj_vec = [
+                        cute.flat_divide(gProj[(k, None)], (self.proj_vec,))
+                        for k in range(self.rel_rank)
+                    ]
+                    sPreBias_row_out = cute.flat_divide(
+                        sPreBias[(warp_idx, None)], (self.proj_vec,)
+                    )
+                    for e_chunk in cutlass.range_constexpr(
+                        self.rel_extent // (32 * self.proj_vec)
+                    ):
+                        e_vec_idx = e_chunk * 32 + lane_idx
+                        acc_frg = cute.make_rmem_tensor((self.proj_vec,), dtype=Float32)
+                        acc_frg.fill(Float32(0.0))
                         for k in cutlass.range_constexpr(self.rel_rank):
-                            acc += rR[k] * mProj[proj_head_idx, k, e_idx].to(Float32)
-                        sPreBias[warp_idx, e_idx] = self.bias_dtype(acc)
+                            proj_frg = cute.make_rmem_tensor(
+                                (self.proj_vec,), dtype=self.bias_dtype
+                            )
+                            cute.autovec_copy(gProj_vec[k][None, e_vec_idx], proj_frg)
+                            acc_frg.store(
+                                acc_frg.load() + rR[k] * proj_frg.load().to(Float32)
+                            )
+                        prebias_out_frg = cute.make_rmem_tensor(
+                            (self.proj_vec,), dtype=self.bias_dtype
+                        )
+                        prebias_out_frg.store(acc_frg.load().to(self.bias_dtype))
+                        cute.autovec_copy(prebias_out_frg, sPreBias_row_out[None, e_vec_idx])
                 # The shear stage below only reads this warp's own row of
                 # sPreBias, so a warp-level sync is sufficient.
                 cute.arch.sync_warp()

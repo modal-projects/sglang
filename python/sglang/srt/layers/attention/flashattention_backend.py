@@ -1240,13 +1240,23 @@ class FlashAttentionBackend(AttentionBackend):
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
             and not self.kv_cache_is_mxfp8
         ):
+            # fa3: per-tensor fp8 with checkpoint k/v scales. fa4 (W6): the
+            # folded-domain shear bias handles per-tensor fp8 qk_descale in
+            # kernel — requires FA4_FOLD_SCALE=1 with rel bias; uncalibrated
+            # checkpoints (k_scale None) use identity descales.
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
+            elif self.fa_impl_ver == 4:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                one = torch.ones(
+                    (1, 1), device=q.device, dtype=torch.float32
+                )
+                fa_k_descale = one.expand(descale_shape)
+                fa_v_descale = one.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
@@ -1830,6 +1840,13 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
+            elif self.fa_impl_ver == 4:
+                # Uncalibrated per-tensor fp8 (W6): identity descales; the
+                # folded-domain shear bias needs FA4_FOLD_SCALE=1.
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                one = torch.ones((1, 1), device=q.device, dtype=torch.float32)
+                fa_k_descale = one.expand(descale_shape)
+                fa_v_descale = one.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None

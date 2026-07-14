@@ -791,6 +791,42 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
+        # Record the reload load plan during the INITIAL load (opt-in models, flag on),
+        # so the FIRST update_weights_from_disk can already replay / go partial instead
+        # of paying a full record-reload. The initial load dispatches every tensor, so
+        # the recorded plan covers any later partial's touched subset -- the full
+        # record-reload is eliminated from steady state (matters most for elastic
+        # joiners, which boot then immediately catch up via deltas). plan.record does the
+        # actual load while recording; any failure drops the plan and falls back to a
+        # plain load. (get_or_create_plan returns None unless the model opts in.)
+        record_plan = None
+        if os.environ.get("SGLANG_ENABLE_RELOAD_LOAD_PLAN", "0") == "1":
+            try:
+                from sglang.srt.model_loader.load_plan import get_or_create_plan
+
+                p = get_or_create_plan(model)
+                if p is not None and not p.recorded:
+                    record_plan = p
+            except Exception:
+                record_plan = None
+
+        def _load(w):
+            if record_plan is not None:
+                try:
+                    record_plan.record(model, w)
+                    return
+                except Exception:
+                    logger.exception(
+                        "initial-load plan record failed; falling back to a plain load"
+                    )
+                    model._reload_load_plan = None
+                    # record() may have partially consumed the iterator; the caller's
+                    # weights generator can't be rewound, so re-raise rather than load a
+                    # truncated set. record() wraps loaders (delegating, not raising), so
+                    # this path is not expected to trigger mid-load in practice.
+                    raise
+            model.load_weights(w)
+
         start = time.perf_counter()
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
@@ -799,12 +835,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                _load(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            _load(weights)
         if timing is not None:
             timing["load_s"] = time.perf_counter() - start
 

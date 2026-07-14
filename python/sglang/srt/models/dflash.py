@@ -19,9 +19,11 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,7 +36,7 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
@@ -69,7 +71,13 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
@@ -111,15 +119,15 @@ class DFlashAttention(nn.Module):
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
-            quant_config=quant_config,
-            prefix="qkv_proj",
+            quant_config=None,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix="o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -237,7 +245,12 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashMLP(nn.Module):
-    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         intermediate_size = int(getattr(config, "intermediate_size", 0))
@@ -251,14 +264,14 @@ class DFlashMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix="down_proj" if not prefix else f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         hidden_act = getattr(config, "hidden_act", "silu")
         if hidden_act != "silu":
@@ -277,17 +290,30 @@ class DFlashMLP(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = self.attention_cls(
-            config=config, layer_id=layer_id, quant_config=quant_config
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+        self.mlp = DFlashMLP(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
     def forward(
         self,
@@ -342,7 +368,10 @@ class DFlashDraftModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(num_layers)
             ]
@@ -364,8 +393,12 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -381,7 +414,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -391,7 +424,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        target_hidden, _ = self.fc(target_hidden)
+        return self.hidden_norm(target_hidden)
 
     @torch.no_grad()
     def forward(
@@ -486,8 +520,19 @@ class DFlashDraftModel(nn.Module):
 class DFlashLagunaAttention(DFlashAttention):
     """Laguna DFlash attention with the trained Laguna softplus gate."""
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
-        super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         hidden_size = int(config.hidden_size)
         total_num_heads = self.total_num_heads
         gating = normalize_gating(getattr(config, "gating", True))
@@ -506,7 +551,7 @@ class DFlashLagunaAttention(DFlashAttention):
                 g_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix="g_proj",
+                prefix=add_prefix("g_proj", prefix),
             )
 
     def apply_attention_output(
@@ -554,7 +599,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
@@ -573,7 +618,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         for i, norm in enumerate(self.aux_hidden_norms):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
-        return self.hidden_norm(self.fc(fused))
+        fused, _ = self.fc(fused)
+        return self.hidden_norm(fused)
 
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]

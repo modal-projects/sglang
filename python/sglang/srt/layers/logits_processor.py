@@ -751,9 +751,14 @@ class LogitsProcessor(nn.Module):
             else:
                 assert False, "Should never reach"
 
-        if hidden_states_to_store_before_norm is not None:
-            # NOTE: when hidden_states_before_norm is provided, we always
-            # prefer to return it.
+        if hidden_states_to_store_before_norm is not None and aux_hidden_states is None:
+            # NOTE: when hidden_states_before_norm is provided, prefer it —
+            # UNLESS aux hidden states were captured: DFLASH's packed
+            # [T, K*hidden] aux is the payload the draft consumes, and the
+            # unconditional preference silently replaced it with the plain
+            # before-norm hidden (target_hidden feature-dim mismatch,
+            # 6144 vs 36864). MTP (which needs before-norm) never captures
+            # aux, so the two consumers are disjoint.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         return hidden_states_to_store

@@ -3,23 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import os
-
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.metadata import (
+from sglang.kernels.ops.attention.metadata import (
+    draft_extend_set_metadata,
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -31,7 +30,8 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
@@ -46,6 +46,10 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+
+def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
+    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
 
 
 @triton.jit
@@ -228,6 +232,7 @@ class FlashAttentionBackend(AttentionBackend):
     """
 
     needs_cpu_seq_lens: bool = False
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -259,12 +264,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        # Per-runner resolved string (draft workers may override their pool
-        # dtype via --speculative-draft-kv-cache-dtype); fall back to the
-        # global arg for runners predating configure_kv_cache_dtype.
-        self.kv_cache_dtype_str = getattr(
-            model_runner, "kv_cache_dtype_str", model_runner.server_args.kv_cache_dtype
-        )
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
         # Static page-table width (upper bound). The device-side page-table build
@@ -275,14 +275,18 @@ class FlashAttentionBackend(AttentionBackend):
         # Skip the seq_lens_cpu D2H when the sync-free-seqlen opt is on (spec-v2
         # page tables use the static max_context_len) — scoped to multi-layer
         # EAGLE, the only path whose consumers all tolerate seq_lens_cpu=None —
-        # or, regardless of the opt, for dflash (the worker adapted to the
-        # GPU-only relay); other EAGLE/MTP/standalone/non-spec keep the CPU mirror.
-        self.needs_cpu_seq_lens = not (
-            envs.SGLANG_OPT_FA_SYNC_FREE_SEQLEN.get()
-            and model_runner.server_args.enable_multi_layer_eagle
-        ) and not SpeculativeAlgorithm.from_string(
-            model_runner.server_args.speculative_algorithm
-        ).is_dflash()
+        # or, regardless of the opt, for dflash/dspark (their workers adapted to
+        # the GPU-only relay); other EAGLE/MTP/standalone/non-spec keep the
+        # CPU mirror.
+        self.needs_cpu_seq_lens = (
+            not (
+                envs.SGLANG_OPT_FA_SYNC_FREE_SEQLEN.get()
+                and model_runner.server_args.enable_multi_layer_eagle
+            )
+            and not SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            ).is_dflash_family()
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
@@ -297,6 +301,15 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and model_runner.is_draft_worker
+        ):
+            self.speculative_num_draft_tokens = SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            ).get_num_tokens_per_bs_for_target_verify(
+                int(self.speculative_num_draft_tokens), is_draft_worker=True
+            )
         self.speculative_step_id = speculative_step_id
 
         # Local attention settings
@@ -349,26 +362,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
-        # BCG captured-metadata contract (see base_attn_backend.py): capture
-        # extend metadata into stable tensors and refresh them in place at
-        # replay, so the attention group can live INSIDE prefill breakable
-        # CUDA graphs instead of running as a per-layer eager break.
-        # Limits: fa4 only. Sheared bias is supported: its prep cache is
-        # capture-aware (interface.py), so the block-schedule kernel is
-        # captured and self-refreshes at replay. Batch capacity: graphs
-        # capture with
-        # SGLANG_OPT_INKLING_BCG_CAPTURE_BS sequence slots (zero-length
-        # padding seqs); wider batches fall back to eager via the runner.
-        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
-            envs.SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN.get()
-            and self.fa_impl_ver == 4
-            and not self.use_mla
-            and self.attn_cp_size <= 1
-        )
-        self.bcg_captured_metadata_max_bs = (
-            envs.SGLANG_OPT_INKLING_BCG_CAPTURE_BS.get()
-        )
-
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
@@ -386,21 +379,16 @@ class FlashAttentionBackend(AttentionBackend):
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
-        # fa4's SplitKV kernel needs SM >= 10.0 (Blackwell+). Below that (e.g. Hopper
-        # SM 9.0) the auto heuristic can pick >1 splits and trip a compiled-kernel
-        # assert, so force a single split. SM >= 10.0 supports it — keep the heuristic.
-        fa4_no_splitkv = self.fa_impl_ver == 4 and get_device_capability() < (10, 0)
+        fa4_no_splitkv = self.fa_impl_ver == 4 and get_device_capability() < (9, 0)
         self.num_splits = (
             1
             if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
             else 0
         )
-        # Debug/ops override (FA4_NUM_SPLITS=1 disables split-KV): the fp8 +
-        # sheared-bias fwd/combine faults with splits>1 (open kernel bug);
-        # forcing 1 split trades some decode latency for a working config.
-        _num_splits_env = os.environ.get("FA4_NUM_SPLITS")
-        if _num_splits_env:  # empty string = unset (image-baked env passthrough)
-            self.num_splits = int(_num_splits_env)
+        # Set (never getattr'd) so forward_extend can identity-check "is this the
+        # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
+        # block-schedule cache (see forward_extend rel_bias handling).
+        self.full_cg_prefill_metadata = None
 
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
@@ -418,14 +406,13 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
 
-        # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
-        # attention. The precomputed buffer can become inconsistent with the
-        # num_splits the C++ mha_fwd kernel derives from live cache_seqlens
-        # during decode, leading to an OOB read in the split-KV combine kernel
-        # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
-        # unset uses the existing per-layer metadata path.
-        self._disable_scheduler_metadata_precompute = bool(
-            getattr(server_args, "enable_dp_attention", False)
+        # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
+        # attention modes can change live cache_seqlens/num_splits across ranks.
+        # A stale precomputed buffer can lead to an OOB read in the split-KV
+        # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
+        # scheduler_metadata unset uses the existing per-layer metadata path.
+        self._disable_scheduler_metadata_precompute = (
+            _should_disable_scheduler_metadata_precompute(server_args)
         )
 
     def _compute_scheduler_metadata(
@@ -480,36 +467,50 @@ class FlashAttentionBackend(AttentionBackend):
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # Single-CG draft_extend_v2: no Python runs between captured steps, so the
-        # metadata is emitted as capturable tensor ops over the persistent buffers.
+        # Single-CG has no Python between steps, so one capturable kernel updates
+        # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
             return
         bs = forward_batch.batch_size
         metadata = self.draft_extend_metadata[bs]
-        seq_lens = forward_batch.seq_lens[:bs]
-        req_pool_indices = forward_batch.req_pool_indices[:bs]
-        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int32)
-
-        metadata.cache_seqlens_int32.copy_(seq_lens)
-        metadata.cu_seqlens_k[1:].copy_(
-            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        draft_extend_set_metadata(
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            page_table=metadata.page_table,
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            seq_lens=forward_batch.seq_lens[:bs],
+            extend_seq_lens=forward_batch.extend_seq_lens[:bs],
+            page_size=self.page_size,
         )
-        metadata.cu_seqlens_q[1:].copy_(
-            torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
-        )
 
-        max_seq_pages = metadata.page_table.shape[1]
-        page_indices = self.req_to_token[
-            req_pool_indices[:, None],
-            self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-        ]
-        metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+    def draft_extend_metadata_captured_in_graph(self) -> bool:
+        # The in-graph update covers everything the eager replay path writes
+        # except the SWA translations (swa_page_table / swa_out_cache_loc_buf).
+        return not self.use_sliding_window_kv_pool
 
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        """Dispatch full-CG metadata: plain EXTEND (prefill) vs decode modes."""
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_extend() and not (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_dllm_extend()
+        ):
+            self._init_full_cg_prefill_metadata(forward_batch, in_capture)
+        else:
+            self._init_full_cg_decode_metadata(forward_batch, in_capture)
+
+    def _init_full_cg_decode_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ):
+        """Capture/replay metadata for the decode-runner full-CG modes
+        (decode / idle / target_verify / draft_extend)."""
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -604,6 +605,102 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 out_cache_loc=out_cache_loc,
             )
+
+    def _init_full_cg_prefill_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ):
+        """Capture/replay metadata for plain EXTEND under full prefill CUDA
+        graph. Mirrors the eager extend branch of init_forward_metadata, with
+        three capture-contract differences:
+
+        - all tensors live in dedicated preallocated buffers (the captured
+          kernels hold their addresses; refilled in place each replay);
+        - cu_seqlens_q always gets its own buffer (the eager no-prefix path
+          aliases it to cu_seqlens_k — under capture that would permanently
+          weld q to the k buffer and break prefix replays);
+        - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
+          (the bucket's num_tokens / max_context_len): the kernel reads real
+          work extents from the cu_seqlens / cache_seqlens device buffers.
+        """
+        bs = forward_batch.batch_size
+        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
+            device = forward_batch.seq_lens.device
+            m = FlashAttentionMetadata()
+            m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
+            m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            # Block table sized in PAGES. For page_size == 1 max_num_pages ==
+            # max_context_len, so this reduces to the per-token layout.
+            m.page_table = torch.zeros(
+                (bs, self.max_num_pages), dtype=torch.int32, device=device
+            )
+            # Page-start token offsets for the strided block-table gather. For
+            # page_size == 1 this is arange(max_context_len) and the gather + //1
+            # below reduces to the plain per-token req_to_token copy.
+            self.full_cg_prefill_strided_indices = torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            )
+            # SWA (hybrid sliding-window) buffers, mirroring the eager extend
+            # path: a page-strided SWA block table + SWA-translated write
+            # locations. The out-cache buffer is pointer-stable (sized to an
+            # upper bound) so captured graphs keep a valid address; each replay
+            # refills a [:num_tokens] view.
+            if self.use_sliding_window_kv_pool:
+                m.swa_page_table = torch.zeros(
+                    (bs, self.max_num_pages), dtype=torch.int32, device=device
+                )
+                self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
+                    (self.max_context_len,), dtype=torch.int64, device=device
+                )
+            self.full_cg_prefill_metadata = m
+        m = self.full_cg_prefill_metadata
+        assert m is not None and bs == m.cache_seqlens_int32.shape[0], (
+            "full-CG prefill metadata must be created at capture with the same "
+            "fixed request-slot count used at replay"
+        )
+
+        seq_lens = forward_batch.seq_lens[:bs]
+        m.cache_seqlens_int32.copy_(seq_lens)
+        m.cu_seqlens_k[1:].copy_(torch.cumsum(seq_lens, dim=0))
+        m.cu_seqlens_q[1:].copy_(
+            torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
+        )
+        max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
+        if max_seq_len_k > 0:
+            # Build the block table like the eager extend branch: take every
+            # page_size-th token slot from req_to_token and divide by page_size.
+            # Identity for page_size == 1 (strided is 0..max_seq_len_k-1, //1).
+            max_seq_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+            page_indices = self.req_to_token[
+                forward_batch.req_pool_indices[:bs, None],
+                self.full_cg_prefill_strided_indices[:max_seq_pages],
+            ]
+            m.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            if self.use_sliding_window_kv_pool:
+                # SWA block table: translate the page-start full slots to their
+                # SWA cache locations, then reduce to SWA page indices.
+                swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_indices
+                )
+                m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            # SWA write targets for the new tokens (KVWriteLoc.swa_loc), refilled
+            # into the pointer-stable buffer and bound as a [:num_tokens] view.
+            num_out = forward_batch.out_cache_loc.shape[0]
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
+            # Captured kernels read the full bucket. Route its inactive tail to
+            # SWA's zero dummy slot to prevent stale writes into live slots.
+            self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
+            m.swa_out_cache_loc = self.full_cg_prefill_swa_out_cache_loc[:num_out]
+        if in_capture:
+            # Baked into the captured kernel launches; upper bounds only.
+            m.max_seq_len_q = forward_batch.positions.numel()
+            m.max_seq_len_k = self.max_context_len
+        self.forward_metadata = m
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -748,27 +845,50 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + self.speculative_num_draft_tokens
-                ).to(torch.int32)
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    _seqlen_cpu_max(forward_batch.seq_lens_cpu, self.max_context_len)
-                    + self.speculative_num_draft_tokens
+                ragged_layout = getattr(
+                    forward_batch.spec_info, "ragged_verify_layout", None
                 )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
+                if ragged_layout is not None:
+                    geometry = build_ragged_target_verify_geometry(
+                        seq_lens=forward_batch.seq_lens, layout=ragged_layout
+                    )
+                    metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
+                    # Device-only layouts carry no host lens; the verify
+                    # window is a valid varlen upper bound.
+                    metadata.max_seq_len_q = (
+                        geometry.max_seq_len_q
+                        if geometry.max_seq_len_q is not None
+                        else self.speculative_num_draft_tokens
+                    )
+                    metadata.max_seq_len_k = int(
+                        metadata.cache_seqlens_int32.max().item()
+                    )
+                    metadata.cu_seqlens_q = geometry.cu_seqlens_q
+                    metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + self.speculative_num_draft_tokens
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                    metadata.max_seq_len_k = (
+                        _seqlen_cpu_max(
+                            forward_batch.seq_lens_cpu, self.max_context_len
+                        )
+                        + self.speculative_num_draft_tokens
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.speculative_num_draft_tokens + 1,
+                        self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
@@ -1041,115 +1161,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
-    # --- BCG captured-metadata contract (prefill breakable CUDA graphs) ----
-    #
-    # Strategy (mirrors DSV4): at capture, build extend metadata with the
-    # normal builder, then re-home the shape-varying tensors into fixed-max
-    # buffers whose addresses the graph captures. At replay, rebuild fresh
-    # metadata against the padded static batch with the same builder and
-    # copy_ the values into the captured buffers. Host ints are frozen at
-    # capture to conservative maxima (bucket token count for q, full
-    # req_to_token width for k) — FA4 bounds actual reads via
-    # cache_seqlens/cu_seqlens content, so over-approximation is correct.
-
-    def _bcg_fixed_page_table(self, src: torch.Tensor) -> torch.Tensor:
-        """Copy src into a zero-init [bs, max_num_pages] int32 buffer."""
-        dst = torch.zeros(
-            src.shape[0],
-            self.max_num_pages,
-            dtype=torch.int32,
-            device=src.device,
-        )
-        dst[:, : src.shape[1]].copy_(src)
-        return dst
-
-    def init_forward_metadata_for_breakable_cuda_graph_capture(
-        self, forward_batch: ForwardBatch
-    ):
-        assert forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(), (
-            "BCG captured-metadata capture expects an extend batch"
-        )
-        assert (
-            forward_batch.batch_size <= self.bcg_captured_metadata_max_bs
-        ), "capture batch wider than SGLANG_OPT_INKLING_BCG_CAPTURE_BS"
-        # Sheared bias composes with capture: the prep cache refuses to serve
-        # eager(warmup)-built schedules during capture (interface.py), so the
-        # CuSeqlensToBlocks launch is captured and every replay recomputes the
-        # block schedule from the refreshed static cu_seqlens_q.
-        self.init_forward_metadata(forward_batch)
-        metadata = self.forward_metadata
-        # The zero-prefix capture batch aliases cu_seqlens_q = cu_seqlens_k
-        # (same tensor object). De-alias so replay batches with radix-prefix
-        # hits (q != k) can refresh the two buffers independently.
-        if metadata.cu_seqlens_q is metadata.cu_seqlens_k:
-            metadata.cu_seqlens_q = metadata.cu_seqlens_k.clone()
-        # Freeze q upper bound at the capture bucket's token count; k at the
-        # full pool width so replay batches with radix-prefix hits (k > q)
-        # stay within the captured host constants.
-        metadata.max_seq_len_k = self.max_num_pages * self.page_size
-        # Re-home width-varying tensors into fixed-max captured buffers.
-        metadata.page_table = self._bcg_fixed_page_table(metadata.page_table)
-        if metadata.swa_page_table is not None:
-            metadata.swa_page_table = self._bcg_fixed_page_table(
-                metadata.swa_page_table
-            )
-        return metadata
-
-    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
-        self,
-        capture_metadata,
-        forward_batch: ForwardBatch,
-        *,
-        static_forward_batch: Optional[ForwardBatch] = None,
-    ) -> None:
-        batch = (
-            static_forward_batch if static_forward_batch is not None else forward_batch
-        )
-        # Rebuild fresh metadata with the normal builder, then copy values
-        # into the graph-captured tensors.
-        self.init_forward_metadata(batch)
-        fresh = self.forward_metadata
-        assert isinstance(capture_metadata, FlashAttentionMetadata)
-        assert (
-            fresh.max_seq_len_q <= capture_metadata.max_seq_len_q
-        ), f"{fresh.max_seq_len_q=} exceeds capture bucket"
-        assert fresh.max_seq_len_k <= capture_metadata.max_seq_len_k
-
-        # Real batch has k seqs, captured buffers have N >= k sequence
-        # slots: copy the real prefix, pad the tail with zero-length seqs
-        # (cu_seqlens repeat the final total; seqlens/page rows go to 0 =
-        # the dummy page). FA4 varlen skips zero-length segments.
-        k = fresh.cu_seqlens_q.shape[0] - 1
-        for name in ("cu_seqlens_q", "cu_seqlens_k"):
-            dst, src = getattr(capture_metadata, name), getattr(fresh, name)
-            assert src.shape[0] - 1 <= dst.shape[0] - 1, f"{name}: batch too wide"
-            dst[: k + 1].copy_(src)
-            if dst.shape[0] > k + 1:
-                dst[k + 1 :].copy_(src[-1].expand(dst.shape[0] - k - 1))
-        dst = capture_metadata.cache_seqlens_int32
-        dst[:k].copy_(fresh.cache_seqlens_int32)
-        if dst.shape[0] > k:
-            dst[k:].zero_()
-
-        def _copy_page_table(dst: torch.Tensor, src: torch.Tensor) -> None:
-            # Stale columns beyond the fresh width are never read: FA4 bounds
-            # per-seq reads by cache_seqlens content (zeroed for pad seqs).
-            dst[: src.shape[0], : src.shape[1]].copy_(src)
-            if dst.shape[0] > src.shape[0]:
-                dst[src.shape[0] :].zero_()
-
-        _copy_page_table(capture_metadata.page_table, fresh.page_table)
-        if capture_metadata.swa_page_table is not None:
-            _copy_page_table(capture_metadata.swa_page_table, fresh.swa_page_table)
-        if capture_metadata.swa_out_cache_loc is not None:
-            # Token-shaped; fresh may be shorter than the padded bucket. The
-            # padded tail keeps its capture-time value (slot 0 / dummy page),
-            # matching the runner's out_cache_loc padding convention.
-            n = fresh.swa_out_cache_loc.shape[0]
-            capture_metadata.swa_out_cache_loc[:n].copy_(fresh.swa_out_cache_loc)
-
-        self.forward_metadata = capture_metadata
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1169,8 +1180,6 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-        rel_r=None,
-        rel_proj=None,
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1254,37 +1263,16 @@ class FlashAttentionBackend(AttentionBackend):
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
+            and self.fa_impl_ver != 4
             and not self.kv_cache_is_mxfp8
         ):
-            # fa3: per-tensor fp8 with checkpoint k/v scales. fa4 (W6): the
-            # folded-domain shear bias handles per-tensor fp8 qk_descale in
-            # kernel — requires FA4_FOLD_SCALE=1 with rel bias; uncalibrated
-            # checkpoints (k_scale None) use identity descales.
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            elif self.fa_impl_ver == 4:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                one = torch.ones(
-                    (1, 1), device=q.device, dtype=torch.float32
-                )
-                fa_k_descale = one.expand(descale_shape)
-                fa_v_descale = one.expand(descale_shape)
-            # Saturating cast: plain .to(fp8) maps overflow to NaN (no inf in
-            # e4m3fn); clamp to the fp8 range first (identity-descale path).
-            _finfo = torch.finfo(self.kv_cache_dtype)
-            q = q.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-            q_rope = (
-                q_rope.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-                if q_rope is not None
-                else None
-            )
-            k_rope = (
-                k_rope.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-                if k_rope is not None
-                else None
-            )
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -1317,28 +1305,25 @@ class FlashAttentionBackend(AttentionBackend):
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
-        if rel_r is not None:
-            if self.fa_impl_ver != 4:
-                raise RuntimeError(
-                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
-                )
-            kwargs["rel_r"] = rel_r
-            kwargs["rel_proj"] = rel_proj
-            if metadata.rel_bias_prep_cache is None:
-                metadata.rel_bias_prep_cache = {}
-            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
-                raise RuntimeError("rel_bias (sheared bias) is only supported by the FA4 backend.")
+                raise RuntimeError(
+                    "rel_bias (sheared bias) is only supported by the FA4 backend."
+                )
             if rel_bias_event is not None:
                 # rel_bias (rel_logits) is produced on InklingAttention's alt stream;
                 # join it here -- as late as possible, just before the kernel reads
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
-            if metadata.rel_bias_prep_cache is None:
-                metadata.rel_bias_prep_cache = {}
-            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
+            if metadata is self.full_cg_prefill_metadata:
+                # Full-CG reuses the cu_seqlens pointer with new values each replay.
+                # Disable its pointer-keyed schedule cache so the graph refreshes it.
+                kwargs["rel_bias_prep_cache"] = None
+            else:
+                if metadata.rel_bias_prep_cache is None:
+                    metadata.rel_bias_prep_cache = {}
+                kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
 
         _fa_out = (
             forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1554,7 +1539,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_global_server_args().disable_chunked_prefix_cache
+                    assert not get_server_args().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -1757,8 +1742,6 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
-        rel_r=None,
-        rel_proj=None,
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1823,28 +1806,25 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["score_mod"] = score_mod
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
-        if rel_r is not None:
-            if self.fa_impl_ver != 4:
-                raise RuntimeError(
-                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
-                )
-            kwargs["rel_r"] = rel_r
-            kwargs["rel_proj"] = rel_proj
-            if metadata.rel_bias_prep_cache is None:
-                metadata.rel_bias_prep_cache = {}
-            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
-                raise RuntimeError("rel_bias (sheared bias) is only supported by the FA4 backend.")
+                raise RuntimeError(
+                    "rel_bias (sheared bias) is only supported by the FA4 backend."
+                )
             if rel_bias_event is not None:
                 # rel_bias (rel_logits) is produced on InklingAttention's alt stream;
                 # join it here -- as late as possible, just before the kernel reads
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
-            if metadata.rel_bias_prep_cache is None:
-                metadata.rel_bias_prep_cache = {}
-            kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
+            if metadata is self.full_cg_prefill_metadata:
+                # Full-CG reuses the cu_seqlens pointer with new values each replay.
+                # Disable its pointer-keyed schedule cache so the graph refreshes it.
+                kwargs["rel_bias_prep_cache"] = None
+            else:
+                if metadata.rel_bias_prep_cache is None:
+                    metadata.rel_bias_prep_cache = {}
+                kwargs["rel_bias_prep_cache"] = metadata.rel_bias_prep_cache
 
         _fa_out = (
             forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1865,27 +1845,9 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            elif self.fa_impl_ver == 4:
-                # Uncalibrated per-tensor fp8 (W6): identity descales; the
-                # folded-domain shear bias needs FA4_FOLD_SCALE=1.
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                one = torch.ones((1, 1), device=q.device, dtype=torch.float32)
-                fa_k_descale = one.expand(descale_shape)
-                fa_v_descale = one.expand(descale_shape)
-            # Saturating cast: plain .to(fp8) maps overflow to NaN (no inf in
-            # e4m3fn); clamp to the fp8 range first (identity-descale path).
-            _finfo = torch.finfo(self.kv_cache_dtype)
-            q = q.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-            q_rope = (
-                q_rope.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-                if q_rope is not None
-                else None
-            )
-            k_rope = (
-                k_rope.clamp(_finfo.min, _finfo.max).to(self.kv_cache_dtype)
-                if k_rope is not None
-                else None
-            )
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
@@ -2831,9 +2793,18 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
+                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                if ragged_layout is not None:
+                    padded = ragged_layout.padded_to_bucket(padded_bs=bs)
+                    geometry = build_ragged_target_verify_geometry(
+                        seq_lens=seq_lens, layout=padded
+                    )
+                    metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
+                    metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
+                else:
+                    metadata.cache_seqlens_int32.copy_(
+                        (seq_lens + self.speculative_num_draft_tokens)
+                    )
 
                 # Page table built on-device (self-guards on cache_seqlens);
                 # max_seq_len_k left unset -- unread here (scheduler_metadata is

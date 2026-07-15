@@ -57,6 +57,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        is_split_kv: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -96,6 +97,7 @@ class FlashAttentionForwardBase:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.q_subtile_factor = q_subtile_factor
+        self.is_split_kv = is_split_kv
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -187,7 +189,13 @@ class FlashAttentionForwardBase:
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
     ):
         # Get the data type and check if it is fp16 or bf16
-        if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
+        if const_expr(self.is_split_kv):
+            # SplitKV writes float32 partial outputs; Q/K/V still fp16/bf16.
+            if const_expr(not (mQ_type == mK_type == mV_type)):
+                raise TypeError("Q/K/V must have the same data type")
+            if const_expr(mO_type != Float32):
+                raise TypeError("SplitKV partial output (mO) must be Float32")
+        elif const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
             raise TypeError("All tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
@@ -343,7 +351,14 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        split_idx: Int32 = 0,
     ):
+        if const_expr(self.is_split_kv):
+            self.epilogue_split(
+                acc_O, lse, mO, mLSE, seqlen, tiled_mma, tidx, m_block,
+                head_idx, batch_idx, split_idx,
+            )
+            return
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -447,6 +462,72 @@ class FlashAttentionForwardBase:
                         )
             else:
                 pack_gqa.store_O(mO_cur, tOrO, gmem_tiled_copy_O, tidx, m_block, seqlen.seqlen_q)
+
+    @cute.jit
+    def epilogue_split(
+        self,
+        acc_O: cute.Tensor,
+        lse: cute.Tensor,
+        mO: cute.Tensor,  # (s_q, dv, h, b, num_splits) or (total_q, dv, h, num_splits)
+        mLSE: Optional[cute.Tensor],  # (s_q, h, b, num_splits) or (total_q, h, num_splits)
+        seqlen: SeqlenInfoQK,
+        tiled_mma: cute.TiledMma,
+        tidx: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+    ):
+        thr_mma = tiled_mma.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+
+        if const_expr(not self.pack_gqa):
+            # Write LSE: only the thread that owns column 0 of each row writes.
+            if const_expr(mLSE is not None):
+                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
+                gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
+                if taccOcO[0][1] == 0:
+                    for r in cutlass.range(cute.size(taccOcO, mode=[0]), unroll_full=True):
+                        row = taccOcO[r, 0][0]
+                        if m_block * self.tile_m + row < seqlen.seqlen_q:
+                            gLSE[row] = lse[r]
+
+            # Write O partials (float32) directly from the accumulator.
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
+                None, None, head_idx, split_idx
+            ]
+            gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+            taccOgO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
+            for r in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
+                if m_block * self.tile_m + taccOcO[r, 0][0] < seqlen.seqlen_q:
+                    for c in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
+                        if const_expr(not self.check_hdim_v_oob) or taccOcO[r, c][1] < mO.shape[1]:
+                            taccOgO[r, c] = acc_O_mn[r, c]
+        else:
+            # pack_gqa: mO/mLSE arrive pre-packed by pack_gqa_layout — mode 0 is the
+            # hierarchical (qhead_per_kvhead, seqlen_q) row and the head mode indexes
+            # KV heads. An integer row coordinate decomposes colexicographically as
+            # (row % qhead, row // qhead), which is exactly the kernel's packed row
+            # (q-head fastest), so we index mode 0 with the tile row directly.
+            row_limit = seqlen.seqlen_q * self.qhead_per_kvhead
+            if const_expr(mLSE is not None):
+                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
+                if taccOcO[0][1] == 0:
+                    for r in cutlass.range(cute.size(taccOcO, mode=[0]), unroll_full=True):
+                        row = m_block * self.tile_m + taccOcO[r, 0][0]
+                        if row < row_limit:
+                            mLSE_cur[row] = lse[r]
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
+                None, None, head_idx, split_idx
+            ]
+            for r in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
+                row = m_block * self.tile_m + taccOcO[r, 0][0]
+                if row < row_limit:
+                    for c in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
+                        if const_expr(not self.check_hdim_v_oob) or taccOcO[r, c][1] < mO.shape[1]:
+                            mO_cur[row, taccOcO[r, c][1]] = acc_O_mn[r, c]
 
     @cute.jit
     def advance_pipeline(self, pipeline_index):

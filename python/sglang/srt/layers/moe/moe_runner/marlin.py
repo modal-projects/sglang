@@ -142,13 +142,8 @@ def fused_experts_none_to_marlin(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
 
-    # Allocate the Marlin workspace (inter-block reduction locks) per call rather
-    # than caching it in a module global. A shared global buffer is NOT
-    # cuda-graph-safe: every captured decode graph records its Marlin kernels
-    # against the same workspace, so the lock/reduction state aliases across
-    # graphs and the kernel deadlocks during capture (a few reduction blocks spin
-    # forever, stalling the following collective). A fresh per-call buffer is
-    # captured into each graph's own memory pool, so graphs no longer alias it.
+    # Use a per-call workspace so captured graphs cannot alias Marlin's
+    # inter-block reduction locks and deadlock during capture.
     workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
     marlin_hidden_states = hidden_states
@@ -208,3 +203,9 @@ def fused_experts_none_to_marlin(
     return StandardCombineInput(
         hidden_states=output,
     )
+
+
+# ===== TO BE REFACTORED ====
+from sglang.srt.lora.marlin_lora_temp import sgl_backend  # noqa: E402,F401
+
+# ===== END TO BE REFACTORED ====

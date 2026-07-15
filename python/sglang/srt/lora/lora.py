@@ -315,32 +315,46 @@ class LoRAAdapter(nn.Module):
                 # else: no-op as LoRA B weight is already stacked.
 
     def _normalize_shared_expert_moe(self, weights: Dict[str, torch.Tensor]):
-        """Reshape flat 2D sink (shared-expert) LoRA tensors to the shared-outer 3D
-        form the *_shared_moe buffers expect: w1/w3 A [1,r,h] B [E,i,r]; w2 A [E,r,i] B [1,h,r].
-        """
-        # Inkling-only: its shared-expert sink is a FusedMoE that needs the 3D form. Gate on the
-        # arch so other MoE models with .w1/.w2/.w3-named shared experts and n_shared_experts>0
-        # (e.g. Mistral-Large-3, whose sink is a plain 2D MLP) keep the stock 2D rename path.
-        archs = getattr(self.base_hf_config, "architectures", None) or []
-        if not any("Inkling" in a for a in archs):
-            return
+        """Reshape flat Inkling shared-sink factors to shared-outer 3D form."""
+        # Gate on the architecture so other models with 2D shared experts keep
+        # the stock path.
         cfg = self.base_hf_config
         if hasattr(cfg, "get_text_config"):
             cfg = cfg.get_text_config()
+        archs = list(getattr(self.base_hf_config, "architectures", None) or [])
+        archs += list(getattr(cfg, "architectures", None) or [])
+        is_inkling = (
+            any("Inkling" in arch for arch in archs)
+            or "inkling" in str(getattr(cfg, "model_type", "")).lower()
+        )
+        if not is_inkling:
+            return
         num_shared = getattr(cfg, "n_shared_experts", 0) or 0
         if num_shared <= 0:
             return
         for name in list(weights.keys()):
             if "shared_experts." not in name:
                 continue
-            if not any(k in name for k in (".w1.", ".w2.", ".w3.")):
-                # Only Inkling-trainer w-named tensors (pre-rename); proj-named
-                # shared_experts adapters (DeepSeek-family) keep the 2D path.
+            if re.search(r"shared_experts\.\d+\.", name):
+                # Preserve named per-expert factors so adapter validation can
+                # reject outer factors that are not actually shared.
+                continue
+            is_down = any(k in name for k in (".w2.", ".down_proj."))
+            is_gate_up = any(
+                k in name
+                for k in (
+                    ".w1.",
+                    ".w3.",
+                    ".gate_proj.",
+                    ".up_proj.",
+                    ".gate_up_proj.",
+                )
+            )
+            if not (is_down or is_gate_up):
                 continue
             w = weights[name]
             if w.dim() != 2:
                 continue
-            is_down = ".w2." in name
             if "lora_A" in name:
                 if is_down:
                     r, flat = w.shape

@@ -15,6 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.jit_kernel.flash_attn.cute.cache_utils import get_jit_cache
 from sglang.jit_kernel.flash_attn.cute.testing import is_fake_mode
 
@@ -170,6 +171,12 @@ torch2cute_dtype_map = {
 _shear_bias_workspace: dict = {}
 
 
+def _round_up_to_tile(size: int, tile_size: int) -> int:
+    """Return the smallest whole-tile buffer capacity that holds ``size`` rows."""
+    assert tile_size > 0
+    return (size + tile_size - 1) // tile_size * tile_size
+
+
 def _shear_bias_empty(shape, dtype, device):
     # Grow-only per-device workspace: the sheared-bias staging tensor is large
     # (total_q x num_head x rel_extent_padded) and call shapes vary, so per-call
@@ -268,8 +275,6 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
-    rel_r: Optional[torch.Tensor] = None,
-    rel_proj: Optional[torch.Tensor] = None,
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
@@ -548,15 +553,8 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        # qk_blockscaled at q_stage=2 needs the W7-2 SF/S TMEM time-multiplex
-        # (pipeline_sf_overlap in flash_fwd_sm100.py): the SFQ/SFK TMEM columns
-        # alias the other stage's S region, which q_stage=2 overwrites every
-        # iteration. The wiring is new, so it is opt-in via FA4_MXFP8_QS2=1
-        # (default keeps the safe q_stage=1) until validated on hardware.
-        if qk_blockscaled and os.environ.get("FA4_MXFP8_QS2", "0") != "1":
-            q_stage = 1
-        else:
-            q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
+        q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -711,41 +709,16 @@ def _flash_attn_fwd(
 
     # rel_bias -> sheared bias (Inkling relative attention). Produces `bias`, the column-aligned
     # bias the SM100 kernel adds to pre-softmax scores via its dedicated TMA pipeline.
-    # Alternatively, rel_r + rel_proj (fused projection): the shear kernel computes each needed
-    # prebias row in-kernel as rel_r @ rel_proj instead of reading a pre-materialized rel_bias.
     rel_extent = 0
     rel_extent_padded = 0
     bias = None
     tile_bias = tile_m
     cu_total_m_blocks_bias = None
     blocks_to_batch_idx = None
-    if rel_r is not None or rel_proj is not None:
-        assert rel_r is not None and rel_proj is not None, (
-            "rel_r and rel_proj must be provided together"
-        )
-        assert rel_bias is None, (
-            "provide exactly one of rel_bias or (rel_r, rel_proj)"
-        )
-    fused_rel_proj = rel_r is not None
-    if rel_bias is not None or fused_rel_proj:
-        assert arch // 10 in [10, 11], "rel_bias (sheared bias) is only supported on SM10x"
+    if rel_bias is not None:
+        assert arch // 10 in [9, 10, 11], "rel_bias (sheared bias) is only supported on SM9x/10x"
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
-        max_m_blocks_leq_one = False
-        if fused_rel_proj:
-            rel_r = maybe_contiguous(rel_r)
-            rel_proj = maybe_contiguous(rel_proj)
-            assert rel_r.dtype == rel_proj.dtype
-            rel_rank = rel_proj.shape[-2]
-            assert rel_rank == 16, "fused projection requires rel_rank == 16"
-            rel_extent = rel_proj.shape[-1]
-            assert rel_proj.shape == (num_head, rel_rank, rel_extent)
-            # `rel_in` is the first tensor arg of the shear kernel: the prebias
-            # tensor in non-fused mode, the r tensor in fused mode (same layout
-            # minus the extent axis).
-            rel_in = rel_r
-        else:
-            rel_extent = rel_bias.shape[-1]
-            rel_in = rel_bias
+        rel_extent = rel_bias.shape[-1]
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_m == 128 and tile_n == 128
@@ -755,23 +728,28 @@ def _flash_attn_fwd(
             or (window_size_right is not None and window_size_left + window_size_right + 1 == rel_extent)
         ), "for relative bias, require causal or window length == rel_extent"
         tile_bias = (seqlen_q_packgqa + 7) // 8 * 8 if seqlen_q_packgqa < tile_m else tile_m
-        rel_in_last_dim = rel_rank if fused_rel_proj else rel_extent
         if cu_seqlens_q is None:
-            bias_seqlen_q_rounded = (seqlen_q + tile_m - 1) // tile_m * tile_m
-            assert rel_in.shape == (batch_size, seqlen_q, num_head, rel_in_last_dim)
+            bias_seqlen_q_rounded = _round_up_to_tile(seqlen_q, tile_m)
+            assert rel_bias.shape == (batch_size, seqlen_q, num_head, rel_extent)
             bias = _shear_bias_empty(
                 (batch_size, bias_seqlen_q_rounded, num_head, rel_extent_padded),
-                rel_in.dtype, device,
+                rel_bias.dtype, device,
             )
         else:
-            assert rel_in.shape == (total_q, num_head, rel_in_last_dim)
+            assert rel_bias.shape == (total_q, num_head, rel_extent)
+            bias_total_q_rounded = _round_up_to_tile(total_q, tile_m)
             bias = _shear_bias_empty(
-                (total_q + tile_m, num_head, rel_extent_padded),
-                rel_in.dtype, device,
+                (bias_total_q_rounded, num_head, rel_extent_padded),
+                rel_bias.dtype, device,
             )
 
         rows_per_cta = 4
         group_tile_bias = _group_tile_bias(qhead_per_kvhead_packgqa)
+        # Decode and target verification fit each sequence in one packed-Q block.
+        # In that case the batch index is already a scheduler coordinate, so the
+        # prefix-sum/block-map preparation kernel is pure launch overhead.
+        max_m_blocks_leq_one = seqlen_q_packgqa <= group_tile_bias
+        use_pdl = is_arch_support_pdl()
         bias_max_seqlen_q = max_seqlen_q if max_seqlen_q is not None else seqlen_q
         bias_max_seqlen_k = max_seqlen_k if max_seqlen_k is not None else seqlen_k
 
@@ -781,24 +759,13 @@ def _flash_attn_fwd(
         )
         if use_prepare_bias_kernel:
             prep_cache_key = (group_tile_bias, qhead_per_kvhead_packgqa, cu_seqlens_q.data_ptr())
-            # A cached schedule must not cross the eager/capture boundary.
-            # Under BCG captured metadata, cu_seqlens_q is a static buffer
-            # (stable data_ptr) refreshed in place at replay: a warmup-built
-            # entry hitting during capture would skip the CuSeqlensToBlocks
-            # launch, baking a stale schedule into the graph. Rejecting it
-            # forces the prep kernel INTO the capture, so every replay
-            # recomputes the schedule from the refreshed cu_seqlens_q.
-            # Within one capture, later layers reuse the capture-built entry.
-            capturing = torch.cuda.is_current_stream_capturing()
             cached_prep = (
                 rel_bias_prep_cache.get(prep_cache_key)
                 if rel_bias_prep_cache is not None
                 else None
             )
-            if cached_prep is not None and cached_prep[2] != capturing:
-                cached_prep = None
             if cached_prep is not None:
-                cu_total_m_blocks_bias, blocks_to_batch_idx = cached_prep[:2]
+                cu_total_m_blocks_bias, blocks_to_batch_idx = cached_prep
             else:
                 cu_total_m_blocks_bias = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
                 total_group_blocks_max = (
@@ -812,7 +779,11 @@ def _flash_attn_fwd(
                         for t in (cu_total_m_blocks_bias, cu_seqlens_q, blocks_to_batch_idx)
                     ]
                     _flash_attn_fwd.compile_cache_prepare_shear_bias[compile_key_prepare] = cute.compile(
-                        CuSeqlensToBlocksKernel(tile=group_tile_bias, seqlen_multiple=qhead_per_kvhead_packgqa),
+                        CuSeqlensToBlocksKernel(
+                            tile=group_tile_bias,
+                            seqlen_multiple=qhead_per_kvhead_packgqa,
+                            use_pdl=use_pdl,
+                        ),
                         cu_total_m_blocks_bias_tensor, cu_seqlens_q_tensor, blocks_to_batch_idx_tensor,
                         current_stream, options="--enable-tvm-ffi",
                     )
@@ -822,16 +793,15 @@ def _flash_attn_fwd(
                     )
                 if rel_bias_prep_cache is not None:
                     rel_bias_prep_cache[prep_cache_key] = (
-                        cu_total_m_blocks_bias, blocks_to_batch_idx, capturing,
+                        cu_total_m_blocks_bias, blocks_to_batch_idx,
                     )
 
         shear_compile_key = (
-            rel_in.dtype, rel_extent, causal,
+            rel_bias.dtype, rel_extent, causal,
             window_size_left is not None, window_size_right is not None,
             cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
             pack_gqa, qhead_per_kvhead, rows_per_cta, group_tile_bias, max_m_blocks_leq_one,
             cu_total_m_blocks_bias is not None, blocks_to_batch_idx is not None,
-            fused_rel_proj,
         )
         if shear_compile_key not in _flash_attn_fwd.compile_cache_shear_bias:
             (
@@ -842,27 +812,24 @@ def _flash_attn_fwd(
                 for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
                           cu_total_m_blocks_bias, blocks_to_batch_idx)
             ]
-            rel_proj_tensor = to_cute_tensor(rel_proj) if fused_rel_proj else None
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key] = cute.compile(
                 ShearingBias(
                     rel_extent, is_causal=causal, is_local=local, pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead, rows_per_cta=rows_per_cta,
                     tile_m=group_tile_bias, max_m_blocks_leq_one=max_m_blocks_leq_one,
-                    fused_proj=fused_rel_proj,
+                    use_pdl=use_pdl,
                 ),
-                to_cute_tensor(rel_in), to_cute_tensor(bias),
+                to_cute_tensor(rel_bias), to_cute_tensor(bias),
                 bias_max_seqlen_q, bias_max_seqlen_k,
                 cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
                 cu_total_m_blocks_bias_tensor, blocks_to_batch_idx_tensor,
-                window_size_left, window_size_right, rel_proj_tensor,
-                current_stream, options="--enable-tvm-ffi",
+                window_size_left, window_size_right, current_stream, options="--enable-tvm-ffi",
             )
         if not is_fake_mode():
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key](
-                rel_in, bias, bias_max_seqlen_q, bias_max_seqlen_k,
+                rel_bias, bias, bias_max_seqlen_q, bias_max_seqlen_k,
                 cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
                 cu_total_m_blocks_bias, blocks_to_batch_idx, window_size_left, window_size_right,
-                rel_proj,
             )
         if os.environ.get("BIAS_PREP_ONLY", "0") == "1":
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
@@ -1027,7 +994,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
-            assert not is_split_kv, "SplitKV not supported on SM 9.0"
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
                 head_dim,
@@ -1035,6 +1001,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
@@ -1049,6 +1016,9 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                has_bias=bias is not None,
+                bias_block_size=tile_bias,
+                rel_extent_padded=rel_extent_padded,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1215,8 +1185,9 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 compile_args.append(bias_tensor)  # mBias
+            if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
                     compile_args.extend([
                         sfq_tensor,  # mSFQ
@@ -1307,8 +1278,9 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 call_args.append(bias)  # mBias
+            if arch // 10 in [10, 11]:
                 if not use_dedicated_hd256_kernel:
                     # qk_sf_vec_size / v_sf_vec_size are Constexpr (baked at
                     # compile time), so only the SF tensors go on the call.
@@ -1441,8 +1413,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         k_descale: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
         rel_bias: Optional[torch.Tensor] = None,
-        rel_r: Optional[torch.Tensor] = None,
-        rel_proj: Optional[torch.Tensor] = None,
         sfq: Optional[torch.Tensor] = None,
         sfk: Optional[torch.Tensor] = None,
         sfv: Optional[torch.Tensor] = None,
@@ -1491,8 +1461,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
-            rel_r=rel_r,
-            rel_proj=rel_proj,
             sfq=sfq,
             sfk=sfk,
             sfv=sfv,
@@ -1608,8 +1576,6 @@ def flash_attn_varlen_func(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
-    rel_r: Optional[torch.Tensor] = None,
-    rel_proj: Optional[torch.Tensor] = None,
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
@@ -1688,8 +1654,6 @@ def flash_attn_varlen_func(
         k_descale,
         v_descale,
         rel_bias,
-        rel_r,
-        rel_proj,
         sfq,
         sfk,
         sfv,
@@ -1702,7 +1666,7 @@ def flash_attn_varlen_func(
 
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx, *, use_pdl,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -1715,6 +1679,7 @@ def _compile_fwd_combine(
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
+        use_pdl=use_pdl,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -1824,6 +1789,9 @@ def _flash_attn_fwd_combine(
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
     dtype_partial = torch2cute_dtype_map[out_partial.dtype]
+    # Device architecture is invariant for the lifetime of this server/JIT
+    # cache, so PDL does not belong in the compile key.
+    use_pdl = is_arch_support_pdl()
     compile_key = (
         dtype,
         dtype_partial,
@@ -1838,7 +1806,7 @@ def _flash_attn_fwd_combine(
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
-            *compile_key
+            *compile_key, use_pdl=use_pdl
         )
     if not is_fake_mode():
         _flash_attn_fwd_combine.compile_cache[compile_key](

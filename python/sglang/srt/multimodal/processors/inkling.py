@@ -13,7 +13,7 @@
 # ==============================================================================
 """SGLang multimodal processor for Inkling models.
 
-Adapts the HF-convention feature extraction in ``sglang.tml.huggingface`` to
+Adapts the HF-convention feature extraction in ``sglang.srt.multimodal.inkling`` to
 SGLang's ``BaseMultimodalProcessor``: expands the MM placeholder tokens in a
 pre-rendered ``input_ids`` (the chat renderer is a separate workstream) and attaches
 per-item features as ``MultimodalDataItem``s. A modality is enabled only when its
@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -39,12 +40,12 @@ from sglang.srt.models.inkling import InklingForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.tml.huggingface import (
+from sglang.srt.multimodal.inkling import (
     InklingAudioFeatureExtractor,
     InklingImageProcessor,
     InklingProcessor,
 )
-from sglang.tml.tokenizer import (
+from sglang.srt.parser.inkling_tokenizer import (
     AUDIO_END,
     AUDIO_TOKEN_ID as INKLING_AUDIO_TOKEN_ID,
     IMAGE_TOKEN_ID as INKLING_IMAGE_TOKEN_ID,
@@ -120,9 +121,20 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
         vision_enabled = _cfg(vision_config, "decoder_dmodel") is not None
         audio_enabled = _cfg(audio_config, "decoder_dmodel") is not None
 
-        image_processor = InklingImageProcessor(
-            patch_size=_cfg(vision_config, "patch_size", 40),
-        )
+        patch_size = _cfg(vision_config, "patch_size", 40)
+        if envs.SGLANG_INKLING_RS_MM_PREPROCESS.get():
+            try:
+                from sglang.srt.multimodal.inkling.image_processing_rust import InklingRustImageProcessor
+                image_processor = InklingRustImageProcessor(patch_size=patch_size)
+                logger.info("Using Rust-accelerated Inkling image processor")
+            except ImportError:
+                logger.warning(
+                    "SGLANG_INKLING_RS_MM_PREPROCESS=1 but sglang.srt.multimodal._core is not available; "
+                    "falling back to the default image processor."
+                )
+                image_processor = InklingImageProcessor(patch_size=patch_size)
+        else:
+            image_processor = InklingImageProcessor(patch_size=patch_size)
         # The dmel grid used here at encode time must equal what the model de-bins with
         # at decode (InklingAudio reads it from audio_config); require it when audio
         # is enabled rather than guessing a default that would silently corrupt embeds.
@@ -203,6 +215,9 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
         img_feat = self.inkling_processor.process_images(image_data) if image_data else None
         aud_feat = self.inkling_processor.process_audios(audio_data) if audio_data else None
 
+        # Rust processor returns content_hashes; original processor does not.
+        img_hashes = img_feat.get("content_hashes") if img_feat else None
+
         out_ids: List[int] = []
         image_items: List[Tuple[int, int, torch.Tensor]] = []  # (start, end, feature)
         audio_items: List[Tuple[int, int, torch.Tensor]] = []
@@ -237,10 +252,13 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
                 out_ids.append(tok)
 
         mm_items: List[MultimodalDataItem] = []
-        for start, end, feat in image_items:
+        for idx, (start, end, feat) in enumerate(image_items):
             mm_items.append(
                 MultimodalDataItem(
-                    modality=Modality.IMAGE, feature=feat, offsets=[(start, end)]
+                    modality=Modality.IMAGE,
+                    feature=feat,
+                    offsets=[(start, end)],
+                    hash=img_hashes[idx] if img_hashes else None,
                 )
             )
         for start, end, feat in audio_items:

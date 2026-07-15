@@ -70,7 +70,6 @@ from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -80,6 +79,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -483,18 +483,7 @@ def extend(reqs, model_runner):
 
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
-    # Diagnosis hook (fp8 NaN-logits-print anomaly): the printed logits were
-    # all-NaN while greedy sampling was provably correct, so check whether the
-    # tensor is corrupted before or after sample().
-    _lg = logits_output.next_token_logits
-    _pre = torch.isfinite(_lg).float().mean().item()
     next_token_ids = model_runner.sample(logits_output, forward_batch)
-    _post = torch.isfinite(_lg).float().mean().item()
-    print(
-        f"[extend-debug] next_token_logits finite fraction: pre-sample={_pre:.4f} "
-        f"post-sample={_post:.4f} ptr={_lg.data_ptr():#x} dtype={_lg.dtype}",
-        flush=True,
-    )
     return next_token_ids, logits_output.next_token_logits, batch
 
 
@@ -514,7 +503,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=get_attention_tp_size(),
+            attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
@@ -652,16 +641,6 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    # Same runtime-config globals latency_test sets (one_batch's two entry
-    # paths must agree). Without initialize_moe_config the global MoE runner
-    # backend stays default, so --moe-runner-backend flashinfer_trtllm_routed
-    # is ignored during model build: ModelOptNvFp4FusedMoEMethod skips the
-    # TRTLLM weight alignment (no g1_scale_c) and apply() falls through to
-    # the generic cutlass path, which crashes on Inkling's PackedTopKOutput.
-    initialize_moe_config(server_args)
-    initialize_fp8_gemm_config(server_args)
-    initialize_fp4_gemm_config(server_args)
-
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None

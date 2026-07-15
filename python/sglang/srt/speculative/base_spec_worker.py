@@ -5,6 +5,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -97,6 +104,8 @@ class EagleDraftWorkerBase(ABC):
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        widened_out_cache_loc: torch.Tensor = None,
+        widened_positions: torch.Tensor = None,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -107,7 +116,14 @@ class EagleDraftWorkerBase(ABC):
         from sglang.srt.utils.common import is_npu
 
         bs = len(batch.seq_lens)
-        extend_num_tokens = bs * num_draft_tokens
+        # Optional window widening (num_front_tokens=0 -> off): prepend that many
+        # rows below the boundary. Locs/positions arrive precomputed; token/hidden
+        # buffers are zeroed placeholders the caller fills after the plan-stream join.
+        num_front_tokens = draft_extend_input.num_front_tokens
+        widen = num_front_tokens > 0 and not batch.forward_mode.is_idle()
+        front_offset = num_front_tokens if widen else 0
+        num_window_tokens = num_draft_tokens + front_offset
+        extend_num_tokens = bs * num_window_tokens
         # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
         gpu_only = batch.seq_lens_cpu is None
 
@@ -116,7 +132,21 @@ class EagleDraftWorkerBase(ABC):
         # may run this under a plan stream; casting inside the plan stream creates a
         # cross-stream dependency that can lead to data races and break MTP acceptance.
         # The caller should cast to int64 before entering the plan stream context.
-        batch.input_ids = predict
+        if widen:
+            assert widened_out_cache_loc is not None and widened_positions is not None
+            batch.input_ids = predict.new_zeros((extend_num_tokens,))
+            batch.out_cache_loc = widened_out_cache_loc
+            # init_new adopts spec_info.positions when present.
+            draft_extend_input.positions = widened_positions
+            # Placeholder for the widened hidden window, filled by the worker.
+            if draft_extend_input.hidden_states is not None:
+                draft_extend_input.hidden_states = (
+                    draft_extend_input.hidden_states.new_empty(
+                        (extend_num_tokens, draft_extend_input.hidden_states.shape[1])
+                    )
+                )
+        else:
+            batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -126,13 +156,20 @@ class EagleDraftWorkerBase(ABC):
         # init_new requires both list or both Tensor;
         # gpu_only emits device tensors to skip H2D.
         if gpu_only:
-            batch.prefix_lens = batch.seq_lens.to(torch.int32)
+            batch.prefix_lens = (
+                (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
+            )
             batch.extend_lens = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int32, device=batch.seq_lens.device
+                (bs,),
+                num_window_tokens,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
             )
         else:
-            batch.prefix_lens = batch.seq_lens_cpu.tolist()
-            batch.extend_lens = [num_draft_tokens] * bs
+            batch.prefix_lens = [
+                max(int(x) - front_offset, 0) for x in batch.seq_lens_cpu.tolist()
+            ]
+            batch.extend_lens = [num_window_tokens] * bs
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
@@ -155,7 +192,7 @@ class EagleDraftWorkerBase(ABC):
         else:
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
-            forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+            forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
@@ -183,12 +220,12 @@ class EagleDraftWorkerBase(ABC):
         topk: int,
         num_steps: int,
     ):
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_draft_cache_locs_contiguous,
+        )
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
-        )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
-            assign_draft_cache_locs_contiguous,
         )
 
         if not batch.forward_mode.is_idle():
@@ -202,16 +239,27 @@ class EagleDraftWorkerBase(ABC):
                     dtype=torch.int64,
                     device=batch.device,
                 )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
+                if _is_cpu:
+                    assign_draft_cache_locs_contiguous_cpu(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
+                else:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
                 # Reduce out_cache_loc from the page-aligned tree region down to the
@@ -317,6 +365,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 

@@ -14,7 +14,6 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-import os
 from dataclasses import dataclass
 
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
@@ -26,13 +25,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
-
-# Perf-attribution probes (numerics-breaking, bench only): FA4_PROBE in
-# {"norescale", "noregbump"}. Read at import; set env before importing.
-_FA4_PROBE = os.environ.get("FA4_PROBE", "")
-# Fold softmax scale into the exp2 base even with bias: scores stay unscaled,
-# host passes rel_bias pre-multiplied by 1/softmax_scale (exact for 1/128).
-_FA4_FOLD_SCALE = os.environ.get("FA4_FOLD_SCALE", "") == "1"
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.blockscaled_layout as blockscaled_layout
@@ -78,7 +70,7 @@ from sglang.jit_kernel.flash_attn.cute.tile_scheduler import (
 )
 from sglang.jit_kernel.flash_attn.cute.fa_logging import fa_log, fa_printf
 from sglang.jit_kernel.flash_attn.cute.utils import smid
-from sglang.jit_kernel.flash_attn.cute.utils import cvt_tensor_ue8m0_to_bf16
+from sglang.jit_kernel.flash_attn.cute.utils import cvt_bf16x2_ue8m0x2, cvt_tensor_ue8m0_to_bf16
 from sglang.jit_kernel.flash_attn.cute.utils import AuxData
 
 # === TUNING KNOBS (agent-editable) ===
@@ -248,8 +240,6 @@ class FlashAttentionForwardSm100:
         self.bias_n_max = rel_extent_padded // n_block_size if has_bias else 0
         self.bias_block_size = bias_block_size
         self.bias_stage = 2 if (self.q_stage == 2 or (self.q_stage == 1 and not is_split_kv)) else 1
-        if "biasstage4" in _FA4_PROBE and self.bias_stage == 2:
-            self.bias_stage = 4
         assert self.bias_stage >= self.q_stage
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
@@ -395,10 +385,8 @@ class FlashAttentionForwardSm100:
             else:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
-            if self.has_bias and "noregbump" not in _FA4_PROBE:
+            if self.has_bias:
                 self.num_regs_softmax += 8
-                if "rebalance" in _FA4_PROBE:
-                    self.num_regs_correction -= 16
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
@@ -432,11 +420,10 @@ class FlashAttentionForwardSm100:
             smem_size_k_per_stage += self.n_block_size * self.head_dim_padded // self.qk_sf_vec_size * self.sfk_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         if self.v_dequant:
-            # fp8 V scale bytes ride each kv stage (the fp8 V and K no longer
-            # share smem). The dequantized bf16 V is NOT per-kv-stage: it is a
-            # separate v_mma_stage-deep buffer (PV consumer depth), accounted
-            # as a fixed cost in the kv_stage formula below.
+            # fp8 V scale bytes + the dequantized bf16 V (the fp8 V and its
+            # dequant target both live in smem; K and V no longer share).
             smem_size_v_per_stage += self.n_block_size * self.head_dim_v_padded // self.v_sf_vec_size * self.sfv_dtype.width // 8
+            smem_size_v_per_stage += self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
         if self.v_dequant:
             # v_dequant uses separate K and V pipelines, so their smem is not shared.
             smem_size_kv_per_stage = smem_size_k_per_stage + smem_size_v_per_stage
@@ -462,43 +449,22 @@ class FlashAttentionForwardSm100:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         v_mma_stage = kv_stage
-        if self.v_dtype.width == 8 and not self.v_dequant:
-            # Plain (per-tensor) fp8 V: keep the bring-up hardcode untouched.
-            kv_stage = 2
-            v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else kv_stage
-        elif self.v_dequant:
-            # W7-1: decoupled staging for the mxfp8 v_dequant path.
-            #   kv_stage    = depth of the fp8 K(+SFK) / V(+SFV) TMA pipelines
-            #                 (pipeline_kv / pipeline_vq): latency hiding.
-            #   v_mma_stage = depth of the dequantized bf16 V buffer
-            #                 (pipeline_v_mma): the PV consumer depth. The
-            #                 correction warps write exactly one bf16 tile per
-            #                 kv iteration, so this only needs to cover
-            #                 dequant/PV-MMA overlap, not TMA latency.
-            # Smem ledger at hd128 decode (q_stage=1, fp8 QKV, sf_vec=32), bytes:
-            #   fixed:      sQ 16384 + sSFQ 512 + sO 32768              = 49664
-            #   fixed:      bf16 sV 32768 * v_mma_stage
-            #   per stage:  K 16384 + SFK 512 + Vq 16384 + SFV 512      = 33792
-            #   v_mma_stage=2 -> kv_stage = (229376-49664-65536)//33792 = 3
-            #   v_mma_stage=1 -> kv_stage = (229376-49664-32768)//33792 = 4  <- picked
-            # (old hardcode: kv_stage=2 with the bf16 tile counted per kv stage,
-            #  i.e. 66560 B/stage).
-            bf16_v_bytes = (
-                self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
-            )
-            budget = 224 * 1024 - smem_size_q_o_bias
-            kv_stage_2buf = min((budget - 2 * bf16_v_bytes) // smem_size_kv_per_stage, 32)
-            kv_stage_1buf = min((budget - 1 * bf16_v_bytes) // smem_size_kv_per_stage, 32)
-            if self.has_bias and self.q_stage == 2:
-                # Pre-existing constraint: sheared-bias + q_stage=2 runs with a
-                # single bf16 V buffer.
-                v_mma_stage, kv_stage = 1, kv_stage_1buf
-            elif kv_stage_2buf >= 2:
-                v_mma_stage, kv_stage = 2, kv_stage_2buf
+        if self.v_dtype.width == 8:
+            if self.v_dequant:
+                # Budget the fp8 K/V load pipeline (kv_stage) separately from the
+                # bf16 dequant buffers (v_mma_stage): sVq/sK follow kv_stage, only
+                # sV_dequant follows v_mma_stage, so deepening the load pipeline
+                # costs 8-bit bytes, not 16-bit ones.
+                v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else 2
+                smem_size_v_mma_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
+                smem_size_load_per_stage = smem_size_kv_per_stage - smem_size_v_mma_per_stage
+                kv_stage = (
+                    224 * 1024 - smem_size_q_o_bias - v_mma_stage * smem_size_v_mma_per_stage
+                ) // smem_size_load_per_stage
+                kv_stage = max(min(kv_stage, 8), 2)
             else:
-                v_mma_stage, kv_stage = 1, kv_stage_1buf
-            # Floor at the old hardcode; matches the previous smem-risk profile.
-            kv_stage = max(kv_stage, 2)
+                kv_stage = 2
+                v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else kv_stage
         self.kv_stage = kv_stage
         self.v_mma_stage = v_mma_stage
         # print("kv_stage", self.kv_stage)
@@ -512,9 +478,6 @@ class FlashAttentionForwardSm100:
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-            # v_dequant keeps K and V in separate buffers; the uneven-KV trick
-            # assumes they share one, so never enable it there.
-            and not self.v_dequant
         )
         self.uneven_kv_smem_offset = (
             self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
@@ -1104,29 +1067,7 @@ class FlashAttentionForwardSm100:
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
         if const_expr(self.overlap_sO_sQ and self.has_bias):
-            # With bias, sO (recast over sQ's smem below) is allowed to spill
-            # past sQ into sK/sBias instead of inflating sQ to cosize(sO).
-            # The spill is race-free: under overlap_sO_sQ the MMA warp commits
-            # pipeline_o_acc for all stages only after the final gemms, so
-            # every K/V/bias smem read of the (single) work tile has completed
-            # before the correction epilogue writes sO. But the spill must
-            # stay inside the shared-memory struct: with split-KV (fp32
-            # partials double sO) + fp8 KV (kv_stage pinned to 2, small sK) +
-            # decode-shaped bias tiles (tile_bias < 128, tiny sBias), sQ + sK
-            # + sBias can be SMALLER than sO, and the unpredicated sO stores
-            # then land past the smem allocation -> cudaErrorIllegalAddress.
-            # Pad sQ by the shortfall so the struct always covers sO.
             sQ_size = cute.cosize(sQ_layout)
-            o_bytes = cute.cosize(sO_layout) * self.o_dtype.width // 8
-            covered_bytes = (
-                sQ_size * self.q_dtype.width // 8
-                + cute.cosize(sK_layout) * self.k_dtype.width // 8
-                + sBias_size * self.bias_dtype.width // 8
-            )
-            shortfall_bytes = cutlass.max(o_bytes - covered_bytes, 0)
-            sQ_size = sQ_size + (
-                (shortfall_bytes * 8 + self.q_dtype.width - 1) // self.q_dtype.width
-            )
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
@@ -1231,7 +1172,7 @@ class FlashAttentionForwardSm100:
         # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
         # through the same runtime kernel argument as the score_mod path so the device
         # code sees identical operand kinds (constant vs register changes codegen).
-        if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
+        if const_expr(self.has_bias):
             base_softmax_scale = softmax_scale
             softmax_scale_log2, softmax_scale = utils.LOG2_E, None
         else:
@@ -1315,6 +1256,10 @@ class FlashAttentionForwardSm100:
             cluster=self.cluster_shape_mnk if cute.size(self.cluster_shape_mnk) > 1 else None,
             stream=stream,
             min_blocks_per_mp=1,
+            # PDL overlaps this grid with the ShearingBias producer that immediately
+            # precedes it on the bias path; the load warp's griddepcontrol_wait
+            # (before the first bias TMA) keeps every read of its output ordered.
+            use_pdl=self.has_bias,
         )
 
     def _generate_attention_mask_cls(self, window_size_left, window_size_right):
@@ -1953,7 +1898,6 @@ class FlashAttentionForwardSm100:
                 sBias=sBias,
                 bias_s2r_tiled_copy=bias_s2r_tiled_copy,
                 pipeline_bias=pipeline_bias,
-                pipeline_sf_overlap=pipeline_sf_overlap,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2347,6 +2291,15 @@ class FlashAttentionForwardSm100:
                     if issue_kv_for_this_warp:
                         kv_producer_state.advance()
                     if const_expr(tma_atom_bias is not None):
+                        # Under PDL the grid launches while the ShearingBias producer
+                        # is still running; mBias is its output, so every bias TMA
+                        # stays behind this wait (bias_max_idx0 >= bias_max_idx1, so
+                        # idx0 < 0 means this worktile issues no bias load at all and
+                        # must not stall its K/V loads on the producer). Q/K/V and
+                        # the page table are written before the producer and need no
+                        # ordering here.
+                        if const_expr(not self.is_split_kv) or bias_max_idx0 >= 0:
+                            cute.arch.griddepcontrol_wait()
                         if (
                             issue_q_for_this_warp
                             and (const_expr(not self.is_split_kv) or bias_max_idx0 >= 0)
@@ -2591,25 +2544,43 @@ class FlashAttentionForwardSm100:
 
         num_v = cute.size(tVrV_f8.shape[0])  # vectorized elements per (row,col)
 
-        # Per-head-dim scaling is per-ELEMENT: within a vectorized copy block the
-        # elements are consecutive TOKENS (V is (dv, token) with token fastest),
-        # each with its own scale sSFV[token, dv//v_sf_vec] (dv fixed per row).
-        # Gather all (num_v x num_cols) e8m0 scales per row -> one cvt per row
-        # (num_v*num_cols is even), storing bf16 scales as (num_v, num_rows, num_cols).
-        ncv = num_cols * num_v
-        assert ncv % 2 == 0
+        # Partition geometry (from tVcV): the vector (e) runs along dv within
+        # one sf block, mode-1 (i) steps tokens by 32, mode-2 (j) steps dv
+        # blocks by 32. So all num_v elements of a vector share ONE scale
+        # sSFV[token(i), block=j], and the SFB atom keeps one token's sf_dim
+        # block bytes contiguous and 4B-aligned -> one 4-byte smem load per
+        # token row covers every block this thread touches.
+        assert num_cols == self.head_dim_v_padded // self.v_sf_vec_size
+        assert num_cols % 2 == 0
         def _gather_scales():
-            sc = cute.make_rmem_tensor((num_v, num_rows, num_cols), dtype=cutlass.BFloat16)
+            # Explicit bf16 view over the packed cvt results: flat Int32 word
+            # (i * num_cols//2 + p) holds bf16 scales (j=2p, 2p+1) of row i.
+            sc32 = cute.make_rmem_tensor((num_cols // 2) * num_rows, cutlass.Int32)
+            sc = cute.make_tensor(
+                cute.recast_ptr(sc32.iterator, dtype=cutlass.BFloat16),
+                cute.make_layout((num_cols, num_rows), stride=(1, num_cols)),
+            )
+            # NOTE: recast_tensor on tiny rmem tensors mis-aliased here (a
+            # (1,)xInt32 -> Int16 recast returned the low half for BOTH
+            # entries, observed on-device), so both reinterpretations below use
+            # explicit make_tensor-over-recast_ptr aliases instead.
+            w16 = cute.make_rmem_tensor((2,), cutlass.Int16)
+            w32 = cute.make_tensor(
+                cute.recast_ptr(w16.iterator, dtype=cutlass.Int32), cute.make_layout((1,))
+            )
+            # crd2idx with a dynamic stage coord silently dropped the stage
+            # term (observed on-device); add the stage stride explicitly.
+            sf_stage_stride = cute.crd2idx((0, 0, 0, 1), sSFV_u8.layout)
             for i in cutlass.range_constexpr(num_rows):
-                e8u = cute.make_rmem_tensor((num_v, num_cols), dtype=cutlass.Uint8)
-                for j in cutlass.range_constexpr(num_cols):
-                    for e in cutlass.range_constexpr(num_v):
-                        # element (e,i,j) holds V[dv, token]; scale = sSFV[token, dv//vec]
-                        crd = tVcV[e, i, j]
-                        e8u[e, j] = sSFV_u8[crd[1], 0, crd[0] // self.v_sf_vec_size, vq_stage]
-                e8 = cute.recast_tensor(e8u, sSFV.element_type)
-                cvt_tensor_ue8m0_to_bf16(e8, sc[None, i, None])
-            return sc
+                tok = tVcV[0, i, 0][1]
+                idx = cute.crd2idx((tok, 0, 0, 0), sSFV_u8.layout) + vq_stage * sf_stage_stride
+                w32[0] = cute.make_tensor(
+                    cute.recast_ptr(sSFV_u8.iterator + idx, dtype=cutlass.Int32),
+                    cute.make_layout((1,)),
+                )[0]
+                for p in cutlass.range_constexpr(num_cols // 2):
+                    sc32[i * (num_cols // 2) + p] = cvt_bf16x2_ue8m0x2(w16[p])
+            return sc  # sc[j, i]: block j, token-row i
 
         if const_expr(delay_v_mma_acquire):
             scales_all = _gather_scales()
@@ -2635,8 +2606,9 @@ class FlashAttentionForwardSm100:
             tVrV_f16_frg = cute.make_fragment_like(tVsV_f16_frg)
             tVrV_f16_frg.store(tVrV_f8_frg.load().to(cutlass.Float32).to(self.v_mma_dtype))
             for j in cutlass.range_constexpr(num_cols):
+                s = scales_all[j, i]
                 for e in cutlass.range_constexpr(num_v):
-                    tVrV_f16_frg[e, j] = tVrV_f16_frg[e, j] * scales_all[e, i, j]
+                    tVrV_f16_frg[e, j] = tVrV_f16_frg[e, j] * s
             cute.copy(tiled_copy_r2s, tVrV_f16_frg, tVsV_f16_frg)
 
         cute.arch.fence_view_async_shared()
@@ -2847,12 +2819,6 @@ class FlashAttentionForwardSm100:
         # ]
 
         mma_q_consumer_phase = Int32(0)
-        # W7-2 SF/S TMEM time-multiplex phase (q_stage == 2 blockscaled only).
-        # Each S region r is acquired ("softmax(r) drained S(r)") exactly once
-        # per kv iteration -- prologue included -- so a single phase bit,
-        # toggled once per iteration, serves both regions. See the ordering
-        # note at the prologue acquire below.
-        sf_overlap_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
@@ -2902,37 +2868,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     # S2T copy SFQ then SFK into TMEM (blockscaled QK^T operands)
-                    #
-                    # W7-2: at q_stage == 2 the SFs for stage s live INSIDE the
-                    # other stage's S region (tmem_sfq_offset[s] ==
-                    # tmem_s_offset[1-s], first 8 columns), so this copy
-                    # overwrites live score columns of S(1-s). Acquire
-                    # pipeline_sf_overlap(1-s) = "softmax warp group (1-s) has
-                    # t2r'd the most recently committed S(1-s)" first.
-                    # Pairing (asymmetric by construction):
-                    #   region 1 (stage-0 copies): the last writer of S1 is
-                    #     gemm_Si[1] of the PREVIOUS iteration, so this acquire
-                    #     pairs with softmax1's release for the previous tile;
-                    #     the very first acquire is satisfied by softmax1's
-                    #     one-time priming release at kernel start.
-                    #   region 0 (stage-1 copies): gemm_Si[0] + commit(0) of
-                    #     THIS iteration already happened above, so this
-                    #     acquire pairs with softmax0's release for the
-                    #     CURRENT tile (no priming release).
-                    # Deadlock argument: the awaited release only requires the
-                    # corresponding S commit (already issued by this warp) and
-                    # softmax's t2r, which is the first thing softmax does
-                    # after its S wait -- it depends on no later mma work, no
-                    # correction-warp work, and no pipeline_s_p_o release, so
-                    # there is no cycle; the wait is bounded by one t2r.
-                    # The copy itself only touches SF columns [0, 8) of the
-                    # region and is disjoint from the P columns [64, 128) that
-                    # softmax may still be writing.
                     if const_expr(self.qk_blockscaled):
-                        if const_expr(self.q_stage == 2):
-                            pipeline_sf_overlap.producer_acquire_w_index_phase(
-                                1 - stage, sf_overlap_phase
-                            )
                         cute.copy(
                             sf_copies[stage].tiled_copy_sfq,
                             sf_copies[stage].tCsSFQ_s2t[(None, None, None, None, stage)],
@@ -2967,8 +2903,6 @@ class FlashAttentionForwardSm100:
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
-                if const_expr(self.qk_blockscaled and self.q_stage == 2):
-                    sf_overlap_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
@@ -3034,29 +2968,8 @@ class FlashAttentionForwardSm100:
                             if const_expr(not self.v_dequant):
                                 mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        # S2T re-copy the SFs for this stage:
-                        #   SFK: new scales for each Ki (content changes per tile).
-                        #   SFQ (q_stage == 2 only): the OTHER stage's S GEMM
-                        #     overwrote the SF TMEM region (SFQ/SFK of stage s
-                        #     live in the first 8 columns of S(1-s)), so SFQ
-                        #     must be restored every iteration too. At
-                        #     q_stage == 1 nothing writes the S1 region, so the
-                        #     prologue SFQ copy stays valid.
-                        # The pipeline_sf_overlap acquire orders these copies
-                        # after softmax(1-stage) drained S(1-stage); see the
-                        # prologue comment for the pairing/deadlock argument.
+                        # S2T re-copy SFK for this Ki (S GEMM overwrote the SF TMEM region)
                         if const_expr(self.qk_blockscaled):
-                            if const_expr(self.q_stage == 2):
-                                pipeline_sf_overlap.producer_acquire_w_index_phase(
-                                    1 - stage, sf_overlap_phase
-                                )
-                                cute.copy(
-                                    sf_copies[stage].tiled_copy_sfq,
-                                    sf_copies[stage].tCsSFQ_s2t[
-                                        (None, None, None, None, stage)
-                                    ],
-                                    sf_copies[stage].tCtSFQ_s2t,
-                                )
                             cute.copy(
                                 sf_copies[stage].tiled_copy_sfk,
                                 sf_copies[stage].tCsSFK_s2t[
@@ -3088,8 +3001,6 @@ class FlashAttentionForwardSm100:
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
-                    if const_expr(self.qk_blockscaled and self.q_stage == 2):
-                        sf_overlap_phase ^= 1
                     O_should_accumulate = True
                 # End of seqlen_kv loop
 
@@ -3217,7 +3128,6 @@ class FlashAttentionForwardSm100:
         sBias: Optional[cute.Tensor] = None,
         bias_s2r_tiled_copy: Optional[cute.TiledCopy] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
-        pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3291,15 +3201,6 @@ class FlashAttentionForwardSm100:
             bias_s2r_thr_copy = None
             tS2RsBias = None
 
-        if const_expr(self.qk_blockscaled and self.q_stage == 2):
-            # W7-2 priming: the mma warp's SF copies into S region 1 pair with
-            # softmax warp group 1's release for the PREVIOUS tile (see the
-            # pairing note in mma()), so group 1 releases once up front.
-            # Region-0 copies pair with the CURRENT tile's release -- no prime
-            # there, or the acquire/release counts would go out of sync.
-            if stage == 1:
-                pipeline_sf_overlap.consumer_release_w_index(stage)
-
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -3369,7 +3270,7 @@ class FlashAttentionForwardSm100:
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
             max_offset = 8 if cutlass.const_expr(self.v_mma_dtype.width == 8) else 0
-            if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
+            if const_expr(self.has_bias):
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = base_softmax_scale * qk_descale
             elif const_expr(self.score_mod is None):
@@ -3378,12 +3279,6 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
-
-            if const_expr(self.has_bias and _FA4_FOLD_SCALE):
-                # Folded domain with per-tensor fp8 descales: exp2 base carries
-                # softmax_scale*qk_descale, so the (already 1/softmax_scale
-                # pre-scaled) bias still needs the 1/qk_descale factor.
-                softmax_scale_eff = 1.0 / qk_descale
 
             rescale_threshold = (
                 8.0 if const_expr(self.v_mma_dtype.width == 16) else
@@ -3443,7 +3338,6 @@ class FlashAttentionForwardSm100:
                 tS2RsBias=tS2RsBias,
                 bias_s2r_thr_copy=bias_s2r_thr_copy,
                 pipeline_bias=pipeline_bias,
-                pipeline_sf_overlap=pipeline_sf_overlap,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -3691,7 +3585,6 @@ class FlashAttentionForwardSm100:
         bias_emu_off: Optional[Boolean] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
         bias_si_consumer_state: Optional[pipeline.PipelineState] = None,
-        pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3723,19 +3616,6 @@ class FlashAttentionForwardSm100:
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
 
-        if const_expr(self.qk_blockscaled and self.q_stage == 2):
-            # W7-2: S(stage) is now fully in registers -- release the region so
-            # the mma warp may s2t-copy the other stage's SFQ/SFK into its
-            # first 8 TMEM columns (they alias score columns of S(stage)).
-            # The fence orders the async tcgen05.ld above before the arrive.
-            # Ordering vs pipeline_s_p_o: this release strictly precedes this
-            # step's P-full release below, and depends only on the S-full wait
-            # above, so it cannot introduce a wait cycle with the mma warp.
-            # The mma's subsequent SF copy writes columns [0, 8) only, disjoint
-            # from the P columns [64, 128) this step is about to write.
-            cute.arch.fence_view_async_tmem_load()
-            pipeline_sf_overlap.consumer_release_w_index(stage)
-
         if const_expr(self.has_bias and apply_bias):
             tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
             bias_si_phase = bias_si_consumer_state.phase
@@ -3750,23 +3630,33 @@ class FlashAttentionForwardSm100:
                     tS2RsBias_cur = tS2RsBias[None, 0, i, bias_si_stage]
                     tS2RrBias_cur = cute.make_fragment_like(tS2RsBias[None, 0, 0, 0])
                     cute.copy(bias_s2r_thr_copy, tS2RsBias_cur, tS2RrBias_cur)
-                    for j in cutlass.range_constexpr(cute.size(tBrS_cur.shape)):
-                        if const_expr(not _FA4_FOLD_SCALE):
-                            tBrS_cur[j] = tBrS_cur[j] * bias_softmax_scale
-                            tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype)
-                        else:
-                            tBrS_cur[j] = tBrS_cur[j] + tS2RrBias_cur[j].to(self.qk_acc_dtype) * bias_softmax_scale
+                    assert cute.size(tBrS_cur.shape) % 2 == 0
+                    for j in cutlass.range(
+                        0, cute.size(tBrS_cur.shape), 2, unroll_full=True
+                    ):
+                        tBrS_cur[j], tBrS_cur[j + 1] = cute.arch.fma_packed_f32x2(
+                            (tBrS_cur[j], tBrS_cur[j + 1]),
+                            (bias_softmax_scale, bias_softmax_scale),
+                            (
+                                tS2RrBias_cur[j].to(self.qk_acc_dtype),
+                                tS2RrBias_cur[j + 1].to(self.qk_acc_dtype),
+                            ),
+                        )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwdSm100.Softmax) + stage, number_of_threads=128,
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(self.has_bias and not apply_bias and "norescale" not in _FA4_PROBE and not _FA4_FOLD_SCALE):
+        if const_expr(self.has_bias and not apply_bias):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
-            for j in cutlass.range_constexpr(cute.size(tSrS_t2r.shape)):
-                tSrS_t2r[j] = tSrS_t2r[j] * bias_softmax_scale
+            assert cute.size(tSrS_t2r.shape) % 2 == 0
+            for j in cutlass.range(0, cute.size(tSrS_t2r.shape), 2, unroll_full=True):
+                tSrS_t2r[j], tSrS_t2r[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tSrS_t2r[j], tSrS_t2r[j + 1]),
+                    (bias_softmax_scale, bias_softmax_scale),
+                )
 
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -3947,7 +3837,7 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
             qk_descale, v_descale = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
-            if const_expr(self.has_bias and not _FA4_FOLD_SCALE):
+            if const_expr(self.has_bias):
                 softmax_scale_log2_eff = softmax_scale_log2
             elif const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale

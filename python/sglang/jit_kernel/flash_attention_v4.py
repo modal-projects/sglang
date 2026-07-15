@@ -59,8 +59,6 @@ def flash_attn_varlen_func(
     sfk: Optional[torch.Tensor] = None,  # MXFP8 UE8M0 per-32-elem block scales (block-scaled QK^T)
     sfv: Optional[torch.Tensor] = None,  # MXFP8 UE8M0 per-32-elem block scales (in-kernel V dequant)
     rel_bias: Optional[torch.Tensor] = None,
-    rel_r: Optional[torch.Tensor] = None,  # W4a fused shear: r tensor (with rel_proj)
-    rel_proj: Optional[torch.Tensor] = None,  # W4a fused shear: per-head proj
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
     **_: object,
@@ -109,9 +107,6 @@ def flash_attn_varlen_func(
     rel_bias_kwargs = {}
     if rel_bias is not None:
         rel_bias_kwargs["rel_bias"] = rel_bias
-    if rel_r is not None:
-        rel_bias_kwargs["rel_r"] = rel_r
-        rel_bias_kwargs["rel_proj"] = rel_proj
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
     result = _flash_attn_varlen_func(
@@ -185,8 +180,6 @@ def flash_attn_with_kvcache(
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
-    rel_r: Optional[torch.Tensor] = None,  # W4a fused shear: r tensor (with rel_proj)
-    rel_proj: Optional[torch.Tensor] = None,  # W4a fused shear: per-head proj
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
     **_: object,
@@ -228,8 +221,6 @@ def flash_attn_with_kvcache(
         sfk=sfk,
         sfv=sfv,
         rel_bias=rel_bias,
-        rel_r=rel_r,
-        rel_proj=rel_proj,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
     )

@@ -17,10 +17,6 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
 )
 from sglang.srt.environ import envs
@@ -41,6 +37,7 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -95,7 +92,7 @@ def _get_moe_ep_context() -> Tuple[int, int]:
     """Return `(moe_ep_size, moe_ep_rank)`, or `(1, 0)` if the MoE EP group
     is not initialized (hermetic tests or pure-TP launches)."""
     try:
-        return get_moe_expert_parallel_world_size(), get_moe_expert_parallel_rank()
+        return get_parallel().moe_ep_size, get_parallel().moe_ep_rank
     except Exception:  # pragma: no cover - MoE EP group not initialized
         return 1, 0
 
@@ -107,14 +104,13 @@ def _get_moe_tp_context() -> Tuple[int, int]:
     MoE weights are NOT sharded along their inner dim even though attention
     weights are."""
     try:
-        return get_moe_tensor_parallel_world_size(), get_moe_tensor_parallel_rank()
+        return get_parallel().moe_tp_size, get_parallel().moe_tp_rank
     except Exception:  # pragma: no cover - MoE TP group not initialized
         return 1, 0
 
 
 def _moe_runner_keeps_global_expert_ids() -> bool:
-    """True if the active MoE runner keeps global `topk_ids` instead of
-    remapping to local IDs. Mirrors the predicate in `StandardDispatcher`."""
+    """True if a supported LoRA runner keeps global expert IDs."""
     try:
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
@@ -122,8 +118,9 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
-            or b.is_experimental_sgl_trtllm()
+            or b.is_flashinfer_trtllm()
             or b.is_flashinfer_trtllm_routed()
+            or b.is_flashinfer_mxfp4()
         )
     except Exception:  # pragma: no cover - backend not initialized
         return False
@@ -165,7 +162,7 @@ class LoRAMemoryPool:
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
         # global `topk_ids` -> local expert IDs before the MoE kernel, so
         # per-expert LoRA buffers must be sized and keyed by the local slice.
-        # FlashInfer CUTLASS/CuteDSL/TRTLLM-routed keep global IDs, and an
+        # FlashInfer CUTLASS/CuteDSL/TRTLLM/MXFP4 keep global IDs, and an
         # uneven expert split (`num_experts % moe_ep_size != 0`, shouldn't
         # happen in practice) is also treated as globally-keyed so we don't
         # silently truncate experts.
@@ -182,8 +179,8 @@ class LoRAMemoryPool:
         # e.g. `--tp 4 --ep 4` each rank holds full-width expert weights
         # (`moe_tp_size == 1`). Sizing per-expert LoRA buffers by `tp_size`
         # here would yield a 4x-narrower inner dim than the adapter weight
-        # (which `FusedMoEWithLoRA.slice_moe_lora_{a,b}_weights` correctly
-        # skip-slices when `moe_tp_size <= 1`), producing a shape-mismatch
+        # (which MoE LoRA modules correctly skip-slice when
+        # `moe_tp_size <= 1`), producing a shape-mismatch
         # assert during weight load. Non-MoE modules still shard by
         # `tp_size` because attention TP is unchanged.
         self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
@@ -259,8 +256,7 @@ class LoRAMemoryPool:
 
     @staticmethod
     def is_shared_moe_module(module_name: str) -> bool:
-        """Whether this buffer belongs to a shared-expert FusedMoE (a second
-        FusedMoE per layer, e.g. Inkling's sink; sharded over the full TP group)."""
+        """Whether this buffer belongs to the shared-expert MoE namespace."""
         return module_name.endswith("_shared_moe")
 
     @staticmethod
@@ -284,8 +280,7 @@ class LoRAMemoryPool:
 
     @staticmethod
     def _has_shared_fused_moe(base_model: torch.nn.Module) -> bool:
-        """Whether the model serves its shared experts as a second FusedMoE per
-        layer (duck-typed marker set by e.g. InklingSharedFusedMoE)."""
+        """Whether shared experts require their own MoE LoRA pool namespace."""
         return any(
             getattr(m, "is_shared_fused_moe", False) for m in base_model.modules()
         )
@@ -322,14 +317,18 @@ class LoRAMemoryPool:
         self,
         weights: Union[torch.Tensor, Dict[int, torch.Tensor]],
         cache_keys: Union[str, Dict[int, str]],
+        *,
+        localize: bool = True,
     ) -> Iterator[Tuple[int, torch.Tensor, str]]:
-        """Yield `(local_expert_id, weight, cache_key)` triples for per-expert
-        MoE LoRA inputs, filtered/remapped to this rank's slice. Accepts either
-        a `{global_eid: 2D tensor}` dict or a 3D `[num_experts, *, *]` tensor."""
+        """Yield `(expert_id, weight, cache_key)` triples for MoE LoRA A/B weights.
+
+        By default global IDs are filtered and remapped to this rank. Set
+        ``localize=False`` for replicated shared-expert weights.
+        """
         if isinstance(weights, dict):
             assert isinstance(cache_keys, dict)
             for gid, w in weights.items():
-                lid = self._global_to_local_expert_id(gid)
+                lid = self._global_to_local_expert_id(gid) if localize else gid
                 if lid is not None:
                     yield lid, w, cache_keys[gid]
             return
@@ -337,7 +336,7 @@ class LoRAMemoryPool:
         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
             assert isinstance(cache_keys, str)
             total = weights.shape[0]
-            if self.moe_use_local_expert_ids:
+            if self.moe_use_local_expert_ids and localize:
                 start = self.moe_ep_rank * self._num_experts_local
                 count = max(0, min(self._num_experts_local, total - start))
             else:
@@ -388,8 +387,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        # Routed MoE shards along moe_tp_size, not the outer tp_size; *_shared_moe
-        # modules shard over the full TP group at EP=1 (see InklingSharedFusedMoE).
+        # Routed MoE shards along moe_tp_size; shared MoE shards over full TP at EP=1.
         effective_tp_size = (
             self.tp_size
             if not self.is_moe_module(module_name)
@@ -600,8 +598,7 @@ class LoRAMemoryPool:
                         for idx in range(self.num_layer)
                     ]
 
-                    # Shared-expert FusedMoE version (4D, second FusedMoE per
-                    # layer, e.g. Inkling's sink experts).
+                    # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):
                         shared_moe_key = f"{module_name}_shared_moe"
                         buffer[shared_moe_key] = [
@@ -733,11 +730,14 @@ class LoRAMemoryPool:
         self,
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
-        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, torch.nn.Module]],
         lora_refs: Dict[str, LoRARef],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        # Python hash seeds differ by TP process; slot and LRU updates must not.
+        ordered_uids = sorted(cur_uids, key=lambda uid: (uid is not None, uid or ""))
+
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
@@ -792,10 +792,10 @@ class LoRAMemoryPool:
             return victim_buffer_id
 
         # Mark all adapters in current batch as used (for LRU tracking)
-        for uid in cur_uids:
+        for uid in ordered_uids:
             self.eviction_policy.mark_used(uid)
 
-        for uid in cur_uids:
+        for uid in ordered_uids:
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
@@ -810,12 +810,39 @@ class LoRAMemoryPool:
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
+    def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
+        """Make an evicted slot safe for graph-captured base-model replay."""
+        for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
+            for tensor in buffers:
+                tensor[buffer_id].zero_()
+        for buffers in (
+            self.embedding_A_buffer,
+            self.embedding_B_buffer,
+            self.lm_head_A_buffer,
+            self.lm_head_B_buffer,
+            self.new_embeddings_buffer,
+        ):
+            for tensor in buffers.values():
+                tensor[buffer_id].zero_()
+
+    def remove_lora(self, uid: str) -> Optional[int]:
+        """Remove a resident adapter and return its cleared pool slot."""
+        buffer_id = self.uid_to_buffer_id.get(uid)
+        if buffer_id is None:
+            return None
+
+        self._clear_buffer_slot_for_base(buffer_id)
+        del self.uid_to_buffer_id[uid]
+        self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+        self.eviction_policy.remove(uid)
+        return buffer_id
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
         buffer_id: int,
         lora_adapter: LoRAAdapter,
-        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
@@ -833,15 +860,7 @@ class LoRAMemoryPool:
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
-            for i in range(self.num_layer):
-                for k in self.A_buffer.keys():
-                    self.A_buffer[k][i][buffer_id] = 0
-
-            for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id] = 0
-
-            for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id] = 0
+            self._clear_buffer_slot_for_base(buffer_id)
             return
 
         assert lora_adapter is not None
@@ -887,6 +906,13 @@ class LoRAMemoryPool:
             layer = lora_adapter.layers[layer_id]
             layer_weights = layer.weights
             pinned_layer_weights = layer.pinned_weights
+            cur_layer_modules = lora_modules[layer_id]
+            has_shared_moe_module = any(
+                getattr(
+                    getattr(module, "base_layer", module), "is_shared_fused_moe", False
+                )
+                for module in cur_layer_modules.values()
+            )
             # - Standard: module_name -> torch.Tensor
             # - MoE: module_name -> Dict[expert_id -> torch.Tensor]
             temp_A_buffer: Dict[str, Union[torch.Tensor, Dict[int, torch.Tensor]]] = {
@@ -907,12 +933,30 @@ class LoRAMemoryPool:
 
                 # Check if this is an MoE weight (has expert index in name)
                 expert_match = re.search(r"experts\.(\d+)\.", name)
+                is_shared_expert = "shared_experts." in name
+                shared_moe_target = f"{target_module}_shared_moe"
 
-                if "shared_experts." in name and weights.dim() == 3:
-                    # 3D shared-expert FusedMoE weight (e.g. Inkling's sink); must precede
-                    # the generic "experts" checks or it collides into routed *_moe buffers.
-                    target_module = target_module + "_shared_moe"
-                    if "lora_A" in name:
+                if is_shared_expert and (
+                    weights.dim() == 3
+                    or (has_shared_moe_module and shared_moe_target in temp_A_buffer)
+                ):
+                    # Keep sink experts separate from routed experts for both
+                    # packed 3D weights and named per-expert 2D weights.
+                    target_module = shared_moe_target
+                    if expert_match:
+                        if temp_A_buffer[target_module] is None:
+                            temp_A_buffer[target_module] = {}
+                            temp_B_buffer[target_module] = {}
+                            temp_A_cache_keys[target_module] = {}
+                            temp_B_cache_keys[target_module] = {}
+                        expert_id = int(expert_match.group(1))
+                        if "lora_A" in name:
+                            temp_A_buffer[target_module][expert_id] = weights
+                            temp_A_cache_keys[target_module][expert_id] = name
+                        else:
+                            temp_B_buffer[target_module][expert_id] = weights
+                            temp_B_cache_keys[target_module][expert_id] = name
+                    elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                         temp_A_cache_keys[target_module] = name
                     else:
@@ -961,18 +1005,17 @@ class LoRAMemoryPool:
             # redundant zero-fills on slots no `update_lora_info` ever points
             # a forward-time module at.
             active_target_modules: Set[str] = set()
-            cur_layer_modules = lora_modules[layer_id]
-            for module_name, module in cur_layer_modules.items():
-                # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
-                # Handle FusedMoEWithLoRA specially - it contains multiple target modules
-                from sglang.srt.lora.layers import FusedMoEWithLoRA
+            from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-                if isinstance(module, FusedMoEWithLoRA):
-                    # Routed experts shard along moe_tp_size (= tp // ep // dp); a shared
-                    # FusedMoE (is_shared_fused_moe) shards over full TP at EP=1.
-                    is_shared = module.base_layer.is_shared_fused_moe
-                    key_suffix = "_shared_moe" if is_shared else "_moe"
-                    moe_tp_rank = module.base_layer.moe_tp_rank
+            for module_name, module in cur_layer_modules.items():
+                if isinstance(module, FusedMoEWithLoRA) or getattr(
+                    module, "is_shared_fused_moe", False
+                ):
+                    base_layer = getattr(module, "base_layer", module)
+                    key_suffix = (
+                        "_shared_moe" if base_layer.is_shared_fused_moe else "_moe"
+                    )
+                    moe_tp_rank = base_layer.moe_tp_rank
                     for canonical in ("gate_up_proj_moe", "down_proj_moe"):
                         # Slice methods key on canonical *_moe names; buffers are
                         # namespaced per module kind.
@@ -1060,12 +1103,10 @@ class LoRAMemoryPool:
                         "gate_up_proj_moe",
                         "gate_up_proj_shared_moe",
                     ):
-                        if weights is None:
+                        if weights is None or (
+                            isinstance(weights, dict) and not weights
+                        ):
                             representative_weight = None
-                            buffer_view = target_buffer[
-                                buffer_id, 0, : lora_rank * c, :
-                            ]
-                            load_lora_weight_tensor(buffer_view, None)
                         elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
@@ -1080,10 +1121,6 @@ class LoRAMemoryPool:
                                 weights,
                             )
                             representative_weight = weights[0]
-                            buffer_view = target_buffer[
-                                buffer_id, 0, : lora_rank * c, :
-                            ]
-                            load_lora_weight_tensor(buffer_view, weights[0])
                         elif isinstance(weights, dict) and len(weights) > 0:
                             if len(weights) != 1:
                                 raise ValueError(
@@ -1098,15 +1135,19 @@ class LoRAMemoryPool:
                                 pinned_layer_weights, rep_cache_key, rep
                             )
                             representative_weight = rep
-                            buffer_view = target_buffer[
-                                buffer_id, 0, : lora_rank * c, :
-                            ]
-                            load_lora_weight_tensor(buffer_view, rep)
                         else:
                             raise ValueError(
                                 f"Unexpected weight format for shared outer gate_up_proj_moe lora_A: "
                                 f"type={type(weights)}, "
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
+                            )
+                        if representative_weight is not None:
+                            expected_shape = target_buffer[
+                                buffer_id, 0, : lora_rank * c, :
+                            ].shape
+                            assert representative_weight.shape == expected_shape, (
+                                f"LoRA buffer shape {expected_shape} does not match "
+                                f"weight shape {representative_weight.shape}."
                             )
                         # Place each stacked component at max_rank-spaced
                         # positions so the kernel's [:max_r] / [max_r:2*max_r]
@@ -1123,6 +1164,8 @@ class LoRAMemoryPool:
                                         ci * lora_rank : (ci + 1) * lora_rank, :
                                     ],
                                 )
+                    elif weights is None:
+                        target_buffer[buffer_id].zero_()
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero first so any local-expert slot the adapter
                         # doesn't fill (e.g. out-of-rank under EP) is clean;
@@ -1136,7 +1179,9 @@ class LoRAMemoryPool:
                             expert_weight,
                             expert_cache_key,
                         ) in self._iter_local_expert_weights(
-                            weights, weights_cache_key
+                            weights,
+                            weights_cache_key,
+                            localize=not self.is_shared_moe_module(name),
                         ):
                             if expert_weight is None:
                                 continue
@@ -1185,7 +1230,9 @@ class LoRAMemoryPool:
                         "down_proj_moe",
                         "down_proj_shared_moe",
                     ):
-                        if weights is None:
+                        if weights is None or (
+                            isinstance(weights, dict) and not weights
+                        ):
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             load_lora_weight_tensor(buffer_view, None)
                         elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
@@ -1235,6 +1282,8 @@ class LoRAMemoryPool:
                             )
                         # Zero beyond loaded rank — MoE kernel reads full max_rank.
                         target_buffer[buffer_id, 0, :, lora_rank:].zero_()
+                    elif weights is None:
+                        target_buffer[buffer_id].zero_()
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero out slots this rank owns but the adapter
                         # doesn't fill (padded-out / out-of-rank experts);
@@ -1246,7 +1295,9 @@ class LoRAMemoryPool:
                             w,
                             w_cache_key,
                         ) in self._iter_local_expert_weights(
-                            weights, weights_cache_key
+                            weights,
+                            weights_cache_key,
+                            localize=not self.is_shared_moe_module(name),
                         ):
                             if w is not None:
                                 w = w * lora_adapter.scaling

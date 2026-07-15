@@ -6,17 +6,16 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -115,15 +114,15 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
         )
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+        from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
-        from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+        from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
 
@@ -166,8 +165,8 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = getattr(model_runner, "dcp_size", 1)
-        self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         ) * self.dcp_size
@@ -1207,6 +1206,8 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        score_mod=None,
+        aux_tensors=None,
     ):
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
@@ -1273,6 +1274,10 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         if self.dcp_size > 1:
+            if score_mod is not None:
+                raise NotImplementedError(
+                    "DCP Triton extend does not support score_mod"
+                )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
@@ -1280,7 +1285,15 @@ class TritonAttnBackend(AttentionBackend):
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
             return self._forward_extend_unified(
-                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
+                q,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
             )
 
         # Normal mode: use original 2-stage kernel
@@ -1313,6 +1326,7 @@ class TritonAttnBackend(AttentionBackend):
         # extend_attention_fwd below. Correctness is never at risk.
         if (
             self.use_verify_splitkv
+            and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
             and self.verify_splitkv_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1364,6 +1378,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
         return o
 
@@ -1387,7 +1403,7 @@ class TritonAttnBackend(AttentionBackend):
                 "DCP Triton extend does not support sliding window"
             )
 
-        group = get_dcp_group()
+        group = get_parallel().dcp_group
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         total_tokens, local_heads, _ = q_local.shape
 
@@ -1509,6 +1525,8 @@ class TritonAttnBackend(AttentionBackend):
         causal: bool,
         logits_soft_cap: float,
         sinks: Optional[torch.Tensor],
+        score_mod=None,
+        aux_tensors=None,
     ):
         """
         Unified 1-stage extend attention for deterministic inference.
@@ -1634,6 +1652,8 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
 
         return o
@@ -1647,6 +1667,8 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        score_mod=None,
+        aux_tensors=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -1712,7 +1734,11 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = self.forward_metadata.swa_attn_logits
 
         if self.dcp_size > 1:
-            group = get_dcp_group()
+            if score_mod is not None:
+                raise NotImplementedError(
+                    "DCP Triton decode does not support score_mod"
+                )
+            group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
@@ -1771,6 +1797,8 @@ class TritonAttnBackend(AttentionBackend):
             has_mla=self.use_mla,
             use_pdl=self.use_pdl,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
         return o
 

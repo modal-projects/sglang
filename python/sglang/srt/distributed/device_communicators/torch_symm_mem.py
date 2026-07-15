@@ -94,15 +94,19 @@ class TorchSymmMemCommunicator:
             )
             return
         self.max_size = supported_max_sizes[self.world_size]
-        # Inkling custom all-reduce reduces IN this buffer via its own JIT kernels;
-        # enlarge it so large prefill ARs stay on the fused-kernel path instead
-        # of falling off the 64 MiB multimem eligibility cap onto NCCL. 256 MiB
-        # covers the max prefill AR ([16384, 6144] bf16 = 192 MiB; the
-        # eligibility check is strict `<`) with room for v4's tail regions.
-        # Allocated here at init (a normal, non-inference tensor), so producer
-        # GEMMs can write into it.
+        # Keep the JIT all-reduce buffer above the largest prefill payload
+        # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
             self.max_size = max(self.max_size, 256 * 1024 * 1024)
+            from sglang.srt.server_args import get_global_server_args
+
+            if (
+                get_global_server_args().enable_scattered_sconv
+                or envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
+            ):
+                # Fused extend kernels are out-of-place, so OUT must hold the
+                # same maximum prefill payload as IN, including tail regions.
+                self.max_size = max(self.max_size, 512 * 1024 * 1024)
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,

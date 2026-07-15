@@ -17,16 +17,17 @@ Some tool-related blocks include a plain-text name between the message token and
 A compact end-to-end prompt and response can look like this:
 
 ```text
+<|message_system|>tool_declare<|content_xml|>[{"description":"Get weather information","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"type":"function"}]<|end_message|>
 <|message_system|><|content_text|>You are a concise assistant.<|end_message|>
 <|message_system|><|content_text|>Thinking effort level: 0.8<|end_message|>
-<|message_system|>tool_declare<|content_xml|>[{"description":"Get weather information","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"type":"function"}]<|end_message|>
 <|message_user|><|content_text|>What is suitable to wear in this place today?<|end_message|>
 <|message_user|><|content_image|><image input span><|end_message|>
 <|message_user|><|content_audio_input|><audio input span><|audio_end|><|end_message|>
-<|content_thinking|>I need the location and current weather.<|end_message|>
-<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|message_model|><|content_thinking|>I need the location and current weather.<|end_message|>
+<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|content_model_end_sampling|>
 <|message_tool|>get_weather<|content_text|>{"temperature":58,"condition":"fog"}<|end_message|>
-<|content_text|>Wear a light jacket; it is cool and foggy.<|end_message|>
+<|message_model|><|content_text|>Wear a light jacket; it is cool and foggy.<|end_message|>
 <|content_model_end_sampling|>
 ```
 
@@ -65,6 +66,7 @@ System, user, and model text messages use `content_text`:
 <|message_system|><|content_text|>You are a concise assistant.<|end_message|>
 <|message_user|><|content_text|>What is 2 + 2?<|end_message|>
 <|message_model|><|content_text|>4<|end_message|>
+<|content_model_end_sampling|>
 ```
 
 ## Chat Template Shape
@@ -83,6 +85,10 @@ Multiple content parts for the same conversational turn are represented as multi
 <|message_user|><|content_image|><image input span><|end_message|>
 <|message_user|><|content_text|>Focus on the objects in the center.<|end_message|>
 ```
+
+Do not prefill `<|message_model|>` after the final input block. The model emits
+its own model-message header. Historical model turns end with the standalone
+`<|content_model_end_sampling|>` token.
 
 ## Multimodal Input Blocks
 
@@ -197,15 +203,15 @@ The audio extractor output is the per-token audio feature. During inference, the
 Reasoning content is represented with `content_thinking`. It is separate from visible text content:
 
 ```text
-<|content_thinking|>Calculate 2 + 2.<|end_message|>
-<|content_text|>4<|end_message|>
+<|message_model|><|content_thinking|>Calculate 2 + 2.<|end_message|>
+<|message_model|><|content_text|>4<|end_message|>
 ```
 
 Reasoning can also precede a tool call:
 
 ```text
-<|content_thinking|>I need current weather data.<|end_message|>
-<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|message_model|><|content_thinking|>I need current weather data.<|end_message|>
+<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
 ```
 
 ### Reasoning Effort
@@ -216,7 +222,9 @@ Inkling supports a scalar reasoning-effort prompt control. It is represented as 
 <|message_system|><|content_text|>Thinking effort level: 0.8<|end_message|>
 ```
 
-The effort value is a number between `0.0` and `1.0`, where larger values request more reasoning. Values are commonly rendered with up to two decimal places.
+The effort value is a conversation-level setting between `0.0` and `1.0`, where larger values request more reasoning. Emit exactly one effort directive in the initial prompt prefix, after the optional tool declaration and original leading system messages but before the first user turn. Reuse the same value when rendering later turns in the conversation; do not add a directive per turn.
+
+When no effort is supplied, use `0.9`. OpenAI and Anthropic named levels map as follows: `none=0.0`, `low=0.2`, `medium=0.7`, `high=0.9`, and `xhigh=max=0.99`. Numeric effort is quantized to the nearest millieffort (`0.001`) before rendering.
 
 ## Model Response Format
 
@@ -225,7 +233,7 @@ A Inkling model response is a sequence of typed content blocks. The most common 
 ### Text Content
 
 ```text
-<|content_text|>The answer is 4.<|end_message|>
+<|message_model|><|content_text|>The answer is 4.<|end_message|>
 ```
 
 The visible assistant content is the payload between `<|content_text|>` and `<|end_message|>`. Multiple text blocks represent multiple text segments in sequence.
@@ -239,7 +247,7 @@ Reasoning content appears in `content_thinking` blocks, as described in the reas
 The structured tool-call response format is:
 
 ```text
-<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
 ```
 
 The payload is a JSON object with string field `name` and object field `args`. Multiple tool-call blocks represent multiple tool calls.
@@ -249,7 +257,7 @@ The payload is a JSON object with string field `name` and object field `args`. M
 Tool-error content uses `content_tool_error`:
 
 ```text
-<|content_tool_error|>Error text here<|end_message|>
+<|message_model|><|content_tool_error|>Error text here<|end_message|>
 ```
 
 This content kind represents tool-error text emitted by the model.
@@ -300,13 +308,13 @@ The payload is a JSON array of tool specs. Each tool spec contains:
 Structured tool calls use `content_invoke_tool_json`:
 
 ```text
-<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
 ```
 
-The same content block is wrapped in `message_model` when it appears inside conversation history:
+The same representation is retained when the tool call appears in conversation history:
 
 ```text
-<|message_model|><|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
+<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"SF"}}<|end_message|>
 ```
 
 The JSON object has this shape:

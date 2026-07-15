@@ -1,8 +1,7 @@
-"""CUDA-JIT ports of the Inkling sconv-family kernels (Triton originals in
-``python/sglang/tml/kernels/sconv.py`` / ``layers/sconv.py``).
+"""CUDA-JIT implementations of the Inkling short-convolution kernels.
 
-Drop-in signatures mirror the Triton entrypoints so the model layer can dispatch
-to either backend. See ``benchmark/tml/fusion/CUDA_JIT_PLAN.md``.
+Their signatures match the Triton entrypoints so model layers can select either
+backend without adapting arguments.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ def _jit_causal_conv1d_module(
     return load_jit(
         "inkling_causal_conv1d",
         *args,
-        cuda_files=["tml/causal_conv1d.cuh"],
+        cuda_files=["inkling/causal_conv1d.cuh"],
         cuda_wrappers=[("causal_conv1d", f"CausalConv1dKernel<{args}>::run")],
     )
 
@@ -46,7 +45,7 @@ def causal_conv1d(
     use_residual: bool = True,
     is_decode: bool = False,
 ) -> torch.Tensor:
-    """CUDA-JIT port of ``tml.kernels.sconv.causal_conv1d``.
+    """Apply depthwise causal convolution to a packed token stream.
 
     Depthwise causal conv1d over a packed ``[T, D]`` token stream, with the W-1
     prefix taps gathered directly from ``sconv_cache`` (no intermediate prefix
@@ -78,7 +77,7 @@ def _jit_update_sconv_cache_module(w1: int, dtype: torch.dtype) -> Module:
     return load_jit(
         "inkling_update_sconv_cache",
         *args,
-        cuda_files=["tml/update_sconv_cache.cuh"],
+        cuda_files=["inkling/update_sconv_cache.cuh"],
         cuda_wrappers=[("update_sconv_cache", f"UpdateSconvCacheKernel<{args}>::run")],
     )
 
@@ -90,7 +89,7 @@ def update_sconv_cache(
     has_initial_state: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
-    """CUDA-JIT port of ``tml.kernels.sconv.update_sconv_cache`` (in-place).
+    """Update each sequence's convolution cache in place.
 
     Shift-updates each sequence's conv state to the last W-1 entries of
     ``[old_state(gated) ++ x[start:end]]``; PAD / empty lanes are untouched. Pure
@@ -109,7 +108,7 @@ def _jit_gather_scatter_sconv_module(w1: int, dtype: torch.dtype) -> Module:
     return load_jit(
         "inkling_gather_scatter_sconv",
         *args,
-        cuda_files=["tml/gather_scatter_sconv.cuh"],
+        cuda_files=["inkling/gather_scatter_sconv.cuh"],
         cuda_wrappers=[("gather_scatter", f"GatherScatterSconvKernel<{args}>::run")],
     )
 
@@ -121,7 +120,7 @@ def fused_gather_scatter_to_sconv_cache(
     mask: torch.Tensor,
     dst_indices: torch.Tensor,
 ) -> None:
-    """CUDA-JIT port of ``tml.layers.sconv.fused_gather_scatter_to_sconv_cache``.
+    """Gather selected hidden-state rows into the convolution cache.
 
     Scatters masked rows ``hidden_states[track_conv_indices[b, w]]`` into
     ``sconv_cache[dst_indices[b], w]`` in-place; masked-out lanes untouched.
@@ -142,7 +141,7 @@ def _jit_fused_decode_update_module(
     return load_jit(
         "inkling_fused_decode_update",
         *args,
-        cuda_files=["tml/fused_decode_update.cuh"],
+        cuda_files=["inkling/fused_decode_update.cuh"],
         cuda_wrappers=[
             ("fused_decode_update", f"FusedDecodeUpdateKernel<{args}>::run")
         ],
@@ -160,7 +159,7 @@ def fused_causal_conv1d_update_decode(
     track_mask: torch.Tensor | None = None,
     track_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA-JIT port of ``tml.kernels.sconv.fused_causal_conv1d_update_decode``.
+    """Apply decode convolution and update its cache in one kernel.
 
     Decode conv (W-1 cached taps + current token) fused with the cache shift-update
     (+ optional prefix-cache track-copy). Returns a contiguous ``[T, D]`` output.
@@ -192,7 +191,7 @@ def _jit_draft_extend_sconv_module(w1: int, do_track: bool, dtype: torch.dtype) 
     return load_jit(
         "inkling_draft_extend_sconv",
         *args,
-        cuda_files=["tml/draft_extend_sconv.cuh"],
+        cuda_files=["inkling/draft_extend_sconv.cuh"],
         cuda_wrappers=[("draft_extend", f"DraftExtendSconvKernel<{args}>::run")],
     )
 
@@ -208,7 +207,7 @@ def fused_draft_extend_sconv_cache(
     track_step: torch.Tensor | None = None,
     mamba_track_indices: torch.Tensor | None = None,
 ) -> None:
-    """CUDA-JIT port of ``tml.layers.sconv.fused_draft_extend_sconv_cache`` (in-place).
+    """Update draft-extend convolution state in place.
 
     Selects each sequence's length-(W-1) conv-state window from the virtual
     ``[sconv_cache[ci] ++ hidden[b]]`` stream at ``num_accepted_tokens[b]`` (and, if

@@ -1,12 +1,7 @@
-"""CUDA-JIT two-shot all-reduce over a torch symmetric-memory buffer for Inkling.
+"""CUDA-JIT all-reduce kernels for Inkling symmetric-memory buffers.
 
-An efficient, self-contained all-reduce the model owns end-to-end, built so an
-epilogue (RMSNorm / short-conv / bias) can later be fused into its reduce (see
-the EPILOGUE SEAM in ``csrc/tml/inkling_all_reduce.cuh``).
-
-v1: cross-GPU sync via the symm-mem handle's ``barrier()`` on each side of the
-launch. The producer writes its local shard into the symm buffer (get_ar_buffer)
-and the reduced result is left in the buffer -- no stage-in / copy-out.
+The producer writes its local shard into the symmetric buffer, and the reduced
+result remains there so callers do not need staging or copy-out kernels.
 """
 
 from __future__ import annotations
@@ -27,7 +22,7 @@ def _jit_inkling_all_reduce_module(dtype: torch.dtype, world_size: int) -> Modul
     return load_jit(
         "inkling_all_reduce",
         *args,
-        cuda_files=["tml/inkling_all_reduce.cuh"],
+        cuda_files=["inkling/inkling_all_reduce.cuh"],
         cuda_wrappers=[
             ("two_shot_all_reduce", f"inkling_two_shot_all_reduce<{args}>"),
             ("two_shot_all_reduce_fused", f"inkling_two_shot_all_reduce_fused<{args}>"),
@@ -47,7 +42,7 @@ def _jit_inkling_all_reduce_module(dtype: torch.dtype, world_size: int) -> Modul
 #     [arrival0, arrival1, release0, release1, xepoch] padded to 8, then
 #     MAX_BARRIER_BLOCKS per-block epochs; persists across calls and advances
 #     under CUDA-graph replay.
-# Mirrors kLeaderStateWords / kMaxBarrierBlocks in csrc/tml/inkling_ar_barrier.cuh.
+# Keep these sizes aligned with the CUDA barrier implementation.
 MAX_BARRIER_BLOCKS = 256
 STATE_SIZE = 8 + MAX_BARRIER_BLOCKS
 
@@ -56,18 +51,12 @@ def flags_numel(world_size: int) -> int:
     return world_size * (1 + MAX_BARRIER_BLOCKS)
 
 
-# Autotuned best (kernel, num_blocks, block_size) per shape, from the
-# fine-grained (variant x num_blocks x block_size) sweep on B200 / bf16 /
-# hidden=6144. Keyed by number of reduction rows (num_tokens). kernels:
+# Tuned (kernel, num_blocks, block_size) per reduction row count. Kernels:
 # "v5"=push one-shot with per-block barriers (single barrier, out-of-place;
 # owns the latency band), "mm"=torch multimem, "v2"=two-shot explicit,
 # "v3"=two-shot multimem (single-leader barriers), "v3b"=v3 with per-block
-# barriers (wins the 256-1024 mid band), "v4"=full one-shot (superseded by v5
-# at 1-2 rows but kept selectable). nb/bs are 0 for "mm". Tables are per
-# world_size (dispatched in _AR_TUNED); TP4 is default.
-# TP4 crossovers (see benchmark/tml/allreduce/): v5 1.03-1.44x vs mm at 1-96
-# rows; mm keeps only 128-192 (within ~8%); v3b then v3 win everything above.
-# TODO(autotune): make this per-device too; these are B200 values.
+# barriers, and "v4"=full one-shot. nb/bs are 0 for "mm". Tables are keyed
+# by world size; TP4 is the fallback.
 _AR_TUNED_TP4 = {
     1: ("v5", 1, 1024), 2: ("v5", 1, 1024),
     3: ("v5", 8, 512), 4: ("v5", 8, 512), 6: ("v5", 8, 1024), 8: ("v5", 8, 1024),
@@ -80,12 +69,8 @@ _AR_TUNED_TP4 = {
     4096: ("v3", 96, 512), 6144: ("v3", 64, 512), 8192: ("v3", 32, 1024),
     12288: ("v3", 96, 512), 16384: ("v3", 96, 512),
 }
-# TP8 (B200): v4 wins bsz<=2; torch multimem ("mm") wins the small/medium band
-# (3-768); v3 wins >=1024 up to 16384 (up to 1.22x). v2 never wins at TP8. The
-# v3<->mm crossover is higher than TP4 (1024 vs 256): v3's per-GPU slice is half
-# as big at TP8, so it needs more rows to amortize the barrier past mm's floor.
-# TODO(tp8-sweep): v5/v3b not yet swept at TP8 -- v5's (N-1)*n ingress doubles
-# there, so expect a narrower v5 band; run the validation-script bench to tune.
+# TP8 uses full one-shot for the smallest shapes, multimem through the
+# medium-sized range, and two-shot multimem for larger reductions.
 _AR_TUNED_TP8 = {
     1: ("v4", 1, 1024), 2: ("v4", 1, 1024),
     3: ("mm", 0, 0), 4: ("mm", 0, 0), 6: ("mm", 0, 0), 8: ("mm", 0, 0),

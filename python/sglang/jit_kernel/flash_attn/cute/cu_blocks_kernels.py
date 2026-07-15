@@ -4,7 +4,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, const_expr
 
 
 class CuSeqlensToBlocksKernel:
@@ -16,12 +16,14 @@ class CuSeqlensToBlocksKernel:
         tile: int = 128,
         num_threads: int = 1024,
         seqlen_multiple: int = 1,
+        use_pdl: bool = False,
     ):
         self.tile = tile
         self.num_threads = num_threads
         assert num_threads % 32 == 0
         self.num_warps = num_threads // cute.arch.WARP_SIZE
         self.seqlen_multiple = seqlen_multiple
+        self.use_pdl = use_pdl
 
     @cute.jit
     def __call__(
@@ -46,6 +48,7 @@ class CuSeqlensToBlocksKernel:
             grid=[1, 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -56,6 +59,10 @@ class CuSeqlensToBlocksKernel:
         mBlocksToBatchIdx: cute.Tensor,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+
         batch_size = mCuBlocks.shape[0] - 1
         batch_idx = cute.arch.thread_idx()[0]
         lane_idx = cute.arch.lane_idx()

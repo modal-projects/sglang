@@ -165,10 +165,10 @@ class InklingModelConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Optional[InklingConvCacheParams]:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.runtime_context import get_parallel
 
         try:
-            tp_size = get_attention_tp_size()
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 
@@ -180,6 +180,15 @@ class InklingModelConfig(PretrainedConfig):
             self.swa_num_key_value_heads, self.swa_head_dim
         )
         stream_dim = self.hidden_size
+        from sglang.srt.server_args import get_global_server_args
+
+        if get_global_server_args().enable_scattered_sconv:
+            # Scattered sconv: the attn/mlp output sconvs run on the [T, H/P]
+            # hidden shard, so their conv-state caches shard with them.
+            assert (
+                self.hidden_size % tp_size == 0
+            ), f"hidden_size {self.hidden_size} not divisible by attn tp {tp_size}"
+            stream_dim = self.hidden_size // tp_size
         conv_len = self.sconv_kernel_size - 1
         shape = InklingConvStateShape(
             conv=[
@@ -193,7 +202,9 @@ class InklingModelConfig(PretrainedConfig):
             temporal=(0, 0, 0),
         )
         dtype = InklingStateDType(conv=torch.bfloat16, temporal=torch.bfloat16)
-        return InklingConvCacheParams(shape=shape, layers=self.conv_layer_ids, dtype=dtype)
+        return InklingConvCacheParams(
+            shape=shape, layers=self.conv_layer_ids, dtype=dtype
+        )
 
 
 class InklingAudioConfig(PretrainedConfig):

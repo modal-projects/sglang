@@ -13,12 +13,12 @@
 # ==============================================================================
 """SRT adapter exports for Inkling multimodal preprocessing."""
 
-from sglang.tml.huggingface import (
+from sglang.srt.multimodal.inkling.feature_extraction import (
     InklingAudioEncoderParams,
     InklingAudioFeatureExtractor,
-    InklingImageProcessor,
-    InklingProcessor,
 )
+from sglang.srt.multimodal.inkling.image_processing import InklingImageProcessor
+from sglang.srt.multimodal.inkling.processing_inkling import InklingProcessor
 
 __all__ = [
     "InklingImageProcessor",

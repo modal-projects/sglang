@@ -45,8 +45,6 @@ def flash_attn_with_kvcache(
     sfk=None,
     sfv=None,
     rel_bias=None,
-    rel_r=None,  # W4a fused shear: r tensor (ver=4 only, with rel_proj)
-    rel_proj=None,  # W4a fused shear: per-head proj (ver=4 only)
     rel_bias_prep_cache=None,
     ver=3,
     out=None,
@@ -141,8 +139,6 @@ def flash_attn_with_kvcache(
     """
 
     if ver == 3:
-        if rel_r is not None or rel_bias is not None:
-            raise RuntimeError("rel_bias / rel_r (Inkling shear bias) requires ver=4.")
         return fa3_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -215,8 +211,6 @@ def flash_attn_with_kvcache(
             sfk=sfk,
             sfv=sfv,
             rel_bias=rel_bias,
-            rel_r=rel_r,
-            rel_proj=rel_proj,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )
@@ -256,16 +250,12 @@ def flash_attn_varlen_func(
     sfk=None,
     sfv=None,
     rel_bias=None,
-    rel_r=None,  # W4a fused shear: r tensor (ver=4 only, with rel_proj)
-    rel_proj=None,  # W4a fused shear: per-head proj (ver=4 only)
     rel_bias_prep_cache=None,
     ver=3,
     out=None,
 ):
 
     if ver == 3:
-        if rel_r is not None or rel_bias is not None:
-            raise RuntimeError("rel_bias / rel_r (Inkling shear bias) requires ver=4.")
         return fa3_flash_attn_varlen_func(
             q,
             k,
@@ -326,8 +316,6 @@ def flash_attn_varlen_func(
             sfk=sfk,
             sfv=sfv,
             rel_bias=rel_bias,
-            rel_r=rel_r,
-            rel_proj=rel_proj,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
         )

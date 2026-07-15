@@ -1,9 +1,6 @@
-"""CUDA-JIT fused {all-reduce -> decode sconv -> add+RMSNorm} for Inkling decode.
+"""Fused all-reduce, decode short-convolution, and RMSNorm for Inkling.
 
-One launch replacing the v5 push one-shot AR, the decode short-conv
-(``fused_decode_update``) and the fused-add RMSNorm -- the EPILOGUE SEAM of
-``csrc/tml/inkling_all_reduce.cuh`` filled in for the small-batch decode path
-(one block per token; see ``csrc/tml/inkling_ar_fused_decode.cuh``).
+The small-batch decode kernel processes one token per block.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ def _jit_ar_fused_module(
     return load_jit(
         "inkling_ar_fused_decode",
         *args,
-        cuda_files=["tml/inkling_ar_fused_decode.cuh"],
+        cuda_files=["inkling/inkling_ar_fused_decode.cuh"],
         cuda_wrappers=[
             ("ar_sconv_norm", f"ArSconvNormKernel<{args}>::run"),
             ("ar_sconv_norm_verify", f"ArSconvNormVerifyKernel<{args}>::run"),
@@ -39,10 +36,7 @@ def _jit_ar_fused_module(
     )
 
 
-# Tuned vecs-per-thread (VPT) per decode row count, from the validate_ar_fused
-# [F4] sweep on B200/TP4/hidden=6144 (block = ceil(768/VPT) threads). Fewer,
-# fatter threads buy load ILP and a cheaper block reduction at tiny T; wider
-# blocks win as rows grow. Round up to the nearest tested T.
+# Tuned vectors per thread by decode row count; round up to the next entry.
 _FUSED_VPT_TUNED = {1: 1, 2: 1, 4: 1, 8: 1, 16: 1, 32: 1, 64: 1, 96: 1}
 _FUSED_VPT_TOKENS = sorted(_FUSED_VPT_TUNED)
 

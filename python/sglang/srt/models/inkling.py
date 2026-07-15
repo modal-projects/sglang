@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import re
 from typing import Iterable, Optional, Set, Tuple
 
@@ -25,15 +24,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -48,7 +43,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -58,22 +52,35 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
-from sglang.tml.layers.attn import InklingAttention, compute_log_scaling_tau
-from sglang.tml.layers.dense_mlp import InklingDenseMLP
-from sglang.tml.layers.hmlp import HMLPPatchEncoder
-from sglang.tml.kernels.comm import (
+from sglang.srt.models.inkling_common.attn import (
+    InklingAttention,
+    compute_log_scaling_tau,
+)
+from sglang.srt.models.inkling_common.dense_mlp import InklingDenseMLP
+from sglang.srt.models.inkling_common.hmlp import HMLPPatchEncoder
+from sglang.srt.models.inkling_common.kernels.comm import (
+    all_gather_hidden,
+    ar_fullwidth_sconv_fused,
+    ar_scattered_sconv_fused,
     ar_sconv_norm_fusable,
     ar_sconv_norm_fused,
     ensure_inkling_ar_resources,
+    fullwidth_ar_sconv_fusable,
+    scattered_ar_sconv_fusable,
 )
-from sglang.tml.layers.moe import InklingMoE
-from sglang.tml.layers.sconv import SconvType, ShortConvolution
-from sglang.tml.layers.util import (
+from sglang.srt.models.inkling_common.moe import InklingMoE
+from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
+from sglang.srt.models.inkling_common.util import (
+    bf16_routed_uses_stock_fused_moe,
     deinterleave_gate_up,
     lora_compatible_layout_enabled,
+    shared_sink_uses_trtllm_bf16,
+    trtllm_bf16_weight_prep_enabled,
+    use_inkling_shared_fused_moe,
 )
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +109,9 @@ _PER_EXPERT_WEIGHT_RE = re.compile(
 )
 
 
-def _shard_full_to_local(loaded_weight: torch.Tensor, dst: torch.Tensor, dim: int) -> torch.Tensor:
+def _shard_full_to_local(
+    loaded_weight: torch.Tensor, dst: torch.Tensor, dim: int
+) -> torch.Tensor:
     """Slice a FULL (unsharded) per-expert weight to this MoE-TP rank's shard along `dim`.
 
     The online weight-sync ships full per-expert tensors (parallelism-agnostic HF
@@ -191,14 +200,14 @@ class InklingDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 fused=True,
-                tp_rank=get_attention_tp_rank(),
-                tp_size=get_attention_tp_size(),
-                tp_group=get_attention_tp_group(),
+                tp_rank=get_parallel().attn_tp_rank,
+                tp_size=get_parallel().attn_tp_size,
+                tp_group=get_parallel().attn_tp_group,
                 use_dp_attention_reduce=True,
             )
         else:
-            # InklingMoE already exposes LoRA-wrappable modules: routed experts are a
-            # stock FusedMoE and the sink shared experts are InklingSharedFusedMoE.
+            # Routed experts use FusedMoE. Under LoRA the shared expert remains
+            # InklingBatchDenseMLP and applies its adapter delta directly.
             self.mlp = InklingMoE(
                 config=config,
                 layer_id=layer_id,
@@ -210,9 +219,21 @@ class InklingDecoderLayer(nn.Module):
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # --enable-scattered-sconv: the output sconvs are channelwise, so they
+        # run on the [T, H/P] hidden shard the reduce-scatter produces; weights
+        # (ShortConvolution.weight_loader narrows by tp_rank) and conv-state
+        # cache (configs/inkling.py stream_dim) shard with them. The layer
+        # all-gathers back to [T, H] after each sconv, before the residual add.
+        self.attn_tp_group = get_parallel().attn_tp_group
+        self.scattered_sconv = get_global_server_args().enable_scattered_sconv
+        sconv_hidden = config.hidden_size
+        if self.scattered_sconv:
+            assert config.use_sconv, "--enable-scattered-sconv requires use_sconv"
+            assert config.hidden_size % self.attn_tp_group.world_size == 0
+            sconv_hidden = config.hidden_size // self.attn_tp_group.world_size
         self.attn_sconv = (
             ShortConvolution(
-                config.hidden_size,
+                sconv_hidden,
                 config.sconv_kernel_size,
                 sconv_type=SconvType.ATTN,
                 layer_id=layer_id,
@@ -222,7 +243,7 @@ class InklingDecoderLayer(nn.Module):
         )
         self.mlp_sconv = (
             ShortConvolution(
-                config.hidden_size,
+                sconv_hidden,
                 config.sconv_kernel_size,
                 sconv_type=SconvType.MLP,
                 layer_id=layer_id,
@@ -230,9 +251,8 @@ class InklingDecoderLayer(nn.Module):
             if config.use_sconv
             else None
         )
-        # The fused decode {AR -> mlp_sconv -> attn_norm} path needs an MoE
-        # (for reduce=False) and this layer's mlp_sconv (the next consumer
-        # fuses it); see ar_sconv_norm_fused in tml/kernels/comm.py.
+        # The fused decode path needs an MoE and this layer's MLP convolution;
+        # scattered convolution disables the fusion separately.
         self.mlp_ar_fusable = (
             isinstance(self.mlp, InklingMoE) and self.mlp_sconv is not None
         )
@@ -245,20 +265,8 @@ class InklingDecoderLayer(nn.Module):
         # ONE eager break; only mlp_norm + MoE stay captured. Outside a capture
         # these wrappers just run inline. `_breakable_mlp_sconv` runs the final
         # layer's deferred mlp_sconv after the layer loop.
-        #
-        # SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN=1: capture the attention group
-        # INSIDE the graph instead. The FA4 backend opts into the BCG
-        # captured-metadata contract (metadata tensors refreshed in place
-        # before replay) and the runner gates replay to single-seq batches,
-        # so the bs=1-baked sconv metadata concern is moot; sconv metadata
-        # itself is re-derived inside the graph from the runner's refreshed
-        # static slots (seq_lens/extend_seq_lens/extend_prefix_lens).
-        if envs.SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN.get():
-            self._breakable_attn_group = self._attn_group_impl
-            self._breakable_mlp_sconv = self._mlp_sconv_impl
-        else:
-            self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
-            self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
+        self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
+        self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
 
     def _attn_block(
         self,
@@ -289,16 +297,55 @@ class InklingDecoderLayer(nn.Module):
         UNREDUCED MoE partial sums (``reduce=False``); the {all-reduce ->
         prev_mlp_sconv -> attn_norm} chain runs as ONE fused kernel."""
         hs, res = hidden_states, residual
-        if prev_mlp_partial:
-            # Fused decode {AR -> sconv -> add+norm}; residual is always live
-            # here (partials only ever come from a previous layer's MoE).
-            hs, res = ar_sconv_norm_fused(
-                hs, res, prev_mlp_sconv, self.attn_norm, forward_batch,
-                get_tensor_model_parallel_group(),
-            )
+        if prev_mlp_partial and self.scattered_sconv:
+            fm = forward_batch.forward_mode
+            if fm.is_decode() or fm.is_target_verify():
+                # Fused decode/verify {AR + scattered sconv + attn_norm}: the
+                # add+RMSNorm tail is fused in-kernel (residual always live
+                # here -- partials only ever come from a previous layer's MoE).
+                hs, res = ar_scattered_sconv_fused(
+                    hs,
+                    prev_mlp_sconv,
+                    forward_batch,
+                    get_tensor_model_parallel_group(),
+                    norm=self.attn_norm,
+                    norm_residual=res,
+                )
+            else:
+                # Fused extend {AR + scattered sconv}: hs holds the previous
+                # MoE's unreduced partials; the kernel returns the gathered
+                # post-conv [T, H], and the norm runs unfused below.
+                hs = ar_scattered_sconv_fused(
+                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                )
+                hs, res = self.attn_norm(hs, res)
+        elif prev_mlp_partial:
+            fm = forward_batch.forward_mode
+            if fm.is_decode() or fm.is_target_verify():
+                # Fused decode {AR -> sconv -> add+norm}; residual is always
+                # live here (partials only ever come from a prior layer's MoE).
+                hs, res = ar_sconv_norm_fused(
+                    hs,
+                    res,
+                    prev_mlp_sconv,
+                    self.attn_norm,
+                    forward_batch,
+                    get_tensor_model_parallel_group(),
+                )
+            else:
+                # Fused extend {AR + full-width sconv + cache update}
+                # (non-scattered); norm runs unfused on the gathered [T, H].
+                hs = ar_fullwidth_sconv_fused(
+                    hs, prev_mlp_sconv, forward_batch, get_tensor_model_parallel_group()
+                )
+                hs, res = self.attn_norm(hs, res)
         else:
             if prev_mlp_sconv is not None:
                 hs = prev_mlp_sconv(hs, positions, forward_batch)
+                if self.scattered_sconv:
+                    # hs was the previous layer's reduce-scattered [T, H/P] MoE
+                    # shard; gather back to [T, H] before the residual add.
+                    hs = all_gather_hidden(hs, self.attn_tp_group)
 
             # Fused residual-add + norm for attention input. First layer: no prior
             # residual yet, so just norm the (post-deferred-sconv) embeddings.
@@ -316,11 +363,16 @@ class InklingDecoderLayer(nn.Module):
             orig_out_cache_loc = forward_batch.out_cache_loc
             forward_batch.out_cache_loc = orig_out_cache_loc[: hs.shape[0]]
             with force_eager_attention():
-                hs = self.attn(hs, positions, forward_batch, log_scaling_tau=log_scaling_tau)
+                hs = self.attn(
+                    hs, positions, forward_batch, log_scaling_tau=log_scaling_tau
+                )
             forward_batch.out_cache_loc = orig_out_cache_loc
         else:
             hs = self.attn(
-                hs, positions, forward_batch, log_scaling_tau=log_scaling_tau,
+                hs,
+                positions,
+                forward_batch,
+                log_scaling_tau=log_scaling_tau,
                 reduce=not fuse_attn_ar,
             )
 
@@ -329,7 +381,11 @@ class InklingDecoderLayer(nn.Module):
             # {AR -> attn_sconv -> mlp_norm} into one kernel.
             return hs, res
         if self.attn_sconv is not None:
+            # Under scattered sconv, hs is the attn output's reduce-scattered
+            # [T, H/P] shard (attn.py routed the reduction); gather after.
             hs = self.attn_sconv(hs, positions, forward_batch)
+            if self.scattered_sconv:
+                hs = all_gather_hidden(hs, self.attn_tp_group)
         return hs, res
 
     def _attn_group_impl(
@@ -373,6 +429,9 @@ class InklingDecoderLayer(nn.Module):
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         n = forward_batch.num_token_non_padded_cpu
         y = self.mlp_sconv(hidden_states[:n], positions[:n], forward_batch)
+        if self.scattered_sconv:
+            # y is the [n, H/P] shard; the output buffer is post-gather [n, H].
+            y = all_gather_hidden(y, self.attn_tp_group)
         out[:n].copy_(y)
         if out.shape[0] != n:
             out[n:].zero_()
@@ -411,7 +470,10 @@ class InklingDecoderLayer(nn.Module):
         # context; the decode breakable backend sets is_in_breakable_cuda_graph() but
         # NOT the context, so gate on both and otherwise fall through to the inline
         # path below (which uses the passed forward_batch — correct for decode).
-        if is_in_breakable_cuda_graph() and get_tc_piecewise_forward_context() is not None:
+        if (
+            is_in_breakable_cuda_graph()
+            and get_tc_piecewise_forward_context() is not None
+        ):
             # BCG prefill path: the AR fusion is decode-only, so partials never
             # reach (or leave) this branch.
             assert not prev_mlp_partial and not fuse_ar_sconv and not fuse_attn_ar
@@ -419,8 +481,12 @@ class InklingDecoderLayer(nn.Module):
             # break under capture); mlp_norm + MoE stay captured. (The live
             # forward_batch inside the break is read from the shared tc_piecewise
             # context, which the prefill BCG runner populates at capture and replay.)
-            attn_out = torch.empty_like(hidden_states)
-            residual_out = torch.empty_like(hidden_states)
+            # Under scattered sconv the group's INPUT can be the previous layer's
+            # [T, H/P] MoE shard while its OUTPUT is post-all-gather [T, H], so
+            # size the output buffers explicitly (residual is always [T, H]).
+            out_shape = (hidden_states.shape[0], self.attn_norm.weight.shape[0])
+            attn_out = hidden_states.new_empty(out_shape)
+            residual_out = hidden_states.new_empty(out_shape)
             self._breakable_attn_group(
                 hidden_states,
                 residual,
@@ -450,12 +516,48 @@ class InklingDecoderLayer(nn.Module):
             prev_mlp_partial=prev_mlp_partial,
             fuse_attn_ar=fuse_attn,
         )
-        if fuse_attn:
-            # Fused {wo_ud AR -> attn_sconv -> mlp_norm} (attn-side chain).
-            hidden_states, residual = ar_sconv_norm_fused(
-                hidden_states, residual, self.attn_sconv, self.mlp_norm,
-                forward_batch, get_attention_tp_group(),
-            )
+        if fuse_attn and self.scattered_sconv:
+            fm = forward_batch.forward_mode
+            if fm.is_decode() or fm.is_target_verify():
+                # Fused decode/verify {wo_ud AR + scattered attn_sconv +
+                # mlp_norm} (attn-side chain), norm tail in-kernel.
+                hidden_states, residual = ar_scattered_sconv_fused(
+                    hidden_states,
+                    self.attn_sconv,
+                    forward_batch,
+                    self.attn_tp_group,
+                    norm=self.mlp_norm,
+                    norm_residual=residual,
+                )
+            else:
+                # Fused extend {AR + scattered sconv} (attn-side chain); the
+                # norm runs unfused on the gathered [T, H].
+                hidden_states = ar_scattered_sconv_fused(
+                    hidden_states, self.attn_sconv, forward_batch, self.attn_tp_group
+                )
+                hidden_states, residual = self.mlp_norm(hidden_states, residual)
+        elif fuse_attn:
+            fm = forward_batch.forward_mode
+            if fm.is_decode() or fm.is_target_verify():
+                # Fused {wo_ud AR -> attn_sconv -> mlp_norm} (attn-side chain).
+                hidden_states, residual = ar_sconv_norm_fused(
+                    hidden_states,
+                    residual,
+                    self.attn_sconv,
+                    self.mlp_norm,
+                    forward_batch,
+                    get_parallel().attn_tp_group,
+                )
+            else:
+                # Fused extend {AR + full-width attn_sconv + cache update}
+                # (attn-side chain, non-scattered); norm runs unfused.
+                hidden_states = ar_fullwidth_sconv_fused(
+                    hidden_states,
+                    self.attn_sconv,
+                    forward_batch,
+                    get_parallel().attn_tp_group,
+                )
+                hidden_states, residual = self.mlp_norm(hidden_states, residual)
         else:
             hidden_states, residual = self.mlp_norm(hidden_states, residual)
         if fuse_ar_sconv and self.mlp_ar_fusable:
@@ -516,7 +618,7 @@ class InklingCausalLLM(nn.Module):
         # forward to build them lazily; decode capture would bake the fallback).
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
             ensure_inkling_ar_resources(get_tensor_model_parallel_group())
-            ensure_inkling_ar_resources(get_attention_tp_group())
+            ensure_inkling_ar_resources(get_parallel().attn_tp_group)
 
         # Warm the fused decode {AR -> mlp_sconv -> norm} JIT module (both
         # track variants) so the first fused call -- which can land inside a
@@ -524,7 +626,8 @@ class InklingCausalLLM(nn.Module):
         sconv0 = self.layers[0].mlp_sconv
         world = get_tensor_model_parallel_world_size()
         if (
-            envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
+            is_cuda()
+            and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
             and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM.get()
             and sconv0 is not None
             and world in (4, 8)  # symm-mem multimem worlds, power-of-two
@@ -547,20 +650,29 @@ class InklingCausalLLM(nn.Module):
         # distinct eligible signature -- not just layer 0, which may be a
         # local/SWA layer (head_dim != 128) that never uses the prologue while
         # later full-attention layers do.
-        if envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
-            from sglang.jit_kernel.inkling_attn_prologue import compile_inkling_attn_prologue
+        if is_cuda() and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
+            from sglang.jit_kernel.inkling_attn_prologue import (
+                compile_inkling_attn_prologue,
+            )
 
             warmed: set = set()
+            warm_mxfp8 = get_global_server_args().kv_cache_dtype == "mxfp8"
             for layer in self.layers:
                 attn = layer.attn
                 ks = attn.k_sconv
                 if ks is None or attn.head_dim != 128:
                     continue
-                sig = (ks.kernel_size[0], ks.activation in ("silu", "swish"), ks.use_residual)
+                sig = (
+                    ks.kernel_size[0],
+                    ks.activation in ("silu", "swish"),
+                    ks.use_residual,
+                )
                 if sig in warmed:
                     continue
                 warmed.add(sig)
                 compile_inkling_attn_prologue(torch.bfloat16, *sig)
+                if warm_mxfp8:
+                    compile_inkling_attn_prologue(torch.bfloat16, *sig, use_mxfp8=True)
 
         self.lm_head = ParallelLMHead(
             self.padded_vocab_size,
@@ -570,30 +682,6 @@ class InklingCausalLLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
-        # DFLASH tap layers, populated via set_dflash_layers_to_capture.
-        # Tap semantic: hidden_states + residual right after the tapped layer
-        # returns. The layer's own mlp_sconv is deferred into the NEXT layer,
-        # so it is excluded from the tap -- this must match the definition the
-        # draft was trained against (dtrain producer capture).
-        self._dflash_layers_to_capture: set[int] = set()
-        self._dflash_num_taps: int = 0
-
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        self._dflash_layers_to_capture = set(layer_ids)
-        self._dflash_num_taps = len(layer_ids)
-        # A tapped layer must not emit unreduced MoE partials: the fused
-        # {AR -> mlp_sconv -> norm} chain (decode/target-verify) defers the
-        # layer's all-reduce into the NEXT consumer, so hidden + residual at
-        # the tap point would be a per-rank partial sum. Producer and consumer
-        # both gate on layer.mlp_ar_fusable, so flipping it here keeps them
-        # consistent while leaving untapped layers fully fused.
-        for layer in self.layers:
-            if not hasattr(layer, "_mlp_ar_fusable_natural"):
-                layer._mlp_ar_fusable_natural = layer.mlp_ar_fusable
-            layer.mlp_ar_fusable = (
-                layer._mlp_ar_fusable_natural
-                and layer.layer_id not in self._dflash_layers_to_capture
-            )
 
     def get_input_embeddings(self):
         # Fold embed_norm into the embedding so general_mm_embed_routine norms the text
@@ -658,29 +746,43 @@ class InklingCausalLLM(nn.Module):
         fuse_attn_ar = (
             not forward_batch.forward_mode.is_idle()
             and ar_sconv_norm_fusable(
-                get_attention_tp_group(),
+                get_parallel().attn_tp_group,
                 forward_batch,
                 hidden_states.shape[0],
                 hidden_states.shape[-1],
                 hidden_states.dtype,
             )
         )
+        # Fused extend {AR + scattered sconv} (--enable-scattered-sconv +
+        # SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV): same producer contract as the
+        # decode fusion above (reduce=False), consumer runs the scattered
+        # kernel. Mutually exclusive with ar_sconv_norm_fusable by mode
+        # (extend vs decode/verify) and by the scattered gate inside it.
+        if not forward_batch.forward_mode.is_idle() and scattered_ar_sconv_fusable(
+            get_tensor_model_parallel_group(),
+            forward_batch,
+            hidden_states.shape[0],
+            hidden_states.shape[-1],
+            hidden_states.dtype,
+        ):
+            fuse_ar_sconv = True
+            fuse_attn_ar = True
+        # Fused extend {AR + full-width sconv + cache update} (NON-scattered):
+        # same producer contract (reduce=False); the consumer sites dispatch
+        # by mode -- extend runs the full-width column kernel, decode/verify
+        # keep ar_sconv_norm_fused. Mutually exclusive with both gates above
+        # (mode for ar_sconv_norm_fusable, the scattered flag for
+        # scattered_ar_sconv_fusable).
+        if not forward_batch.forward_mode.is_idle() and fullwidth_ar_sconv_fusable(
+            get_tensor_model_parallel_group(),
+            forward_batch,
+            hidden_states.shape[0],
+            hidden_states.shape[-1],
+            hidden_states.dtype,
+        ):
+            fuse_ar_sconv = True
+            fuse_attn_ar = True
         prev_mlp_partial = False
-        # Aux hidden states are packed directly as [tokens, K * hidden] so the
-        # logits processor can store them without a second full-size concat.
-        aux_hidden_states: Optional[torch.Tensor] = None
-        aux_tap_idx = 0
-        capture_aux = (
-            bool(self._dflash_layers_to_capture)
-            and not forward_batch.forward_mode.is_idle()
-        )
-        # fp8-NaN bisect probe (INKLING_NAN_PROBE=1): report the first layer
-        # whose output goes non-finite. Syncs per layer — debug only. Skipped
-        # while a CUDA graph is capturing (.item() is capture-illegal).
-        nan_probe = (
-            os.environ.get("INKLING_NAN_PROBE") == "1"
-            and not torch.cuda.is_current_stream_capturing()
-        )
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states,
@@ -695,71 +797,84 @@ class InklingCausalLLM(nn.Module):
             )
             prev_mlp_sconv = layer.mlp_sconv
             prev_mlp_partial = fuse_ar_sconv and layer.mlp_ar_fusable
-            if nan_probe and not prev_mlp_partial:
-                h_bad = ~torch.isfinite(hidden_states)
-                r_bad = (
-                    ~torch.isfinite(residual) if residual is not None else None
-                )
-                if h_bad.any() or (r_bad is not None and r_bad.any()):
-                    print(
-                        f"[nan-probe] layer {layer.layer_id} "
-                        f"(local={getattr(layer, 'is_local', '?')}): "
-                        f"hidden non-finite {h_bad.sum().item()}/{h_bad.numel()}, "
-                        f"residual non-finite "
-                        f"{r_bad.sum().item() if r_bad is not None else 0}",
-                        flush=True,
-                    )
-                    nan_probe = False  # first offender only
-            if capture_aux and layer.layer_id in self._dflash_layers_to_capture:
-                # Tapped layers have mlp_ar_fusable forced off, so
-                # hidden_states here is always fully reduced.
-                assert not (fuse_ar_sconv and layer.mlp_ar_fusable)
-                hidden_size = hidden_states.shape[-1]
-                if aux_hidden_states is None:
-                    aux_hidden_states = hidden_states.new_empty(
-                        (hidden_states.shape[0], hidden_size * self._dflash_num_taps)
-                    )
-                aux_slot = aux_hidden_states[
-                    :, aux_tap_idx * hidden_size : (aux_tap_idx + 1) * hidden_size
-                ]
-                if residual is None:
-                    aux_slot.copy_(hidden_states)
-                else:
-                    torch.add(hidden_states, residual, out=aux_slot)
-                aux_tap_idx += 1
         # The final layer's mlp_sconv was deferred; run it now — as an eager break
         # under BCG (so it re-reads live per-seq metadata at replay), else inline.
         if prev_mlp_sconv is not None and not forward_batch.forward_mode.is_idle():
-            if prev_mlp_partial:
-                # Fused tail: {AR -> final mlp_sconv -> final norm} in one kernel.
-                hidden_states, _ = ar_sconv_norm_fused(
+            if prev_mlp_partial and self.layers[-1].scattered_sconv:
+                fm = forward_batch.forward_mode
+                if fm.is_decode() or fm.is_target_verify():
+                    # Fused decode/verify tail: {AR + scattered sconv + final
+                    # norm} in one kernel.
+                    hidden_states, _ = ar_scattered_sconv_fused(
+                        hidden_states,
+                        prev_mlp_sconv,
+                        forward_batch,
+                        get_tensor_model_parallel_group(),
+                        norm=self.norm,
+                        norm_residual=residual,
+                    )
+                    return hidden_states
+                # Fused extend tail: {AR + scattered sconv}, then the final
+                # norm unfused on the gathered [T, H].
+                hidden_states = ar_scattered_sconv_fused(
                     hidden_states,
-                    residual,
                     prev_mlp_sconv,
-                    self.norm,
                     forward_batch,
                     get_tensor_model_parallel_group(),
                 )
-                if self._dflash_layers_to_capture:
-                    return hidden_states, aux_hidden_states
+                hidden_states, _ = self.norm(hidden_states, residual)
+                return hidden_states
+            if prev_mlp_partial:
+                fm = forward_batch.forward_mode
+                if fm.is_decode() or fm.is_target_verify():
+                    # Fused tail: {AR -> final mlp_sconv -> final norm} in one
+                    # kernel.
+                    hidden_states, _ = ar_sconv_norm_fused(
+                        hidden_states,
+                        residual,
+                        prev_mlp_sconv,
+                        self.norm,
+                        forward_batch,
+                        get_tensor_model_parallel_group(),
+                    )
+                    return hidden_states
+                # Fused extend tail: {AR + full-width sconv + cache update}
+                # (non-scattered), then the final norm unfused.
+                hidden_states = ar_fullwidth_sconv_fused(
+                    hidden_states,
+                    prev_mlp_sconv,
+                    forward_batch,
+                    get_tensor_model_parallel_group(),
+                )
+                hidden_states, _ = self.norm(hidden_states, residual)
                 return hidden_states
             # Same gate as the per-layer group: the eager break needs the tc_piecewise
             # context (installed only by the prefill BCG runner) to read the live
             # forward_batch at replay; else run inline with the passed forward_batch.
+            scattered = self.layers[-1].scattered_sconv
             if (
                 is_in_breakable_cuda_graph()
                 and get_tc_piecewise_forward_context() is not None
             ):
-                mlp_sconv_out = torch.empty_like(hidden_states)
+                # Under scattered sconv the input is the last MoE's [T, H/P]
+                # shard; the break's output buffer is post-all-gather [T, H].
+                out_shape = (
+                    (hidden_states.shape[0], self.norm.weight.shape[0])
+                    if scattered
+                    else hidden_states.shape
+                )
+                mlp_sconv_out = hidden_states.new_empty(out_shape)
                 self.layers[-1]._breakable_mlp_sconv(
                     hidden_states, positions, mlp_sconv_out
                 )
                 hidden_states = mlp_sconv_out
             else:
                 hidden_states = prev_mlp_sconv(hidden_states, positions, forward_batch)
+                if scattered:
+                    hidden_states = all_gather_hidden(
+                        hidden_states, self.layers[-1].attn_tp_group
+                    )
         hidden_states, _ = self.norm(hidden_states, residual)
-        if self._dflash_layers_to_capture:
-            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -836,13 +951,16 @@ class InklingForConditionalGeneration(nn.Module):
 
         server_args = get_global_server_args()
         assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
-        assert not server_args.disable_radix_cache
-        assert not server_args.disable_hybrid_swa_memory
-        assert server_args.enable_mamba_extra_buffer()
+        if server_args.disaggregation_mode != "decode":
+            assert not server_args.disable_radix_cache
+            assert not server_args.disable_hybrid_swa_memory
+            assert server_args.enable_mamba_extra_buffer()
 
         from types import SimpleNamespace
 
-        from sglang.tml.layers.quantization import get_quantization_config
+        from sglang.srt.models.inkling_common.quantization import (
+            get_quantization_config,
+        )
 
         inkling_quant_config = get_quantization_config(
             SimpleNamespace(hf_config=self.config, model_path=server_args.model_path)
@@ -946,15 +1064,6 @@ class InklingForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.llm.embed_tokens.weight, self.llm.lm_head.weight
 
-    @property
-    def lm_head(self):
-        # Spec-decode workers (DFLASH) address the target head generically as
-        # `model.lm_head`; delegate to the inner LLM.
-        return self.llm.lm_head
-
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        self.llm.set_dflash_layers_to_capture(layer_ids)
-
     def get_num_kv_cache_layers(self) -> int:
         return self.text_config.num_hidden_layers
 
@@ -990,21 +1099,21 @@ class InklingForConditionalGeneration(nn.Module):
             data_embedding_funcs=data_embedding_funcs,
             positions=positions,
         )
-        aux_hidden_states = None
-        if self.llm._dflash_layers_to_capture:
-            hidden_states, aux_hidden_states = hidden_states
         mup_width_multiplier = self.config.text_config.logits_mup_width_multiplier
         hidden_states_for_logits = (
             hidden_states
             if not mup_width_multiplier
             else hidden_states / mup_width_multiplier
         )
+        # The MTP chain needs the undivided hidden (the mup division is
+        # lm_head-only); passed unconditionally because the target
+        # verify/prefill forwards never set return_hidden_states_before_norm.
         return self.llm.logits_processor(
             input_ids,
             hidden_states_for_logits,
             self.llm.lm_head,
             forward_batch,
-            aux_hidden_states=aux_hidden_states,
+            hidden_states_before_norm=hidden_states,
         )
 
     def update_conv_state_after_mtp_verify(
@@ -1220,7 +1329,11 @@ class InklingForConditionalGeneration(nn.Module):
         # Under --enable-lora the FusedMoE is wrapped and the base tensor lives one
         # level down at `base_layer.<leaf>`.
         target = next(
-            (t for t in (f"{pfx}.{leaf}", f"{pfx}.base_layer.{leaf}") if t in params_dict),
+            (
+                t
+                for t in (f"{pfx}.{leaf}", f"{pfx}.base_layer.{leaf}")
+                if t in params_dict
+            ),
             None,
         )
         if target is None:
@@ -1245,10 +1358,14 @@ class InklingForConditionalGeneration(nn.Module):
                 return True
             eid -= first
         if proj == "down_proj":
-            dst = params_dict[target].data[eid]  # [H, I_local]; shard intermediate (dim 1)
+            dst = params_dict[target].data[
+                eid
+            ]  # [H, I_local]; shard intermediate (dim 1)
             dst.copy_(_shard_full_to_local(loaded_weight, dst, dim=1))
         else:
-            w13 = params_dict[target].data[eid]  # [2*I_local, H]; shard intermediate (dim 0)
+            w13 = params_dict[target].data[
+                eid
+            ]  # [2*I_local, H]; shard intermediate (dim 0)
             idx = 0 if proj == "gate_proj" else 1
             if (
                 lora_compatible_layout_enabled()
@@ -1296,7 +1413,7 @@ class InklingForConditionalGeneration(nn.Module):
                             self.text_config.head_dim,
                         )
                     )
-                    attn_tp_size = get_attention_tp_size()
+                    attn_tp_size = get_parallel().attn_tp_size
                     if (
                         attn_tp_size > num_kv_heads
                         and loaded_weight.shape[0] == num_kv_heads * head_dim
@@ -1310,7 +1427,7 @@ class InklingForConditionalGeneration(nn.Module):
                                 .reshape(attn_tp_size * head_dim, -1)
                             )
                         else:
-                            kv_head_idx = get_attention_tp_rank() // replicas
+                            kv_head_idx = get_parallel().attn_tp_rank // replicas
                             loaded_weight = loaded_weight.narrow(
                                 0, kv_head_idx * head_dim, head_dim
                             )
@@ -1347,7 +1464,7 @@ class InklingForConditionalGeneration(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_attention_tp_rank() * shard_size
+                        start = get_parallel().attn_tp_rank * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     if lora_compatible_layout_enabled():
                         # Local interleaved rows -> [gate||up] so contiguous swiglu and
@@ -1421,19 +1538,23 @@ class InklingForConditionalGeneration(nn.Module):
                 continue
 
             if ".experts.w13_weight" in name:
-                # Under --enable-lora the bf16 (NVFP4-excluded) routed layers run the
-                # stock FusedMoE forward, not moe_tp_forward: de-interleave per moe_tp block.
+                # bf16 routed layers run the stock FusedMoE forward (not moe_tp_forward)
+                # under --enable-lora, or natively on trtllm_routed for UNQUANTIZED
+                # checkpoints: de-interleave per moe_tp block for the stock weight prep.
                 if (
                     loaded_weight.dtype != torch.uint8
                     and self.text_config.inference_moe_w13_interleaved
-                    and lora_compatible_layout_enabled()
+                    and (
+                        lora_compatible_layout_enabled()
+                        or bf16_routed_uses_stock_fused_moe(self.quant_config)
+                    )
                 ):
                     tp = get_moe_tensor_parallel_world_size()
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2
                     )
-                    if get_moe_runner_backend().is_experimental_sgl_trtllm():
+                    if trtllm_bf16_weight_prep_enabled():
                         # trtllm bf16 weight prep consumes [up || gate] per rank
                         # ("w3_w1" order); triton/marlin consume [gate || up].
                         half = two_f // tp // 2
@@ -1459,16 +1580,20 @@ class InklingForConditionalGeneration(nn.Module):
                 if (
                     loaded_weight.dtype != torch.uint8
                     and self.text_config.inference_moe_w13_interleaved
-                    and envs.SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE.get()
+                    and use_inkling_shared_fused_moe()
                 ):
                     tp = get_tensor_model_parallel_world_size()
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2
                     )
-                    if get_moe_runner_backend().is_experimental_sgl_trtllm():
-                        # Same as the routed experts above: the trtllm bf16
-                        # weight prep consumes [up || gate] per rank.
+                    if (
+                        get_moe_runner_backend().is_experimental_sgl_trtllm()
+                        or bf16_routed_uses_stock_fused_moe(self.quant_config)
+                        or shared_sink_uses_trtllm_bf16()
+                    ):
+                        # TRT-LLM BF16 weight preparation consumes [up || gate]
+                        # per rank, including the shared sink on quantized models.
                         half = two_f // tp // 2
                         loaded_weight = torch.cat(
                             [loaded_weight[:, :, half:], loaded_weight[:, :, :half]],
@@ -1486,7 +1611,9 @@ class InklingForConditionalGeneration(nn.Module):
                     params_dict, loaded_params, sgl_name, loaded_weight, "w2"
                 ):
                     continue
-            if self._load_per_expert_param(params_dict, loaded_params, name, loaded_weight):
+            if self._load_per_expert_param(
+                params_dict, loaded_params, name, loaded_weight
+            ):
                 continue
 
             if name.endswith(".bias") and name not in params_dict:
@@ -1566,18 +1693,12 @@ class InklingMTPLayer(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         embeds = self.embed_tokens(input_ids)
         if self.main_model_embed_norm is not None:
             embeds = self.main_model_embed_norm(embeds)
 
-        in_hidden = forward_batch.spec_info.hidden_states
-        if self.mup_width_multiplier is not None:
-            hidden_states = in_hidden * self.mup_width_multiplier
-        else:
-            hidden_states = in_hidden
-
-        hnorm = self.hidden_norm(hidden_states)
+        hnorm = self.hidden_norm(forward_batch.spec_info.hidden_states)
         enorm = self.embed_norm(embeds)
         combined = torch.cat((hnorm, enorm), dim=-1)
         h_inproj = self.input_proj(combined)
@@ -1605,9 +1726,8 @@ class InklingMTPLayer(nn.Module):
         if self.chain_norm is not None:
             h = self.chain_norm(h)
         if self.mup_width_multiplier is not None:
-            h = h / self.mup_width_multiplier
-
-        return h
+            return h / self.mup_width_multiplier, h
+        return h, h
 
 
 class InklingForConditionalGenerationMTP(nn.Module):
@@ -1663,9 +1783,15 @@ class InklingForConditionalGenerationMTP(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states, hidden_states_before_norm = self.model(
+            input_ids, positions, forward_batch
+        )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            hidden_states_before_norm=hidden_states_before_norm,
         )
 
     def get_embed_and_head(self):
@@ -1729,7 +1855,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
                     param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
-                        start = get_attention_tp_rank() * shard_size
+                        start = get_parallel().attn_tp_rank * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     default_weight_loader(param, loaded_weight)
                     loaded_params.add(sgl_name)

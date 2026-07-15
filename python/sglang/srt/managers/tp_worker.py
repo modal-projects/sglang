@@ -208,6 +208,28 @@ class BaseTpWorker(ABC):
             tensors = dict(bucket.reconstruct_tensors())
         else:
             tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        if recv_req.expected_checksums is not None:
+            import hashlib
+
+            exp = recv_req.expected_checksums
+            mismatch, missing = [], []
+            for name, want in exp.items():
+                if name not in tensors:
+                    missing.append(name)
+                    continue
+                got = hashlib.sha256(
+                    tensors[name].detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
+                ).hexdigest()
+                if got != want:
+                    mismatch.append(name)
+            extra = [n for n in tensors if n not in exp]
+            if mismatch or missing or extra:
+                raise RuntimeError(
+                    f"[LORA-CHECK] rank{self.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
+                    f"{len(extra)} extra {extra[:5]}"
+                )
+            logger.info(f"[LORA-CHECK] rank{self.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)")
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -475,14 +497,27 @@ class TpModelWorker(BaseTpWorker):
         return self.dllm_algorithm is not None
 
     def _forward_batch_generation_dllm(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
-        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
-            self.model_runner, forward_batch
-        )
+        algo_states = None
+        if self.dllm_algorithm.fdfo and batch is not None:
+            algo_states = [req.dllm_algo_state for req in batch.reqs]
+
+        (
+            logits_output,
+            next_token_ids,
+            accept_length_per_req_cpu,
+            dllm_algo_state,
+            can_run_cuda_graph,
+        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -508,7 +543,7 @@ class TpModelWorker(BaseTpWorker):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
+            return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(

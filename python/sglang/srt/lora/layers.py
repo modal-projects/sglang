@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -20,12 +19,14 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.runtime_context import get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -750,7 +751,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.base_layer.tp_size
             )
@@ -769,6 +770,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
         )
 
         if self.set_lora and should_reduce:
@@ -954,8 +956,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
-        # Unquantized (bf16) layers have no marlin-repacked weights (e.g. Inkling's
-        # NVFP4-excluded MoE layer under W4A16): run their LoRA on triton instead.
+        # Unquantized layers have no marlin-repacked weights, so run their LoRA
+        # on Triton. Inkling shared experts use InklingBatchDenseMLP directly
+        # and never reach this wrapper.
         if runner_backend.is_marlin():
             from sglang.srt.layers.quantization.unquant import (
                 UnquantizedFusedMoEMethod,
@@ -972,6 +975,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
 
             init_experimental_sgl_trtllm_lora(self, base_layer)
+            return
+        if runner_backend.is_experimental_sgl_marlin():
+            from sglang.srt.lora.marlin_lora_temp.lora_layer import (
+                init_experimental_sgl_marlin_lora,
+            )
+
+            init_experimental_sgl_marlin_lora(self, base_layer)
             return
         # ===== END TO BE REFACTORED ====
 
@@ -1035,9 +1045,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm():
-            # Per-rank (local) expert count the LoRA buffers are indexed by, so
-            # virtual-experts indexing matches the buffers under EP.
+        if self._lora_runner_backend.is_experimental_sgl_trtllm() or (
+            self._lora_runner_backend.is_experimental_sgl_marlin()
+        ):
             num_experts = (
                 self.down_lora_a_weights.shape[1]
                 if self.down_lora_a_weights is not None
@@ -1111,6 +1121,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
             combine_input = dispatch_experimental_sgl_trtllm_lora(
                 dispatch_output, quant_info, base_layer, lora_info
+            )
+        elif self._lora_runner_backend.is_experimental_sgl_marlin():
+            from sglang.srt.lora.marlin_lora_temp.lora_layer import (
+                dispatch_experimental_sgl_marlin_lora,
+            )
+
+            combine_input = dispatch_experimental_sgl_marlin_lora(
+                dispatch_output,
+                quant_info,
+                base_layer,
+                lora_info,
             )
         # ===== END TO BE REFACTORED ====
         else:

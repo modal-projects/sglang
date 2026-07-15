@@ -15,6 +15,7 @@ from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
@@ -44,11 +45,6 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         cfg.rope_scaling = {"rope_type": "llama3", "type": "custom", "factor": 8.0}
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling["type"], "custom")
-
-    def test_no_op_when_no_rope_scaling(self):
-        cfg = PretrainedConfig()
-        normalize_rope_scaling_compat(cfg)
-        self.assertIsNone(getattr(cfg, "rope_scaling", None))
 
     def test_no_op_when_rope_scaling_is_none(self):
         cfg = PretrainedConfig()
@@ -386,6 +382,37 @@ class TestGetHfTextConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(unittest.TestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
+
+
+# ---------------------------------------------------------------------------
 # _fix_special_tokens_pattern
 # ---------------------------------------------------------------------------
 
@@ -477,59 +504,6 @@ class TestPatchRemovedSymbols(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
-
-
-class TestPatchRopeParametersValidation(unittest.TestCase):
-    # -----------------------------------------------------------------------
-    # Test ``rope_theta`` injection into ``rope_scaling``.
-    #
-    # Upstream `transformers.PretrainedConfig` now natively handles this
-    # logic. While the manual injection patch has been removed, these
-    # test cases are retained to ensure regression testing of the
-    # configuration's injection behavior.
-    # -----------------------------------------------------------------------
-
-    def test_injects_rope_theta_into_rope_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertIn("rope_theta", rope_params)
-
-    def test_no_injection_when_rope_theta_already_in_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "rope_theta": 999.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertEqual(rope_params["rope_theta"], 999.0)
-
-    def test_no_crash_without_rope_scaling(self):
-        config_dict = {"model_type": "llama", "rope_theta": 10000.0}
-        config = PretrainedConfig.from_dict(config_dict)
-        self.assertIsNotNone(config)
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ class FlashAttentionForwardCombine:
         log_max_splits: int = 4,
         num_threads: int = 256,
         stages: int = 4,
+        use_pdl: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -52,6 +53,7 @@ class FlashAttentionForwardCombine:
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
+        self.use_pdl = use_pdl
 
     @staticmethod
     def can_implement(
@@ -318,6 +320,7 @@ class FlashAttentionForwardCombine:
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -371,7 +374,8 @@ class FlashAttentionForwardCombine:
                 and k_block == cute.arch.grid_dim()[1] - 1
                 and maybe_virtual_batch == cute.arch.grid_dim()[2] - 1
             ):
-                cute.arch.griddepcontrol_wait()
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 semaphore_to_reset[0] = 0
 
         # Get number of splits (use maybe_virtual_batch for per-batch-slot splits)
@@ -399,7 +403,8 @@ class FlashAttentionForwardCombine:
             const_expr(not varlen) or m_block * self.tile_m < max_idx
         ):
             # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)
-            cute.arch.griddepcontrol_wait()
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
 
             # ===============================
             # Step 1: Load LSE_partial from gmem to shared memory

@@ -59,10 +59,15 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids_triton
-from sglang.srt.speculative.spec_utils import fast_topk, sample_draft_proposal
+from sglang.srt.speculative.multi_layer_eagle_utils import (
+    fill_draft_extend_prepare_buffers_triton,
+    rotate_input_ids,
+    wide_row_softmax_triton,
+)
+from sglang.srt.speculative.spec_utils import fast_sample, fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
     require_attn_tp_gather,
@@ -132,7 +137,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.tp_size = model_runner.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
@@ -148,6 +153,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
+        self.metadata_captured_in_graph = (
+            self.attn_backend.draft_extend_metadata_captured_in_graph()
+        )
+        # Gathered-buffer (DP) modes size the logprob gather for all-row
+        # logits, so they keep the unpruned lm_head path.
+        self.prune_draft_extend_logits = not self.require_gathered_buffer
 
         # Disable parent paths that don't apply.
         self.compile_bs = []
@@ -164,7 +175,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Fixed window: every step extends each request by the same number of
         # tokens, which lets all steps share one buffer set.
-        self.num_tokens_per_bs = self.speculative_num_draft_tokens
+        self.num_front_tokens = eagle_worker.draft_extend_num_front_tokens
+        self.num_tokens_per_bs = (
+            self.speculative_num_draft_tokens + self.num_front_tokens
+        )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
@@ -237,7 +251,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        if self.prune_draft_extend_logits:
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
+        else:
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -272,8 +289,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            num_front_tokens=self.num_front_tokens,
         )
         spec_info.positions = None
+        if self.prune_draft_extend_logits:
+            spec_info.select_index = buffers.select_index[:bs]
 
         capture_mode = (
             CaptureHiddenMode.NULL
@@ -317,25 +337,32 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         """Hook for subclasses to mutate the captured forward batch."""
         return forward_batch
 
+    def _select_step_logits(self, ret, bs: int):
+        """Each request's last-accepted-row logits, [bs, vocab]."""
+        if self.prune_draft_extend_logits:
+            return ret.next_token_logits
+        return ret.next_token_logits[self.buffers.select_index[:bs]]
+
     def _compute_topk(self, ret, bs: int):
         """Compute top-k on the last accepted token's logits and attach it to
-        ``ret``. The gather index lives in a persistent buffer, so the captured
-        graph reads the right rows on each replay. Overridable so distributed
-        (vocab-sharded) builds can plug in an all-reduce-aware sampler."""
-        buffers = self.buffers
-        probs = torch.softmax(ret.next_token_logits[buffers.select_index[:bs]], dim=-1)
+        ``ret``. Overridable so distributed (vocab-sharded) builds can plug in
+        an all-reduce-aware sampler."""
+        probs = torch.softmax(self._select_step_logits(ret, bs), dim=-1)
         ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
     def _sample_draft_proposal(self, ret, bs: int):
         """In-graph Leviathan proposal (single-CG runner + rejection sampling):
-        sample X ~ q with the staged temperatures and stash q per step, so the
-        in-graph rotation carries the sampled token to the next step."""
+        q = softmax(logits / T) written straight into this step's draft_probs
+        slot, then X ~ q. The accept test coin*q(X) < p(X) is unbiased only if
+        q is exactly the distribution X was drawn from -- q here IS the
+        stashed tensor."""
         buffers = self.buffers
-        probs, ret.topk_p, ret.topk_index = sample_draft_proposal(
-            ret.next_token_logits[buffers.select_index[:bs]],
+        probs = wide_row_softmax_triton(
+            self._select_step_logits(ret, bs),
             buffers.temperatures[:bs],
+            buffers.draft_probs[:bs, self.step],
         )
-        buffers.draft_probs[:bs, self.step].copy_(probs)
+        ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
 
     def _run_step_body(self, forward_batch: ForwardBatch, num_tokens: int, bs: int):
         """One draft step's body: model forward + chain-hidden write + top-k.
@@ -411,17 +438,15 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def replay(self, bs: int, seq_lens_sum: int, spec_info: EagleDraftExtendInput):
-        """Init this step's attention metadata for the prepared bucket and
-        replay its graph. Buffers must already be populated by the composite
-        runner's ``prepare`` (step 0) or by the previous step's in-graph chain
-        write + worker-side rotation (steps > 0)."""
+        """Replay this step's graph for the prepared bucket. Buffers must
+        already be populated by the composite runner's ``prepare`` (step 0) or
+        by the previous step's in-graph chain write + worker-side rotation
+        (steps > 0). Backends whose in-graph metadata update is complete
+        recompute it inside the replayed graph; others get the eager
+        out-graph rebuild here."""
         self.deepep_adapter.replay()
         buffers = self.buffers
         num_tokens = bs * self.num_tokens_per_bs
-
-        if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(num_tokens)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(num_tokens)
 
         fb_view = SimpleNamespace(
             batch_size=bs,
@@ -436,9 +461,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             spec_info=spec_info,
         )
-        self.eagle_worker.draft_extend_attn_backend_list[
-            self.step
-        ].init_forward_metadata_out_graph(fb_view)
+        if not self.metadata_captured_in_graph:
+            self.eagle_worker.draft_extend_attn_backend_list[
+                self.step
+            ].init_forward_metadata_out_graph(fb_view)
 
         self.bs = bs
         shape_key = self._make_graph_key(bs)
@@ -454,7 +480,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         for step in range(num_steps):
             _, topk_p, topk_index = runner.replay(step)
             if step < num_steps - 1:
-                rotate_input_ids_triton(...)  # advance the draft chain
+                rotate_input_ids(...)  # advance the draft chain
 
     Not itself a DecodeCudaGraphRunner -- it only routes work to the per-step
     runners.
@@ -475,6 +501,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.seq_len_fill_value = 1
         self.max_bs = 1
         self.num_tokens_per_bs = 1
+        self.num_front_tokens = 0
+        self.prune_draft_extend_logits = False
 
         self._init_and_capture()
 
@@ -498,11 +526,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 self.seq_len_fill_value = runner.seq_len_fill_value
                 self.max_bs = runner.max_bs
                 self.num_tokens_per_bs = runner.num_tokens_per_bs
+                self.num_front_tokens = runner.num_front_tokens
                 self.capture_bs = runner.capture_bs
                 self.require_gathered_buffer = runner.require_gathered_buffer
                 self.require_mlp_tp_gather = runner.require_mlp_tp_gather
                 self.require_mlp_sync = runner.require_mlp_sync
                 self.disable_padding = runner.disable_padding
+                self.prune_draft_extend_logits = runner.prune_draft_extend_logits
             else:
                 self.runners.append(None)
 
@@ -588,7 +618,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             select_index = torch.zeros((max_bs,), dtype=torch.int64)
 
             next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size), dtype=torch.float
+                (
+                    max_bs if self.prune_draft_extend_logits else max_num_token,
+                    vocab_size,
+                ),
+                dtype=torch.float,
             )
 
             if (
@@ -659,60 +693,52 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         else:
             bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
 
-        # Reset padded slots, then copy the real values in.
-        buffers.input_ids.zero_()
-        buffers.out_cache_loc.zero_()
-        buffers.positions.zero_()
-        buffers.seq_lens.fill_(self.seq_len_fill_value)
-
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-
-        if (
-            forward_batch.spec_info.hidden_states.shape[1]
-            == buffers.hidden_states.shape[1]
-        ):
-            buffers.hidden_states[:num_tokens].copy_(
+        fill_draft_extend_prepare_buffers_triton(
+            buffers.input_ids,
+            buffers.positions,
+            buffers.out_cache_loc,
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch.out_cache_loc,
+            buffers.seq_lens,
+            buffers.req_pool_indices,
+            buffers.num_correct_drafts,
+            buffers.num_accept_tokens,
+            buffers.select_index,
+            buffers.temperatures,
+            forward_batch.seq_lens,
+            forward_batch.req_pool_indices,
+            forward_batch.spec_info.num_correct_drafts,
+            forward_batch.spec_info.num_accept_tokens,
+            (
+                forward_batch.sampling_info.temperatures
+                if buffers.temperatures is not None
+                else None
+            ),
+            buffers.hidden_states,
+            (
                 forward_batch.spec_info.hidden_states
-            )
-
-        buffers.num_correct_drafts[:raw_bs].copy_(
-            forward_batch.spec_info.num_correct_drafts
+                if forward_batch.spec_info.hidden_states.shape[1]
+                == buffers.hidden_states.shape[1]
+                else None
+            ),
+            buffers.global_num_tokens_gpu if self.require_gathered_buffer else None,
+            (
+                buffers.global_num_tokens_for_logprob_gpu
+                if self.require_gathered_buffer
+                else None
+            ),
+            raw_bs,
+            bs,
+            self.num_tokens_per_bs,
+            self.num_front_tokens,
+            self.seq_len_fill_value,
         )
-        buffers.num_accept_tokens[:raw_bs].copy_(
-            forward_batch.spec_info.num_accept_tokens
-        )
-        if bs != raw_bs:
-            # Padded rows carry stale req_pool_indices whose mamba slots may be
-            # live; the sconv commit kernel skips rows with a negative count.
-            buffers.num_accept_tokens[raw_bs:bs].fill_(-1)
-
-        if buffers.temperatures is not None:
-            if bs != raw_bs:
-                buffers.temperatures[raw_bs:bs].fill_(1.0)
-            buffers.temperatures[:raw_bs].copy_(
-                forward_batch.sampling_info.temperatures[:raw_bs]
-            )
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-
-        # select_index[i] = i * window + num_correct_drafts[i]: the flat index
-        # of request i's last accepted token. Used by the in-graph top-k gather
-        # and by the worker's rotation.
-        arange = torch.arange(bs, device=self.device, dtype=torch.int64)
-        buffers.select_index[:bs].copy_(
-            arange * self.num_tokens_per_bs + buffers.num_correct_drafts[:bs]
-        )
-
-        if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         # Reusable spec_info for per-step attention metadata.
         padded_num_tokens = bs * self.num_tokens_per_bs
@@ -720,6 +746,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             hidden_states=buffers.hidden_states[:padded_num_tokens],
             num_correct_drafts=buffers.num_correct_drafts[:bs],
             num_accept_tokens=buffers.num_accept_tokens[:bs],
+            num_front_tokens=self.num_front_tokens,
         )
         spec_info.num_tokens_per_req = self.num_tokens_per_bs
         spec_info.num_tokens_for_logprob_per_req = 1
@@ -747,8 +774,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         out = runner.replay(self.bs, self.seq_lens_sum, self._replay_spec_info)
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens
+        num_logit_rows = raw_bs if self.prune_draft_extend_logits else raw_num_tokens
         logits_output = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_num_tokens],
+            next_token_logits=out.next_token_logits[:num_logit_rows],
             hidden_states=(
                 out.hidden_states[:raw_num_tokens]
                 if out.hidden_states is not None
@@ -867,7 +895,7 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                     ret = r._run_step_body(forward_batch, num_tokens, bs)
                 outs.append(ret)
                 if i < n - 1:
-                    rotate_input_ids_triton(
+                    rotate_input_ids(
                         buffers.input_ids[: bs * self.num_tokens_per_bs],
                         buffers.extend_start_loc[:bs],
                         buffers.extend_seq_lens[:bs],
@@ -899,6 +927,9 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
         buffers.select_index.copy_(select_index_orig)
 
     def replay(self, step: int):
+        """Replays the one graph on step 0 and serves the rest from cache. The
+        first tuple element is the step's RAW (unsliced) LogitsProcessorOutput;
+        the single-CG worker path never consumes it."""
         if step == 0:
             first = self.runners[0]
             for r in self.runners:
@@ -907,20 +938,11 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
             shape_key = first._make_graph_key(self.bs)
             outs = first.backend.replay(shape_key, self._replay_spec_info)
             raw_bs = self.raw_bs
-            raw_num_tokens = self.raw_num_tokens
             self._cached = {}
             non_null = [r for r in self.runners if r is not None]
             for r, out in zip(non_null, outs):
-                logits_output = LogitsProcessorOutput(
-                    next_token_logits=out.next_token_logits[:raw_num_tokens],
-                    hidden_states=(
-                        out.hidden_states[:raw_num_tokens]
-                        if out.hidden_states is not None
-                        else None
-                    ),
-                )
                 self._cached[r.step] = (
-                    logits_output,
+                    out,
                     out.topk_p[:raw_bs],
                     out.topk_index[:raw_bs],
                 )

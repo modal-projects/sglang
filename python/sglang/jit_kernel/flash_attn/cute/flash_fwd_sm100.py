@@ -455,6 +455,10 @@ class FlashAttentionForwardSm100:
                 # bf16 dequant buffers (v_mma_stage): sVq/sK follow kv_stage, only
                 # sV_dequant follows v_mma_stage, so deepening the load pipeline
                 # costs 8-bit bytes, not 16-bit ones.
+                # NOTE: do NOT trade v_mma_stage down to 1 to buy extra kv_stage
+                # depth (e.g. (kv=4, v_mma=1) instead of (kv=3, v_mma=2) at hd128
+                # decode): a single bf16 V buffer serializes dequant behind the PV
+                # MMA and measured a 2x decode regression (bcg-fp8 c671995).
                 v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else 2
                 smem_size_v_mma_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_mma_dtype.width // 8
                 smem_size_load_per_stage = smem_size_kv_per_stage - smem_size_v_mma_per_stage
@@ -478,6 +482,9 @@ class FlashAttentionForwardSm100:
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
+            # v_dequant keeps K and V in separate buffers; the uneven-KV trick
+            # assumes they share one, so never enable it there.
+            and not self.v_dequant
         )
         self.uneven_kv_smem_offset = (
             self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2

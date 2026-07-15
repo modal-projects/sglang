@@ -689,6 +689,49 @@ class InklingCausalLLM(nn.Module):
         # draft was trained against (dtrain producer capture).
         self._dflash_layers_to_capture: set[int] = set()
         self._dflash_num_taps: int = 0
+        # DFLASH aux taps run as BCG eager breaks (James 07-15): the packed
+        # aux lives in ONE persistent buffer written OUTSIDE the captured
+        # segments, so prefill graphs carry no per-bucket [tokens, K*hidden]
+        # static aux (~GBs across the bucket list). The buffer is sized on
+        # first use — capture warmup runs the LARGEST bucket first, so its
+        # capacity covers every captured shape; replays then always alias it
+        # (the invariant the captured return-value slice depends on). Eager
+        # forwards larger than the capacity (e.g. 16k chunks) use a transient
+        # tensor instead of regrowing, which would orphan captured views.
+        self._dflash_aux_buffer: Optional[torch.Tensor] = None
+        self._breakable_aux_tap = eager_on_graph(True)(self._aux_tap_impl)
+
+    def _aux_tap_impl(
+        self,
+        tap_hidden: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        aux_out: torch.Tensor,
+        tap_idx: int,
+        scattered: bool,
+        attn_tp_group,
+    ) -> None:
+        """Copy one DFLASH tap into its packed-aux slot (eager under BCG)."""
+        if scattered:
+            # Under --enable-scattered-sconv the MoE returns a
+            # reduce-scattered [T, H/P] shard; gather the full hidden for the
+            # tap only (the layer loop keeps threading the shard).
+            tap_hidden = all_gather_hidden(tap_hidden, attn_tp_group)
+        hidden_size = tap_hidden.shape[-1]
+        slot = aux_out[:, tap_idx * hidden_size : (tap_idx + 1) * hidden_size]
+        if residual is None:
+            slot.copy_(tap_hidden)
+        else:
+            torch.add(tap_hidden, residual, out=slot)
+
+    def _get_aux_buffer(self, num_tokens: int, hidden_size: int, ref: torch.Tensor):
+        """Packed-aux target: persistent (graph-aliased) if it fits, else transient."""
+        width = hidden_size * self._dflash_num_taps
+        buf = self._dflash_aux_buffer
+        if buf is None or buf.shape[1] != width:
+            buf = self._dflash_aux_buffer = ref.new_empty((num_tokens, width))
+        if num_tokens <= buf.shape[0]:
+            return buf[:num_tokens]
+        return ref.new_empty((num_tokens, width))
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         self._dflash_layers_to_capture = set(layer_ids)
@@ -843,24 +886,28 @@ class InklingCausalLLM(nn.Module):
                 # set_dflash_layers_to_capture), so hidden_states here is
                 # always fully reduced.
                 assert not (fuse_ar_sconv and layer.mlp_ar_fusable)
-                tap_hidden = hidden_states
-                if layer.scattered_sconv:
-                    # Under --enable-scattered-sconv the MoE returns a
-                    # reduce-scattered [T, H/P] shard; gather the full hidden
-                    # for the tap only (the loop keeps threading the shard).
-                    tap_hidden = all_gather_hidden(hidden_states, layer.attn_tp_group)
-                hidden_size = tap_hidden.shape[-1]
                 if aux_hidden_states is None:
-                    aux_hidden_states = tap_hidden.new_empty(
-                        (tap_hidden.shape[0], hidden_size * self._dflash_num_taps)
+                    # Full hidden width even when the loop threads a
+                    # scattered [T, H/P] shard.
+                    full_hidden = (
+                        hidden_states.shape[-1] * layer.attn_tp_group.world_size
+                        if layer.scattered_sconv
+                        else hidden_states.shape[-1]
                     )
-                aux_slot = aux_hidden_states[
-                    :, aux_tap_idx * hidden_size : (aux_tap_idx + 1) * hidden_size
-                ]
-                if residual is None:
-                    aux_slot.copy_(tap_hidden)
-                else:
-                    torch.add(tap_hidden, residual, out=aux_slot)
+                    aux_hidden_states = self._get_aux_buffer(
+                        hidden_states.shape[0], full_hidden, hidden_states
+                    )
+                # Eager break under BCG: the copy (and the scattered
+                # all-gather) run outside the captured segments and re-write
+                # the persistent buffer at every replay.
+                self._breakable_aux_tap(
+                    hidden_states,
+                    residual,
+                    aux_hidden_states,
+                    aux_tap_idx,
+                    layer.scattered_sconv,
+                    layer.attn_tp_group,
+                )
                 aux_tap_idx += 1
         # The final layer's mlp_sconv was deferred; run it now — as an eager break
         # under BCG (so it re-reads live per-seq metadata at replay), else inline.

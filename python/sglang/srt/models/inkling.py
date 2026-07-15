@@ -724,18 +724,25 @@ class InklingCausalLLM(nn.Module):
         scattered: bool,
         attn_tp_group,
     ) -> None:
-        """Copy one DFLASH tap into its packed-aux slot (eager under BCG)."""
-        if scattered:
-            # Under --enable-scattered-sconv the MoE returns a
-            # reduce-scattered [T, H/P] shard; gather the full hidden for the
-            # tap only (the layer loop keeps threading the shard).
-            tap_hidden = all_gather_hidden(tap_hidden, attn_tp_group)
-        hidden_size = tap_hidden.shape[-1]
-        slot = aux_out[:, tap_idx * hidden_size : (tap_idx + 1) * hidden_size]
-        if residual is None:
-            slot.copy_(tap_hidden)
-        else:
-            torch.add(tap_hidden, residual, out=slot)
+        """Copy one DFLASH tap into its packed-aux slot (eager under BCG).
+
+        Runs under inference_mode explicitly: the persistent aux buffer is
+        allocated inside the spec worker's inference_mode, and the BCG
+        eager-break wrapper re-invokes this outside it — torch forbids
+        in-place writes to inference tensors from normal mode.
+        """
+        with torch.inference_mode():
+            if scattered:
+                # Under --enable-scattered-sconv the MoE returns a
+                # reduce-scattered [T, H/P] shard; gather the full hidden for
+                # the tap only (the layer loop keeps threading the shard).
+                tap_hidden = all_gather_hidden(tap_hidden, attn_tp_group)
+            hidden_size = tap_hidden.shape[-1]
+            slot = aux_out[:, tap_idx * hidden_size : (tap_idx + 1) * hidden_size]
+            if residual is None:
+                slot.copy_(tap_hidden)
+            else:
+                torch.add(tap_hidden, residual, out=slot)
 
     def _get_aux_buffer(self, num_tokens: int, hidden_size: int, ref: torch.Tensor):
         """Packed-aux target: persistent (graph-aliased) if it fits, else transient."""

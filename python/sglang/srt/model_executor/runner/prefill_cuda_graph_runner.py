@@ -266,6 +266,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
         self._capture_req_slots = 1
+        # Same ordering requirement: capture_prepare reads this. Populated
+        # below for BCG captured-attention backends that declare a
+        # sequence-slot bound.
+        self.bcg_capture_bs_of: Optional[Dict[int, int]] = None
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -327,6 +331,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.attn_metadata_buffers: Optional[Dict[int, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
+        # Captured-attention graphs carry the batch dimension inside the
+        # graph, so backends that declare a sequence-slot bound (FA4 via
+        # SGLANG_OPT_INKLING_BCG_CAPTURE_BS) capture each bucket with a fixed
+        # number of slots (1 real + N-1 zero-length pads); replay pads real
+        # batches up to it and wider batches fall back to eager. A chunk of
+        # T tokens holds at most T sequences, hence min(cap, bucket tokens).
+        # DSV4 declares no bound (attr unset) — no per-bucket slot limit.
+        bcg_bs_cap = getattr(
+            model_runner.attn_backend, "bcg_captured_metadata_max_bs", None
+        )
+        if self.use_captured_attn_metadata and bcg_bs_cap is not None:
+            self.bcg_capture_bs_of = {
+                n: max(1, min(bcg_bs_cap, n, self.max_bs))
+                for n in self.capture_num_tokens
+            }
 
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
@@ -645,6 +664,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
+        # Captured-attention graphs carry a fixed per-bucket sequence-slot
+        # count; wider batches fall back to eager. (DSV4's captured
+        # metadata has no such limit — bcg_capture_bs_of is None there.)
+        if self.bcg_capture_bs_of is not None:
+            bucket = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+            if forward_batch.batch_size > self.bcg_capture_bs_of.get(bucket, 0):
+                return False
         # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
@@ -675,7 +701,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        bs = self._capture_req_slots
+        # Captured-attention buckets capture with their own sequence-slot
+        # count (zero-length pads exercise the same padding replay uses).
+        bs = (
+            self.bcg_capture_bs_of[num_tokens]
+            if self.bcg_capture_bs_of is not None
+            else self._capture_req_slots
+        )
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
         start_loc_cpu = [0] + [num_tokens] * (bs - 1)
@@ -837,6 +869,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
+        if self.use_captured_attn_metadata and size == max(self.capture_num_tokens):
+            # Captured-attention graphs pull real workspace (MoE, attention
+            # transients) into the shared graph pool. Release the eager
+            # warmup's cached blocks first — otherwise the global allocator
+            # strands ~20 GB (at 16k buckets) that the graph pool can't use
+            # and capture OOMs while plenty of memory is reclaimable.
+            # ONCE, before the first (largest) bucket: the strandable mass is
+            # the pre-capture server warmup; later (smaller) buckets reuse
+            # cached blocks. Per-shape flushing forces every bucket's warmup
+            # through synchronous cudaMalloc against a nearly-full device,
+            # and the cost grows as the graph pool expands — at mem-frac
+            # >=0.92 with dense bucket lists that degraded to minutes per
+            # bucket (allocator thrash), dominating startup.
+            torch.cuda.empty_cache()
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
         if self._is_full_backend:
@@ -879,10 +925,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         bs = forward_batch.batch_size
         self.raw_bs = bs
 
+        # Captured-attention graphs read bs-shaped slots at the bucket's
+        # captured sequence-slot count: pad real batches up to it with
+        # zero-length seqs (fill_from zero-pads the bs-shaped slots).
+        if self.bcg_capture_bs_of is not None:
+            graph_bs = self.bcg_capture_bs_of[static_num_tokens]
+            assert bs <= graph_bs, f"{bs=} > captured slots {graph_bs=}"
+        else:
+            graph_bs = bs
+
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=bs,
-            padded_bs=bs,
+            padded_bs=graph_bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
         )
@@ -890,7 +945,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         registry = self.buffer_registry
 
         def _slot(name):
-            return registry.get_slot(name).slice_for(bs, static_num_tokens)
+            return registry.get_slot(name).slice_for(graph_bs, static_num_tokens)
 
         mamba_track_indices = (
             _slot("mamba_track_indices")
@@ -1029,6 +1084,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
                 s["req_pool_indices"][bs:r].zero_()
                 s["orig_seq_lens"][bs:r].zero_()
+            elif graph_bs > bs:
+                # Zero-length padding seqs for the captured-attention graph's
+                # extra sequence slots: lens 0, prefix 0, start loc at the
+                # end of the real token range, dummy req slot 0. Stale values
+                # from a previous (wider) replay must not leak in.
+                s["seq_lens"][bs:graph_bs].zero_()
+                s["extend_seq_lens"][bs:graph_bs].zero_()
+                s["extend_prefix_lens"][bs:graph_bs].zero_()
+                s["extend_start_loc"][bs:graph_bs].fill_(self.raw_num_tokens)
+                s["req_pool_indices"][bs:graph_bs].zero_()
+                s["orig_seq_lens"][bs:graph_bs].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (

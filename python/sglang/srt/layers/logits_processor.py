@@ -707,6 +707,15 @@ class LogitsProcessor(nn.Module):
     ) -> Optional[torch.Tensor]:
         hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
+        if not getattr(LogitsProcessor, "_auxprobe5", False):
+            LogitsProcessor._auxprobe5 = True
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "[AUXPROBE5] store: cap_mode=%s aux_none=%s hidden=%s",
+                logits_metadata.capture_hidden_mode,
+                aux_hidden_states is None,
+                tuple(hidden_states.shape),
+            )
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:

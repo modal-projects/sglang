@@ -273,7 +273,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
-            elif mr.server_args.kv_cache_dtype == "mxfp8":
+            elif (
+                getattr(mr, "kv_cache_dtype_str", mr.server_args.kv_cache_dtype)
+                == "mxfp8"
+            ):
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
@@ -333,7 +336,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if mr.server_args.kv_cache_dtype == "mxfp8":
+        if (
+            getattr(mr, "kv_cache_dtype_str", mr.server_args.kv_cache_dtype)
+            == "mxfp8"
+        ):
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)

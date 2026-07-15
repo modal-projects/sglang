@@ -102,6 +102,13 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    def _resolved_kv_cache_dtype_str(self: ModelRunner) -> str:
+        # Per-runner resolved KV dtype string published by
+        # configure_kv_cache_dtype (draft workers may override their pool
+        # dtype via --speculative-draft-kv-cache-dtype); fall back to the
+        # global arg for mock runners that skip that step.
+        return getattr(self, "kv_cache_dtype_str", self.server_args.kv_cache_dtype)
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -1053,7 +1060,7 @@ class ModelRunnerKVCacheMixin:
                     }
                 swa_pool_class = (
                     MHATokenToKVPoolMXFP8
-                    if self.server_args.kv_cache_dtype == "mxfp8"
+                    if self._resolved_kv_cache_dtype_str() == "mxfp8"
                     else mha_pool_class
                 )
                 swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
@@ -1122,7 +1129,7 @@ class ModelRunnerKVCacheMixin:
                 # buffers) for the full-attention layers, same as the SWA branch.
                 hybrid_full_pool_class = (
                     MHATokenToKVPoolMXFP8
-                    if self.server_args.kv_cache_dtype == "mxfp8"
+                    if self._resolved_kv_cache_dtype_str() == "mxfp8"
                     and not self.use_mla_backend
                     else mha_pool_class
                 )
@@ -1181,7 +1188,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    if self.server_args.kv_cache_dtype == "mxfp8":
+                    if self._resolved_kv_cache_dtype_str() == "mxfp8":
                         pool_cls = MHATokenToKVPoolMXFP8
                     else:
                         pool_cls = (

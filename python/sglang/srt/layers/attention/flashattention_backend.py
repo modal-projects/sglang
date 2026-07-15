@@ -1180,6 +1180,8 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        rel_r=None,
+        rel_proj=None,
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1305,6 +1307,13 @@ class FlashAttentionBackend(AttentionBackend):
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
+        if rel_r is not None:
+            if self.fa_impl_ver != 4:
+                raise RuntimeError(
+                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
+                )
+            kwargs["rel_r"] = rel_r
+            kwargs["rel_proj"] = rel_proj
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
                 raise RuntimeError(
@@ -1316,6 +1325,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
+        if rel_bias is not None or rel_r is not None:
             if metadata is self.full_cg_prefill_metadata:
                 # Full-CG reuses the cu_seqlens pointer with new values each replay.
                 # Disable its pointer-keyed schedule cache so the graph refreshes it.
@@ -1742,6 +1752,8 @@ class FlashAttentionBackend(AttentionBackend):
         aux_tensors=None,
         rel_bias=None,
         rel_bias_event=None,
+        rel_r=None,
+        rel_proj=None,
     ) -> torch.Tensor:
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -1806,6 +1818,13 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["score_mod"] = score_mod
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
+        if rel_r is not None:
+            if self.fa_impl_ver != 4:
+                raise RuntimeError(
+                    "rel_r/rel_proj (fused shear bias) requires the FA4 backend."
+                )
+            kwargs["rel_r"] = rel_r
+            kwargs["rel_proj"] = rel_proj
         if rel_bias is not None:
             if self.fa_impl_ver != 4:
                 raise RuntimeError(
@@ -1817,6 +1836,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
+        if rel_bias is not None or rel_r is not None:
             if metadata is self.full_cg_prefill_metadata:
                 # Full-CG reuses the cu_seqlens pointer with new values each replay.
                 # Disable its pointer-keyed schedule cache so the graph refreshes it.

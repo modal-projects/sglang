@@ -910,6 +910,12 @@ class Envs:
     SGLANG_OPT_FA_SYNC_FREE_SEQLEN = EnvBool(True)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # W4a fused rel-bias: pass rel_r + rel_proj to FA4's ShearingBias so the
+    # kernel computes prebias rows in-kernel (r @ proj) instead of the layer
+    # materializing rel_logits ([tokens, heads, extent] transients) via a
+    # separate GEMM. Requires SGLANG_OPT_USE_INKLING_SHEARED_BIAS=1 and the
+    # FA4 backend.
+    SGLANG_OPT_USE_INKLING_FUSED_REL_PROJ = EnvBool(False)
     # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
     # serving enables this layout independently of the flag.
     SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)

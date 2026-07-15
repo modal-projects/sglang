@@ -816,6 +816,14 @@ class InklingCausalLLM(nn.Module):
             bool(self._dflash_layers_to_capture)
             and not forward_batch.forward_mode.is_idle()
         )
+        if not getattr(self, "_auxprobe_logged", False):
+            self._auxprobe_logged = True
+            logger.info(
+                "[AUXPROBE] llm.forward: taps=%s capture_aux=%s mode=%s",
+                sorted(self._dflash_layers_to_capture),
+                capture_aux,
+                forward_batch.forward_mode,
+            )
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states,
@@ -1138,6 +1146,7 @@ class InklingForConditionalGeneration(nn.Module):
         return self.llm.lm_head
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        logger.info("[AUXPROBE] wrapper set_dflash_layers_to_capture: %s", layer_ids)
         self.llm.set_dflash_layers_to_capture(layer_ids)
 
     def get_num_kv_cache_layers(self) -> int:

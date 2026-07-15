@@ -1078,6 +1078,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Must be called before CUDA graph capture so the captured graphs
         include aux hidden state output paths.
         """
+        logger.info(
+            "[AUXPROBE] init_aux: dflash_use_aux=%s ids=%s model=%s is_draft=%s spec=%s",
+            self.dflash_family_use_aux_hidden_state,
+            self.dflash_family_target_layer_ids,
+            type(self.model).__name__,
+            self.is_draft_worker,
+            self.server_args.speculative_algorithm,
+        )
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids

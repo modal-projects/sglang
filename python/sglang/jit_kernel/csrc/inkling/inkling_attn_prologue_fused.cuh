@@ -121,6 +121,7 @@ struct AttnPrologueParams {
   void* __restrict__ sfq;  // uint8 [T, Hq, head_dim/32] when USE_MXFP8
   void* __restrict__ sfk;  // uint8 BlockScaledBasicChunk layout
   void* __restrict__ sfv;
+  const float* __restrict__ q_log_scaling_tau;  // float32 [T]
   int64_t qkvr_stride_t;
   int64_t q_off;  // elem offsets of the q/k/v slices within a qkvr row
   int64_t k_off;
@@ -137,6 +138,7 @@ struct AttnPrologueParams {
   uint32_t dq;
   uint32_t dkv;
   uint32_t page_size;
+  uint32_t apply_q_log_scaling;
 };
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8>
@@ -183,11 +185,14 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
     }
     if constexpr (USE_MXFP8) {
       float q_quant[kVecElems];
+      const float tau = p.apply_q_log_scaling ? p.q_log_scaling_tau[t] : 1.0f;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const float2 f = __bfloat1622float2(o[j]);
-        q_quant[2 * j] = f.x;
-        q_quant[2 * j + 1] = f.y;
+        // Match the unfused order exactly: q_norm bf16 -> fp32*tau -> bf16,
+        // then choose the MXFP8 block exponent from the scaled values.
+        q_quant[2 * j] = __bfloat162float(__float2bfloat16_rn(f.x * tau));
+        q_quant[2 * j + 1] = __bfloat162float(__float2bfloat16_rn(f.y * tau));
       }
       const uint32_t sf_idx = static_cast<uint32_t>(t) * (p.dq / kMXFP8Block) + c / kMXFP8Block;
       store_mxfp8_vec(
@@ -365,12 +370,14 @@ struct AttnPrologueKernel {
       tvm::ffi::TensorView sfq,
       tvm::ffi::TensorView sfk,
       tvm::ffi::TensorView sfv,
+      tvm::ffi::TensorView q_log_scaling_tau,
       int64_t q_off,
       int64_t k_off,
       int64_t v_off,
       int64_t q_num,
       int64_t do_store,
-      int64_t page_size) {
+      int64_t page_size,
+      int64_t apply_q_log_scaling) {
     using namespace host;
     const uint32_t T = static_cast<uint32_t>(qkvr.size(0));
     const uint32_t B = static_cast<uint32_t>(cache_indices.size(0));
@@ -422,7 +429,14 @@ struct AttnPrologueKernel {
               sfv.stride(1) == kMXFP8Block * page_chunks * sf_dim,
           "MXFP8 SFK/SFV must be contiguous BlockScaledBasicChunk layout");
       RuntimeCheck(k_buf.stride(0) % kMXFP8Block == 0, "MXFP8 kv buf row alignment");
+      if (apply_q_log_scaling) {
+        RuntimeCheck(
+            is_type<float>(q_log_scaling_tau.dtype()) && q_log_scaling_tau.ndim() == 1 &&
+                q_log_scaling_tau.size(0) == T && q_log_scaling_tau.stride(0) == 1,
+            "q_log_scaling_tau must be contiguous float32 [T]");
+      }
     } else {
+      RuntimeCheck(!apply_q_log_scaling, "Q log scaling in the prologue requires MXFP8");
       RuntimeCheck(k_buf.stride(0) % kVecElems == 0, "kv buf rows must be 16B aligned");
       RuntimeCheck(is_type<DType>(q_out.dtype()), "q_out dtype mismatch");
     }
@@ -449,6 +463,9 @@ struct AttnPrologueKernel {
         .sfq = USE_MXFP8 ? sfq.data_ptr() : nullptr,
         .sfk = USE_MXFP8 ? sfk.data_ptr() : nullptr,
         .sfv = USE_MXFP8 ? sfv.data_ptr() : nullptr,
+        .q_log_scaling_tau = apply_q_log_scaling
+                                 ? static_cast<const float*>(q_log_scaling_tau.data_ptr())
+                                 : nullptr,
         .qkvr_stride_t = qkvr.stride(0),
         .q_off = q_off,
         .k_off = k_off,
@@ -465,6 +482,7 @@ struct AttnPrologueKernel {
         .dq = dq,
         .dkv = dkv,
         .page_size = static_cast<uint32_t>(page_size),
+        .apply_q_log_scaling = static_cast<uint32_t>(apply_q_log_scaling),
     };
     RuntimeCheck(
         k_cache.stride(0) == v_cache.stride(0) && k_cache.stride(1) == v_cache.stride(1) &&
@@ -507,6 +525,7 @@ struct AttnPrologueDecodeParams {
   void* __restrict__ sfq;  // uint8 [T, Hq, head_dim/32] when USE_MXFP8
   void* __restrict__ sfk;  // uint8 BlockScaledBasicChunk layout
   void* __restrict__ sfv;
+  const float* __restrict__ q_log_scaling_tau;  // float32 [T]
   int64_t qkvr_stride_t;
   int64_t q_off;
   int64_t k_off;
@@ -520,6 +539,7 @@ struct AttnPrologueDecodeParams {
   uint32_t dq;
   uint32_t dkv;
   uint32_t page_size;
+  uint32_t apply_q_log_scaling;
 };
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_TRACK, bool DO_STORE, bool USE_MXFP8>
@@ -556,11 +576,12 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     }
     if constexpr (USE_MXFP8) {
       float q_quant[kVecElems];
+      const float tau = p.apply_q_log_scaling ? p.q_log_scaling_tau[t] : 1.0f;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const float2 f = __bfloat1622float2(o[j]);
-        q_quant[2 * j] = f.x;
-        q_quant[2 * j + 1] = f.y;
+        q_quant[2 * j] = __bfloat162float(__float2bfloat16_rn(f.x * tau));
+        q_quant[2 * j + 1] = __bfloat162float(__float2bfloat16_rn(f.y * tau));
       }
       const uint32_t sf_idx = static_cast<uint32_t>(t) * (p.dq / kMXFP8Block) + c / kMXFP8Block;
       store_mxfp8_vec(
@@ -725,12 +746,14 @@ struct AttnPrologueDecodeKernel {
       tvm::ffi::TensorView sfq,
       tvm::ffi::TensorView sfk,
       tvm::ffi::TensorView sfv,
+      tvm::ffi::TensorView q_log_scaling_tau,
       int64_t q_off,
       int64_t k_off,
       int64_t v_off,
       int64_t do_track,
       int64_t do_store,
-      int64_t page_size) {
+      int64_t page_size,
+      int64_t apply_q_log_scaling) {
     using namespace host;
     const uint32_t T = static_cast<uint32_t>(qkvr.size(0));
     const uint32_t dq = static_cast<uint32_t>(q_out.size(1));
@@ -780,7 +803,14 @@ struct AttnPrologueDecodeKernel {
               sfv.stride(1) == kMXFP8Block * page_chunks * sf_dim,
           "MXFP8 SFK/SFV must be contiguous BlockScaledBasicChunk layout");
       RuntimeCheck(k_buf.stride(0) % kMXFP8Block == 0, "MXFP8 kv buf row alignment");
+      if (apply_q_log_scaling) {
+        RuntimeCheck(
+            is_type<float>(q_log_scaling_tau.dtype()) && q_log_scaling_tau.ndim() == 1 &&
+                q_log_scaling_tau.size(0) == T && q_log_scaling_tau.stride(0) == 1,
+            "q_log_scaling_tau must be contiguous float32 [T]");
+      }
     } else {
+      RuntimeCheck(!apply_q_log_scaling, "Q log scaling in the prologue requires MXFP8");
       RuntimeCheck(k_buf.stride(0) % kVecElems == 0, "kv buf rows must be 16B aligned");
       RuntimeCheck(is_type<DType>(q_out.dtype()), "q_out dtype mismatch");
     }
@@ -807,6 +837,9 @@ struct AttnPrologueDecodeKernel {
         .sfq = USE_MXFP8 ? sfq.data_ptr() : nullptr,
         .sfk = USE_MXFP8 ? sfk.data_ptr() : nullptr,
         .sfv = USE_MXFP8 ? sfv.data_ptr() : nullptr,
+        .q_log_scaling_tau = apply_q_log_scaling
+                                 ? static_cast<const float*>(q_log_scaling_tau.data_ptr())
+                                 : nullptr,
         .qkvr_stride_t = qkvr.stride(0),
         .q_off = q_off,
         .k_off = k_off,
@@ -820,6 +853,7 @@ struct AttnPrologueDecodeKernel {
         .dq = dq,
         .dkv = dkv,
         .page_size = static_cast<uint32_t>(page_size),
+        .apply_q_log_scaling = static_cast<uint32_t>(apply_q_log_scaling),
     };
     const uint32_t block = div_ceil(lanes, 32u) * 32u;
     auto pick = [&](auto tr, auto st, auto mx) {
@@ -873,6 +907,7 @@ struct AttnPrologueExtendParams {
   void* __restrict__ sfq;  // uint8 [T, Hq, head_dim/32] when USE_MXFP8
   void* __restrict__ sfk;  // uint8 BlockScaledBasicChunk layout
   void* __restrict__ sfv;
+  const float* __restrict__ q_log_scaling_tau;  // float32 [T]
   int64_t qkvr_stride_t;
   int64_t q_off;
   int64_t k_off;
@@ -885,6 +920,7 @@ struct AttnPrologueExtendParams {
   uint32_t dq;
   uint32_t dkv;
   uint32_t page_size;
+  uint32_t apply_q_log_scaling;
 };
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8>
@@ -928,11 +964,12 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     }
     if constexpr (USE_MXFP8) {
       float q_quant[kVecElems];
+      const float tau = p.apply_q_log_scaling ? p.q_log_scaling_tau[t] : 1.0f;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const float2 f = __bfloat1622float2(o[j]);
-        q_quant[2 * j] = f.x;
-        q_quant[2 * j + 1] = f.y;
+        q_quant[2 * j] = __bfloat162float(__float2bfloat16_rn(f.x * tau));
+        q_quant[2 * j + 1] = __bfloat162float(__float2bfloat16_rn(f.y * tau));
       }
       const uint32_t sf_idx = static_cast<uint32_t>(t) * (p.dq / kMXFP8Block) + c / kMXFP8Block;
       store_mxfp8_vec(
@@ -1177,11 +1214,13 @@ struct AttnPrologueExtendKernel {
       tvm::ffi::TensorView sfq,
       tvm::ffi::TensorView sfk,
       tvm::ffi::TensorView sfv,
+      tvm::ffi::TensorView q_log_scaling_tau,
       int64_t q_off,
       int64_t k_off,
       int64_t v_off,
       int64_t do_store,
-      int64_t page_size) {
+      int64_t page_size,
+      int64_t apply_q_log_scaling) {
     using namespace host;
     const uint32_t T = static_cast<uint32_t>(qkvr.size(0));
     const uint32_t B = static_cast<uint32_t>(cache_indices.size(0));
@@ -1239,7 +1278,14 @@ struct AttnPrologueExtendKernel {
               sfv.stride(1) == kMXFP8Block * page_chunks * sf_dim,
           "MXFP8 SFK/SFV must be contiguous BlockScaledBasicChunk layout");
       RuntimeCheck(k_buf.stride(0) % kMXFP8Block == 0, "MXFP8 kv buf row alignment");
+      if (apply_q_log_scaling) {
+        RuntimeCheck(
+            is_type<float>(q_log_scaling_tau.dtype()) && q_log_scaling_tau.ndim() == 1 &&
+                q_log_scaling_tau.size(0) == T && q_log_scaling_tau.stride(0) == 1,
+            "q_log_scaling_tau must be contiguous float32 [T]");
+      }
     } else {
+      RuntimeCheck(!apply_q_log_scaling, "Q log scaling in the prologue requires MXFP8");
       RuntimeCheck(k_buf.stride(0) % kVecElems == 0, "kv buf rows must be 16B aligned");
       RuntimeCheck(is_type<DType>(q_out.dtype()), "q_out dtype mismatch");
     }
@@ -1267,6 +1313,9 @@ struct AttnPrologueExtendKernel {
         .sfq = USE_MXFP8 ? sfq.data_ptr() : nullptr,
         .sfk = USE_MXFP8 ? sfk.data_ptr() : nullptr,
         .sfv = USE_MXFP8 ? sfv.data_ptr() : nullptr,
+        .q_log_scaling_tau = apply_q_log_scaling
+                                 ? static_cast<const float*>(q_log_scaling_tau.data_ptr())
+                                 : nullptr,
         .qkvr_stride_t = qkvr.stride(0),
         .q_off = q_off,
         .k_off = k_off,
@@ -1279,6 +1328,7 @@ struct AttnPrologueExtendKernel {
         .dq = dq,
         .dkv = dkv,
         .page_size = static_cast<uint32_t>(page_size),
+        .apply_q_log_scaling = static_cast<uint32_t>(apply_q_log_scaling),
     };
     const uint32_t block = div_ceil(lanes, 32u) * 32u;
     const auto kernel = do_store

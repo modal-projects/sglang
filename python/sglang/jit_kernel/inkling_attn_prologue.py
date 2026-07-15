@@ -72,11 +72,16 @@ def inkling_attn_prologue_verify(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    q_log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Returns fresh contiguous (q_normed, k_normed, v_conv) [T, dq/dkv];
     KV rows are also scattered into k_buf/v_buf at ``loc`` (the attention call
     should pass save_kv_cache=False)."""
     t = qkvr.shape[0]
+    apply_q_log_scaling = mxfp8_quant and q_log_scaling_tau is not None
+    q_log_scaling_tau_arg = (
+        q_log_scaling_tau if q_log_scaling_tau is not None else qkvr
+    )
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
             raise ValueError("MXFP8 fused prologue requires head_dim-aligned Q/K/V.")
@@ -133,12 +138,14 @@ def inkling_attn_prologue_verify(
         sfq_u8,
         sfk_u8,
         sfv_u8,
+        q_log_scaling_tau_arg,
         int(q_off),
         int(k_off),
         int(v_off),
         int(draft_token_num),
         int(do_store),
         int(page_size),
+        int(apply_q_log_scaling),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale
@@ -176,6 +183,7 @@ def inkling_attn_prologue_extend(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    q_log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Extend (prefill) analog of ``inkling_attn_prologue_verify``: varlen
     sequences via ``cu``/``si``, no window save; instead a tiny trailing
@@ -185,6 +193,10 @@ def inkling_attn_prologue_extend(
     scatters KV rows into k_buf/v_buf at ``loc`` when ``do_store`` (the
     attention call should then pass save_kv_cache=False)."""
     t = qkvr.shape[0]
+    apply_q_log_scaling = mxfp8_quant and q_log_scaling_tau is not None
+    q_log_scaling_tau_arg = (
+        q_log_scaling_tau if q_log_scaling_tau is not None else qkvr
+    )
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
             raise ValueError("MXFP8 fused prologue requires head_dim-aligned Q/K/V.")
@@ -245,11 +257,13 @@ def inkling_attn_prologue_extend(
         sfq_u8,
         sfk_u8,
         sfv_u8,
+        q_log_scaling_tau_arg,
         int(q_off),
         int(k_off),
         int(v_off),
         int(do_store),
         int(page_size),
+        int(apply_q_log_scaling),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale
@@ -283,6 +297,7 @@ def inkling_attn_prologue_decode(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    q_log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Decode {k/v decode-conv + conv-cache shift-update (+track) + qk-norm
     (+ KV store)} in one kernel. Returns fresh (q_normed, k_normed, v_conv).
@@ -290,6 +305,10 @@ def inkling_attn_prologue_decode(
     semantics). With ``do_store`` the KV rows are scattered into k_buf/v_buf at
     ``loc``; MXFP8 mode also quantizes Q and writes interleaved K/V scales."""
     t = qkvr.shape[0]
+    apply_q_log_scaling = mxfp8_quant and q_log_scaling_tau is not None
+    q_log_scaling_tau_arg = (
+        q_log_scaling_tau if q_log_scaling_tau is not None else qkvr
+    )
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
             raise ValueError("MXFP8 fused decode prologue requires head_dim-aligned Q/K/V.")
@@ -334,9 +353,9 @@ def inkling_attn_prologue_decode(
         qkvr, k_cache, v_cache, cache_indices.to(torch.int32), cache_mask,
         k_weight, v_weight, tm, ti, q_gamma, k_gamma, float(eps),
         q_out, k_out, v_out, loc, k_buf.view(-1, hkv * 128), v_buf.view(-1, hkv * 128),
-        sfq_u8, sfk_u8, sfv_u8,
+        sfq_u8, sfk_u8, sfv_u8, q_log_scaling_tau_arg,
         int(q_off), int(k_off), int(v_off), int(do_track), int(do_store),
-        int(page_size),
+        int(page_size), int(apply_q_log_scaling),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale

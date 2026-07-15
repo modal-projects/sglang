@@ -285,7 +285,9 @@ class InklingAttention(nn.Module):
             )
         return self._fa4_rel_proj_cache
 
-    def _fused_attn_prologue_verify(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_verify(
+        self, q, k, v, forward_batch, q_log_scaling_tau=None
+    ):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
         (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
 
@@ -389,10 +391,15 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            q_log_scaling_tau=(
+                q_log_scaling_tau if do_mxfp8_store else None
+            ),
         )
         return q, k, v, do_store, q_descale
 
-    def _fused_attn_prologue_extend(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_extend(
+        self, q, k, v, forward_batch, q_log_scaling_tau=None
+    ):
         """Extend analog of _fused_attn_prologue_verify: {k/v varlen sconv +
         qk-norm (+ KV store)} in the main kernel plus a tiny trailing k/v
         conv-cache update (+ prefix-cache track) kernel -- replacing
@@ -503,10 +510,15 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            q_log_scaling_tau=(
+                q_log_scaling_tau if do_mxfp8_store else None
+            ),
         )
         return q, k, v, do_store, q_descale
 
-    def _fused_attn_prologue_decode(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_decode(
+        self, q, k, v, forward_batch, q_log_scaling_tau=None
+    ):
         """Decode analog of _fused_attn_prologue_verify: {k/v decode-conv +
         conv-cache shift-update (+ prefix track) + qk-norm (+ KV store)} in one
         kernel. Decode is one token/seq so the conv taps come from the working
@@ -597,6 +609,9 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            q_log_scaling_tau=(
+                q_log_scaling_tau if do_mxfp8_store else None
+            ),
         )
         return q, k, v, do_store, q_descale
 
@@ -691,7 +706,15 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_verify(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_verify(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    q_log_scaling_tau=(
+                        log_scaling_tau if apply_log_scaling else None
+                    ),
+                )
             elif _prologue_decode:
                 (
                     q,
@@ -699,7 +722,15 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_decode(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_decode(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    q_log_scaling_tau=(
+                        log_scaling_tau if apply_log_scaling else None
+                    ),
+                )
             else:
                 (
                     q,
@@ -707,7 +738,15 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_extend(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_extend(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    q_log_scaling_tau=(
+                        log_scaling_tau if apply_log_scaling else None
+                    ),
+                )
         use_alt = (
             not fused_prologue
             and fa4
@@ -766,7 +805,10 @@ class InklingAttention(nn.Module):
                 alt_stream=None,
             )
 
-        if apply_log_scaling:
+        # The fused MXFP8 prologue applies tau to normalized Q before choosing
+        # its block exponent; q_descale being present signals that path. All
+        # bf16/non-fused paths still apply tau here, before their later quant.
+        if apply_log_scaling and prologue_q_descale is None:
             # q is 2D [num_tokens, heads*head_dim]; tau is per-token, so broadcast
             # over the whole row with [num_tokens, 1] -- identical to scaling the
             # (num_tokens, heads, head_dim) view by tau.view(-1, 1, 1), but with no

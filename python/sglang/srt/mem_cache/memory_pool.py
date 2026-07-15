@@ -2619,10 +2619,58 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-MXFP8)"
         )
-        if k_scale is None or v_scale is None:
-            raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
         layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
         idx = layer_id - self.start_layer
+
+        if k_scale is None or v_scale is None:
+            # Tier-2 fused store: the caller passed UNquantized bf16 K/V (no
+            # scales); quantize + scatter data + interleaved scales here.
+            if not (
+                cache_k.dtype == torch.bfloat16
+                and cache_v.dtype == torch.bfloat16
+            ):
+                raise ValueError(
+                    "MXFP8 KV cache requires K and V scale tensors for "
+                    f"pre-quantized inputs (got {cache_k.dtype})."
+                )
+            cache_k = cache_k.view(-1, self.head_num, self.head_dim)
+            cache_v = cache_v.view(-1, self.head_num, self.v_head_dim)
+            if (
+                self.mxfp8_sf_interleaved
+                and self.head_dim == 128
+                and self.v_head_dim == 128
+            ):
+                from sglang.tml.kernels.mxfp8_fused_store import mxfp8_quant_store
+
+                # One fused launch each for K and V (quant + data scatter +
+                # interleaved-sf scatter), bit-identical to the legacy
+                # to_mxfp8 + fancy-index + store_sf_interleaved sequence.
+                # Runs on the current stream even under graph capture (no
+                # alt-stream split needed: there are no big aten scatters
+                # left to overlap).
+                mxfp8_quant_store(
+                    cache_k,
+                    self.k_buffer[idx],
+                    self.k_scale_buffer[idx],
+                    loc,
+                    page_size=self.page_size,
+                )
+                mxfp8_quant_store(
+                    cache_v,
+                    self.v_buffer[idx],
+                    self.v_scale_buffer[idx],
+                    loc,
+                    page_size=self.page_size,
+                )
+                return
+            # Non-interleaved SF layout (page_size != 128) or non-128
+            # head_dim: quantize here and take the legacy write path below.
+            from sglang.tml.kernels.mxfp8_quant import to_mxfp8
+
+            k_mx = to_mxfp8(cache_k)
+            v_mx = to_mxfp8(cache_v)
+            cache_k, k_scale = k_mx.data, k_mx.scale.view(torch.float8_e8m0fnu)
+            cache_v, v_scale = v_mx.data, v_mx.scale.view(torch.float8_e8m0fnu)
 
         from sglang.srt.model_executor.runner import get_is_capture_mode
 

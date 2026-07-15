@@ -40,6 +40,15 @@ else:
 
 
 @cache
+def _fused_mxfp8_store_enabled() -> bool:
+    """Tier-2 fused MXFP8 KV store (quant + data scatter + interleaved-sf
+    scatter in one kernel per K/V tensor). INKLING_FUSED_MXFP8_STORE=0 keeps
+    the legacy three-kernel path (to_mxfp8 + aten fancy-index +
+    store_sf_interleaved) for A/B."""
+    return os.environ.get("INKLING_FUSED_MXFP8_STORE", "1") == "1"
+
+
+@cache
 def get_inkling_relative_attention_score_mod(rel_extent: int) -> Callable:
     if cute is None or Float32 is None or SeqlenInfoQK is None:
         raise ImportError(
@@ -496,15 +505,33 @@ class InklingAttention(nn.Module):
             # set_kv_buffer, which stores them interleaved as sfk/sfv.
             from sglang.tml.kernels.mxfp8_quant import to_mxfp8
 
-            k_mxfp = to_mxfp8(k.view(num_tokens, self.num_tp_kv_heads, self.head_dim))
             q_mxfp = to_mxfp8(q.view(num_tokens, self.num_tp_heads, self.head_dim))
-            v_mxfp = to_mxfp8(v.view(num_tokens, self.num_tp_kv_heads, self.head_dim))
-            q = q_mxfp.data.view(num_tokens, -1)
-            k = k_mxfp.data.view(num_tokens, -1)
-            v = v_mxfp.data.view(num_tokens, -1)
             extra_attn_kwargs["q_descale"] = q_mxfp.scale.view(torch.float8_e8m0fnu)
-            extra_attn_kwargs["k_descale"] = k_mxfp.scale.view(torch.float8_e8m0fnu)
-            extra_attn_kwargs["v_descale"] = v_mxfp.scale.view(torch.float8_e8m0fnu)
+            if _fused_mxfp8_store_enabled() and self.head_dim == 128:
+                # Tier-2 fused KV store (INKLING_FUSED_MXFP8_STORE=1, default):
+                # keep K/V bf16 and pass them onward with save_kv_cache; the
+                # pool's set_kv_buffer (bf16 + no descale kwargs -> k/v_scale
+                # None in the FA4 backend) quantizes and scatters data +
+                # interleaved scales in one fused kernel per tensor. The
+                # attention kernel still reads fp8 K/V + sfk/sfv from the
+                # POOL buffers (_mxfp8_sf_kwargs); only q/sfq come from here.
+                q = q_mxfp.data.view(num_tokens, -1)
+            else:
+                k_mxfp = to_mxfp8(
+                    k.view(num_tokens, self.num_tp_kv_heads, self.head_dim)
+                )
+                v_mxfp = to_mxfp8(
+                    v.view(num_tokens, self.num_tp_kv_heads, self.head_dim)
+                )
+                q = q_mxfp.data.view(num_tokens, -1)
+                k = k_mxfp.data.view(num_tokens, -1)
+                v = v_mxfp.data.view(num_tokens, -1)
+                extra_attn_kwargs["k_descale"] = k_mxfp.scale.view(
+                    torch.float8_e8m0fnu
+                )
+                extra_attn_kwargs["v_descale"] = v_mxfp.scale.view(
+                    torch.float8_e8m0fnu
+                )
 
         if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get():
             if fused_rel:

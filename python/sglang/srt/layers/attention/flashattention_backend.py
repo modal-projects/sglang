@@ -366,6 +366,15 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        # Checkpoint-free per-tensor fp8 uses unit descales. Keep the scalar
+        # pointer stable for CUDA graphs and avoid a tiny allocation/fill on
+        # every draft layer and step.
+        self._identity_kv_descale = (
+            torch.ones((1, 1), device=self.device, dtype=torch.float32)
+            if self.fa_impl_ver == 4
+            and self.kv_cache_dtype_str in ("fp8_e4m3", "fp8_e5m2")
+            else None
+        )
 
         # BCG captured-metadata contract (see base_attn_backend.py): capture
         # extend metadata into stable tensors and refresh them in place at
@@ -1396,7 +1405,7 @@ class FlashAttentionBackend(AttentionBackend):
         # also supports fp8 Q/K/V; uncalibrated draft checkpoints use identity
         # descales (the draft pool's saturating casts keep values representable).
         if (
-            self.kv_cache_dtype_str != "auto"
+            self.kv_cache_dtype_str in ("fp8_e4m3", "fp8_e5m2")
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
         ):
@@ -1406,9 +1415,9 @@ class FlashAttentionBackend(AttentionBackend):
                 fa_v_descale = layer.v_scale.expand(descale_shape)
             elif self.fa_impl_ver == 4:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                one = torch.ones((1, 1), device=q.device, dtype=torch.float32)
-                fa_k_descale = one.expand(descale_shape)
-                fa_v_descale = one.expand(descale_shape)
+                assert self._identity_kv_descale is not None
+                fa_k_descale = self._identity_kv_descale.expand(descale_shape)
+                fa_v_descale = self._identity_kv_descale.expand(descale_shape)
             # Saturating cast: plain .to(fp8) maps overflow to NaN (no inf in
             # e4m3fn); clamp to the fp8 range first (identity-descale path).
             _finfo = torch.finfo(self.kv_cache_dtype)
@@ -2005,7 +2014,7 @@ class FlashAttentionBackend(AttentionBackend):
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
         if (
-            self.kv_cache_dtype_str != "auto"
+            self.kv_cache_dtype_str in ("fp8_e4m3", "fp8_e5m2")
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
         ):
@@ -2017,9 +2026,9 @@ class FlashAttentionBackend(AttentionBackend):
                 # DFLASH checkpoints do not carry calibrated KV scales. FA4
                 # still requires explicit descale tensors for fp8 Q/K/V.
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                one = torch.ones((1, 1), device=q.device, dtype=torch.float32)
-                fa_k_descale = one.expand(descale_shape)
-                fa_v_descale = one.expand(descale_shape)
+                assert self._identity_kv_descale is not None
+                fa_k_descale = self._identity_kv_descale.expand(descale_shape)
+                fa_v_descale = self._identity_kv_descale.expand(descale_shape)
             # Saturating cast: plain .to(fp8) maps overflow to NaN (no inf in
             # e4m3fn); clamp to the fp8 range first (identity-descale path).
             _finfo = torch.finfo(self.kv_cache_dtype)

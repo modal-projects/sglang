@@ -1814,6 +1814,7 @@ class InklingMTPLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_id: int | None = None,
+        is_local: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1851,7 +1852,7 @@ class InklingMTPLayer(nn.Module):
         self.transformer_block = InklingDecoderLayer(
             config=mtp_config,
             layer_id=layer_id if layer_id is not None else 0,
-            is_local=False,
+            is_local=is_local,
             quant_config=quant_config,
             prefix=add_prefix("transformer_block", prefix),
         )
@@ -1887,6 +1888,16 @@ class InklingMTPLayer(nn.Module):
             None,
             log_scaling_tau=log_scaling_tau,
         )
+        # InklingDecoderLayer defers its own MLP sconv to the next layer.  An MTP
+        # head contains only one decoder layer, so it must run that deferred tail
+        # itself before adding the full-width residual.  With scattered sconv the
+        # dense MLP returns a [T, H / TP] shard; gather it after the channelwise
+        # convolution, matching InklingCausalLLM's final-layer tail.
+        mlp_sconv = self.transformer_block.mlp_sconv
+        if mlp_sconv is not None and not forward_batch.forward_mode.is_idle():
+            h = mlp_sconv(h, positions, forward_batch)
+            if self.transformer_block.scattered_sconv:
+                h = all_gather_hidden(h, self.transformer_block.attn_tp_group)
         # transformer_block defers the final residual add to the caller.
         if residual is not None:
             h = h + residual
@@ -1925,6 +1936,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
             config.text_config.chain_hidden_post_norm = config.mtp_config.get(
                 "chain_hidden_post_norm", config.text_config.chain_hidden_post_norm
             )
+        self.is_local = self.draft_model_idx in config.mtp_local_layer_ids
         # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so build
         # the draft unquantized.
         quant_config = None
@@ -1933,6 +1945,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
             layer_id=self.draft_model_idx,
+            is_local=self.is_local,
         )
         self.lm_head = ParallelLMHead(
             config.text_config.padded_vocab_size,

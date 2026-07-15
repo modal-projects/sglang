@@ -1071,8 +1071,26 @@ class ModelRunnerKVCacheMixin:
                     and self.model_config.hf_config.architectures[0]
                     == "InklingForConditionalGenerationMTP"
                 ):
-                    swa_attention_layer_ids = []
-                    full_attention_layer_ids = [self.draft_model_idx]
+                    draft_layer_is_local = self.draft_model_idx in getattr(
+                        self.model_config.hf_config,
+                        "mtp_local_layer_ids",
+                        frozenset(),
+                    )
+                    if draft_layer_is_local:
+                        swa_attention_layer_ids = [self.draft_model_idx]
+                        full_attention_layer_ids = []
+                    else:
+                        swa_attention_layer_ids = []
+                        full_attention_layer_ids = [self.draft_model_idx]
+                    kwargs.update(
+                        {
+                            "swa_head_num": self.model_config.get_swa_num_kv_heads(
+                                get_parallel().attn_tp_size
+                            ),
+                            "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
+                            "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
+                        }
+                    )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,

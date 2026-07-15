@@ -301,6 +301,34 @@ class InklingMMConfig(PretrainedConfig):
         return self.text_config
 
     @property
+    def mtp_local_layer_ids(self) -> frozenset[int]:
+        """MTP depths whose attention uses the target's sliding-window shape."""
+        if not isinstance(self.mtp_config, dict):
+            return frozenset()
+
+        layer_ids = self.mtp_config.get("local_layer_ids", [])
+        if not isinstance(layer_ids, list) or any(
+            type(layer_id) is not int for layer_id in layer_ids
+        ):
+            raise ValueError("mtp_config.local_layer_ids must be a list of integers")
+
+        num_layers = self.mtp_config.get(
+            "num_nextn_predict_layers",
+            self.text_config.num_nextn_predict_layers,
+        )
+        if type(num_layers) is not int or num_layers < 1:
+            raise ValueError(
+                "mtp_config.num_nextn_predict_layers must be a positive integer"
+            )
+        invalid = [layer_id for layer_id in layer_ids if not 0 <= layer_id < num_layers]
+        if invalid:
+            raise ValueError(
+                "mtp_config.local_layer_ids must be in "
+                f"[0, {num_layers}); got {invalid}"
+            )
+        return frozenset(layer_ids)
+
+    @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
 

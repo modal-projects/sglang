@@ -438,7 +438,18 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     from sglang.srt.utils import is_hip
 
-    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    # Experimental DFLASH checkpoints whose layers are all causal can use the
+    # TRT-LLM MHA kernels.  The backend itself already consumes each layer's
+    # sliding_window_size; older DFLASH checkpoints with ENCODER_ONLY/full
+    # attention layers remain the caller's responsibility on this branch.
+    supported_draft_backends = (
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "triton",
+        "trtllm_mha",
+        "ascend",
+    )
     # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
     fallback_backend = "triton" if is_hip() else "flashinfer"
 
@@ -451,14 +462,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
-        draft_backend = fallback_backend
-    elif draft_backend == "trtllm_mha":
-        logger.warning(
-            "DFLASH draft worker does not support 'trtllm_mha' because the "
-            "draft path requires per-layer DFlash attention. Falling back to "
-            "'%s'.",
-            fallback_backend,
-        )
         draft_backend = fallback_backend
     elif draft_backend not in supported_draft_backends:
         logger.warning(

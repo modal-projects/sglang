@@ -648,17 +648,6 @@ class InklingAttention(nn.Module):
         _prologue_extend = (
             _fm.is_extend() and not _prologue_verify and not _fm.is_draft_extend_v2()
         )
-        # BCG attention capture (SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN): record
-        # the captured prefill graph single-stream — the alt-stream fork would
-        # bake capture-time stream dependencies into the graph, and the
-        # validated bcg-fp8 captured-attn configuration runs this group
-        # single-stream under capture. Scoped to extend-mode stream capture so
-        # decode/verify graph captures keep their multi-stream recording.
-        _bcg_attn_capture = (
-            _prologue_extend
-            and envs.SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN.get()
-            and torch.cuda.is_current_stream_capturing()
-        )
         fused_prologue = (
             fa4
             and self.kv_conv
@@ -666,7 +655,6 @@ class InklingAttention(nn.Module):
             and num_tokens > 0
             and self.head_dim == 128
             and (_prologue_verify or _prologue_decode or _prologue_extend)
-            and not _bcg_attn_capture
             and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get()
         )
         if fused_prologue:
@@ -715,9 +703,6 @@ class InklingAttention(nn.Module):
             and hidden_states.is_cuda
             and num_tokens > 0
             and get_is_capture_mode()
-            # BCG attention capture: run single-stream under capture (see
-            # _bcg_attn_capture above).
-            and not _bcg_attn_capture
         )
         if use_alt:
             # Alt stream runs v_sconv then rel_logits_proj, each fenced by its own

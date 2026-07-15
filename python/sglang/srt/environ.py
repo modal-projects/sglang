@@ -910,6 +910,18 @@ class Envs:
     SGLANG_OPT_FA_SYNC_FREE_SEQLEN = EnvBool(True)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # Capture the Inkling attention group inside prefill breakable CUDA graphs
+    # (BCG) instead of running it as a per-layer eager break. Uses the FA4
+    # captured-metadata contract (metadata tensors refreshed in place before
+    # replay). Sheared bias composes: its block-schedule prep cache is
+    # capture-aware (jit_kernel/flash_attn/cute/interface.py), so the prep
+    # kernel is captured and self-refreshes at replay.
+    SGLANG_OPT_INKLING_BCG_CAPTURE_ATTN = EnvBool(False)
+    # Batch-dimension capacity of captured-attention prefill graphs: each
+    # bucket captures with this many sequence slots (1 real + N-1 zero-length
+    # padding seqs); replay pads real batches up to it, wider batches fall
+    # back to eager. Per-bucket effective value is min(this, bucket tokens).
+    SGLANG_OPT_INKLING_BCG_CAPTURE_BS = EnvInt(32)
     # W4a fused rel-bias: pass rel_r + rel_proj to FA4's ShearingBias so the
     # kernel computes prebias rows in-kernel (r @ proj) instead of the layer
     # materializing rel_logits ([tokens, heads, extent] transients) via a

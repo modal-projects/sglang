@@ -555,8 +555,15 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
-        q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
+        # qk_blockscaled at q_stage=2 needs the W7-2 SF/S TMEM time-multiplex
+        # (pipeline_sf_overlap in flash_fwd_sm100.py): the SFQ/SFK TMEM columns
+        # alias the other stage's S region, which q_stage=2 overwrites every
+        # iteration. The wiring is new, so it is opt-in via FA4_MXFP8_QS2=1
+        # (default keeps the safe q_stage=1) until validated on hardware.
+        if qk_blockscaled and os.environ.get("FA4_MXFP8_QS2", "0") != "1":
+            q_stage = 1
+        else:
+            q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
 

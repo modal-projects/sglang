@@ -1898,6 +1898,7 @@ class FlashAttentionForwardSm100:
                 sBias=sBias,
                 bias_s2r_tiled_copy=bias_s2r_tiled_copy,
                 pipeline_bias=pipeline_bias,
+                pipeline_sf_overlap=pipeline_sf_overlap,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2819,6 +2820,12 @@ class FlashAttentionForwardSm100:
         # ]
 
         mma_q_consumer_phase = Int32(0)
+        # W7-2 SF/S TMEM time-multiplex phase (q_stage == 2 blockscaled only).
+        # Each S region r is acquired ("softmax(r) drained S(r)") exactly once
+        # per kv iteration -- prologue included -- so a single phase bit,
+        # toggled once per iteration, serves both regions. See the ordering
+        # note at the prologue acquire below.
+        sf_overlap_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
@@ -2868,7 +2875,37 @@ class FlashAttentionForwardSm100:
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     # S2T copy SFQ then SFK into TMEM (blockscaled QK^T operands)
+                    #
+                    # W7-2: at q_stage == 2 the SFs for stage s live INSIDE the
+                    # other stage's S region (tmem_sfq_offset[s] ==
+                    # tmem_s_offset[1-s], first 8 columns), so this copy
+                    # overwrites live score columns of S(1-s). Acquire
+                    # pipeline_sf_overlap(1-s) = "softmax warp group (1-s) has
+                    # t2r'd the most recently committed S(1-s)" first.
+                    # Pairing (asymmetric by construction):
+                    #   region 1 (stage-0 copies): the last writer of S1 is
+                    #     gemm_Si[1] of the PREVIOUS iteration, so this acquire
+                    #     pairs with softmax1's release for the previous tile;
+                    #     the very first acquire is satisfied by softmax1's
+                    #     one-time priming release at kernel start.
+                    #   region 0 (stage-1 copies): gemm_Si[0] + commit(0) of
+                    #     THIS iteration already happened above, so this
+                    #     acquire pairs with softmax0's release for the
+                    #     CURRENT tile (no priming release).
+                    # Deadlock argument: the awaited release only requires the
+                    # corresponding S commit (already issued by this warp) and
+                    # softmax's t2r, which is the first thing softmax does
+                    # after its S wait -- it depends on no later mma work, no
+                    # correction-warp work, and no pipeline_s_p_o release, so
+                    # there is no cycle; the wait is bounded by one t2r.
+                    # The copy itself only touches SF columns [0, 8) of the
+                    # region and is disjoint from the P columns [64, 128) that
+                    # softmax may still be writing.
                     if const_expr(self.qk_blockscaled):
+                        if const_expr(self.q_stage == 2):
+                            pipeline_sf_overlap.producer_acquire_w_index_phase(
+                                1 - stage, sf_overlap_phase
+                            )
                         cute.copy(
                             sf_copies[stage].tiled_copy_sfq,
                             sf_copies[stage].tCsSFQ_s2t[(None, None, None, None, stage)],
@@ -2903,6 +2940,8 @@ class FlashAttentionForwardSm100:
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
+                if const_expr(self.qk_blockscaled and self.q_stage == 2):
+                    sf_overlap_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
@@ -2968,8 +3007,29 @@ class FlashAttentionForwardSm100:
                             if const_expr(not self.v_dequant):
                                 mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        # S2T re-copy SFK for this Ki (S GEMM overwrote the SF TMEM region)
+                        # S2T re-copy the SFs for this stage:
+                        #   SFK: new scales for each Ki (content changes per tile).
+                        #   SFQ (q_stage == 2 only): the OTHER stage's S GEMM
+                        #     overwrote the SF TMEM region (SFQ/SFK of stage s
+                        #     live in the first 8 columns of S(1-s)), so SFQ
+                        #     must be restored every iteration too. At
+                        #     q_stage == 1 nothing writes the S1 region, so the
+                        #     prologue SFQ copy stays valid.
+                        # The pipeline_sf_overlap acquire orders these copies
+                        # after softmax(1-stage) drained S(1-stage); see the
+                        # prologue comment for the pairing/deadlock argument.
                         if const_expr(self.qk_blockscaled):
+                            if const_expr(self.q_stage == 2):
+                                pipeline_sf_overlap.producer_acquire_w_index_phase(
+                                    1 - stage, sf_overlap_phase
+                                )
+                                cute.copy(
+                                    sf_copies[stage].tiled_copy_sfq,
+                                    sf_copies[stage].tCsSFQ_s2t[
+                                        (None, None, None, None, stage)
+                                    ],
+                                    sf_copies[stage].tCtSFQ_s2t,
+                                )
                             cute.copy(
                                 sf_copies[stage].tiled_copy_sfk,
                                 sf_copies[stage].tCsSFK_s2t[
@@ -3001,6 +3061,8 @@ class FlashAttentionForwardSm100:
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
+                    if const_expr(self.qk_blockscaled and self.q_stage == 2):
+                        sf_overlap_phase ^= 1
                     O_should_accumulate = True
                 # End of seqlen_kv loop
 
@@ -3128,6 +3190,7 @@ class FlashAttentionForwardSm100:
         sBias: Optional[cute.Tensor] = None,
         bias_s2r_tiled_copy: Optional[cute.TiledCopy] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
+        pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3200,6 +3263,15 @@ class FlashAttentionForwardSm100:
         else:
             bias_s2r_thr_copy = None
             tS2RsBias = None
+
+        if const_expr(self.qk_blockscaled and self.q_stage == 2):
+            # W7-2 priming: the mma warp's SF copies into S region 1 pair with
+            # softmax warp group 1's release for the PREVIOUS tile (see the
+            # pairing note in mma()), so group 1 releases once up front.
+            # Region-0 copies pair with the CURRENT tile's release -- no prime
+            # there, or the acquire/release counts would go out of sync.
+            if stage == 1:
+                pipeline_sf_overlap.consumer_release_w_index(stage)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -3338,6 +3410,7 @@ class FlashAttentionForwardSm100:
                 tS2RsBias=tS2RsBias,
                 bias_s2r_thr_copy=bias_s2r_thr_copy,
                 pipeline_bias=pipeline_bias,
+                pipeline_sf_overlap=pipeline_sf_overlap,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -3585,6 +3658,7 @@ class FlashAttentionForwardSm100:
         bias_emu_off: Optional[Boolean] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
         bias_si_consumer_state: Optional[pipeline.PipelineState] = None,
+        pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3615,6 +3689,19 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
+
+        if const_expr(self.qk_blockscaled and self.q_stage == 2):
+            # W7-2: S(stage) is now fully in registers -- release the region so
+            # the mma warp may s2t-copy the other stage's SFQ/SFK into its
+            # first 8 TMEM columns (they alias score columns of S(stage)).
+            # The fence orders the async tcgen05.ld above before the arrive.
+            # Ordering vs pipeline_s_p_o: this release strictly precedes this
+            # step's P-full release below, and depends only on the S-full wait
+            # above, so it cannot introduce a wait cycle with the mma warp.
+            # The mma's subsequent SF copy writes columns [0, 8) only, disjoint
+            # from the P columns [64, 128) this step is about to write.
+            cute.arch.fence_view_async_tmem_load()
+            pipeline_sf_overlap.consumer_release_w_index(stage)
 
         if const_expr(self.has_bias and apply_bias):
             tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))

@@ -275,6 +275,8 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
+    rel_r: Optional[torch.Tensor] = None,
+    rel_proj: Optional[torch.Tensor] = None,
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
@@ -553,8 +555,15 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
-        q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
+        # qk_blockscaled at q_stage=2 needs the W7-2 SF/S TMEM time-multiplex
+        # (pipeline_sf_overlap in flash_fwd_sm100.py): the SFQ/SFK TMEM columns
+        # alias the other stage's S region, which q_stage=2 overwrites every
+        # iteration. The wiring is new, so it is opt-in via FA4_MXFP8_QS2=1
+        # (default keeps the safe q_stage=1) until validated on hardware.
+        if qk_blockscaled and os.environ.get("FA4_MXFP8_QS2", "0") != "1":
+            q_stage = 1
+        else:
+            q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
 
@@ -709,16 +718,40 @@ def _flash_attn_fwd(
 
     # rel_bias -> sheared bias (Inkling relative attention). Produces `bias`, the column-aligned
     # bias the SM100 kernel adds to pre-softmax scores via its dedicated TMA pipeline.
+    # Alternatively, rel_r + rel_proj (fused projection): the shear kernel computes each needed
+    # prebias row in-kernel as rel_r @ rel_proj instead of reading a pre-materialized rel_bias.
     rel_extent = 0
     rel_extent_padded = 0
     bias = None
     tile_bias = tile_m
     cu_total_m_blocks_bias = None
     blocks_to_batch_idx = None
-    if rel_bias is not None:
+    if rel_r is not None or rel_proj is not None:
+        assert rel_r is not None and rel_proj is not None, (
+            "rel_r and rel_proj must be provided together"
+        )
+        assert rel_bias is None, (
+            "provide exactly one of rel_bias or (rel_r, rel_proj)"
+        )
+    fused_rel_proj = rel_r is not None
+    if rel_bias is not None or fused_rel_proj:
         assert arch // 10 in [9, 10, 11], "rel_bias (sheared bias) is only supported on SM9x/10x"
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
-        rel_extent = rel_bias.shape[-1]
+        if fused_rel_proj:
+            rel_r = maybe_contiguous(rel_r)
+            rel_proj = maybe_contiguous(rel_proj)
+            assert rel_r.dtype == rel_proj.dtype
+            rel_rank = rel_proj.shape[-2]
+            assert rel_rank == 16, "fused projection requires rel_rank == 16"
+            rel_extent = rel_proj.shape[-1]
+            assert rel_proj.shape == (num_head, rel_rank, rel_extent)
+            # `rel_in` is the first tensor arg of the shear kernel: the prebias
+            # tensor in non-fused mode, the r tensor in fused mode (same layout
+            # minus the extent axis).
+            rel_in = rel_r
+        else:
+            rel_extent = rel_bias.shape[-1]
+            rel_in = rel_bias
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_m == 128 and tile_n == 128
@@ -728,19 +761,20 @@ def _flash_attn_fwd(
             or (window_size_right is not None and window_size_left + window_size_right + 1 == rel_extent)
         ), "for relative bias, require causal or window length == rel_extent"
         tile_bias = (seqlen_q_packgqa + 7) // 8 * 8 if seqlen_q_packgqa < tile_m else tile_m
+        rel_in_last_dim = rel_rank if fused_rel_proj else rel_extent
         if cu_seqlens_q is None:
             bias_seqlen_q_rounded = _round_up_to_tile(seqlen_q, tile_m)
-            assert rel_bias.shape == (batch_size, seqlen_q, num_head, rel_extent)
+            assert rel_in.shape == (batch_size, seqlen_q, num_head, rel_in_last_dim)
             bias = _shear_bias_empty(
                 (batch_size, bias_seqlen_q_rounded, num_head, rel_extent_padded),
-                rel_bias.dtype, device,
+                rel_in.dtype, device,
             )
         else:
-            assert rel_bias.shape == (total_q, num_head, rel_extent)
+            assert rel_in.shape == (total_q, num_head, rel_in_last_dim)
             bias_total_q_rounded = _round_up_to_tile(total_q, tile_m)
             bias = _shear_bias_empty(
                 (bias_total_q_rounded, num_head, rel_extent_padded),
-                rel_bias.dtype, device,
+                rel_in.dtype, device,
             )
 
         rows_per_cta = 4
@@ -797,11 +831,12 @@ def _flash_attn_fwd(
                     )
 
         shear_compile_key = (
-            rel_bias.dtype, rel_extent, causal,
+            rel_in.dtype, rel_extent, causal,
             window_size_left is not None, window_size_right is not None,
             cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
             pack_gqa, qhead_per_kvhead, rows_per_cta, group_tile_bias, max_m_blocks_leq_one,
             cu_total_m_blocks_bias is not None, blocks_to_batch_idx is not None,
+            fused_rel_proj,
         )
         if shear_compile_key not in _flash_attn_fwd.compile_cache_shear_bias:
             (
@@ -812,24 +847,27 @@ def _flash_attn_fwd(
                 for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
                           cu_total_m_blocks_bias, blocks_to_batch_idx)
             ]
+            rel_proj_tensor = to_cute_tensor(rel_proj) if fused_rel_proj else None
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key] = cute.compile(
                 ShearingBias(
                     rel_extent, is_causal=causal, is_local=local, pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead, rows_per_cta=rows_per_cta,
                     tile_m=group_tile_bias, max_m_blocks_leq_one=max_m_blocks_leq_one,
-                    use_pdl=use_pdl,
+                    use_pdl=use_pdl, fused_proj=fused_rel_proj,
                 ),
-                to_cute_tensor(rel_bias), to_cute_tensor(bias),
+                to_cute_tensor(rel_in), to_cute_tensor(bias),
                 bias_max_seqlen_q, bias_max_seqlen_k,
                 cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor,
                 cu_total_m_blocks_bias_tensor, blocks_to_batch_idx_tensor,
-                window_size_left, window_size_right, current_stream, options="--enable-tvm-ffi",
+                window_size_left, window_size_right, rel_proj_tensor,
+                current_stream, options="--enable-tvm-ffi",
             )
         if not is_fake_mode():
             _flash_attn_fwd.compile_cache_shear_bias[shear_compile_key](
-                rel_bias, bias, bias_max_seqlen_q, bias_max_seqlen_k,
+                rel_in, bias, bias_max_seqlen_q, bias_max_seqlen_k,
                 cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
                 cu_total_m_blocks_bias, blocks_to_batch_idx, window_size_left, window_size_right,
+                rel_proj,
             )
         if os.environ.get("BIAS_PREP_ONLY", "0") == "1":
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
@@ -1413,6 +1451,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         k_descale: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
         rel_bias: Optional[torch.Tensor] = None,
+        rel_r: Optional[torch.Tensor] = None,
+        rel_proj: Optional[torch.Tensor] = None,
         sfq: Optional[torch.Tensor] = None,
         sfk: Optional[torch.Tensor] = None,
         sfv: Optional[torch.Tensor] = None,
@@ -1461,6 +1501,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
+            rel_r=rel_r,
+            rel_proj=rel_proj,
             sfq=sfq,
             sfk=sfk,
             sfv=sfv,
@@ -1576,6 +1618,8 @@ def flash_attn_varlen_func(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
+    rel_r: Optional[torch.Tensor] = None,
+    rel_proj: Optional[torch.Tensor] = None,
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
@@ -1654,6 +1698,8 @@ def flash_attn_varlen_func(
         k_descale,
         v_descale,
         rel_bias,
+        rel_r,
+        rel_proj,
         sfq,
         sfk,
         sfv,

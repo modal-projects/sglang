@@ -393,6 +393,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    @staticmethod
+    def _graph_input_embeds(
+        registry: CudaGraphBufferRegistry, batch_size: int, num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        """Return the stable embedding buffer consumed by prefill graphs.
+
+        Breakable capture calls the inner language-model stack directly.  A
+        multimodal replay builds text+vision embeddings eagerly in the outer
+        model, then refreshes this buffer before replaying the captured stack.
+        Capture must therefore take the ``input_embeds`` branch too; capturing
+        with ``None`` bakes in the text-token embedding lookup and silently
+        ignores the refreshed vision embeddings at replay.
+        """
+        if not registry.has_slot("input_embeds"):
+            return None
+        return registry.get_slot("input_embeds").slice_for(batch_size, num_tokens)
+
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
         if not self.model_runner.pp_group.is_last_rank:
             return None
@@ -763,18 +780,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                # BCG's graph is text-only, so it forces input_embeds=None;
-                # tc_piecewise keeps the slot so multimodal prefill keeps its
-                # image embeds (else NaN logits).
-                input_embeds=(
-                    None
-                    if self.prefill_backend_name == Backend.BREAKABLE
-                    else (
-                        _slot("input_embeds")
-                        if registry.has_slot("input_embeds")
-                        else None
-                    )
-                ),
+                # Capture multimodal models against the stable embedding slot.
+                # Replay refreshes it with the current text+vision embeddings.
+                input_embeds=self._graph_input_embeds(registry, bs, num_tokens),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
@@ -965,13 +973,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
-        # logits).
-        input_embeds = (
-            None
-            if self.prefill_backend_name == Backend.BREAKABLE
-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
+        # Keep the same stable address used at capture.  The eager outer model
+        # composes the live text+vision embeddings into this slot before BCG
+        # replays the inner transformer stack.
+        input_embeds = self._graph_input_embeds(
+            registry, graph_bs, static_num_tokens
         )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")

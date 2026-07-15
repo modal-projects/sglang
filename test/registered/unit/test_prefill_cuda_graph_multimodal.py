@@ -1,50 +1,47 @@
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 
 
+class _Slot:
+    def __init__(self):
+        self.calls = []
+        self.value = object()
+
+    def slice_for(self, batch_size, num_tokens):
+        self.calls.append((batch_size, num_tokens))
+        return self.value
+
+
+class _Registry:
+    def __init__(self, with_input_embeds):
+        self.slot = _Slot() if with_input_embeds else None
+
+    def has_slot(self, name):
+        return name == "input_embeds" and self.slot is not None
+
+    def get_slot(self, name):
+        assert name == "input_embeds"
+        return self.slot
+
+
 class TestPrefillCudaGraphMultimodalEmbeddings(unittest.TestCase):
-    def _runner(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner._is_full_backend = False
-        runner.capture_hidden_mode = object()
-        runner.max_num_tokens = 4096
-        runner.bcg_capture_bs_of = None
-        runner._has_inactive_dp_rank = lambda _forward_batch: False
-        return runner
+    def test_multimodal_capture_uses_stable_input_embeds_slot(self):
+        registry = _Registry(with_input_embeds=True)
 
-    def _batch(self, mm_inputs):
-        mode = SimpleNamespace(is_target_verify=lambda: False)
-        hidden_mode = object()
-        batch = SimpleNamespace(
-            batch_size=1,
-            input_ids=[0] * 128,
-            input_embeds=None,
-            replace_embeds=None,
-            mm_inputs=mm_inputs,
-            forward_mode=mode,
-            capture_hidden_mode=hidden_mode,
-            global_num_tokens_cpu=None,
-            return_logprob=False,
-        )
-        return batch
+        result = PrefillCudaGraphRunner._graph_input_embeds(registry, 4, 1536)
 
-    def test_multimodal_prefill_falls_back_to_eager(self):
-        runner = self._runner()
-        batch = self._batch([object()])
-        batch.capture_hidden_mode = runner.capture_hidden_mode
+        self.assertIs(result, registry.slot.value)
+        self.assertEqual(registry.slot.calls, [(4, 1536)])
 
-        self.assertFalse(runner.can_run_graph(batch))
+    def test_text_only_capture_has_no_input_embeds(self):
+        registry = _Registry(with_input_embeds=False)
 
-    def test_text_only_prefill_remains_graph_eligible(self):
-        runner = self._runner()
-        batch = self._batch([None])
-        batch.capture_hidden_mode = runner.capture_hidden_mode
+        result = PrefillCudaGraphRunner._graph_input_embeds(registry, 1, 128)
 
-        self.assertTrue(runner.can_run_graph(batch))
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

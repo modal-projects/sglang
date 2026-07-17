@@ -1835,9 +1835,50 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale_2[:, 0],
                     layer.w13_weight_scale_2[:, 1],
                 ):
-                    logger.warning_once(
-                        "w1_weight_scale_2 must match w3_weight_scale_2. "
-                        "Accuracy may be affected."
+                    # Checkpoint stores distinct per-tensor fp32 globals for w1
+                    # (gate) and w3 (up), but the fused w13 GEMM uses a single
+                    # global per expert. Fold each half's own global into its
+                    # fp8 block scales against the shared per-expert max, so
+                    # dequantization stays equivalent (up to e4m3 re-rounding).
+                    # Ratios are <= 1, so the rescaled block scales cannot
+                    # overflow e4m3. Mirrors the FP8 MoE requant-to-max above.
+                    gs2 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
+                    g_shared = gs2.max(dim=1).values  # [E]
+                    ratios = gs2 / g_shared.unsqueeze(1)  # [E, 2]
+                    isz = layer.intermediate_size_per_partition
+                    block_scale = layer.w13_weight_scale.data
+                    assert block_scale.dtype == torch.float8_e4m3fn
+                    assert block_scale.shape[1] == 2 * isz
+                    # Map weight_scale_2 columns (always [w1, w3]) to w13 row
+                    # halves: the loader puts w1 in the first isz rows unless
+                    # load_up_proj_weight_first flips the halves. The trtllm
+                    # w1<->w3 shard remap swaps rows and columns together, so
+                    # the identity mapping still holds there.
+                    half_ratios = (
+                        ratios.flip(1) if self.load_up_proj_weight_first else ratios
+                    )
+                    rescaled = block_scale.to(torch.float32)
+                    rescaled[:, :isz, :] *= half_ratios[:, 0].view(-1, 1, 1)
+                    rescaled[:, isz:, :] *= half_ratios[:, 1].view(-1, 1, 1)
+                    rescaled = rescaled.to(block_scale.dtype)
+                    flushed_to_zero = int(
+                        (
+                            (block_scale.to(torch.float32) != 0)
+                            & (rescaled.to(torch.float32) == 0)
+                        )
+                        .sum()
+                        .item()
+                    )
+                    num_experts_affected = int((gs2[:, 0] != gs2[:, 1]).sum().item())
+                    block_scale.copy_(rescaled)
+                    layer.w13_weight_scale_2.data.copy_(
+                        g_shared.unsqueeze(1).expand_as(layer.w13_weight_scale_2)
+                    )
+                    logger.info_once(
+                        "w1_weight_scale_2 != w3_weight_scale_2; requantized w13 "
+                        "block scales onto shared per-expert max global "
+                        f"({num_experts_affected}/{gs2.shape[0]} experts affected, "
+                        f"{flushed_to_zero} nonzero block scales flushed to zero)."
                     )
 
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]

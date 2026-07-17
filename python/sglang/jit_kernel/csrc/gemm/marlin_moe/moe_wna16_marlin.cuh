@@ -482,6 +482,7 @@ exec_config_t determine_exec_config(
     bool is_k_full,
     bool has_zp,
     bool is_zp_float,
+    int global_scale_stride,
     int max_shared_mem) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
@@ -492,6 +493,13 @@ exec_config_t determine_exec_config(
   constexpr int device_max_reg_size = 255 * 1024;
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
+
+    // A two-column NVFP4 scale changes at the gate/up boundary. Keep each
+    // output tile wholly within one half so the kernel can select one scalar
+    // for the tile without adding per-element scale loads.
+    if (global_scale_stride == 2 && (prob_n / 2) % th_config.thread_n != 0) {
+      continue;
+    }
 
     if (!is_valid_config(
             th_config,
@@ -571,6 +579,7 @@ void marlin_mm(
     void* b_bias,
     void* s,
     void* s2,
+    int global_scale_stride,
     void* zp,
     void* g_idx,
     void* perm,
@@ -715,6 +724,7 @@ void marlin_mm(
         is_k_full,
         has_zp,
         is_zp_float,
+        global_scale_stride,
         max_shared_mem);
     thread_tfg = exec_cfg.tb_cfg;
   }
@@ -722,6 +732,14 @@ void marlin_mm(
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
+  if (global_scale_stride == 2 && thread_n > 0) {
+    host::RuntimeCheck(
+        (prob_n / 2) % thread_n == 0,
+        "gate/up global-scale boundary at N/2 = ",
+        prob_n / 2,
+        " is not aligned to Marlin thread_n = ",
+        thread_n);
+  }
   int blocks = sms * exec_cfg.blocks_per_sm;
   if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
@@ -812,7 +830,8 @@ void marlin_mm(
   host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem));
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr,
+      global_scale_stride, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
@@ -967,8 +986,39 @@ void moe_wna16_marlin_gemm(
 
   // Verify global_scale (Optional unwrap done in Python)
   int64_t global_scale_size = global_scale.size(0);
+  int global_scale_stride = 0;
   if (global_scale_size > 0) {
     RuntimeCheck(b_q_type == kFE2M1f && group_size == 16, "global_scale can only be used for nvfp4 format.");
+    RuntimeCheck(
+        global_scale.dim() == 1 || global_scale.dim() == 2,
+        "global_scale must have rank 1 or 2, got rank ",
+        global_scale.dim());
+    device.verify(global_scale.device());
+    RuntimeCheck(global_scale.is_contiguous(), "global_scale is not contiguous");
+    RuntimeCheck(
+        global_scale.size(0) == b_q_weight.size(0),
+        "global_scale.size(0) = ",
+        global_scale.size(0),
+        " is not num_experts = ",
+        b_q_weight.size(0));
+    if (global_scale.dim() == 1) {
+      TensorMatcher({-1}).with_dtype<scalar_t>().with_device(device).verify(global_scale);
+      global_scale_stride = 1;
+    } else {
+      TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(global_scale);
+      RuntimeCheck(
+          global_scale.size(1) == 1 || global_scale.size(1) == 2,
+          "global_scale.size(1) must be 1 (shared) or 2 (gate/up), got ",
+          global_scale.size(1));
+      global_scale_stride = static_cast<int>(global_scale.size(1));
+    }
+    RuntimeCheck(
+        global_scale_stride != 2 || !mul_topk_weights,
+        "two-column global_scale is supported only for the gated W13 GEMM; W2 must use one scale per expert.");
+    RuntimeCheck(
+        global_scale_stride != 2 || size_n % 2 == 0,
+        "two-column global_scale requires an even output size, got size_n = ",
+        size_n);
   } else {
     RuntimeCheck(
         !(b_q_type == kFE2M1f && group_size == 16), "the global_scale parameter must be passed for nvfp4 format.");
@@ -1065,6 +1115,7 @@ void moe_wna16_marlin_gemm(
       b_bias.data_ptr(),
       b_scales.data_ptr(),
       global_scale.data_ptr(),
+      global_scale_stride,
       b_zeros.data_ptr(),
       g_idx.data_ptr(),
       perm.data_ptr(),

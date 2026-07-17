@@ -7,9 +7,8 @@ _compute_g1_scale_c. Both are plain tensor ops, so they run on CPU.
 
 The full TRT-LLM path only runs on Blackwell, and most checkpoints ship
 near-equal gate/up scales, so this regression wouldn't surface in an accuracy
-eval -- hence the direct contract tests. The wiring around the helpers (Marlin's
-single-scale collapse, the w1/w3 mismatch warning, and registering g1_alphas /
-g1_alphas_up in process_weights_after_loading) needs the GPU kernels and is
+eval -- hence the direct contract tests. Marlin's accepted global-scale layouts
+and shape-preserving scale transform are also pinned here; kernel application is
 covered on-device.
 
 Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
@@ -21,6 +20,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -29,7 +30,16 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
-from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptNvFp4FusedMoEMethod,
+    _compute_gemm1_alphas,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    nvfp4_marlin_process_global_scale,
+    validate_moe_nvfp4_global_scale_layout,
+)
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
 
 # isort: on
@@ -223,6 +233,166 @@ class TestGemm1Alphas(CustomTestCase):
 
                 self.assertEqual(g1_alphas.dtype, torch.float32)
                 self.assertEqual(g1_alphas_up.dtype, torch.float32)
+
+
+class TestMarlinGlobalScaleLayouts(CustomTestCase):
+    def test_gated_w13_accepts_shared_and_split_forms(self):
+        num_experts = 8
+        forms = [
+            (torch.ones(num_experts), 1),
+            (torch.ones(num_experts, 1), 1),
+            (torch.ones(num_experts, 2), 2),
+        ]
+        for scale, expected_stride in forms:
+            with self.subTest(shape=tuple(scale.shape)):
+                stride = validate_moe_nvfp4_global_scale_layout(
+                    scale,
+                    num_experts,
+                    allow_gate_up=True,
+                    name="w13_weight_scale_2",
+                )
+                self.assertEqual(stride, expected_stride)
+
+    def test_w2_and_non_gated_w13_reject_split_scale(self):
+        scale = torch.ones(8, 2)
+        for name in ("w2_weight_scale_2", "non_gated_w13_weight_scale_2"):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "columns in"),
+            ):
+                validate_moe_nvfp4_global_scale_layout(
+                    scale,
+                    8,
+                    allow_gate_up=False,
+                    name=name,
+                )
+
+    def test_rejects_wrong_expert_count_and_noncontiguous_layout(self):
+        with self.assertRaisesRegex(ValueError, "4 experts"):
+            validate_moe_nvfp4_global_scale_layout(
+                torch.ones(3, 2),
+                4,
+                allow_gate_up=True,
+                name="w13_weight_scale_2",
+            )
+
+        noncontiguous = torch.ones(2, 8).T
+        self.assertFalse(noncontiguous.is_contiguous())
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            validate_moe_nvfp4_global_scale_layout(
+                noncontiguous,
+                8,
+                allow_gate_up=True,
+                name="w13_weight_scale_2",
+            )
+
+    def test_marlin_transform_preserves_distinct_gate_up_columns(self):
+        raw = torch.tensor([[1.0, 3.0], [2.0, 5.0]], dtype=torch.float16)
+        processed = nvfp4_marlin_process_global_scale(raw)
+
+        self.assertEqual(processed.shape, raw.shape)
+        torch.testing.assert_close(processed, raw * 128.0)
+        self.assertFalse(torch.equal(processed[:, 0], processed[:, 1]))
+
+
+class TestW4A16MarlinWeights(CustomTestCase):
+    @staticmethod
+    def _layer() -> torch.nn.Module:
+        layer = torch.nn.Module()
+        layer.num_local_experts = 2
+        layer.num_experts = 2
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        return layer
+
+    @staticmethod
+    def _config() -> ModelOptFp4Config:
+        return ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=[],
+            is_checkpoint_w4a16_nvfp4=True,
+        )
+
+    def test_explicit_marlin_registers_no_missing_input_scales(self):
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.swizzle_blockscale",
+                side_effect=lambda scale: scale,
+            ),
+        ):
+            method = ModelOptNvFp4FusedMoEMethod(self._config())
+            layer = self._layer()
+            method.create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=128,
+                intermediate_size_per_partition=128,
+                params_dtype=torch.bfloat16,
+            )
+
+        self.assertFalse(hasattr(layer, "w13_input_scale"))
+        self.assertFalse(hasattr(layer, "w2_input_scale"))
+        self.assertEqual(layer.w13_weight_scale_2.shape, (2, 2))
+        self.assertEqual(layer.w2_weight_scale_2.shape, (2,))
+
+    def test_process_weights_preserves_split_gate_up_scale(self):
+        split_scale = torch.nn.Parameter(
+            torch.tensor([[1.0, 3.0], [2.0, 5.0]]), requires_grad=False
+        )
+        layer = self._layer()
+        layer.w13_weight_scale_2 = split_scale
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.prepare_moe_nvfp4_layer_for_marlin"
+            ) as prepare,
+        ):
+            method = ModelOptNvFp4FusedMoEMethod(self._config())
+            method.process_weights_after_loading(layer)
+
+        prepare.assert_called_once_with(layer)
+        self.assertIs(layer.w13_weight_scale_2, split_scale)
+        torch.testing.assert_close(
+            layer.w13_weight_scale_2,
+            torch.tensor([[1.0, 3.0], [2.0, 5.0]]),
+        )
+
+    def test_auto_backend_remains_unsupported_for_weight_only_metadata(self):
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                return_value=True,
+            ),
+        ):
+            method = ModelOptNvFp4FusedMoEMethod(self._config())
+            with self.assertRaisesRegex(ValueError, "--moe-runner-backend marlin"):
+                method.create_weights(
+                    layer=self._layer(),
+                    num_experts=2,
+                    hidden_size=128,
+                    intermediate_size_per_partition=128,
+                    params_dtype=torch.bfloat16,
+                )
 
 
 class TestG1ScaleC(CustomTestCase):

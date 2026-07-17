@@ -1191,9 +1191,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
+        is_checkpoint_w4a16_nvfp4: bool = False,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
+        self.is_checkpoint_w4a16_nvfp4 = is_checkpoint_w4a16_nvfp4
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
                 "Detected nvfp4 checkpoint. Please note that the "
@@ -1320,13 +1322,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        quant_method = str(quant_method).upper()
+        if quant_method not in ["FP8", "NVFP4", "W4A16_NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4, W4A16_NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
+        is_checkpoint_w4a16_nvfp4 = quant_method == "W4A16_NVFP4"
 
         if group_size is None or exclude_modules is None:
             logger.warning(
@@ -1339,11 +1343,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "specified in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo,
-            group_size,
-            exclude_modules,
-            config.get("packed_modules_mapping"),
+            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+            is_checkpoint_w4a16_nvfp4=is_checkpoint_w4a16_nvfp4,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1847,6 +1852,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "flashinfer_trtllm_routed."
                 )
 
+        is_w4a16_nvfp4 = getattr(
+            self.quant_config, "is_checkpoint_w4a16_nvfp4", False
+        )
+        if is_w4a16_nvfp4:
+            moe_runner_backend = get_moe_runner_backend()
+            if not moe_runner_backend.is_marlin():
+                raise ValueError(
+                    "W4A16_NVFP4 fused MoE requires the weight-only Marlin path. "
+                    "Set --moe-runner-backend marlin explicitly; automatic "
+                    "backend selection is unchanged."
+                )
+
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -1976,57 +1993,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        w13_input_scale_shape = (layer.num_experts, num_shards)
-        w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        w13_input_scale._sglang_require_global_experts = True
-        layer.register_parameter("w13_input_scale", w13_input_scale)
+        # W4A16_NVFP4 is weight-only and deliberately exports no input_scale
+        # tensors. The explicit Marlin path consumes BF16/FP16 activations
+        # directly; activation-quantizing backends are rejected above.
+        if not is_w4a16_nvfp4:
+            w13_input_scale_shape = (layer.num_experts, num_shards)
+            w13_input_scale = PerTensorScaleParameter(
+                data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            w13_input_scale._sglang_require_global_experts = True
+            layer.register_parameter("w13_input_scale", w13_input_scale)
 
-        w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        w2_input_scale._sglang_require_global_experts = True
-        layer.register_parameter("w2_input_scale", w2_input_scale)
+            w2_input_scale = PerTensorScaleParameter(
+                data=torch.empty(layer.num_experts, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            w2_input_scale._sglang_require_global_experts = True
+            layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # GEMM1 scale processing is deferred until the input scale is known;
-        # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
+        # GEMM1 scale processing is deferred until the input scale is known for
+        # activation-quantizing backends. Marlin consumes weight-only global
+        # scales directly, including separate gate/up scales for gated W13.
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
         if moe_runner_backend.is_marlin():
-            # Marlin supports only a single shared w1/w3 weight scale, so collapse
-            # the gate/up columns to the gate scale here. Other backends keep the
-            # raw scale and split the halves later (see _compute_gemm1_alphas).
-            if layer.moe_runner_config.is_gated:
-                if layer.w13_weight_scale_2.dim() == 1:
-                    # Some checkpoints store a shared scale for w1/w3.
-                    w13_weight_scale_2 = layer.w13_weight_scale_2
-                else:
-                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                        layer.w13_weight_scale_2[:, 0],
-                        layer.w13_weight_scale_2[:, 1],
-                    ):
-                        logger.warning_once(
-                            "w1_weight_scale_2 must match w3_weight_scale_2. "
-                            "Accuracy may be affected."
-                        )
-
-                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
-            else:
-                w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-            copy_or_rebind_param(
-                layer,
-                "w13_weight_scale_2",
-                w13_weight_scale_2.contiguous(),
-            )
             prepare_moe_nvfp4_layer_for_marlin(layer)
             return
 

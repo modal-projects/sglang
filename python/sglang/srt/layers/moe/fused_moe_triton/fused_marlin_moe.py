@@ -168,6 +168,39 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
+    if is_nvfp4_marlin:
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            validate_moe_nvfp4_global_scale_layout,
+        )
+
+        assert w1_global_scale is not None
+        assert w2_global_scale is not None
+        validate_moe_nvfp4_global_scale_layout(
+            w1_global_scale,
+            E,
+            allow_gate_up=is_gated,
+            name="w1_global_scale",
+        )
+        validate_moe_nvfp4_global_scale_layout(
+            w2_global_scale,
+            E,
+            allow_gate_up=False,
+            name="w2_global_scale",
+        )
+        for name, scale in (
+            ("w1_global_scale", w1_global_scale),
+            ("w2_global_scale", w2_global_scale),
+        ):
+            if scale.dtype != hidden_states.dtype:
+                raise ValueError(
+                    f"{name}.dtype must match hidden_states.dtype "
+                    f"({hidden_states.dtype}), got {scale.dtype}."
+                )
+            if scale.device != hidden_states.device:
+                raise ValueError(
+                    f"{name}.device must match hidden_states.device "
+                    f"({hidden_states.device}), got {scale.device}."
+                )
 
     # M block size selection logic
     # TODO: tune this further for specific models

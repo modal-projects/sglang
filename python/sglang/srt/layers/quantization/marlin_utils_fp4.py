@@ -57,6 +57,43 @@ def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tenso
     return global_scale
 
 
+def validate_moe_nvfp4_global_scale_layout(
+    global_scale: torch.Tensor,
+    num_experts: int,
+    *,
+    allow_gate_up: bool,
+    name: str,
+) -> int:
+    """Validate a Marlin NVFP4 per-expert global-scale tensor.
+
+    A projection normally has one scale per expert, represented by ``[E]`` or
+    ``[E, 1]``. Gated W13 may additionally use ``[E, 2]`` in gate/up order.
+    Return the contiguous per-expert stride consumed by the CUDA kernel.
+    """
+    expected_columns = "{1, 2}" if allow_gate_up else "{1}"
+    if global_scale.dim() == 1:
+        valid = global_scale.shape == (num_experts,)
+        stride = 1
+    elif global_scale.dim() == 2:
+        valid = global_scale.shape[0] == num_experts and (
+            global_scale.shape[1] == 1 or (allow_gate_up and global_scale.shape[1] == 2)
+        )
+        stride = global_scale.shape[1]
+    else:
+        valid = False
+        stride = 0
+
+    if not valid:
+        raise ValueError(
+            f"{name} must have shape [num_experts] or "
+            f"[num_experts, columns] with columns in {expected_columns}; "
+            f"got shape {tuple(global_scale.shape)} for {num_experts} experts."
+        )
+    if not global_scale.is_contiguous():
+        raise ValueError(f"{name} must be contiguous.")
+    return stride
+
+
 def fake_apply_fp4_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -416,7 +453,20 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     w2_bias = getattr(layer, "w2_bias", None)
 
     num_experts = w13.shape[0]
-    num_shards = 2 if layer.moe_runner_config.is_gated else 1
+    is_gated = layer.moe_runner_config.is_gated
+    num_shards = 2 if is_gated else 1
+    validate_moe_nvfp4_global_scale_layout(
+        w13_global_scale,
+        num_experts,
+        allow_gate_up=is_gated,
+        name="w13_weight_scale_2",
+    )
+    validate_moe_nvfp4_global_scale_layout(
+        w2_global_scale,
+        num_experts,
+        allow_gate_up=False,
+        name="w2_weight_scale_2",
+    )
     intermediate_size = layer.intermediate_size_per_partition
     hidden_size = w13.shape[2] * 2
     param_dtype = layer.params_dtype

@@ -577,6 +577,10 @@ class TestParseQuantHfConfig(CustomTestCase):
         ({"quant_method": "modelopt", "quant_algo": "FP8"}, "modelopt_fp8"),
         ({"quant_method": "modelopt", "quant_algo": "FP4"}, "modelopt_fp4"),
         ({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "modelopt_fp4"),
+        (
+            {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4"},
+            "modelopt_fp4",
+        ),
         ({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}, "w4afp8"),
         ({"quant_algo": "FP8"}, "modelopt_fp8"),
         ({"quant_algo": "FP4"}, "modelopt_fp4"),
@@ -623,6 +627,42 @@ class TestParseQuantHfConfig(CustomTestCase):
         result = self.model_config._parse_quant_hf_config()
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
+
+    def test_w4a16_nvfp4_flat_and_nested_configs(self):
+        flat = {
+            "quant_method": "modelopt",
+            "quant_algo": "W4A16_NVFP4",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 4,
+                        "group_size": 16,
+                    },
+                    "input_activations": None,
+                }
+            },
+            "ignore": ["*self_attn*", "*shared_experts*"],
+        }
+        nested = {
+            "quantization": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16,
+                "exclude_modules": ["*self_attn*", "*shared_experts*"],
+            }
+        }
+
+        for config in (flat, nested):
+            with self.subTest(format="flat" if config is flat else "nested"):
+                parsed = ModelOptFp4Config.from_config(config)
+                self.assertTrue(parsed.is_checkpoint_nvfp4_serialized)
+                self.assertTrue(parsed.is_checkpoint_w4a16_nvfp4)
+                self.assertEqual(parsed.group_size, 16)
+
+        self.assertEqual(
+            ModelOptFp4Config.override_quantization_method(flat, "modelopt"),
+            "modelopt_fp4",
+        )
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):

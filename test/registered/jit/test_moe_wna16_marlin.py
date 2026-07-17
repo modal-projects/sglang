@@ -12,7 +12,6 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -31,6 +30,10 @@ def _has_aot_moe_wna16_marlin_gemm() -> bool:
 
 
 AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
+
+
+def _nvfp4_marlin_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -350,8 +353,8 @@ def test_moe_wna16_marlin_gemm(
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported()),
-    reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
+    not _nvfp4_marlin_supported(),
+    reason="NVFP4 Marlin tests require CUDA SM80+",
 )
 def test_fused_marlin_moe_non_gated_relu2():
     torch.manual_seed(0)
@@ -413,8 +416,8 @@ def test_fused_marlin_moe_non_gated_relu2():
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported()),
-    reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
+    not _nvfp4_marlin_supported(),
+    reason="NVFP4 Marlin tests require CUDA SM80+",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     torch.manual_seed(0)
@@ -509,8 +512,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported()),
-    reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
+    not _nvfp4_marlin_supported(),
+    reason="NVFP4 Marlin tests require CUDA SM80+",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.manual_seed(0)
@@ -606,6 +609,119 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
+
+
+@pytest.mark.skipif(
+    not _nvfp4_marlin_supported(),
+    reason="NVFP4 Marlin tests require CUDA SM80+",
+)
+def test_fused_marlin_moe_nvfp4_gated_silu_split_global_scales():
+    """Gated W13 must apply its own outer scale to each output half."""
+    torch.manual_seed(0)
+
+    m = 17
+    intermediate_size = 256
+    hidden_size = 256
+    e = 4
+    topk = 2
+    dtype = torch.bfloat16
+    group_size = 16
+
+    w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
+    w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
+    for expert_idx in range(e):
+        gate_packed, gate_scales, gate_gscale, gate_ref = make_nvfp4_weight_and_ref(
+            intermediate_size, hidden_size, dtype, group_size=group_size
+        )
+        up_packed, up_scales, up_gscale, up_ref = make_nvfp4_weight_and_ref(
+            intermediate_size, hidden_size, dtype, group_size=group_size
+        )
+
+        # Make the columns deliberately and deterministically different. The
+        # old gate-column collapse mis-scales every up projection by this ratio.
+        up_multiplier = float(expert_idx + 2)
+        up_gscale = up_gscale * up_multiplier
+        up_ref = up_ref * up_multiplier
+
+        w13_packed_l.append(torch.cat([gate_packed, up_packed], dim=0))
+        w13_scales_l.append(torch.cat([gate_scales, up_scales], dim=0))
+        w13_gscale_l.append(torch.stack([gate_gscale, up_gscale]))
+        w13_ref_l.append(torch.cat([gate_ref, up_ref], dim=0))
+
+        packed, scales, gscale, ref = make_nvfp4_weight_and_ref(
+            hidden_size, intermediate_size, dtype, group_size=group_size
+        )
+        w2_packed_l.append(packed)
+        w2_scales_l.append(scales)
+        w2_gscale_l.append(gscale)
+        w2_ref_l.append(ref)
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=group_size)
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = intermediate_size
+    layer.w13_weight = torch.nn.Parameter(
+        torch.stack(w13_packed_l), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(torch.stack(w2_packed_l), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.stack(w13_scales_l), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.stack(w2_scales_l), requires_grad=False
+    )
+    layer.w13_weight_scale_2 = torch.nn.Parameter(
+        torch.stack(w13_gscale_l), requires_grad=False
+    )
+    layer.w2_weight_scale_2 = torch.nn.Parameter(
+        torch.stack(w2_gscale_l), requires_grad=False
+    )
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+
+    assert layer.w13_weight_scale_2.shape == (e, 2)
+    assert not torch.equal(
+        layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+    )
+
+    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 40
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(score_softmax, topk)
+
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        w1_global_scale=layer.w13_weight_scale_2,
+        w2_global_scale=layer.w2_weight_scale_2,
+        workspace=layer.workspace,
+        num_bits=4,
+        is_k_full=True,
+        routed_scaling_factor=1.0,
+        activation="silu",
+        is_gated=True,
+    )
+
+    w13_ref = torch.stack(w13_ref_l)
+    w2_ref = torch.stack(w2_ref_l)
+    output_ref = torch.zeros_like(hidden_states)
+    for token_idx in range(m):
+        for route_idx in range(topk):
+            expert_id = topk_ids[token_idx, route_idx]
+            gate_up = hidden_states[token_idx] @ w13_ref[expert_id].T
+            gate, up = gate_up.chunk(2)
+            intermediate = torch.nn.functional.silu(gate) * up
+            routed = intermediate @ w2_ref[expert_id].T
+            output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref, rtol=0.08, atol=0.25)
 
 
 if __name__ == "__main__":

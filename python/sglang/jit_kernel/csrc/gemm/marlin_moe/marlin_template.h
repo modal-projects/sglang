@@ -304,6 +304,8 @@ __global__ void Marlin(
                                                              // (k/groupsize)xn
     const uint16_t* __restrict__ scale2_ptr,                 // fp16 global scale (for nvfp4
                                                              // only)
+    int global_scale_stride,                                 // one shared scale, or gate/up scales
+                                                             // per expert
     const int4* __restrict__ zp_ptr,                         // 4bit packed zero-points of shape
                                                              // (k/groupsize)x(n/pack_factor)
     const int* __restrict__ g_idx,                           // int32 group indices of shape k
@@ -363,6 +365,7 @@ __global__ void Marlin(
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 
   scalar_t2 global_scale;
+  scalar_t2 global_scale_up;
 
   constexpr bool has_act_order = group_blocks == 0;
 
@@ -532,8 +535,14 @@ __global__ void Marlin(
     }
 
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-      uint16_t val = scale2_ptr[expert_id];
-      global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
+      uint16_t gate_val = scale2_ptr[expert_id * global_scale_stride];
+      global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&gate_val));
+      if (global_scale_stride == 2) {
+        uint16_t up_val = scale2_ptr[expert_id * global_scale_stride + 1];
+        global_scale_up = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&up_val));
+      } else {
+        global_scale_up = global_scale;
+      }
     }
 
     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
@@ -1536,7 +1545,9 @@ __global__ void Marlin(
 
       if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
         if (!mul_topk_weights) {
-          res = __hmul2(res, global_scale);
+          scalar_t2 output_global_scale =
+              global_scale_stride == 2 && slice_col >= n_tiles / 2 ? global_scale_up : global_scale;
+          res = __hmul2(res, output_global_scale);
         }
       }
       if (has_bias && last) {

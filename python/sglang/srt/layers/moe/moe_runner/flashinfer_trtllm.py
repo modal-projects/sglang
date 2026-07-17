@@ -937,6 +937,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.runtime_context import get_server_args
 
     _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
@@ -1069,6 +1070,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
+            enable_pdl=not get_server_args().disable_trtllm_moe_pdl,
         )[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1112,6 +1114,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            enable_pdl=not get_server_args().disable_trtllm_moe_pdl,
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output

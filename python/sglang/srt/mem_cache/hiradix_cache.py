@@ -771,10 +771,12 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # NOTE: Every rank must reach the all_reduce below unconditionally.
+        # ongoing_write_through and ack_write_queue progress can diverge across
+        # ranks (e.g. write_backup returning 0 on a subset of ranks under host
+        # memory pressure, or per-rank DMA event timing), so an early return
+        # here desyncs the NCCL op sequence and hangs the whole TP group.
+        # See sgl-project/sglang#26923.
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
             if not finish_event.query():

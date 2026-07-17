@@ -1352,6 +1352,21 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if self.is_checkpoint_w4a16_nvfp4:
+            from sglang.srt.layers.linear import LinearBase
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+            if isinstance(layer, (LinearBase, ParallelLMHead)) and not (
+                is_layer_skipped(
+                    prefix, self.exclude_modules, self.packed_modules_mapping
+                )
+                or self.is_layer_excluded(prefix)
+            ):
+                raise ValueError(
+                    "W4A16_NVFP4 standalone Linear layers are not supported by "
+                    "this branch. The checkpoint must quantize only routed FusedMoE "
+                    f"experts; unexpected quantized layer: {prefix}"
+                )
         return self._get_quant_method(
             layer,
             prefix,

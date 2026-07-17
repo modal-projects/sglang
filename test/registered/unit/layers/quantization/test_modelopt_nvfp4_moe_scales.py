@@ -321,7 +321,9 @@ class TestW4A16MarlinWeights(CustomTestCase):
             ),
             patch(
                 "sglang.srt.layers.quantization.modelopt_quant.swizzle_blockscale",
-                side_effect=lambda scale: scale,
+                side_effect=lambda scale: torch.empty(
+                    tuple(scale.shape), dtype=scale.dtype
+                ),
             ),
         ):
             method = ModelOptNvFp4FusedMoEMethod(self._config())

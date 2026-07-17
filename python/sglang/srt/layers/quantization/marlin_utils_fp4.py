@@ -455,7 +455,7 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     num_experts = w13.shape[0]
     is_gated = layer.moe_runner_config.is_gated
     num_shards = 2 if is_gated else 1
-    validate_moe_nvfp4_global_scale_layout(
+    w13_global_scale_stride = validate_moe_nvfp4_global_scale_layout(
         w13_global_scale,
         num_experts,
         allow_gate_up=is_gated,
@@ -472,6 +472,17 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     param_dtype = layer.params_dtype
     if param_dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("NVFP4 Marlin MoE requires FP16 or BF16 activations.")
+    if getattr(layer.quant_config, "is_checkpoint_w4a16_nvfp4", False) and (
+        w13_bias is not None or w2_bias is not None
+    ):
+        raise ValueError(
+            "W4A16_NVFP4 Marlin MoE currently supports only bias-free experts."
+        )
+    if is_gated and w13_global_scale_stride == 2 and intermediate_size % 128 != 0:
+        raise ValueError(
+            "Split gate/up NVFP4 global scales require each gated output half "
+            f"to be divisible by 128; got intermediate_size={intermediate_size}."
+        )
 
     device = w13.device
     layer.workspace = marlin_make_workspace(device, 4)

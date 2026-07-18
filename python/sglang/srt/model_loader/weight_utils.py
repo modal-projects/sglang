@@ -901,6 +901,24 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+_PRE_FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _maybe_view_fp4_as_packed_uint8(tensor: torch.Tensor) -> torch.Tensor:
+    """Restore the packed-uint8 convention for F4-serialized NVFP4 checkpoints.
+
+    Checkpoints exported with the F4 safetensors dtype (e.g. Kimi-family NVFP4
+    re-quants) deserialize as torch.float4_e2m1fn_x2 on current torch/safetensors,
+    but every quant method here expects packed uint8 (shape [..., in/2]), and
+    torch has no copy_ for the fp4 dtype — the load dies at
+    expert_data.copy_(loaded_weight). Pre-fp4-dtype stacks read the same bytes as
+    uint8; viewing keeps that convention (same shape, same bytes).
+    """
+    if _PRE_FP4_DTYPE is not None and tensor.dtype == _PRE_FP4_DTYPE:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -929,11 +947,11 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
-                    yield name, result[name]
+                    yield name, _maybe_view_fp4_as_packed_uint8(result[name])
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    yield name, _maybe_view_fp4_as_packed_uint8(f.get_tensor(name))
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
 
@@ -1035,7 +1053,7 @@ def multi_thread_safetensors_weights_iterator(
         for future in futures_iter:
             st_file, state_dict = future.result()
             for name, param in state_dict.items():
-                yield name, param
+                yield name, _maybe_view_fp4_as_packed_uint8(param)
             del state_dict
             if drop_cache_after_load:
                 _drop_file_cache_after_load(st_file)

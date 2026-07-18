@@ -1820,67 +1820,67 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process FP4 MoE weights after loading from serialized checkpoint.
+    def _fold_w13_global_scales(
+        self, layer: torch.nn.Module, experts: slice
+    ) -> tuple:
+        """Fold each w13 half's own per-tensor fp32 global into its fp8 block
+        scales against the shared per-expert max global, for the experts
+        selected by ``experts`` (a basic slice, so the writes land in the
+        parameters' own storage). Returns (num_experts_affected,
+        flushed_to_zero) for the caller's logging.
 
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        The checkpoint stores distinct per-tensor fp32 globals for w1 (gate)
+        and w3 (up), but the fused w13 GEMM uses a single global per expert,
+        so dequantization stays equivalent (up to e4m3 re-rounding). Ratios
+        are <= 1, so the rescaled block scales cannot overflow e4m3. Mirrors
+        the FP8 MoE requant-to-max. Shared by the full post-loading pass (all
+        experts) and the partial pass (per touched expert; the math is
+        per-expert-local, so a single-expert slice folds identically to the
+        whole-layer pass).
         """
-        # GEMM 1 scale processing
+        gs2 = layer.w13_weight_scale_2.data[experts].to(torch.float32)  # [E, 2]
+        g_shared = gs2.max(dim=1).values  # [E]
+        ratios = gs2 / g_shared.unsqueeze(1)  # [E, 2]
+        isz = layer.intermediate_size_per_partition
+        block_scale = layer.w13_weight_scale.data[experts]
+        assert block_scale.dtype == torch.float8_e4m3fn
+        assert block_scale.shape[1] == 2 * isz
+        # Map weight_scale_2 columns (always [w1, w3]) to w13 row
+        # halves: the loader puts w1 in the first isz rows unless
+        # load_up_proj_weight_first flips the halves. The trtllm
+        # w1<->w3 shard remap swaps rows and columns together, so
+        # the identity mapping still holds there.
+        half_ratios = ratios.flip(1) if self.load_up_proj_weight_first else ratios
+        rescaled = block_scale.to(torch.float32)
+        rescaled[:, :isz, :] *= half_ratios[:, 0].view(-1, 1, 1)
+        rescaled[:, isz:, :] *= half_ratios[:, 1].view(-1, 1, 1)
+        rescaled = rescaled.to(block_scale.dtype)
+        flushed_to_zero = int(
+            (
+                (block_scale.to(torch.float32) != 0)
+                & (rescaled.to(torch.float32) == 0)
+            )
+            .sum()
+            .item()
+        )
+        num_experts_affected = int((gs2[:, 0] != gs2[:, 1]).sum().item())
+        block_scale.copy_(rescaled)
+        layer.w13_weight_scale_2.data[experts] = g_shared.unsqueeze(1).expand_as(gs2)
+        return num_experts_affected, flushed_to_zero
+
+    def _derive_scalar_params(self, layer: torch.nn.Module) -> None:
+        """Derive the per-layer scalar quant params (input-scale quants,
+        GEMM1/2 alphas, dispatcher config) from their never-transformed
+        per-tensor sources — shared by the full and the partial post-loading
+        passes, and always refreshed wholesale (they are cheap). Runs after
+        any w13 global-scale fold, so w13_weight_scale_2[:, 0] is the shared
+        per-expert global."""
+        # GEMM 1 global scale
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
                 # Some checkpoints store a shared scale for w1/w3.
                 w13_weight_scale_2 = layer.w13_weight_scale_2
             else:
-                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                    layer.w13_weight_scale_2[:, 0],
-                    layer.w13_weight_scale_2[:, 1],
-                ):
-                    # Checkpoint stores distinct per-tensor fp32 globals for w1
-                    # (gate) and w3 (up), but the fused w13 GEMM uses a single
-                    # global per expert. Fold each half's own global into its
-                    # fp8 block scales against the shared per-expert max, so
-                    # dequantization stays equivalent (up to e4m3 re-rounding).
-                    # Ratios are <= 1, so the rescaled block scales cannot
-                    # overflow e4m3. Mirrors the FP8 MoE requant-to-max above.
-                    gs2 = layer.w13_weight_scale_2.data.to(torch.float32)  # [E, 2]
-                    g_shared = gs2.max(dim=1).values  # [E]
-                    ratios = gs2 / g_shared.unsqueeze(1)  # [E, 2]
-                    isz = layer.intermediate_size_per_partition
-                    block_scale = layer.w13_weight_scale.data
-                    assert block_scale.dtype == torch.float8_e4m3fn
-                    assert block_scale.shape[1] == 2 * isz
-                    # Map weight_scale_2 columns (always [w1, w3]) to w13 row
-                    # halves: the loader puts w1 in the first isz rows unless
-                    # load_up_proj_weight_first flips the halves. The trtllm
-                    # w1<->w3 shard remap swaps rows and columns together, so
-                    # the identity mapping still holds there.
-                    half_ratios = (
-                        ratios.flip(1) if self.load_up_proj_weight_first else ratios
-                    )
-                    rescaled = block_scale.to(torch.float32)
-                    rescaled[:, :isz, :] *= half_ratios[:, 0].view(-1, 1, 1)
-                    rescaled[:, isz:, :] *= half_ratios[:, 1].view(-1, 1, 1)
-                    rescaled = rescaled.to(block_scale.dtype)
-                    flushed_to_zero = int(
-                        (
-                            (block_scale.to(torch.float32) != 0)
-                            & (rescaled.to(torch.float32) == 0)
-                        )
-                        .sum()
-                        .item()
-                    )
-                    num_experts_affected = int((gs2[:, 0] != gs2[:, 1]).sum().item())
-                    block_scale.copy_(rescaled)
-                    layer.w13_weight_scale_2.data.copy_(
-                        g_shared.unsqueeze(1).expand_as(layer.w13_weight_scale_2)
-                    )
-                    logger.info_once(
-                        "w1_weight_scale_2 != w3_weight_scale_2; requantized w13 "
-                        "block scales onto shared per-expert max global "
-                        f"({num_experts_affected}/{gs2.shape[0]} experts affected, "
-                        f"{flushed_to_zero} nonzero block scales flushed to zero)."
-                    )
-
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
@@ -1957,6 +1957,241 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+
+    def process_weights_after_partial_loading(
+        self, layer: torch.nn.Module, touched: dict
+    ) -> bool:
+        """Incrementally re-process after a partial reload that rewrote only
+        some experts' params raw. Re-runs each touched expert's kernel
+        transform plus the always-cheap scalar derivations, instead of the
+        full per-layer pass:
+
+        - w13 global-scale fold: re-fold only the touched experts' block
+          scales onto the shared per-expert max global (the fold is
+          per-expert-local; untouched experts keep their boot-time fold).
+        - TRT-LLM: re-align only the touched experts via a per-expert
+          prepare_static_weights_for_trtllm_fp4_moe (the full pass aligns each
+          expert independently) + refresh g1_scale_c with the same formula
+          align_fp4_moe_weights_for_flashinfer_trtllm uses.
+        - CUTLASS: re-swizzle only the touched experts' block scales
+          (swizzle_blockscale keeps the expert dim as an untouched batch dim;
+          the full pass binds the swizzle into the raw scale's own buffer via
+          alias_or_bind_derived_param, so the re-swizzle lands in place).
+
+        Scalar-derived params (alphas, input-scale quants) recompute from
+        never-transformed per-tensor sources. Returns False (the caller then
+        full-reloads) for CuteDSL (whole-layer interleave / MMA repack), for a
+        whole-param (non-expert-attributed) touch, and when a per-expert
+        result doesn't land back in the stored slot (a padded /
+        whole-layer-only layout) — the guards make a decline safe.
+
+        ``touched`` maps param names (e.g. "w13_weight_scale") to the expert
+        ids whose slices were reloaded (empty set = non-expert touch).
+        """
+        if self.enable_flashinfer_cutedsl_moe or self._is_cutedsl_v2_standard:
+            logger.info(
+                "nvfp4 partial post-loading declined: no per-expert-local "
+                "transform for the cutedsl backend"
+            )
+            return False
+        if getattr(layer, "_trtllm_fp4_intermediate_padded", False):
+            # Padded at boot: the stored slots are not raw-shaped, so neither
+            # the w13 fold nor the per-expert re-alignment can apply.
+            logger.info(
+                "nvfp4 partial post-loading declined: trtllm intermediate "
+                "size was padded at boot (slots are not raw-shaped)"
+            )
+            return False
+
+        kernel_params = (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        )
+        for name in (*kernel_params, "w13_weight_scale_2"):
+            if name in touched and not touched[name]:
+                logger.info(
+                    "nvfp4 partial post-loading declined: whole-param touch "
+                    f"for {name} (no per-expert attribution)"
+                )
+                return False
+        realign_experts = sorted(
+            set().union(*(set(touched.get(n, set())) for n in kernel_params))
+        )
+        # The fold rewrites w13 block-scale rows, which the kernel transform
+        # then re-reads: every folded expert must also be re-aligned. The
+        # load plan's expert closure reloads every tensor of a touched expert,
+        # so these sets coincide; anything else is a gap we cannot patch.
+        fold_experts = sorted(
+            set(touched.get("w13_weight_scale_2", set()))
+            | set(touched.get("w13_weight_scale", set()))
+        )
+        if not set(fold_experts) <= set(realign_experts):
+            logger.info(
+                "nvfp4 partial post-loading declined: touched w13 scales "
+                "without their expert's full raw slot (incomplete closure)"
+            )
+            return False
+
+        # Re-fold the touched experts' w13 globals exactly like the full pass
+        # (see process_weights_after_loading). The boot pass folded either
+        # every expert or none; a partial pass can only mirror the former.
+        gs2 = layer.w13_weight_scale_2
+        if layer.moe_runner_config.is_gated and gs2.dim() != 1 and gs2.shape[1] >= 2:
+            if getattr(layer, "_w13_scales_folded", False):
+                for e in fold_experts:
+                    self._fold_w13_global_scales(layer, slice(e, e + 1))
+            elif not torch.allclose(gs2[:, 0], gs2[:, 1]):
+                # Boot never folded (its allclose gate held), but the refilled
+                # globals now differ: a full reload would fold EVERY expert,
+                # which is beyond a partial pass.
+                logger.info(
+                    "nvfp4 partial post-loading declined: w13 global scales "
+                    "diverged but the boot pass did not fold"
+                )
+                return False
+
+        # Scalars are cheap and read only never-transformed per-tensor sources;
+        # refresh them so touched weight_scale_2 / input_scale values propagate.
+        self._derive_scalar_params(layer)
+
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and reorder_rows_for_gated_act_gemm is not None
+            and shuffle_matrix_sf_a is not None
+        ):
+            # TRT-LLM: re-align only the touched experts. The full pass
+            # (align_fp4_moe_weights_for_flashinfer_trtllm ->
+            # prepare_static_weights_for_trtllm_fp4_moe) shuffles each expert
+            # independently, so a touched expert's slot re-aligns from just
+            # its own freshly-loaded raw tensors (padded layouts declined
+            # above; per-expert shape/dtype guards below back that up).
+            from sglang.srt.layers.quantization.utils import (
+                prepare_static_weights_for_trtllm_fp4_moe,
+            )
+
+            is_gated = layer.moe_runner_config.is_gated
+            for e in realign_experts:
+                g1w, g1s, g2w, g2s = prepare_static_weights_for_trtllm_fp4_moe(
+                    layer.w13_weight.data[e : e + 1],
+                    layer.w2_weight.data[e : e + 1],
+                    layer.w13_weight_scale.data[e : e + 1],
+                    layer.w2_weight_scale.data[e : e + 1],
+                    layer.w2_weight.data.size(-2),  # hidden_size
+                    layer.intermediate_size_per_partition,  # (padded) intermediate
+                    1,  # num_experts for this per-expert slice
+                    is_gated=is_gated,
+                )
+                for param, aligned in (
+                    (layer.w13_weight, g1w),
+                    (layer.w13_weight_scale, g1s),
+                    (layer.w2_weight, g2w),
+                    (layer.w2_weight_scale, g2s),
+                ):
+                    slot = param.data[e : e + 1]
+                    if aligned.shape != slot.shape or aligned.dtype != slot.dtype:
+                        logger.info(
+                            "nvfp4 partial post-loading declined: trtllm "
+                            "per-expert slot %s/%s vs aligned %s/%s "
+                            "(whole-layer/padded layout)",
+                            tuple(slot.shape),
+                            slot.dtype,
+                            tuple(aligned.shape),
+                            aligned.dtype,
+                        )
+                        return False
+                    slot.copy_(aligned)
+            # GEMM1-output scale from the refreshed scalars — the same formula
+            # the full pass computes at the end of
+            # align_fp4_moe_weights_for_flashinfer_trtllm.
+            if is_gated:
+                g1_scale_c = (layer.w2_input_scale_quant * layer.g1_alphas).to(
+                    torch.float32
+                )
+            else:
+                num_experts = layer.g1_alphas.shape[0]
+                g1_scale_c = (
+                    layer.w2_input_scale_quant.to(torch.float32)
+                    .expand(num_experts)
+                    .contiguous()
+                )
+            copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
+            return True
+
+        # CUTLASS: the weights themselves load final (only scales are
+        # swizzled), so a touched expert only needs its block scales
+        # re-swizzled. The full pass binds the swizzle into the raw scale's
+        # own storage (alias_or_bind_derived_param); if it fell back to a
+        # separate (padded) buffer instead, an in-place re-swizzle cannot
+        # reach the tensor the kernel reads — decline.
+        if (
+            getattr(layer, "w13_blockscale_swizzled", None)
+            is not layer.w13_weight_scale
+            or getattr(layer, "w2_blockscale_swizzled", None)
+            is not layer.w2_weight_scale
+        ):
+            logger.info(
+                "nvfp4 partial post-loading declined: swizzled block scales "
+                "not bound into the raw scales' storage (padded layout)"
+            )
+            return False
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            scale = getattr(layer, name).data
+            # w13 uses the realign set: the fold above rewrote those experts'
+            # raw rows, so they must re-swizzle even if only w13_weight_scale_2
+            # was touched.
+            experts = (
+                realign_experts
+                if name == "w13_weight_scale"
+                else sorted(set(touched.get(name, set())))
+            )
+            for expert_id in experts:
+                swizzled = swizzle_blockscale(scale[expert_id])
+                if swizzled.shape != scale[expert_id].shape:
+                    logger.info(
+                        "nvfp4 partial post-loading declined: padded swizzle "
+                        "(%s[%d] %s -> %s)",
+                        name,
+                        expert_id,
+                        tuple(scale[expert_id].shape),
+                        tuple(swizzled.shape),
+                    )
+                    return False
+                scale[expert_id].copy_(swizzled)
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Process FP4 MoE weights after loading from serialized checkpoint.
+
+        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        """
+        # GEMM 1 scale processing
+        if (
+            layer.moe_runner_config.is_gated
+            and layer.w13_weight_scale_2.dim() != 1
+            and layer.w13_weight_scale_2.shape[1] >= 2
+            and not torch.allclose(
+                layer.w13_weight_scale_2[:, 0],
+                layer.w13_weight_scale_2[:, 1],
+            )
+        ):
+            # Fold each half's own global into its fp8 block scales against
+            # the shared per-expert max (see _fold_w13_global_scales).
+            num_experts_affected, flushed_to_zero = self._fold_w13_global_scales(
+                layer, slice(None)
+            )
+            # Partial reloads consult this: a touched expert's freshly-loaded
+            # raw globals must be re-folded the same way.
+            layer._w13_scales_folded = True
+            logger.info_once(
+                "w1_weight_scale_2 != w3_weight_scale_2; requantized w13 "
+                "block scales onto shared per-expert max global "
+                f"({num_experts_affected}/{layer.w13_weight_scale_2.shape[0]} experts affected, "
+                f"{flushed_to_zero} nonzero block scales flushed to zero)."
+            )
+
+        self._derive_scalar_params(layer)
         block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
@@ -1996,7 +2231,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
+            pre_align_intermediate_size = layer.intermediate_size_per_partition
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            # Partial reloads consult this: a padded layout means the stored
+            # slots are not raw-shaped, so per-expert re-alignment can't apply.
+            layer._trtllm_fp4_intermediate_padded = (
+                layer.intermediate_size_per_partition != pre_align_intermediate_size
+            )
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale

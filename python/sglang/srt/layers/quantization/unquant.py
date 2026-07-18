@@ -124,6 +124,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    # Post-loading is a no-op on CUDA, so a partial reload needs no re-processing.
+    partial_reload_safe = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -178,6 +181,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
+
+    @property
+    def partial_reload_safe(self) -> bool:
+        # Post-loading is a no-op on CUDA — except the flashinfer trtllm path,
+        # which reorders W1 rows for the fused gated activation (and ROCm/CPU
+        # apply aiter shuffle / amx packing). Only claim that a partial reload
+        # needs no re-processing when none of those transforms apply.
+        _should_use_aiter_moe = _use_aiter and (
+            get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
+        )
+        return not (
+            _should_use_aiter_moe
+            or (_is_cpu and _is_cpu_amx_available)
+            or self.use_flashinfer_trtllm_moe
+        )
 
     def __init__(
         self,

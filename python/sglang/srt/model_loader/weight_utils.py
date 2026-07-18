@@ -1118,7 +1118,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     pending.append(executor.submit(_load_file, next_file))
 
                 for name in sorted(state_dict.keys()):
-                    yield name, state_dict[name]
+                    yield name, _maybe_view_fp4_as_packed_uint8(state_dict[name])
                 del state_dict
                 pbar.update(1)
 

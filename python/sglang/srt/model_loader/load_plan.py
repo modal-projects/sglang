@@ -458,11 +458,19 @@ def partial_weights_iterator(
             return None
         by_file.setdefault(shard, []).append(name)
 
+    # Restore the packed-uint8 convention for F4-serialized NVFP4 checkpoints,
+    # the same view weight_utils' boot-load iterators apply (inlined so this
+    # module keeps importing without the full sglang chain, as its tests do).
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+
     def read() -> Iterable[Tuple[str, torch.Tensor]]:
         for shard, shard_names in sorted(by_file.items()):
             with safe_open(os.path.join(checkpoint_dir, shard), framework="pt", device="cpu") as f:
                 for name in shard_names:
-                    yield name, f.get_tensor(name)
+                    tensor = f.get_tensor(name)
+                    if fp4_dtype is not None and tensor.dtype == fp4_dtype:
+                        tensor = tensor.view(torch.uint8)
+                    yield name, tensor
 
     return read()
 

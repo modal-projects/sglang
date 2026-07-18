@@ -235,6 +235,19 @@ class DeepseekV2WeightLoaderMixin:
                         f"mlp.experts.{self.config.n_routed_experts}",
                     )
 
+                if (
+                    self.quant_config is not None
+                    and self.quant_config.get_name() == "modelopt_fp4"
+                    and ".mlp.experts." in name
+                ):
+                    # Kimi-family NVFP4 re-quants (pigeon-v4-nvfp4-*) store the expert
+                    # scales under fp8-style names; map them onto the modelopt NVFP4
+                    # params (F8_E4M3 block scales / F32 per-tensor scale).
+                    if name.endswith(".weight_scale_inv"):
+                        name = name[: -len("weight_scale_inv")] + "weight_scale"
+                    elif name.endswith(".weight_scale_global"):
+                        name = name[: -len("weight_scale_global")] + "weight_scale_2"
+
                 weight_names.append(name)
 
                 match nextn_conf:

@@ -24,6 +24,12 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
+        # delegation the base-class default (True) forces a per-step seq_lens
+        # D2H + host sync even when both sub-backends opted out.
+        self.needs_cpu_seq_lens = (
+            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """

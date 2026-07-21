@@ -1395,9 +1395,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
@@ -1491,6 +1493,19 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
             labelnames=labels.keys(),
+        )
+
+        self.num_inflight_requests = Gauge(
+            name="sglang:num_inflight_requests",
+            documentation=(
+                "Number of requests currently in flight at the frontend "
+                "(received by the tokenizer manager but not yet finished/aborted). "
+                "Spans tokenization, in-transit-to-scheduler, running, and "
+                "streaming-back phases; a frontend-side superset of the "
+                "scheduler's num_running_reqs + num_queue_reqs."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         self.get_loads_duration_seconds = Histogram(
@@ -1694,6 +1709,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def set_num_inflight_requests(self, value: int):
+        self.num_inflight_requests.labels(**self.labels).set(value)
 
 
 @dataclass

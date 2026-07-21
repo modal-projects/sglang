@@ -1336,6 +1336,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
                 del self.rid_to_state[state.obj.rid]
+                self._sync_inflight_requests_metric()
 
             # Mark ongoing LoRA request as finished.
             if self.server_args.enable_lora and state.obj.lora_path:
@@ -1540,6 +1541,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
                 del self.rid_to_state[objs[i].rid]
+                self._sync_inflight_requests_metric()
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -1977,6 +1979,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                self._sync_inflight_requests_metric()
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
@@ -2562,6 +2565,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "meta_info": meta_info,
         }
         del self.rid_to_state[recv_obj.rid]
+        self._sync_inflight_requests_metric()
 
         state.out_list.append(out)
         state.event.set()
@@ -2708,6 +2712,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.server_args.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+        self._sync_inflight_requests_metric()
+
+    def _sync_inflight_requests_metric(self):
+        """Publish the current frontend in-flight request count to Prometheus.
+
+        Reads the ground-truth ``len(rid_to_state)`` so the gauge is self-correcting
+        (no inc/dec drift). 
+        """
+        if self.enable_metrics:
+            self.metrics_collector.set_num_inflight_requests(len(self.rid_to_state))
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

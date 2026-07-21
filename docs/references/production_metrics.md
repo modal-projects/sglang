@@ -14,6 +14,9 @@ sglang:prompt_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 8.1289
 # HELP sglang:generation_tokens_total Number of generation tokens processed.
 # TYPE sglang:generation_tokens_total counter
 sglang:generation_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.557572e+06
+# HELP sglang:num_inflight_requests Number of requests currently in flight at the frontend (received by the tokenizer manager but not yet finished/aborted).
+# TYPE sglang:num_inflight_requests gauge
+sglang:num_inflight_requests{model_name="meta-llama/Llama-3.1-8B-Instruct"} 47.0
 # HELP sglang:token_usage The token usage
 # TYPE sglang:token_usage gauge
 sglang:token_usage{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28

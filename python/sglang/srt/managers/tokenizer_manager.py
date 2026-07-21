@@ -1938,6 +1938,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         rid: str = "",
         abort_all: bool = False,
+        prefix: bool = False,
         finished_reason: Optional[dict] = None,
     ):
         # Empty rid would startswith-match every request on the scheduler.
@@ -1949,6 +1950,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if state_rid not in self.child_rid_to_logical_rid:
                     state.abort_requested = True
             target_rids = (rid,)
+        elif prefix:
+            matched_rids = tuple(
+                state_rid
+                for state_rid in self.rid_to_state
+                if state_rid.startswith(rid)
+            )
+            if not matched_rids and self.server_args.tokenizer_worker_num == 1:
+                return
+
+            # Requests can still be tokenizer-held while tokenization awaits.
+            # Mark their logical lifecycle so its existing pre-dispatch checks
+            # stop them. The scheduler request handles already-dispatched RIDs.
+            matched_logical_rids = {
+                self.child_rid_to_logical_rid.get(state_rid, state_rid)
+                for state_rid in matched_rids
+            }
+            for logical_rid in matched_logical_rids:
+                if state := self.rid_to_state.get(logical_rid):
+                    state.abort_requested = True
+
+            # Child RIDs normally share their parent's namespace. Explicitly
+            # fan out any exception so prefix aborts retain the exact-abort
+            # behavior for parallel sampling with independently named children.
+            extra_child_rids = {
+                child_rid
+                for logical_rid in matched_logical_rids
+                for child_rid in self.logical_rid_to_child_rids.get(logical_rid, ())
+                if not child_rid.startswith(rid)
+            }
+            target_rids = (rid, *sorted(extra_child_rids))
         elif rid in self.child_rid_to_logical_rid:
             # Preserve direct child aborts for internal callers.
             target_rids = (rid,)
@@ -1980,6 +2011,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 AbortReq(
                     rid=target_rid,
                     abort_all=abort_all,
+                    prefix=prefix,
                     finished_reason=finished_reason,
                 )
             )

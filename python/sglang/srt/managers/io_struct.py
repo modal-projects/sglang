@@ -2080,6 +2080,8 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
+    # Whether rid identifies a request namespace rather than one exact request.
+    prefix: bool = False
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None

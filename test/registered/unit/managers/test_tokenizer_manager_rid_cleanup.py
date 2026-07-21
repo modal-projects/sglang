@@ -584,6 +584,71 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         self.assertNotIn(undelivered, tm.rid_to_state)
 
 
+class TestAbortRequestPrefix(CustomTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm._dispatch_to_scheduler = Mock()
+
+    def test_prefix_marks_only_matching_states(self):
+        for rid in ("job-1::0", "job-1::1", "other"):
+            self.tm.rid_to_state[rid] = _make_req_state(rid)
+
+        self.tm.abort_request(rid="job-1::", prefix=True)
+
+        self.assertTrue(self.tm.rid_to_state["job-1::0"].abort_sent)
+        self.assertTrue(self.tm.rid_to_state["job-1::1"].abort_sent)
+        self.assertFalse(self.tm.rid_to_state["other"].abort_sent)
+        sent = self.tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(sent.rid, "job-1::")
+        self.assertTrue(sent.prefix)
+
+    def test_exact_abort_does_not_match_namespace(self):
+        self.tm.rid_to_state["job-1::0"] = _make_req_state("job-1::0")
+
+        self.tm.abort_request(rid="job-1::")
+
+        self.tm._dispatch_to_scheduler.assert_not_called()
+        self.assertFalse(self.tm.rid_to_state["job-1::0"].abort_sent)
+
+    def test_abort_before_dispatch_is_resent_after_request(self):
+        rid = "job-1::0"
+        state = _make_req_state(rid)
+        state.abort_sent = True
+        self.tm.rid_to_state[rid] = state
+
+        request = Mock(rid=rid)
+        self.tm._dispatch_to_scheduler(request)
+        self.tm._mark_state_dispatched(rid)
+
+        sent = [call.args[0] for call in self.tm._dispatch_to_scheduler.call_args_list]
+        self.assertIs(sent[0], request)
+        self.assertIsInstance(sent[1], AbortReq)
+        self.assertEqual(sent[1].rid, rid)
+        self.assertTrue(state.dispatched)
+
+    def test_abort_all_marks_requests_pending_dispatch(self):
+        for rid in ("a", "b"):
+            self.tm.rid_to_state[rid] = _make_req_state(rid)
+
+        self.tm.abort_request(abort_all=True)
+
+        self.assertTrue(
+            all(state.abort_sent for state in self.tm.rid_to_state.values())
+        )
+        sent = self.tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertTrue(sent.abort_all)
+
+    def test_dispatch_failure_restores_abort_state(self):
+        state = _make_req_state("job-1::0")
+        self.tm.rid_to_state[state.obj.rid] = state
+        self.tm._dispatch_to_scheduler.side_effect = RuntimeError("send failed")
+
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            self.tm.abort_request(rid="job-1::", prefix=True)
+
+        self.assertFalse(state.abort_sent)
+
+
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
         tm = _make_tokenizer_manager(self)

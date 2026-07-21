@@ -1695,6 +1695,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state.get(rid)
         if state is not None:
             state.dispatched = True
+            # An abort sent while the request was still being prepared could
+            # not reach it in the scheduler. The ordered channel guarantees
+            # this exact abort follows the newly dispatched request.
+            if state.abort_sent:
+                self._dispatch_to_scheduler(AbortReq(rid=rid))
 
     async def _send_batch_request(
         self,
@@ -2095,19 +2100,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        state = None if abort_all else self.rid_to_state.get(rid)
+
+        if abort_all:
+            states = list(self.rid_to_state.values())
+        else:
+            state = self.rid_to_state.get(rid)
+            states = [] if state is None else [state]
+
         if not abort_all:
-            if state is not None:
-                if state.abort_sent:
-                    return
-                state.abort_sent = True
-            elif get_serving().tokenizer_worker_num == 1:
+            if not states and get_serving().tokenizer_worker_num == 1:
                 return
+            if states and all(state.abort_sent for state in states):
+                return
+
+        newly_marked = [state for state in states if not state.abort_sent]
+        for state in newly_marked:
+            state.abort_sent = True
+
         req = AbortReq(rid=rid, abort_all=abort_all)
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
-            if state is not None:
+            for state in newly_marked:
                 state.abort_sent = False
             raise
         if self.enable_metrics:

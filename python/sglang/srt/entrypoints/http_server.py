@@ -402,11 +402,41 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread.join()
 
 
+class RequestTimestampHeaderMiddleware:
+    """
+    Stamp every HTTP response with request start/finish wall-clock times.
+    """
+
+    STARTED_HEADER = b"sglang-http-req-started-at"
+    FINISHED_HEADER = b"sglang-http-req-finished-at"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started_at = time.time()
+
+        async def send_with_timestamps(message):
+            if message["type"] == "http.response.start":
+                finished_at = time.time()
+                headers = message.setdefault("headers", [])
+                headers.append((self.STARTED_HEADER, f"{started_at:.3f}".encode()))
+                headers.append((self.FINISHED_HEADER, f"{finished_at:.3f}".encode()))
+            await send(message)
+
+        await self.app(scope, receive, send_with_timestamps)
+
+
 # Fast API
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.add_middleware(RequestTimestampHeaderMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

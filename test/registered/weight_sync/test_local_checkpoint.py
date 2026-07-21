@@ -327,6 +327,40 @@ class PullTest(unittest.TestCase):
         self.pull(3)
         self.assert_at_version(3)
 
+    def test_fold_telescopes_repeated_tensor_changes(self):
+        # A multi-delta pull folds each tensor's whole chain in one pass. layer.a changes
+        # again in v3 and v4, so the fresh pull(4) must XOR base ⊕ d1 ⊕ d3 ⊕ d4 for it
+        # (telescoping) and checksum only the final state — the case the 2-tensor chain misses.
+        rng = np.random.default_rng(23)
+        self.pub.publish_delta(
+            3, {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+        )
+        self.pub.publish_delta(
+            4,
+            {
+                "layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes(),
+                "layer.b": rng.integers(0, 256, 2048, dtype=np.uint8).tobytes(),
+            },
+        )
+        self.pull(4)  # fresh host -> multi-delta fold of v1..v4
+        self.assert_at_version(4)
+
+    def test_fold_corrupt_local_reseeds(self):
+        # A multi-delta fold onto silently-corrupt local state must checksum-fail on the
+        # final state and reseed+replay from base — never serve the wrong bytes.
+        rng = np.random.default_rng(31)
+        self.pub.publish_delta(
+            3, {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+        )
+        self.pull(1)  # single delta -> _apply_delta path, at v1
+        shard = os.path.join(self.local, Publisher.SHARD)
+        _, offset, _ = local_checkpoint._tensor_locations(self.local)["layer.a"]
+        with open(shard, "r+b") as f:
+            f.seek(offset)
+            f.write(bytes(16))  # silent local corruption
+        self.pull(3)  # applied=1 -> fold v2..v3 -> checksum-fail -> reseed + replay
+        self.assert_at_version(3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -157,8 +157,17 @@ def _pull_locked(
         _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
     else:
         start = applied
-    for version in range(start + 1, target_version + 1):
-        _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
+    if target_version - start > 1:
+        # Multi-delta catch-up (a fresh/behind host). Fold the whole range per tensor in one
+        # pass — read each tensor once, XOR every delta into it in RAM, write once, checksum
+        # once — instead of a per-delta mmap read-modify-write. The sequential path pays N
+        # full-tensor mmap page-in passes (gVisor-throttled to ~0.4 GB/s); folding pays one
+        # buffered read + one buffered write, with the XOR/decompress in RAM.
+        _apply_range(local_checkpoint_dir, source_dir, start + 1, target_version)
+    else:
+        # Steady state (one delta): the in-place mmap apply writes only the delta's dirty
+        # pages (O(delta)), which beats folding's full-tensor rewrite for a single step.
+        _apply_delta(local_checkpoint_dir, _version_dir(source_dir, start + 1))
 
 
 def _load_hook(path: str):
@@ -542,3 +551,122 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             f"{sorted(mismatches)[:20]}"
         )
     _write_applied_version(local_checkpoint_dir, int(meta["version"]))
+
+
+def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -> None:
+    """Fold XOR deltas v{lo}..v{hi} into the local checkpoint in one pass per tensor.
+
+    The local checkpoint is at v{lo-1}; XOR telescopes, so v{hi} = state ⊕ d{lo} ⊕ ... ⊕ d{hi}.
+    Reading each tensor once, XOR-folding every delta into it in RAM, and writing once avoids
+    the per-delta mmap read-modify-write (two full-tensor page-ins per delta, gVisor-throttled)
+    and the O(N) rewrites of a sequential replay. Only the delta's dirty regions differ, but the
+    XOR encoding is full-tensor, so the fold's cost is one buffered read + one buffered write per
+    tensor plus N in-RAM decompress+XORs.
+
+    Pure-xor/zstd ranges only; a range that contains an ``overwrite`` (or otherwise non-xor)
+    version falls back to the per-version path (correct, just not folded). Correctness is
+    unchanged from the sequential apply: only the final v{hi} state is checksummed per tensor
+    (XOR telescoping means any corrupt delta in the chain breaks it), and a mismatch raises so
+    the caller reseeds from base and replays.
+    """
+    blobs_alive = []  # keep the whole-file delta reads alive; the views below point into them
+    per_version = []  # [(version, {tensor: compressed_view}, {tensor: want_checksum})]
+    algorithm = None
+    prev = lo - 1
+    for v in range(lo, hi + 1):
+        vdir = _version_dir(source_dir, v)
+        with open(os.path.join(vdir, "model.safetensors.index.json")) as f:
+            index = json.load(f)
+        meta = index["metadata"]
+        if int(meta["base_version"]) != prev:
+            raise RuntimeError(
+                f"out-of-order delta v{v}: builds on {meta['base_version']}, local at {prev}"
+            )
+        if meta.get("delta_encoding") != "xor" or meta.get("compression_format") != "zstd":
+            for w in range(lo, hi + 1):  # not a pure-xor range — the safe per-version path
+                _apply_delta(local_checkpoint_dir, _version_dir(source_dir, w))
+            return
+        for blob_name in sorted(set(index.get("weight_map", {}).values())):
+            if not os.path.exists(os.path.join(vdir, blob_name)):
+                raise FileNotFoundError(
+                    f"incomplete source version {vdir}: missing blob {blob_name}"
+                )
+        algorithm = meta["checksum_format"]
+        comp, want = {}, {}
+        for delta_file in sorted(glob.glob(os.path.join(vdir, "*.safetensors"))):
+            with open(delta_file, "rb") as f:
+                blob = f.read()
+            expected = _safetensors_size(blob)
+            if expected is None or len(blob) != expected:
+                raise FileNotFoundError(
+                    f"incomplete source blob {delta_file}: {len(blob)}B, header "
+                    f"declares {expected}B (not fully materialized)"
+                )
+            blobs_alive.append(blob)
+            (header_len,) = struct.unpack("<Q", blob[:8])
+            header = json.loads(blob[8 : 8 + header_len])
+            want_checksums = header.get("__metadata__", {})
+            view = memoryview(blob)
+            data_start = 8 + header_len
+            for name, info in header.items():
+                if name == "__metadata__":
+                    continue
+                begin, end = info["data_offsets"]
+                comp[name] = view[data_start + begin : data_start + end]
+                want[name] = want_checksums.get(name)
+        per_version.append((v, comp, want))
+        prev = v
+
+    # The last version that touches a tensor defines its final v{hi} state + checksum.
+    last_want = {}
+    for _, comp, want in per_version:
+        for name in comp:
+            last_want[name] = want[name]
+
+    locations = _tensor_locations(local_checkpoint_dir)
+    by_shard: dict = {}
+    for name, (path, offset, nbytes) in locations.items():
+        by_shard.setdefault(path, []).append((name, offset, nbytes))
+    mismatches = []
+    lock = threading.Lock()
+
+    def fold_shard(path) -> None:
+        with open(path, "rb") as f:
+            buf = bytearray(f.read())
+        mv = memoryview(buf)
+        dctx = zstandard.ZstdDecompressor()
+        bad = []
+        for name, offset, nbytes in by_shard[path]:
+            region = np.frombuffer(mv[offset : offset + nbytes], dtype=np.uint8)
+            touched = False
+            for _, comp, _w in per_version:
+                view = comp.get(name)
+                if view is None:
+                    continue
+                touched = True
+                reader = dctx.stream_reader(view)
+                pos = 0
+                while pos < nbytes:  # stream: no full-tensor delta buffer, L2-resident chunks
+                    block = reader.read(min(4 << 20, nbytes - pos))
+                    if not block:
+                        break
+                    chunk = np.frombuffer(block, dtype=np.uint8)
+                    region[pos : pos + chunk.size] ^= chunk
+                    pos += chunk.size
+            if touched and _checksum(algorithm, region) != last_want.get(name):
+                bad.append(name)
+        if bad:
+            with lock:
+                mismatches.extend(bad)
+        else:  # write only after every tensor in the shard verifies (no torn write on mismatch)
+            with open(path, "wb") as f:
+                f.write(buf)
+
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
+        list(pool.map(fold_shard, list(by_shard)))
+    if mismatches:
+        raise RuntimeError(
+            f"checksum mismatch for {len(mismatches)} tensors after folding v{lo}..v{hi}: "
+            f"{sorted(mismatches)[:20]}"
+        )
+    _write_applied_version(local_checkpoint_dir, hi)

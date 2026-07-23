@@ -925,6 +925,7 @@ def build_host_load_proxy(
     *,
     image_bytes: torch.Tensor | None = None,
     segments: list[RuntimeStorageSegment] | None = None,
+    pinned_scratch: torch.Tensor | None = None,
 ) -> tuple[
     torch.nn.Module,
     dict[str, float | int],
@@ -982,11 +983,35 @@ def build_host_load_proxy(
         stats["restore_s"] += time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
+        pinned_shadow = None
+        source_shadow = device_shadow
+        if (
+            arena is not None
+            and not image_bytes.is_pinned()
+            and target_device.type == "cuda"
+        ):
+            if pinned_scratch is None:
+                raise ValueError(
+                    "a pageable direct image requires reusable pinned scratch"
+                )
+            scratch_arena = HostImageArena.from_range(
+                pinned_scratch,
+                0,
+                pinned_scratch.numel(),
+            )
+            pinned_shadow = clone_module_tensors(
+                device_shadow,
+                target_device=torch.device("cpu"),
+                storage_allocator=scratch_arena.allocate,
+            )
+            if target_device.type == "cuda":
+                torch.cuda.synchronize(target_device)
+            source_shadow = pinned_shadow
         arena_cursor = arena.cursor if arena is not None else 0
         raw_begin = _align_up(arena_cursor)
         try:
             host_shadow = clone_module_tensors(
-                device_shadow,
+                source_shadow,
                 target_device=torch.device("cpu"),
                 storage_allocator=arena.allocate if arena is not None else None,
             )
@@ -1008,7 +1033,7 @@ def build_host_load_proxy(
                 group.path,
             )
             host_shadow = clone_module_tensors(
-                device_shadow,
+                source_shadow,
                 target_device=torch.device("cpu"),
             )
             stats["fallback_groups"] += 1
@@ -1020,7 +1045,7 @@ def build_host_load_proxy(
         stats["d2h_s"] += time.perf_counter() - phase_started
         replace_proxy_module(proxy, model, group.path, host_shadow)
         stats["groups"] += 1
-        del device_shadow, host_shadow
+        del device_shadow, host_shadow, pinned_shadow
 
     if arena is not None:
         stats["direct_image_capacity_bytes"] = arena.capacity_bytes
@@ -1178,10 +1203,29 @@ class PreparedRuntimeState:
         self._gpu_stage: torch.Tensor | None = None
         self._gpu_stage_image_offset = 0
         self._checkpoint_device_buffer: torch.Tensor | None = None
+        self._group_pinned_scratch: torch.Tensor | None = None
         self._full_pinned = (
             os.environ.get("SGLANG_PREPARED_FULL_PINNED_IMAGE", "0") == "1"
         )
+        self._single_image = (
+            os.environ.get("SGLANG_PREPARED_SINGLE_IMAGE", "0") == "1"
+        )
         self._preallocated_image_bytes: torch.Tensor | None = None
+
+    def _ensure_group_pinned_scratch(self) -> int:
+        requested = (
+            int(os.environ.get("SGLANG_PREPARED_GROUP_SCRATCH_GB", "9")) * _GIB
+        )
+        if (
+            self._group_pinned_scratch is None
+            or self._group_pinned_scratch.numel() != requested
+        ):
+            self._group_pinned_scratch = torch.empty(
+                requested,
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+        return requested
 
     @property
     def prepared_identity(self) -> str | None:
@@ -1228,7 +1272,19 @@ class PreparedRuntimeState:
     def begin_preparation(self, identity: str) -> RuntimeStateImage:
         """Allocate a fresh dense image for all checkpoint-derived storages."""
 
-        if self.prepared is None or self.prepared is self.active:
+        if (
+            getattr(self, "_single_image", False)
+            and self.prepared is None
+            and self.active is not None
+        ):
+            # The active image is only a host rollback snapshot; the serving
+            # model owns independent CUDA storage. Reuse it as preparation
+            # scratch so steady-state pulls do not allocate/page-lock another
+            # full model. A mid-commit failure is fail-stop in this mode.
+            self.prepared = self.active
+            self.active = None
+            self.prepared.identity = identity
+        elif self.prepared is None or self.prepared is self.active:
             self.prepared = self.allocate_image(identity)
         else:
             # After the second successful commit ``prepared`` is the previous
@@ -1686,6 +1742,11 @@ class PreparedRuntimeState:
                 phase_started = time.perf_counter()
                 if self.prepared is None:
                     raise AssertionError("prepared runtime image is missing")
+                if (
+                    not self.prepared.bytes.is_pinned()
+                    and self._group_pinned_scratch is None
+                ):
+                    self._ensure_group_pinned_scratch()
                 (
                     load_proxy,
                     host_proxy_stats,
@@ -1697,6 +1758,11 @@ class PreparedRuntimeState:
                     restore_weights_before_loading,
                     image_bytes=self.prepared.bytes,
                     segments=self.segments,
+                    pinned_scratch=(
+                        self._group_pinned_scratch
+                        if not self.prepared.bytes.is_pinned()
+                        else None
+                    ),
                 )
                 logger.info(
                     "[RL_PREPARED_STATE] built rank-local host load proxy "
@@ -1802,13 +1868,20 @@ class PreparedRuntimeState:
                         raise AssertionError("single-pass load proxy is missing")
                     host_shadow = module_at_path(load_proxy, path)
                     direct_image = path in raw_image_ranges
-                    if direct_image:
+                    if direct_image and self.prepared.bytes.is_pinned():
                         pinned_shadow = host_shadow
                     else:
+                        if self._group_pinned_scratch is None:
+                            self._ensure_group_pinned_scratch()
+                        scratch_arena = HostImageArena.from_range(
+                            self._group_pinned_scratch,
+                            0,
+                            self._group_pinned_scratch.numel(),
+                        )
                         pinned_shadow = clone_module_tensors(
                             host_shadow,
                             target_device=torch.device("cpu"),
-                            pin_memory=True,
+                            storage_allocator=scratch_arena.allocate,
                         )
                     host_target_alloc_s = time.perf_counter() - phase_started
                     replace_proxy_module(
@@ -2086,6 +2159,15 @@ class PreparedRuntimeState:
         """Pay page-locking/allocation costs once during engine startup."""
 
         started = time.perf_counter()
+        group_scratch_bytes = 0
+        if (
+            os.environ.get(
+                "SGLANG_PREPARED_SINGLE_PASS_CPU_ASSEMBLY",
+                "0",
+            )
+            == "1"
+        ):
+            group_scratch_bytes = self._ensure_group_pinned_scratch()
         if self._full_pinned:
             if self.prepared is None and self._preallocated_image_bytes is None:
                 try:
@@ -2105,6 +2187,7 @@ class PreparedRuntimeState:
                     "full_pinned_image_bytes": self.image_nbytes,
                     "pinned_prefix_bytes": 0,
                     "tail_buffer_bytes": 0,
+                    "group_scratch_bytes": group_scratch_bytes,
                     "wall_s": round(time.perf_counter() - started, 6),
                 }
         pinned_prefix_bytes = self._ensure_pinned_prefix()
@@ -2113,6 +2196,7 @@ class PreparedRuntimeState:
             "full_pinned_image_bytes": 0,
             "pinned_prefix_bytes": pinned_prefix_bytes,
             "tail_buffer_bytes": sum(item.numel() for item in self._tail_buffers),
+            "group_scratch_bytes": group_scratch_bytes,
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
@@ -2401,8 +2485,9 @@ class PreparedRuntimeState:
     def commit(self) -> dict[str, float | int | str]:
         """Overwrite every checkpoint-derived storage and retain the old image.
 
-        A previous successfully committed image is available for rollback.  The
-        first prepared commit intentionally has no rollback snapshot: capturing
+        Unless single-image reuse is enabled, a previous successfully committed
+        image is available for rollback. The first prepared commit and every
+        single-image commit intentionally have no rollback snapshot: capturing
         the serving model would itself take several minutes on this host and is
         outside the paused-path contract.
         """

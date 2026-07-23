@@ -628,3 +628,28 @@ def test_begin_preparation_does_not_overwrite_active_rollback(monkeypatch):
 
     assert image is replacement
     assert state.active.identity == "active"
+
+
+def test_begin_preparation_single_image_reuses_active_snapshot():
+    state = object.__new__(PreparedRuntimeState)
+    state._single_image = True
+    state.active = RuntimeStateImage(
+        bytes=torch.empty(16, dtype=torch.uint8),
+        identity="active",
+    )
+    state.prepared = None
+    state._staged_image = object()
+    state._staged_tail = [object()]
+    state._gpu_stage = object()
+    state._gpu_stage_image_offset = 7
+
+    active_bytes = state.active.bytes
+    image = state.begin_preparation("next")
+
+    assert image.bytes is active_bytes
+    assert image.identity == "next"
+    assert state.active is None
+    assert state._staged_image is None
+    assert state._staged_tail == []
+    assert state._gpu_stage is None
+    assert state._gpu_stage_image_offset == 0

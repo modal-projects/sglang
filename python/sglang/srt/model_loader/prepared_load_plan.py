@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.model_loader.utils import should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -53,6 +54,59 @@ class PreparedLoadCall:
     kwargs: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ParameterStorageSignature:
+    """The restored storage layout whose complete writes were observed."""
+
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    storage_offset: int
+    storage_nbytes: int
+
+
+class _DestinationWriteRecorder(TorchDispatchMode):
+    """Observe contiguous ``copy_`` destinations inside one weight loader."""
+
+    def __init__(
+        self,
+        parameter: torch.nn.Parameter,
+        intervals: list[tuple[int, int]],
+    ) -> None:
+        super().__init__()
+        self._storage_ptr = parameter.untyped_storage().data_ptr()
+        self._storage_nbytes = parameter.untyped_storage().nbytes()
+        self._intervals = intervals
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.copy_.default and args:
+            destination = args[0]
+            if (
+                isinstance(destination, torch.Tensor)
+                and destination.untyped_storage().data_ptr() == self._storage_ptr
+                and destination.untyped_storage().nbytes() == self._storage_nbytes
+                and destination.is_contiguous()
+            ):
+                begin = destination.storage_offset() * destination.element_size()
+                end = begin + destination.numel() * destination.element_size()
+                self._intervals.append((begin, end))
+        return func(*args, **({} if kwargs is None else kwargs))
+
+
+def _covers_storage(intervals: Iterable[tuple[int, int]], nbytes: int) -> bool:
+    """Return whether a set of byte intervals covers one entire storage."""
+
+    cursor = 0
+    for begin, end in sorted(intervals):
+        if end <= cursor:
+            continue
+        if begin > cursor:
+            return False
+        cursor = end
+        if cursor >= nbytes:
+            return True
+    return cursor >= nbytes
+
+
 class PreparedLoadPlan:
     """A full-checkpoint dispatch plan recorded from an ordinary model load."""
 
@@ -61,6 +115,9 @@ class PreparedLoadPlan:
         self.fallback: set[str] = set()
         self.fallback_patterns = tuple(fallback_patterns)
         self.loader_kinds: dict[str, int] = {}
+        self.fully_overwritten_parameters: dict[
+            str, ParameterStorageSignature
+        ] = {}
         self.recorded = False
 
     def _forced_fallback(self, name: str) -> bool:
@@ -77,6 +134,9 @@ class PreparedLoadPlan:
         recorded: dict[str, list[PreparedLoadCall]] = {}
         seen: set[str] = set()
         loader_kinds: Counter[str] = Counter()
+        write_intervals: dict[str, list[tuple[int, int]]] = {}
+        parameter_signatures: dict[str, ParameterStorageSignature] = {}
+        unsafe_parameters: set[str] = set()
         lock = threading.Lock()
 
         def tagged() -> Iterable[tuple[str, torch.Tensor]]:
@@ -137,12 +197,42 @@ class PreparedLoadPlan:
                             with lock:
                                 recorded.setdefault(source_name, []).append(call)
                                 loader_kinds[loader_kind] += 1
-                        return original_loader(
-                            parameter_arg,
-                            loaded_weight,
-                            *args,
-                            **kwargs,
+                        signature = ParameterStorageSignature(
+                            shape=tuple(parameter_arg.shape),
+                            stride=tuple(parameter_arg.stride()),
+                            storage_offset=parameter_arg.storage_offset(),
+                            storage_nbytes=parameter_arg.untyped_storage().nbytes(),
                         )
+                        with lock:
+                            intervals = write_intervals.setdefault(
+                                parameter_name, []
+                            )
+                            previous_signature = parameter_signatures.setdefault(
+                                parameter_name, signature
+                            )
+                        if (
+                            parameter_name in unsafe_parameters
+                            or previous_signature != signature
+                        ):
+                            # A loader that rebinds or reshapes its destination
+                            # cannot be proven safe for copy elision.
+                            with lock:
+                                unsafe_parameters.add(parameter_name)
+                                parameter_signatures.pop(parameter_name, None)
+                                intervals.clear()
+                            return original_loader(
+                                parameter_arg,
+                                loaded_weight,
+                                *args,
+                                **kwargs,
+                            )
+                        with _DestinationWriteRecorder(parameter_arg, intervals):
+                            return original_loader(
+                                parameter_arg,
+                                loaded_weight,
+                                *args,
+                                **kwargs,
+                            )
 
                     return recording_loader
 
@@ -170,6 +260,15 @@ class PreparedLoadPlan:
             if name not in recorded or self._forced_fallback(name)
         }
         self.loader_kinds = dict(loader_kinds)
+        self.fully_overwritten_parameters = {
+            name: signature
+            for name, signature in parameter_signatures.items()
+            if name not in unsafe_parameters
+            if _covers_storage(
+                write_intervals.get(name, ()),
+                signature.storage_nbytes,
+            )
+        }
         for name in self.fallback:
             self.entries.pop(name, None)
         self.recorded = True
@@ -179,10 +278,45 @@ class PreparedLoadPlan:
             "fallback": len(self.fallback),
             "seen": len(seen),
             "loader_kinds": self.loader_kinds,
+            "fully_overwritten_parameters": len(
+                self.fully_overwritten_parameters
+            ),
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.info("[RL_PREPARED_LOAD_PLAN] %s", stats)
         return stats
+
+    def fully_overwritten_parameter_names(
+        self,
+        module: torch.nn.Module,
+        *,
+        parameter_prefix: str = "",
+    ) -> set[str]:
+        """Return restored Parameters proven fully determined by checkpoint load.
+
+        The caller still groups aliases by storage and requires every Parameter
+        view backed by a storage to appear in this result before eliding its
+        initial copy. Unrecognized, partial, and reshaped destinations stay on
+        the conservative initialization path.
+        """
+
+        parameters = dict(module.named_parameters(remove_duplicate=False))
+        result: set[str] = set()
+        for relative_name, parameter in parameters.items():
+            full_name = (
+                f"{parameter_prefix}.{relative_name}"
+                if parameter_prefix
+                else relative_name
+            )
+            signature = self.fully_overwritten_parameters.get(full_name)
+            if signature is not None and signature == ParameterStorageSignature(
+                shape=tuple(parameter.shape),
+                stride=tuple(parameter.stride()),
+                storage_offset=parameter.storage_offset(),
+                storage_nbytes=parameter.untyped_storage().nbytes(),
+            ):
+                result.add(relative_name)
+        return result
 
     def replay(
         self,

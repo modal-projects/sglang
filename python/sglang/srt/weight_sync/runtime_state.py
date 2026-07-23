@@ -1027,6 +1027,7 @@ def build_host_load_proxy(
     image_bytes: torch.Tensor | None = None,
     segments: list[RuntimeStorageSegment] | None = None,
     pinned_scratch: torch.Tensor | None = None,
+    prepared_load_plan: Any | None = None,
 ) -> tuple[
     torch.nn.Module,
     dict[str, float | int],
@@ -1070,6 +1071,8 @@ def build_host_load_proxy(
         "restore_s": 0.0,
         "d2h_s": 0.0,
         "page_copy_s": 0.0,
+        "skipped_initial_copy_bytes": 0,
+        "preserved_initial_copy_bytes": 0,
         "direct_image_groups": 0,
         "direct_image_capacity_bytes": 0,
         "direct_image_used_bytes": 0,
@@ -1093,6 +1096,63 @@ def build_host_load_proxy(
             phase_started = time.perf_counter()
             pinned_shadow = None
             source_shadow = device_shadow
+            fully_overwritten_names = (
+                prepared_load_plan.fully_overwritten_parameter_names(
+                    device_shadow,
+                    parameter_prefix=group.path,
+                )
+                if prepared_load_plan is not None
+                else set()
+            )
+            parameter_names_by_storage: dict[
+                tuple[int | None, int, int], list[str]
+            ] = {}
+            for relative_name, parameter in device_shadow.named_parameters(
+                remove_duplicate=False
+            ):
+                parameter_bytes = _storage_bytes(parameter)
+                key = (
+                    parameter_bytes.device.index,
+                    parameter_bytes.data_ptr(),
+                    parameter_bytes.numel(),
+                )
+                parameter_names_by_storage.setdefault(key, []).append(
+                    relative_name
+                )
+            skippable_storage_keys = {
+                key
+                for key, relative_names in parameter_names_by_storage.items()
+                if all(
+                    name in fully_overwritten_names for name in relative_names
+                )
+            }
+            skipped_pinned_storage_keys: set[
+                tuple[int | None, int, int]
+            ] = set()
+
+            def stage_initial_storage(
+                destination: torch.Tensor,
+                source: torch.Tensor,
+                non_blocking: bool,
+            ) -> None:
+                source_key = (
+                    source.device.index,
+                    source.data_ptr(),
+                    source.numel(),
+                )
+                if source_key in skippable_storage_keys:
+                    skipped_pinned_storage_keys.add(
+                        (
+                            destination.device.index,
+                            destination.data_ptr(),
+                            destination.numel(),
+                        )
+                    )
+                    stats["skipped_initial_copy_bytes"] += source.numel()
+                    return
+                destination.copy_(source, non_blocking=non_blocking)
+                stats["preserved_initial_copy_bytes"] += source.numel()
+
             if (
                 arena is not None
                 and not image_bytes.is_pinned()
@@ -1111,6 +1171,7 @@ def build_host_load_proxy(
                     device_shadow,
                     target_device=torch.device("cpu"),
                     storage_allocator=scratch_arena.allocate,
+                    storage_copier=stage_initial_storage,
                 )
                 if target_device.type == "cuda":
                     torch.cuda.synchronize(target_device)
@@ -1129,6 +1190,13 @@ def build_host_load_proxy(
             ) -> None:
                 if non_blocking:
                     raise ValueError("deferred pageable copy cannot be non-blocking")
+                source_key = (
+                    source.device.index,
+                    source.data_ptr(),
+                    source.numel(),
+                )
+                if source_key in skipped_pinned_storage_keys:
+                    return
                 copies.append((destination, source))
 
             try:
@@ -1140,7 +1208,12 @@ def build_host_load_proxy(
                         defer_cpu_copy
                         if source_shadow is pinned_shadow
                         and pinned_shadow is not None
-                        else None
+                        else (
+                            stage_initial_storage
+                            if source_shadow is device_shadow
+                            and skippable_storage_keys
+                            else None
+                        )
                     ),
                 )
                 if deferred_copies:
@@ -1839,6 +1912,8 @@ class PreparedRuntimeState:
             "host_proxy_direct_image_capacity_bytes": 0,
             "host_proxy_direct_image_used_bytes": 0,
             "host_proxy_fallback_groups": 0,
+            "host_proxy_skipped_initial_copy_bytes": 0,
+            "host_proxy_preserved_initial_copy_bytes": 0,
             "single_pass_load_s": 0.0,
             "load_plan_hits": 0,
             "load_plan_fallback": 0,
@@ -1910,6 +1985,11 @@ class PreparedRuntimeState:
                     and self._group_pinned_scratch is None
                 ):
                     self._ensure_group_pinned_scratch()
+                from sglang.srt.model_loader.prepared_load_plan import (
+                    get_or_create_prepared_load_plan,
+                )
+
+                prepared_load_plan = get_or_create_prepared_load_plan(model)
                 (
                     load_proxy,
                     host_proxy_stats,
@@ -1926,12 +2006,15 @@ class PreparedRuntimeState:
                         if not self.prepared.bytes.is_pinned()
                         else None
                     ),
+                    prepared_load_plan=prepared_load_plan,
                 )
                 logger.info(
                     "[RL_PREPARED_STATE] built rank-local host load proxy "
                     "groups=%d wall_s=%.3f clone_s=%.3f restore_s=%.3f "
                     "d2h_s=%.3f page_copy_s=%.3f direct_image_groups=%d "
-                    "direct_image_used_bytes=%d fallback_groups=%d",
+                    "direct_image_used_bytes=%d fallback_groups=%d "
+                    "skipped_initial_copy_bytes=%d "
+                    "preserved_initial_copy_bytes=%d",
                     host_proxy_stats["groups"],
                     time.perf_counter() - phase_started,
                     host_proxy_stats["clone_s"],
@@ -1941,6 +2024,8 @@ class PreparedRuntimeState:
                     host_proxy_stats["direct_image_groups"],
                     host_proxy_stats["direct_image_used_bytes"],
                     host_proxy_stats["fallback_groups"],
+                    host_proxy_stats["skipped_initial_copy_bytes"],
+                    host_proxy_stats["preserved_initial_copy_bytes"],
                 )
                 totals["host_proxy_clone_s"] = host_proxy_stats["clone_s"]
                 totals["host_proxy_restore_s"] = host_proxy_stats["restore_s"]
@@ -1951,15 +2036,12 @@ class PreparedRuntimeState:
                     "direct_image_capacity_bytes",
                     "direct_image_used_bytes",
                     "fallback_groups",
+                    "skipped_initial_copy_bytes",
+                    "preserved_initial_copy_bytes",
                 ):
                     totals[f"host_proxy_{name}"] = host_proxy_stats[name]
 
                 phase_started = time.perf_counter()
-                from sglang.srt.model_loader.prepared_load_plan import (
-                    get_or_create_prepared_load_plan,
-                )
-
-                prepared_load_plan = get_or_create_prepared_load_plan(model)
                 if prepared_load_plan is not None and prepared_load_plan.recorded:
                     load_plan_stats = prepared_load_plan.replay(
                         load_proxy,
@@ -2300,6 +2382,12 @@ class PreparedRuntimeState:
             ),
             "host_proxy_fallback_groups": int(
                 totals["host_proxy_fallback_groups"]
+            ),
+            "host_proxy_skipped_initial_copy_bytes": int(
+                totals["host_proxy_skipped_initial_copy_bytes"]
+            ),
+            "host_proxy_preserved_initial_copy_bytes": int(
+                totals["host_proxy_preserved_initial_copy_bytes"]
             ),
             "single_pass_load_s": round(float(totals["single_pass_load_s"]), 6),
             "load_plan_hits": int(totals["load_plan_hits"]),

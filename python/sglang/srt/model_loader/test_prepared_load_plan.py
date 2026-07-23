@@ -138,6 +138,45 @@ def test_record_classifies_direct_derived_and_forced_fallback():
     assert "part_b" in plan.fallback
     assert "tail" in plan.fallback
     assert not hasattr(model.norm, "weight_loader")
+    assert set(plan.fully_overwritten_parameters) == {
+        "plain",
+        "stacked",
+        "fused",
+        "tail",
+        "norm",
+    }
+    assert plan.fully_overwritten_parameter_names(model) == {
+        "plain",
+        "stacked",
+        "fused",
+        "tail",
+        "norm",
+    }
+
+
+def test_record_does_not_elide_partially_written_storage():
+    class PartialModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8), requires_grad=False)
+
+            def partial_loader(parameter, loaded_weight):
+                parameter.data[:4].copy_(loaded_weight)
+
+            self.weight.weight_loader = partial_loader
+
+        def load_weights(self, weights):
+            for _, loaded_weight in weights:
+                self.weight.weight_loader(self.weight, loaded_weight)
+
+    model = PartialModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(model)
+    stats = plan.record(model, [("weight", torch.ones(4))])
+
+    assert stats["fully_overwritten_parameters"] == 0
+    assert plan.fully_overwritten_parameter_names(model) == set()
 
 
 def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():

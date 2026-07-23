@@ -706,6 +706,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.sampler = create_sampler()
         self.load_model()
         self._prepare_moe_topk()
+        if os.environ.get("SGLANG_PROFILE_RUNTIME_STATE", "0") == "1":
+            self._log_runtime_state_inventory()
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
@@ -1423,6 +1425,145 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     or self.server_args.mooncake_ib_device
                 ),
             )
+
+    def _log_runtime_state_inventory(self) -> None:
+        """Log unique tensor storage owned by the loaded model.
+
+        Checkpoint bytes and iterator yield counts are not the physical reload
+        volume.  The lower bound is the unique runtime storage that a forward
+        can observe, after TP/EP sharding, fusion, quantization layout changes,
+        and aliasing.  Keep this diagnostic env-gated because walking every
+        module attribute is useful for reload design but unnecessary in normal
+        serving.
+        """
+
+        storages: dict[tuple, dict[str, Any]] = {}
+        registered_storage_keys: set[tuple] = set()
+        loadable_storage_keys: set[tuple] = set()
+        named_counts = defaultdict(int)
+
+        def add_tensor(kind: str, name: str, tensor: torch.Tensor) -> None:
+            if tensor.device.type == "meta":
+                return
+            try:
+                storage = tensor.untyped_storage()
+                storage_bytes = storage.nbytes()
+                pointer = storage.data_ptr()
+            except (RuntimeError, TypeError):
+                return
+            key = (
+                tensor.device.type,
+                tensor.device.index,
+                pointer if storage_bytes else id(storage),
+                storage_bytes,
+            )
+            entry = storages.setdefault(
+                key,
+                {
+                    "device": str(tensor.device),
+                    "dtype": str(tensor.dtype),
+                    "storage_bytes": storage_bytes,
+                    "logical_bytes": 0,
+                    "names": [],
+                    "kinds": set(),
+                },
+            )
+            entry["logical_bytes"] = max(
+                entry["logical_bytes"], tensor.numel() * tensor.element_size()
+            )
+            if len(entry["names"]) < 12:
+                entry["names"].append(name)
+            entry["kinds"].add(kind)
+            named_counts[kind] += 1
+            if kind in ("parameter", "buffer"):
+                registered_storage_keys.add(key)
+            if kind == "parameter" and hasattr(tensor, "weight_loader"):
+                loadable_storage_keys.add(key)
+
+        for name, parameter in self.model.named_parameters(remove_duplicate=False):
+            add_tensor("parameter", name, parameter)
+        for name, buffer in self.model.named_buffers(remove_duplicate=False):
+            add_tensor("buffer", name, buffer)
+
+        # Some fused kernels keep tensors as ordinary Python attributes instead
+        # of registered parameters/buffers.  Inspect shallow containers on every
+        # module so the inventory exposes those bytes separately rather than
+        # silently under-counting the state a forward pass can observe.
+        def walk_attribute(value: Any, name: str, depth: int = 0) -> None:
+            if isinstance(value, torch.Tensor):
+                add_tensor("attribute", name, value)
+            elif depth < 2 and isinstance(value, dict):
+                for child_name, child in value.items():
+                    walk_attribute(child, f"{name}[{child_name!r}]", depth + 1)
+            elif depth < 2 and isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    walk_attribute(child, f"{name}[{index}]", depth + 1)
+
+        reserved_module_attributes = {"_parameters", "_buffers", "_modules"}
+        for module_name, module in self.model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for attribute_name, value in vars(module).items():
+                if attribute_name in reserved_module_attributes:
+                    continue
+                walk_attribute(value, f"{prefix}{attribute_name}")
+
+        cuda_storages = {
+            key: entry for key, entry in storages.items() if key[0] == "cuda"
+        }
+        registered_cuda_keys = registered_storage_keys & cuda_storages.keys()
+        attribute_only_cuda_keys = cuda_storages.keys() - registered_storage_keys
+
+        def bytes_for(keys) -> int:
+            return sum(cuda_storages[key]["storage_bytes"] for key in keys)
+
+        dtype_bytes = defaultdict(int)
+        for entry in cuda_storages.values():
+            dtype_bytes[entry["dtype"]] += entry["storage_bytes"]
+
+        largest = sorted(
+            cuda_storages.values(),
+            key=lambda entry: entry["storage_bytes"],
+            reverse=True,
+        )[:24]
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        report = {
+            "rank": rank,
+            "stage": "runtime_state_inventory",
+            "model_type": type(self.model).__name__,
+            "named_tensor_counts": dict(sorted(named_counts.items())),
+            "unique_cuda_storages": len(cuda_storages),
+            "all_cuda_storage_gb": round(bytes_for(cuda_storages.keys()) / 1e9, 6),
+            "registered_cuda_storage_gb": round(
+                bytes_for(registered_cuda_keys) / 1e9, 6
+            ),
+            "attribute_only_cuda_storage_gb": round(
+                bytes_for(attribute_only_cuda_keys) / 1e9, 6
+            ),
+            "checkpoint_loadable_cuda_storage_gb": round(
+                bytes_for(loadable_storage_keys & cuda_storages.keys()) / 1e9, 6
+            ),
+            "alias_storage_count": sum(
+                len(entry["names"]) > 1 for entry in cuda_storages.values()
+            ),
+            "cuda_storage_gb_by_dtype": {
+                dtype: round(num_bytes / 1e9, 6)
+                for dtype, num_bytes in sorted(dtype_bytes.items())
+            },
+            "torch_cuda_allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 6),
+            "torch_cuda_reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 6),
+            "largest_cuda_storages": [
+                {
+                    "storage_gb": round(entry["storage_bytes"] / 1e9, 6),
+                    "logical_gb": round(entry["logical_bytes"] / 1e9, 6),
+                    "device": entry["device"],
+                    "dtype": entry["dtype"],
+                    "kinds": sorted(entry["kinds"]),
+                    "names": entry["names"],
+                }
+                for entry in largest
+            ],
+        }
+        logger.info("[RL_RUNTIME_STATE] %s", json.dumps(report, sort_keys=True))
 
     def load_model(self):
         tic_total = time.perf_counter()

@@ -413,7 +413,15 @@ class PreparedRuntimeState:
     def begin_preparation(self, identity: str) -> RuntimeStateImage:
         """Allocate a fresh dense image for all checkpoint-derived storages."""
 
-        self.prepared = self.allocate_image(identity)
+        if self.prepared is None or self.prepared is self.active:
+            self.prepared = self.allocate_image(identity)
+        else:
+            # After the second successful commit ``prepared`` is the previous
+            # active image. It is no longer needed for serving and is exactly
+            # the right-sized scratch buffer for the next target. Reuse it
+            # instead of transiently allocating a third full image before the
+            # old reference can be released.
+            self.prepared.identity = identity
         self._staged_image = None
         self._staged_tail = []
         self._gpu_stage = None
@@ -792,6 +800,7 @@ class PreparedRuntimeState:
             "pack_s": 0.0,
             "h2d_s": 0.0,
             "broadcast_s": 0.0,
+            "cleanup_gc_s": 0.0,
         }
         try:
             batched_mmap = (
@@ -898,7 +907,15 @@ class PreparedRuntimeState:
                     batch_stats["broadcast_s"],
                 )
                 del shadow, proxy
+                cleanup_gc_started = time.perf_counter()
                 gc.collect()
+                cleanup_gc_s = time.perf_counter() - cleanup_gc_started
+                totals["cleanup_gc_s"] += cleanup_gc_s
+                logger.info(
+                    "[RL_PREPARED_STATE] group=%s cleanup_gc_s=%.3f",
+                    path,
+                    cleanup_gc_s,
+                )
         finally:
             self._checkpoint_device_buffer = None
             torch.cuda.empty_cache()
@@ -933,6 +950,7 @@ class PreparedRuntimeState:
             "pack_s": round(float(totals["pack_s"]), 6),
             "h2d_s": round(float(totals["h2d_s"]), 6),
             "broadcast_s": round(float(totals["broadcast_s"]), 6),
+            "cleanup_gc_s": round(float(totals["cleanup_gc_s"]), 6),
             "wall_s": round(time.perf_counter() - started, 6),
         }
 

@@ -2,6 +2,7 @@ import torch
 
 from sglang.srt.weight_sync.runtime_state import (
     PreparedRuntimeState,
+    RuntimeStateImage,
     checkpoint_module_path,
     clone_module_proxy,
     clone_module_tensors,
@@ -188,3 +189,49 @@ def test_allocate_image_falls_back_when_full_pin_fails(monkeypatch):
     assert image.identity == "v1"
     assert image.bytes.numel() == 32
     assert not state._full_pinned
+
+
+def test_begin_preparation_reuses_rollback_image():
+    state = object.__new__(PreparedRuntimeState)
+    state.active = None
+    state.prepared = RuntimeStateImage(
+        bytes=torch.empty(16, dtype=torch.uint8),
+        identity="old",
+    )
+    state._staged_image = object()
+    state._staged_tail = [object()]
+    state._gpu_stage = object()
+    state._gpu_stage_image_offset = 7
+
+    old_bytes = state.prepared.bytes
+    image = state.begin_preparation("next")
+
+    assert image.bytes is old_bytes
+    assert image.identity == "next"
+    assert state._staged_image is None
+    assert state._staged_tail == []
+    assert state._gpu_stage is None
+    assert state._gpu_stage_image_offset == 0
+
+
+def test_begin_preparation_does_not_overwrite_active_rollback(monkeypatch):
+    state = object.__new__(PreparedRuntimeState)
+    state.active = RuntimeStateImage(
+        bytes=torch.empty(16, dtype=torch.uint8),
+        identity="active",
+    )
+    state.prepared = state.active
+    state._staged_image = None
+    state._staged_tail = []
+    state._gpu_stage = None
+    state._gpu_stage_image_offset = 0
+    replacement = RuntimeStateImage(
+        bytes=torch.empty(16, dtype=torch.uint8),
+        identity="next",
+    )
+    monkeypatch.setattr(state, "allocate_image", lambda identity: replacement)
+
+    image = state.begin_preparation("next")
+
+    assert image is replacement
+    assert state.active.identity == "active"

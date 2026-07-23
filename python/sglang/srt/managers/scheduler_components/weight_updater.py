@@ -151,7 +151,11 @@ class SchedulerWeightUpdaterManager:
                 target_version=recv_req.target_version,
                 pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
             )
-            if os.environ.get("SGLANG_ENABLE_PREPARED_RUNTIME_RELOAD", "0") == "1":
+            if (
+                recv_req.target_version > 0
+                and os.environ.get("SGLANG_ENABLE_PREPARED_RUNTIME_RELOAD", "0")
+                == "1"
+            ):
                 prepare_stats = self.tp_worker.prepare_runtime_state_from_disk(
                     model_path=recv_req.local_checkpoint_dir,
                     load_format=server_args.load_format,

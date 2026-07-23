@@ -363,15 +363,26 @@ class PreparedRuntimeState:
         self._gpu_stage: torch.Tensor | None = None
         self._gpu_stage_image_offset = 0
         self._checkpoint_device_buffer: torch.Tensor | None = None
+        self._full_pinned = (
+            os.environ.get("SGLANG_PREPARED_FULL_PINNED_IMAGE", "0") == "1"
+        )
+        self._preallocated_image_bytes: torch.Tensor | None = None
 
     @property
     def prepared_identity(self) -> str | None:
         return self.prepared.identity if self.prepared is not None else None
 
     def allocate_image(self, identity: str) -> RuntimeStateImage:
-        return RuntimeStateImage(
-            bytes=torch.empty(self.image_nbytes, dtype=torch.uint8), identity=identity
-        )
+        if self._preallocated_image_bytes is not None:
+            image_bytes = self._preallocated_image_bytes
+            self._preallocated_image_bytes = None
+        else:
+            image_bytes = torch.empty(
+                self.image_nbytes,
+                dtype=torch.uint8,
+                pin_memory=self._full_pinned,
+            )
+        return RuntimeStateImage(bytes=image_bytes, identity=identity)
 
     def capture_active(self, identity: str) -> dict[str, float | int]:
         """Snapshot the currently serving model; intended for background setup."""
@@ -593,9 +604,39 @@ class PreparedRuntimeState:
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
         if self.prepared is None:
             raise RuntimeError("begin_preparation must run first")
-        self._ensure_transfer_buffers()
         shadow_tensors = dict(iter_model_tensors(shadow))
         prefix = f"{path}."
+
+        if self.prepared.bytes.is_pinned():
+            copied = 0
+            with torch.cuda.stream(self._stream):
+                for segment in self.segments:
+                    if not segment.name.startswith(prefix):
+                        continue
+                    relative_name = segment.name[len(prefix) :]
+                    tensor = shadow_tensors.get(relative_name)
+                    if tensor is None:
+                        raise RuntimeError(
+                            f"prepared shadow {path!r} is missing runtime tensor "
+                            f"{relative_name!r}"
+                        )
+                    shadow_bytes = _storage_bytes(tensor)
+                    if shadow_bytes.numel() != segment.nbytes:
+                        raise RuntimeError(
+                            f"prepared storage changed shape for {segment.name}: "
+                            f"live={segment.nbytes} bytes, "
+                            f"shadow={shadow_bytes.numel()} bytes"
+                        )
+                    begin = segment.image_offset
+                    self.prepared.bytes[begin : begin + segment.nbytes].copy_(
+                        shadow_bytes,
+                        non_blocking=True,
+                    )
+                    copied += segment.nbytes
+            self._stream.synchronize()
+            return copied
+
+        self._ensure_transfer_buffers()
         copied = 0
 
         def chunks():
@@ -909,9 +950,23 @@ class PreparedRuntimeState:
         """Pay page-locking/allocation costs once during engine startup."""
 
         started = time.perf_counter()
+        if self._full_pinned:
+            if self.prepared is None and self._preallocated_image_bytes is None:
+                self._preallocated_image_bytes = torch.empty(
+                    self.image_nbytes,
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+            return {
+                "full_pinned_image_bytes": self.image_nbytes,
+                "pinned_prefix_bytes": 0,
+                "tail_buffer_bytes": 0,
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
         pinned_prefix_bytes = self._ensure_pinned_prefix()
         self._ensure_transfer_buffers()
         return {
+            "full_pinned_image_bytes": 0,
             "pinned_prefix_bytes": pinned_prefix_bytes,
             "tail_buffer_bytes": sum(item.numel() for item in self._tail_buffers),
             "wall_s": round(time.perf_counter() - started, 6),
@@ -1037,6 +1092,17 @@ class PreparedRuntimeState:
         if self.prepared is None:
             raise RuntimeError("no prepared runtime image")
         started = time.perf_counter()
+        if self.prepared.bytes.is_pinned():
+            self._staged_image = self.prepared
+            self._staged_tail = []
+            self._gpu_stage = None
+            return {
+                "pinned_prefix_bytes": self.image_nbytes,
+                "tail_buffer_bytes": 0,
+                "gpu_stage_bytes": 0,
+                "gpu_stage_wall_s": 0.0,
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
         requested = self._ensure_pinned_prefix()
         self._ensure_transfer_buffers()
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
@@ -1091,6 +1157,25 @@ class PreparedRuntimeState:
         return copies
 
     def _copy_to_device(self, image: RuntimeStateImage) -> dict[str, float | int]:
+        if image.bytes.is_pinned():
+            if self._staged_image is not image:
+                raise RuntimeError("requested runtime image is not staged")
+            wall_started = time.perf_counter()
+            with torch.cuda.stream(self._stream):
+                copies = self._scatter_range(0, image.bytes, self._stream)
+            self._stream.synchronize()
+            wall_s = time.perf_counter() - wall_started
+            return {
+                "bytes": self.image_nbytes,
+                "copies": copies,
+                "cpu_tail_copy_thread_s": 0.0,
+                "gpu_stage_bytes": 0,
+                "wall_s": round(wall_s, 6),
+                "gbps": round(
+                    self.image_nbytes / max(wall_s, 1e-9) / 1e9,
+                    3,
+                ),
+            }
         if self._pinned_prefix is None or not self._tail_buffers:
             raise RuntimeError("stage_prepared must run before commit")
         if self._staged_image is not image:

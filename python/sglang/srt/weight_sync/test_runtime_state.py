@@ -154,3 +154,17 @@ def test_parallel_memcpy_copies_disjoint_cpu_ranges():
     assert elapsed >= 0
     assert torch.equal(destination[:4096], first)
     assert torch.equal(destination[5000:5256], second)
+
+
+def test_allocate_image_consumes_preallocated_buffer():
+    state = object.__new__(PreparedRuntimeState)
+    state.image_nbytes = 32
+    state._full_pinned = True
+    preallocated = torch.empty(32, dtype=torch.uint8)
+    state._preallocated_image_bytes = preallocated
+
+    image = state.allocate_image("v1")
+
+    assert image.identity == "v1"
+    assert image.bytes is preallocated
+    assert state._preallocated_image_bytes is None

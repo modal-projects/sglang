@@ -78,3 +78,23 @@ def test_clone_module_tensors_preserves_aliases_and_shares_non_tensor_state():
     with torch.no_grad():
         cloned.weight.add_(10)
     assert torch.equal(module.weight, torch.arange(8.0))
+
+
+def test_clone_module_tensors_preserves_sglang_parameter_subclass():
+    from sglang.srt.layers.parameter import ModelWeightParameter
+
+    parameter = ModelWeightParameter(
+        data=torch.empty(2, 2),
+        output_dim=1,
+        input_dim=1,
+        weight_loader=lambda _: None,
+    )
+    module = torch.nn.Module()
+    module.register_parameter("weight", parameter)
+
+    cloned = clone_module_tensors(module)
+
+    assert type(cloned.weight) is type(parameter)
+    assert cloned.weight.output_dim == parameter.output_dim
+    assert cloned.weight.input_dim == parameter.input_dim
+    assert cloned.weight.weight_loader is parameter.weight_loader

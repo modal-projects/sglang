@@ -189,10 +189,11 @@ def _clone_tensor_storage(
         tuple(tensor.stride()),
     )
     if isinstance(tensor, torch.nn.Parameter):
-        cloned = copy.copy(tensor)
+        cloned = type(tensor)._make_subclass(
+            type(tensor), view, tensor.requires_grad
+        )
         if hasattr(tensor, "__dict__"):
             cloned.__dict__.update(tensor.__dict__)
-        cloned.data = view
     else:
         cloned = view.requires_grad_(tensor.requires_grad)
         if hasattr(tensor, "__dict__"):

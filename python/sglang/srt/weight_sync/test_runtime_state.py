@@ -1,11 +1,16 @@
 import torch
+from sglang.srt.models.utils import WeightsMapper
 
 from sglang.srt.weight_sync.runtime_state import (
     PreparedRuntimeState,
+    RuntimeModuleGroup,
     RuntimeStateImage,
+    build_runtime_module_groups,
     checkpoint_module_path,
     clone_module_proxy,
     clone_module_tensors,
+    grouped_mmap_weights_iterator,
+    map_checkpoint_names_to_runtime_groups,
     ordered_mmap_weights_iterator,
     runtime_module_path,
 )
@@ -46,6 +51,79 @@ def test_runtime_module_path_includes_derived_state_but_excludes_static_state():
     assert runtime_module_path(
         "language_model.model.layers.17.rotary_emb.inv_freq"
     ) == ("language_model.model.layers.17")
+
+
+def test_runtime_module_groups_derive_bounded_model_frontier():
+    model = _ToyModel()
+    groups = build_runtime_module_groups(
+        model,
+        max_group_bytes=model.language_model.model.layers[0].weight.nbytes,
+        device_type="cpu",
+    )
+
+    assert groups == [
+        RuntimeModuleGroup(
+            path=f"language_model.model.layers.{index}",
+            nbytes=model.language_model.model.layers[index].weight.nbytes,
+        )
+        for index in range(3)
+    ]
+
+
+def test_checkpoint_names_map_to_runtime_groups_without_model_patterns():
+    model = _ToyModel()
+    groups = [
+        RuntimeModuleGroup(
+            path=f"language_model.model.layers.{index}",
+            nbytes=model.language_model.model.layers[index].weight.nbytes,
+        )
+        for index in range(3)
+    ]
+
+    mapping = map_checkpoint_names_to_runtime_groups(
+        model,
+        [
+            "language_model.model.layers.0.weight",
+            "language_model.model.layers.2.weight",
+        ],
+        groups,
+    )
+
+    assert mapping == {
+        "language_model.model.layers.0.weight": "language_model.model.layers.0",
+        "language_model.model.layers.2.weight": "language_model.model.layers.2",
+    }
+
+
+def test_checkpoint_names_use_model_mapper_and_skip_explicit_ignores():
+    model = _ToyModel()
+    model.hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+            "unused.": None,
+        }
+    )
+    groups = [
+        RuntimeModuleGroup(
+            path=f"language_model.model.layers.{index}",
+            nbytes=model.language_model.model.layers[index].weight.nbytes,
+        )
+        for index in range(3)
+    ]
+
+    mapping = map_checkpoint_names_to_runtime_groups(
+        model,
+        [
+            "language_model.layers.1.weight",
+            "unused.rotary_cache",
+        ],
+        groups,
+    )
+
+    assert mapping == {
+        "language_model.layers.1.weight": "language_model.model.layers.1",
+        "unused.rotary_cache": None,
+    }
 
 
 def test_clone_module_proxy_replaces_only_selected_path():
@@ -136,6 +214,57 @@ def test_ordered_mmap_weights_iterator_merges_checkpoint_shards(tmp_path):
         "language_model.model.layers.1.b",
     ]
     assert [tensor.item() for _, tensor in items] == [1, 11, 12]
+
+
+def test_grouped_mmap_weights_iterator_yields_complete_runtime_frontier(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    filename = "model.safetensors"
+    save_file(
+        {
+            "language_model.model.layers.0.weight": torch.tensor([1]),
+            "language_model.model.layers.2.weight": torch.tensor([3]),
+        },
+        tmp_path / filename,
+    )
+    index = {
+        "weight_map": {
+            "language_model.model.layers.0.weight": filename,
+            "language_model.model.layers.2.weight": filename,
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    model = _ToyModel()
+    groups = [
+        RuntimeModuleGroup(
+            path=f"language_model.model.layers.{index}",
+            nbytes=model.language_model.model.layers[index].weight.nbytes,
+        )
+        for index in range(3)
+    ]
+
+    grouped = [
+        (path, [(name, tensor.item()) for name, tensor in weights])
+        for path, weights in grouped_mmap_weights_iterator(
+            str(tmp_path),
+            model,
+            groups,
+        )
+    ]
+
+    assert grouped == [
+        (
+            "language_model.model.layers.0",
+            [("language_model.model.layers.0.weight", 1)],
+        ),
+        ("language_model.model.layers.1", []),
+        (
+            "language_model.model.layers.2",
+            [("language_model.model.layers.2.weight", 3)],
+        ),
+    ]
 
 
 def test_parallel_memcpy_copies_disjoint_cpu_ranges():

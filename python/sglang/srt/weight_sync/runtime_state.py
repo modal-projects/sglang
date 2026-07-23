@@ -5,14 +5,14 @@ the final commit primitive for a faster path: all checkpoint parsing, sharding,
 fusion and quantization must already have produced a byte-exact host image of
 the model's live CUDA storages before :meth:`commit` is called.
 
-The implementation is intentionally dense-update safe.  It inventories every
-unique checkpoint-derived runtime storage rather than changed tensor names,
-copies every byte in that inventory, and preserves aliases by overwriting
-existing storage instead of rebinding Parameters.  Checkpoint-invariant CUDA
-buffers are deliberately excluded: copying them would add hundreds of gigabytes
-of needless GPU-to-host traffic without changing the result.  A bounded pinned
-prefix and two pinned streaming buffers keep the design within hosts that cannot
-pin an entire 600+ GB tensor-parallel runtime image.
+The implementation is intentionally dense-update safe. It inventories runtime
+storage rather than changed tensor names, copies every byte in that inventory,
+and preserves aliases by overwriting existing storage instead of rebinding
+Parameters. The legacy model-specific preparer excludes checkpoint-invariant
+CUDA state; architecture-neutral grouping includes every discovered CUDA
+storage so it does not need such a classification. Bounded scratch modules and
+staging buffers keep the design within hosts that cannot hold a second model in
+HBM.
 """
 
 from __future__ import annotations
@@ -68,6 +68,14 @@ class HostLoadTarget:
     name: str
     parameter: torch.nn.Parameter
     host_data: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RuntimeModuleGroup:
+    """A bounded module subtree used as one scratch preparation unit."""
+
+    path: str
+    nbytes: int
 
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
@@ -134,12 +142,16 @@ def runtime_module_path(name: str) -> str | None:
 
 def build_runtime_storage_plan(
     model: torch.nn.Module,
+    *,
+    include_all_cuda_tensors: bool = False,
 ) -> tuple[list[RuntimeStorageSegment], int]:
     """Build a deterministic checkpoint-derived plan without changing addresses."""
 
     unique: dict[tuple[int | None, int, int], tuple[str, torch.Tensor]] = {}
     for name, tensor in iter_model_tensors(model):
-        if tensor.device.type != "cuda" or runtime_module_path(name) is None:
+        if tensor.device.type != "cuda" or (
+            not include_all_cuda_tensors and runtime_module_path(name) is None
+        ):
             continue
         storage = tensor.untyped_storage()
         nbytes = storage.nbytes()
@@ -163,6 +175,171 @@ def build_runtime_storage_plan(
         )
         offset += device_bytes.numel()
     return segments, _align_up(offset)
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
+    storage = tensor.untyped_storage()
+    return tensor.device.index, storage.data_ptr(), storage.nbytes()
+
+
+def _iter_direct_module_tensors(
+    module: torch.nn.Module,
+) -> Iterable[torch.Tensor]:
+    """Yield tensors owned directly by one module, excluding child subtrees."""
+
+    yield from (item for item in module._parameters.values() if item is not None)
+    yield from (item for item in module._buffers.values() if item is not None)
+    reserved = {"_parameters", "_buffers", "_modules"}
+    for name, value in vars(module).items():
+        if name in reserved:
+            continue
+        yield from (tensor for _, tensor in _walk_attribute(value, name))
+
+
+def build_runtime_module_groups(
+    model: torch.nn.Module,
+    *,
+    max_group_bytes: int,
+    device_type: str = "cuda",
+) -> list[RuntimeModuleGroup]:
+    """Partition a model tree into bounded, storage-complete scratch groups.
+
+    The partition is derived only from the loaded runtime structure. A subtree
+    becomes a group when its unique CUDA storage fits the configured scratch
+    budget; larger containers recurse into their children. This naturally
+    selects transformer blocks for large models without recognizing model
+    classes or layer-name patterns.
+
+    A large container that directly owns CUDA tensors as well as child modules
+    cannot be split safely by the current proxy cloner. Fail explicitly so the
+    caller can retain the ordinary full-loader fallback.
+    """
+
+    if max_group_bytes <= 0:
+        raise ValueError("runtime module group budget must be positive")
+
+    modules = dict(model.named_modules())
+    subtree_keys: dict[str, set[tuple[int | None, int, int]]] = {}
+    direct_keys: dict[str, set[tuple[int | None, int, int]]] = {}
+    storage_bytes: dict[tuple[int | None, int, int], int] = {}
+
+    def collect(path: str, module: torch.nn.Module):
+        direct: set[tuple[int | None, int, int]] = set()
+        for tensor in _iter_direct_module_tensors(module):
+            if tensor.device.type != device_type:
+                continue
+            key = _tensor_storage_key(tensor)
+            direct.add(key)
+            storage_bytes[key] = key[2]
+        direct_keys[path] = direct
+        subtree = set(direct)
+        prefix = f"{path}." if path else ""
+        for child_name, child in module.named_children():
+            child_path = f"{prefix}{child_name}"
+            subtree.update(collect(child_path, child))
+        subtree_keys[path] = subtree
+        return subtree
+
+    collect("", model)
+    groups: list[RuntimeModuleGroup] = []
+
+    def visit(path: str):
+        module = modules[path]
+        keys = subtree_keys[path]
+        if not keys:
+            return
+        nbytes = sum(storage_bytes[key] for key in keys)
+        children = [
+            f"{path}.{name}" if path else name
+            for name, child in module.named_children()
+            if subtree_keys.get(f"{path}.{name}" if path else name)
+        ]
+        if path and (nbytes <= max_group_bytes or not children):
+            groups.append(RuntimeModuleGroup(path=path, nbytes=nbytes))
+            return
+        if direct_keys[path]:
+            raise ValueError(
+                "cannot bound prepared reload module with direct CUDA tensors "
+                f"and child subtrees: path={path or '<root>'!r} "
+                f"bytes={nbytes} budget={max_group_bytes}"
+            )
+        for child_path in children:
+            visit(child_path)
+
+    visit("")
+    if not groups:
+        raise ValueError("loaded model has no bounded CUDA runtime groups")
+    return groups
+
+
+def _checkpoint_name_candidates(
+    model: torch.nn.Module,
+    name: str,
+    root_prefixes: set[str],
+) -> list[str]:
+    """Return architecture-neutral name candidates for module attribution."""
+
+    candidates = [name]
+    mapper = getattr(model, "hf_to_sglang_mapper", None)
+    if mapper is not None:
+        try:
+            mapped_name = mapper._map_name(name)
+            if mapped_name is None:
+                return []
+            candidates.append(mapped_name)
+        except Exception:
+            logger.debug(
+                "checkpoint name mapper could not map %s for prepared grouping",
+                name,
+                exc_info=True,
+            )
+    for candidate in list(candidates):
+        first = candidate.split(".", 1)[0]
+        for prefix in root_prefixes:
+            if first != prefix:
+                candidates.append(f"{prefix}.{candidate}")
+    return list(dict.fromkeys(candidates))
+
+
+def map_checkpoint_names_to_runtime_groups(
+    model: torch.nn.Module,
+    names: Iterable[str],
+    groups: list[RuntimeModuleGroup],
+) -> dict[str, str | None]:
+    """Map every checkpoint tensor to a bounded live module subtree."""
+
+    paths = sorted((group.path for group in groups), key=len, reverse=True)
+    root_prefixes = {path.split(".", 1)[0] for path in paths}
+    result: dict[str, str | None] = {}
+    for name in names:
+        candidates = _checkpoint_name_candidates(
+            model,
+            name,
+            root_prefixes,
+        )
+        if not candidates:
+            result[name] = None
+            continue
+        matches = {
+            path
+            for candidate in candidates
+            for path in paths
+            if candidate == path or candidate.startswith(f"{path}.")
+        }
+        if not matches:
+            raise ValueError(
+                "checkpoint tensor cannot be attributed to a bounded runtime "
+                f"module group: {name!r}"
+            )
+        # Groups form a disjoint tree frontier, so multiple matches indicate a
+        # bad partition rather than an ambiguity to guess through.
+        if len(matches) != 1:
+            raise ValueError(
+                f"checkpoint tensor maps to multiple runtime groups: "
+                f"{name!r} -> {sorted(matches)}"
+            )
+        result[name] = matches.pop()
+    return result
 
 
 def checkpoint_module_path(name: str) -> str:
@@ -215,6 +392,57 @@ def ordered_mmap_weights_iterator(
         }
         for name in sorted(weight_map):
             yield name, handles[weight_map[name]].get_tensor(name)
+
+
+def grouped_mmap_weights_iterator(
+    model_path: str,
+    model: torch.nn.Module,
+    groups: list[RuntimeModuleGroup],
+) -> Iterable[tuple[str, Iterable[tuple[str, torch.Tensor]]]]:
+    """Yield mmap checkpoint tensors grouped by bounded runtime subtree."""
+
+    from safetensors import safe_open
+
+    index_path = Path(model_path) / "model.safetensors.index.json"
+    with index_path.open() as file:
+        index = json.load(file)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid or empty safetensors weight map: {index_path}")
+
+    group_for_name = map_checkpoint_names_to_runtime_groups(
+        model,
+        weight_map,
+        groups,
+    )
+    names_by_group: dict[str, list[str]] = {}
+    for name in sorted(weight_map):
+        path = group_for_name[name]
+        if path is not None:
+            names_by_group.setdefault(path, []).append(name)
+
+    filenames = sorted(set(weight_map.values()))
+    with ExitStack() as stack:
+        handles = {
+            filename: stack.enter_context(
+                safe_open(
+                    Path(model_path) / filename,
+                    framework="pt",
+                    device="cpu",
+                )
+            )
+            for filename in filenames
+        }
+        # Yield the complete runtime frontier, including groups with no direct
+        # checkpoint tensor. Such groups can contain tied or synthesized state
+        # that must be cloned and postprocessed into the dense runtime image.
+        for group in groups:
+            path = group.path
+            names = names_by_group.get(path, ())
+            yield (
+                path,
+                ((name, handles[weight_map[name]].get_tensor(name)) for name in names),
+            )
 
 
 def _clone_tensor_storage(
@@ -429,7 +657,40 @@ class PreparedRuntimeState:
     """Own active/prepared host images and commit prepared bytes in-place."""
 
     def __init__(self, model: torch.nn.Module):
-        self.segments, self.image_nbytes = build_runtime_storage_plan(model)
+        self._auto_groups = (
+            os.environ.get("SGLANG_PREPARED_AUTO_MODULE_GROUPS", "0") == "1"
+        )
+        self._module_groups: list[RuntimeModuleGroup] = []
+        if self._auto_groups:
+            max_group_bytes = (
+                int(os.environ.get("SGLANG_PREPARED_MAX_GROUP_GB", "8")) * _GIB
+            )
+            self._module_groups = build_runtime_module_groups(
+                model,
+                max_group_bytes=max_group_bytes,
+            )
+        self.segments, self.image_nbytes = build_runtime_storage_plan(
+            model,
+            include_all_cuda_tensors=self._auto_groups,
+        )
+        if self._auto_groups:
+            group_paths = [group.path for group in self._module_groups]
+            for segment in self.segments:
+                matches = [
+                    path
+                    for path in group_paths
+                    if segment.name == path or segment.name.startswith(f"{path}.")
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "runtime storage is not covered by exactly one bounded "
+                        f"module group: {segment.name!r} -> {matches}"
+                    )
+            logger.info(
+                "[RL_PREPARED_STATE] auto module groups=%d max_bytes=%d",
+                len(self._module_groups),
+                max(group.nbytes for group in self._module_groups),
+            )
         self.active: RuntimeStateImage | None = None
         self.prepared: RuntimeStateImage | None = None
         self._pinned_prefix: torch.Tensor | None = None
@@ -913,22 +1174,36 @@ class PreparedRuntimeState:
                     "CPU checkpoint assembly and batched CUDA mmap loading "
                     "are mutually exclusive"
                 )
-            if (
+            mmap_checkpoint = (
                 batched_mmap
                 or os.environ.get("SGLANG_PREPARED_MMAP_CHECKPOINT", "0") == "1"
-            ):
+            )
+            if self._auto_groups and not mmap_checkpoint:
+                raise ValueError(
+                    "automatic runtime module grouping requires the mmap "
+                    "checkpoint iterator"
+                )
+            if mmap_checkpoint:
                 logger.info(
                     "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint%s",
                     " with pinned H2D batching" if batched_mmap else "",
                 )
-                weights = ordered_mmap_weights_iterator(model_path)
+                if self._auto_groups:
+                    grouped = grouped_mmap_weights_iterator(
+                        model_path,
+                        model,
+                        self._module_groups,
+                    )
+                else:
+                    weights = ordered_mmap_weights_iterator(model_path)
             else:
                 weights = loader._get_weights_iterator(
                     DefaultModelLoader.Source.init_new(model_config, model)
                 )
-            grouped = itertools.groupby(
-                weights, key=lambda item: checkpoint_module_path(item[0])
-            )
+            if not self._auto_groups:
+                grouped = itertools.groupby(
+                    weights, key=lambda item: checkpoint_module_path(item[0])
+                )
             for path, group in grouped:
                 if path in seen_paths:
                     raise RuntimeError(

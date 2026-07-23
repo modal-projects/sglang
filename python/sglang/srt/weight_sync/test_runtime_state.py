@@ -1,6 +1,7 @@
 import torch
 
 from sglang.srt.weight_sync.runtime_state import (
+    PreparedRuntimeState,
     checkpoint_module_path,
     clone_module_proxy,
     clone_module_tensors,
@@ -41,9 +42,9 @@ def test_runtime_module_path_includes_derived_state_but_excludes_static_state():
         == "language_model.model.layers.17"
     )
     assert runtime_module_path("language_model.model.rotary_emb.inv_freq") is None
-    assert runtime_module_path("language_model.model.layers.17.rotary_emb.inv_freq") == (
-        "language_model.model.layers.17"
-    )
+    assert runtime_module_path(
+        "language_model.model.layers.17.rotary_emb.inv_freq"
+    ) == ("language_model.model.layers.17")
 
 
 def test_clone_module_proxy_replaces_only_selected_path():
@@ -134,3 +135,22 @@ def test_ordered_mmap_weights_iterator_merges_checkpoint_shards(tmp_path):
         "language_model.model.layers.1.b",
     ]
     assert [tensor.item() for _, tensor in items] == [1, 11, 12]
+
+
+def test_parallel_memcpy_copies_disjoint_cpu_ranges():
+    first = torch.arange(4096, dtype=torch.uint8)
+    second = torch.arange(255, -1, -1, dtype=torch.uint8)
+    destination = torch.zeros(8192, dtype=torch.uint8)
+
+    elapsed = PreparedRuntimeState._parallel_memcpy(
+        destination.data_ptr(),
+        [
+            (0, first.data_ptr(), first.numel()),
+            (5000, second.data_ptr(), second.numel()),
+        ],
+        max_workers=2,
+    )
+
+    assert elapsed >= 0
+    assert torch.equal(destination[:4096], first)
+    assert torch.equal(destination[5000:5256], second)

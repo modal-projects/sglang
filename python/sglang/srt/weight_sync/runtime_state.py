@@ -232,9 +232,7 @@ def _clone_tensor_storage(
         tuple(tensor.stride()),
     )
     if isinstance(tensor, torch.nn.Parameter):
-        cloned = type(tensor)._make_subclass(
-            type(tensor), view, tensor.requires_grad
-        )
+        cloned = type(tensor)._make_subclass(type(tensor), view, tensor.requires_grad)
         if hasattr(tensor, "__dict__"):
             cloned.__dict__.update(tensor.__dict__)
     else:
@@ -352,9 +350,9 @@ class PreparedRuntimeState:
         self._stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._prefix_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._gpu_stage_stream = torch.cuda.Stream(device=torch.cuda.current_device())
-        self._tail_chunk_bytes = int(
-            os.environ.get("SGLANG_PREPARED_TAIL_CHUNK_MIB", "1024")
-        ) * _MIB
+        self._tail_chunk_bytes = (
+            int(os.environ.get("SGLANG_PREPARED_TAIL_CHUNK_MIB", "1024")) * _MIB
+        )
         self._tail_buffer_count = int(
             os.environ.get("SGLANG_PREPARED_TAIL_BUFFER_COUNT", "8")
         )
@@ -364,6 +362,7 @@ class PreparedRuntimeState:
         self._staged_tail: list[tuple[int, int, float] | None] = []
         self._gpu_stage: torch.Tensor | None = None
         self._gpu_stage_image_offset = 0
+        self._checkpoint_device_buffer: torch.Tensor | None = None
 
     @property
     def prepared_identity(self) -> str | None:
@@ -400,6 +399,168 @@ class PreparedRuntimeState:
         self._gpu_stage_image_offset = 0
         return self.prepared
 
+    @staticmethod
+    def _parallel_memcpy(
+        destination_ptr: int,
+        copies: list[tuple[int, int, int]],
+        *,
+        max_workers: int,
+    ) -> float:
+        """Copy independent CPU ranges with a bounded set of memcpy workers."""
+
+        if not copies:
+            return 0.0
+        if max_workers < 1:
+            raise ValueError("parallel memcpy needs at least one worker")
+        bins: list[list[tuple[int, int, int]]] = [
+            [] for _ in range(min(max_workers, len(copies)))
+        ]
+        bin_bytes = [0] * len(bins)
+        for copy_item in sorted(copies, key=lambda item: item[2], reverse=True):
+            bin_index = min(range(len(bins)), key=bin_bytes.__getitem__)
+            bins[bin_index].append(copy_item)
+            bin_bytes[bin_index] += copy_item[2]
+
+        def copy_bin(items: list[tuple[int, int, int]]) -> None:
+            for destination_offset, source_ptr, nbytes in items:
+                ctypes.memmove(
+                    destination_ptr + destination_offset,
+                    source_ptr,
+                    nbytes,
+                )
+
+        started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(bins)) as executor:
+            list(executor.map(copy_bin, bins))
+        return time.perf_counter() - started
+
+    def _iter_batched_cuda_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        target_device: torch.device,
+        stats: dict[str, float | int],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Batch mmap tensors into large pinned H2D transfers.
+
+        The ordinary model loader still sees the exact same named CUDA tensors.
+        A batch remains live until the loader asks for the next one, at which
+        point the current stream is synchronized before either reusable buffer
+        is overwritten.
+        """
+
+        self._ensure_transfer_buffers()
+        host_buffer = self._tail_buffers[0]
+        capacity = host_buffer.numel()
+        if (
+            self._checkpoint_device_buffer is None
+            or self._checkpoint_device_buffer.numel() != capacity
+        ):
+            self._checkpoint_device_buffer = torch.empty(
+                capacity,
+                dtype=torch.uint8,
+                device=target_device,
+            )
+        device_buffer = self._checkpoint_device_buffer
+        stream = torch.cuda.current_stream(target_device)
+        max_workers = int(
+            os.environ.get(
+                "SGLANG_PREPARED_CHECKPOINT_MEMCPY_WORKERS",
+                str(self._tail_buffer_count),
+            )
+        )
+
+        batch: list[tuple[str, torch.Tensor, int, int]] = []
+        batch_bytes = 0
+
+        def drain_batch():
+            nonlocal batch, batch_bytes
+            if not batch:
+                return
+            stream.synchronize()
+            copies = [
+                (offset, tensor.data_ptr(), nbytes)
+                for _, tensor, offset, nbytes in batch
+            ]
+            stats["pack_s"] += self._parallel_memcpy(
+                host_buffer.data_ptr(),
+                copies,
+                max_workers=max_workers,
+            )
+            started = time.perf_counter()
+            device_buffer[:batch_bytes].copy_(
+                host_buffer[:batch_bytes],
+                non_blocking=True,
+            )
+            stream.synchronize()
+            stats["h2d_s"] += time.perf_counter() - started
+            stats["batches"] += 1
+            stats["source_bytes"] += sum(item[3] for item in batch)
+            for name, tensor, offset, _ in batch:
+                element_size = tensor.element_size()
+                loaded = torch.empty(
+                    0,
+                    dtype=tensor.dtype,
+                    device=target_device,
+                ).set_(
+                    device_buffer.untyped_storage(),
+                    offset // element_size,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                )
+                yield name, loaded
+            batch = []
+            batch_bytes = 0
+
+        for name, tensor in weights:
+            if tensor.device.type != "cpu":
+                raise ValueError(
+                    "batched mmap checkpoint expected CPU tensors, got "
+                    f"{tensor.device} for {name}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"batched mmap checkpoint tensor is not contiguous: {name}"
+                )
+            nbytes = tensor.numel() * tensor.element_size()
+            if nbytes > capacity:
+                yield from drain_batch()
+                loaded = torch.empty_like(tensor, device=target_device)
+                loaded_bytes = _storage_bytes(loaded)
+                source_offset = 0
+                while source_offset < nbytes:
+                    size = min(capacity, nbytes - source_offset)
+                    stream.synchronize()
+                    started = time.perf_counter()
+                    ctypes.memmove(
+                        host_buffer.data_ptr(),
+                        tensor.data_ptr() + source_offset,
+                        size,
+                    )
+                    stats["pack_s"] += time.perf_counter() - started
+                    started = time.perf_counter()
+                    loaded_bytes[source_offset : source_offset + size].copy_(
+                        host_buffer[:size],
+                        non_blocking=True,
+                    )
+                    stream.synchronize()
+                    stats["h2d_s"] += time.perf_counter() - started
+                    stats["batches"] += 1
+                    stats["source_bytes"] += size
+                    source_offset += size
+                yield name, loaded
+                stream.synchronize()
+                continue
+
+            offset = _align_up(batch_bytes, max(_ALIGNMENT, tensor.element_size()))
+            if batch and offset + nbytes > capacity:
+                yield from drain_batch()
+                offset = 0
+            batch.append((name, tensor, offset, nbytes))
+            batch_bytes = offset + nbytes
+
+        yield from drain_batch()
+        stream.synchronize()
+
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
         if self.prepared is None:
             raise RuntimeError("begin_preparation must run first")
@@ -407,62 +568,98 @@ class PreparedRuntimeState:
         shadow_tensors = dict(iter_model_tensors(shadow))
         prefix = f"{path}."
         copied = 0
-        buffer = self._tail_buffers[0]
-        buffer_offset = 0
-        pending: list[tuple[int, int, int]] = []
 
-        def flush() -> None:
-            nonlocal buffer_offset
-            if not pending:
-                return
-            self._stream.synchronize()
-            for image_offset, staging_offset, nbytes in pending:
-                self.prepared.bytes[
-                    image_offset : image_offset + nbytes
-                ].copy_(buffer[staging_offset : staging_offset + nbytes])
-            pending.clear()
-            buffer_offset = 0
-
-        for segment in self.segments:
-            if not segment.name.startswith(prefix):
-                continue
-            relative_name = segment.name[len(prefix) :]
-            tensor = shadow_tensors.get(relative_name)
-            if tensor is None:
-                raise RuntimeError(
-                    f"prepared shadow {path!r} is missing runtime tensor "
-                    f"{relative_name!r}"
-                )
-            shadow_bytes = _storage_bytes(tensor)
-            if shadow_bytes.numel() != segment.nbytes:
-                raise RuntimeError(
-                    f"prepared storage changed shape for {segment.name}: "
-                    f"live={segment.nbytes} bytes, shadow={shadow_bytes.numel()} bytes"
-                )
-            source_offset = 0
-            while source_offset < segment.nbytes:
-                if buffer_offset == buffer.numel():
-                    flush()
-                size = min(
-                    segment.nbytes - source_offset,
-                    buffer.numel() - buffer_offset,
-                )
-                with torch.cuda.stream(self._stream):
-                    buffer[buffer_offset : buffer_offset + size].copy_(
-                        shadow_bytes[source_offset : source_offset + size],
-                        non_blocking=True,
+        def chunks():
+            nonlocal copied
+            for segment in self.segments:
+                if not segment.name.startswith(prefix):
+                    continue
+                relative_name = segment.name[len(prefix) :]
+                tensor = shadow_tensors.get(relative_name)
+                if tensor is None:
+                    raise RuntimeError(
+                        f"prepared shadow {path!r} is missing runtime tensor "
+                        f"{relative_name!r}"
                     )
-                pending.append(
-                    (
+                shadow_bytes = _storage_bytes(tensor)
+                if shadow_bytes.numel() != segment.nbytes:
+                    raise RuntimeError(
+                        f"prepared storage changed shape for {segment.name}: "
+                        f"live={segment.nbytes} bytes, "
+                        f"shadow={shadow_bytes.numel()} bytes"
+                    )
+                source_offset = 0
+                while source_offset < segment.nbytes:
+                    size = min(
+                        segment.nbytes - source_offset,
+                        self._tail_chunk_bytes,
+                    )
+                    copied += size
+                    yield (
+                        shadow_bytes[source_offset : source_offset + size],
                         segment.image_offset + source_offset,
-                        buffer_offset,
                         size,
                     )
-                )
-                source_offset += size
-                buffer_offset += size
-                copied += size
-        flush()
+                    source_offset += size
+
+        chunk_iterator = iter(chunks())
+        events = [torch.cuda.Event() for _ in self._tail_buffers]
+
+        def stage(slot: int):
+            try:
+                source, image_offset, size = next(chunk_iterator)
+            except StopIteration:
+                return None
+            buffer = self._tail_buffers[slot]
+            with torch.cuda.stream(self._stream):
+                buffer[:size].copy_(source, non_blocking=True)
+                events[slot].record(self._stream)
+            return image_offset, size
+
+        def copy_to_image(
+            slot: int,
+            image_offset: int,
+            size: int,
+        ) -> None:
+            events[slot].synchronize()
+            ctypes.memmove(
+                self.prepared.bytes.data_ptr() + image_offset,
+                self._tail_buffers[slot].data_ptr(),
+                size,
+            )
+
+        pending: list[concurrent.futures.Future[None] | None] = [None] * len(
+            self._tail_buffers
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self._tail_buffers)
+        ) as executor:
+            for slot in range(len(self._tail_buffers)):
+                item = stage(slot)
+                if item is not None:
+                    pending[slot] = executor.submit(
+                        copy_to_image,
+                        slot,
+                        item[0],
+                        item[1],
+                    )
+            while any(future is not None for future in pending):
+                for slot, future in enumerate(pending):
+                    if future is None:
+                        continue
+                    future.result()
+                    item = stage(slot)
+                    pending[slot] = (
+                        None
+                        if item is None
+                        else executor.submit(
+                            copy_to_image,
+                            slot,
+                            item[0],
+                            item[1],
+                        )
+                    )
+        self._stream.synchronize()
         return copied
 
     def prepare_from_disk(
@@ -496,15 +693,28 @@ class PreparedRuntimeState:
         loader = get_model_loader(LoadConfig(load_format=load_format), model_config)
         if not isinstance(loader, DefaultModelLoader):
             model_config.model_path = original_model_path
-            raise TypeError(f"prepared reload requires DefaultModelLoader, got {loader}")
+            raise TypeError(
+                f"prepared reload requires DefaultModelLoader, got {loader}"
+            )
 
         copied_bytes = 0
         group_count = 0
         seen_paths: set[str] = set()
         try:
-            if os.environ.get("SGLANG_PREPARED_MMAP_CHECKPOINT", "0") == "1":
+            batched_mmap = (
+                os.environ.get(
+                    "SGLANG_PREPARED_BATCHED_MMAP_CHECKPOINT",
+                    "0",
+                )
+                == "1"
+            )
+            if (
+                batched_mmap
+                or os.environ.get("SGLANG_PREPARED_MMAP_CHECKPOINT", "0") == "1"
+            ):
                 logger.info(
-                    "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint"
+                    "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint%s",
+                    " with pinned H2D batching" if batched_mmap else "",
                 )
                 weights = ordered_mmap_weights_iterator(model_path)
             else:
@@ -528,8 +738,21 @@ class PreparedRuntimeState:
                 phase_started = time.perf_counter()
                 restore_weights_before_loading(shadow, target_device)
                 restore_s = time.perf_counter() - phase_started
+                batch_stats: dict[str, float | int] = {
+                    "source_bytes": 0,
+                    "batches": 0,
+                    "pack_s": 0.0,
+                    "h2d_s": 0.0,
+                }
+                group_weights: Iterable[tuple[str, torch.Tensor]] = group
+                if batched_mmap:
+                    group_weights = self._iter_batched_cuda_weights(
+                        group,
+                        target_device,
+                        batch_stats,
+                    )
                 phase_started = time.perf_counter()
-                proxy.load_weights(group)
+                proxy.load_weights(group_weights)
                 load_s = time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
                 for _, module in shadow.named_modules():
@@ -548,7 +771,8 @@ class PreparedRuntimeState:
                 logger.info(
                     "[RL_PREPARED_STATE] group=%s bytes=%d wall_s=%.3f "
                     "clone_s=%.3f restore_s=%.3f load_s=%.3f "
-                    "postprocess_s=%.3f synchronize_s=%.3f d2h_s=%.3f",
+                    "postprocess_s=%.3f synchronize_s=%.3f d2h_s=%.3f "
+                    "source_bytes=%d batches=%d pack_s=%.3f h2d_s=%.3f",
                     path,
                     group_bytes,
                     time.perf_counter() - group_started,
@@ -558,10 +782,16 @@ class PreparedRuntimeState:
                     postprocess_s,
                     synchronize_s,
                     d2h_s,
+                    batch_stats["source_bytes"],
+                    batch_stats["batches"],
+                    batch_stats["pack_s"],
+                    batch_stats["h2d_s"],
                 )
                 del shadow, proxy
                 gc.collect()
         finally:
+            self._checkpoint_device_buffer = None
+            torch.cuda.empty_cache()
             model_config.model_path = original_model_path
 
         expected_bytes = sum(segment.nbytes for segment in self.segments)
@@ -588,9 +818,7 @@ class PreparedRuntimeState:
     def _ensure_transfer_buffers(self) -> None:
         if not self._tail_buffers:
             self._tail_buffers = [
-                torch.empty(
-                    self._tail_chunk_bytes, dtype=torch.uint8, pin_memory=True
-                )
+                torch.empty(self._tail_chunk_bytes, dtype=torch.uint8, pin_memory=True)
                 for _ in range(self._tail_buffer_count)
             ]
 
@@ -623,9 +851,7 @@ class PreparedRuntimeState:
     ) -> list[tuple[int, int, float] | None]:
         if image_end is None:
             image_end = self.image_nbytes
-        ready: list[tuple[int, int, float] | None] = [
-            None
-        ] * self._tail_buffer_count
+        ready: list[tuple[int, int, float] | None] = [None] * self._tail_buffer_count
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self._tail_buffer_count
         ) as executor:
@@ -641,9 +867,7 @@ class PreparedRuntimeState:
                     None,
                     image_end,
                 )
-                image_offset += min(
-                    self._tail_chunk_bytes, image_end - image_offset
-                )
+                image_offset += min(self._tail_chunk_bytes, image_end - image_offset)
             for slot, future in futures.items():
                 image_offset, size, _ = future.result()
                 ready[slot] = (image_offset, size, 0.0)
@@ -673,9 +897,7 @@ class PreparedRuntimeState:
             | concurrent.futures.Future[tuple[int, int, float]]
             | None
         ] = list(self._prefill_tail(image, image_offset, image_end))
-        next_offset = image_offset + sum(
-            item[1] for item in ready if item is not None
-        )
+        next_offset = image_offset + sum(item[1] for item in ready if item is not None)
         events = [torch.cuda.Event() for _ in self._tail_buffers]
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self._tail_buffer_count
@@ -732,12 +954,12 @@ class PreparedRuntimeState:
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
         torch.cuda.empty_cache()
         free_bytes, _ = torch.cuda.mem_get_info()
-        reserve_bytes = int(
-            os.environ.get("SGLANG_PREPARED_GPU_RESERVE_GB", "12")
-        ) * _GIB
-        requested_gpu_bytes = int(
-            os.environ.get("SGLANG_PREPARED_GPU_STAGING_GB", "30")
-        ) * _GIB
+        reserve_bytes = (
+            int(os.environ.get("SGLANG_PREPARED_GPU_RESERVE_GB", "12")) * _GIB
+        )
+        requested_gpu_bytes = (
+            int(os.environ.get("SGLANG_PREPARED_GPU_STAGING_GB", "30")) * _GIB
+        )
         gpu_stage_bytes = min(
             requested_gpu_bytes,
             max(0, free_bytes - reserve_bytes),
@@ -774,9 +996,9 @@ class PreparedRuntimeState:
             end = min(image_end, segment_end)
             if begin >= end:
                 continue
-            segment.device_bytes[
-                begin - segment_start : end - segment_start
-            ].copy_(source[begin - image_start : end - image_start], non_blocking=True)
+            segment.device_bytes[begin - segment_start : end - segment_start].copy_(
+                source[begin - image_start : end - image_start], non_blocking=True
+            )
             copies += 1
         return copies
 
@@ -792,12 +1014,8 @@ class PreparedRuntimeState:
         copies = 0
         wall_started = time.perf_counter()
         with torch.cuda.stream(self._prefix_stream):
-            copies += self._scatter_range(
-                0, self._pinned_prefix, self._prefix_stream
-            )
-        gpu_stage_bytes = (
-            self._gpu_stage.numel() if self._gpu_stage is not None else 0
-        )
+            copies += self._scatter_range(0, self._pinned_prefix, self._prefix_stream)
+        gpu_stage_bytes = self._gpu_stage.numel() if self._gpu_stage is not None else 0
         if self._gpu_stage is not None:
             with torch.cuda.stream(self._gpu_stage_stream):
                 copies += self._scatter_range(
@@ -811,8 +1029,10 @@ class PreparedRuntimeState:
             | concurrent.futures.Future[tuple[int, int, float]]
             | None
         ] = list(self._staged_tail)
-        next_offset = self._pinned_prefix.numel() + gpu_stage_bytes + sum(
-            item[1] for item in self._staged_tail if item is not None
+        next_offset = (
+            self._pinned_prefix.numel()
+            + gpu_stage_bytes
+            + sum(item[1] for item in self._staged_tail if item is not None)
         )
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self._tail_buffer_count
@@ -877,7 +1097,9 @@ class PreparedRuntimeState:
             stats = self._copy_to_device(prepared)
         except Exception:
             if self.active is not None:
-                logger.exception("prepared commit failed; restoring active runtime image")
+                logger.exception(
+                    "prepared commit failed; restoring active runtime image"
+                )
                 self.prepared = self.active
                 self.stage_prepared()
                 self._copy_to_device(self.active)

@@ -468,6 +468,20 @@ class PreparedRuntimeState:
                 str(self._tail_buffer_count),
             )
         )
+        broadcast_checkpoint = (
+            os.environ.get(
+                "SGLANG_PREPARED_BROADCAST_CHECKPOINT",
+                "0",
+            )
+            == "1"
+        )
+        tp_group = None
+        is_source_rank = True
+        if broadcast_checkpoint:
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            is_source_rank = tp_group.rank_in_group == 0
 
         batch: list[tuple[str, torch.Tensor, int, int]] = []
         batch_bytes = 0
@@ -477,22 +491,28 @@ class PreparedRuntimeState:
             if not batch:
                 return
             stream.synchronize()
-            copies = [
-                (offset, tensor.data_ptr(), nbytes)
-                for _, tensor, offset, nbytes in batch
-            ]
-            stats["pack_s"] += self._parallel_memcpy(
-                host_buffer.data_ptr(),
-                copies,
-                max_workers=max_workers,
-            )
-            started = time.perf_counter()
-            device_buffer[:batch_bytes].copy_(
-                host_buffer[:batch_bytes],
-                non_blocking=True,
-            )
-            stream.synchronize()
-            stats["h2d_s"] += time.perf_counter() - started
+            if is_source_rank:
+                copies = [
+                    (offset, tensor.data_ptr(), nbytes)
+                    for _, tensor, offset, nbytes in batch
+                ]
+                stats["pack_s"] += self._parallel_memcpy(
+                    host_buffer.data_ptr(),
+                    copies,
+                    max_workers=max_workers,
+                )
+                started = time.perf_counter()
+                device_buffer[:batch_bytes].copy_(
+                    host_buffer[:batch_bytes],
+                    non_blocking=True,
+                )
+                stream.synchronize()
+                stats["h2d_s"] += time.perf_counter() - started
+            if tp_group is not None:
+                started = time.perf_counter()
+                tp_group.broadcast(device_buffer[:batch_bytes], src=0)
+                stream.synchronize()
+                stats["broadcast_s"] += time.perf_counter() - started
             stats["batches"] += 1
             stats["source_bytes"] += sum(item[3] for item in batch)
             for name, tensor, offset, _ in batch:
@@ -530,20 +550,29 @@ class PreparedRuntimeState:
                 while source_offset < nbytes:
                     size = min(capacity, nbytes - source_offset)
                     stream.synchronize()
-                    started = time.perf_counter()
-                    ctypes.memmove(
-                        host_buffer.data_ptr(),
-                        tensor.data_ptr() + source_offset,
-                        size,
-                    )
-                    stats["pack_s"] += time.perf_counter() - started
-                    started = time.perf_counter()
-                    loaded_bytes[source_offset : source_offset + size].copy_(
-                        host_buffer[:size],
-                        non_blocking=True,
-                    )
-                    stream.synchronize()
-                    stats["h2d_s"] += time.perf_counter() - started
+                    if is_source_rank:
+                        started = time.perf_counter()
+                        ctypes.memmove(
+                            host_buffer.data_ptr(),
+                            tensor.data_ptr() + source_offset,
+                            size,
+                        )
+                        stats["pack_s"] += time.perf_counter() - started
+                        started = time.perf_counter()
+                        loaded_bytes[source_offset : source_offset + size].copy_(
+                            host_buffer[:size],
+                            non_blocking=True,
+                        )
+                        stream.synchronize()
+                        stats["h2d_s"] += time.perf_counter() - started
+                    if tp_group is not None:
+                        started = time.perf_counter()
+                        tp_group.broadcast(
+                            loaded_bytes[source_offset : source_offset + size],
+                            src=0,
+                        )
+                        stream.synchronize()
+                        stats["broadcast_s"] += time.perf_counter() - started
                     stats["batches"] += 1
                     stats["source_bytes"] += size
                     source_offset += size
@@ -743,6 +772,7 @@ class PreparedRuntimeState:
                     "batches": 0,
                     "pack_s": 0.0,
                     "h2d_s": 0.0,
+                    "broadcast_s": 0.0,
                 }
                 group_weights: Iterable[tuple[str, torch.Tensor]] = group
                 if batched_mmap:
@@ -772,7 +802,8 @@ class PreparedRuntimeState:
                     "[RL_PREPARED_STATE] group=%s bytes=%d wall_s=%.3f "
                     "clone_s=%.3f restore_s=%.3f load_s=%.3f "
                     "postprocess_s=%.3f synchronize_s=%.3f d2h_s=%.3f "
-                    "source_bytes=%d batches=%d pack_s=%.3f h2d_s=%.3f",
+                    "source_bytes=%d batches=%d pack_s=%.3f h2d_s=%.3f "
+                    "broadcast_s=%.3f",
                     path,
                     group_bytes,
                     time.perf_counter() - group_started,
@@ -786,6 +817,7 @@ class PreparedRuntimeState:
                     batch_stats["batches"],
                     batch_stats["pack_s"],
                     batch_stats["h2d_s"],
+                    batch_stats["broadcast_s"],
                 )
                 del shadow, proxy
                 gc.collect()

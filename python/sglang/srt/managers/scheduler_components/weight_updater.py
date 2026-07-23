@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 import traceback
 from contextlib import contextmanager
@@ -150,6 +151,13 @@ class SchedulerWeightUpdaterManager:
                 target_version=recv_req.target_version,
                 pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
             )
+            if os.environ.get("SGLANG_ENABLE_PREPARED_RUNTIME_RELOAD", "0") == "1":
+                prepare_stats = self.tp_worker.prepare_runtime_state_from_disk(
+                    model_path=recv_req.local_checkpoint_dir,
+                    load_format=server_args.load_format,
+                    weight_version=str(recv_req.target_version),
+                )
+                logger.info("[RL_PREPARED_STATE] ready=%s", prepare_stats)
             success, message = True, "Success."
         except Exception:
             success, message = False, traceback.format_exc()

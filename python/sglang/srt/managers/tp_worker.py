@@ -104,9 +104,19 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.update_weights_from_disk(
             recv_req.model_path,
             recv_req.load_format,
+            weight_version=recv_req.weight_version,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def prepare_runtime_state_from_disk(
+        self, model_path: str, load_format: str, weight_version: str
+    ):
+        return self.model_runner.prepare_runtime_state_from_disk(
+            model_path=model_path,
+            load_format=load_format,
+            weight_version=weight_version,
+        )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.init_weights_update_group(

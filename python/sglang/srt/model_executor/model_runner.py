@@ -1986,9 +1986,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         model_path: str,
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
+        weight_version: Optional[str] = None,
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        prepared_state = getattr(self, "prepared_runtime_state", None)
+        prepared_identity = (
+            f"{os.path.realpath(model_path)}|{weight_version}"
+            if weight_version is not None
+            else None
+        )
+        if (
+            weight_name_filter is None
+            and prepared_state is not None
+            and prepared_identity == prepared_state.prepared_identity
+        ):
+            stats = prepared_state.commit()
+            self.model_config.model_path = model_path
+            self.server_args.model_path = model_path
+            self.server_args.load_format = load_format
+            self.load_config = LoadConfig(load_format=load_format)
+            logger.info("[RL_PREPARED_COMMIT] %s", json.dumps(stats, sort_keys=True))
+            return True, f"Committed prepared runtime state: {stats}"
+
         profile_enabled = os.environ.get("SGLANG_PROFILE_WEIGHT_RELOAD", "0") == "1"
         profile_started = time.perf_counter()
         profile_cpu_started = time.process_time()
@@ -2126,6 +2146,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
         return True, "Succeeded to update model weights."
+
+    def prepare_runtime_state_from_disk(
+        self, *, model_path: str, load_format: str, weight_version: str
+    ) -> dict[str, Any]:
+        """Prepare finalized runtime bytes while the current model remains live."""
+
+        from sglang.srt.weight_sync.runtime_state import PreparedRuntimeState
+
+        state = getattr(self, "prepared_runtime_state", None)
+        if state is None:
+            state = PreparedRuntimeState(self.model)
+            active_identity = f"{os.path.realpath(self.server_args.model_path)}|active"
+            capture_stats = state.capture_active(active_identity)
+            logger.info("[RL_PREPARED_STATE] captured_active=%s", capture_stats)
+            self.prepared_runtime_state = state
+        identity = f"{os.path.realpath(model_path)}|{weight_version}"
+        return state.prepare_from_disk(
+            model=self.model,
+            model_config=self.model_config,
+            model_path=model_path,
+            load_format=load_format,
+            target_device=torch.device(self.device),
+            identity=identity,
+        )
 
     def init_weights_send_group_for_remote_instance(
         self,

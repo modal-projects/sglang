@@ -190,6 +190,8 @@ def _clone_tensor_storage(
     )
     if isinstance(tensor, torch.nn.Parameter):
         cloned = copy.copy(tensor)
+        if hasattr(tensor, "__dict__"):
+            cloned.__dict__.update(tensor.__dict__)
         cloned.data = view
     else:
         cloned = view.requires_grad_(tensor.requires_grad)

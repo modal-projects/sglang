@@ -61,6 +61,15 @@ class RuntimeStateImage:
     identity: str
 
 
+@dataclass
+class HostLoadTarget:
+    """One registered scratch tensor temporarily assembled in pinned CPU RAM."""
+
+    name: str
+    parameter: torch.nn.Parameter
+    host_data: torch.Tensor
+
+
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -336,6 +345,74 @@ def clone_module_proxy(
         proxy_cursor = proxy_child
         live = live_child
     raise AssertionError("empty module path")
+
+
+def move_load_targets_to_pinned_host(module: torch.nn.Module) -> list[HostLoadTarget]:
+    """Move unique registered parameters to empty pinned host tensors.
+
+    Model ``weight_loader`` functions mostly slice and fuse checkpoint tensors
+    into a much smaller set of rank-local Parameters.  Letting those functions
+    write CPU mmap tensors directly into pinned CPU Parameters avoids issuing
+    thousands of tiny pageable H2D copies.  The completed Parameters are copied
+    to CUDA in a few large transfers before quantization post-processing.
+
+    This is deliberately a storage transport primitive, not a model-specific
+    load plan: the model's ordinary ``load_weights`` implementation still owns
+    all name mapping, sharding, expert placement, and fusion semantics.
+    """
+
+    targets: list[HostLoadTarget] = []
+    seen: set[int] = set()
+    for name, parameter in module.named_parameters(remove_duplicate=False):
+        if id(parameter) in seen or parameter.device.type != "cuda":
+            continue
+        seen.add(id(parameter))
+        host_data = torch.empty_strided(
+            tuple(parameter.shape),
+            tuple(parameter.stride()),
+            dtype=parameter.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        parameter.data = host_data
+        targets.append(
+            HostLoadTarget(
+                name=name,
+                parameter=parameter,
+                host_data=host_data,
+            )
+        )
+    return targets
+
+
+def move_load_targets_to_device(
+    targets: list[HostLoadTarget],
+    target_device: torch.device,
+    stream: torch.cuda.Stream,
+) -> tuple[int, int]:
+    """Move assembled Parameters back to CUDA with large nonblocking copies."""
+
+    copies = 0
+    copied_bytes = 0
+    with torch.cuda.stream(stream):
+        for target in targets:
+            if target.parameter.device.type != "cpu":
+                raise RuntimeError(
+                    "CPU assembly changed a load target's device unexpectedly: "
+                    f"{target.name} is on {target.parameter.device}"
+                )
+            device_data = torch.empty_strided(
+                tuple(target.host_data.shape),
+                tuple(target.host_data.stride()),
+                dtype=target.host_data.dtype,
+                device=target_device,
+            )
+            device_data.copy_(target.host_data, non_blocking=True)
+            target.parameter.data = device_data
+            copies += 1
+            copied_bytes += target.host_data.untyped_storage().nbytes()
+    stream.synchronize()
+    return copies, copied_bytes
 
 
 class PreparedRuntimeState:
@@ -801,6 +878,10 @@ class PreparedRuntimeState:
             "h2d_s": 0.0,
             "broadcast_s": 0.0,
             "cleanup_gc_s": 0.0,
+            "host_target_alloc_s": 0.0,
+            "raw_h2d_s": 0.0,
+            "raw_h2d_bytes": 0,
+            "raw_h2d_copies": 0,
         }
         try:
             batched_mmap = (
@@ -810,6 +891,18 @@ class PreparedRuntimeState:
                 )
                 == "1"
             )
+            cpu_assemble = (
+                os.environ.get(
+                    "SGLANG_PREPARED_CPU_ASSEMBLY",
+                    "0",
+                )
+                == "1"
+            )
+            if cpu_assemble and batched_mmap:
+                raise ValueError(
+                    "CPU checkpoint assembly and batched CUDA mmap loading "
+                    "are mutually exclusive"
+                )
             if (
                 batched_mmap
                 or os.environ.get("SGLANG_PREPARED_MMAP_CHECKPOINT", "0") == "1"
@@ -840,6 +933,15 @@ class PreparedRuntimeState:
                 phase_started = time.perf_counter()
                 restore_weights_before_loading(shadow, target_device)
                 restore_s = time.perf_counter() - phase_started
+                host_targets: list[HostLoadTarget] = []
+                host_target_alloc_s = 0.0
+                raw_h2d_s = 0.0
+                raw_h2d_bytes = 0
+                raw_h2d_copies = 0
+                if cpu_assemble:
+                    phase_started = time.perf_counter()
+                    host_targets = move_load_targets_to_pinned_host(shadow)
+                    host_target_alloc_s = time.perf_counter() - phase_started
                 batch_stats: dict[str, float | int] = {
                     "source_bytes": 0,
                     "batches": 0,
@@ -857,6 +959,14 @@ class PreparedRuntimeState:
                 phase_started = time.perf_counter()
                 proxy.load_weights(group_weights)
                 load_s = time.perf_counter() - phase_started
+                if cpu_assemble:
+                    phase_started = time.perf_counter()
+                    raw_h2d_copies, raw_h2d_bytes = move_load_targets_to_device(
+                        host_targets,
+                        target_device,
+                        self._stream,
+                    )
+                    raw_h2d_s = time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
                 for _, module in shadow.named_modules():
                     quant_method = getattr(module, "quant_method", None)
@@ -877,6 +987,10 @@ class PreparedRuntimeState:
                 totals["postprocess_s"] += postprocess_s
                 totals["synchronize_s"] += synchronize_s
                 totals["d2h_s"] += d2h_s
+                totals["host_target_alloc_s"] += host_target_alloc_s
+                totals["raw_h2d_s"] += raw_h2d_s
+                totals["raw_h2d_bytes"] += raw_h2d_bytes
+                totals["raw_h2d_copies"] += raw_h2d_copies
                 for name in (
                     "source_bytes",
                     "batches",
@@ -890,7 +1004,8 @@ class PreparedRuntimeState:
                     "clone_s=%.3f restore_s=%.3f load_s=%.3f "
                     "postprocess_s=%.3f synchronize_s=%.3f d2h_s=%.3f "
                     "source_bytes=%d batches=%d pack_s=%.3f h2d_s=%.3f "
-                    "broadcast_s=%.3f",
+                    "broadcast_s=%.3f host_target_alloc_s=%.3f "
+                    "raw_h2d_s=%.3f raw_h2d_bytes=%d raw_h2d_copies=%d",
                     path,
                     group_bytes,
                     time.perf_counter() - group_started,
@@ -905,6 +1020,10 @@ class PreparedRuntimeState:
                     batch_stats["pack_s"],
                     batch_stats["h2d_s"],
                     batch_stats["broadcast_s"],
+                    host_target_alloc_s,
+                    raw_h2d_s,
+                    raw_h2d_bytes,
+                    raw_h2d_copies,
                 )
                 del shadow, proxy
                 cleanup_gc_started = time.perf_counter()
@@ -951,6 +1070,10 @@ class PreparedRuntimeState:
             "h2d_s": round(float(totals["h2d_s"]), 6),
             "broadcast_s": round(float(totals["broadcast_s"]), 6),
             "cleanup_gc_s": round(float(totals["cleanup_gc_s"]), 6),
+            "host_target_alloc_s": round(float(totals["host_target_alloc_s"]), 6),
+            "raw_h2d_s": round(float(totals["raw_h2d_s"]), 6),
+            "raw_h2d_bytes": int(totals["raw_h2d_bytes"]),
+            "raw_h2d_copies": int(totals["raw_h2d_copies"]),
             "wall_s": round(time.perf_counter() - started, 6),
         }
 

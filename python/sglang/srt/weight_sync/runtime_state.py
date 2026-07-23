@@ -1946,6 +1946,10 @@ class PreparedRuntimeState:
             "load_plan_worker_cpu_s": 0.0,
             "load_plan_worker_minor_faults": 0,
             "load_plan_worker_major_faults": 0,
+            "load_plan_worker_direct_entries": 0,
+            "load_plan_worker_direct_operations": 0,
+            "load_plan_worker_foreach_calls": 0,
+            "load_plan_worker_foreach_fallback_calls": 0,
             "load_plan_drain_wait_s": 0.0,
             "load_plan_source_bytes": 0,
             "load_plan_worker_bytes": 0,
@@ -2090,6 +2094,10 @@ class PreparedRuntimeState:
                         "worker_cpu_s",
                         "worker_minor_faults",
                         "worker_major_faults",
+                        "worker_direct_entries",
+                        "worker_direct_operations",
+                        "worker_foreach_calls",
+                        "worker_foreach_fallback_calls",
                         "drain_wait_s",
                         "source_bytes",
                         "worker_bytes",
@@ -2446,6 +2454,18 @@ class PreparedRuntimeState:
             ),
             "load_plan_worker_major_faults": int(
                 totals["load_plan_worker_major_faults"]
+            ),
+            "load_plan_worker_direct_entries": int(
+                totals["load_plan_worker_direct_entries"]
+            ),
+            "load_plan_worker_direct_operations": int(
+                totals["load_plan_worker_direct_operations"]
+            ),
+            "load_plan_worker_foreach_calls": int(
+                totals["load_plan_worker_foreach_calls"]
+            ),
+            "load_plan_worker_foreach_fallback_calls": int(
+                totals["load_plan_worker_foreach_fallback_calls"]
             ),
             "load_plan_drain_wait_s": round(
                 float(totals["load_plan_drain_wait_s"]), 6

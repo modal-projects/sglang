@@ -137,6 +137,14 @@ def test_record_classifies_direct_derived_and_forced_fallback():
     assert "part_a" in plan.fallback
     assert "part_b" in plan.fallback
     assert "tail" in plan.fallback
+    assert set(plan.direct_copies) == {
+        "plain",
+        "stacked.0",
+        "stacked.1",
+        "norm",
+    }
+    assert stats["direct_copy_entries"] == 4
+    assert stats["direct_copy_operations"] == 4
     assert not hasattr(model.norm, "weight_loader")
     assert set(plan.fully_overwritten_parameters) == {
         "plain",
@@ -179,6 +187,107 @@ def test_record_does_not_elide_partially_written_storage():
     assert plan.fully_overwritten_parameter_names(model) == set()
 
 
+def test_record_keeps_transformed_source_on_loader_fallback():
+    class TransformedModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8), requires_grad=False)
+
+            def transformed_loader(parameter, loaded_weight):
+                parameter.data.copy_(loaded_weight * 2)
+
+            self.weight.weight_loader = transformed_loader
+
+        def load_weights(self, weights):
+            for _, loaded_weight in weights:
+                self.weight.weight_loader(self.weight, loaded_weight)
+
+    recorded = TransformedModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, [("weight", torch.ones(8))])
+    assert "weight" in plan.entries
+    assert "weight" not in plan.direct_copies
+
+    replayed = TransformedModel()
+    replayed._prepared_load_plan = plan
+    stats = plan.replay(replayed, [("weight", torch.full((8,), 3.0))], max_workers=2)
+
+    torch.testing.assert_close(replayed.weight, torch.full((8,), 6.0))
+    assert stats["worker_direct_entries"] == 0
+
+
+def test_record_keeps_mutated_source_on_loader_fallback():
+    class MutatingModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8), requires_grad=False)
+
+            def mutating_loader(parameter, loaded_weight):
+                loaded_weight.mul_(2)
+                parameter.data.copy_(loaded_weight)
+
+            self.weight.weight_loader = mutating_loader
+
+        def load_weights(self, weights):
+            for _, loaded_weight in weights:
+                self.weight.weight_loader(self.weight, loaded_weight)
+
+    recorded = MutatingModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, [("weight", torch.ones(8))])
+    assert "weight" in plan.entries
+    assert "weight" not in plan.direct_copies
+
+    replayed = MutatingModel()
+    replayed._prepared_load_plan = plan
+    stats = plan.replay(
+        replayed,
+        [("weight", torch.full((8,), 3.0))],
+        max_workers=2,
+    )
+
+    torch.testing.assert_close(replayed.weight, torch.full((8,), 6.0))
+    assert stats["worker_direct_entries"] == 0
+
+
+def test_direct_copy_resolves_parameter_in_shared_image_storage():
+    recorded = ToyModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, _weights(1).items())
+
+    backing = torch.empty(256, dtype=torch.uint8)
+    logical_byte_offset = 128
+    view = torch.empty(0, dtype=torch.float32).set_(
+        backing.untyped_storage(),
+        logical_byte_offset // torch.tensor([], dtype=torch.float32).element_size(),
+        (8,),
+        (1,),
+    )
+    parameter = nn.Parameter(view, requires_grad=False)
+    setattr(
+        parameter,
+        "_sglang_prepared_logical_storage_range",
+        (logical_byte_offset, 8 * parameter.element_size()),
+    )
+    loaded_weight = torch.arange(8, dtype=torch.float32)
+
+    resolved = plan._resolve_direct_copies(
+        {"plain": parameter},
+        loaded_weight,
+        plan.direct_copies["plain"],
+    )
+
+    assert resolved is not None
+    destinations = [item[0] for item in resolved]
+    sources = [item[1] for item in resolved]
+    torch._foreach_copy_(destinations, sources)
+    torch.testing.assert_close(parameter, loaded_weight)
+
+
 def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():
     recorded = ToyModel()
     plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
@@ -208,6 +317,10 @@ def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():
     assert stats["fallback_source_bytes"] == 3 * 8 * 4
     assert stats["worker_calls"] == 4
     assert stats["worker_bytes"] == 4 * 8 * 4
+    assert stats["worker_direct_entries"] == 4
+    assert stats["worker_direct_operations"] == 4
+    assert stats["worker_foreach_calls"] >= 1
+    assert stats["worker_foreach_fallback_calls"] == 0
     assert stats["submitted_batches"] >= 1
     assert stats["source_next_s"] >= 0
     assert stats["source_next_cpu_s"] >= 0

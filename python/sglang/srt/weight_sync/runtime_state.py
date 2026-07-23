@@ -18,6 +18,8 @@ pin an entire 600+ GB tensor-parallel runtime image.
 from __future__ import annotations
 
 import copy
+import concurrent.futures
+import ctypes
 import gc
 import itertools
 import json
@@ -348,9 +350,17 @@ class PreparedRuntimeState:
         self._pinned_prefix: torch.Tensor | None = None
         self._tail_buffers: list[torch.Tensor] = []
         self._stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._prefix_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._tail_chunk_bytes = int(
             os.environ.get("SGLANG_PREPARED_TAIL_CHUNK_MIB", "1024")
         ) * _MIB
+        self._tail_buffer_count = int(
+            os.environ.get("SGLANG_PREPARED_TAIL_BUFFER_COUNT", "8")
+        )
+        if self._tail_buffer_count < 2:
+            raise ValueError("prepared reload needs at least two tail buffers")
+        self._staged_image: RuntimeStateImage | None = None
+        self._staged_tail: list[tuple[int, int, float] | None] = []
 
     @property
     def prepared_identity(self) -> str | None:
@@ -381,6 +391,8 @@ class PreparedRuntimeState:
         """Allocate a fresh dense image for all checkpoint-derived storages."""
 
         self.prepared = self.allocate_image(identity)
+        self._staged_image = None
+        self._staged_tail = []
         return self.prepared
 
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
@@ -570,25 +582,74 @@ class PreparedRuntimeState:
                 torch.empty(
                     self._tail_chunk_bytes, dtype=torch.uint8, pin_memory=True
                 )
-                for _ in range(2)
+                for _ in range(self._tail_buffer_count)
             ]
+
+    def _copy_tail_chunk(
+        self,
+        image: RuntimeStateImage,
+        slot: int,
+        image_offset: int,
+        wait_event: torch.cuda.Event | None = None,
+    ) -> tuple[int, int, float]:
+        if wait_event is not None:
+            wait_event.synchronize()
+        size = min(self._tail_chunk_bytes, self.image_nbytes - image_offset)
+        started = time.perf_counter()
+        ctypes.memmove(
+            self._tail_buffers[slot].data_ptr(),
+            image.bytes.data_ptr() + image_offset,
+            size,
+        )
+        return image_offset, size, time.perf_counter() - started
+
+    def _prefill_tail(
+        self,
+        image: RuntimeStateImage,
+        image_offset: int,
+    ) -> list[tuple[int, int, float] | None]:
+        ready: list[tuple[int, int, float] | None] = [
+            None
+        ] * self._tail_buffer_count
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._tail_buffer_count
+        ) as executor:
+            futures = {}
+            for slot in range(self._tail_buffer_count):
+                if image_offset >= self.image_nbytes:
+                    break
+                futures[slot] = executor.submit(
+                    self._copy_tail_chunk,
+                    image,
+                    slot,
+                    image_offset,
+                )
+                image_offset += min(
+                    self._tail_chunk_bytes, self.image_nbytes - image_offset
+                )
+            for slot, future in futures.items():
+                image_offset, size, _ = future.result()
+                ready[slot] = (image_offset, size, 0.0)
+        return ready
 
     def stage_prepared(self) -> dict[str, float | int]:
         """Pre-pin the largest safe prefix; this runs before inference pauses."""
 
         if self.prepared is None:
             raise RuntimeError("no prepared runtime image")
+        started = time.perf_counter()
         requested = min(
             self.image_nbytes,
-            int(os.environ.get("SGLANG_PREPARED_PINNED_GB", "60")) * _GIB,
+            int(os.environ.get("SGLANG_PREPARED_PINNED_GB", "56")) * _GIB,
         )
         if self._pinned_prefix is None or self._pinned_prefix.numel() != requested:
             self._pinned_prefix = torch.empty(
                 requested, dtype=torch.uint8, pin_memory=True
             )
         self._ensure_transfer_buffers()
-        started = time.perf_counter()
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
+        self._staged_tail = self._prefill_tail(self.prepared, requested)
+        self._staged_image = self.prepared
         return {
             "pinned_prefix_bytes": requested,
             "tail_buffer_bytes": sum(item.numel() for item in self._tail_buffers),
@@ -619,41 +680,68 @@ class PreparedRuntimeState:
     def _copy_to_device(self, image: RuntimeStateImage) -> dict[str, float | int]:
         if self._pinned_prefix is None or not self._tail_buffers:
             raise RuntimeError("stage_prepared must run before commit")
+        if self._staged_image is not image:
+            raise RuntimeError("requested runtime image is not staged")
 
         stream = self._stream
         events = [torch.cuda.Event() for _ in self._tail_buffers]
-        pending = [False] * len(self._tail_buffers)
-        cpu_copy_s = 0.0
+        cpu_copy_thread_s = 0.0
         copies = 0
         wall_started = time.perf_counter()
-        with torch.cuda.stream(stream):
-            copies += self._scatter_range(0, self._pinned_prefix, stream)
+        with torch.cuda.stream(self._prefix_stream):
+            copies += self._scatter_range(
+                0, self._pinned_prefix, self._prefix_stream
+            )
 
-        offset = self._pinned_prefix.numel()
-        tail_index = 0
-        while offset < self.image_nbytes:
-            slot = tail_index % len(self._tail_buffers)
-            if pending[slot]:
-                events[slot].synchronize()
-            size = min(self._tail_chunk_bytes, self.image_nbytes - offset)
-            cpu_started = time.perf_counter()
-            self._tail_buffers[slot][:size].copy_(image.bytes[offset : offset + size])
-            cpu_copy_s += time.perf_counter() - cpu_started
-            with torch.cuda.stream(stream):
-                copies += self._scatter_range(
-                    offset, self._tail_buffers[slot][:size], stream
-                )
-                events[slot].record(stream)
-            pending[slot] = True
-            offset += size
-            tail_index += 1
+        ready: list[
+            tuple[int, int, float]
+            | concurrent.futures.Future[tuple[int, int, float]]
+            | None
+        ] = list(self._staged_tail)
+        next_offset = self._pinned_prefix.numel() + sum(
+            item[1] for item in self._staged_tail if item is not None
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._tail_buffer_count
+        ) as executor:
+            while any(item is not None for item in ready):
+                for slot in range(self._tail_buffer_count):
+                    item = ready[slot]
+                    if item is None:
+                        continue
+                    if isinstance(item, concurrent.futures.Future):
+                        item = item.result()
+                    image_offset, size, copy_s = item
+                    cpu_copy_thread_s += copy_s
+                    with torch.cuda.stream(stream):
+                        copies += self._scatter_range(
+                            image_offset,
+                            self._tail_buffers[slot][:size],
+                            stream,
+                        )
+                        events[slot].record(stream)
+                    if next_offset < self.image_nbytes:
+                        ready[slot] = executor.submit(
+                            self._copy_tail_chunk,
+                            image,
+                            slot,
+                            next_offset,
+                            events[slot],
+                        )
+                        next_offset += min(
+                            self._tail_chunk_bytes,
+                            self.image_nbytes - next_offset,
+                        )
+                    else:
+                        ready[slot] = None
 
+        self._prefix_stream.synchronize()
         stream.synchronize()
         wall_s = time.perf_counter() - wall_started
         return {
             "bytes": self.image_nbytes,
             "copies": copies,
-            "cpu_tail_copy_s": round(cpu_copy_s, 6),
+            "cpu_tail_copy_thread_s": round(cpu_copy_thread_s, 6),
             "wall_s": round(wall_s, 6),
             "gbps": round(self.image_nbytes / max(wall_s, 1e-9) / 1e9, 3),
         }
@@ -675,9 +763,8 @@ class PreparedRuntimeState:
         except Exception:
             if self.active is not None:
                 logger.exception("prepared commit failed; restoring active runtime image")
-                self._pinned_prefix.copy_(
-                    self.active.bytes[: self._pinned_prefix.numel()]
-                )
+                self.prepared = self.active
+                self.stage_prepared()
                 self._copy_to_device(self.active)
             raise
         self.active, self.prepared = prepared, self.active

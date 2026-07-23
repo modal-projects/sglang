@@ -30,7 +30,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 
@@ -41,6 +41,7 @@ _MIB = 1 << 20
 _ALIGNMENT = 4096
 _DECODER_LAYER = re.compile(r"^(language_model\.model\.layers\.\d+)(?:\.|$)")
 _VISION_BLOCK = re.compile(r"^(vision_tower\.encoder\.blocks\.\d+)(?:\.|$)")
+_LOGICAL_STORAGE_RANGE_ATTR = "_sglang_prepared_logical_storage_range"
 
 
 @dataclass(frozen=True)
@@ -78,14 +79,74 @@ class RuntimeModuleGroup:
     nbytes: int
 
 
+class HostImageCapacityError(RuntimeError):
+    """A restored checkpoint group does not fit the remaining host image."""
+
+
+@dataclass
+class HostImageArena:
+    """Allocate aligned restored CPU storages from a shared host image."""
+
+    bytes: torch.Tensor
+    begin: int
+    end: int
+    cursor: int
+
+    @classmethod
+    def from_range(
+        cls,
+        image_bytes: torch.Tensor,
+        begin: int,
+        end: int,
+    ) -> HostImageArena:
+        if image_bytes.device.type != "cpu":
+            raise ValueError("host image backing must be a CPU tensor")
+        if begin < 0 or end < begin or end > image_bytes.numel():
+            raise ValueError(
+                f"invalid host image arena range [{begin}, {end}) for "
+                f"{image_bytes.numel()} bytes"
+            )
+        return cls(bytes=image_bytes, begin=begin, end=end, cursor=begin)
+
+    @property
+    def used_bytes(self) -> int:
+        return self.cursor - self.begin
+
+    @property
+    def capacity_bytes(self) -> int:
+        return self.end - self.begin
+
+    def allocate(self, source_bytes: torch.Tensor) -> torch.Tensor:
+        begin = _align_up(self.cursor)
+        end = begin + source_bytes.numel()
+        if end > self.end:
+            raise HostImageCapacityError(
+                "restored checkpoint storage exceeds remaining runtime-image "
+                f"capacity: requested={source_bytes.numel()} used={self.used_bytes} "
+                f"capacity={self.capacity_bytes}"
+            )
+        self.cursor = end
+        return self.bytes[begin:end]
+
+
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
 def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
     storage = tensor.untyped_storage()
+    logical_range = getattr(tensor, _LOGICAL_STORAGE_RANGE_ATTR, None)
+    if logical_range is None:
+        byte_offset, nbytes = 0, storage.nbytes()
+    else:
+        byte_offset, nbytes = logical_range
+        if byte_offset < 0 or nbytes < 0 or byte_offset + nbytes > storage.nbytes():
+            raise ValueError(
+                "invalid prepared logical storage range: "
+                f"offset={byte_offset} nbytes={nbytes} storage={storage.nbytes()}"
+            )
     return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
-        storage, 0, (storage.nbytes(),), (1,)
+        storage, byte_offset, (nbytes,), (1,)
     )
 
 
@@ -178,8 +239,8 @@ def build_runtime_storage_plan(
 
 
 def _tensor_storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
-    storage = tensor.untyped_storage()
-    return tensor.device.index, storage.data_ptr(), storage.nbytes()
+    storage_bytes = _storage_bytes(tensor)
+    return tensor.device.index, storage_bytes.data_ptr(), storage_bytes.numel()
 
 
 def _iter_direct_module_tensors(
@@ -342,6 +403,100 @@ def map_checkpoint_names_to_runtime_groups(
     return result
 
 
+def runtime_group_image_ranges(
+    segments: list[RuntimeStorageSegment],
+    groups: list[RuntimeModuleGroup],
+) -> dict[str, tuple[int, int]]:
+    """Return the aligned final-image span owned by every runtime group."""
+
+    spans: dict[str, list[int]] = {}
+    paths = [group.path for group in groups]
+    for segment in segments:
+        matches = [
+            path
+            for path in paths
+            if segment.name == path or segment.name.startswith(f"{path}.")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "runtime storage is not covered by exactly one module group: "
+                f"{segment.name!r} -> {matches}"
+            )
+        span = spans.setdefault(matches[0], [segment.image_offset, segment.image_offset])
+        span[0] = min(span[0], segment.image_offset)
+        span[1] = max(span[1], segment.image_offset + segment.nbytes)
+
+    missing = [path for path in paths if path not in spans]
+    if missing:
+        raise ValueError(f"runtime module groups have no image storage: {missing}")
+    ranges = {path: (span[0], span[1]) for path, span in spans.items()}
+    ordered = sorted((begin, end, path) for path, (begin, end) in ranges.items())
+    for (_, previous_end, previous_path), (begin, _, path) in zip(
+        ordered,
+        ordered[1:],
+    ):
+        if begin < previous_end:
+            raise ValueError(
+                "runtime module image spans overlap: "
+                f"{previous_path!r} and {path!r}"
+            )
+    return ranges
+
+
+def runtime_group_finalization_order(
+    groups: list[RuntimeModuleGroup],
+    segments: list[RuntimeStorageSegment],
+    raw_image_ranges: dict[str, tuple[int, int]],
+) -> list[str]:
+    """Order finalization so final bytes never overwrite unconsumed raw bytes.
+
+    Restored checkpoint layouts and finalized kernel layouts can have different
+    per-group sizes even when their full-model totals fit the same host image.
+    Raw groups are packed in final-image order. A group can be finalized once
+    its final span overlaps no other remaining raw group.
+    """
+
+    final_ranges = runtime_group_image_ranges(segments, groups)
+    ordered_paths = sorted(final_ranges, key=lambda path: final_ranges[path][0])
+    remaining = set(ordered_paths)
+    result: list[str] = []
+
+    def overlaps(left: tuple[int, int], right: tuple[int, int]) -> bool:
+        return left[0] < right[1] and right[0] < left[1]
+
+    while remaining:
+        ready = [
+            path
+            for path in ordered_paths
+            if path in remaining
+            and not any(
+                other != path
+                and other in raw_image_ranges
+                and overlaps(final_ranges[path], raw_image_ranges[other])
+                for other in remaining
+            )
+        ]
+        if not ready:
+            dependencies = {
+                path: sorted(
+                    other
+                    for other in remaining
+                    if other != path
+                    and other in raw_image_ranges
+                    and overlaps(final_ranges[path], raw_image_ranges[other])
+                )
+                for path in sorted(remaining)
+            }
+            raise RuntimeError(
+                "restored and finalized runtime-image layouts form an unsafe "
+                f"overwrite cycle: {dependencies}"
+            )
+        for path in ready:
+            remaining.remove(path)
+            result.append(path)
+    return result
+
+
 def checkpoint_module_path(name: str) -> str:
     """Return a bounded scratch-module path for a checkpoint tensor.
 
@@ -476,6 +631,7 @@ def _clone_tensor_storage(
     *,
     target_device: torch.device | None = None,
     pin_memory: bool = False,
+    storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Clone a tensor while retaining subclasses, views, and storage aliases."""
 
@@ -483,12 +639,24 @@ def _clone_tensor_storage(
     if cached is not None:
         return cached
 
-    storage = tensor.untyped_storage()
-    storage_key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
+    source_bytes = _storage_bytes(tensor)
+    storage_key = (
+        tensor.device.index,
+        source_bytes.data_ptr(),
+        source_bytes.numel(),
+    )
     cloned_storage = storage_memo.get(storage_key)
     if cloned_storage is None:
-        source_bytes = _storage_bytes(tensor)
-        if target_device is None:
+        if storage_allocator is not None:
+            cloned_storage = storage_allocator(source_bytes)
+            if cloned_storage.dtype != torch.uint8:
+                raise TypeError("storage allocator must return a uint8 tensor")
+            if cloned_storage.numel() != source_bytes.numel():
+                raise ValueError(
+                    "storage allocator returned the wrong size: "
+                    f"{cloned_storage.numel()} != {source_bytes.numel()}"
+                )
+        elif target_device is None:
             cloned_storage = source_bytes.clone()
         else:
             cloned_storage = torch.empty(
@@ -497,15 +665,43 @@ def _clone_tensor_storage(
                 device=target_device,
                 pin_memory=pin_memory,
             )
-            cloned_storage.copy_(
-                source_bytes,
-                non_blocking=source_bytes.is_pinned() and target_device.type == "cuda",
+        if storage_allocator is not None:
+            destination_device = cloned_storage.device
+        else:
+            destination_device = (
+                tensor.device if target_device is None else target_device
             )
+        if storage_allocator is not None or target_device is not None:
+            non_blocking = (
+                source_bytes.device.type == "cuda" and cloned_storage.is_pinned()
+            ) or (
+                source_bytes.is_pinned() and destination_device.type == "cuda"
+            )
+            cloned_storage.copy_(source_bytes, non_blocking=non_blocking)
         storage_memo[storage_key] = cloned_storage
-    cloned_device = tensor.device if target_device is None else target_device
+    cloned_device = (
+        cloned_storage.device
+        if storage_allocator is not None
+        else tensor.device if target_device is None else target_device
+    )
+    cloned_byte_offset = cloned_storage.storage_offset() * cloned_storage.element_size()
+    source_byte_offset = source_bytes.storage_offset() * source_bytes.element_size()
+    tensor_byte_offset = tensor.storage_offset() * tensor.element_size()
+    relative_tensor_byte_offset = tensor_byte_offset - source_byte_offset
+    if relative_tensor_byte_offset < 0:
+        raise ValueError(
+            "tensor view begins before its prepared logical storage range: "
+            f"tensor_offset={tensor_byte_offset} storage_offset={source_byte_offset}"
+        )
+    view_byte_offset = cloned_byte_offset + relative_tensor_byte_offset
+    if view_byte_offset % tensor.element_size():
+        raise ValueError(
+            "cloned storage is not aligned for tensor dtype: "
+            f"offset={view_byte_offset} element_size={tensor.element_size()}"
+        )
     view = torch.empty(0, dtype=tensor.dtype, device=cloned_device).set_(
         cloned_storage.untyped_storage(),
-        tensor.storage_offset(),
+        view_byte_offset // tensor.element_size(),
         tuple(tensor.shape),
         tuple(tensor.stride()),
     )
@@ -517,6 +713,11 @@ def _clone_tensor_storage(
         cloned = view.requires_grad_(tensor.requires_grad)
         if hasattr(tensor, "__dict__"):
             cloned.__dict__.update(tensor.__dict__)
+    setattr(
+        cloned,
+        _LOGICAL_STORAGE_RANGE_ATTR,
+        (cloned_byte_offset, cloned_storage.numel()),
+    )
     tensor_memo[id(tensor)] = cloned
     return cloned
 
@@ -528,6 +729,7 @@ def _clone_attribute_tensors(
     *,
     target_device: torch.device | None = None,
     pin_memory: bool = False,
+    storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
     depth: int = 0,
 ) -> Any:
     """Clone tensor leaves but share immutable and non-tensor runtime objects."""
@@ -539,6 +741,7 @@ def _clone_attribute_tensors(
             storage_memo,
             target_device=target_device,
             pin_memory=pin_memory,
+            storage_allocator=storage_allocator,
         )
     if depth >= 2:
         return value
@@ -550,6 +753,7 @@ def _clone_attribute_tensors(
                 storage_memo,
                 target_device=target_device,
                 pin_memory=pin_memory,
+                storage_allocator=storage_allocator,
                 depth=depth + 1,
             )
             for key, child in value.items()
@@ -562,6 +766,7 @@ def _clone_attribute_tensors(
                 storage_memo,
                 target_device=target_device,
                 pin_memory=pin_memory,
+                storage_allocator=storage_allocator,
                 depth=depth + 1,
             )
             for child in value
@@ -574,6 +779,7 @@ def _clone_attribute_tensors(
                 storage_memo,
                 target_device=target_device,
                 pin_memory=pin_memory,
+                storage_allocator=storage_allocator,
                 depth=depth + 1,
             )
             for child in value
@@ -586,11 +792,14 @@ def clone_module_tensors(
     *,
     target_device: torch.device | None = None,
     pin_memory: bool = False,
+    storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.nn.Module:
     """Clone a module tree's tensor state without copying CUDA runtime objects."""
 
     if pin_memory and (target_device is None or target_device.type != "cpu"):
         raise ValueError("pin_memory requires an explicit CPU target device")
+    if storage_allocator is not None and target_device is None:
+        raise ValueError("storage_allocator requires an explicit target device")
     tensor_memo: dict[int, torch.Tensor] = {}
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor] = {}
 
@@ -606,6 +815,7 @@ def clone_module_tensors(
                     storage_memo,
                     target_device=target_device,
                     pin_memory=pin_memory,
+                    storage_allocator=storage_allocator,
                 )
             )
             for name, parameter in current._parameters.items()
@@ -620,6 +830,7 @@ def clone_module_tensors(
                     storage_memo,
                     target_device=target_device,
                     pin_memory=pin_memory,
+                    storage_allocator=storage_allocator,
                 )
             )
             for name, buffer in current._buffers.items()
@@ -637,6 +848,7 @@ def clone_module_tensors(
                 storage_memo,
                 target_device=target_device,
                 pin_memory=pin_memory,
+                storage_allocator=storage_allocator,
             )
         return result
 
@@ -710,24 +922,57 @@ def build_host_load_proxy(
     groups: list[RuntimeModuleGroup],
     target_device: torch.device,
     restore_weights_before_loading,
-) -> tuple[torch.nn.Module, dict[str, float | int]]:
+    *,
+    image_bytes: torch.Tensor | None = None,
+    segments: list[RuntimeStorageSegment] | None = None,
+) -> tuple[
+    torch.nn.Module,
+    dict[str, float | int],
+    dict[str, tuple[int, int]],
+]:
     """Clone a restored model frontier into pageable rank-local CPU memory.
 
     The resulting proxy owns every tensor in the runtime-derived group frontier
     but shares tensorless runtime objects. The model's ordinary ``load_weights``
     can therefore run once against CPU tensors, amortizing architecture-specific
-    name mapping and expert dispatch across the entire checkpoint.
+    name mapping and expert dispatch across the entire checkpoint. When a host
+    image is supplied, restored storages are packed directly into that full
+    image in final-group order. A restored layout that exceeds the remaining
+    full-image capacity falls back to bounded pageable storage for only that
+    group.
     """
 
+    if (image_bytes is None) != (segments is None):
+        raise ValueError("image_bytes and segments must be supplied together")
+    final_image_ranges = (
+        runtime_group_image_ranges(segments, groups)
+        if image_bytes is not None and segments is not None
+        else {}
+    )
+    ordered_groups = (
+        sorted(groups, key=lambda group: final_image_ranges[group.path][0])
+        if final_image_ranges
+        else groups
+    )
+    arena = (
+        HostImageArena.from_range(image_bytes, 0, image_bytes.numel())
+        if image_bytes is not None
+        else None
+    )
     proxy = copy.copy(model)
     proxy._modules = model._modules.copy()
+    raw_image_ranges: dict[str, tuple[int, int]] = {}
     stats: dict[str, float | int] = {
         "groups": 0,
         "clone_s": 0.0,
         "restore_s": 0.0,
         "d2h_s": 0.0,
+        "direct_image_groups": 0,
+        "direct_image_capacity_bytes": 0,
+        "direct_image_used_bytes": 0,
+        "fallback_groups": 0,
     }
-    for group in groups:
+    for group in ordered_groups:
         phase_started = time.perf_counter()
         _, device_shadow = clone_module_proxy(model, group.path)
         stats["clone_s"] += time.perf_counter() - phase_started
@@ -737,16 +982,49 @@ def build_host_load_proxy(
         stats["restore_s"] += time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
-        host_shadow = clone_module_tensors(
-            device_shadow,
-            target_device=torch.device("cpu"),
-        )
+        arena_cursor = arena.cursor if arena is not None else 0
+        raw_begin = _align_up(arena_cursor)
+        try:
+            host_shadow = clone_module_tensors(
+                device_shadow,
+                target_device=torch.device("cpu"),
+                storage_allocator=arena.allocate if arena is not None else None,
+            )
+            if target_device.type == "cuda":
+                # Direct-image D2H copies can be asynchronous because the image
+                # is pinned. The bounded CUDA scratch must remain live until all
+                # copies from this group have completed.
+                torch.cuda.synchronize(target_device)
+        except HostImageCapacityError:
+            if target_device.type == "cuda":
+                torch.cuda.synchronize(target_device)
+            if arena is not None:
+                # A partial group cannot remain in the packed layout. Reclaim
+                # its bytes and keep only this bounded group in pageable RAM.
+                arena.cursor = arena_cursor
+            logger.warning(
+                "[RL_PREPARED_STATE] restored group %s exceeds remaining full "
+                "image capacity; using bounded pageable fallback",
+                group.path,
+            )
+            host_shadow = clone_module_tensors(
+                device_shadow,
+                target_device=torch.device("cpu"),
+            )
+            stats["fallback_groups"] += 1
+        else:
+            if arena is not None:
+                raw_image_ranges[group.path] = (raw_begin, arena.cursor)
+                stats["direct_image_groups"] += 1
+                stats["direct_image_used_bytes"] = arena.used_bytes
         stats["d2h_s"] += time.perf_counter() - phase_started
         replace_proxy_module(proxy, model, group.path, host_shadow)
         stats["groups"] += 1
         del device_shadow, host_shadow
 
-    return proxy, stats
+    if arena is not None:
+        stats["direct_image_capacity_bytes"] = arena.capacity_bytes
+    return proxy, stats, raw_image_ranges
 
 
 def clone_module_proxy(
@@ -874,18 +1152,7 @@ class PreparedRuntimeState:
             include_all_cuda_tensors=self._auto_groups,
         )
         if self._auto_groups:
-            group_paths = [group.path for group in self._module_groups]
-            for segment in self.segments:
-                matches = [
-                    path
-                    for path in group_paths
-                    if segment.name == path or segment.name.startswith(f"{path}.")
-                ]
-                if len(matches) != 1:
-                    raise ValueError(
-                        "runtime storage is not covered by exactly one bounded "
-                        f"module group: {segment.name!r} -> {matches}"
-                    )
+            runtime_group_image_ranges(self.segments, self._module_groups)
             logger.info(
                 "[RL_PREPARED_STATE] auto module groups=%d max_bytes=%d",
                 len(self._module_groups),
@@ -1356,9 +1623,17 @@ class PreparedRuntimeState:
             "host_proxy_clone_s": 0.0,
             "host_proxy_restore_s": 0.0,
             "host_proxy_d2h_s": 0.0,
+            "host_proxy_direct_image_groups": 0,
+            "host_proxy_direct_image_capacity_bytes": 0,
+            "host_proxy_direct_image_used_bytes": 0,
+            "host_proxy_fallback_groups": 0,
             "single_pass_load_s": 0.0,
+            "cuda_allocated_bytes_peak": 0,
+            "cuda_allocated_after_release_bytes_peak": 0,
+            "cuda_free_bytes_min": 1 << 63,
         }
         load_proxy: torch.nn.Module | None = None
+        raw_image_ranges: dict[str, tuple[int, int]] = {}
         try:
             batched_mmap = (
                 os.environ.get(
@@ -1406,25 +1681,44 @@ class PreparedRuntimeState:
                 )
             if single_pass_cpu:
                 phase_started = time.perf_counter()
-                load_proxy, host_proxy_stats = build_host_load_proxy(
+                if self.prepared is None:
+                    raise AssertionError("prepared runtime image is missing")
+                (
+                    load_proxy,
+                    host_proxy_stats,
+                    raw_image_ranges,
+                ) = build_host_load_proxy(
                     model,
                     self._module_groups,
                     target_device,
                     restore_weights_before_loading,
+                    image_bytes=self.prepared.bytes,
+                    segments=self.segments,
                 )
                 logger.info(
                     "[RL_PREPARED_STATE] built rank-local host load proxy "
                     "groups=%d wall_s=%.3f clone_s=%.3f restore_s=%.3f "
-                    "d2h_s=%.3f",
+                    "d2h_s=%.3f direct_image_groups=%d "
+                    "direct_image_used_bytes=%d fallback_groups=%d",
                     host_proxy_stats["groups"],
                     time.perf_counter() - phase_started,
                     host_proxy_stats["clone_s"],
                     host_proxy_stats["restore_s"],
                     host_proxy_stats["d2h_s"],
+                    host_proxy_stats["direct_image_groups"],
+                    host_proxy_stats["direct_image_used_bytes"],
+                    host_proxy_stats["fallback_groups"],
                 )
                 totals["host_proxy_clone_s"] = host_proxy_stats["clone_s"]
                 totals["host_proxy_restore_s"] = host_proxy_stats["restore_s"]
                 totals["host_proxy_d2h_s"] = host_proxy_stats["d2h_s"]
+                for name in (
+                    "direct_image_groups",
+                    "direct_image_capacity_bytes",
+                    "direct_image_used_bytes",
+                    "fallback_groups",
+                ):
+                    totals[f"host_proxy_{name}"] = host_proxy_stats[name]
 
                 phase_started = time.perf_counter()
                 load_proxy.load_weights(streaming_mmap_weights_iterator(model_path))
@@ -1433,7 +1727,12 @@ class PreparedRuntimeState:
                     "[RL_PREPARED_STATE] single-pass rank-local CPU load wall_s=%.3f",
                     totals["single_pass_load_s"],
                 )
-                grouped = ((group.path, None) for group in self._module_groups)
+                finalization_order = runtime_group_finalization_order(
+                    self._module_groups,
+                    self.segments,
+                    raw_image_ranges,
+                )
+                grouped = ((path, None) for path in finalization_order)
             elif mmap_checkpoint:
                 logger.info(
                     "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint%s",
@@ -1473,11 +1772,15 @@ class PreparedRuntimeState:
                     if load_proxy is None:
                         raise AssertionError("single-pass load proxy is missing")
                     host_shadow = module_at_path(load_proxy, path)
-                    pinned_shadow = clone_module_tensors(
-                        host_shadow,
-                        target_device=torch.device("cpu"),
-                        pin_memory=True,
-                    )
+                    direct_image = path in raw_image_ranges
+                    if direct_image:
+                        pinned_shadow = host_shadow
+                    else:
+                        pinned_shadow = clone_module_tensors(
+                            host_shadow,
+                            target_device=torch.device("cpu"),
+                            pin_memory=True,
+                        )
                     host_target_alloc_s = time.perf_counter() - phase_started
                     replace_proxy_module(
                         load_proxy,
@@ -1485,8 +1788,6 @@ class PreparedRuntimeState:
                         path,
                         module_at_path(model, path),
                     )
-                    release_module_tensors(host_shadow)
-                    del host_shadow
 
                     phase_started = time.perf_counter()
                     shadow = clone_module_tensors(
@@ -1502,7 +1803,10 @@ class PreparedRuntimeState:
                     }
                     raw_h2d_copies = len(shadow_storages)
                     raw_h2d_bytes = sum(key[2] for key in shadow_storages)
-                    del pinned_shadow
+                    if not direct_image:
+                        del pinned_shadow
+                    release_module_tensors(host_shadow)
+                    del host_shadow
                     clone_s = 0.0
                     restore_s = 0.0
                     load_s = 0.0
@@ -1600,7 +1904,39 @@ class PreparedRuntimeState:
                     raw_h2d_bytes,
                     raw_h2d_copies,
                 )
+                cuda_allocated_before_release = torch.cuda.memory_allocated(
+                    target_device
+                )
+                # Module/quantization objects can contain reference cycles. Drop
+                # every tensor leaf explicitly once its finalized bytes are in
+                # the host image so bounded preparation never accumulates one
+                # CUDA scratch group per layer while waiting for cyclic GC.
+                release_module_tensors(shadow)
                 del shadow
+                cuda_allocated_after_release = torch.cuda.memory_allocated(
+                    target_device
+                )
+                cuda_free_bytes, _ = torch.cuda.mem_get_info(target_device)
+                totals["cuda_allocated_bytes_peak"] = max(
+                    totals["cuda_allocated_bytes_peak"],
+                    cuda_allocated_before_release,
+                )
+                totals["cuda_allocated_after_release_bytes_peak"] = max(
+                    totals["cuda_allocated_after_release_bytes_peak"],
+                    cuda_allocated_after_release,
+                )
+                totals["cuda_free_bytes_min"] = min(
+                    totals["cuda_free_bytes_min"],
+                    cuda_free_bytes,
+                )
+                logger.info(
+                    "[RL_PREPARED_HBM] group=%s allocated_before_release=%d "
+                    "allocated_after_release=%d free_after_release=%d",
+                    path,
+                    cuda_allocated_before_release,
+                    cuda_allocated_after_release,
+                    cuda_free_bytes,
+                )
                 if not single_pass_cpu:
                     del proxy
                     cleanup_gc_started = time.perf_counter()
@@ -1664,7 +2000,24 @@ class PreparedRuntimeState:
             "host_proxy_clone_s": round(float(totals["host_proxy_clone_s"]), 6),
             "host_proxy_restore_s": round(float(totals["host_proxy_restore_s"]), 6),
             "host_proxy_d2h_s": round(float(totals["host_proxy_d2h_s"]), 6),
+            "host_proxy_direct_image_groups": int(
+                totals["host_proxy_direct_image_groups"]
+            ),
+            "host_proxy_direct_image_capacity_bytes": int(
+                totals["host_proxy_direct_image_capacity_bytes"]
+            ),
+            "host_proxy_direct_image_used_bytes": int(
+                totals["host_proxy_direct_image_used_bytes"]
+            ),
+            "host_proxy_fallback_groups": int(
+                totals["host_proxy_fallback_groups"]
+            ),
             "single_pass_load_s": round(float(totals["single_pass_load_s"]), 6),
+            "cuda_allocated_bytes_peak": int(totals["cuda_allocated_bytes_peak"]),
+            "cuda_allocated_after_release_bytes_peak": int(
+                totals["cuda_allocated_after_release_bytes_peak"]
+            ),
+            "cuda_free_bytes_min": int(totals["cuda_free_bytes_min"]),
             "wall_s": round(time.perf_counter() - started, 6),
         }
 

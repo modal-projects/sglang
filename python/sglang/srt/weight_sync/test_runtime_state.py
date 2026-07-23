@@ -2,8 +2,10 @@ import torch
 from sglang.srt.models.utils import WeightsMapper
 
 from sglang.srt.weight_sync.runtime_state import (
+    HostImageArena,
     PreparedRuntimeState,
     RuntimeModuleGroup,
+    RuntimeStorageSegment,
     RuntimeStateImage,
     build_host_load_proxy,
     build_runtime_module_groups,
@@ -16,6 +18,8 @@ from sglang.srt.weight_sync.runtime_state import (
     ordered_mmap_weights_iterator,
     release_module_tensors,
     replace_proxy_module,
+    runtime_group_finalization_order,
+    runtime_group_image_ranges,
     runtime_module_path,
     streaming_mmap_weights_iterator,
 )
@@ -203,6 +207,82 @@ def test_clone_module_tensors_can_copy_to_explicit_device():
     assert torch.equal(cloned.weight, module.weight)
 
 
+def test_clone_module_tensors_uses_disjoint_backing_ranges_and_reclones():
+    module = torch.nn.Module()
+    module.register_parameter(
+        "first",
+        torch.nn.Parameter(torch.arange(8.0)),
+    )
+    module.register_parameter(
+        "second",
+        torch.nn.Parameter(torch.arange(8.0) + 20),
+    )
+    module.alias = module.first[2:6]
+    backing = torch.empty(3 * 4096, dtype=torch.uint8)
+    arena = HostImageArena.from_range(backing, 0, backing.numel())
+
+    cloned = clone_module_tensors(
+        module,
+        target_device=torch.device("cpu"),
+        storage_allocator=arena.allocate,
+    )
+    recloned = clone_module_tensors(
+        cloned,
+        target_device=torch.device("cpu"),
+    )
+
+    assert cloned.first.data_ptr() == backing.data_ptr()
+    assert cloned.second.data_ptr() == backing.data_ptr() + 4096
+    assert cloned.first.untyped_storage().data_ptr() == backing.data_ptr()
+    assert cloned.second.untyped_storage().data_ptr() == backing.data_ptr()
+    assert cloned.alias.data_ptr() == cloned.first[2:].data_ptr()
+    assert recloned.first.untyped_storage().data_ptr() != (
+        recloned.second.untyped_storage().data_ptr()
+    )
+    assert torch.equal(recloned.first, module.first)
+    assert torch.equal(recloned.second, module.second)
+    assert torch.equal(recloned.alias, module.alias)
+
+
+def test_runtime_group_image_ranges_include_alignment_gaps():
+    tensor = torch.empty(1, dtype=torch.uint8)
+    segments = [
+        RuntimeStorageSegment("left.a", 0, 4, tensor),
+        RuntimeStorageSegment("left.b", 4096, 8, tensor),
+        RuntimeStorageSegment("right.a", 8192, 16, tensor),
+    ]
+    groups = [
+        RuntimeModuleGroup("left", 12),
+        RuntimeModuleGroup("right", 16),
+    ]
+
+    assert runtime_group_image_ranges(segments, groups) == {
+        "left": (0, 4104),
+        "right": (8192, 8208),
+    }
+
+
+def test_runtime_group_finalization_order_protects_larger_final_prefix():
+    tensor = torch.empty(1, dtype=torch.uint8)
+    groups = [
+        RuntimeModuleGroup("first", 8),
+        RuntimeModuleGroup("second", 8),
+    ]
+    segments = [
+        RuntimeStorageSegment("first.weight", 0, 12, tensor),
+        RuntimeStorageSegment("second.weight", 12, 4, tensor),
+    ]
+    raw_ranges = {
+        "first": (0, 8),
+        "second": (8, 16),
+    }
+
+    assert runtime_group_finalization_order(groups, segments, raw_ranges) == [
+        "second",
+        "first",
+    ]
+
+
 def test_host_load_proxy_owns_complete_group_frontier():
     model = _ToyModel()
     groups = build_runtime_module_groups(
@@ -211,7 +291,7 @@ def test_host_load_proxy_owns_complete_group_frontier():
         device_type="cpu",
     )
 
-    proxy, stats = build_host_load_proxy(
+    proxy, stats, raw_image_ranges = build_host_load_proxy(
         model,
         groups,
         torch.device("cpu"),
@@ -219,6 +299,7 @@ def test_host_load_proxy_owns_complete_group_frontier():
     )
 
     assert stats["groups"] == 3
+    assert raw_image_ranges == {}
     for group in groups:
         proxy_group = module_at_path(proxy, group.path)
         live_group = module_at_path(model, group.path)
@@ -234,6 +315,74 @@ def test_host_load_proxy_owns_complete_group_frontier():
     )
     assert module_at_path(proxy, groups[1].path) is replacement
     assert module_at_path(model, groups[1].path) is not replacement
+
+
+def test_host_load_proxy_uses_runtime_image_as_direct_cpu_backing():
+    model = _ToyModel()
+    groups = build_runtime_module_groups(
+        model,
+        max_group_bytes=model.language_model.model.layers[0].weight.nbytes,
+        device_type="cpu",
+    )
+    segments = [
+        RuntimeStorageSegment(
+            name=f"{group.path}.weight",
+            image_offset=index * 4096,
+            nbytes=group.nbytes,
+            device_bytes=torch.empty(group.nbytes, dtype=torch.uint8),
+        )
+        for index, group in enumerate(groups)
+    ]
+    image = torch.empty(3 * 4096, dtype=torch.uint8)
+
+    proxy, stats, raw_image_ranges = build_host_load_proxy(
+        model,
+        groups,
+        torch.device("cpu"),
+        lambda module, device: None,
+        image_bytes=image,
+        segments=segments,
+    )
+
+    assert set(raw_image_ranges) == {group.path for group in groups}
+    assert stats["direct_image_groups"] == 3
+    assert stats["fallback_groups"] == 0
+    for index, group in enumerate(groups):
+        proxy_weight = module_at_path(proxy, group.path).weight
+        assert proxy_weight.data_ptr() == image.data_ptr() + index * 4096
+        assert torch.equal(
+            proxy_weight,
+            module_at_path(model, group.path).weight,
+        )
+
+
+def test_host_load_proxy_bounds_layout_growth_with_pageable_fallback():
+    model = _ToyModel()
+    group = RuntimeModuleGroup(
+        path="language_model.model.layers.0",
+        nbytes=model.language_model.model.layers[0].weight.nbytes,
+    )
+    segment = RuntimeStorageSegment(
+        name=f"{group.path}.weight",
+        image_offset=0,
+        nbytes=group.nbytes - 1,
+        device_bytes=torch.empty(1, dtype=torch.uint8),
+    )
+    image = torch.empty(group.nbytes - 1, dtype=torch.uint8)
+
+    proxy, stats, raw_image_ranges = build_host_load_proxy(
+        model,
+        [group],
+        torch.device("cpu"),
+        lambda module, device: None,
+        image_bytes=image,
+        segments=[segment],
+    )
+
+    assert raw_image_ranges == {}
+    assert stats["direct_image_groups"] == 0
+    assert stats["fallback_groups"] == 1
+    assert module_at_path(proxy, group.path).weight.data_ptr() != image.data_ptr()
 
 
 def test_release_module_tensors_does_not_mutate_live_module():

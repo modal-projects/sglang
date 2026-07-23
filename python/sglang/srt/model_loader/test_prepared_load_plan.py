@@ -210,6 +210,11 @@ def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():
     assert stats["worker_bytes"] == 4 * 8 * 4
     assert stats["submitted_batches"] >= 1
     assert stats["source_next_s"] >= 0
+    assert stats["source_next_cpu_s"] >= 0
+    assert stats["source_next_minor_faults"] >= 0
+    assert stats["source_next_major_faults"] >= 0
+    assert stats["worker_minor_faults"] >= 0
+    assert stats["worker_major_faults"] >= 0
     assert stats["drain_wait_s"] >= 0
 
 

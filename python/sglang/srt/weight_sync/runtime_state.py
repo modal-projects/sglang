@@ -1919,8 +1919,13 @@ class PreparedRuntimeState:
             "load_plan_fallback": 0,
             "load_plan_unknown": 0,
             "load_plan_source_next_s": 0.0,
+            "load_plan_source_next_cpu_s": 0.0,
+            "load_plan_source_next_minor_faults": 0,
+            "load_plan_source_next_major_faults": 0,
             "load_plan_worker_wall_s": 0.0,
             "load_plan_worker_cpu_s": 0.0,
+            "load_plan_worker_minor_faults": 0,
+            "load_plan_worker_major_faults": 0,
             "load_plan_drain_wait_s": 0.0,
             "load_plan_source_bytes": 0,
             "load_plan_worker_bytes": 0,
@@ -2058,8 +2063,13 @@ class PreparedRuntimeState:
                     totals["load_plan_unknown"] = load_plan_stats["unknown"]
                     for name in (
                         "source_next_s",
+                        "source_next_cpu_s",
+                        "source_next_minor_faults",
+                        "source_next_major_faults",
                         "worker_wall_s",
                         "worker_cpu_s",
+                        "worker_minor_faults",
+                        "worker_major_faults",
                         "drain_wait_s",
                         "source_bytes",
                         "worker_bytes",
@@ -2396,11 +2406,26 @@ class PreparedRuntimeState:
             "load_plan_source_next_s": round(
                 float(totals["load_plan_source_next_s"]), 6
             ),
+            "load_plan_source_next_cpu_s": round(
+                float(totals["load_plan_source_next_cpu_s"]), 6
+            ),
+            "load_plan_source_next_minor_faults": int(
+                totals["load_plan_source_next_minor_faults"]
+            ),
+            "load_plan_source_next_major_faults": int(
+                totals["load_plan_source_next_major_faults"]
+            ),
             "load_plan_worker_wall_s": round(
                 float(totals["load_plan_worker_wall_s"]), 6
             ),
             "load_plan_worker_cpu_s": round(
                 float(totals["load_plan_worker_cpu_s"]), 6
+            ),
+            "load_plan_worker_minor_faults": int(
+                totals["load_plan_worker_minor_faults"]
+            ),
+            "load_plan_worker_major_faults": int(
+                totals["load_plan_worker_major_faults"]
             ),
             "load_plan_drain_wait_s": round(
                 float(totals["load_plan_drain_wait_s"]), 6

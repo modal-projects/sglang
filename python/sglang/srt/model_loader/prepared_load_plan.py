@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import resource
 import threading
 import time
 from collections import Counter
@@ -345,6 +346,9 @@ class PreparedLoadPlan:
         batch: list[tuple[torch.Tensor, list[PreparedLoadCall]]] = []
         batch_bytes = 0
         source_next_s = 0.0
+        source_next_cpu_s = 0.0
+        source_next_minor_faults = 0
+        source_next_major_faults = 0
         source_tensors = 0
         source_bytes = 0
         direct_source_bytes = 0
@@ -355,6 +359,8 @@ class PreparedLoadPlan:
         synchronous_dispatch_s = 0.0
         worker_wall_s = 0.0
         worker_cpu_s = 0.0
+        worker_minor_faults = 0
+        worker_major_faults = 0
         worker_calls = 0
         worker_bytes = 0
         worker_lock = threading.Lock()
@@ -383,18 +389,31 @@ class PreparedLoadPlan:
         def dispatch_batch(
             items: list[tuple[torch.Tensor, list[PreparedLoadCall]]],
         ) -> None:
-            nonlocal worker_wall_s, worker_cpu_s, worker_calls, worker_bytes
+            nonlocal worker_wall_s
+            nonlocal worker_cpu_s
+            nonlocal worker_minor_faults
+            nonlocal worker_major_faults
+            nonlocal worker_calls
+            nonlocal worker_bytes
             batch_started = time.perf_counter()
             batch_cpu_started = time.thread_time()
+            batch_usage_started = resource.getrusage(resource.RUSAGE_THREAD)
             call_count = 0
             copied_bytes = 0
             for loaded_weight, load_calls in items:
                 dispatch(loaded_weight, load_calls)
                 call_count += len(load_calls)
                 copied_bytes += loaded_weight.numel() * loaded_weight.element_size()
+            batch_usage_done = resource.getrusage(resource.RUSAGE_THREAD)
             with worker_lock:
                 worker_wall_s += time.perf_counter() - batch_started
                 worker_cpu_s += time.thread_time() - batch_cpu_started
+                worker_minor_faults += (
+                    batch_usage_done.ru_minflt - batch_usage_started.ru_minflt
+                )
+                worker_major_faults += (
+                    batch_usage_done.ru_majflt - batch_usage_started.ru_majflt
+                )
                 worker_calls += call_count
                 worker_bytes += copied_bytes
 
@@ -428,17 +447,32 @@ class PreparedLoadPlan:
                 nonlocal fallback_source_bytes
                 nonlocal source_bytes
                 nonlocal source_next_s
+                nonlocal source_next_cpu_s
+                nonlocal source_next_minor_faults
+                nonlocal source_next_major_faults
                 nonlocal source_tensors
                 nonlocal synchronous_dispatch_s
                 iterator = iter(weights)
                 while True:
                     next_started = time.perf_counter()
+                    next_cpu_started = time.thread_time()
+                    next_usage_started = resource.getrusage(resource.RUSAGE_THREAD)
                     try:
-                        name, tensor = next(iterator)
+                        item = next(iterator)
                     except StopIteration:
-                        source_next_s += time.perf_counter() - next_started
-                        break
+                        item = None
+                    next_usage_done = resource.getrusage(resource.RUSAGE_THREAD)
                     source_next_s += time.perf_counter() - next_started
+                    source_next_cpu_s += time.thread_time() - next_cpu_started
+                    source_next_minor_faults += (
+                        next_usage_done.ru_minflt - next_usage_started.ru_minflt
+                    )
+                    source_next_major_faults += (
+                        next_usage_done.ru_majflt - next_usage_started.ru_majflt
+                    )
+                    if item is None:
+                        break
+                    name, tensor = item
                     tensor_bytes = tensor.numel() * tensor.element_size()
                     source_tensors += 1
                     source_bytes += tensor_bytes
@@ -492,6 +526,9 @@ class PreparedLoadPlan:
             "direct_source_bytes": direct_source_bytes,
             "fallback_source_bytes": fallback_source_bytes,
             "source_next_s": round(source_next_s, 6),
+            "source_next_cpu_s": round(source_next_cpu_s, 6),
+            "source_next_minor_faults": source_next_minor_faults,
+            "source_next_major_faults": source_next_major_faults,
             "submitted_batches": submitted_batches,
             "max_inflight_batches": max_inflight_batches,
             "inflight_limit": inflight_limit,
@@ -499,6 +536,8 @@ class PreparedLoadPlan:
             "synchronous_dispatch_s": round(synchronous_dispatch_s, 6),
             "worker_wall_s": round(worker_wall_s, 6),
             "worker_cpu_s": round(worker_cpu_s, 6),
+            "worker_minor_faults": worker_minor_faults,
+            "worker_major_faults": worker_major_faults,
             "worker_calls": worker_calls,
             "worker_bytes": worker_bytes,
             "model_load_s": round(model_load_s, 6),

@@ -351,6 +351,7 @@ class PreparedRuntimeState:
         self._tail_buffers: list[torch.Tensor] = []
         self._stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._prefix_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._gpu_stage_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._tail_chunk_bytes = int(
             os.environ.get("SGLANG_PREPARED_TAIL_CHUNK_MIB", "1024")
         ) * _MIB
@@ -361,6 +362,8 @@ class PreparedRuntimeState:
             raise ValueError("prepared reload needs at least two tail buffers")
         self._staged_image: RuntimeStateImage | None = None
         self._staged_tail: list[tuple[int, int, float] | None] = []
+        self._gpu_stage: torch.Tensor | None = None
+        self._gpu_stage_image_offset = 0
 
     @property
     def prepared_identity(self) -> str | None:
@@ -393,6 +396,8 @@ class PreparedRuntimeState:
         self.prepared = self.allocate_image(identity)
         self._staged_image = None
         self._staged_tail = []
+        self._gpu_stage = None
+        self._gpu_stage_image_offset = 0
         return self.prepared
 
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
@@ -572,6 +577,10 @@ class PreparedRuntimeState:
             "groups": group_count,
             "copied_bytes": copied_bytes,
             "image_bytes": self.image_nbytes,
+            "pinned_prefix_bytes": stage_stats["pinned_prefix_bytes"],
+            "tail_buffer_bytes": stage_stats["tail_buffer_bytes"],
+            "gpu_stage_bytes": stage_stats["gpu_stage_bytes"],
+            "gpu_stage_wall_s": stage_stats["gpu_stage_wall_s"],
             "stage_wall_s": stage_stats["wall_s"],
             "wall_s": round(time.perf_counter() - started, 6),
         }
@@ -591,10 +600,13 @@ class PreparedRuntimeState:
         slot: int,
         image_offset: int,
         wait_event: torch.cuda.Event | None = None,
+        image_end: int | None = None,
     ) -> tuple[int, int, float]:
         if wait_event is not None:
             wait_event.synchronize()
-        size = min(self._tail_chunk_bytes, self.image_nbytes - image_offset)
+        if image_end is None:
+            image_end = self.image_nbytes
+        size = min(self._tail_chunk_bytes, image_end - image_offset)
         started = time.perf_counter()
         ctypes.memmove(
             self._tail_buffers[slot].data_ptr(),
@@ -607,7 +619,10 @@ class PreparedRuntimeState:
         self,
         image: RuntimeStateImage,
         image_offset: int,
+        image_end: int | None = None,
     ) -> list[tuple[int, int, float] | None]:
+        if image_end is None:
+            image_end = self.image_nbytes
         ready: list[tuple[int, int, float] | None] = [
             None
         ] * self._tail_buffer_count
@@ -616,21 +631,88 @@ class PreparedRuntimeState:
         ) as executor:
             futures = {}
             for slot in range(self._tail_buffer_count):
-                if image_offset >= self.image_nbytes:
+                if image_offset >= image_end:
                     break
                 futures[slot] = executor.submit(
                     self._copy_tail_chunk,
                     image,
                     slot,
                     image_offset,
+                    None,
+                    image_end,
                 )
                 image_offset += min(
-                    self._tail_chunk_bytes, self.image_nbytes - image_offset
+                    self._tail_chunk_bytes, image_end - image_offset
                 )
             for slot, future in futures.items():
                 image_offset, size, _ = future.result()
                 ready[slot] = (image_offset, size, 0.0)
         return ready
+
+    def _stage_gpu_range(
+        self,
+        image: RuntimeStateImage,
+        image_offset: int,
+        nbytes: int,
+    ) -> dict[str, float | int]:
+        if nbytes <= 0:
+            self._gpu_stage = None
+            self._gpu_stage_image_offset = image_offset
+            return {"bytes": 0, "wall_s": 0.0}
+
+        started = time.perf_counter()
+        image_end = image_offset + nbytes
+        self._gpu_stage = torch.empty(
+            nbytes,
+            dtype=torch.uint8,
+            device=torch.cuda.current_device(),
+        )
+        self._gpu_stage_image_offset = image_offset
+        ready: list[
+            tuple[int, int, float]
+            | concurrent.futures.Future[tuple[int, int, float]]
+            | None
+        ] = list(self._prefill_tail(image, image_offset, image_end))
+        next_offset = image_offset + sum(
+            item[1] for item in ready if item is not None
+        )
+        events = [torch.cuda.Event() for _ in self._tail_buffers]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._tail_buffer_count
+        ) as executor:
+            while any(item is not None for item in ready):
+                for slot in range(self._tail_buffer_count):
+                    item = ready[slot]
+                    if item is None:
+                        continue
+                    if isinstance(item, concurrent.futures.Future):
+                        item = item.result()
+                    source_offset, size, _ = item
+                    destination_offset = source_offset - image_offset
+                    with torch.cuda.stream(self._gpu_stage_stream):
+                        self._gpu_stage[
+                            destination_offset : destination_offset + size
+                        ].copy_(self._tail_buffers[slot][:size], non_blocking=True)
+                        events[slot].record(self._gpu_stage_stream)
+                    if next_offset < image_end:
+                        ready[slot] = executor.submit(
+                            self._copy_tail_chunk,
+                            image,
+                            slot,
+                            next_offset,
+                            events[slot],
+                            image_end,
+                        )
+                        next_offset += min(
+                            self._tail_chunk_bytes, image_end - next_offset
+                        )
+                    else:
+                        ready[slot] = None
+        self._gpu_stage_stream.synchronize()
+        return {
+            "bytes": nbytes,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
 
     def stage_prepared(self) -> dict[str, float | int]:
         """Pre-pin the largest safe prefix; this runs before inference pauses."""
@@ -648,11 +730,32 @@ class PreparedRuntimeState:
             )
         self._ensure_transfer_buffers()
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
-        self._staged_tail = self._prefill_tail(self.prepared, requested)
+        torch.cuda.empty_cache()
+        free_bytes, _ = torch.cuda.mem_get_info()
+        reserve_bytes = int(
+            os.environ.get("SGLANG_PREPARED_GPU_RESERVE_GB", "12")
+        ) * _GIB
+        requested_gpu_bytes = int(
+            os.environ.get("SGLANG_PREPARED_GPU_STAGING_GB", "30")
+        ) * _GIB
+        gpu_stage_bytes = min(
+            requested_gpu_bytes,
+            max(0, free_bytes - reserve_bytes),
+            self.image_nbytes - requested,
+        )
+        gpu_stage_stats = self._stage_gpu_range(
+            self.prepared,
+            requested,
+            gpu_stage_bytes,
+        )
+        tail_offset = requested + gpu_stage_bytes
+        self._staged_tail = self._prefill_tail(self.prepared, tail_offset)
         self._staged_image = self.prepared
         return {
             "pinned_prefix_bytes": requested,
             "tail_buffer_bytes": sum(item.numel() for item in self._tail_buffers),
+            "gpu_stage_bytes": gpu_stage_stats["bytes"],
+            "gpu_stage_wall_s": gpu_stage_stats["wall_s"],
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
@@ -692,13 +795,23 @@ class PreparedRuntimeState:
             copies += self._scatter_range(
                 0, self._pinned_prefix, self._prefix_stream
             )
+        gpu_stage_bytes = (
+            self._gpu_stage.numel() if self._gpu_stage is not None else 0
+        )
+        if self._gpu_stage is not None:
+            with torch.cuda.stream(self._gpu_stage_stream):
+                copies += self._scatter_range(
+                    self._gpu_stage_image_offset,
+                    self._gpu_stage,
+                    self._gpu_stage_stream,
+                )
 
         ready: list[
             tuple[int, int, float]
             | concurrent.futures.Future[tuple[int, int, float]]
             | None
         ] = list(self._staged_tail)
-        next_offset = self._pinned_prefix.numel() + sum(
+        next_offset = self._pinned_prefix.numel() + gpu_stage_bytes + sum(
             item[1] for item in self._staged_tail if item is not None
         )
         with concurrent.futures.ThreadPoolExecutor(
@@ -736,12 +849,14 @@ class PreparedRuntimeState:
                         ready[slot] = None
 
         self._prefix_stream.synchronize()
+        self._gpu_stage_stream.synchronize()
         stream.synchronize()
         wall_s = time.perf_counter() - wall_started
         return {
             "bytes": self.image_nbytes,
             "copies": copies,
             "cpu_tail_copy_thread_s": round(cpu_copy_thread_s, 6),
+            "gpu_stage_bytes": gpu_stage_bytes,
             "wall_s": round(wall_s, 6),
             "gbps": round(self.image_nbytes / max(wall_s, 1e-9) / 1e9, 3),
         }
@@ -766,7 +881,9 @@ class PreparedRuntimeState:
                 self.prepared = self.active
                 self.stage_prepared()
                 self._copy_to_device(self.active)
+                self._gpu_stage = None
             raise
+        self._gpu_stage = None
         self.active, self.prepared = prepared, self.active
         stats["identity"] = prepared.identity
         return stats

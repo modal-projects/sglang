@@ -580,7 +580,14 @@ def ordered_mmap_weights_iterator(
 def streaming_mmap_weights_iterator(
     model_path: str,
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Read a sharded safetensors checkpoint once in physical file order."""
+    """Read a sharded safetensors checkpoint once in physical file order.
+
+    Recent safetensors releases can materialize every tensor view in one shard
+    with one Python-to-Rust call. Large MoE checkpoints contain hundreds of
+    thousands of small tensors, so calling ``get_tensor`` separately for every
+    name can spend minutes constructing views even when all file pages are
+    already resident. Keep the per-name fallback for older safetensors builds.
+    """
 
     from safetensors import safe_open
 
@@ -591,14 +598,27 @@ def streaming_mmap_weights_iterator(
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"invalid or empty safetensors weight map: {index_path}")
 
+    bulk_logged = False
     for filename in sorted(set(weight_map.values())):
         with safe_open(
             Path(model_path) / filename,
             framework="pt",
             device="cpu",
         ) as handle:
-            for name in handle.keys():
-                yield name, handle.get_tensor(name)
+            names = handle.keys()
+            get_tensors = getattr(handle, "get_tensors", None)
+            if get_tensors is None:
+                for name in names:
+                    yield name, handle.get_tensor(name)
+                continue
+            if not bulk_logged:
+                logger.info(
+                    "[RL_PREPARED_STATE] using bulk safetensors shard iteration"
+                )
+                bulk_logged = True
+            tensors = get_tensors()
+            for name in names:
+                yield name, tensors[name]
 
 
 def grouped_mmap_weights_iterator(

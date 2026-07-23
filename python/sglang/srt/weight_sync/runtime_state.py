@@ -345,9 +345,26 @@ class PreparedRuntimeState:
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
         if self.prepared is None:
             raise RuntimeError("begin_preparation must run first")
+        self._ensure_transfer_buffers()
         shadow_tensors = dict(iter_model_tensors(shadow))
         prefix = f"{path}."
         copied = 0
+        buffer = self._tail_buffers[0]
+        buffer_offset = 0
+        pending: list[tuple[int, int, int]] = []
+
+        def flush() -> None:
+            nonlocal buffer_offset
+            if not pending:
+                return
+            self._stream.synchronize()
+            for image_offset, staging_offset, nbytes in pending:
+                self.prepared.bytes[
+                    image_offset : image_offset + nbytes
+                ].copy_(buffer[staging_offset : staging_offset + nbytes])
+            pending.clear()
+            buffer_offset = 0
+
         for segment in self.segments:
             if not segment.name.startswith(prefix):
                 continue
@@ -364,9 +381,30 @@ class PreparedRuntimeState:
                     f"prepared storage changed shape for {segment.name}: "
                     f"live={segment.nbytes} bytes, shadow={shadow_bytes.numel()} bytes"
                 )
-            begin = segment.image_offset
-            self.prepared.bytes[begin : begin + segment.nbytes].copy_(shadow_bytes)
-            copied += segment.nbytes
+            source_offset = 0
+            while source_offset < segment.nbytes:
+                if buffer_offset == buffer.numel():
+                    flush()
+                size = min(
+                    segment.nbytes - source_offset,
+                    buffer.numel() - buffer_offset,
+                )
+                with torch.cuda.stream(self._stream):
+                    buffer[buffer_offset : buffer_offset + size].copy_(
+                        shadow_bytes[source_offset : source_offset + size],
+                        non_blocking=True,
+                    )
+                pending.append(
+                    (
+                        segment.image_offset + source_offset,
+                        buffer_offset,
+                        size,
+                    )
+                )
+                source_offset += size
+                buffer_offset += size
+                copied += size
+        flush()
         return copied
 
     def prepare_from_disk(
@@ -420,22 +458,42 @@ class PreparedRuntimeState:
                     )
                 seen_paths.add(path)
                 group_started = time.perf_counter()
+                phase_started = group_started
                 proxy, shadow = clone_module_proxy(model, path)
+                clone_s = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
                 restore_weights_before_loading(shadow, target_device)
+                restore_s = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
                 proxy.load_weights(group)
+                load_s = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
                 for _, module in shadow.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
+                postprocess_s = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
                 torch.cuda.synchronize(target_device)
+                synchronize_s = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
                 group_bytes = self._copy_shadow_module(path, shadow)
+                d2h_s = time.perf_counter() - phase_started
                 copied_bytes += group_bytes
                 group_count += 1
                 logger.info(
-                    "[RL_PREPARED_STATE] group=%s bytes=%d wall_s=%.3f",
+                    "[RL_PREPARED_STATE] group=%s bytes=%d wall_s=%.3f "
+                    "clone_s=%.3f restore_s=%.3f load_s=%.3f "
+                    "postprocess_s=%.3f synchronize_s=%.3f d2h_s=%.3f",
                     path,
                     group_bytes,
                     time.perf_counter() - group_started,
+                    clone_s,
+                    restore_s,
+                    load_s,
+                    postprocess_s,
+                    synchronize_s,
+                    d2h_s,
                 )
                 del shadow, proxy
                 gc.collect()
@@ -459,6 +517,15 @@ class PreparedRuntimeState:
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
+    def _ensure_transfer_buffers(self) -> None:
+        if not self._tail_buffers:
+            self._tail_buffers = [
+                torch.empty(
+                    self._tail_chunk_bytes, dtype=torch.uint8, pin_memory=True
+                )
+                for _ in range(2)
+            ]
+
     def stage_prepared(self) -> dict[str, float | int]:
         """Pre-pin the largest safe prefix; this runs before inference pauses."""
 
@@ -472,13 +539,7 @@ class PreparedRuntimeState:
             self._pinned_prefix = torch.empty(
                 requested, dtype=torch.uint8, pin_memory=True
             )
-        if not self._tail_buffers:
-            self._tail_buffers = [
-                torch.empty(
-                    self._tail_chunk_bytes, dtype=torch.uint8, pin_memory=True
-                )
-                for _ in range(2)
-            ]
+        self._ensure_transfer_buffers()
         started = time.perf_counter()
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
         return {

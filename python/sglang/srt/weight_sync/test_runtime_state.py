@@ -5,14 +5,19 @@ from sglang.srt.weight_sync.runtime_state import (
     PreparedRuntimeState,
     RuntimeModuleGroup,
     RuntimeStateImage,
+    build_host_load_proxy,
     build_runtime_module_groups,
     checkpoint_module_path,
     clone_module_proxy,
     clone_module_tensors,
     grouped_mmap_weights_iterator,
     map_checkpoint_names_to_runtime_groups,
+    module_at_path,
     ordered_mmap_weights_iterator,
+    release_module_tensors,
+    replace_proxy_module,
     runtime_module_path,
+    streaming_mmap_weights_iterator,
 )
 
 
@@ -181,6 +186,70 @@ def test_clone_module_tensors_preserves_sglang_parameter_subclass():
     assert cloned.weight.weight_loader is parameter.weight_loader
 
 
+def test_clone_module_tensors_can_copy_to_explicit_device():
+    module = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.arange(8.0))
+    module.register_parameter("weight", parameter)
+    module.alias = parameter[2:6]
+
+    cloned = clone_module_tensors(
+        module,
+        target_device=torch.device("cpu"),
+    )
+
+    assert cloned.weight.device.type == "cpu"
+    assert cloned.weight.data_ptr() != module.weight.data_ptr()
+    assert cloned.alias.untyped_storage().data_ptr() == cloned.weight.data_ptr()
+    assert torch.equal(cloned.weight, module.weight)
+
+
+def test_host_load_proxy_owns_complete_group_frontier():
+    model = _ToyModel()
+    groups = build_runtime_module_groups(
+        model,
+        max_group_bytes=model.language_model.model.layers[0].weight.nbytes,
+        device_type="cpu",
+    )
+
+    proxy, stats = build_host_load_proxy(
+        model,
+        groups,
+        torch.device("cpu"),
+        lambda module, device: None,
+    )
+
+    assert stats["groups"] == 3
+    for group in groups:
+        proxy_group = module_at_path(proxy, group.path)
+        live_group = module_at_path(model, group.path)
+        assert proxy_group is not live_group
+        assert proxy_group.weight.data_ptr() != live_group.weight.data_ptr()
+
+    replacement = torch.nn.Linear(4, 4, bias=False)
+    replace_proxy_module(
+        proxy,
+        model,
+        groups[1].path,
+        replacement,
+    )
+    assert module_at_path(proxy, groups[1].path) is replacement
+    assert module_at_path(model, groups[1].path) is not replacement
+
+
+def test_release_module_tensors_does_not_mutate_live_module():
+    live = torch.nn.Module()
+    live.register_parameter("weight", torch.nn.Parameter(torch.arange(8.0)))
+    live.aliases = {"slice": live.weight[2:6]}
+    cloned = clone_module_tensors(live)
+
+    release_module_tensors(cloned)
+
+    assert cloned.weight is None
+    assert cloned.aliases == {"slice": None}
+    assert torch.equal(live.weight, torch.arange(8.0))
+    assert torch.equal(live.aliases["slice"], torch.arange(2.0, 6.0))
+
+
 def test_ordered_mmap_weights_iterator_merges_checkpoint_shards(tmp_path):
     import json
 
@@ -214,6 +283,35 @@ def test_ordered_mmap_weights_iterator_merges_checkpoint_shards(tmp_path):
         "language_model.model.layers.1.b",
     ]
     assert [tensor.item() for _, tensor in items] == [1, 11, 12]
+
+
+def test_streaming_mmap_weights_iterator_reads_each_shard_once(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    save_file(
+        {"second": torch.tensor([2])},
+        tmp_path / "model-00002-of-00002.safetensors",
+    )
+    save_file(
+        {"first": torch.tensor([1])},
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    index = {
+        "weight_map": {
+            "second": "model-00002-of-00002.safetensors",
+            "first": "model-00001-of-00002.safetensors",
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    items = list(streaming_mmap_weights_iterator(str(tmp_path)))
+
+    assert [(name, tensor.item()) for name, tensor in items] == [
+        ("first", 1),
+        ("second", 2),
+    ]
 
 
 def test_grouped_mmap_weights_iterator_yields_complete_runtime_frontier(tmp_path):

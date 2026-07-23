@@ -394,6 +394,30 @@ def ordered_mmap_weights_iterator(
             yield name, handles[weight_map[name]].get_tensor(name)
 
 
+def streaming_mmap_weights_iterator(
+    model_path: str,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Read a sharded safetensors checkpoint once in physical file order."""
+
+    from safetensors import safe_open
+
+    index_path = Path(model_path) / "model.safetensors.index.json"
+    with index_path.open() as file:
+        index = json.load(file)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid or empty safetensors weight map: {index_path}")
+
+    for filename in sorted(set(weight_map.values())):
+        with safe_open(
+            Path(model_path) / filename,
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for name in handle.keys():
+                yield name, handle.get_tensor(name)
+
+
 def grouped_mmap_weights_iterator(
     model_path: str,
     model: torch.nn.Module,
@@ -449,6 +473,9 @@ def _clone_tensor_storage(
     tensor: torch.Tensor,
     tensor_memo: dict[int, torch.Tensor],
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor],
+    *,
+    target_device: torch.device | None = None,
+    pin_memory: bool = False,
 ) -> torch.Tensor:
     """Clone a tensor while retaining subclasses, views, and storage aliases."""
 
@@ -460,9 +487,23 @@ def _clone_tensor_storage(
     storage_key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
     cloned_storage = storage_memo.get(storage_key)
     if cloned_storage is None:
-        cloned_storage = _storage_bytes(tensor).clone()
+        source_bytes = _storage_bytes(tensor)
+        if target_device is None:
+            cloned_storage = source_bytes.clone()
+        else:
+            cloned_storage = torch.empty(
+                source_bytes.numel(),
+                dtype=torch.uint8,
+                device=target_device,
+                pin_memory=pin_memory,
+            )
+            cloned_storage.copy_(
+                source_bytes,
+                non_blocking=source_bytes.is_pinned() and target_device.type == "cuda",
+            )
         storage_memo[storage_key] = cloned_storage
-    view = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+    cloned_device = tensor.device if target_device is None else target_device
+    view = torch.empty(0, dtype=tensor.dtype, device=cloned_device).set_(
         cloned_storage.untyped_storage(),
         tensor.storage_offset(),
         tuple(tensor.shape),
@@ -484,35 +525,72 @@ def _clone_attribute_tensors(
     value: Any,
     tensor_memo: dict[int, torch.Tensor],
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor],
+    *,
+    target_device: torch.device | None = None,
+    pin_memory: bool = False,
     depth: int = 0,
 ) -> Any:
     """Clone tensor leaves but share immutable and non-tensor runtime objects."""
 
     if isinstance(value, torch.Tensor):
-        return _clone_tensor_storage(value, tensor_memo, storage_memo)
+        return _clone_tensor_storage(
+            value,
+            tensor_memo,
+            storage_memo,
+            target_device=target_device,
+            pin_memory=pin_memory,
+        )
     if depth >= 2:
         return value
     if isinstance(value, dict):
         return {
-            key: _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            key: _clone_attribute_tensors(
+                child,
+                tensor_memo,
+                storage_memo,
+                target_device=target_device,
+                pin_memory=pin_memory,
+                depth=depth + 1,
+            )
             for key, child in value.items()
         }
     if isinstance(value, list):
         return [
-            _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            _clone_attribute_tensors(
+                child,
+                tensor_memo,
+                storage_memo,
+                target_device=target_device,
+                pin_memory=pin_memory,
+                depth=depth + 1,
+            )
             for child in value
         ]
     if isinstance(value, tuple):
         return tuple(
-            _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            _clone_attribute_tensors(
+                child,
+                tensor_memo,
+                storage_memo,
+                target_device=target_device,
+                pin_memory=pin_memory,
+                depth=depth + 1,
+            )
             for child in value
         )
     return value
 
 
-def clone_module_tensors(module: torch.nn.Module) -> torch.nn.Module:
+def clone_module_tensors(
+    module: torch.nn.Module,
+    *,
+    target_device: torch.device | None = None,
+    pin_memory: bool = False,
+) -> torch.nn.Module:
     """Clone a module tree's tensor state without copying CUDA runtime objects."""
 
+    if pin_memory and (target_device is None or target_device.type != "cpu"):
+        raise ValueError("pin_memory requires an explicit CPU target device")
     tensor_memo: dict[int, torch.Tensor] = {}
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor] = {}
 
@@ -522,7 +600,13 @@ def clone_module_tensors(module: torch.nn.Module) -> torch.nn.Module:
             name: (
                 None
                 if parameter is None
-                else _clone_tensor_storage(parameter, tensor_memo, storage_memo)
+                else _clone_tensor_storage(
+                    parameter,
+                    tensor_memo,
+                    storage_memo,
+                    target_device=target_device,
+                    pin_memory=pin_memory,
+                )
             )
             for name, parameter in current._parameters.items()
         }
@@ -530,7 +614,13 @@ def clone_module_tensors(module: torch.nn.Module) -> torch.nn.Module:
             name: (
                 None
                 if buffer is None
-                else _clone_tensor_storage(buffer, tensor_memo, storage_memo)
+                else _clone_tensor_storage(
+                    buffer,
+                    tensor_memo,
+                    storage_memo,
+                    target_device=target_device,
+                    pin_memory=pin_memory,
+                )
             )
             for name, buffer in current._buffers.items()
         }
@@ -542,11 +632,121 @@ def clone_module_tensors(module: torch.nn.Module) -> torch.nn.Module:
             if name in {"_parameters", "_buffers", "_modules"}:
                 continue
             result.__dict__[name] = _clone_attribute_tensors(
-                value, tensor_memo, storage_memo
+                value,
+                tensor_memo,
+                storage_memo,
+                target_device=target_device,
+                pin_memory=pin_memory,
             )
         return result
 
     return clone(module)
+
+
+def module_at_path(model: torch.nn.Module, path: str) -> torch.nn.Module:
+    """Return one registered module subtree by dotted path."""
+
+    current = model
+    for part in path.split("."):
+        child = current._modules.get(part)
+        if child is None:
+            raise KeyError(f"module path {path!r} is missing component {part!r}")
+        current = child
+    return current
+
+
+def replace_proxy_module(
+    proxy: torch.nn.Module,
+    live_model: torch.nn.Module,
+    path: str,
+    replacement: torch.nn.Module,
+) -> None:
+    """Replace a proxy subtree while cloning each shared ancestor at most once."""
+
+    proxy_cursor = proxy
+    live_cursor = live_model
+    parts = path.split(".")
+    for part in parts[:-1]:
+        live_child = live_cursor._modules.get(part)
+        proxy_child = proxy_cursor._modules.get(part)
+        if live_child is None or proxy_child is None:
+            raise KeyError(f"module path {path!r} is missing component {part!r}")
+        if proxy_child is live_child:
+            proxy_child = copy.copy(live_child)
+            proxy_child._modules = live_child._modules.copy()
+            proxy_cursor._modules[part] = proxy_child
+        proxy_cursor = proxy_child
+        live_cursor = live_child
+    proxy_cursor._modules[parts[-1]] = replacement
+
+
+def release_module_tensors(module: torch.nn.Module) -> None:
+    """Drop tensor references from a disposable cloned module tree."""
+
+    def drop(value: Any, depth: int = 0) -> Any:
+        if isinstance(value, torch.Tensor):
+            return None
+        if depth >= 2:
+            return value
+        if isinstance(value, dict):
+            return {key: drop(child, depth + 1) for key, child in value.items()}
+        if isinstance(value, list):
+            return [drop(child, depth + 1) for child in value]
+        if isinstance(value, tuple):
+            return tuple(drop(child, depth + 1) for child in value)
+        return value
+
+    reserved = {"_parameters", "_buffers", "_modules"}
+    for current in module.modules():
+        current._parameters = dict.fromkeys(current._parameters)
+        current._buffers = dict.fromkeys(current._buffers)
+        for name, value in vars(current).items():
+            if name not in reserved:
+                current.__dict__[name] = drop(value)
+
+
+def build_host_load_proxy(
+    model: torch.nn.Module,
+    groups: list[RuntimeModuleGroup],
+    target_device: torch.device,
+    restore_weights_before_loading,
+) -> tuple[torch.nn.Module, dict[str, float | int]]:
+    """Clone a restored model frontier into pageable rank-local CPU memory.
+
+    The resulting proxy owns every tensor in the runtime-derived group frontier
+    but shares tensorless runtime objects. The model's ordinary ``load_weights``
+    can therefore run once against CPU tensors, amortizing architecture-specific
+    name mapping and expert dispatch across the entire checkpoint.
+    """
+
+    proxy = copy.copy(model)
+    proxy._modules = model._modules.copy()
+    stats: dict[str, float | int] = {
+        "groups": 0,
+        "clone_s": 0.0,
+        "restore_s": 0.0,
+        "d2h_s": 0.0,
+    }
+    for group in groups:
+        phase_started = time.perf_counter()
+        _, device_shadow = clone_module_proxy(model, group.path)
+        stats["clone_s"] += time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
+        restore_weights_before_loading(device_shadow, target_device)
+        stats["restore_s"] += time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
+        host_shadow = clone_module_tensors(
+            device_shadow,
+            target_device=torch.device("cpu"),
+        )
+        stats["d2h_s"] += time.perf_counter() - phase_started
+        replace_proxy_module(proxy, model, group.path, host_shadow)
+        stats["groups"] += 1
+        del device_shadow, host_shadow
+
+    return proxy, stats
 
 
 def clone_module_proxy(
@@ -1153,7 +1353,12 @@ class PreparedRuntimeState:
             "raw_h2d_s": 0.0,
             "raw_h2d_bytes": 0,
             "raw_h2d_copies": 0,
+            "host_proxy_clone_s": 0.0,
+            "host_proxy_restore_s": 0.0,
+            "host_proxy_d2h_s": 0.0,
+            "single_pass_load_s": 0.0,
         }
+        load_proxy: torch.nn.Module | None = None
         try:
             batched_mmap = (
                 os.environ.get(
@@ -1169,6 +1374,22 @@ class PreparedRuntimeState:
                 )
                 == "1"
             )
+            single_pass_cpu = (
+                os.environ.get(
+                    "SGLANG_PREPARED_SINGLE_PASS_CPU_ASSEMBLY",
+                    "0",
+                )
+                == "1"
+            )
+            if single_pass_cpu and not cpu_assemble:
+                raise ValueError(
+                    "single-pass CPU assembly requires SGLANG_PREPARED_CPU_ASSEMBLY=1"
+                )
+            if single_pass_cpu and not self._auto_groups:
+                raise ValueError(
+                    "single-pass CPU assembly requires automatic runtime "
+                    "module grouping"
+                )
             if cpu_assemble and batched_mmap:
                 raise ValueError(
                     "CPU checkpoint assembly and batched CUDA mmap loading "
@@ -1183,7 +1404,37 @@ class PreparedRuntimeState:
                     "automatic runtime module grouping requires the mmap "
                     "checkpoint iterator"
                 )
-            if mmap_checkpoint:
+            if single_pass_cpu:
+                phase_started = time.perf_counter()
+                load_proxy, host_proxy_stats = build_host_load_proxy(
+                    model,
+                    self._module_groups,
+                    target_device,
+                    restore_weights_before_loading,
+                )
+                logger.info(
+                    "[RL_PREPARED_STATE] built rank-local host load proxy "
+                    "groups=%d wall_s=%.3f clone_s=%.3f restore_s=%.3f "
+                    "d2h_s=%.3f",
+                    host_proxy_stats["groups"],
+                    time.perf_counter() - phase_started,
+                    host_proxy_stats["clone_s"],
+                    host_proxy_stats["restore_s"],
+                    host_proxy_stats["d2h_s"],
+                )
+                totals["host_proxy_clone_s"] = host_proxy_stats["clone_s"]
+                totals["host_proxy_restore_s"] = host_proxy_stats["restore_s"]
+                totals["host_proxy_d2h_s"] = host_proxy_stats["d2h_s"]
+
+                phase_started = time.perf_counter()
+                load_proxy.load_weights(streaming_mmap_weights_iterator(model_path))
+                totals["single_pass_load_s"] = time.perf_counter() - phase_started
+                logger.info(
+                    "[RL_PREPARED_STATE] single-pass rank-local CPU load wall_s=%.3f",
+                    totals["single_pass_load_s"],
+                )
+                grouped = ((group.path, None) for group in self._module_groups)
+            elif mmap_checkpoint:
                 logger.info(
                     "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint%s",
                     " with pinned H2D batching" if batched_mmap else "",
@@ -1213,17 +1464,55 @@ class PreparedRuntimeState:
                 seen_paths.add(path)
                 group_started = time.perf_counter()
                 phase_started = group_started
-                proxy, shadow = clone_module_proxy(model, path)
-                clone_s = time.perf_counter() - phase_started
-                phase_started = time.perf_counter()
-                restore_weights_before_loading(shadow, target_device)
-                restore_s = time.perf_counter() - phase_started
                 host_targets: list[HostLoadTarget] = []
                 host_target_alloc_s = 0.0
                 raw_h2d_s = 0.0
                 raw_h2d_bytes = 0
                 raw_h2d_copies = 0
-                if cpu_assemble:
+                if single_pass_cpu:
+                    if load_proxy is None:
+                        raise AssertionError("single-pass load proxy is missing")
+                    host_shadow = module_at_path(load_proxy, path)
+                    pinned_shadow = clone_module_tensors(
+                        host_shadow,
+                        target_device=torch.device("cpu"),
+                        pin_memory=True,
+                    )
+                    host_target_alloc_s = time.perf_counter() - phase_started
+                    replace_proxy_module(
+                        load_proxy,
+                        model,
+                        path,
+                        module_at_path(model, path),
+                    )
+                    release_module_tensors(host_shadow)
+                    del host_shadow
+
+                    phase_started = time.perf_counter()
+                    shadow = clone_module_tensors(
+                        pinned_shadow,
+                        target_device=target_device,
+                    )
+                    torch.cuda.synchronize(target_device)
+                    raw_h2d_s = time.perf_counter() - phase_started
+                    shadow_storages = {
+                        _tensor_storage_key(tensor)
+                        for _, tensor in iter_model_tensors(shadow)
+                        if tensor.device.type == "cuda"
+                    }
+                    raw_h2d_copies = len(shadow_storages)
+                    raw_h2d_bytes = sum(key[2] for key in shadow_storages)
+                    del pinned_shadow
+                    clone_s = 0.0
+                    restore_s = 0.0
+                    load_s = 0.0
+                else:
+                    proxy, shadow = clone_module_proxy(model, path)
+                    clone_s = time.perf_counter() - phase_started
+                    phase_started = time.perf_counter()
+                    restore_weights_before_loading(shadow, target_device)
+                    restore_s = time.perf_counter() - phase_started
+                if cpu_assemble and not single_pass_cpu:
                     phase_started = time.perf_counter()
                     host_targets = move_load_targets_to_pinned_host(shadow)
                     host_target_alloc_s = time.perf_counter() - phase_started
@@ -1234,24 +1523,25 @@ class PreparedRuntimeState:
                     "h2d_s": 0.0,
                     "broadcast_s": 0.0,
                 }
-                group_weights: Iterable[tuple[str, torch.Tensor]] = group
-                if batched_mmap:
-                    group_weights = self._iter_batched_cuda_weights(
-                        group,
-                        target_device,
-                        batch_stats,
-                    )
-                phase_started = time.perf_counter()
-                proxy.load_weights(group_weights)
-                load_s = time.perf_counter() - phase_started
-                if cpu_assemble:
+                if not single_pass_cpu:
+                    group_weights: Iterable[tuple[str, torch.Tensor]] = group
+                    if batched_mmap:
+                        group_weights = self._iter_batched_cuda_weights(
+                            group,
+                            target_device,
+                            batch_stats,
+                        )
                     phase_started = time.perf_counter()
-                    raw_h2d_copies, raw_h2d_bytes = move_load_targets_to_device(
-                        host_targets,
-                        target_device,
-                        self._stream,
-                    )
-                    raw_h2d_s = time.perf_counter() - phase_started
+                    proxy.load_weights(group_weights)
+                    load_s = time.perf_counter() - phase_started
+                    if cpu_assemble:
+                        phase_started = time.perf_counter()
+                        raw_h2d_copies, raw_h2d_bytes = move_load_targets_to_device(
+                            host_targets,
+                            target_device,
+                            self._stream,
+                        )
+                        raw_h2d_s = time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
                 for _, module in shadow.named_modules():
                     quant_method = getattr(module, "quant_method", None)
@@ -1310,17 +1600,29 @@ class PreparedRuntimeState:
                     raw_h2d_bytes,
                     raw_h2d_copies,
                 )
-                del shadow, proxy
+                del shadow
+                if not single_pass_cpu:
+                    del proxy
+                    cleanup_gc_started = time.perf_counter()
+                    gc.collect()
+                    cleanup_gc_s = time.perf_counter() - cleanup_gc_started
+                    totals["cleanup_gc_s"] += cleanup_gc_s
+                    logger.info(
+                        "[RL_PREPARED_STATE] group=%s cleanup_gc_s=%.3f",
+                        path,
+                        cleanup_gc_s,
+                    )
+            if single_pass_cpu:
                 cleanup_gc_started = time.perf_counter()
                 gc.collect()
                 cleanup_gc_s = time.perf_counter() - cleanup_gc_started
                 totals["cleanup_gc_s"] += cleanup_gc_s
                 logger.info(
-                    "[RL_PREPARED_STATE] group=%s cleanup_gc_s=%.3f",
-                    path,
+                    "[RL_PREPARED_STATE] single-pass cleanup_gc_s=%.3f",
                     cleanup_gc_s,
                 )
         finally:
+            load_proxy = None
             self._checkpoint_device_buffer = None
             torch.cuda.empty_cache()
             model_config.model_path = original_model_path
@@ -1359,6 +1661,10 @@ class PreparedRuntimeState:
             "raw_h2d_s": round(float(totals["raw_h2d_s"]), 6),
             "raw_h2d_bytes": int(totals["raw_h2d_bytes"]),
             "raw_h2d_copies": int(totals["raw_h2d_copies"]),
+            "host_proxy_clone_s": round(float(totals["host_proxy_clone_s"]), 6),
+            "host_proxy_restore_s": round(float(totals["host_proxy_restore_s"]), 6),
+            "host_proxy_d2h_s": round(float(totals["host_proxy_d2h_s"]), 6),
+            "single_pass_load_s": round(float(totals["single_pass_load_s"]), 6),
             "wall_s": round(time.perf_counter() - started, 6),
         }
 

@@ -377,11 +377,21 @@ class PreparedRuntimeState:
             image_bytes = self._preallocated_image_bytes
             self._preallocated_image_bytes = None
         else:
-            image_bytes = torch.empty(
-                self.image_nbytes,
-                dtype=torch.uint8,
-                pin_memory=self._full_pinned,
-            )
+            try:
+                image_bytes = torch.empty(
+                    self.image_nbytes,
+                    dtype=torch.uint8,
+                    pin_memory=self._full_pinned,
+                )
+            except RuntimeError:
+                if not self._full_pinned:
+                    raise
+                logger.exception(
+                    "[RL_PREPARED_STATE] full pinned image allocation failed; "
+                    "falling back to bounded staging"
+                )
+                self._full_pinned = False
+                image_bytes = torch.empty(self.image_nbytes, dtype=torch.uint8)
         return RuntimeStateImage(bytes=image_bytes, identity=identity)
 
     def capture_active(self, identity: str) -> dict[str, float | int]:
@@ -952,17 +962,25 @@ class PreparedRuntimeState:
         started = time.perf_counter()
         if self._full_pinned:
             if self.prepared is None and self._preallocated_image_bytes is None:
-                self._preallocated_image_bytes = torch.empty(
-                    self.image_nbytes,
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-            return {
-                "full_pinned_image_bytes": self.image_nbytes,
-                "pinned_prefix_bytes": 0,
-                "tail_buffer_bytes": 0,
-                "wall_s": round(time.perf_counter() - started, 6),
-            }
+                try:
+                    self._preallocated_image_bytes = torch.empty(
+                        self.image_nbytes,
+                        dtype=torch.uint8,
+                        pin_memory=True,
+                    )
+                except RuntimeError:
+                    logger.exception(
+                        "[RL_PREPARED_STATE] full pinned image preallocation "
+                        "failed; falling back to bounded staging"
+                    )
+                    self._full_pinned = False
+            if self._full_pinned:
+                return {
+                    "full_pinned_image_bytes": self.image_nbytes,
+                    "pinned_prefix_bytes": 0,
+                    "tail_buffer_bytes": 0,
+                    "wall_s": round(time.perf_counter() - started, 6),
+                }
         pinned_prefix_bytes = self._ensure_pinned_prefix()
         self._ensure_transfer_buffers()
         return {

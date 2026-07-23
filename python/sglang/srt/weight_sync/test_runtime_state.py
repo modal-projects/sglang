@@ -168,3 +168,23 @@ def test_allocate_image_consumes_preallocated_buffer():
     assert image.identity == "v1"
     assert image.bytes is preallocated
     assert state._preallocated_image_bytes is None
+
+
+def test_allocate_image_falls_back_when_full_pin_fails(monkeypatch):
+    state = object.__new__(PreparedRuntimeState)
+    state.image_nbytes = 32
+    state._full_pinned = True
+    state._preallocated_image_bytes = None
+    real_empty = torch.empty
+
+    def empty(*args, pin_memory=False, **kwargs):
+        if pin_memory:
+            raise RuntimeError("pin limit")
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    image = state.allocate_image("v1")
+
+    assert image.identity == "v1"
+    assert image.bytes.numel() == 32
+    assert not state._full_pinned

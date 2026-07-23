@@ -678,6 +678,7 @@ class PreparedLoadPlan:
                     **call.kwargs,
                 )
 
+        @torch.inference_mode()
         def dispatch_batch(
             items: list[tuple[str, torch.Tensor, list[PreparedLoadCall]]],
         ) -> None:

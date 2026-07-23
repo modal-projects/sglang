@@ -288,6 +288,41 @@ def test_direct_copy_resolves_parameter_in_shared_image_storage():
     torch.testing.assert_close(parameter, loaded_weight)
 
 
+def test_direct_copy_worker_enters_inference_mode_for_trainable_parameter():
+    class TrainableModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8))
+
+        def load_weights(self, weights):
+            from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+            for _, loaded_weight in weights:
+                loader = (
+                    getattr(self.weight, "weight_loader", None)
+                    or default_weight_loader
+                )
+                loader(self.weight, loaded_weight)
+
+    recorded = TrainableModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, [("weight", torch.ones(8))])
+    assert "weight" in plan.direct_copies
+
+    replayed = TrainableModel()
+    replayed._prepared_load_plan = plan
+    stats = plan.replay(
+        replayed,
+        [("weight", torch.full((8,), 3.0))],
+        max_workers=2,
+    )
+
+    torch.testing.assert_close(replayed.weight, torch.full((8,), 3.0))
+    assert stats["worker_direct_entries"] == 1
+
+
 def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():
     recorded = ToyModel()
     plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)

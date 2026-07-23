@@ -3,6 +3,8 @@ import torch
 from sglang.srt.weight_sync.runtime_state import (
     checkpoint_module_path,
     clone_module_proxy,
+    clone_module_tensors,
+    runtime_module_path,
 )
 
 
@@ -30,6 +32,19 @@ def test_checkpoint_module_path_bounds_large_groups():
     assert checkpoint_module_path("mm_projector.proj.0.weight") == "mm_projector"
 
 
+def test_runtime_module_path_includes_derived_state_but_excludes_static_state():
+    assert (
+        runtime_module_path(
+            "language_model.model.layers.17.mlp.experts.w13_weight_scale"
+        )
+        == "language_model.model.layers.17"
+    )
+    assert runtime_module_path("language_model.model.rotary_emb.inv_freq") is None
+    assert runtime_module_path("language_model.model.layers.17.rotary_emb.inv_freq") == (
+        "language_model.model.layers.17"
+    )
+
+
 def test_clone_module_proxy_replaces_only_selected_path():
     model = _ToyModel()
     proxy, shadow = clone_module_proxy(model, "language_model.model.layers.1")
@@ -42,3 +57,24 @@ def test_clone_module_proxy_replaces_only_selected_path():
     with torch.no_grad():
         shadow.weight.fill_(42)
     assert not torch.equal(shadow.weight, model.language_model.model.layers[1].weight)
+
+
+def test_clone_module_tensors_preserves_aliases_and_shares_non_tensor_state():
+    module = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.arange(8.0))
+    parameter.weight_loader = "sentinel"
+    module.register_parameter("weight", parameter)
+    module.alias = parameter[2:6]
+    module.runtime_object = object()
+
+    cloned = clone_module_tensors(module)
+
+    assert cloned.weight is not module.weight
+    assert cloned.weight.data_ptr() != module.weight.data_ptr()
+    assert cloned.weight.weight_loader == "sentinel"
+    assert cloned.alias.untyped_storage().data_ptr() == cloned.weight.data_ptr()
+    assert cloned.alias.storage_offset() == 2
+    assert cloned.runtime_object is module.runtime_object
+    with torch.no_grad():
+        cloned.weight.add_(10)
+    assert torch.equal(module.weight, torch.arange(8.0))

@@ -2157,9 +2157,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         state = getattr(self, "prepared_runtime_state", None)
         if state is None:
             state = PreparedRuntimeState(self.model)
-            active_identity = f"{os.path.realpath(self.server_args.model_path)}|active"
-            capture_stats = state.capture_active(active_identity)
-            logger.info("[RL_PREPARED_STATE] captured_active=%s", capture_stats)
             self.prepared_runtime_state = state
         identity = f"{os.path.realpath(model_path)}|{weight_version}"
         return state.prepare_from_disk(

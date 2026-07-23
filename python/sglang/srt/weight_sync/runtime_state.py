@@ -5,9 +5,12 @@ the final commit primitive for a faster path: all checkpoint parsing, sharding,
 fusion and quantization must already have produced a byte-exact host image of
 the model's live CUDA storages before :meth:`commit` is called.
 
-The implementation is intentionally dense-update safe.  It inventories unique
-storages rather than tensor names, copies every byte, and preserves aliases by
-overwriting existing storage instead of rebinding Parameters.  A bounded pinned
+The implementation is intentionally dense-update safe.  It inventories every
+unique checkpoint-derived runtime storage rather than changed tensor names,
+copies every byte in that inventory, and preserves aliases by overwriting
+existing storage instead of rebinding Parameters.  Checkpoint-invariant CUDA
+buffers are deliberately excluded: copying them would add hundreds of gigabytes
+of needless GPU-to-host traffic without changing the result.  A bounded pinned
 prefix and two pinned streaming buffers keep the design within hosts that cannot
 pin an entire 600+ GB tensor-parallel runtime image.
 """
@@ -94,14 +97,35 @@ def iter_model_tensors(model: torch.nn.Module) -> Iterable[tuple[str, torch.Tens
             yield from _walk_attribute(value, f"{prefix}{attribute_name}")
 
 
+def runtime_module_path(name: str) -> str | None:
+    """Map a live runtime tensor to the checkpoint module that produces it."""
+
+    for pattern in (_DECODER_LAYER, _VISION_BLOCK):
+        match = pattern.match(name)
+        if match is not None:
+            return match.group(1)
+    if name.startswith("mm_projector."):
+        return "mm_projector"
+    for path in (
+        "language_model.lm_head",
+        "language_model.model.embed_tokens",
+        "language_model.model.norm",
+        "vision_tower.encoder.final_layernorm",
+        "vision_tower.patch_embed",
+    ):
+        if name == path or name.startswith(f"{path}."):
+            return path
+    return None
+
+
 def build_runtime_storage_plan(
     model: torch.nn.Module,
 ) -> tuple[list[RuntimeStorageSegment], int]:
-    """Build a deterministic unique-storage plan without changing GPU addresses."""
+    """Build a deterministic checkpoint-derived plan without changing addresses."""
 
     unique: dict[tuple[int | None, int, int], tuple[str, torch.Tensor]] = {}
     for name, tensor in iter_model_tensors(model):
-        if tensor.device.type != "cuda":
+        if tensor.device.type != "cuda" or runtime_module_path(name) is None:
             continue
         storage = tensor.untyped_storage()
         nbytes = storage.nbytes()
@@ -135,28 +159,119 @@ def checkpoint_module_path(name: str) -> str:
     decoder/vision block in spare HBM.
     """
 
-    for pattern in (_DECODER_LAYER, _VISION_BLOCK):
-        match = pattern.match(name)
-        if match is not None:
-            return match.group(1)
-    if name.startswith("mm_projector."):
-        return "mm_projector"
-    for path in (
-        "language_model.lm_head",
-        "language_model.model.embed_tokens",
-        "language_model.model.norm",
-        "vision_tower.encoder.final_layernorm",
-        "vision_tower.patch_embed",
-    ):
-        if name == path or name.startswith(f"{path}."):
-            return path
-    raise ValueError(f"no bounded scratch module for checkpoint tensor {name!r}")
+    path = runtime_module_path(name)
+    if path is None:
+        raise ValueError(f"no bounded scratch module for checkpoint tensor {name!r}")
+    return path
+
+
+def _clone_tensor_storage(
+    tensor: torch.Tensor,
+    tensor_memo: dict[int, torch.Tensor],
+    storage_memo: dict[tuple[int | None, int, int], torch.Tensor],
+) -> torch.Tensor:
+    """Clone a tensor while retaining subclasses, views, and storage aliases."""
+
+    cached = tensor_memo.get(id(tensor))
+    if cached is not None:
+        return cached
+
+    storage = tensor.untyped_storage()
+    storage_key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
+    cloned_storage = storage_memo.get(storage_key)
+    if cloned_storage is None:
+        cloned_storage = _storage_bytes(tensor).clone()
+        storage_memo[storage_key] = cloned_storage
+    view = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+        cloned_storage.untyped_storage(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+    )
+    if isinstance(tensor, torch.nn.Parameter):
+        cloned = copy.copy(tensor)
+        cloned.data = view
+    else:
+        cloned = view.requires_grad_(tensor.requires_grad)
+        if hasattr(tensor, "__dict__"):
+            cloned.__dict__.update(tensor.__dict__)
+    tensor_memo[id(tensor)] = cloned
+    return cloned
+
+
+def _clone_attribute_tensors(
+    value: Any,
+    tensor_memo: dict[int, torch.Tensor],
+    storage_memo: dict[tuple[int | None, int, int], torch.Tensor],
+    depth: int = 0,
+) -> Any:
+    """Clone tensor leaves but share immutable and non-tensor runtime objects."""
+
+    if isinstance(value, torch.Tensor):
+        return _clone_tensor_storage(value, tensor_memo, storage_memo)
+    if depth >= 2:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            for child in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _clone_attribute_tensors(child, tensor_memo, storage_memo, depth + 1)
+            for child in value
+        )
+    return value
+
+
+def clone_module_tensors(module: torch.nn.Module) -> torch.nn.Module:
+    """Clone a module tree's tensor state without copying CUDA runtime objects."""
+
+    tensor_memo: dict[int, torch.Tensor] = {}
+    storage_memo: dict[tuple[int | None, int, int], torch.Tensor] = {}
+
+    def clone(current: torch.nn.Module) -> torch.nn.Module:
+        result = copy.copy(current)
+        result._parameters = {
+            name: (
+                None
+                if parameter is None
+                else _clone_tensor_storage(parameter, tensor_memo, storage_memo)
+            )
+            for name, parameter in current._parameters.items()
+        }
+        result._buffers = {
+            name: (
+                None
+                if buffer is None
+                else _clone_tensor_storage(buffer, tensor_memo, storage_memo)
+            )
+            for name, buffer in current._buffers.items()
+        }
+        result._modules = {
+            name: None if child is None else clone(child)
+            for name, child in current._modules.items()
+        }
+        for name, value in vars(current).items():
+            if name in {"_parameters", "_buffers", "_modules"}:
+                continue
+            result.__dict__[name] = _clone_attribute_tensors(
+                value, tensor_memo, storage_memo
+            )
+        return result
+
+    return clone(module)
 
 
 def clone_module_proxy(
     model: torch.nn.Module, path: str
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
-    """Shallow-clone ancestors and deep-clone only the selected CUDA module."""
+    """Shallow-clone ancestors and tensor-clone only the selected CUDA module."""
 
     parts = path.split(".")
     live = model
@@ -168,7 +283,7 @@ def clone_module_proxy(
         if live_child is None:
             raise KeyError(f"module path {path!r} is missing component {part!r}")
         if index == len(parts) - 1:
-            shadow = copy.deepcopy(live_child)
+            shadow = clone_module_tensors(live_child)
             proxy_cursor._modules[part] = shadow
             return proxy, shadow
         proxy_child = copy.copy(live_child)
@@ -219,13 +334,9 @@ class PreparedRuntimeState:
         }
 
     def begin_preparation(self, identity: str) -> RuntimeStateImage:
-        """Start from the active image so unchanged/static storages stay exact."""
+        """Allocate a fresh dense image for all checkpoint-derived storages."""
 
-        if self.active is None:
-            raise RuntimeError("capture_active must run before preparing an update")
-        self.prepared = RuntimeStateImage(
-            bytes=self.active.bytes.clone(), identity=identity
-        )
+        self.prepared = self.allocate_image(identity)
         return self.prepared
 
     def _copy_shadow_module(self, path: str, shadow: torch.nn.Module) -> int:
@@ -327,6 +438,13 @@ class PreparedRuntimeState:
                 gc.collect()
         finally:
             model_config.model_path = original_model_path
+
+        expected_bytes = sum(segment.nbytes for segment in self.segments)
+        if copied_bytes != expected_bytes:
+            raise RuntimeError(
+                "prepared runtime image is incomplete: "
+                f"copied={copied_bytes} expected={expected_bytes} bytes"
+            )
 
         stage_stats = self.stage_prepared()
         return {
@@ -430,7 +548,13 @@ class PreparedRuntimeState:
         }
 
     def commit(self) -> dict[str, float | int | str]:
-        """Overwrite every inventoried storage, retaining the old host image."""
+        """Overwrite every checkpoint-derived storage and retain the old image.
+
+        A previous successfully committed image is available for rollback.  The
+        first prepared commit intentionally has no rollback snapshot: capturing
+        the serving model would itself take several minutes on this host and is
+        outside the paused-path contract.
+        """
 
         if self.prepared is None:
             raise RuntimeError("no prepared runtime image")

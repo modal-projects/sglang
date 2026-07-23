@@ -729,6 +729,19 @@ class PreparedRuntimeState:
         copied_bytes = 0
         group_count = 0
         seen_paths: set[str] = set()
+        totals: dict[str, float | int] = {
+            "clone_s": 0.0,
+            "restore_s": 0.0,
+            "load_s": 0.0,
+            "postprocess_s": 0.0,
+            "synchronize_s": 0.0,
+            "d2h_s": 0.0,
+            "source_bytes": 0,
+            "batches": 0,
+            "pack_s": 0.0,
+            "h2d_s": 0.0,
+            "broadcast_s": 0.0,
+        }
         try:
             batched_mmap = (
                 os.environ.get(
@@ -798,6 +811,20 @@ class PreparedRuntimeState:
                 d2h_s = time.perf_counter() - phase_started
                 copied_bytes += group_bytes
                 group_count += 1
+                totals["clone_s"] += clone_s
+                totals["restore_s"] += restore_s
+                totals["load_s"] += load_s
+                totals["postprocess_s"] += postprocess_s
+                totals["synchronize_s"] += synchronize_s
+                totals["d2h_s"] += d2h_s
+                for name in (
+                    "source_bytes",
+                    "batches",
+                    "pack_s",
+                    "h2d_s",
+                    "broadcast_s",
+                ):
+                    totals[name] += batch_stats[name]
                 logger.info(
                     "[RL_PREPARED_STATE] group=%s bytes=%d wall_s=%.3f "
                     "clone_s=%.3f restore_s=%.3f load_s=%.3f "
@@ -844,6 +871,17 @@ class PreparedRuntimeState:
             "gpu_stage_bytes": stage_stats["gpu_stage_bytes"],
             "gpu_stage_wall_s": stage_stats["gpu_stage_wall_s"],
             "stage_wall_s": stage_stats["wall_s"],
+            "clone_s": round(float(totals["clone_s"]), 6),
+            "restore_s": round(float(totals["restore_s"]), 6),
+            "load_s": round(float(totals["load_s"]), 6),
+            "postprocess_s": round(float(totals["postprocess_s"]), 6),
+            "synchronize_s": round(float(totals["synchronize_s"]), 6),
+            "d2h_s": round(float(totals["d2h_s"]), 6),
+            "source_bytes": int(totals["source_bytes"]),
+            "batches": int(totals["batches"]),
+            "pack_s": round(float(totals["pack_s"]), 6),
+            "h2d_s": round(float(totals["h2d_s"]), 6),
+            "broadcast_s": round(float(totals["broadcast_s"]), 6),
             "wall_s": round(time.perf_counter() - started, 6),
         }
 

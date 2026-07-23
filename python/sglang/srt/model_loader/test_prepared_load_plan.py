@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -123,6 +124,35 @@ def _weights(seed):
         "tail": torch.randn(8, generator=generator),
         "norm": torch.randn(8, generator=generator),
     }
+
+
+def _write_safetensors_checkpoint(path, weights):
+    from safetensors.torch import save_file
+
+    names = list(weights)
+    split = (len(names) + 1) // 2
+    shards = [shard for shard in (names[:split], names[split:]) if shard]
+    weight_map = {}
+    for index, shard_names in enumerate(shards, start=1):
+        filename = f"model-{index:05d}-of-{len(shards):05d}.safetensors"
+        save_file(
+            {name: weights[name].contiguous() for name in shard_names},
+            path / filename,
+        )
+        weight_map.update({name: filename for name in shard_names})
+    with (path / "model.safetensors.index.json").open("w") as file:
+        json.dump(
+            {
+                "metadata": {
+                    "total_size": sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in weights.values()
+                    )
+                },
+                "weight_map": weight_map,
+            },
+            file,
+        )
 
 
 def test_record_classifies_direct_derived_and_forced_fallback():
@@ -321,6 +351,167 @@ def test_direct_copy_worker_enters_inference_mode_for_trainable_parameter():
 
     torch.testing.assert_close(replayed.weight, torch.full((8,), 3.0))
     assert stats["worker_direct_entries"] == 1
+
+
+def test_raw_replay_consumes_sharded_checkpoint_and_matches_ordinary_load(
+    tmp_path,
+):
+    recorded = ToyModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, _weights(1).items())
+
+    target_weights = _weights(2)
+    _write_safetensors_checkpoint(tmp_path, target_weights)
+    expected = ToyModel()
+    expected.load_weights(target_weights.items())
+
+    replayed = ToyModel()
+    replayed._prepared_load_plan = plan
+    stats = plan.replay_safetensors(
+        replayed,
+        str(tmp_path),
+        max_workers=4,
+    )
+
+    for name, parameter in expected.named_parameters():
+        torch.testing.assert_close(
+            parameter,
+            dict(replayed.named_parameters())[name],
+        )
+    assert set(replayed.consumed) == {"part_a", "part_b", "tail"}
+    assert replayed.tail_seen == ["tail"]
+    assert stats["plan"] == "raw_replay"
+    assert stats["hits"] == 4
+    assert stats["fallback"] == 3
+    assert stats["unknown"] == 0
+    assert stats["source_tensors"] == 7
+    assert stats["source_bytes"] == 7 * 8 * 4
+    assert stats["direct_source_bytes"] == 4 * 8 * 4
+    assert stats["fallback_source_bytes"] == 3 * 8 * 4
+    assert stats["raw_entries"] == 4
+    assert stats["raw_operations"] == 4
+    assert stats["raw_copy_bytes"] == 4 * 8 * 4
+    assert stats["worker_direct_entries"] == 4
+    assert stats["worker_direct_operations"] == 4
+
+
+def test_raw_replay_resolves_shared_host_image_storage(tmp_path):
+    recorded = ToyModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, _weights(1).items())
+    target_weights = _weights(2)
+    _write_safetensors_checkpoint(tmp_path, target_weights)
+
+    replayed = ToyModel()
+    backing = torch.zeros(256, dtype=torch.uint8)
+    logical_byte_offset = 128
+    view = torch.empty(0, dtype=torch.float32).set_(
+        backing.untyped_storage(),
+        logical_byte_offset // torch.empty((), dtype=torch.float32).element_size(),
+        (8,),
+        (1,),
+    )
+    replayed.plain = nn.Parameter(view, requires_grad=False)
+    setattr(
+        replayed.plain,
+        "_sglang_prepared_logical_storage_range",
+        (logical_byte_offset, 8 * replayed.plain.element_size()),
+    )
+    replayed._prepared_load_plan = plan
+
+    stats = plan.replay_safetensors(
+        replayed,
+        str(tmp_path),
+        max_workers=4,
+    )
+
+    torch.testing.assert_close(replayed.plain, target_weights["plain"])
+    torch.testing.assert_close(
+        backing[logical_byte_offset : logical_byte_offset + 32].view(
+            torch.float32
+        ),
+        target_weights["plain"],
+    )
+    assert stats["raw_entries"] == 4
+
+
+def test_raw_replay_falls_back_on_checkpoint_dtype_mismatch(tmp_path):
+    class TrainableModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8))
+
+        def load_weights(self, weights):
+            from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+            for _, loaded_weight in weights:
+                loader = (
+                    getattr(self.weight, "weight_loader", None)
+                    or default_weight_loader
+                )
+                loader(self.weight, loaded_weight)
+
+    recorded = TrainableModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    plan.record(recorded, [("weight", torch.ones(8))])
+    target = torch.arange(8, dtype=torch.float64)
+    _write_safetensors_checkpoint(tmp_path, {"weight": target})
+
+    replayed = TrainableModel()
+    replayed._prepared_load_plan = plan
+    stats = plan.replay_safetensors(
+        replayed,
+        str(tmp_path),
+        max_workers=2,
+    )
+
+    torch.testing.assert_close(replayed.weight, target.float())
+    assert stats["raw_entries"] == 0
+    assert stats["raw_rejection_reasons"] == {"source_layout": 1}
+    assert stats["hits"] == 1
+    assert stats["worker_direct_entries"] == 0
+
+
+def test_raw_replay_accepts_initial_tensor_view_in_padded_storage(tmp_path):
+    class PaddedSourceModel(nn.Module):
+        supports_prepared_load_plan = True
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(8), requires_grad=False)
+
+        def load_weights(self, weights):
+            from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+            for _, loaded_weight in weights:
+                loader = (
+                    getattr(self.weight, "weight_loader", None)
+                    or default_weight_loader
+                )
+                loader(self.weight, loaded_weight)
+
+    recorded = PaddedSourceModel()
+    plan = prepared_load_plan.get_or_create_prepared_load_plan(recorded)
+    initial_storage = torch.arange(16, dtype=torch.float32)
+    plan.record(recorded, [("weight", initial_storage[4:12])])
+    assert plan.direct_copies["weight"][0].source_signature.storage_offset == 4
+
+    target = torch.arange(8, dtype=torch.float32) + 100
+    _write_safetensors_checkpoint(tmp_path, {"weight": target})
+    replayed = PaddedSourceModel()
+    replayed._prepared_load_plan = plan
+
+    stats = plan.replay_safetensors(
+        replayed,
+        str(tmp_path),
+        max_workers=2,
+    )
+
+    torch.testing.assert_close(replayed.weight, target)
+    assert stats["raw_entries"] == 1
+    assert stats["raw_rejection_reasons"] == {}
 
 
 def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():

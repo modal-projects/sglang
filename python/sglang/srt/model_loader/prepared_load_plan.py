@@ -23,13 +23,18 @@ ordinary full loader.
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
+import json
 import logging
+import mmap
 import resource
 import threading
 import time
 from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass
+from math import prod
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -65,6 +70,7 @@ class ParameterStorageSignature:
     stride: tuple[int, ...]
     storage_offset: int
     storage_nbytes: int
+    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,172 @@ class PreparedDirectCopy:
     destination_view: TensorViewSpec
 
 
+@dataclass(frozen=True)
+class SafetensorsTensorMetadata:
+    """Validated location and layout of one tensor in a safetensors shard."""
+
+    filename: str
+    data_offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype_name: str
+
+
+@dataclass(frozen=True)
+class PreparedRawCopy:
+    """One byte-identical file range copied into a restored CPU storage."""
+
+    name: str
+    filename: str
+    source_offset: int
+    destination_ptr: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class PreparedRawRange:
+    """One possibly coalesced native copy inside a mapped shard."""
+
+    source_offset: int
+    destination_ptr: int
+    nbytes: int
+
+
+_SAFETENSORS_DTYPE_NAMES: dict[torch.dtype, str] = {
+    torch.bool: "BOOL",
+    torch.uint8: "U8",
+    torch.int8: "I8",
+    torch.int16: "I16",
+    torch.int32: "I32",
+    torch.int64: "I64",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float32: "F32",
+    torch.float64: "F64",
+}
+for _torch_name, _safetensors_name in (
+    ("uint16", "U16"),
+    ("uint32", "U32"),
+    ("uint64", "U64"),
+    ("float8_e4m3fn", "F8_E4M3"),
+    ("float8_e5m2", "F8_E5M2"),
+):
+    _dtype = getattr(torch, _torch_name, None)
+    if _dtype is not None:
+        _SAFETENSORS_DTYPE_NAMES[_dtype] = _safetensors_name
+
+
+def _is_contiguous_view(view: TensorViewSpec) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(view.shape), reversed(view.stride)):
+        if size > 1 and stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _safetensors_metadata(
+    model_path: str,
+) -> tuple[
+    dict[str, SafetensorsTensorMetadata],
+    dict[str, list[str]],
+    int,
+]:
+    """Parse and validate a sharded safetensors index without tensor creation."""
+
+    root = Path(model_path)
+    index_path = root / "model.safetensors.index.json"
+    with index_path.open() as file:
+        index = json.load(file)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid or empty safetensors weight map: {index_path}")
+
+    names_by_filename: dict[str, list[str]] = {}
+    for name, filename in weight_map.items():
+        if not isinstance(name, str) or not isinstance(filename, str):
+            raise TypeError(f"invalid safetensors weight map entry: {name!r}")
+        names_by_filename.setdefault(filename, []).append(name)
+
+    tensors: dict[str, SafetensorsTensorMetadata] = {}
+    total_bytes = 0
+    for filename, expected_names in sorted(names_by_filename.items()):
+        path = root / filename
+        with path.open("rb") as file:
+            header_size_bytes = file.read(8)
+            if len(header_size_bytes) != 8:
+                raise ValueError(f"truncated safetensors header length: {path}")
+            header_size = int.from_bytes(header_size_bytes, "little")
+            header_bytes = file.read(header_size)
+            if len(header_bytes) != header_size:
+                raise ValueError(f"truncated safetensors header: {path}")
+            header = json.loads(header_bytes)
+        if not isinstance(header, dict):
+            raise TypeError(f"invalid safetensors header: {path}")
+
+        data_start = 8 + header_size
+        file_payload_bytes = path.stat().st_size - data_start
+        header_names = {name for name in header if name != "__metadata__"}
+        if header_names != set(expected_names):
+            missing = sorted(set(expected_names) - header_names)
+            extra = sorted(header_names - set(expected_names))
+            raise ValueError(
+                f"safetensors index/header mismatch for {path}: "
+                f"missing={missing[:10]} extra={extra[:10]}"
+            )
+        payload_ranges: list[tuple[int, int, str]] = []
+        for name in expected_names:
+            item = header[name]
+            if not isinstance(item, dict):
+                raise TypeError(f"invalid safetensors metadata for {name!r}")
+            offsets = item.get("data_offsets")
+            shape = item.get("shape")
+            dtype_name = item.get("dtype")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(isinstance(value, int) for value in offsets)
+                or not isinstance(shape, list)
+                or not all(isinstance(value, int) and value >= 0 for value in shape)
+                or not isinstance(dtype_name, str)
+            ):
+                raise ValueError(f"invalid safetensors metadata for {name!r}: {item}")
+            begin, end = offsets
+            if begin < 0 or end < begin or end > file_payload_bytes:
+                raise ValueError(
+                    f"invalid safetensors data range for {name!r}: "
+                    f"{begin}:{end} payload={file_payload_bytes}"
+                )
+            payload_ranges.append((begin, end, name))
+            metadata = SafetensorsTensorMetadata(
+                filename=filename,
+                data_offset=data_start + begin,
+                nbytes=end - begin,
+                shape=tuple(shape),
+                dtype_name=dtype_name,
+            )
+            tensors[name] = metadata
+            total_bytes += metadata.nbytes
+        cursor = 0
+        for begin, end, name in sorted(payload_ranges):
+            if begin != cursor:
+                raise ValueError(
+                    f"non-contiguous safetensors payload before {name!r}: "
+                    f"expected={cursor} actual={begin} path={path}"
+                )
+            cursor = end
+        if cursor != file_payload_bytes:
+            raise ValueError(
+                f"unaccounted safetensors payload bytes: "
+                f"accounted={cursor} payload={file_payload_bytes} path={path}"
+            )
+    return tensors, names_by_filename, total_bytes
+
+
 def _logical_storage_range(tensor: torch.Tensor) -> tuple[int, int]:
     storage_nbytes = tensor.untyped_storage().nbytes()
     logical_range = getattr(tensor, _LOGICAL_STORAGE_RANGE_ATTR, None)
@@ -128,6 +300,7 @@ def _parameter_storage_signature(
         stride=tuple(parameter.stride()),
         storage_offset=relative_byte_offset // parameter.element_size(),
         storage_nbytes=logical_nbytes,
+        dtype=parameter.dtype,
     )
 
 
@@ -606,6 +779,420 @@ class PreparedLoadPlan:
                 )
             )
         return resolved
+
+    def _resolve_raw_copies(
+        self,
+        parameters: dict[str, torch.nn.Parameter],
+        metadata: dict[str, SafetensorsTensorMetadata],
+    ) -> tuple[dict[str, list[PreparedRawCopy]], dict[str, int]]:
+        """Compile byte-identical checkpoint ranges for an isomorphic proxy.
+
+        This is intentionally conservative. A complete source name either
+        compiles or stays on the ordinary tensor/loader path; individual views
+        are never silently omitted.
+        """
+
+        candidates: dict[str, list[PreparedRawCopy]] = {}
+        rejection_reasons: Counter[str] = Counter()
+        for name, copies in self.direct_copies.items():
+            item = metadata.get(name)
+            if item is None:
+                rejection_reasons["missing_metadata"] += 1
+                continue
+            resolved: list[PreparedRawCopy] = []
+            rejected = None
+            for copy in copies:
+                source_signature = copy.source_signature
+                source_dtype_name = _SAFETENSORS_DTYPE_NAMES.get(
+                    source_signature.dtype
+                )
+                source_element_size = _dtype_element_size(
+                    source_signature.dtype
+                )
+                source_tensor_nbytes = (
+                    prod(source_signature.shape) * source_element_size
+                )
+                source_storage_byte_offset = (
+                    source_signature.storage_offset * source_element_size
+                )
+                if (
+                    source_dtype_name != item.dtype_name
+                    or source_signature.shape != item.shape
+                    or source_signature.storage_offset < 0
+                    or source_storage_byte_offset + source_tensor_nbytes
+                    > source_signature.storage_nbytes
+                    or not _is_contiguous_view(
+                        TensorViewSpec(
+                            shape=source_signature.shape,
+                            stride=source_signature.stride,
+                            storage_offset=source_signature.storage_offset,
+                        )
+                    )
+                    or source_tensor_nbytes != item.nbytes
+                ):
+                    rejected = "source_layout"
+                    break
+                parameter = parameters.get(copy.parameter_name)
+                if (
+                    parameter is None
+                    or self._parameter_signature(parameter)
+                    != copy.parameter_signature
+                    or parameter.device.type != "cpu"
+                    or parameter.dtype != source_signature.dtype
+                ):
+                    rejected = "destination_signature"
+                    break
+                if (
+                    copy.source_view.shape != copy.destination_view.shape
+                    or not _is_contiguous_view(copy.source_view)
+                    or not _is_contiguous_view(copy.destination_view)
+                ):
+                    rejected = "view_layout"
+                    break
+
+                view_elements = prod(copy.source_view.shape)
+                view_nbytes = view_elements * source_element_size
+                source_relative_offset = (
+                    copy.source_view.storage_offset
+                    - source_signature.storage_offset
+                ) * source_element_size
+                logical_byte_offset, logical_nbytes = _logical_storage_range(
+                    parameter
+                )
+                destination_relative_offset = (
+                    copy.destination_view.storage_offset
+                    * source_element_size
+                )
+                if (
+                    view_nbytes <= 0
+                    or source_relative_offset < 0
+                    or source_relative_offset + view_nbytes > item.nbytes
+                    or destination_relative_offset < 0
+                    or destination_relative_offset + view_nbytes
+                    > logical_nbytes
+                ):
+                    rejected = "view_range"
+                    break
+                resolved.append(
+                    PreparedRawCopy(
+                        name=name,
+                        filename=item.filename,
+                        source_offset=item.data_offset + source_relative_offset,
+                        destination_ptr=(
+                            parameter.untyped_storage().data_ptr()
+                            + logical_byte_offset
+                            + destination_relative_offset
+                        ),
+                        nbytes=view_nbytes,
+                    )
+                )
+            if rejected is not None or not resolved:
+                rejection_reasons[rejected or "empty"] += 1
+                continue
+            candidates[name] = resolved
+
+        # Overlapping writes can be order-sensitive. Rather than trying to
+        # reconstruct Python loader ordering, keep every name in a connected
+        # overlap component on the ordinary path.
+        intervals = sorted(
+            (
+                operation.destination_ptr,
+                operation.destination_ptr + operation.nbytes,
+                name,
+            )
+            for name, operations in candidates.items()
+            for operation in operations
+        )
+        overlapping_names: set[str] = set()
+        component_names: set[str] = set()
+        component_end = -1
+        component_overlaps = False
+        for begin, end, name in intervals:
+            if begin >= component_end:
+                if component_overlaps:
+                    overlapping_names.update(component_names)
+                component_names = {name}
+                component_end = end
+                component_overlaps = False
+                continue
+            component_names.add(name)
+            component_end = max(component_end, end)
+            component_overlaps = True
+        if component_overlaps:
+            overlapping_names.update(component_names)
+        for name in overlapping_names:
+            candidates.pop(name, None)
+        if overlapping_names:
+            rejection_reasons["destination_overlap"] += len(overlapping_names)
+
+        return candidates, dict(rejection_reasons)
+
+    @staticmethod
+    def _coalesce_raw_ranges(
+        operations: list[PreparedRawCopy],
+    ) -> list[PreparedRawRange]:
+        ranges: list[PreparedRawRange] = []
+        for operation in sorted(
+            operations,
+            key=lambda item: (item.source_offset, item.destination_ptr),
+        ):
+            if (
+                ranges
+                and ranges[-1].source_offset + ranges[-1].nbytes
+                == operation.source_offset
+                and ranges[-1].destination_ptr + ranges[-1].nbytes
+                == operation.destination_ptr
+            ):
+                previous = ranges[-1]
+                ranges[-1] = PreparedRawRange(
+                    source_offset=previous.source_offset,
+                    destination_ptr=previous.destination_ptr,
+                    nbytes=previous.nbytes + operation.nbytes,
+                )
+            else:
+                ranges.append(
+                    PreparedRawRange(
+                        source_offset=operation.source_offset,
+                        destination_ptr=operation.destination_ptr,
+                        nbytes=operation.nbytes,
+                    )
+                )
+        return ranges
+
+    @staticmethod
+    def _partition_raw_ranges(
+        ranges: list[PreparedRawRange],
+        partitions: int,
+    ) -> list[list[PreparedRawRange]]:
+        """Create a small number of source-ordered, byte-balanced tasks."""
+
+        if not ranges:
+            return []
+        partitions = max(1, min(partitions, len(ranges)))
+        remaining_bytes = sum(item.nbytes for item in ranges)
+        remaining_partitions = partitions
+        result: list[list[PreparedRawRange]] = []
+        current: list[PreparedRawRange] = []
+        current_bytes = 0
+        target_bytes = max(1, remaining_bytes // remaining_partitions)
+        for item in ranges:
+            current.append(item)
+            current_bytes += item.nbytes
+            if (
+                len(result) + 1 < partitions
+                and current_bytes >= target_bytes
+            ):
+                result.append(current)
+                remaining_bytes -= current_bytes
+                remaining_partitions -= 1
+                target_bytes = max(1, remaining_bytes // remaining_partitions)
+                current = []
+                current_bytes = 0
+        if current:
+            result.append(current)
+        return result
+
+    def _copy_raw_safetensors_ranges(
+        self,
+        model_path: str,
+        raw_copies: dict[str, list[PreparedRawCopy]],
+        *,
+        max_workers: int,
+    ) -> dict[str, Any]:
+        """Copy compiled file ranges directly into restored CPU storages."""
+
+        started = time.perf_counter()
+        operations_by_filename: dict[str, list[PreparedRawCopy]] = {}
+        for operations in raw_copies.values():
+            for operation in operations:
+                operations_by_filename.setdefault(
+                    operation.filename, []
+                ).append(operation)
+
+        copy_wall_s = 0.0
+        worker_wall_s = 0.0
+        worker_cpu_s = 0.0
+        copied_bytes = 0
+        coalesced_ranges = 0
+        submitted_tasks = 0
+        root = Path(model_path)
+
+        def copy_partition(
+            mapping_ptr: int,
+            ranges: list[PreparedRawRange],
+        ) -> tuple[float, float, int]:
+            partition_started = time.perf_counter()
+            cpu_started = time.thread_time()
+            partition_bytes = 0
+            for item in ranges:
+                ctypes.memmove(
+                    item.destination_ptr,
+                    mapping_ptr + item.source_offset,
+                    item.nbytes,
+                )
+                partition_bytes += item.nbytes
+            return (
+                time.perf_counter() - partition_started,
+                time.thread_time() - cpu_started,
+                partition_bytes,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            for filename in sorted(operations_by_filename):
+                ranges = self._coalesce_raw_ranges(
+                    operations_by_filename[filename]
+                )
+                coalesced_ranges += len(ranges)
+                partitions = self._partition_raw_ranges(
+                    ranges,
+                    max_workers,
+                )
+                submitted_tasks += len(partitions)
+                shard_started = time.perf_counter()
+                with (root / filename).open("rb") as file:
+                    with mmap.mmap(
+                        file.fileno(),
+                        0,
+                        access=mmap.ACCESS_COPY,
+                    ) as mapping:
+                        madvise = getattr(mapping, "madvise", None)
+                        sequential = getattr(mmap, "MADV_SEQUENTIAL", None)
+                        if madvise is not None and sequential is not None:
+                            madvise(sequential)
+                        mapping_ptr = ctypes.addressof(
+                            ctypes.c_char.from_buffer(mapping)
+                        )
+                        futures = [
+                            executor.submit(
+                                copy_partition,
+                                mapping_ptr,
+                                partition,
+                            )
+                            for partition in partitions
+                        ]
+                        for future in futures:
+                            wall_s, cpu_s, task_bytes = future.result()
+                            worker_wall_s += wall_s
+                            worker_cpu_s += cpu_s
+                            copied_bytes += task_bytes
+                copy_wall_s += time.perf_counter() - shard_started
+
+        return {
+            "raw_entries": len(raw_copies),
+            "raw_operations": sum(
+                len(operations) for operations in raw_copies.values()
+            ),
+            "raw_coalesced_ranges": coalesced_ranges,
+            "raw_submitted_tasks": submitted_tasks,
+            "raw_copy_bytes": copied_bytes,
+            "raw_copy_wall_s": round(copy_wall_s, 6),
+            "raw_worker_wall_s": round(worker_wall_s, 6),
+            "raw_worker_cpu_s": round(worker_cpu_s, 6),
+            "raw_wall_s": round(time.perf_counter() - started, 6),
+        }
+
+    def replay_safetensors(
+        self,
+        model: torch.nn.Module,
+        model_path: str,
+        *,
+        max_workers: int,
+    ) -> dict[str, Any]:
+        """Consume a full safetensors checkpoint with validated native copies."""
+
+        if not self.recorded:
+            raise RuntimeError("prepared load plan has not been recorded")
+        if max_workers <= 0:
+            raise ValueError("prepared load plan needs at least one worker")
+
+        started = time.perf_counter()
+        metadata_started = time.perf_counter()
+        metadata, names_by_filename, total_source_bytes = _safetensors_metadata(
+            model_path
+        )
+        metadata_s = time.perf_counter() - metadata_started
+        parameters = dict(model.named_parameters())
+        compile_started = time.perf_counter()
+        raw_copies, rejection_reasons = self._resolve_raw_copies(
+            parameters,
+            metadata,
+        )
+        compile_s = time.perf_counter() - compile_started
+        raw_stats = self._copy_raw_safetensors_ranges(
+            model_path,
+            raw_copies,
+            max_workers=max_workers,
+        )
+        raw_names = set(raw_copies)
+
+        def fallback_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            from safetensors import safe_open
+
+            root = Path(model_path)
+            for filename in sorted(names_by_filename):
+                fallback_names = [
+                    name
+                    for name in names_by_filename[filename]
+                    if name not in raw_names
+                ]
+                if not fallback_names:
+                    continue
+                with safe_open(
+                    root / filename,
+                    framework="pt",
+                    device="cpu",
+                ) as handle:
+                    for name in fallback_names:
+                        yield name, handle.get_tensor(name)
+
+        fallback_stats = self.replay(
+            model,
+            fallback_weights(),
+            max_workers=max_workers,
+        )
+        raw_source_bytes = sum(metadata[name].nbytes for name in raw_names)
+        fallback_stats.update(raw_stats)
+        fallback_stats.update(
+            {
+                "plan": "raw_replay",
+                "metadata_s": round(metadata_s, 6),
+                "raw_compile_s": round(compile_s, 6),
+                "raw_rejection_reasons": rejection_reasons,
+                "hits": fallback_stats["hits"] + len(raw_names),
+                "source_tensors": len(metadata),
+                "source_bytes": total_source_bytes,
+                "direct_source_bytes": (
+                    fallback_stats["direct_source_bytes"] + raw_source_bytes
+                ),
+                "worker_calls": fallback_stats["worker_calls"]
+                + sum(len(self.entries[name]) for name in raw_names),
+                "worker_bytes": (
+                    fallback_stats["worker_bytes"] + raw_source_bytes
+                ),
+                "worker_direct_entries": (
+                    fallback_stats["worker_direct_entries"] + len(raw_names)
+                ),
+                "worker_direct_operations": (
+                    fallback_stats["worker_direct_operations"]
+                    + raw_stats["raw_operations"]
+                ),
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
+        )
+        if (
+            fallback_stats["source_tensors"]
+            != fallback_stats["hits"]
+            + fallback_stats["fallback"]
+            + fallback_stats["unknown"]
+        ):
+            raise RuntimeError(
+                "raw prepared replay did not account for the complete "
+                f"checkpoint: {fallback_stats}"
+            )
+        logger.info("[RL_PREPARED_LOAD_PLAN_RAW] %s", fallback_stats)
+        return fallback_stats
 
     def replay(
         self,

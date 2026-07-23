@@ -2072,9 +2072,9 @@ class PreparedRuntimeState:
 
                 phase_started = time.perf_counter()
                 if prepared_load_plan is not None and prepared_load_plan.recorded:
-                    load_plan_stats = prepared_load_plan.replay(
+                    load_plan_stats = prepared_load_plan.replay_safetensors(
                         load_proxy,
-                        streaming_mmap_weights_iterator(model_path),
+                        model_path,
                         max_workers=int(
                             os.environ.get(
                                 "SGLANG_PREPARED_LOAD_PLAN_WORKERS",
@@ -2102,6 +2102,16 @@ class PreparedRuntimeState:
                         "source_bytes",
                         "worker_bytes",
                         "submitted_batches",
+                        "metadata_s",
+                        "raw_compile_s",
+                        "raw_copy_wall_s",
+                        "raw_worker_wall_s",
+                        "raw_worker_cpu_s",
+                        "raw_copy_bytes",
+                        "raw_entries",
+                        "raw_operations",
+                        "raw_coalesced_ranges",
+                        "raw_submitted_tasks",
                     ):
                         totals[f"load_plan_{name}"] = load_plan_stats[name]
                 else:

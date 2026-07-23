@@ -19,6 +19,7 @@ import contextlib
 import datetime
 import gc
 import inspect
+import json
 import logging
 import os
 import socket
@@ -1847,12 +1848,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        profile_enabled = os.environ.get("SGLANG_PROFILE_WEIGHT_RELOAD", "0") == "1"
+        profile_started = time.perf_counter()
+        profile_cpu_started = time.process_time()
+
+        def sync_profile_device() -> float:
+            if not profile_enabled or self.device != "cuda":
+                return 0.0
+            started = time.perf_counter()
+            torch.cuda.synchronize(target_device)
+            return time.perf_counter() - started
+
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)
+
+        restore_started = time.perf_counter()
+        restore_cpu_started = time.process_time()
+        restore_initial_sync_s = sync_profile_device()
 
         if weight_name_filter is None:
             # Return latched quant state (e.g. fp8 UE8M0 format flags) to its
@@ -1865,12 +1881,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "process_weights_after_loading re-derives kernel state for every "
                 "layer, which is only correct when all source weights were refilled."
             )
+        restore_final_sync_s = sync_profile_device()
+        restore_done = time.perf_counter()
+        restore_cpu_done = time.process_time()
 
         original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now
+        iterator_setup_started = time.perf_counter()
+        iterator_setup_cpu_started = time.process_time()
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
@@ -1897,6 +1918,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
+            iterator_setup_done = time.perf_counter()
+            iterator_setup_cpu_done = time.process_time()
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
@@ -1930,6 +1953,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_decode_cuda_graph()
 
         logger.info("Update weights end.")
+        if profile_enabled:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                "[RL_RELOAD_PROFILE] %s",
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "stage": "update_weights_from_disk",
+                        "load_format": str(load_format),
+                        "total_wall_s": round(time.perf_counter() - profile_started, 6),
+                        "total_cpu_s": round(time.process_time() - profile_cpu_started, 6),
+                        "restore_wall_s": round(restore_done - restore_started, 6),
+                        "restore_cpu_s": round(
+                            restore_cpu_done - restore_cpu_started, 6
+                        ),
+                        "restore_initial_sync_s": round(restore_initial_sync_s, 6),
+                        "restore_final_sync_s": round(restore_final_sync_s, 6),
+                        "iterator_setup_wall_s": round(
+                            iterator_setup_done - iterator_setup_started, 6
+                        ),
+                        "iterator_setup_cpu_s": round(
+                            iterator_setup_cpu_done - iterator_setup_cpu_started, 6
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+            )
         return True, "Succeeded to update model weights."
 
     def init_weights_send_group_for_remote_instance(

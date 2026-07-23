@@ -133,6 +133,64 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+class _WeightLoadProfileIterator:
+    """Attribute iterator time to the source versus the model consumer.
+
+    Enabled only by ``SGLANG_PROFILE_WEIGHT_RELOAD=1``. ``source_*`` measures
+    time blocked in the underlying iterator (file I/O, decode, and any loader
+    transfer); ``consumer_*`` measures time between yielding a tensor and the
+    model asking for the next one (name mapping and parameter copies).
+    """
+
+    def __init__(self, weights):
+        self._weights = iter(weights)
+        self._yield_wall = None
+        self._yield_cpu = None
+        self.source_wall_s = 0.0
+        self.source_cpu_s = 0.0
+        self.consumer_wall_s = 0.0
+        self.consumer_cpu_s = 0.0
+        self.tensor_count = 0
+        self.tensor_bytes = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        now_wall = time.perf_counter()
+        now_cpu = time.process_time()
+        if self._yield_wall is not None:
+            self.consumer_wall_s += now_wall - self._yield_wall
+            self.consumer_cpu_s += now_cpu - self._yield_cpu
+
+        source_wall = time.perf_counter()
+        source_cpu = time.process_time()
+        try:
+            item = next(self._weights)
+        except StopIteration:
+            self.source_wall_s += time.perf_counter() - source_wall
+            self.source_cpu_s += time.process_time() - source_cpu
+            raise
+        self.source_wall_s += time.perf_counter() - source_wall
+        self.source_cpu_s += time.process_time() - source_cpu
+
+        self.tensor_count += 1
+        tensor = item[1]
+        if isinstance(tensor, torch.Tensor):
+            self.tensor_bytes += tensor.numel() * tensor.element_size()
+        self._yield_wall = time.perf_counter()
+        self._yield_cpu = time.process_time()
+        return item
+
+
+def _sync_profile_device(target_device: torch.device) -> float:
+    if target_device.type != "cuda":
+        return 0.0
+    started = time.perf_counter()
+    torch.cuda.synchronize(target_device)
+    return time.perf_counter() - started
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
@@ -773,6 +831,16 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        profile_enabled = os.environ.get("SGLANG_PROFILE_WEIGHT_RELOAD", "0") == "1"
+        profile_iter = None
+        profile_started = time.perf_counter()
+        profile_cpu_started = time.process_time()
+        profile_initial_sync_s = 0.0
+        if profile_enabled:
+            profile_initial_sync_s = _sync_profile_device(target_device)
+            profile_iter = _WeightLoadProfileIterator(weights)
+            weights = profile_iter
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -801,6 +869,10 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             model.load_weights(weights)
 
+        load_sync_s = _sync_profile_device(target_device) if profile_enabled else 0.0
+        load_done = time.perf_counter()
+        load_cpu_done = time.process_time()
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             memory_end = get_available_gpu_memory(
@@ -811,6 +883,11 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        postprocess_by_method = collections.defaultdict(
+            lambda: {"wall_s": 0.0, "cpu_s": 0.0, "modules": 0}
+        )
+        postprocess_started = time.perf_counter()
+        postprocess_cpu_started = time.process_time()
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
@@ -819,8 +896,68 @@ class DefaultModelLoader(BaseModelLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                if profile_enabled:
+                    method_started = time.perf_counter()
+                    method_cpu_started = time.process_time()
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+                    method_name = type(quant_method).__name__
+                    method_profile = postprocess_by_method[method_name]
+                    method_profile["wall_s"] += time.perf_counter() - method_started
+                    method_profile["cpu_s"] += time.process_time() - method_cpu_started
+                    method_profile["modules"] += 1
+                else:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+        postprocess_enqueue_done = time.perf_counter()
+        postprocess_cpu_done = time.process_time()
+        postprocess_sync_s = (
+            _sync_profile_device(target_device) if profile_enabled else 0.0
+        )
+        if profile_enabled:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                "[RL_RELOAD_PROFILE] %s",
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "stage": "load_weights_and_postprocess",
+                        "total_wall_s": round(time.perf_counter() - profile_started, 6),
+                        "total_cpu_s": round(time.process_time() - profile_cpu_started, 6),
+                        "initial_sync_s": round(profile_initial_sync_s, 6),
+                        "load_wall_s": round(load_done - profile_started, 6),
+                        "load_cpu_s": round(load_cpu_done - profile_cpu_started, 6),
+                        "load_final_sync_s": round(load_sync_s, 6),
+                        "source_next_wall_s": round(profile_iter.source_wall_s, 6),
+                        "source_next_cpu_s": round(profile_iter.source_cpu_s, 6),
+                        "consumer_wall_s": round(profile_iter.consumer_wall_s, 6),
+                        "consumer_cpu_s": round(profile_iter.consumer_cpu_s, 6),
+                        "tensor_count": profile_iter.tensor_count,
+                        "tensor_gb": round(profile_iter.tensor_bytes / 1e9, 6),
+                        "postprocess_enqueue_wall_s": round(
+                            postprocess_enqueue_done - postprocess_started, 6
+                        ),
+                        "postprocess_cpu_s": round(
+                            postprocess_cpu_done - postprocess_cpu_started, 6
+                        ),
+                        "postprocess_final_sync_s": round(postprocess_sync_s, 6),
+                        "postprocess_by_method": {
+                            name: {
+                                "wall_s": round(values["wall_s"], 6),
+                                "cpu_s": round(values["cpu_s"], 6),
+                                "modules": values["modules"],
+                            }
+                            for name, values in sorted(postprocess_by_method.items())
+                        },
+                    },
+                    sort_keys=True,
+                ),
+            )
 
 
 def restore_weights_before_loading(model, target_device):

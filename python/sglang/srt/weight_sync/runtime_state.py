@@ -822,6 +822,31 @@ class PreparedRuntimeState:
                 for _ in range(self._tail_buffer_count)
             ]
 
+    def _ensure_pinned_prefix(self) -> int:
+        requested = min(
+            self.image_nbytes,
+            int(os.environ.get("SGLANG_PREPARED_PINNED_GB", "56")) * _GIB,
+        )
+        if self._pinned_prefix is None or self._pinned_prefix.numel() != requested:
+            self._pinned_prefix = torch.empty(
+                requested,
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+        return requested
+
+    def preallocate_transfer_buffers(self) -> dict[str, float | int]:
+        """Pay page-locking/allocation costs once during engine startup."""
+
+        started = time.perf_counter()
+        pinned_prefix_bytes = self._ensure_pinned_prefix()
+        self._ensure_transfer_buffers()
+        return {
+            "pinned_prefix_bytes": pinned_prefix_bytes,
+            "tail_buffer_bytes": sum(item.numel() for item in self._tail_buffers),
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+
     def _copy_tail_chunk(
         self,
         image: RuntimeStateImage,
@@ -942,14 +967,7 @@ class PreparedRuntimeState:
         if self.prepared is None:
             raise RuntimeError("no prepared runtime image")
         started = time.perf_counter()
-        requested = min(
-            self.image_nbytes,
-            int(os.environ.get("SGLANG_PREPARED_PINNED_GB", "56")) * _GIB,
-        )
-        if self._pinned_prefix is None or self._pinned_prefix.numel() != requested:
-            self._pinned_prefix = torch.empty(
-                requested, dtype=torch.uint8, pin_memory=True
-            )
+        requested = self._ensure_pinned_prefix()
         self._ensure_transfer_buffers()
         self._pinned_prefix.copy_(self.prepared.bytes[:requested])
         torch.cuda.empty_cache()

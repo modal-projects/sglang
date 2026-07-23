@@ -708,6 +708,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._prepare_moe_topk()
         if os.environ.get("SGLANG_PROFILE_RUNTIME_STATE", "0") == "1":
             self._log_runtime_state_inventory()
+        if (
+            not self.is_draft_worker
+            and os.environ.get(
+                "SGLANG_PREPARED_PREALLOCATE_TRANSFER_BUFFERS",
+                "0",
+            )
+            == "1"
+        ):
+            from sglang.srt.weight_sync.runtime_state import PreparedRuntimeState
+
+            self.prepared_runtime_state = PreparedRuntimeState(self.model)
+            preallocate_stats = (
+                self.prepared_runtime_state.preallocate_transfer_buffers()
+            )
+            logger.info(
+                "[RL_PREPARED_STATE] preallocated transfer buffers: %s",
+                json.dumps(preallocate_stats, sort_keys=True),
+            )
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.

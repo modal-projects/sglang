@@ -348,7 +348,7 @@ def clone_module_proxy(
 
 
 def move_load_targets_to_pinned_host(module: torch.nn.Module) -> list[HostLoadTarget]:
-    """Move unique registered parameters to empty pinned host tensors.
+    """Move unique registered parameters to initialized pinned host tensors.
 
     Model ``weight_loader`` functions mostly slice and fuse checkpoint tensors
     into a much smaller set of rank-local Parameters.  Letting those functions
@@ -363,6 +363,7 @@ def move_load_targets_to_pinned_host(module: torch.nn.Module) -> list[HostLoadTa
 
     targets: list[HostLoadTarget] = []
     seen: set[int] = set()
+    device_sources: list[torch.Tensor] = []
     for name, parameter in module.named_parameters(remove_duplicate=False):
         if id(parameter) in seen or parameter.device.type != "cuda":
             continue
@@ -374,6 +375,13 @@ def move_load_targets_to_pinned_host(module: torch.nn.Module) -> list[HostLoadTa
             device="cpu",
             pin_memory=True,
         )
+        # A model may intentionally omit tied, synthesized, or checkpoint-
+        # invariant Parameters from load_weights. Preserve their current value
+        # so CPU assembly remains a full-state operation even when only a
+        # subset of this scratch module is filled by checkpoint tensors.
+        device_source = parameter.data
+        host_data.copy_(device_source, non_blocking=True)
+        device_sources.append(device_source)
         parameter.data = host_data
         targets.append(
             HostLoadTarget(
@@ -382,6 +390,8 @@ def move_load_targets_to_pinned_host(module: torch.nn.Module) -> list[HostLoadTa
                 host_data=host_data,
             )
         )
+    if device_sources:
+        torch.cuda.synchronize()
     return targets
 
 

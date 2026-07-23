@@ -26,6 +26,7 @@ import concurrent.futures
 import logging
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -39,7 +40,8 @@ logger = logging.getLogger(__name__)
 _SOURCE_TAG = "_sglang_prepared_load_source"
 _BATCH_NAMES = 256
 _BATCH_BYTES = 256 << 20
-_MAX_INFLIGHT_BATCHES = 32
+_MIN_INFLIGHT_BATCHES = 32
+_INFLIGHT_BATCHES_PER_WORKER = 2
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class PreparedLoadPlan:
         self.entries: dict[str, list[PreparedLoadCall]] = {}
         self.fallback: set[str] = set()
         self.fallback_patterns = tuple(fallback_patterns)
+        self.loader_kinds: dict[str, int] = {}
         self.recorded = False
 
     def _forced_fallback(self, name: str) -> bool:
@@ -67,12 +70,13 @@ class PreparedLoadPlan:
         self,
         model: torch.nn.Module,
         weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> dict[str, int | float | str]:
+    ) -> dict[str, Any]:
         """Run the ordinary loader once while observing direct loader calls."""
 
         started = time.perf_counter()
         recorded: dict[str, list[PreparedLoadCall]] = {}
         seen: set[str] = set()
+        loader_kinds: Counter[str] = Counter()
         lock = threading.Lock()
 
         def tagged() -> Iterable[tuple[str, torch.Tensor]]:
@@ -109,6 +113,14 @@ class PreparedLoadPlan:
                     parameter_name: str = parameter_name,
                     original_loader: Any = original_loader,
                 ):
+                    module_name = getattr(original_loader, "__module__", "")
+                    qualname = getattr(
+                        original_loader,
+                        "__qualname__",
+                        type(original_loader).__name__,
+                    )
+                    loader_kind = f"{module_name}.{qualname}"
+
                     def recording_loader(
                         parameter_arg,
                         loaded_weight,
@@ -124,6 +136,7 @@ class PreparedLoadPlan:
                             )
                             with lock:
                                 recorded.setdefault(source_name, []).append(call)
+                                loader_kinds[loader_kind] += 1
                         return original_loader(
                             parameter_arg,
                             loaded_weight,
@@ -156,14 +169,16 @@ class PreparedLoadPlan:
             for name in seen
             if name not in recorded or self._forced_fallback(name)
         }
+        self.loader_kinds = dict(loader_kinds)
         for name in self.fallback:
             self.entries.pop(name, None)
         self.recorded = True
-        stats: dict[str, int | float | str] = {
+        stats: dict[str, Any] = {
             "plan": "record",
             "entries": len(self.entries),
             "fallback": len(self.fallback),
             "seen": len(seen),
+            "loader_kinds": self.loader_kinds,
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.info("[RL_PREPARED_LOAD_PLAN] %s", stats)
@@ -175,7 +190,7 @@ class PreparedLoadPlan:
         weights: Iterable[tuple[str, torch.Tensor]],
         *,
         max_workers: int,
-    ) -> dict[str, int | float | str]:
+    ) -> dict[str, Any]:
         """Consume the full checkpoint and replay safe direct dispatch calls.
 
         Direct batches may execute in parallel, but the fallback iterator does
@@ -195,6 +210,24 @@ class PreparedLoadPlan:
         futures: list[concurrent.futures.Future[None]] = []
         batch: list[tuple[torch.Tensor, list[PreparedLoadCall]]] = []
         batch_bytes = 0
+        source_next_s = 0.0
+        source_tensors = 0
+        source_bytes = 0
+        direct_source_bytes = 0
+        fallback_source_bytes = 0
+        submitted_batches = 0
+        max_inflight_batches = 0
+        drain_wait_s = 0.0
+        synchronous_dispatch_s = 0.0
+        worker_wall_s = 0.0
+        worker_cpu_s = 0.0
+        worker_calls = 0
+        worker_bytes = 0
+        worker_lock = threading.Lock()
+        inflight_limit = max(
+            _MIN_INFLIGHT_BATCHES,
+            max_workers * _INFLIGHT_BATCHES_PER_WORKER,
+        )
 
         def dispatch(
             loaded_weight: torch.Tensor,
@@ -216,31 +249,65 @@ class PreparedLoadPlan:
         def dispatch_batch(
             items: list[tuple[torch.Tensor, list[PreparedLoadCall]]],
         ) -> None:
-            for loaded_weight, calls in items:
-                dispatch(loaded_weight, calls)
+            nonlocal worker_wall_s, worker_cpu_s, worker_calls, worker_bytes
+            batch_started = time.perf_counter()
+            batch_cpu_started = time.thread_time()
+            call_count = 0
+            copied_bytes = 0
+            for loaded_weight, load_calls in items:
+                dispatch(loaded_weight, load_calls)
+                call_count += len(load_calls)
+                copied_bytes += loaded_weight.numel() * loaded_weight.element_size()
+            with worker_lock:
+                worker_wall_s += time.perf_counter() - batch_started
+                worker_cpu_s += time.thread_time() - batch_cpu_started
+                worker_calls += call_count
+                worker_bytes += copied_bytes
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers
         ) as executor:
 
             def drain() -> None:
+                nonlocal drain_wait_s
+                wait_started = time.perf_counter()
                 for future in futures:
                     future.result()
+                drain_wait_s += time.perf_counter() - wait_started
                 futures.clear()
 
             def flush() -> None:
-                nonlocal batch_bytes
+                nonlocal batch_bytes, submitted_batches, max_inflight_batches
                 if not batch:
                     return
-                if len(futures) >= _MAX_INFLIGHT_BATCHES:
+                if len(futures) >= inflight_limit:
                     drain()
                 futures.append(executor.submit(dispatch_batch, batch.copy()))
+                submitted_batches += 1
+                max_inflight_batches = max(max_inflight_batches, len(futures))
                 batch.clear()
                 batch_bytes = 0
 
             def fallback_weights() -> Iterable[tuple[str, torch.Tensor]]:
                 nonlocal batch_bytes
-                for name, tensor in weights:
+                nonlocal direct_source_bytes
+                nonlocal fallback_source_bytes
+                nonlocal source_bytes
+                nonlocal source_next_s
+                nonlocal source_tensors
+                nonlocal synchronous_dispatch_s
+                iterator = iter(weights)
+                while True:
+                    next_started = time.perf_counter()
+                    try:
+                        name, tensor = next(iterator)
+                    except StopIteration:
+                        source_next_s += time.perf_counter() - next_started
+                        break
+                    source_next_s += time.perf_counter() - next_started
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    source_tensors += 1
+                    source_bytes += tensor_bytes
                     calls = self.entries.get(name)
                     representable = calls is not None and all(
                         call.parameter_name in parameters for call in calls
@@ -250,34 +317,57 @@ class PreparedLoadPlan:
                             counts["fallback"] += 1
                         else:
                             counts["unknown"] += 1
+                        fallback_source_bytes += tensor_bytes
                         yield name, tensor
                         continue
 
                     counts["hit"] += 1
+                    direct_source_bytes += tensor_bytes
                     if should_async_load(tensor):
                         batch.append((tensor, calls))
-                        batch_bytes += tensor.numel() * tensor.element_size()
+                        batch_bytes += tensor_bytes
                         if (
                             len(batch) >= _BATCH_NAMES
                             or batch_bytes >= _BATCH_BYTES
                         ):
                             flush()
                     else:
+                        dispatch_started = time.perf_counter()
                         dispatch(tensor, calls)
+                        synchronous_dispatch_s += (
+                            time.perf_counter() - dispatch_started
+                        )
                 flush()
                 # model.load_weights commonly executes a name-dependent tail
                 # immediately after its input iterator is exhausted.
                 drain()
 
+            model_load_started = time.perf_counter()
             model.load_weights(fallback_weights())
+            model_load_s = time.perf_counter() - model_load_started
             drain()
 
-        stats: dict[str, int | float | str] = {
+        stats: dict[str, Any] = {
             "plan": "replay",
             "hits": counts["hit"],
             "fallback": counts["fallback"],
             "unknown": counts["unknown"],
             "workers": max_workers,
+            "source_tensors": source_tensors,
+            "source_bytes": source_bytes,
+            "direct_source_bytes": direct_source_bytes,
+            "fallback_source_bytes": fallback_source_bytes,
+            "source_next_s": round(source_next_s, 6),
+            "submitted_batches": submitted_batches,
+            "max_inflight_batches": max_inflight_batches,
+            "inflight_limit": inflight_limit,
+            "drain_wait_s": round(drain_wait_s, 6),
+            "synchronous_dispatch_s": round(synchronous_dispatch_s, 6),
+            "worker_wall_s": round(worker_wall_s, 6),
+            "worker_cpu_s": round(worker_cpu_s, 6),
+            "worker_calls": worker_calls,
+            "worker_bytes": worker_bytes,
+            "model_load_s": round(model_load_s, 6),
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.info("[RL_PREPARED_LOAD_PLAN] %s", stats)

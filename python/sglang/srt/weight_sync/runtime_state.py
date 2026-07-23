@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 _GIB = 1 << 30
 _MIB = 1 << 20
 _ALIGNMENT = 4096
+_HUGEPAGE_BYTES = 2 * _MIB
+_MADV_HUGEPAGE = 14
 _DECODER_LAYER = re.compile(r"^(language_model\.model\.layers\.\d+)(?:\.|$)")
 _VISION_BLOCK = re.compile(r"^(vision_tower\.encoder\.blocks\.\d+)(?:\.|$)")
 _LOGICAL_STORAGE_RANGE_ATTR = "_sglang_prepared_logical_storage_range"
@@ -131,6 +133,32 @@ class HostImageArena:
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _advise_transparent_hugepages(tensor: torch.Tensor) -> int:
+    """Hint that a giant pageable runtime image should fault as 2MiB pages."""
+
+    if tensor.device.type != "cpu" or tensor.is_pinned() or tensor.numel() == 0:
+        return 0
+    begin = _align_up(tensor.data_ptr(), _HUGEPAGE_BYTES)
+    end = (
+        (tensor.data_ptr() + tensor.numel()) // _HUGEPAGE_BYTES
+    ) * _HUGEPAGE_BYTES
+    if end <= begin:
+        return 0
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.madvise(
+        ctypes.c_void_p(begin),
+        ctypes.c_size_t(end - begin),
+        ctypes.c_int(_MADV_HUGEPAGE),
+    )
+    if result != 0:
+        logger.debug(
+            "MADV_HUGEPAGE failed for prepared runtime image: errno=%d",
+            ctypes.get_errno(),
+        )
+        return 0
+    return end - begin
 
 
 def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -632,6 +660,9 @@ def _clone_tensor_storage(
     target_device: torch.device | None = None,
     pin_memory: bool = False,
     storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    storage_copier: (
+        Callable[[torch.Tensor, torch.Tensor, bool], None] | None
+    ) = None,
 ) -> torch.Tensor:
     """Clone a tensor while retaining subclasses, views, and storage aliases."""
 
@@ -677,7 +708,10 @@ def _clone_tensor_storage(
             ) or (
                 source_bytes.is_pinned() and destination_device.type == "cuda"
             )
-            cloned_storage.copy_(source_bytes, non_blocking=non_blocking)
+            if storage_copier is None:
+                cloned_storage.copy_(source_bytes, non_blocking=non_blocking)
+            else:
+                storage_copier(cloned_storage, source_bytes, non_blocking)
         storage_memo[storage_key] = cloned_storage
     cloned_device = (
         cloned_storage.device
@@ -730,6 +764,9 @@ def _clone_attribute_tensors(
     target_device: torch.device | None = None,
     pin_memory: bool = False,
     storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    storage_copier: (
+        Callable[[torch.Tensor, torch.Tensor, bool], None] | None
+    ) = None,
     depth: int = 0,
 ) -> Any:
     """Clone tensor leaves but share immutable and non-tensor runtime objects."""
@@ -742,6 +779,7 @@ def _clone_attribute_tensors(
             target_device=target_device,
             pin_memory=pin_memory,
             storage_allocator=storage_allocator,
+            storage_copier=storage_copier,
         )
     if depth >= 2:
         return value
@@ -754,6 +792,7 @@ def _clone_attribute_tensors(
                 target_device=target_device,
                 pin_memory=pin_memory,
                 storage_allocator=storage_allocator,
+                storage_copier=storage_copier,
                 depth=depth + 1,
             )
             for key, child in value.items()
@@ -767,6 +806,7 @@ def _clone_attribute_tensors(
                 target_device=target_device,
                 pin_memory=pin_memory,
                 storage_allocator=storage_allocator,
+                storage_copier=storage_copier,
                 depth=depth + 1,
             )
             for child in value
@@ -780,6 +820,7 @@ def _clone_attribute_tensors(
                 target_device=target_device,
                 pin_memory=pin_memory,
                 storage_allocator=storage_allocator,
+                storage_copier=storage_copier,
                 depth=depth + 1,
             )
             for child in value
@@ -793,6 +834,9 @@ def clone_module_tensors(
     target_device: torch.device | None = None,
     pin_memory: bool = False,
     storage_allocator: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    storage_copier: (
+        Callable[[torch.Tensor, torch.Tensor, bool], None] | None
+    ) = None,
 ) -> torch.nn.Module:
     """Clone a module tree's tensor state without copying CUDA runtime objects."""
 
@@ -816,6 +860,7 @@ def clone_module_tensors(
                     target_device=target_device,
                     pin_memory=pin_memory,
                     storage_allocator=storage_allocator,
+                    storage_copier=storage_copier,
                 )
             )
             for name, parameter in current._parameters.items()
@@ -831,6 +876,7 @@ def clone_module_tensors(
                     target_device=target_device,
                     pin_memory=pin_memory,
                     storage_allocator=storage_allocator,
+                    storage_copier=storage_copier,
                 )
             )
             for name, buffer in current._buffers.items()
@@ -849,6 +895,7 @@ def clone_module_tensors(
                 target_device=target_device,
                 pin_memory=pin_memory,
                 storage_allocator=storage_allocator,
+                storage_copier=storage_copier,
             )
         return result
 
@@ -917,6 +964,60 @@ def release_module_tensors(module: torch.nn.Module) -> None:
                 current.__dict__[name] = drop(value)
 
 
+def _parallel_cpu_storage_copy(
+    copies: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    max_workers: int,
+    chunk_bytes: int = 64 * _MIB,
+) -> float:
+    """Copy CPU storage ranges while faulting destination pages in parallel."""
+
+    if not copies:
+        return 0.0
+    if max_workers < 1:
+        raise ValueError("parallel CPU storage copy needs at least one worker")
+    chunks: list[tuple[int, int, int]] = []
+    for destination, source in copies:
+        if destination.device.type != "cpu" or source.device.type != "cpu":
+            raise ValueError("parallel storage copy requires CPU tensors")
+        if destination.dtype != torch.uint8 or source.dtype != torch.uint8:
+            raise TypeError("parallel storage copy requires uint8 storage views")
+        if destination.numel() != source.numel():
+            raise ValueError(
+                "parallel storage copy size mismatch: "
+                f"{destination.numel()} != {source.numel()}"
+            )
+        for offset in range(0, source.numel(), chunk_bytes):
+            size = min(chunk_bytes, source.numel() - offset)
+            chunks.append(
+                (
+                    destination.data_ptr() + offset,
+                    source.data_ptr() + offset,
+                    size,
+                )
+            )
+
+    bins: list[list[tuple[int, int, int]]] = [
+        [] for _ in range(min(max_workers, len(chunks)))
+    ]
+    bin_bytes = [0] * len(bins)
+    for item in sorted(chunks, key=lambda copy: copy[2], reverse=True):
+        index = min(range(len(bins)), key=bin_bytes.__getitem__)
+        bins[index].append(item)
+        bin_bytes[index] += item[2]
+
+    def copy_bin(items: list[tuple[int, int, int]]) -> None:
+        for destination_ptr, source_ptr, size in items:
+            ctypes.memmove(destination_ptr, source_ptr, size)
+
+    started = time.perf_counter()
+    futures = [executor.submit(copy_bin, items) for items in bins if items]
+    for future in futures:
+        future.result()
+    return time.perf_counter() - started
+
+
 def build_host_load_proxy(
     model: torch.nn.Module,
     groups: list[RuntimeModuleGroup],
@@ -968,84 +1069,132 @@ def build_host_load_proxy(
         "clone_s": 0.0,
         "restore_s": 0.0,
         "d2h_s": 0.0,
+        "page_copy_s": 0.0,
         "direct_image_groups": 0,
         "direct_image_capacity_bytes": 0,
         "direct_image_used_bytes": 0,
         "fallback_groups": 0,
     }
-    for group in ordered_groups:
-        phase_started = time.perf_counter()
-        _, device_shadow = clone_module_proxy(model, group.path)
-        stats["clone_s"] += time.perf_counter() - phase_started
+    page_copy_workers = int(
+        os.environ.get("SGLANG_PREPARED_PAGE_COPY_WORKERS", "16")
+    )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=page_copy_workers
+    ) as page_copy_executor:
+        for group in ordered_groups:
+            phase_started = time.perf_counter()
+            _, device_shadow = clone_module_proxy(model, group.path)
+            stats["clone_s"] += time.perf_counter() - phase_started
 
-        phase_started = time.perf_counter()
-        restore_weights_before_loading(device_shadow, target_device)
-        stats["restore_s"] += time.perf_counter() - phase_started
+            phase_started = time.perf_counter()
+            restore_weights_before_loading(device_shadow, target_device)
+            stats["restore_s"] += time.perf_counter() - phase_started
 
-        phase_started = time.perf_counter()
-        pinned_shadow = None
-        source_shadow = device_shadow
-        if (
-            arena is not None
-            and not image_bytes.is_pinned()
-            and target_device.type == "cuda"
-        ):
-            if pinned_scratch is None:
-                raise ValueError(
-                    "a pageable direct image requires reusable pinned scratch"
+            phase_started = time.perf_counter()
+            pinned_shadow = None
+            source_shadow = device_shadow
+            if (
+                arena is not None
+                and not image_bytes.is_pinned()
+                and target_device.type == "cuda"
+            ):
+                if pinned_scratch is None:
+                    raise ValueError(
+                        "a pageable direct image requires reusable pinned scratch"
+                    )
+                scratch_arena = HostImageArena.from_range(
+                    pinned_scratch,
+                    0,
+                    pinned_scratch.numel(),
                 )
-            scratch_arena = HostImageArena.from_range(
-                pinned_scratch,
-                0,
-                pinned_scratch.numel(),
-            )
-            pinned_shadow = clone_module_tensors(
-                device_shadow,
-                target_device=torch.device("cpu"),
-                storage_allocator=scratch_arena.allocate,
-            )
-            if target_device.type == "cuda":
-                torch.cuda.synchronize(target_device)
-            source_shadow = pinned_shadow
-        arena_cursor = arena.cursor if arena is not None else 0
-        raw_begin = _align_up(arena_cursor)
-        try:
-            host_shadow = clone_module_tensors(
-                source_shadow,
-                target_device=torch.device("cpu"),
-                storage_allocator=arena.allocate if arena is not None else None,
-            )
-            if target_device.type == "cuda":
-                # Direct-image D2H copies can be asynchronous because the image
-                # is pinned. The bounded CUDA scratch must remain live until all
-                # copies from this group have completed.
-                torch.cuda.synchronize(target_device)
-        except HostImageCapacityError:
-            if target_device.type == "cuda":
-                torch.cuda.synchronize(target_device)
-            if arena is not None:
-                # A partial group cannot remain in the packed layout. Reclaim
-                # its bytes and keep only this bounded group in pageable RAM.
-                arena.cursor = arena_cursor
-            logger.warning(
-                "[RL_PREPARED_STATE] restored group %s exceeds remaining full "
-                "image capacity; using bounded pageable fallback",
-                group.path,
-            )
-            host_shadow = clone_module_tensors(
-                source_shadow,
-                target_device=torch.device("cpu"),
-            )
-            stats["fallback_groups"] += 1
-        else:
-            if arena is not None:
-                raw_image_ranges[group.path] = (raw_begin, arena.cursor)
-                stats["direct_image_groups"] += 1
-                stats["direct_image_used_bytes"] = arena.used_bytes
-        stats["d2h_s"] += time.perf_counter() - phase_started
-        replace_proxy_module(proxy, model, group.path, host_shadow)
-        stats["groups"] += 1
-        del device_shadow, host_shadow, pinned_shadow
+                pinned_shadow = clone_module_tensors(
+                    device_shadow,
+                    target_device=torch.device("cpu"),
+                    storage_allocator=scratch_arena.allocate,
+                )
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                source_shadow = pinned_shadow
+            arena_cursor = arena.cursor if arena is not None else 0
+            raw_begin = _align_up(arena_cursor)
+            deferred_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+            def defer_cpu_copy(
+                destination: torch.Tensor,
+                source: torch.Tensor,
+                non_blocking: bool,
+                copies: list[
+                    tuple[torch.Tensor, torch.Tensor]
+                ] = deferred_copies,
+            ) -> None:
+                if non_blocking:
+                    raise ValueError("deferred pageable copy cannot be non-blocking")
+                copies.append((destination, source))
+
+            try:
+                host_shadow = clone_module_tensors(
+                    source_shadow,
+                    target_device=torch.device("cpu"),
+                    storage_allocator=arena.allocate if arena is not None else None,
+                    storage_copier=(
+                        defer_cpu_copy
+                        if source_shadow is pinned_shadow
+                        and pinned_shadow is not None
+                        else None
+                    ),
+                )
+                if deferred_copies:
+                    stats["page_copy_s"] += _parallel_cpu_storage_copy(
+                        deferred_copies,
+                        executor=page_copy_executor,
+                        max_workers=page_copy_workers,
+                    )
+                if target_device.type == "cuda":
+                    # Direct-image D2H copies can be asynchronous because the
+                    # image is pinned. The bounded CUDA scratch must remain live
+                    # until all copies from this group have completed.
+                    torch.cuda.synchronize(target_device)
+            except HostImageCapacityError:
+                deferred_copies.clear()
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                if arena is not None:
+                    # A partial group cannot remain in the packed layout. Reclaim
+                    # its bytes and keep only this bounded group in pageable RAM.
+                    arena.cursor = arena_cursor
+                logger.warning(
+                    "[RL_PREPARED_STATE] restored group %s exceeds remaining full "
+                    "image capacity; using bounded pageable fallback",
+                    group.path,
+                )
+                deferred_copies.clear()
+                host_shadow = clone_module_tensors(
+                    source_shadow,
+                    target_device=torch.device("cpu"),
+                    storage_copier=(
+                        defer_cpu_copy if pinned_shadow is not None else None
+                    ),
+                )
+                if deferred_copies:
+                    stats["page_copy_s"] += _parallel_cpu_storage_copy(
+                        deferred_copies,
+                        executor=page_copy_executor,
+                        max_workers=page_copy_workers,
+                    )
+                stats["fallback_groups"] += 1
+            else:
+                if arena is not None:
+                    raw_image_ranges[group.path] = (raw_begin, arena.cursor)
+                    stats["direct_image_groups"] += 1
+                    stats["direct_image_used_bytes"] = arena.used_bytes
+            stats["d2h_s"] += time.perf_counter() - phase_started
+            replace_proxy_module(proxy, model, group.path, host_shadow)
+            stats["groups"] += 1
+            del device_shadow, host_shadow, pinned_shadow, deferred_copies
+            # Restored module proxies can contain short reference cycles. Keep
+            # their CUDA scratch bounded during the host-proxy pass as well as
+            # during finalization.
+            gc.collect(0)
 
     if arena is not None:
         stats["direct_image_capacity_bytes"] = arena.capacity_bytes
@@ -1251,6 +1400,12 @@ class PreparedRuntimeState:
                 )
                 self._full_pinned = False
                 image_bytes = torch.empty(self.image_nbytes, dtype=torch.uint8)
+        hugepage_bytes = _advise_transparent_hugepages(image_bytes)
+        if hugepage_bytes:
+            logger.info(
+                "[RL_PREPARED_STATE] advised transparent hugepages bytes=%d",
+                hugepage_bytes,
+            )
         return RuntimeStateImage(bytes=image_bytes, identity=identity)
 
     def capture_active(self, identity: str) -> dict[str, float | int]:
@@ -1679,6 +1834,7 @@ class PreparedRuntimeState:
             "host_proxy_clone_s": 0.0,
             "host_proxy_restore_s": 0.0,
             "host_proxy_d2h_s": 0.0,
+            "host_proxy_page_copy_s": 0.0,
             "host_proxy_direct_image_groups": 0,
             "host_proxy_direct_image_capacity_bytes": 0,
             "host_proxy_direct_image_used_bytes": 0,
@@ -1687,6 +1843,13 @@ class PreparedRuntimeState:
             "load_plan_hits": 0,
             "load_plan_fallback": 0,
             "load_plan_unknown": 0,
+            "load_plan_source_next_s": 0.0,
+            "load_plan_worker_wall_s": 0.0,
+            "load_plan_worker_cpu_s": 0.0,
+            "load_plan_drain_wait_s": 0.0,
+            "load_plan_source_bytes": 0,
+            "load_plan_worker_bytes": 0,
+            "load_plan_submitted_batches": 0,
             "cuda_allocated_bytes_peak": 0,
             "cuda_allocated_after_release_bytes_peak": 0,
             "cuda_free_bytes_min": 1 << 63,
@@ -1767,13 +1930,14 @@ class PreparedRuntimeState:
                 logger.info(
                     "[RL_PREPARED_STATE] built rank-local host load proxy "
                     "groups=%d wall_s=%.3f clone_s=%.3f restore_s=%.3f "
-                    "d2h_s=%.3f direct_image_groups=%d "
+                    "d2h_s=%.3f page_copy_s=%.3f direct_image_groups=%d "
                     "direct_image_used_bytes=%d fallback_groups=%d",
                     host_proxy_stats["groups"],
                     time.perf_counter() - phase_started,
                     host_proxy_stats["clone_s"],
                     host_proxy_stats["restore_s"],
                     host_proxy_stats["d2h_s"],
+                    host_proxy_stats["page_copy_s"],
                     host_proxy_stats["direct_image_groups"],
                     host_proxy_stats["direct_image_used_bytes"],
                     host_proxy_stats["fallback_groups"],
@@ -1781,6 +1945,7 @@ class PreparedRuntimeState:
                 totals["host_proxy_clone_s"] = host_proxy_stats["clone_s"]
                 totals["host_proxy_restore_s"] = host_proxy_stats["restore_s"]
                 totals["host_proxy_d2h_s"] = host_proxy_stats["d2h_s"]
+                totals["host_proxy_page_copy_s"] = host_proxy_stats["page_copy_s"]
                 for name in (
                     "direct_image_groups",
                     "direct_image_capacity_bytes",
@@ -1809,6 +1974,16 @@ class PreparedRuntimeState:
                     totals["load_plan_hits"] = load_plan_stats["hits"]
                     totals["load_plan_fallback"] = load_plan_stats["fallback"]
                     totals["load_plan_unknown"] = load_plan_stats["unknown"]
+                    for name in (
+                        "source_next_s",
+                        "worker_wall_s",
+                        "worker_cpu_s",
+                        "drain_wait_s",
+                        "source_bytes",
+                        "worker_bytes",
+                        "submitted_batches",
+                    ):
+                        totals[f"load_plan_{name}"] = load_plan_stats[name]
                 else:
                     logger.info(
                         "[RL_PREPARED_LOAD_PLAN] unavailable; using ordinary "
@@ -2111,6 +2286,9 @@ class PreparedRuntimeState:
             "host_proxy_clone_s": round(float(totals["host_proxy_clone_s"]), 6),
             "host_proxy_restore_s": round(float(totals["host_proxy_restore_s"]), 6),
             "host_proxy_d2h_s": round(float(totals["host_proxy_d2h_s"]), 6),
+            "host_proxy_page_copy_s": round(
+                float(totals["host_proxy_page_copy_s"]), 6
+            ),
             "host_proxy_direct_image_groups": int(
                 totals["host_proxy_direct_image_groups"]
             ),
@@ -2127,6 +2305,23 @@ class PreparedRuntimeState:
             "load_plan_hits": int(totals["load_plan_hits"]),
             "load_plan_fallback": int(totals["load_plan_fallback"]),
             "load_plan_unknown": int(totals["load_plan_unknown"]),
+            "load_plan_source_next_s": round(
+                float(totals["load_plan_source_next_s"]), 6
+            ),
+            "load_plan_worker_wall_s": round(
+                float(totals["load_plan_worker_wall_s"]), 6
+            ),
+            "load_plan_worker_cpu_s": round(
+                float(totals["load_plan_worker_cpu_s"]), 6
+            ),
+            "load_plan_drain_wait_s": round(
+                float(totals["load_plan_drain_wait_s"]), 6
+            ),
+            "load_plan_source_bytes": int(totals["load_plan_source_bytes"]),
+            "load_plan_worker_bytes": int(totals["load_plan_worker_bytes"]),
+            "load_plan_submitted_batches": int(
+                totals["load_plan_submitted_batches"]
+            ),
             "cuda_allocated_bytes_peak": int(totals["cuda_allocated_bytes_peak"]),
             "cuda_allocated_after_release_bytes_peak": int(
                 totals["cuda_allocated_after_release_bytes_peak"]

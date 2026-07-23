@@ -1,3 +1,4 @@
+import concurrent.futures
 import gc
 import weakref
 
@@ -10,6 +11,7 @@ from sglang.srt.weight_sync.runtime_state import (
     RuntimeModuleGroup,
     RuntimeStorageSegment,
     RuntimeStateImage,
+    _parallel_cpu_storage_copy,
     build_host_load_proxy,
     build_runtime_module_groups,
     checkpoint_module_path,
@@ -208,6 +210,47 @@ def test_clone_module_tensors_can_copy_to_explicit_device():
     assert cloned.weight.data_ptr() != module.weight.data_ptr()
     assert cloned.alias.untyped_storage().data_ptr() == cloned.weight.data_ptr()
     assert torch.equal(cloned.weight, module.weight)
+
+
+def test_clone_module_tensors_can_defer_unique_storage_copies():
+    module = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.arange(8.0))
+    module.register_parameter("weight", parameter)
+    module.alias = parameter[2:6]
+    pending = []
+
+    def defer(destination, source, non_blocking):
+        destination.fill_(255)
+        pending.append((destination, source, non_blocking))
+
+    cloned = clone_module_tensors(
+        module,
+        target_device=torch.device("cpu"),
+        storage_copier=defer,
+    )
+
+    assert len(pending) == 1
+    assert pending[0][2] is False
+    assert not torch.equal(cloned.weight, module.weight)
+    pending[0][0].copy_(pending[0][1])
+    assert torch.equal(cloned.weight, module.weight)
+    assert cloned.alias.untyped_storage().data_ptr() == cloned.weight.data_ptr()
+
+
+def test_parallel_cpu_storage_copy_splits_and_copies_ranges():
+    source = torch.arange(2 * 1024 * 1024, dtype=torch.int64).view(torch.uint8)
+    destination = torch.empty_like(source)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        wall_s = _parallel_cpu_storage_copy(
+            [(destination, source)],
+            executor=executor,
+            max_workers=4,
+            chunk_bytes=1 << 20,
+        )
+
+    assert wall_s >= 0
+    assert torch.equal(destination, source)
 
 
 def test_release_module_tensors_allows_young_parameter_cycles_to_collect():

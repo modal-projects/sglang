@@ -163,6 +163,15 @@ def test_replay_consumes_full_checkpoint_and_matches_ordinary_load():
     assert stats["hits"] == 4
     assert stats["fallback"] == 3
     assert stats["unknown"] == 0
+    assert stats["source_tensors"] == 7
+    assert stats["source_bytes"] == 7 * 8 * 4
+    assert stats["direct_source_bytes"] == 4 * 8 * 4
+    assert stats["fallback_source_bytes"] == 3 * 8 * 4
+    assert stats["worker_calls"] == 4
+    assert stats["worker_bytes"] == 4 * 8 * 4
+    assert stats["submitted_batches"] >= 1
+    assert stats["source_next_s"] >= 0
+    assert stats["drain_wait_s"] >= 0
 
 
 def test_unsupported_model_uses_ordinary_loader():

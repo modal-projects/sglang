@@ -855,6 +855,22 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
+        prepared_load_plan = None
+        if os.environ.get("SGLANG_ENABLE_PREPARED_RUNTIME_RELOAD", "0") == "1":
+            from sglang.srt.model_loader.prepared_load_plan import (
+                get_or_create_prepared_load_plan,
+            )
+
+            candidate = get_or_create_prepared_load_plan(model)
+            if candidate is not None and not candidate.recorded:
+                prepared_load_plan = candidate
+
+        def load_all_weights():
+            if prepared_load_plan is None:
+                model.load_weights(weights)
+            else:
+                prepared_load_plan.record(model, weights)
+
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
@@ -862,12 +878,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                load_all_weights()
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            load_all_weights()
 
         load_sync_s = _sync_profile_device(target_device) if profile_enabled else 0.0
         load_done = time.perf_counter()

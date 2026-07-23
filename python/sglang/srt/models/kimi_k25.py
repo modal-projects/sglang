@@ -614,6 +614,11 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # This wrapper delegates checkpoint routing to the DeepSeek language model
+    # and therefore has the same name-dependent MLA fallback requirement.
+    supports_prepared_load_plan = True
+    prepared_load_plan_fallback_patterns = ("kv_b_proj",)
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json

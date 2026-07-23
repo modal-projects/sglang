@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import torch
 from sglang.srt.models.utils import WeightsMapper
 
@@ -205,6 +208,20 @@ def test_clone_module_tensors_can_copy_to_explicit_device():
     assert cloned.weight.data_ptr() != module.weight.data_ptr()
     assert cloned.alias.untyped_storage().data_ptr() == cloned.weight.data_ptr()
     assert torch.equal(cloned.weight, module.weight)
+
+
+def test_release_module_tensors_allows_young_parameter_cycles_to_collect():
+    module = torch.nn.Module()
+    parameter = torch.nn.Parameter(torch.arange(8.0))
+    parameter.retained_cycle = parameter
+    module.register_parameter("weight", parameter)
+    parameter_ref = weakref.ref(parameter)
+    del parameter
+
+    release_module_tensors(module)
+    gc.collect(0)
+
+    assert parameter_ref() is None
 
 
 def test_clone_module_tensors_uses_disjoint_backing_ranges_and_reclones():

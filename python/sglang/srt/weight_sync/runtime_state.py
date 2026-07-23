@@ -1628,6 +1628,9 @@ class PreparedRuntimeState:
             "host_proxy_direct_image_used_bytes": 0,
             "host_proxy_fallback_groups": 0,
             "single_pass_load_s": 0.0,
+            "load_plan_hits": 0,
+            "load_plan_fallback": 0,
+            "load_plan_unknown": 0,
             "cuda_allocated_bytes_peak": 0,
             "cuda_allocated_after_release_bytes_peak": 0,
             "cuda_free_bytes_min": 1 << 63,
@@ -1721,7 +1724,33 @@ class PreparedRuntimeState:
                     totals[f"host_proxy_{name}"] = host_proxy_stats[name]
 
                 phase_started = time.perf_counter()
-                load_proxy.load_weights(streaming_mmap_weights_iterator(model_path))
+                from sglang.srt.model_loader.prepared_load_plan import (
+                    get_or_create_prepared_load_plan,
+                )
+
+                prepared_load_plan = get_or_create_prepared_load_plan(model)
+                if prepared_load_plan is not None and prepared_load_plan.recorded:
+                    load_plan_stats = prepared_load_plan.replay(
+                        load_proxy,
+                        streaming_mmap_weights_iterator(model_path),
+                        max_workers=int(
+                            os.environ.get(
+                                "SGLANG_PREPARED_LOAD_PLAN_WORKERS",
+                                "16",
+                            )
+                        ),
+                    )
+                    totals["load_plan_hits"] = load_plan_stats["hits"]
+                    totals["load_plan_fallback"] = load_plan_stats["fallback"]
+                    totals["load_plan_unknown"] = load_plan_stats["unknown"]
+                else:
+                    logger.info(
+                        "[RL_PREPARED_LOAD_PLAN] unavailable; using ordinary "
+                        "full checkpoint router"
+                    )
+                    load_proxy.load_weights(
+                        streaming_mmap_weights_iterator(model_path)
+                    )
                 totals["single_pass_load_s"] = time.perf_counter() - phase_started
                 logger.info(
                     "[RL_PREPARED_STATE] single-pass rank-local CPU load wall_s=%.3f",
@@ -1913,6 +1942,15 @@ class PreparedRuntimeState:
                 # CUDA scratch group per layer while waiting for cyclic GC.
                 release_module_tensors(shadow)
                 del shadow
+                # Parameter subclasses and quantization helpers can form
+                # short-lived reference cycles. Collect the young generation
+                # while the scratch group is bounded; waiting until the full
+                # frontier is finalized can retain one CUDA layer per cycle.
+                del module, quant_method
+                cleanup_gc_started = time.perf_counter()
+                gc.collect(0)
+                cleanup_gc_s = time.perf_counter() - cleanup_gc_started
+                totals["cleanup_gc_s"] += cleanup_gc_s
                 cuda_allocated_after_release = torch.cuda.memory_allocated(
                     target_device
                 )
@@ -2013,6 +2051,9 @@ class PreparedRuntimeState:
                 totals["host_proxy_fallback_groups"]
             ),
             "single_pass_load_s": round(float(totals["single_pass_load_s"]), 6),
+            "load_plan_hits": int(totals["load_plan_hits"]),
+            "load_plan_fallback": int(totals["load_plan_fallback"]),
+            "load_plan_unknown": int(totals["load_plan_unknown"]),
             "cuda_allocated_bytes_peak": int(totals["cuda_allocated_bytes_peak"]),
             "cuda_allocated_after_release_bytes_peak": int(
                 totals["cuda_allocated_after_release_bytes_peak"]

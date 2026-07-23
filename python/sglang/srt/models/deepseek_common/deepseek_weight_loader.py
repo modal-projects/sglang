@@ -142,6 +142,12 @@ NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models."""
 
+    # Dense prepared reload can replay ordinary parameter-loader dispatch.
+    # kv_b_proj must retain the normal path because post_load_weights uses its
+    # source names to regenerate the MLA w_kc/w_vc split.
+    supports_prepared_load_plan = True
+    prepared_load_plan_fallback_patterns = ("kv_b_proj",)
+
     model: nn.Module
     config: PretrainedConfig
     quant_config: Optional[QuantizationConfig]

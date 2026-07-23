@@ -20,11 +20,14 @@ from __future__ import annotations
 import copy
 import gc
 import itertools
+import json
 import logging
 import os
 import re
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -163,6 +166,44 @@ def checkpoint_module_path(name: str) -> str:
     if path is None:
         raise ValueError(f"no bounded scratch module for checkpoint tensor {name!r}")
     return path
+
+
+def ordered_mmap_weights_iterator(
+    model_path: str,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Read a sharded safetensors checkpoint in tensor-name order.
+
+    The normal CPU safetensors iterator walks one file at a time.  Large layers
+    can span checkpoint shards, so that order cannot satisfy the one-scratch-
+    module bound used by prepared reloads.  The index gives us a cheap global
+    ordering while every rank maps the same page-cache-backed files.  Weight
+    loaders then fault only the TP slices they actually consume instead of
+    forcing an O_DIRECT GPU copy of every source tensor.
+    """
+
+    from safetensors import safe_open
+
+    index_path = Path(model_path) / "model.safetensors.index.json"
+    with index_path.open() as file:
+        index = json.load(file)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid or empty safetensors weight map: {index_path}")
+
+    filenames = sorted(set(weight_map.values()))
+    with ExitStack() as stack:
+        handles = {
+            filename: stack.enter_context(
+                safe_open(
+                    Path(model_path) / filename,
+                    framework="pt",
+                    device="cpu",
+                )
+            )
+            for filename in filenames
+        }
+        for name in sorted(weight_map):
+            yield name, handles[weight_map[name]].get_tensor(name)
 
 
 def _clone_tensor_storage(
@@ -444,9 +485,15 @@ class PreparedRuntimeState:
         group_count = 0
         seen_paths: set[str] = set()
         try:
-            weights = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(model_config, model)
-            )
+            if os.environ.get("SGLANG_PREPARED_MMAP_CHECKPOINT", "0") == "1":
+                logger.info(
+                    "[RL_PREPARED_STATE] using shared page-cache mmap checkpoint"
+                )
+                weights = ordered_mmap_weights_iterator(model_path)
+            else:
+                weights = loader._get_weights_iterator(
+                    DefaultModelLoader.Source.init_new(model_config, model)
+                )
             grouped = itertools.groupby(
                 weights, key=lambda item: checkpoint_module_path(item[0])
             )

@@ -4,6 +4,7 @@ from sglang.srt.weight_sync.runtime_state import (
     checkpoint_module_path,
     clone_module_proxy,
     clone_module_tensors,
+    ordered_mmap_weights_iterator,
     runtime_module_path,
 )
 
@@ -98,3 +99,38 @@ def test_clone_module_tensors_preserves_sglang_parameter_subclass():
     assert cloned.weight.output_dim == parameter.output_dim
     assert cloned.weight.input_dim == parameter.input_dim
     assert cloned.weight.weight_loader is parameter.weight_loader
+
+
+def test_ordered_mmap_weights_iterator_merges_checkpoint_shards(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    save_file(
+        {"language_model.model.layers.1.b": torch.tensor([12])},
+        tmp_path / "model-00001-of-00002.safetensors",
+    )
+    save_file(
+        {
+            "language_model.model.layers.0.a": torch.tensor([1]),
+            "language_model.model.layers.1.a": torch.tensor([11]),
+        },
+        tmp_path / "model-00002-of-00002.safetensors",
+    )
+    index = {
+        "weight_map": {
+            "language_model.model.layers.1.b": "model-00001-of-00002.safetensors",
+            "language_model.model.layers.0.a": "model-00002-of-00002.safetensors",
+            "language_model.model.layers.1.a": "model-00002-of-00002.safetensors",
+        }
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    items = list(ordered_mmap_weights_iterator(str(tmp_path)))
+
+    assert [name for name, _ in items] == [
+        "language_model.model.layers.0.a",
+        "language_model.model.layers.1.a",
+        "language_model.model.layers.1.b",
+    ]
+    assert [tensor.item() for _, tensor in items] == [1, 11, 12]

@@ -606,7 +606,7 @@ class RuntimeDeltaPlan:
         changed_sources = 0
         logical_bytes = 0
         max_raw_bytes = 0
-        versions: list[tuple[int, str, str]] = []
+        versions: list[tuple[int, str, str, dict[str, Any]]] = []
         changed_names: set[str] = set()
         for version in range(base_version + 1, target_version + 1):
             version_dir = os.path.join(source_dir, f"weight_v{version:06d}")
@@ -627,7 +627,7 @@ class RuntimeDeltaPlan:
                     f"XOR deltas; v{version} uses {encoding!r}"
                 )
             changed_names.update(index.get("weight_map", {}))
-            versions.append((version, version_dir, encoding))
+            versions.append((version, version_dir, encoding, index))
 
         unknown = changed_names - self.source_signatures.keys()
         if unknown:
@@ -689,119 +689,134 @@ class RuntimeDeltaPlan:
                 )
 
         decoded_bytes = 0
+        compressed_bytes = 0
+        max_compressed_shard_bytes = 0
         sparse_sources = 0
-        for _, version_dir, encoding in versions:
-            stage_started = time.perf_counter()
-            _, payloads = _read_delta_payloads(version_dir)
-            stage_wall_s["read_compressed"] += time.perf_counter() - stage_started
-            for name, compressed in payloads.items():
-                signature = self.source_signatures.get(name)
-                if signature is None:
-                    raise RuntimeError(
-                        f"runtime delta source was absent from initial load: {name!r}"
-                    )
-                stage_started = time.perf_counter()
-                decompressor = zstandard.ZstdDecompressor()
-                encoded = (
-                    decompressor.decompress(
-                        compressed,
-                        max_output_size=signature.storage_nbytes,
-                    )
-                    if encoding == "xor"
-                    else decompressor.decompress(compressed)
+        for _, version_dir, encoding, index in versions:
+            for payloads, shard_bytes, read_wall_s in _iter_delta_payload_shards(
+                version_dir,
+                index,
+            ):
+                compressed_bytes += shard_bytes
+                max_compressed_shard_bytes = max(
+                    max_compressed_shard_bytes,
+                    shard_bytes,
                 )
-                stage_wall_s["decompress"] += time.perf_counter() - stage_started
-                if encoding == "xor":
-                    delta: RuntimeDelta = encoded
-                    if len(encoded) != signature.storage_nbytes:
+                stage_wall_s["read_compressed"] += read_wall_s
+                for name, compressed in payloads:
+                    signature = self.source_signatures.get(name)
+                    if signature is None:
                         raise RuntimeError(
-                            f"runtime delta size mismatch for {name!r}: "
-                            f"expected={signature.storage_nbytes} "
-                            f"actual={len(encoded)}"
+                            "runtime delta source was absent from initial load: "
+                            f"{name!r}"
                         )
-                else:
-                    delta = _decode_sparse_xor(
-                        encoded,
-                        signature.storage_nbytes,
+                    stage_started = time.perf_counter()
+                    decompressor = zstandard.ZstdDecompressor()
+                    encoded = (
+                        decompressor.decompress(
+                            compressed,
+                            max_output_size=signature.storage_nbytes,
+                        )
+                        if encoding == "xor"
+                        else decompressor.decompress(compressed)
                     )
-                    sparse_sources += 1
-                changed_sources += 1
-                logical_bytes += signature.storage_nbytes
-                decoded_nbytes = (
-                    len(delta)
-                    if isinstance(delta, bytes)
-                    else delta.encoded_nbytes
-                )
-                decoded_bytes += decoded_nbytes
-                max_raw_bytes = max(max_raw_bytes, decoded_nbytes)
-                stage_started = time.perf_counter()
-                if name in self.runtime_copies:
-                    self._apply_direct_xor(host_image, name, delta)
-                    stage_wall_s["direct"] += (
+                    stage_wall_s["decompress"] += (
                         time.perf_counter() - stage_started
                     )
-                    continue
-
-                context = RuntimeDeltaUpdateContext(
-                    plan=self,
-                    host_image=host_image,
-                    source_deltas={name: delta},
-                )
-                module_name = self.quant_adapter_sources.get(name)
-                if module_name is not None:
-                    module = modules[module_name]
-                    quant_method = getattr(module, "quant_method", None)
-                    apply_adapter = getattr(
-                        quant_method,
-                        "apply_host_runtime_delta",
-                        None,
-                    )
-                    if apply_adapter is None:
-                        raise RuntimeDeltaCoverageError(
-                            "quantization method declared host runtime sources but "
-                            "does not implement apply_host_runtime_delta: "
-                            f"module={module_name!r} "
-                            f"method={type(quant_method).__name__}"
+                    if encoding == "xor":
+                        delta: RuntimeDelta = encoded
+                        if len(encoded) != signature.storage_nbytes:
+                            raise RuntimeError(
+                                f"runtime delta size mismatch for {name!r}: "
+                                f"expected={signature.storage_nbytes} "
+                                f"actual={len(encoded)}"
+                            )
+                    else:
+                        delta = _decode_sparse_xor(
+                            encoded,
+                            signature.storage_nbytes,
                         )
+                        sparse_sources += 1
+                    changed_sources += 1
+                    logical_bytes += signature.storage_nbytes
+                    decoded_nbytes = (
+                        len(delta)
+                        if isinstance(delta, bytes)
+                        else delta.encoded_nbytes
+                    )
+                    decoded_bytes += decoded_nbytes
+                    max_raw_bytes = max(max_raw_bytes, decoded_nbytes)
+                    stage_started = time.perf_counter()
+                    if name in self.runtime_copies:
+                        self._apply_direct_xor(host_image, name, delta)
+                        stage_wall_s["direct"] += (
+                            time.perf_counter() - stage_started
+                        )
+                        continue
+
+                    context = RuntimeDeltaUpdateContext(
+                        plan=self,
+                        host_image=host_image,
+                        source_deltas={name: delta},
+                    )
+                    module_name = self.quant_adapter_sources.get(name)
+                    if module_name is not None:
+                        module = modules[module_name]
+                        quant_method = getattr(module, "quant_method", None)
+                        apply_adapter = getattr(
+                            quant_method,
+                            "apply_host_runtime_delta",
+                            None,
+                        )
+                        if apply_adapter is None:
+                            raise RuntimeDeltaCoverageError(
+                                "quantization method declared host runtime sources "
+                                "but does not implement apply_host_runtime_delta: "
+                                f"module={module_name!r} "
+                                f"method={type(quant_method).__name__}"
+                            )
+                        handled = set(
+                            apply_adapter(
+                                layer=module,
+                                module_name=module_name,
+                                context=context,
+                                source_names={name},
+                            )
+                        )
+                        if handled != {name}:
+                            raise RuntimeError(
+                                "runtime delta quant adapter coverage mismatch: "
+                                f"source={name!r} handled={sorted(handled)}"
+                            )
+                        stage_wall_s["quant_adapter"] += (
+                            time.perf_counter() - stage_started
+                        )
+                        continue
+
+                    if name in self.dtype_conversion_sources:
+                        context.apply_dtype_conversion(name)
+                        stage_wall_s["dtype_conversion"] += (
+                            time.perf_counter() - stage_started
+                        )
+                        continue
+
                     handled = set(
-                        apply_adapter(
-                            layer=module,
-                            module_name=module_name,
+                        model_hook(
                             context=context,
                             source_names={name},
                         )
                     )
                     if handled != {name}:
                         raise RuntimeError(
-                            "runtime delta quant adapter coverage mismatch: "
+                            "runtime delta model hook coverage mismatch: "
                             f"source={name!r} handled={sorted(handled)}"
                         )
-                    stage_wall_s["quant_adapter"] += (
+                    stage_wall_s["model_hook"] += (
                         time.perf_counter() - stage_started
                     )
-                    continue
-
-                if name in self.dtype_conversion_sources:
-                    context.apply_dtype_conversion(name)
-                    stage_wall_s["dtype_conversion"] += (
-                        time.perf_counter() - stage_started
-                    )
-                    continue
-
-                handled = set(
-                    model_hook(
-                        context=context,
-                        source_names={name},
-                    )
-                )
-                if handled != {name}:
-                    raise RuntimeError(
-                        "runtime delta model hook coverage mismatch: "
-                        f"source={name!r} handled={sorted(handled)}"
-                    )
-                stage_wall_s["model_hook"] += (
-                    time.perf_counter() - stage_started
-                )
+                if payloads:
+                    del compressed
+                del payloads
 
         finalize_started = time.perf_counter()
         empty_context = RuntimeDeltaUpdateContext(
@@ -856,12 +871,14 @@ class RuntimeDeltaPlan:
             "target_version": target_version,
             "changed_sources": changed_sources,
             "logical_bytes": logical_bytes,
+            "compressed_bytes": compressed_bytes,
             "decoded_bytes": decoded_bytes,
             "sparse_sources": sparse_sources,
             "hook_sources": len(
                 changed_names - self.runtime_copies.keys()
             ),
             "max_raw_bytes": max_raw_bytes,
+            "max_compressed_shard_bytes": max_compressed_shard_bytes,
             "stage_wall_s": {
                 name: round(value, 6)
                 for name, value in sorted(stage_wall_s.items())
@@ -1301,46 +1318,58 @@ def _safetensors_size(blob: bytes) -> Optional[int]:
     return 8 + header_len + end
 
 
-def _read_delta_payloads(
+def _iter_delta_payload_shards(
     version_dir: str,
-) -> tuple[dict[str, Any], dict[str, memoryview]]:
-    with open(os.path.join(version_dir, "model.safetensors.index.json")) as file:
-        index = json.load(file)
+    index: dict[str, Any],
+) -> Iterable[tuple[list[tuple[str, memoryview]], int, float]]:
+    """Yield one validated compressed safetensors shard at a time."""
+
     expected_files = sorted(set(index.get("weight_map", {}).values()))
-    payloads: dict[str, memoryview] = {}
-    blobs: list[bytes] = []
+    expected_names = set(index.get("weight_map", {}))
+    seen: set[str] = set()
     for filename in expected_files:
         path = os.path.join(version_dir, filename)
+        started = time.perf_counter()
         with open(path, "rb") as file:
             blob = file.read()
+        read_wall_s = time.perf_counter() - started
         expected_size = _safetensors_size(blob)
         if expected_size is None or len(blob) != expected_size:
             raise FileNotFoundError(
                 f"incomplete runtime delta blob {path}: "
                 f"actual={len(blob)} expected={expected_size}"
             )
-        blobs.append(blob)
         (header_len,) = struct.unpack("<Q", blob[:8])
         header = json.loads(blob[8 : 8 + header_len])
         data_start = 8 + header_len
         view = memoryview(blob)
+        payloads: list[tuple[str, memoryview]] = []
         for name, info in header.items():
             if name == "__metadata__":
                 continue
             begin, end = info["data_offsets"]
-            if name in payloads:
+            if name in seen:
                 raise RuntimeError(f"duplicate runtime delta tensor {name!r}")
-            payloads[name] = view[data_start + begin : data_start + end]
-    if set(payloads) != set(index.get("weight_map", {})):
+            if index["weight_map"].get(name) != filename:
+                raise RuntimeError(
+                    "runtime delta index maps tensor to a different shard: "
+                    f"{name!r} index={index['weight_map'].get(name)!r} "
+                    f"actual={filename!r}"
+                )
+            seen.add(name)
+            payloads.append(
+                (name, view[data_start + begin : data_start + end])
+            )
+        yield payloads, len(blob), read_wall_s
+        # The consumer has exhausted this shard. Drop every exporting view
+        # before fetching the next file so peak compressed memory is one shard.
+        del payloads, view, blob
+    if seen != expected_names:
         raise RuntimeError(
             "runtime delta index/payload mismatch: "
-            f"index_only={sorted(set(index.get('weight_map', {})) - set(payloads))[:20]} "
-            f"payload_only={sorted(set(payloads) - set(index.get('weight_map', {})))[:20]}"
+            f"index_only={sorted(expected_names - seen)[:20]} "
+            f"payload_only={sorted(seen - expected_names)[:20]}"
         )
-    # memoryviews retain their exporting bytes, so the local list only makes
-    # that lifetime explicit while constructing the result.
-    del blobs
-    return index, payloads
 
 
 def record_runtime_delta_plan(

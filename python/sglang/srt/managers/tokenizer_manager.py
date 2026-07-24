@@ -77,6 +77,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromPreparedReqInput,
+    UpdateWeightsFromPreparedReqOutput,
     async_sock_recv,
     async_sock_send,
     sock_send,
@@ -465,9 +467,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
-        self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
-            None
-        )
+        self.model_update_result: Optional[
+            Awaitable[
+                Union[
+                    UpdateWeightFromDiskReqOutput,
+                    UpdateWeightsFromPreparedReqOutput,
+                ]
+            ]
+        ] = None
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
@@ -573,6 +580,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
+                    self._handle_update_weights_from_disk_req_output,
+                ),
+                (
+                    UpdateWeightsFromPreparedReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
@@ -1747,6 +1758,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return success, message, num_paused_requests
 
+    async def update_weights_from_prepared(
+        self,
+        obj: UpdateWeightsFromPreparedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, int]:
+        """Atomically commit a version already staged in pinned host memory."""
+
+        self.auto_create_handle_loop()
+        logger.info(
+            "Start update_weights_from_prepared. Weight version=%s",
+            obj.weight_version,
+        )
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            success, message, num_paused_requests = (
+                await self._wait_for_model_update_from_prepared(obj)
+            )
+
+        if success:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+        return success, message, num_paused_requests
+
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
         self.server_args.model_path = model_path
@@ -1774,6 +1815,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
+
+    async def _wait_for_model_update_from_prepared(
+        self, obj: UpdateWeightsFromPreparedReqInput
+    ) -> Tuple[bool, str, int]:
+        self._dispatch_to_scheduler(obj)
+        self.model_update_result = asyncio.Future()
+        if self.server_args.dp_size == 1:
+            result = await self.model_update_result
+            return result.success, result.message, result.num_paused_requests
+
+        self.model_update_tmp = []
+        result = await self.model_update_result
+        all_success = all(r.success for r in result)
+        all_message = " | ".join(r.message for r in result)
+        all_paused_requests = [r.num_paused_requests for r in result]
+        return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_logger.configure(

@@ -1536,6 +1536,23 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class UpdateWeightsFromPreparedReqInput(BaseReq, kw_only=True):
+    """Commit a version already staged in the engine's pinned host image."""
+
+    weight_version: str
+    abort_all_requests: bool = False
+    # Keep in-flight KV cache by default. The caller may explicitly request the
+    # ordinary post-update cache flush when its rollout protocol requires it.
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromPreparedReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    num_paused_requests: int = 0
+
+
 class PullWeightsReqInput(BaseReq, kw_only=True):
     # Host-local checkpoint dir the pulled weights land in; seeded from the
     # server's model path when the published stream has no full version.
@@ -1545,6 +1562,9 @@ class PullWeightsReqInput(BaseReq, kw_only=True):
     source_dir: str
     # The version to bring the local checkpoint up to.
     target_version: int
+    # checkpoint: reconstruct and verify the host-local checkpoint only.
+    # runtime: additionally advance the persistent pinned runtime image.
+    prepare: Literal["checkpoint", "runtime"] = "checkpoint"
 
 
 class PullWeightsReqOutput(BaseReq, kw_only=True):

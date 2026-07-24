@@ -2376,6 +2376,10 @@ class ServerArgs:
         Optional[str],
         "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
     ] = None
+    enable_host_runtime_weight_update: A[
+        bool,
+        "Keep one pinned host mirror of final model runtime storage. This enables background host preparation followed by a short /update_weights_from_prepared full-model commit.",
+    ] = False
     weight_loader_disable_mmap: A[
         bool,
         "Disable mmap while loading weight using safetensors.",

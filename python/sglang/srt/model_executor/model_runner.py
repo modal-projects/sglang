@@ -25,6 +25,7 @@ import os
 import socket
 import threading
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
@@ -708,6 +709,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._prepare_moe_topk()
         if os.environ.get("SGLANG_PROFILE_RUNTIME_STATE", "0") == "1":
             self._log_runtime_state_inventory()
+        self.host_runtime_state = None
+        if (
+            not self.is_draft_worker
+            and self.server_args.enable_host_runtime_weight_update
+        ):
+            from sglang.srt.weight_sync.host_runtime import HostRuntimeState
+
+            self.host_runtime_state = HostRuntimeState(self.model)
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
@@ -1614,6 +1623,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
+            record_host_runtime_delta_plan=(
+                self.server_args.enable_host_runtime_weight_update
+                and not self.is_draft_worker
+            ),
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -2125,7 +2138,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     sort_keys=True,
                 ),
             )
+        if self.host_runtime_state is not None:
+            self.host_runtime_state.invalidate(
+                "GPU weights were updated through the disk loader; restart or "
+                "explicitly reseed the host runtime image before prepared updates"
+            )
         return True, "Succeeded to update model weights."
+
+    def update_weights_from_prepared(
+        self,
+        weight_version: str,
+    ) -> tuple[bool, str]:
+        """Commit a fully prepared host runtime image to existing GPU storage."""
+
+        state = self.host_runtime_state
+        if state is None:
+            return (
+                False,
+                "Host runtime weight updates are disabled. Launch with "
+                "--enable-host-runtime-weight-update.",
+            )
+        try:
+            stats = state.commit(weight_version)
+        except Exception:
+            logger.exception(
+                "Failed to commit prepared host runtime version %s", weight_version
+            )
+            return False, traceback.format_exc()
+        logger.info("[RL_HOST_RUNTIME_COMMIT] %s", json.dumps(stats, sort_keys=True))
+        return True, f"Committed prepared host runtime weights: {stats}"
+
+    def prepare_host_runtime_weights(
+        self,
+        *,
+        source_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        state = self.host_runtime_state
+        if state is None:
+            raise RuntimeError(
+                "Host runtime weight updates are disabled. Launch with "
+                "--enable-host-runtime-weight-update."
+            )
+        stats = state.prepare_from_deltas(
+            model=self.model,
+            source_dir=source_dir,
+            target_version=target_version,
+        )
+        logger.info("[RL_HOST_RUNTIME_PREPARE] %s", json.dumps(stats, sort_keys=True))
+        return stats
 
     def init_weights_send_group_for_remote_instance(
         self,

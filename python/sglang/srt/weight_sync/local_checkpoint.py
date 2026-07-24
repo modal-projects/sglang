@@ -18,13 +18,11 @@ local checkpoint through the ordinary ``update_weights_from_disk`` path.
 per-host file lock serializes the work and an applied-version marker makes the
 extra calls no-ops.
 
-A pull that dies mid-mutation (preemption, power loss) never wedges the host.
-The next pull re-applies the interrupted version; a changed tensor that was
-already XORed reverts under the second XOR and so fails its checksum, which
-triggers one reseed from the newest full version (or the engine's base) plus a
-replay of the delta chain. The delta's dirty pages are msync'd before the
-applied-version marker is written, so the marker can never become durable over
-bytes that never reached disk. Only a failure on the fresh reseed raises.
+A failed mutation invalidates the local checkpoint and fails loudly. Recovery
+is an explicit controller/operator action: deleting or reseeding a 600 GB
+checkpoint is too consequential to hide behind an automatic retry. The delta's
+dirty pages are msync'd before the applied-version marker is written, so a
+successful marker can never become durable over bytes that did not reach disk.
 """
 
 from __future__ import annotations
@@ -65,6 +63,14 @@ _SEED_LOG_STEP_GB = 50
 SYNC_DIR = ".weight_sync"
 
 
+class InvalidLocalCheckpointError(RuntimeError):
+    """The local checkpoint cannot be used until it is explicitly reseeded."""
+
+
+class CheckpointChecksumError(RuntimeError):
+    """A reconstructed checkpoint tensor did not match its published checksum."""
+
+
 def pull(
     local_checkpoint_dir: str,
     base_dir: str,
@@ -74,10 +80,10 @@ def pull(
 ) -> None:
     """Bring the host-local checkpoint up to ``target_version``.
 
-    Seeds from the newest full checkpoint at or below the target — the engine's
-    own pristine base (``base_dir``) for a pure-delta stream, a published full
-    version otherwise — then applies the remaining deltas in order. A local
-    checkpoint already past the seed point just continues its delta chain.
+    Seeds an absent checkpoint from the newest full checkpoint at or below the
+    target, then applies remaining deltas in order. A present valid checkpoint
+    continues its delta chain. Invalid local state is never automatically
+    replaced; the caller must explicitly reseed it.
 
     Runs under a per-host lock. Every co-located TP rank calls this, but only the
     lock winner refreshes + applies; a rank that finds the checkpoint already at or
@@ -93,10 +99,8 @@ def pull(
       * A missing or incomplete *source* version raises ``FileNotFoundError`` and
         stops — we never reseed to paper over a not-yet-materialized source; the
         caller reloads + retries.
-      * A checksum mismatch on staged, complete bytes == corrupt *local* state (a
-        torn mid-write apply, bit rot). That triggers one reseed from the pristine
-        base plus a replay of the chain; a failure on the fresh state re-raises
-        (fail loud, never serve bad weights).
+      * A checksum mismatch on staged, complete bytes invalidates the local
+        checkpoint and fails loudly. It never triggers an automatic reseed.
     """
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)
@@ -112,7 +116,10 @@ def pull(
             _load_hook(pre_read_hook)(source_dir, target_version)
         try:
             _pull_locked(
-                local_checkpoint_dir, base_dir, source_dir, target_version, reseed=False
+                local_checkpoint_dir,
+                base_dir,
+                source_dir,
+                target_version,
             )
         except FileNotFoundError:
             # A source version is missing or not fully materialized — a readiness
@@ -121,18 +128,17 @@ def pull(
             # the caller reloads and retries.
             _log_pull_not_found(source_dir, target_version)
             raise
-        except Exception:
-            # A checksum mismatch on staged, complete bytes == corrupt local
-            # state (incomplete sources are reclassified to FileNotFoundError
-            # above and never reach here). Reseed from the pristine base and
-            # replay once; a failure on that fresh state re-raises.
-            logger.exception(
-                "pull to v%d failed on staged sources; reseeding from base and replaying",
-                target_version,
+        except InvalidLocalCheckpointError:
+            raise
+        except Exception as exc:
+            # Once a complete delta begins applying, an unexpected failure can
+            # leave only part of it durable. Fail closed rather than guessing
+            # whether a retry should XOR, undo, or reseed those bytes.
+            _mark_checkpoint_invalid(
+                local_checkpoint_dir,
+                f"pull to v{target_version} failed: {type(exc).__name__}: {exc}",
             )
-            _pull_locked(
-                local_checkpoint_dir, base_dir, source_dir, target_version, reseed=True
-            )
+            raise
 
 
 def _pull_locked(
@@ -140,11 +146,8 @@ def _pull_locked(
     base_dir: str,
     source_dir: str,
     target_version: int,
-    reseed: bool,
 ) -> None:
-    # A torn local state (reseed=True) is treated like a fresh host: the
-    # applied-version marker can't be trusted over partially-mutated files.
-    applied = None if reseed else _read_applied_version(local_checkpoint_dir)
+    applied = _read_applied_version(local_checkpoint_dir)
     # Scan back from the target for the newest full version. Stop at the
     # local state — below it a reset can never be needed (or, on a fresh
     # host, at 0 = the engine's base).
@@ -279,16 +282,49 @@ def _pull_lock(local_checkpoint_dir: str):
 def _read_applied_version(local_checkpoint_dir: str) -> Optional[int]:
     try:
         with open(os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json")) as f:
-            return int(json.load(f)["version"])
+            state = json.load(f)
     except FileNotFoundError:
         return None
+    if state.get("valid", True) is not True:
+        raise InvalidLocalCheckpointError(
+            "local checkpoint is marked invalid and must be explicitly reseeded: "
+            f"{state.get('reason', 'unknown reason')}"
+        )
+    return int(state["version"])
 
 
 def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
+    _write_checkpoint_state(
+        local_checkpoint_dir,
+        {
+            "version": f"{version:06d}",
+            "valid": True,
+        },
+    )
+
+
+def _mark_checkpoint_invalid(local_checkpoint_dir: str, reason: str) -> None:
+    try:
+        with open(os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json")) as f:
+            old_state = json.load(f)
+    except (FileNotFoundError, ValueError):
+        old_state = {}
+    _write_checkpoint_state(
+        local_checkpoint_dir,
+        {
+            "version": old_state.get("version"),
+            "valid": False,
+            "reason": reason,
+        },
+    )
+
+
+def _write_checkpoint_state(local_checkpoint_dir: str, state: dict) -> None:
+    os.makedirs(os.path.join(local_checkpoint_dir, SYNC_DIR), exist_ok=True)
     path = os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"version": f"{version:06d}"}, f)
+        json.dump(state, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -432,7 +468,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     algorithm = meta["checksum_format"]
     locations = _tensor_locations(local_checkpoint_dir)
     open_mmaps = {}
-    mismatches = []
+    mismatches: list[tuple[str, Optional[str], str]] = []
     lock = threading.Lock()
     file_bytes = []  # keep alive: items hold zero-copy views into these
     items = []  # (name, compressed_view, path, offset, nbytes, want_checksum)
@@ -505,9 +541,10 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                 region[pos : pos + chunk.size] ^= chunk
                 hasher.update(region[pos : pos + chunk.size])
                 pos += chunk.size
-            if hasher.hexdigest() != want:
+            actual = hasher.hexdigest()
+            if actual != want:
                 with lock:
-                    mismatches.append(name)
+                    mismatches.append((name, want, actual))
 
         def apply_overwrite(item) -> None:
             name, compressed, path, offset, nbytes, want = item
@@ -520,9 +557,10 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             count = int.from_bytes(delta[:4], "little")
             positions = np.frombuffer(delta[4 : 4 + 4 * count], dtype="<u4")
             region[positions] = delta[4 + 4 * count :]
-            if _checksum(algorithm, region) != want:
+            actual = _checksum(algorithm, region)
+            if actual != want:
                 with lock:
-                    mismatches.append(name)
+                    mismatches.append((name, want, actual))
 
         if encoding == "xor":
             apply_tensor = apply_xor
@@ -543,9 +581,13 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             mm.close()
             fh.close()
     if mismatches:
-        raise RuntimeError(
-            f"checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: "
-            f"{sorted(mismatches)[:20]}"
+        sample = [
+            {"tensor": name, "expected": expected, "actual": actual}
+            for name, expected, actual in sorted(mismatches)[:20]
+        ]
+        raise CheckpointChecksumError(
+            f"checksum mismatch for {len(mismatches)} tensors after applying "
+            f"{version_dir}: {sample}"
         )
     _write_applied_version(local_checkpoint_dir, int(meta["version"]))
 
@@ -563,8 +605,8 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
     Pure-xor/zstd ranges only; a range that contains an ``overwrite`` (or otherwise non-xor)
     version falls back to the per-version path (correct, just not folded). Correctness is
     unchanged from the sequential apply: only the final v{hi} state is checksummed per tensor
-    (XOR telescoping means any corrupt delta in the chain breaks it), and a mismatch raises so
-    the caller reseeds from base and replays.
+    (XOR telescoping means any corrupt delta in the chain breaks it). A mismatch
+    invalidates the local checkpoint and fails loudly.
     """
     blobs_alive = []  # keep the whole-file delta reads alive; the views below point into them
     per_version = []  # [(version, {tensor: compressed_view}, {tensor: want_checksum})]
@@ -624,7 +666,7 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
     by_shard: dict = {}
     for name, (path, offset, nbytes) in locations.items():
         by_shard.setdefault(path, []).append((name, offset, nbytes))
-    mismatches = []
+    mismatches: list[tuple[str, Optional[str], str]] = []
     lock = threading.Lock()
 
     def fold_shard(path) -> None:
@@ -650,8 +692,11 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
                     chunk = np.frombuffer(block, dtype=np.uint8)
                     region[pos : pos + chunk.size] ^= chunk
                     pos += chunk.size
-            if touched and _checksum(algorithm, region) != last_want.get(name):
-                bad.append(name)
+            if touched:
+                actual = _checksum(algorithm, region)
+                expected = last_want.get(name)
+                if actual != expected:
+                    bad.append((name, expected, actual))
         if bad:
             with lock:
                 mismatches.extend(bad)
@@ -662,8 +707,12 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
         list(pool.map(fold_shard, by_shard))
     if mismatches:
-        raise RuntimeError(
-            f"checksum mismatch for {len(mismatches)} tensors after folding v{lo}..v{hi}: "
-            f"{sorted(mismatches)[:20]}"
+        sample = [
+            {"tensor": name, "expected": expected, "actual": actual}
+            for name, expected, actual in sorted(mismatches)[:20]
+        ]
+        raise CheckpointChecksumError(
+            f"checksum mismatch for {len(mismatches)} tensors after folding "
+            f"v{lo}..v{hi}: {sample}"
         )
     _write_applied_version(local_checkpoint_dir, hi)

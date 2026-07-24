@@ -614,6 +614,10 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # The wrapper delegates language-weight loading and MLA derivation to the
+    # DeepSeek language model.
+    host_runtime_delta_fallback_patterns = ("kv_b_proj",)
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json

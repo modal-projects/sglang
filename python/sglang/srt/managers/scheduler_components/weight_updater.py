@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromPreparedReqInput,
+    UpdateWeightsFromPreparedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -127,6 +129,32 @@ class SchedulerWeightUpdaterManager:
                 success=success, message=message, num_paused_requests=0
             )
 
+    def update_weights_from_prepared(
+        self, recv_req: UpdateWeightsFromPreparedReqInput
+    ):
+        """Commit a complete host-prepared runtime image."""
+
+        with self._observe_weight_load("prepared"):
+            if self.draft_worker is not None:
+                success = False
+                message = (
+                    "Host-prepared weight updates do not yet support speculative "
+                    "draft models."
+                )
+            else:
+                success, message = self.tp_worker.update_weights_from_prepared(
+                    recv_req
+                )
+            if success:
+                self.flush_cache_after_weight_update(recv_req)
+            else:
+                logger.error(message)
+            return UpdateWeightsFromPreparedReqOutput(
+                success=success,
+                message=message,
+                num_paused_requests=0,
+            )
+
     def pull_weights(self, recv_req: PullWeightsReqInput):
         """Sync this host's local checkpoint up to recv_req.target_version.
 
@@ -150,7 +178,20 @@ class SchedulerWeightUpdaterManager:
                 target_version=recv_req.target_version,
                 pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
             )
-            success, message = True, "Success."
+            if recv_req.prepare == "runtime":
+                if recv_req.target_version == 0:
+                    prepare_stats = {"target_version": 0, "already_active": True}
+                else:
+                    prepare_stats = self.tp_worker.prepare_host_runtime_weights(
+                        source_dir=recv_req.source_dir,
+                        target_version=recv_req.target_version,
+                    )
+                success, message = (
+                    True,
+                    f"Verified checkpoint and prepared host runtime: {prepare_stats}",
+                )
+            else:
+                success, message = True, "Verified host-local checkpoint."
         except Exception:
             success, message = False, traceback.format_exc()
             logger.error(message)

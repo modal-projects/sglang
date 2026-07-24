@@ -1,10 +1,8 @@
 """CPU unit tests for weight_sync/local_checkpoint.py.
 
-Covers the pull recovery semantics: seeding + delta-chain replay, torn-apply
-detection via the apply-intent sentinel (a mutation killed partway must
-reseed, never re-patch — XOR applied twice reverts), automatic
-reseed-and-replay after a checksum mismatch on corrupted local state, and
-fail-loud behavior when the published delta itself is bad.
+Covers seeding + delta-chain replay, source-readiness failures, and fail-closed
+checksum semantics. A checksum failure leaves the local checkpoint explicitly
+invalid until the controller/operator reseeds it.
 
 The module under test needs only numpy + zstandard; it is loaded directly so
 the tests run without the full sglang import chain (and therefore in any CPU
@@ -198,33 +196,38 @@ class PullTest(unittest.TestCase):
         self.pull(2)
         self.assert_at_version(2)
 
-    def test_torn_apply_reseeds_instead_of_repatching(self):
+    def test_torn_apply_fails_closed(self):
         self.pull(1)
         # Simulate an apply of v2 killed mid-mutation: marker still at 1, some
         # (not all) bytes of layer.b already XORed toward v2. The re-apply
-        # double-XORs those bytes -> checksum mismatch -> reseed + replay.
+        # double-XORs those bytes and must fail its checksum. The pull must not
+        # hide the corruption behind an automatic full-checkpoint copy.
         shard = os.path.join(self.local, Publisher.SHARD)
         locations = local_checkpoint._tensor_locations(self.local)
         _, offset, nbytes = locations["layer.b"]
         with open(shard, "r+b") as f:
             f.seek(offset)
             f.write(self.pub.versions[2]["layer.b"][: nbytes // 2])
-        self.pull(2)
-        self.assert_at_version(2)
+        with self.assertRaises(local_checkpoint.CheckpointChecksumError):
+            self.pull(2)
+        with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+            local_checkpoint._read_applied_version(self.local)
 
-    def test_corrupt_local_state_recovers_via_reseed(self):
+    def test_corrupt_local_state_fails_closed(self):
         self.pull(1)
         # Silent local divergence (bit rot, lost page): no sentinel, marker
-        # says 1, but the bytes are wrong. The v2 apply must checksum-fail,
-        # reseed from base, and replay the chain — not wedge.
+        # says 1, but the bytes are wrong. The v2 apply must checksum-fail and
+        # invalidate the local checkpoint.
         shard = os.path.join(self.local, Publisher.SHARD)
         locations = local_checkpoint._tensor_locations(self.local)
         _, offset, _ = locations["layer.b"]
         with open(shard, "r+b") as f:
             f.seek(offset)
             f.write(bytes(16))
-        self.pull(2)
-        self.assert_at_version(2)
+        with self.assertRaises(local_checkpoint.CheckpointChecksumError):
+            self.pull(2)
+        with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+            self.pull(2)
 
     def test_bad_published_delta_fails_loud(self):
         # Corrupt the published v1 payload itself: reseed-and-replay hits the
@@ -240,14 +243,18 @@ class PullTest(unittest.TestCase):
             f.write(bytes(data))
         with self.assertRaises(Exception):
             self.pull(1)
-        # The publisher fixes the artifact; the next pull recovers by itself
-        # (the sentinel left by the failed attempt forces a clean reseed).
+        # Fixing the publisher artifact does not silently replace the invalid
+        # local checkpoint.
         shutil.rmtree(vdir)
         self.pub.state = dict(self.pub.versions[0])
         rng = np.random.default_rng(11)
         self.pub.publish_delta(
             1, {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()}
         )
+        with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+            self.pull(1)
+        # Recovery is explicit.
+        shutil.rmtree(self.local)
         self.pull(1)
         self.assert_at_version(1)
 
@@ -370,9 +377,9 @@ class PullTest(unittest.TestCase):
         self.pull(4)  # fresh host -> multi-delta fold of v1..v4
         self.assert_at_version(4)
 
-    def test_fold_corrupt_local_reseeds(self):
+    def test_fold_corrupt_local_fails_closed(self):
         # A multi-delta fold onto silently-corrupt local state must checksum-fail on the
-        # final state and reseed+replay from base — never serve the wrong bytes.
+        # final state and invalidate the local checkpoint.
         rng = np.random.default_rng(31)
         self.pub.publish_delta(
             3, {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()}
@@ -383,8 +390,10 @@ class PullTest(unittest.TestCase):
         with open(shard, "r+b") as f:
             f.seek(offset)
             f.write(bytes(16))  # silent local corruption
-        self.pull(3)  # applied=1 -> fold v2..v3 -> checksum-fail -> reseed + replay
-        self.assert_at_version(3)
+        with self.assertRaises(local_checkpoint.CheckpointChecksumError):
+            self.pull(3)
+        with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+            self.pull(3)
 
     def test_pull_zero_seeds_base_without_applying_a_delta(self):
         # pull(0) seeds the base full and applies NO delta: the target IS a full (start==target,

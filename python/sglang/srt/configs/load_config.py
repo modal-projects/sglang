@@ -104,6 +104,10 @@ class LoadConfig:
     # For multi-layer MTP
     draft_model_idx: Optional[int] = None
 
+    # Record proven checkpoint-source to parameter-copy relationships during
+    # initial loading for pinned host runtime updates.
+    record_host_runtime_delta_plan: bool = False
+
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
         if isinstance(model_loader_extra_config, str):

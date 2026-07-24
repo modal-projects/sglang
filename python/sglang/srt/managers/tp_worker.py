@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromPreparedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -107,6 +108,24 @@ class BaseTpWorker(ABC):
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def update_weights_from_prepared(
+        self, recv_req: UpdateWeightsFromPreparedReqInput
+    ):
+        return self.model_runner.update_weights_from_prepared(
+            recv_req.weight_version,
+        )
+
+    def prepare_host_runtime_weights(
+        self,
+        *,
+        source_dir: str,
+        target_version: int,
+    ):
+        return self.model_runner.prepare_host_runtime_weights(
+            source_dir=source_dir,
+            target_version=target_version,
+        )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.init_weights_update_group(

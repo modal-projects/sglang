@@ -139,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromPreparedReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -1165,6 +1166,27 @@ async def pull_weights(
     success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
 
     content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_prepared")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_prepared(
+    obj: Annotated[UpdateWeightsFromPreparedReqInput, Body()],
+    request: Request,
+):
+    """Commit a verified version already staged in pinned host runtime memory."""
+
+    success, message, num_paused_requests = (
+        await _global_state.tokenizer_manager.update_weights_from_prepared(obj, request)
+    )
+    content = {
+        "success": success,
+        "message": message,
+        "num_paused_requests": num_paused_requests,
+    }
     return ORJSONResponse(
         content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
     )

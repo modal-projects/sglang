@@ -142,6 +142,11 @@ NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models."""
 
+    # MLA derives runtime w_kc/w_vc state from kv_b_proj after the ordinary
+    # parameter copies. Host-runtime preparation must route those sources
+    # through the explicit derived-state hook.
+    host_runtime_delta_fallback_patterns = ("kv_b_proj",)
+
     model: nn.Module
     config: PretrainedConfig
     quant_config: Optional[QuantizationConfig]

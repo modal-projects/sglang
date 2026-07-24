@@ -822,15 +822,41 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
-            )
+            record_plan = self.load_config.record_host_runtime_delta_plan
+            if (
+                record_plan
+                and type(self).load_weights_and_postprocess
+                is not DefaultModelLoader.load_weights_and_postprocess
+            ):
+                raise NotImplementedError(
+                    "host runtime weight updates require the default model "
+                    f"loader, got {type(self).__name__}"
+                )
+            weights = self._get_all_weights(model_config, model)
+            if (
+                type(self).load_weights_and_postprocess
+                is DefaultModelLoader.load_weights_and_postprocess
+            ):
+                self.load_weights_and_postprocess(
+                    model,
+                    weights,
+                    target_device,
+                    record_host_runtime_delta_plan=record_plan,
+                )
+            else:
+                self.load_weights_and_postprocess(model, weights, target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(
+        model,
+        weights,
+        target_device,
+        *,
+        record_host_runtime_delta_plan: bool = False,
+    ):
         profile_enabled = os.environ.get("SGLANG_PROFILE_WEIGHT_RELOAD", "0") == "1"
         profile_iter = None
         profile_started = time.perf_counter()
@@ -855,6 +881,16 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
+        def load_all_weights():
+            if not record_host_runtime_delta_plan:
+                model.load_weights(weights)
+                return
+            from sglang.srt.weight_sync.runtime_delta import (
+                record_runtime_delta_plan,
+            )
+
+            record_runtime_delta_plan(model, weights)
+
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
@@ -862,12 +898,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                load_all_weights()
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            load_all_weights()
 
         load_sync_s = _sync_profile_device(target_device) if profile_enabled else 0.0
         load_done = time.perf_counter()

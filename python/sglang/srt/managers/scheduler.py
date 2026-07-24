@@ -148,6 +148,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromPreparedReqInput,
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
@@ -1388,6 +1389,10 @@ class Scheduler(
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
+                ),
+                (
+                    UpdateWeightsFromPreparedReqInput,
+                    self.weight_updater.update_weights_from_prepared,
                 ),
                 (
                     InitWeightsUpdateGroupReqInput,

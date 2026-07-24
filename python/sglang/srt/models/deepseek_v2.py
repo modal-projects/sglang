@@ -1795,6 +1795,14 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
+    def host_runtime_tensors(self):
+        """Expose MLA-derived weights that are intentionally unregistered."""
+
+        if isinstance(self.w_kc, torch.Tensor):
+            yield "w_kc", self.w_kc
+        if isinstance(self.w_vc, torch.Tensor):
+            yield "w_vc", self.w_vc
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:

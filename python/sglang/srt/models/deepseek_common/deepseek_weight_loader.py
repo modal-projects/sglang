@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -152,6 +153,109 @@ class DeepseekV2WeightLoaderMixin:
     quant_config: Optional[QuantizationConfig]
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
+
+    @staticmethod
+    def validate_host_runtime_delta_sources(source_names) -> None:
+        from sglang.srt.weight_sync.runtime_delta import (
+            RuntimeDeltaCoverageError,
+        )
+
+        unsupported = [
+            name
+            for name in source_names
+            if not name.endswith(
+                (
+                    ".q_a_proj.weight",
+                    ".kv_a_proj_with_mqa.weight",
+                    ".kv_b_proj.weight",
+                )
+            )
+        ]
+        if unsupported:
+            raise RuntimeDeltaCoverageError(
+                "unsupported DeepSeek host runtime delta sources: "
+                f"{sorted(unsupported)[:20]}"
+            )
+
+    def apply_host_runtime_delta(self, *, context, source_names):
+        """Update DeepSeek fused-A and MLA-derived host runtime tensors."""
+
+        from sglang.srt.weight_sync.runtime_delta import (
+            RuntimeDeltaCoverageError,
+        )
+
+        handled: set[str] = set()
+        for source_name in sorted(source_names):
+            match = re.search(
+                r"(?P<prefix>.*model\.layers\.(?P<layer>\d+)\.self_attn\.)",
+                source_name,
+            )
+            if match is None:
+                raise RuntimeDeltaCoverageError(
+                    f"unsupported DeepSeek runtime delta source {source_name!r}"
+                )
+            prefix = match.group("prefix")
+            layer_id = int(match.group("layer"))
+            self_attn = self.model.layers[layer_id].self_attn
+
+            if source_name.endswith(
+                (".q_a_proj.weight", ".kv_a_proj_with_mqa.weight")
+            ):
+                target_name = f"{prefix}fused_qkv_a_proj_with_mqa.weight"
+                target = context.host_tensor(target_name)
+                delta = context.source_tensor(source_name).contiguous()
+                if delta.ndim != 2 or target.ndim != 2:
+                    raise RuntimeDeltaCoverageError(
+                        "DeepSeek fused-A runtime update requires 2D weights: "
+                        f"source={source_name!r} source_shape={tuple(delta.shape)} "
+                        f"target_shape={tuple(target.shape)}"
+                    )
+                if delta.dtype != target.dtype or delta.shape[1] != target.shape[1]:
+                    raise RuntimeDeltaCoverageError(
+                        "DeepSeek fused-A runtime dtype/width mismatch: "
+                        f"source={source_name!r} "
+                        f"source={tuple(delta.shape)}/{delta.dtype} "
+                        f"target={tuple(target.shape)}/{target.dtype}"
+                    )
+                destination = (
+                    target[: delta.shape[0]]
+                    if source_name.endswith(".q_a_proj.weight")
+                    else target[-delta.shape[0] :]
+                )
+                destination.view(torch.uint8).bitwise_xor_(
+                    delta.view(torch.uint8)
+                )
+                handled.add(source_name)
+                continue
+
+            if source_name.endswith(".kv_b_proj.weight"):
+                raw = context.host_tensor(f"{prefix}kv_b_proj.weight")
+                if raw.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                    raise RuntimeDeltaCoverageError(
+                        "MLA host derivation currently requires an unquantized "
+                        f"kv_b_proj, got {raw.dtype} for {source_name!r}"
+                    )
+                context.xor_direct(source_name)
+                w_kc, w_vc = raw.unflatten(
+                    0,
+                    (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
+                ).split(
+                    [self_attn.qk_nope_head_dim, self_attn.v_head_dim],
+                    dim=1,
+                )
+                expected_kc = (
+                    w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                )
+                expected_vc = w_vc.contiguous().transpose(1, 2)
+                context.host_tensor(f"{prefix}w_kc").copy_(expected_kc)
+                context.host_tensor(f"{prefix}w_vc").copy_(expected_vc)
+                handled.add(source_name)
+                continue
+
+            raise RuntimeDeltaCoverageError(
+                f"unsupported DeepSeek runtime delta source {source_name!r}"
+            )
+        return handled
 
     def do_load_weights(
         self,

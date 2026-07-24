@@ -13,6 +13,10 @@ from sglang.srt.weight_sync.runtime_delta import (
     RuntimeDeltaCoverageError,
     RuntimeDeltaPlan,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    _interleave_trtllm_nvfp4_scales,
+    _shuffle_trtllm_epilogue_rows,
+)
 
 
 @dataclass
@@ -30,7 +34,7 @@ class _CopyModel(torch.nn.Module):
         )
         self.weight.weight_loader = self._load
         if quantized:
-            self.quant_method = object()
+            self.quant_method = _QuantAdapterWithoutApply()
 
     @staticmethod
     def _load(parameter, loaded_weight):
@@ -41,6 +45,31 @@ class _CopyModel(torch.nn.Module):
     def load_weights(self, weights):
         for name, tensor in weights:
             assert name == "weight"
+            self.weight.weight_loader(self.weight, tensor)
+
+
+class _QuantAdapterWithoutApply:
+    @staticmethod
+    def host_runtime_delta_parameter_names(layer):
+        return ("weight",)
+
+
+class _PaddedCopyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.full((10,), -1, dtype=torch.int32),
+            requires_grad=False,
+        )
+        self.weight.weight_loader = self._load
+
+    @staticmethod
+    def _load(parameter, loaded_weight):
+        parameter[: loaded_weight.shape[0]].copy_(loaded_weight)
+        parameter[loaded_weight.shape[0] :].fill_(0)
+
+    def load_weights(self, weights):
+        for _, tensor in weights:
             self.weight.weight_loader(self.weight, tensor)
 
 
@@ -123,6 +152,16 @@ def test_direct_xor_advances_tp_view_byte_exactly():
     assert torch.equal(actual, expected)
 
 
+def test_invariant_zero_padding_does_not_require_a_hook():
+    source = torch.arange(8, dtype=torch.int32)
+    model = _PaddedCopyModel()
+    plan = RuntimeDeltaPlan()
+    plan.record(model, [("weight", source)])
+    segment = _Segment(image_offset=0, device_bytes=_storage_bytes(model.weight))
+    stats = plan.finalize(model, [segment])
+    assert stats["direct_sources"] == 1
+
+
 def test_quantized_destination_requires_explicit_hook_before_mutation():
     old = torch.arange(12, dtype=torch.int32)
     new = old.clone()
@@ -144,3 +183,70 @@ def test_quantized_destination_requires_explicit_hook_before_mutation():
                 target_version=1,
             )
     assert torch.equal(host_image, before)
+
+
+def test_trtllm_row_shuffle_matches_flashinfer_index_definition():
+    value = torch.arange(64 * 7, dtype=torch.int32).reshape(64, 7)
+    gated = (
+        value.reshape(2, 32, 7).transpose(0, 1).reshape(64, 7)
+    )
+    src_to_dst = torch.tensor(
+        [
+            0,
+            8,
+            16,
+            24,
+            1,
+            9,
+            17,
+            25,
+            2,
+            10,
+            18,
+            26,
+            3,
+            11,
+            19,
+            27,
+            4,
+            12,
+            20,
+            28,
+            5,
+            13,
+            21,
+            29,
+            6,
+            14,
+            22,
+            30,
+            7,
+            15,
+            23,
+            31,
+        ]
+    )
+    expected = torch.empty_like(gated)
+    for block in range(2):
+        begin = block * 32
+        expected[begin + src_to_dst] = gated[begin : begin + 32]
+
+    actual = _shuffle_trtllm_epilogue_rows(value, gated_w13=True)
+    assert torch.equal(actual, expected)
+
+
+def test_trtllm_scale_interleave_matches_128x4_offset_definition():
+    value = torch.arange(128 * 8, dtype=torch.int32).reshape(128, 8)
+    expected = torch.empty_like(value).view(-1)
+    for row in range(128):
+        for column in range(8):
+            destination = (
+                (column // 4) * 512
+                + (row % 32) * 16
+                + ((row % 128) // 32) * 4
+                + column % 4
+            )
+            expected[destination] = value[row, column]
+
+    actual = _interleave_trtllm_nvfp4_scales(value)
+    assert torch.equal(actual, expected.reshape(128, 8))

@@ -803,6 +803,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if self.language_model is not None:
             self.language_model.post_load_weights()
 
+    def apply_host_runtime_delta(self, *, context, source_names):
+        if self.language_model is None:
+            return set()
+        return self.language_model.apply_host_runtime_delta(
+            context=context,
+            source_names=source_names,
+        )
+
+    def validate_host_runtime_delta_sources(self, source_names):
+        if self.language_model is None:
+            return
+        self.language_model.validate_host_runtime_delta_sources(source_names)
+
     @property
     def stacked_params_mapping(self):
         return getattr(self.language_model, "stacked_params_mapping", [])

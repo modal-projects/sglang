@@ -78,6 +78,15 @@ class RuntimeCopy:
     destination_view: TensorViewSpec
 
 
+@dataclass(frozen=True)
+class RuntimeTensorSpec:
+    image_storage_offset: int
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    storage_offset: int
+
+
 def _tensor_signature(tensor: torch.Tensor) -> TensorSignature:
     return TensorSignature(
         shape=tuple(tensor.shape),
@@ -169,6 +178,21 @@ class _CopyRecorder(TorchDispatchMode):
                 and destination.untyped_storage().data_ptr() == self.source_ptr
             ):
                 self.unsafe = True
+        elif (
+            func in (torch.ops.aten.fill_.Scalar, torch.ops.aten.zero_.default)
+            and len(args) >= 1
+            and isinstance(args[0], torch.Tensor)
+            and args[0].untyped_storage().data_ptr() == self.parameter_ptr
+            and not self._uses_storage((args[1:], kwargs), self.source_ptr)
+            and (
+                func is torch.ops.aten.zero_.default
+                or (len(args) >= 2 and args[1] == 0)
+            )
+        ):
+            # Vocabulary-parallel loaders zero their padding after copying the
+            # source shard. Padding is invariant across versions, so it is not
+            # part of the source-to-runtime delta mapping.
+            pass
         elif func._schema.is_mutable:
             if self._uses_storage((args, kwargs), self.parameter_ptr) or self._uses_storage(
                 (args, kwargs), self.source_ptr
@@ -185,7 +209,12 @@ class RuntimeDeltaPlan:
         self.direct_copies: dict[str, list[DirectCopy]] = {}
         self.unsafe_sources: set[str] = set()
         self.runtime_copies: dict[str, list[RuntimeCopy]] = {}
+        self.resolved_copies: dict[str, list[RuntimeCopy]] = {}
         self.hook_sources: set[str] = set()
+        self.quant_adapter_sources: dict[str, str] = {}
+        self.dtype_conversion_sources: set[str] = set()
+        self.unsupported_quant_sources: dict[str, str] = {}
+        self.runtime_tensor_specs: dict[str, RuntimeTensorSpec] = {}
         self.finalized = False
 
     def record(
@@ -320,21 +349,71 @@ class RuntimeDeltaPlan:
             ): segment
             for segment in segments
         }
-        quantized_parameters: set[str] = set()
+        quant_adapter_parameters: dict[str, str] = {}
+        unsupported_quant_parameters: dict[str, str] = {}
         for module_name, module in model.named_modules():
-            if getattr(module, "quant_method", None) is None:
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            get_adapter_parameters = getattr(
+                quant_method,
+                "host_runtime_delta_parameter_names",
+                None,
+            )
+            if get_adapter_parameters is None:
+                if getattr(
+                    quant_method,
+                    "host_runtime_delta_direct_safe",
+                    False,
+                ):
+                    continue
+                prefix = f"{module_name}." if module_name else ""
+                method_name = type(quant_method).__name__
+                unsupported_quant_parameters.update(
+                    {
+                        f"{prefix}{name}": method_name
+                        for name, _ in module.named_parameters(recurse=False)
+                    }
+                )
                 continue
             prefix = f"{module_name}." if module_name else ""
-            quantized_parameters.update(
-                f"{prefix}{name}"
-                for name, _ in module.named_parameters(recurse=False)
-            )
+            for local_name in get_adapter_parameters(module):
+                full_name = f"{prefix}{local_name}"
+                if full_name in quant_adapter_parameters:
+                    raise RuntimeError(
+                        f"duplicate host runtime quant adapter for {full_name!r}"
+                    )
+                quant_adapter_parameters[full_name] = module_name
         forced_patterns = tuple(
             getattr(model, "host_runtime_delta_fallback_patterns", ())
         )
 
+        from sglang.srt.weight_sync.host_runtime import iter_model_tensors
+
+        runtime_tensor_specs: dict[str, RuntimeTensorSpec] = {}
+        for name, tensor in iter_model_tensors(model):
+            if tensor.device.type != "cuda":
+                continue
+            storage = tensor.untyped_storage()
+            segment = segment_by_storage.get(
+                (tensor.device.index, storage.data_ptr(), storage.nbytes())
+            )
+            if segment is None:
+                continue
+            runtime_tensor_specs[name] = RuntimeTensorSpec(
+                image_storage_offset=segment.image_offset,
+                dtype=tensor.dtype,
+                shape=tuple(tensor.shape),
+                stride=tuple(tensor.stride()),
+                storage_offset=tensor.storage_offset(),
+            )
+
         runtime_copies: dict[str, list[RuntimeCopy]] = {}
+        resolved_copies: dict[str, list[RuntimeCopy]] = {}
         hook_sources: set[str] = set(self.unsafe_sources)
+        quant_adapter_sources: dict[str, str] = {}
+        dtype_conversion_sources: set[str] = set()
+        unsupported_quant_sources: dict[str, str] = {}
         reasons: Counter[str] = Counter()
         reason_examples: dict[str, list[dict[str, str]]] = {}
 
@@ -352,25 +431,14 @@ class RuntimeDeltaPlan:
         for source_name in sorted(self.unsafe_sources):
             reject(source_name, "initial_loader_unsupported")
         for source_name, source_copies in self.direct_copies.items():
-            if any(pattern in source_name for pattern in forced_patterns):
-                hook_sources.add(source_name)
-                reject(source_name, "model_fallback")
-                continue
             resolved: list[RuntimeCopy] = []
             for copy in source_copies:
                 parameter = parameters.get(copy.parameter_name)
                 if parameter is None:
                     reject(source_name, "missing_parameter", copy.parameter_name)
                     break
-                if copy.parameter_name in quantized_parameters:
-                    reject(source_name, "quantized_parameter", copy.parameter_name)
-                    break
                 if _parameter_signature(parameter) != copy.parameter_signature:
                     reject(source_name, "changed_layout", copy.parameter_name)
-                    break
-                source_signature = self.source_signatures[source_name]
-                if parameter.dtype != source_signature.dtype:
-                    reject(source_name, "dtype_conversion", copy.parameter_name)
                     break
                 storage = parameter.untyped_storage()
                 segment = segment_by_storage.get(
@@ -392,12 +460,72 @@ class RuntimeDeltaPlan:
                     )
                 )
             else:
+                resolved_copies[source_name] = resolved
+                if any(pattern in source_name for pattern in forced_patterns):
+                    hook_sources.add(source_name)
+                    reject(source_name, "model_fallback")
+                    continue
+                unsupported_methods = {
+                    unsupported_quant_parameters[copy.parameter_name]
+                    for copy in source_copies
+                    if copy.parameter_name in unsupported_quant_parameters
+                }
+                if unsupported_methods:
+                    hook_sources.add(source_name)
+                    unsupported_quant_sources[source_name] = ",".join(
+                        sorted(unsupported_methods)
+                    )
+                    reject(
+                        source_name,
+                        "unsupported_quant_method",
+                        source_copies[0].parameter_name,
+                    )
+                    continue
+                adapter_module = {
+                    quant_adapter_parameters[copy.parameter_name]
+                    for copy in source_copies
+                    if copy.parameter_name in quant_adapter_parameters
+                }
+                if adapter_module:
+                    if len(adapter_module) != 1:
+                        raise RuntimeError(
+                            "one checkpoint source maps to multiple host runtime "
+                            f"quant adapters: {source_name!r} -> "
+                            f"{sorted(adapter_module)}"
+                        )
+                    module_name = next(iter(adapter_module))
+                    quant_adapter_sources[source_name] = module_name
+                    hook_sources.add(source_name)
+                    reject(
+                        source_name,
+                        "quant_adapter",
+                        source_copies[0].parameter_name,
+                    )
+                    continue
+                source_signature = self.source_signatures[source_name]
+                if any(
+                    copy.parameter_signature.dtype != source_signature.dtype
+                    for copy in source_copies
+                ):
+                    hook_sources.add(source_name)
+                    dtype_conversion_sources.add(source_name)
+                    reject(
+                        source_name,
+                        "dtype_conversion",
+                        source_copies[0].parameter_name,
+                    )
+                    continue
                 runtime_copies[source_name] = resolved
                 continue
             hook_sources.add(source_name)
 
         self.runtime_copies = runtime_copies
+        self.resolved_copies = resolved_copies
         self.hook_sources = hook_sources
+        self.quant_adapter_sources = quant_adapter_sources
+        self.dtype_conversion_sources = dtype_conversion_sources
+        self.unsupported_quant_sources = unsupported_quant_sources
+        self.runtime_tensor_specs = runtime_tensor_specs
         self.finalized = True
         stats = {
             "direct_sources": len(runtime_copies),
@@ -463,14 +591,36 @@ class RuntimeDeltaPlan:
                 "runtime delta contains sources absent from initial load: "
                 f"{sorted(unknown)[:20]}"
             )
-        needed_hooks = changed_names - self.runtime_copies.keys()
-        hook = getattr(model, "apply_host_runtime_delta", None)
-        if needed_hooks and hook is None:
+        unsupported_quant = changed_names & self.unsupported_quant_sources.keys()
+        if unsupported_quant:
+            examples = [
+                (name, self.unsupported_quant_sources[name])
+                for name in sorted(unsupported_quant)[:20]
+            ]
             raise RuntimeDeltaCoverageError(
-                "runtime delta needs explicit model/quantization coverage "
-                f"for {len(needed_hooks)} sources; examples="
-                f"{sorted(needed_hooks)[:20]}"
+                "runtime delta reaches quantization methods without an explicit "
+                f"host adapter; examples={examples}"
             )
+        needed_model_hooks = (
+            changed_names
+            - self.runtime_copies.keys()
+            - self.quant_adapter_sources.keys()
+            - self.dtype_conversion_sources
+        )
+        model_hook = getattr(model, "apply_host_runtime_delta", None)
+        if needed_model_hooks and model_hook is None:
+            raise RuntimeDeltaCoverageError(
+                "runtime delta needs explicit model coverage "
+                f"for {len(needed_model_hooks)} sources; examples="
+                f"{sorted(needed_model_hooks)[:20]}"
+            )
+        validate_model_hook = getattr(
+            model,
+            "validate_host_runtime_delta_sources",
+            None,
+        )
+        if needed_model_hooks and validate_model_hook is not None:
+            validate_model_hook(needed_model_hooks)
 
         for _, version_dir in versions:
             _, payloads = _read_delta_payloads(version_dir)
@@ -500,18 +650,67 @@ class RuntimeDeltaPlan:
                     if previous is None:
                         hook_payloads[name] = raw
                     else:
-                        hook_payloads[name] = bytes(
-                            left ^ right for left, right in zip(previous, raw)
+                        accumulated = torch.frombuffer(
+                            bytearray(previous), dtype=torch.uint8
                         )
+                        accumulated.bitwise_xor_(
+                            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+                        )
+                        hook_payloads[name] = bytes(accumulated.numpy())
 
         if hook_payloads:
-            handled = set(
-                hook(
-                    host_image=host_image,
-                    source_deltas=hook_payloads,
-                    source_signatures=self.source_signatures,
-                )
+            context = RuntimeDeltaUpdateContext(
+                plan=self,
+                host_image=host_image,
+                source_deltas=hook_payloads,
             )
+            handled: set[str] = set()
+            modules = dict(model.named_modules())
+            adapter_groups: dict[str, set[str]] = {}
+            for name in hook_payloads:
+                module_name = self.quant_adapter_sources.get(name)
+                if module_name is not None:
+                    adapter_groups.setdefault(module_name, set()).add(name)
+            for module_name, names in adapter_groups.items():
+                module = modules[module_name]
+                quant_method = getattr(module, "quant_method", None)
+                apply_adapter = getattr(
+                    quant_method,
+                    "apply_host_runtime_delta",
+                    None,
+                )
+                if apply_adapter is None:
+                    raise RuntimeDeltaCoverageError(
+                        "quantization method declared host runtime sources but "
+                        "does not implement apply_host_runtime_delta: "
+                        f"module={module_name!r} "
+                        f"method={type(quant_method).__name__}"
+                    )
+                handled.update(
+                    apply_adapter(
+                        layer=module,
+                        module_name=module_name,
+                        context=context,
+                        source_names=names,
+                    )
+                )
+
+            for name in set(hook_payloads) & self.dtype_conversion_sources:
+                context.apply_dtype_conversion(name)
+                handled.add(name)
+
+            model_names = (
+                set(hook_payloads)
+                - self.quant_adapter_sources.keys()
+                - self.dtype_conversion_sources
+            )
+            if model_names:
+                handled.update(
+                    model_hook(
+                        context=context,
+                        source_names=model_names,
+                    )
+                )
             missing = set(hook_payloads) - handled
             extra = handled - set(hook_payloads)
             if missing or extra:
@@ -534,6 +733,8 @@ class RuntimeDeltaPlan:
         host_image: torch.Tensor,
         source_name: str,
         raw_delta: bytes,
+        *,
+        copies: Optional[list[RuntimeCopy]] = None,
     ) -> None:
         signature = self.source_signatures[source_name]
         source_bytes = torch.frombuffer(bytearray(raw_delta), dtype=torch.uint8)
@@ -543,7 +744,7 @@ class RuntimeDeltaPlan:
             signature.shape,
             signature.stride,
         )
-        for copy in self.runtime_copies[source_name]:
+        for copy in self.runtime_copies[source_name] if copies is None else copies:
             element_size = torch.empty((), dtype=copy.dtype).element_size()
             destination_element_offset = (
                 copy.image_storage_offset // element_size
@@ -563,6 +764,111 @@ class RuntimeDeltaPlan:
             destination.view(torch.uint8).bitwise_xor_(
                 source_view.contiguous().view(torch.uint8)
             )
+
+
+class RuntimeDeltaUpdateContext:
+    """Bounded access to one delta batch and the pinned final-layout image."""
+
+    def __init__(
+        self,
+        *,
+        plan: RuntimeDeltaPlan,
+        host_image: torch.Tensor,
+        source_deltas: dict[str, bytes],
+    ) -> None:
+        self.plan = plan
+        self.host_image = host_image
+        self.source_deltas = source_deltas
+
+    def source_tensor(self, source_name: str) -> torch.Tensor:
+        signature = self.plan.source_signatures[source_name]
+        source_bytes = torch.frombuffer(
+            bytearray(self.source_deltas[source_name]),
+            dtype=torch.uint8,
+        )
+        return torch.empty(0, dtype=signature.dtype).set_(
+            source_bytes.untyped_storage(),
+            signature.storage_offset,
+            signature.shape,
+            signature.stride,
+        )
+
+    def source_view(
+        self,
+        source_name: str,
+        view: TensorViewSpec,
+    ) -> torch.Tensor:
+        return self.source_tensor(source_name).as_strided(
+            view.shape,
+            view.stride,
+            view.storage_offset,
+        )
+
+    def host_tensor(self, tensor_name: str) -> torch.Tensor:
+        try:
+            spec = self.plan.runtime_tensor_specs[tensor_name]
+        except KeyError as exc:
+            raise RuntimeDeltaCoverageError(
+                f"runtime tensor {tensor_name!r} is not mirrored in the host image"
+            ) from exc
+        element_size = torch.empty((), dtype=spec.dtype).element_size()
+        return torch.empty(0, dtype=spec.dtype).set_(
+            self.host_image.untyped_storage(),
+            spec.image_storage_offset // element_size + spec.storage_offset,
+            spec.shape,
+            spec.stride,
+        )
+
+    def direct_copies(self, source_name: str) -> list[DirectCopy]:
+        return self.plan.direct_copies[source_name]
+
+    def xor_direct(self, source_name: str) -> None:
+        try:
+            copies = self.plan.resolved_copies[source_name]
+        except KeyError as exc:
+            raise RuntimeDeltaCoverageError(
+                f"{source_name!r} has no safe direct runtime destination"
+            ) from exc
+        self.plan._apply_direct_xor(
+            self.host_image,
+            source_name,
+            self.source_deltas[source_name],
+            copies=copies,
+        )
+
+    def apply_dtype_conversion(self, source_name: str) -> None:
+        """Apply a direct loader copy whose only transform is dtype conversion."""
+
+        source = self.source_tensor(source_name)
+        source_signature = self.plan.source_signatures[source_name]
+        for direct, runtime in zip(
+            self.plan.direct_copies[source_name],
+            self.plan.resolved_copies[source_name],
+        ):
+            element_size = torch.empty((), dtype=runtime.dtype).element_size()
+            destination = torch.empty(0, dtype=runtime.dtype).set_(
+                self.host_image.untyped_storage(),
+                runtime.image_storage_offset // element_size
+                + runtime.destination_view.storage_offset,
+                runtime.destination_view.shape,
+                runtime.destination_view.stride,
+            )
+            source_delta = source.as_strided(
+                direct.source_view.shape,
+                direct.source_view.stride,
+                direct.source_view.storage_offset,
+            )
+            if destination.shape != source_delta.shape:
+                raise RuntimeDeltaCoverageError(
+                    "dtype-converting runtime copy changed shape: "
+                    f"{source_name!r} source={tuple(source_delta.shape)} "
+                    f"destination={tuple(destination.shape)}"
+                )
+            reconstructed = destination.to(source_signature.dtype).contiguous()
+            reconstructed.view(torch.uint8).bitwise_xor_(
+                source_delta.contiguous().view(torch.uint8)
+            )
+            destination.copy_(reconstructed)
 
 
 def _safetensors_size(blob: bytes) -> Optional[int]:

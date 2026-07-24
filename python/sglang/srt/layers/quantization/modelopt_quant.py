@@ -1885,6 +1885,135 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _shuffle_trtllm_epilogue_rows(
+    tensor: torch.Tensor,
+    *,
+    gated_w13: bool,
+) -> torch.Tensor:
+    """CPU equivalent of gated-row reorder + shuffle_matrix_a(tile_m=128)."""
+
+    if tensor.ndim != 2 or tensor.shape[0] % 32:
+        raise ValueError(
+            "TRT-LLM NVFP4 row shuffle requires a 2D row count divisible by "
+            f"32, got {tuple(tensor.shape)}"
+        )
+    rows, columns = tensor.shape
+    if gated_w13:
+        if rows % 2:
+            raise ValueError(f"gated W13 row count must be even, got {rows}")
+        tensor = (
+            tensor.reshape(2, rows // 2, columns)
+            .transpose(0, 1)
+            .reshape(rows, columns)
+        )
+    # FlashInfer's srcToDstBlk32RowMap maps old rows to new rows as
+    # [0,8,16,24,1,9,...]. The inverse gather is this 8x4 transpose.
+    return (
+        tensor.reshape(-1, 8, 4, columns)
+        .transpose(1, 2)
+        .contiguous()
+        .reshape(rows, columns)
+    )
+
+
+def _interleave_trtllm_nvfp4_scales(tensor: torch.Tensor) -> torch.Tensor:
+    """CPU equivalent of FlashInfer block_scale_interleave (128x4 layout)."""
+
+    rows, columns = tensor.shape
+    padded_rows = round_up(rows, 128)
+    padded_columns = round_up(columns, 4)
+    if padded_rows != rows or padded_columns != columns:
+        padded = torch.zeros(
+            (padded_rows, padded_columns),
+            dtype=tensor.dtype,
+        )
+        padded[:rows, :columns].copy_(tensor)
+        tensor = padded
+    return (
+        tensor.reshape(padded_rows // 128, 4, 32, padded_columns // 4, 4)
+        .transpose(1, 3)
+        .contiguous()
+        .reshape(padded_rows, padded_columns)
+    )
+
+
+def _apply_trtllm_nvfp4_moe_source_xor(
+    *,
+    context,
+    source_name: str,
+    copy,
+    local_name: str,
+    is_gated: bool,
+) -> None:
+    """Map one checkpoint source XOR into one expert's final runtime layout."""
+
+    from sglang.srt.weight_sync.runtime_delta import RuntimeDeltaCoverageError
+
+    parameter_shape = copy.parameter_signature.shape
+    parameter_stride = copy.parameter_signature.stride
+    if (
+        len(parameter_shape) != 3
+        or parameter_stride[-1] != 1
+        or parameter_stride[0] != parameter_shape[1] * parameter_shape[2]
+        or parameter_stride[1] != parameter_shape[2]
+    ):
+        raise RuntimeDeltaCoverageError(
+            "NVFP4 fused-MoE runtime adapter requires contiguous [E,M,K] "
+            f"parameters, got {copy.parameter_name!r} "
+            f"shape={parameter_shape} stride={parameter_stride}"
+        )
+
+    expert_elements = parameter_stride[0]
+    local_offset = (
+        copy.destination_view.storage_offset
+        - copy.parameter_signature.storage_offset
+    )
+    expert_id, expert_offset = divmod(local_offset, expert_elements)
+    if not 0 <= expert_id < parameter_shape[0]:
+        raise RuntimeDeltaCoverageError(
+            f"NVFP4 expert offset is out of range for {source_name!r}: "
+            f"expert={expert_id} shape={parameter_shape}"
+        )
+
+    raw_expert = torch.zeros(
+        parameter_shape[1:],
+        dtype=copy.parameter_signature.dtype,
+    )
+    destination = torch.empty(0, dtype=copy.parameter_signature.dtype).set_(
+        raw_expert.untyped_storage(),
+        expert_offset,
+        copy.destination_view.shape,
+        copy.destination_view.stride,
+    )
+    source_delta = context.source_view(source_name, copy.source_view).contiguous()
+    if destination.shape != source_delta.shape or not destination.is_contiguous():
+        raise RuntimeDeltaCoverageError(
+            "NVFP4 source loader view is not a contiguous expert slice: "
+            f"{source_name!r} source={tuple(source_delta.shape)} "
+            f"destination={tuple(destination.shape)} "
+            f"stride={tuple(destination.stride())}"
+        )
+    destination.view(torch.uint8).copy_(source_delta.view(torch.uint8))
+
+    is_w13 = local_name.startswith("w13_")
+    transformed = _shuffle_trtllm_epilogue_rows(
+        raw_expert.view(torch.uint8),
+        gated_w13=is_w13 and is_gated,
+    )
+    if local_name.endswith("_weight_scale"):
+        transformed = _interleave_trtllm_nvfp4_scales(transformed)
+
+    target = context.host_tensor(copy.parameter_name)
+    target_expert = target[expert_id]
+    if target_expert.shape != transformed.shape:
+        raise RuntimeDeltaCoverageError(
+            "NVFP4 transformed delta shape does not match final runtime layout: "
+            f"{source_name!r} transformed={tuple(transformed.shape)} "
+            f"runtime={tuple(target_expert.shape)}"
+        )
+    target_expert.view(torch.uint8).bitwise_xor_(transformed)
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -1911,6 +2040,158 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
+
+    @staticmethod
+    def host_runtime_delta_parameter_names(layer: torch.nn.Module) -> tuple[str, ...]:
+        """Checkpoint inputs whose runtime values are derived or permuted."""
+
+        names = (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        )
+        return tuple(name for name in names if hasattr(layer, name))
+
+    def apply_host_runtime_delta(
+        self,
+        *,
+        layer: torch.nn.Module,
+        module_name: str,
+        context,
+        source_names: set[str],
+    ) -> set[str]:
+        """Apply serialized NVFP4 deltas to the final TRT-LLM host layout.
+
+        Packed weights and block scales undergo only fixed byte permutations,
+        so the same permutations can be applied directly to XOR bytes. Small
+        raw scale parameters are updated in place and their derived runtime
+        scalars are then recomputed on CPU.
+        """
+
+        from sglang.srt.weight_sync.runtime_delta import (
+            RuntimeDeltaCoverageError,
+        )
+
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if not moe_runner_backend.is_flashinfer_trtllm():
+            raise RuntimeDeltaCoverageError(
+                "ModelOpt NVFP4 host runtime updates currently require the "
+                "flashinfer_trtllm MoE layout; "
+                f"module={module_name!r} backend={moe_runner_backend}"
+            )
+
+        transformed = {
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        }
+        derived_inputs = {
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        }
+        handled: set[str] = set()
+        recompute_derived = False
+        for source_name in sorted(source_names):
+            copies = context.direct_copies(source_name)
+            local_names = {
+                copy.parameter_name.rsplit(".", 1)[-1] for copy in copies
+            }
+            if len(local_names) != 1:
+                raise RuntimeDeltaCoverageError(
+                    "one NVFP4 checkpoint tensor must map to one fused-MoE "
+                    f"parameter: {source_name!r} -> {sorted(local_names)}"
+                )
+            local_name = next(iter(local_names))
+            if local_name in derived_inputs:
+                context.xor_direct(source_name)
+                recompute_derived = True
+            elif local_name in transformed:
+                for copy in copies:
+                    _apply_trtllm_nvfp4_moe_source_xor(
+                        context=context,
+                        source_name=source_name,
+                        copy=copy,
+                        local_name=local_name,
+                        is_gated=layer.moe_runner_config.is_gated,
+                    )
+            else:
+                raise RuntimeDeltaCoverageError(
+                    f"unsupported ModelOpt NVFP4 runtime input {local_name!r} "
+                    f"for source {source_name!r}"
+                )
+            handled.add(source_name)
+
+        if recompute_derived:
+            self._recompute_host_runtime_derived_scales(
+                layer=layer,
+                module_name=module_name,
+                context=context,
+            )
+        return handled
+
+    def _recompute_host_runtime_derived_scales(
+        self,
+        *,
+        layer: torch.nn.Module,
+        module_name: str,
+        context,
+    ) -> None:
+        def host(local_name: str) -> torch.Tensor:
+            return context.host_tensor(f"{module_name}.{local_name}")
+
+        def update(local_name: str, value: torch.Tensor) -> None:
+            full_name = f"{module_name}.{local_name}"
+            if full_name in context.plan.runtime_tensor_specs:
+                host(local_name).copy_(value)
+
+        w13_input_scale = host("w13_input_scale").max().to(torch.float32)
+        w2_input_scale = host("w2_input_scale").max().to(torch.float32)
+        if self.quant_config.use_per_token_activation:
+            w13_input_scale = torch.ones_like(w13_input_scale)
+            w2_input_scale = torch.ones_like(w2_input_scale)
+
+        w13_weight_scale_2 = host("w13_weight_scale_2")
+        if layer.moe_runner_config.is_gated and w13_weight_scale_2.dim() > 1:
+            gate_scale = w13_weight_scale_2[:, 0]
+            up_scale = w13_weight_scale_2[:, 1]
+        else:
+            gate_scale = w13_weight_scale_2.reshape(-1)
+            up_scale = gate_scale
+
+        g1_alphas = (w13_input_scale * gate_scale).to(torch.float32)
+        g1_alphas_up = (w13_input_scale * up_scale).to(torch.float32)
+        g2_alphas = (
+            w2_input_scale * host("w2_weight_scale_2")
+        ).to(torch.float32)
+        w13_input_scale_quant = (1 / w13_input_scale).to(torch.float32)
+        w2_input_scale_quant = (1 / w2_input_scale).to(torch.float32)
+
+        update("g1_alphas", g1_alphas)
+        update("g1_alphas_up", g1_alphas_up)
+        update("g2_alphas", g2_alphas)
+        update("w13_input_scale_quant", w13_input_scale_quant)
+        update("w2_input_scale_quant", w2_input_scale_quant)
+        update(
+            "g1_scale_c",
+            (w2_input_scale_quant * g1_alphas_up).to(torch.float32),
+        )
+
+        swiglu_limit = layer.moe_runner_config.swiglu_limit
+        if swiglu_limit is not None and layer.moe_runner_config.is_gated:
+            update(
+                "gemm1_clamp_limit",
+                (swiglu_limit / g1_alphas).to(torch.float32),
+            )
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:

@@ -4,8 +4,6 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
-logger = logging.getLogger(__name__)
-
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -49,6 +47,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.server_args import ServerArgs
 
+
+logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -112,6 +112,8 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+    host_runtime_delta_direct_safe = True
+
     """Unquantized method for embeddings."""
 
     def create_weights(
@@ -151,6 +153,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
+
+    host_runtime_delta_direct_safe = True
 
     def create_weights(
         self,

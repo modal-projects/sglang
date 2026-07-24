@@ -800,6 +800,110 @@ class RuntimeDeltaPlan:
                 )
             return name, signature, delta, decode_cpu_s
 
+        decoded_batches = 0
+
+        def apply_decoded(decoded) -> None:
+            nonlocal changed_sources
+            nonlocal decoded_batches
+            nonlocal decoded_bytes
+            nonlocal decompress_cpu_s
+            nonlocal logical_bytes
+            nonlocal max_raw_bytes
+            nonlocal sparse_sources
+
+            decoded_batches += 1
+            source_deltas = {}
+            for name, signature, delta, item_decode_cpu_s in decoded:
+                decompress_cpu_s += item_decode_cpu_s
+                if isinstance(delta, SparseXorDelta):
+                    sparse_sources += 1
+                changed_sources += 1
+                logical_bytes += signature.storage_nbytes
+                decoded_nbytes = (
+                    len(delta) if isinstance(delta, bytes) else delta.encoded_nbytes
+                )
+                decoded_bytes += decoded_nbytes
+                max_raw_bytes = max(max_raw_bytes, decoded_nbytes)
+                source_deltas[name] = delta
+
+            context = RuntimeDeltaUpdateContext(
+                plan=self,
+                host_image=host_image,
+                source_deltas=source_deltas,
+            )
+            direct_names = source_deltas.keys() & self.runtime_copies.keys()
+            stage_started = time.perf_counter()
+            for name in sorted(direct_names):
+                self._apply_direct_xor(host_image, name, source_deltas[name])
+            stage_wall_s["direct"] += time.perf_counter() - stage_started
+
+            batch_quant_sources: dict[str, set[str]] = {}
+            for name in source_deltas.keys() & self.quant_adapter_sources.keys():
+                batch_quant_sources.setdefault(
+                    self.quant_adapter_sources[name],
+                    set(),
+                ).add(name)
+            stage_started = time.perf_counter()
+            for module_name, names in batch_quant_sources.items():
+                module = modules[module_name]
+                quant_method = getattr(module, "quant_method", None)
+                apply_adapter = getattr(
+                    quant_method,
+                    "apply_host_runtime_delta",
+                    None,
+                )
+                if apply_adapter is None:
+                    raise RuntimeDeltaCoverageError(
+                        "quantization method declared host runtime sources but "
+                        "does not implement apply_host_runtime_delta: "
+                        f"module={module_name!r} "
+                        f"method={type(quant_method).__name__}"
+                    )
+                handled = set(
+                    apply_adapter(
+                        layer=module,
+                        module_name=module_name,
+                        context=context,
+                        source_names=names,
+                    )
+                )
+                if handled != names:
+                    raise RuntimeError(
+                        "runtime delta quant adapter coverage mismatch: "
+                        f"module={module_name!r} "
+                        f"missing={sorted(names - handled)[:20]} "
+                        f"extra={sorted(handled - names)[:20]}"
+                    )
+            stage_wall_s["quant_adapter"] += time.perf_counter() - stage_started
+
+            dtype_names = source_deltas.keys() & self.dtype_conversion_sources
+            stage_started = time.perf_counter()
+            for name in sorted(dtype_names):
+                context.apply_dtype_conversion(name)
+            stage_wall_s["dtype_conversion"] += time.perf_counter() - stage_started
+
+            model_names = (
+                source_deltas.keys()
+                - direct_names
+                - self.quant_adapter_sources.keys()
+                - self.dtype_conversion_sources
+            )
+            if model_names:
+                stage_started = time.perf_counter()
+                handled = set(
+                    model_hook(
+                        context=context,
+                        source_names=model_names,
+                    )
+                )
+                if handled != model_names:
+                    raise RuntimeError(
+                        "runtime delta model hook coverage mismatch: "
+                        f"missing={sorted(model_names - handled)[:20]} "
+                        f"extra={sorted(handled - model_names)[:20]}"
+                    )
+                stage_wall_s["model_hook"] += time.perf_counter() - stage_started
+
         with ThreadPoolExecutor(max_workers=decode_workers) as decode_pool:
             for _, version_dir, encoding, index in versions:
                 for payloads, shard_bytes, read_wall_s in _iter_delta_payload_shards(
@@ -828,89 +932,7 @@ class RuntimeDeltaPlan:
                         stage_wall_s["decompress"] += (
                             time.perf_counter() - stage_started
                         )
-                        for name, signature, delta, item_decode_cpu_s in decoded:
-                            decompress_cpu_s += item_decode_cpu_s
-                            if isinstance(delta, SparseXorDelta):
-                                sparse_sources += 1
-                            changed_sources += 1
-                            logical_bytes += signature.storage_nbytes
-                            decoded_nbytes = (
-                                len(delta)
-                                if isinstance(delta, bytes)
-                                else delta.encoded_nbytes
-                            )
-                            decoded_bytes += decoded_nbytes
-                            max_raw_bytes = max(max_raw_bytes, decoded_nbytes)
-                            stage_started = time.perf_counter()
-                            if name in self.runtime_copies:
-                                self._apply_direct_xor(host_image, name, delta)
-                                stage_wall_s["direct"] += (
-                                    time.perf_counter() - stage_started
-                                )
-                                continue
-
-                            context = RuntimeDeltaUpdateContext(
-                                plan=self,
-                                host_image=host_image,
-                                source_deltas={name: delta},
-                            )
-                            module_name = self.quant_adapter_sources.get(name)
-                            if module_name is not None:
-                                module = modules[module_name]
-                                quant_method = getattr(module, "quant_method", None)
-                                apply_adapter = getattr(
-                                    quant_method,
-                                    "apply_host_runtime_delta",
-                                    None,
-                                )
-                                if apply_adapter is None:
-                                    raise RuntimeDeltaCoverageError(
-                                        "quantization method declared host runtime "
-                                        "sources but does not implement "
-                                        "apply_host_runtime_delta: "
-                                        f"module={module_name!r} "
-                                        f"method={type(quant_method).__name__}"
-                                    )
-                                handled = set(
-                                    apply_adapter(
-                                        layer=module,
-                                        module_name=module_name,
-                                        context=context,
-                                        source_names={name},
-                                    )
-                                )
-                                if handled != {name}:
-                                    raise RuntimeError(
-                                        "runtime delta quant adapter coverage "
-                                        f"mismatch: source={name!r} "
-                                        f"handled={sorted(handled)}"
-                                    )
-                                stage_wall_s["quant_adapter"] += (
-                                    time.perf_counter() - stage_started
-                                )
-                                continue
-
-                            if name in self.dtype_conversion_sources:
-                                context.apply_dtype_conversion(name)
-                                stage_wall_s["dtype_conversion"] += (
-                                    time.perf_counter() - stage_started
-                                )
-                                continue
-
-                            handled = set(
-                                model_hook(
-                                    context=context,
-                                    source_names={name},
-                                )
-                            )
-                            if handled != {name}:
-                                raise RuntimeError(
-                                    "runtime delta model hook coverage mismatch: "
-                                    f"source={name!r} handled={sorted(handled)}"
-                                )
-                            stage_wall_s["model_hook"] += (
-                                time.perf_counter() - stage_started
-                            )
+                        apply_decoded(decoded)
                         del decoded
                     del payloads
 
@@ -971,6 +993,7 @@ class RuntimeDeltaPlan:
             "decoded_bytes": decoded_bytes,
             "sparse_sources": sparse_sources,
             "hook_sources": len(changed_names - self.runtime_copies.keys()),
+            "decoded_batches": decoded_batches,
             "decode_workers": decode_workers,
             "decode_inflight_bytes": decode_inflight_bytes,
             "decompress_cpu_s": round(decompress_cpu_s, 6),

@@ -22,8 +22,9 @@ extra calls no-ops.
 A failed mutation invalidates the local checkpoint and fails loudly. Recovery
 is an explicit controller/operator action: deleting or reseeding a 600 GB
 checkpoint is too consequential to hide behind an automatic retry. The delta's
-dirty pages are msync'd before the applied-version marker is written, so a
-successful marker can never become durable over bytes that did not reach disk.
+dirty pages are msync'd before a durable disk-mode marker is written. Runtime
+preparation instead uses a run-scoped marker which cannot be reused by a later
+engine process, so verified weights need not wait for synchronous persistence.
 """
 
 from __future__ import annotations
@@ -142,7 +143,7 @@ def pull(
             raise
         except Exception as exc:
             # Once a complete delta begins applying, an unexpected failure can
-            # leave only part of it durable. Fail closed rather than guessing
+            # leave only part of it mutated. Fail closed rather than guessing
             # whether a retry should XOR, undo, or reseed those bytes.
             _mark_checkpoint_invalid(
                 local_checkpoint_dir,

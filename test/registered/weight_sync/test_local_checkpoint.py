@@ -95,8 +95,8 @@ class Publisher:
         checksums = {}
         for name, new in changed.items():
             old = self.state[name]
-            diff = (
-                np.frombuffer(new, dtype=np.uint8) ^ np.frombuffer(old, dtype=np.uint8)
+            diff = np.frombuffer(new, dtype=np.uint8) ^ np.frombuffer(
+                old, dtype=np.uint8
             )
             if encoding == "xor":
                 encoded = diff.tobytes()
@@ -206,6 +206,41 @@ class PullTest(unittest.TestCase):
         self.assert_at_version(1)
         self.pull(2)
         self.assert_at_version(2)
+
+    def test_process_lifetime_checkpoint_rejects_another_engine_run(self):
+        previous_run_id = os.environ.get("SGLANG_RUN_ID")
+        try:
+            os.environ["SGLANG_RUN_ID"] = "run-a"
+            local_checkpoint.pull(
+                self.local,
+                self.pub.base_dir,
+                self.pub.source_dir,
+                1,
+                durable=False,
+            )
+            self.assertEqual(
+                local_checkpoint._read_applied_version(self.local),
+                1,
+            )
+            with open(
+                os.path.join(
+                    self.local,
+                    local_checkpoint.SYNC_DIR,
+                    "state.json",
+                )
+            ) as file:
+                state = json.load(file)
+            self.assertEqual(state["durability"], "process")
+            self.assertEqual(state["run_id"], "run-a")
+
+            os.environ["SGLANG_RUN_ID"] = "run-b"
+            with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+                local_checkpoint._read_applied_version(self.local)
+        finally:
+            if previous_run_id is None:
+                os.environ.pop("SGLANG_RUN_ID", None)
+            else:
+                os.environ["SGLANG_RUN_ID"] = previous_run_id
 
     def test_sparse_xor_updates_and_verifies_canonical_checkpoint(self):
         new = bytearray(self.pub.state["layer.a"])
@@ -348,7 +383,12 @@ class PullTest(unittest.TestCase):
         self.pull(2)
         self.assert_at_version(2)
         self.pub.publish_delta(
-            3, {"layer.a": np.random.default_rng(3).integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+            3,
+            {
+                "layer.a": np.random.default_rng(3)
+                .integers(0, 256, 4096, dtype=np.uint8)
+                .tobytes()
+            },
         )
         shard = os.path.join(self.pub.source_dir, "weight_v000003", Publisher.SHARD)
         with open(shard, "rb") as f:
@@ -368,7 +408,9 @@ class PullTest(unittest.TestCase):
                 self.pull(3)
         finally:
             local_checkpoint._reset_checkpoint = orig_reset
-        self.assertEqual(reset_calls, [], "must not reseed on an incomplete source version")
+        self.assertEqual(
+            reset_calls, [], "must not reseed on an incomplete source version"
+        )
         self.assert_at_version(2)  # local untouched by the failed pull
 
         with open(shard, "wb") as f:
@@ -385,7 +427,12 @@ class PullTest(unittest.TestCase):
         self.pull(2)
         self.assert_at_version(2)
         self.pub.publish_delta(
-            3, {"layer.a": np.random.default_rng(5).integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+            3,
+            {
+                "layer.a": np.random.default_rng(5)
+                .integers(0, 256, 4096, dtype=np.uint8)
+                .tobytes()
+            },
         )
         shard = os.path.join(self.pub.source_dir, "weight_v000003", Publisher.SHARD)
         with open(shard, "rb") as f:
@@ -406,7 +453,9 @@ class PullTest(unittest.TestCase):
                 self.pull(3)
         finally:
             local_checkpoint._reset_checkpoint = orig_reset
-        self.assertEqual(reset_calls, [], "must not reseed on a truncated (not-ready) blob")
+        self.assertEqual(
+            reset_calls, [], "must not reseed on a truncated (not-ready) blob"
+        )
         self.assert_at_version(2)
 
         with open(shard, "wb") as f:
@@ -457,6 +506,7 @@ class PullTest(unittest.TestCase):
             self.pull(0)
         self.assert_at_version(0)
         self.assertEqual((seeds, applies), ([self.pub.base_dir], []))
+
 
 if __name__ == "__main__":
     unittest.main()

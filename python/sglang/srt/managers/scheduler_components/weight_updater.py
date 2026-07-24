@@ -129,9 +129,7 @@ class SchedulerWeightUpdaterManager:
                 success=success, message=message, num_paused_requests=0
             )
 
-    def update_weights_from_prepared(
-        self, recv_req: UpdateWeightsFromPreparedReqInput
-    ):
+    def update_weights_from_prepared(self, recv_req: UpdateWeightsFromPreparedReqInput):
         """Commit a complete host-prepared runtime image."""
 
         with self._observe_weight_load("prepared"):
@@ -142,9 +140,7 @@ class SchedulerWeightUpdaterManager:
                     "draft models."
                 )
             else:
-                success, message = self.tp_worker.update_weights_from_prepared(
-                    recv_req
-                )
+                success, message = self.tp_worker.update_weights_from_prepared(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
             else:
@@ -177,6 +173,7 @@ class SchedulerWeightUpdaterManager:
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
                 pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+                durable=recv_req.prepare == "checkpoint",
             )
             if recv_req.prepare == "runtime":
                 if recv_req.target_version == 0:
@@ -272,9 +269,9 @@ class SchedulerWeightUpdaterManager:
         return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+        assert self.is_fully_idle(), (
+            "release_memory_occupation should be called only when server is idle."
+        )
 
         tags = recv_req.tags
 
@@ -394,9 +391,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
+            assert draft_url is not None, (
+                "draft_url must be provided when draft model is enabled"
+            )
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):

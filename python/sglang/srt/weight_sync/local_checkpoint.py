@@ -79,6 +79,7 @@ def pull(
     source_dir: str,
     target_version: int,
     pre_read_hook: Optional[str] = None,
+    durable: bool = True,
 ) -> None:
     """Bring the host-local checkpoint up to ``target_version``.
 
@@ -103,6 +104,12 @@ def pull(
         caller reloads + retries.
       * A checksum mismatch on staged, complete bytes invalidates the local
         checkpoint and fails loudly. It never triggers an automatic reseed.
+
+    ``durable=True`` synchronously persists changed checkpoint pages before the
+    version marker and is required before a disk reload. ``durable=False`` is
+    the host-runtime path: the checkpoint is run-scoped verification/lineage
+    scratch, so it skips synchronous data persistence and its marker is rejected
+    by a later engine run.
     """
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)
@@ -122,6 +129,7 @@ def pull(
                 base_dir,
                 source_dir,
                 target_version,
+                durable=durable,
             )
         except FileNotFoundError:
             # A source version is missing or not fully materialized — a readiness
@@ -148,6 +156,8 @@ def _pull_locked(
     base_dir: str,
     source_dir: str,
     target_version: int,
+    *,
+    durable: bool,
 ) -> None:
     applied = _read_applied_version(local_checkpoint_dir)
     # Scan back from the target for the newest full version. Stop at the
@@ -159,17 +169,32 @@ def _pull_locked(
         start -= 1
     if applied is None or start > applied:
         seed_dir = base_dir if start == 0 else _version_dir(source_dir, start)
-        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+        _reset_checkpoint(
+            seed_dir,
+            local_checkpoint_dir,
+            start,
+            durable=durable,
+        )
     else:
         start = applied
     remaining = target_version - start
     if remaining > 1:
         # Catch-up: fold d(start+1)..target in one pass per tensor (buffered read + in-RAM XOR + one
         # write) instead of N mmap read-modify-writes, each faulting the whole tensor in.
-        _apply_range(local_checkpoint_dir, source_dir, start + 1, target_version)
+        _apply_range(
+            local_checkpoint_dir,
+            source_dir,
+            start + 1,
+            target_version,
+            durable=durable,
+        )
     elif remaining == 1:
         # Steady state: the mmap apply writes only the delta's dirty pages (O(delta)).
-        _apply_delta(local_checkpoint_dir, _version_dir(source_dir, start + 1))
+        _apply_delta(
+            local_checkpoint_dir,
+            _version_dir(source_dir, start + 1),
+            durable=durable,
+        )
 
 
 def _load_hook(path: str):
@@ -292,16 +317,37 @@ def _read_applied_version(local_checkpoint_dir: str) -> Optional[int]:
             "local checkpoint is marked invalid and must be explicitly reseeded: "
             f"{state.get('reason', 'unknown reason')}"
         )
+    if state.get("durability") == "process":
+        expected_run_id = state.get("run_id")
+        actual_run_id = os.environ.get("SGLANG_RUN_ID")
+        if not actual_run_id or actual_run_id != expected_run_id:
+            raise InvalidLocalCheckpointError(
+                "process-lifetime local checkpoint belongs to another engine run "
+                f"(checkpoint={expected_run_id!r}, current={actual_run_id!r}) "
+                "and must be explicitly reseeded"
+            )
     return int(state["version"])
 
 
-def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
+def _write_applied_version(
+    local_checkpoint_dir: str,
+    version: int,
+    *,
+    durable: bool,
+) -> None:
+    state = {
+        "version": f"{version:06d}",
+        "valid": True,
+        "durability": "durable" if durable else "process",
+    }
+    if not durable:
+        run_id = os.environ.get("SGLANG_RUN_ID")
+        if not run_id:
+            raise RuntimeError("process-lifetime checkpoint requires SGLANG_RUN_ID")
+        state["run_id"] = run_id
     _write_checkpoint_state(
         local_checkpoint_dir,
-        {
-            "version": f"{version:06d}",
-            "valid": True,
-        },
+        state,
     )
 
 
@@ -346,11 +392,21 @@ def _drop_page_cache(path: str) -> None:
         pass
 
 
-def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
+def _reset_checkpoint(
+    src_dir: str,
+    local_checkpoint_dir: str,
+    version: int,
+    *,
+    durable: bool,
+) -> None:
     """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
     (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
     are pruned). Later deltas chain on top of this state."""
     os.makedirs(local_checkpoint_dir, exist_ok=True)
+    _mark_checkpoint_invalid(
+        local_checkpoint_dir,
+        f"checkpoint reseed to v{version} is in progress",
+    )
     src_files = [entry for entry in os.scandir(src_dir) if entry.is_file()]
     total_gb = sum(entry.stat().st_size for entry in src_files) / 1e9
     workers = min(_SEED_COPY_WORKERS, len(src_files) or 1)
@@ -409,7 +465,11 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
             raise RuntimeError(
                 f"size mismatch copying {entry.name}: src {entry.stat().st_size} != local {copied}"
             )
-    _write_applied_version(local_checkpoint_dir, version)
+    _write_applied_version(
+        local_checkpoint_dir,
+        version,
+        durable=durable,
+    )
 
 
 def _tensor_locations(ckpt_dir: str) -> dict:
@@ -449,7 +509,12 @@ def _safetensors_size(blob: bytes) -> Optional[int]:
     return 8 + header_len + end
 
 
-def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
+def _apply_delta(
+    local_checkpoint_dir: str,
+    version_dir: str,
+    *,
+    durable: bool = True,
+) -> None:
     """Apply one version's delta in place: decompress + apply + checksum each tensor across a thread
     pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
     """
@@ -491,6 +556,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     compressed_bytes = 0
     logical_bytes = 0
     max_compressed_shard_bytes = 0
+    mutation_started = False
     decoder_local = threading.local()
 
     def thread_decompressor() -> zstandard.ZstdDecompressor:
@@ -683,6 +749,12 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                             want_checksums.get(name),
                         )
                     )
+                if items and not mutation_started:
+                    _mark_checkpoint_invalid(
+                        local_checkpoint_dir,
+                        f"delta apply from {version_dir} is in progress",
+                    )
+                    mutation_started = True
                 stage_started = time.perf_counter()
                 profiles = list(pool.map(apply_tensor, items))
                 stage_wall_s["apply_and_checksum"] += (
@@ -698,14 +770,15 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                 f"index_only={sorted(expected_names - seen_names)[:20]} "
                 f"payload_only={sorted(seen_names - expected_names)[:20]}"
             )
-        # msync BEFORE the applied-version marker: the marker must never become
-        # durable over data pages that never made it to disk, or a power loss
-        # after a "successful" apply would silently serve stale bytes forever.
-        # Only the delta's dirty pages get written, so the cost is O(delta).
-        stage_started = time.perf_counter()
-        for _, mm in open_mmaps.values():
-            mm.flush()
-        stage_wall_s["flush"] += time.perf_counter() - stage_started
+        # Durable disk reload mode must msync before publishing its marker.
+        # Host-runtime mode deliberately keeps this as a process-lifetime
+        # scratch checkpoint: its run-scoped marker rejects reuse after restart,
+        # so synchronous persistence is outside the inference critical path.
+        if durable:
+            stage_started = time.perf_counter()
+            for _, mm in open_mmaps.values():
+                mm.flush()
+            stage_wall_s["flush"] += time.perf_counter() - stage_started
     finally:
         for fh, mm in open_mmaps.values():
             mm.close()
@@ -719,13 +792,18 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             f"checksum mismatch for {len(mismatches)} tensors after applying "
             f"{version_dir}: {sample}"
         )
-    _write_applied_version(local_checkpoint_dir, int(meta["version"]))
+    _write_applied_version(
+        local_checkpoint_dir,
+        int(meta["version"]),
+        durable=durable,
+    )
     logger.info(
         "[RL_LOCAL_CHECKPOINT_APPLY] %s",
         json.dumps(
             {
                 "version": int(meta["version"]),
                 "encoding": encoding,
+                "durable": durable,
                 "tensors": len(seen_names),
                 "logical_bytes": logical_bytes,
                 "compressed_bytes": compressed_bytes,
@@ -746,7 +824,14 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     )
 
 
-def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -> None:
+def _apply_range(
+    local_checkpoint_dir: str,
+    source_dir: str,
+    lo: int,
+    hi: int,
+    *,
+    durable: bool,
+) -> None:
     """Fold XOR deltas v{lo}..v{hi} into the local checkpoint in one pass per tensor.
 
     The local checkpoint is at v{lo-1}; XOR telescopes, so v{hi} = state ⊕ d{lo} ⊕ ... ⊕ d{hi}.
@@ -782,7 +867,11 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
             for w in range(
                 lo, hi + 1
             ):  # not a pure-xor range — the safe per-version path
-                _apply_delta(local_checkpoint_dir, _version_dir(source_dir, w))
+                _apply_delta(
+                    local_checkpoint_dir,
+                    _version_dir(source_dir, w),
+                    durable=durable,
+                )
             return
         for blob_name in sorted(set(index.get("weight_map", {}).values())):
             if not os.path.exists(os.path.join(vdir, blob_name)):
@@ -827,6 +916,10 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
         by_shard.setdefault(path, []).append((name, offset, nbytes))
     mismatches: list[tuple[str, Optional[str], str]] = []
     lock = threading.Lock()
+    _mark_checkpoint_invalid(
+        local_checkpoint_dir,
+        f"delta fold v{lo}..v{hi} is in progress",
+    )
 
     def fold_shard(path) -> None:
         with open(path, "rb") as f:
@@ -864,6 +957,9 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
         else:  # write only after every tensor in the shard verifies (no torn write on mismatch)
             with open(path, "wb") as f:
                 f.write(buf)
+                if durable:
+                    f.flush()
+                    os.fsync(f.fileno())
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
         list(pool.map(fold_shard, by_shard))
@@ -876,4 +972,8 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
             f"checksum mismatch for {len(mismatches)} tensors after folding "
             f"v{lo}..v{hi}: {sample}"
         )
-    _write_applied_version(local_checkpoint_dir, hi)
+    _write_applied_version(
+        local_checkpoint_dir,
+        hi,
+        durable=durable,
+    )

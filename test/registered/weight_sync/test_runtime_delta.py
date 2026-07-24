@@ -16,6 +16,7 @@ from sglang.srt.weight_sync.runtime_delta import (
 from sglang.srt.layers.quantization.modelopt_quant import (
     _interleave_trtllm_nvfp4_scales,
     _shuffle_trtllm_epilogue_rows,
+    _trtllm_nvfp4_sparse_byte_permutation,
 )
 
 
@@ -105,6 +106,24 @@ class _PaddedCopyModel(torch.nn.Module):
             self.weight.weight_loader(self.weight, tensor)
 
 
+class _DtypeCopyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.zeros(8, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.weight.weight_loader = self._load
+
+    @staticmethod
+    def _load(parameter, loaded_weight):
+        parameter.copy_(loaded_weight)
+
+    def load_weights(self, weights):
+        for _, tensor in weights:
+            self.weight.weight_loader(self.weight, tensor)
+
+
 def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
     storage = tensor.untyped_storage()
     return torch.empty(0, dtype=torch.uint8).set_(
@@ -112,14 +131,31 @@ def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _write_delta(root: str, old: torch.Tensor, new: torch.Tensor) -> None:
+def _write_delta(
+    root: str,
+    old: torch.Tensor,
+    new: torch.Tensor,
+    *,
+    encoding: str = "xor",
+) -> None:
     version_dir = os.path.join(root, "weight_v000001")
     os.makedirs(version_dir)
     delta = np.bitwise_xor(
         old.contiguous().view(torch.uint8).numpy(),
         new.contiguous().view(torch.uint8).numpy(),
-    ).tobytes()
-    compressed = zstandard.ZstdCompressor().compress(delta)
+    )
+    if encoding == "xor":
+        encoded_delta = delta.tobytes()
+    elif encoding == "xor_sparse":
+        positions = np.flatnonzero(delta).astype("<u8")
+        encoded_delta = (
+            struct.pack("<Q", positions.size)
+            + positions.tobytes()
+            + delta[positions].tobytes()
+        )
+    else:
+        raise ValueError(encoding)
+    compressed = zstandard.ZstdCompressor().compress(encoded_delta)
     header = {
         "weight": {
             "dtype": "U8",
@@ -141,7 +177,7 @@ def _write_delta(root: str, old: torch.Tensor, new: torch.Tensor) -> None:
                 "metadata": {
                     "version": "000001",
                     "base_version": "000000",
-                    "delta_encoding": "xor",
+                    "delta_encoding": encoding,
                     "compression_format": "zstd",
                     "checksum_format": "adler32",
                 },
@@ -184,6 +220,69 @@ def test_direct_xor_advances_tp_view_byte_exactly():
     assert torch.equal(actual, expected)
 
 
+def test_sparse_direct_xor_advances_tp_view_without_dense_materialization():
+    old = torch.arange(12, dtype=torch.int32)
+    new = old.clone()
+    new[3] ^= 1
+    new[8] ^= 1
+    model = _CopyModel()
+    plan, _ = _record_and_finalize(model, old)
+
+    host_image = _storage_bytes(model.weight).clone()
+    with tempfile.TemporaryDirectory() as source_dir:
+        _write_delta(
+            source_dir,
+            old,
+            new,
+            encoding="xor_sparse",
+        )
+        stats = plan.apply_versions(
+            model=model,
+            host_image=host_image,
+            source_dir=source_dir,
+            base_version=0,
+            target_version=1,
+        )
+
+    assert torch.equal(host_image.view(torch.int32), new[2:10])
+    assert stats["sparse_sources"] == 1
+    assert stats["decoded_bytes"] < stats["logical_bytes"]
+
+
+def test_sparse_dtype_conversion_reconstructs_only_changed_source_elements():
+    old = torch.arange(8, dtype=torch.bfloat16)
+    new = old.clone()
+    new[2] = torch.tensor(2.03125, dtype=torch.bfloat16)
+    new[6] = torch.tensor(6.0625, dtype=torch.bfloat16)
+    model = _DtypeCopyModel()
+    plan = RuntimeDeltaPlan()
+    plan.record(model, [("weight", old)])
+    segment = _Segment(
+        image_offset=0,
+        device_bytes=_storage_bytes(model.weight),
+    )
+    stats = plan.finalize(model, [segment])
+    assert plan.dtype_conversion_sources == {"weight"}, stats
+
+    host_image = _storage_bytes(model.weight).clone()
+    with tempfile.TemporaryDirectory() as source_dir:
+        _write_delta(
+            source_dir,
+            old,
+            new,
+            encoding="xor_sparse",
+        )
+        plan.apply_versions(
+            model=model,
+            host_image=host_image,
+            source_dir=source_dir,
+            base_version=0,
+            target_version=1,
+        )
+
+    assert torch.equal(host_image.view(torch.float32), new.to(torch.float32))
+
+
 def test_invariant_zero_padding_does_not_require_a_hook():
     source = torch.arange(8, dtype=torch.int32)
     model = _PaddedCopyModel()
@@ -220,8 +319,8 @@ def test_quantized_destination_requires_explicit_hook_before_mutation():
 def test_quant_adapter_streams_one_source_then_finalizes_once():
     old = torch.arange(12, dtype=torch.int32)
     new = old.clone()
-    new[3] = 700
-    new[8] = -123
+    new[3] ^= 1
+    new[8] ^= 1
     model = _CopyModel()
     adapter = _StreamingQuantAdapter()
     model.quant_method = adapter
@@ -230,7 +329,12 @@ def test_quant_adapter_streams_one_source_then_finalizes_once():
 
     host_image = _storage_bytes(model.weight).clone()
     with tempfile.TemporaryDirectory() as source_dir:
-        _write_delta(source_dir, old, new)
+        _write_delta(
+            source_dir,
+            old,
+            new,
+            encoding="xor_sparse",
+        )
         apply_stats = plan.apply_versions(
             model=model,
             host_image=host_image,
@@ -243,7 +347,8 @@ def test_quant_adapter_streams_one_source_then_finalizes_once():
     assert adapter.validated == 1
     assert adapter.applied == 1
     assert adapter.finalized == 1
-    assert apply_stats["max_raw_bytes"] == old.untyped_storage().nbytes()
+    assert apply_stats["max_raw_bytes"] == apply_stats["decoded_bytes"]
+    assert apply_stats["max_raw_bytes"] < old.untyped_storage().nbytes()
     assert apply_stats["stage_wall_s"]["quant_adapter"] >= 0
 
 
@@ -312,3 +417,26 @@ def test_trtllm_scale_interleave_matches_128x4_offset_definition():
 
     actual = _interleave_trtllm_nvfp4_scales(value)
     assert torch.equal(actual, expected.reshape(128, 8))
+
+
+@pytest.mark.parametrize("interleave_scales", [False, True])
+def test_sparse_trtllm_byte_mapping_matches_dense_transform(interleave_scales):
+    rows, columns = 128, 8
+    raw = torch.zeros((rows, columns), dtype=torch.uint8)
+    positions = torch.tensor([0, 7, 8, 511, 512, 777, 1023])
+    values = torch.arange(1, positions.numel() + 1, dtype=torch.uint8)
+    raw.view(-1)[positions] = values
+
+    dense = _shuffle_trtllm_epilogue_rows(raw, gated_w13=True)
+    if interleave_scales:
+        dense = _interleave_trtllm_nvfp4_scales(dense)
+    mapped, output_nbytes = _trtllm_nvfp4_sparse_byte_permutation(
+        positions,
+        rows=rows,
+        columns=columns,
+        gated_w13=True,
+        interleave_scales=interleave_scales,
+    )
+    sparse = torch.zeros(output_nbytes, dtype=torch.uint8)
+    sparse[mapped] = values
+    assert torch.equal(sparse, dense.reshape(-1))

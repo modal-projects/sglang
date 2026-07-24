@@ -4,7 +4,9 @@ During the initial, ordinary model load, :class:`RuntimeDeltaPlan` observes
 only source-view to parameter-view ``copy_`` operations. It does not trace or
 replay arbitrary computation. After quantization postprocessing, direct copies
 whose destination layout is unchanged can be applied to the host runtime image
-as XORs. Model/quantization hooks own derived or repacked destinations.
+as XORs. Dense XOR and position/value sparse XOR share the same proven mapping;
+the sparse form avoids materializing unchanged zero bytes. Model/quantization
+hooks own derived or repacked destinations.
 
 Every changed source tensor must be accounted for. Unsupported operations fail
 preparation; they never preserve stale bytes or silently select a disk reload.
@@ -36,6 +38,29 @@ _SOURCE_TAG = "_sglang_runtime_delta_source"
 
 class RuntimeDeltaCoverageError(RuntimeError):
     """The recorded direct plan and explicit hooks do not cover a delta."""
+
+
+@dataclass(frozen=True)
+class SparseXorDelta:
+    """Byte positions and XOR values for one logical checkpoint tensor."""
+
+    encoded: bytes
+    positions: torch.Tensor
+    values: torch.Tensor
+    logical_nbytes: int
+
+    @property
+    def encoded_nbytes(self) -> int:
+        return len(self.encoded)
+
+    def materialize(self) -> bytearray:
+        dense = bytearray(self.logical_nbytes)
+        target = torch.frombuffer(dense, dtype=torch.uint8)
+        target[self.positions] = self.values
+        return dense
+
+
+RuntimeDelta = bytes | SparseXorDelta
 
 
 @dataclass(frozen=True)
@@ -86,6 +111,22 @@ class RuntimeTensorSpec:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     storage_offset: int
+
+
+def _view_numel(view: TensorViewSpec) -> int:
+    result = 1
+    for size in view.shape:
+        result *= size
+    return result
+
+
+def _view_is_contiguous(view: TensorViewSpec) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(view.shape), reversed(view.stride)):
+        if size > 1 and stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
 
 
 def _tensor_signature(tensor: torch.Tensor) -> TensorSignature:
@@ -565,7 +606,7 @@ class RuntimeDeltaPlan:
         changed_sources = 0
         logical_bytes = 0
         max_raw_bytes = 0
-        versions: list[tuple[int, str]] = []
+        versions: list[tuple[int, str, str]] = []
         changed_names: set[str] = set()
         for version in range(base_version + 1, target_version + 1):
             version_dir = os.path.join(source_dir, f"weight_v{version:06d}")
@@ -579,13 +620,14 @@ class RuntimeDeltaPlan:
                     f"out-of-order runtime delta v{version}: "
                     f"base={metadata['base_version']}"
                 )
-            if metadata.get("delta_encoding") != "xor":
+            encoding = metadata.get("delta_encoding")
+            if encoding not in ("xor", "xor_sparse"):
                 raise NotImplementedError(
-                    "host runtime preparation currently requires XOR deltas; "
-                    f"v{version} uses {metadata.get('delta_encoding')!r}"
+                    "host runtime preparation currently requires dense or sparse "
+                    f"XOR deltas; v{version} uses {encoding!r}"
                 )
             changed_names.update(index.get("weight_map", {}))
-            versions.append((version, version_dir))
+            versions.append((version, version_dir, encoding))
 
         unknown = changed_names - self.source_signatures.keys()
         if unknown:
@@ -646,7 +688,9 @@ class RuntimeDeltaPlan:
                     source_names=names,
                 )
 
-        for _, version_dir in versions:
+        decoded_bytes = 0
+        sparse_sources = 0
+        for _, version_dir, encoding in versions:
             stage_started = time.perf_counter()
             _, payloads = _read_delta_payloads(version_dir)
             stage_wall_s["read_compressed"] += time.perf_counter() - stage_started
@@ -657,22 +701,42 @@ class RuntimeDeltaPlan:
                         f"runtime delta source was absent from initial load: {name!r}"
                     )
                 stage_started = time.perf_counter()
-                raw = zstandard.ZstdDecompressor().decompress(
-                    compressed,
-                    max_output_size=signature.storage_nbytes,
+                decompressor = zstandard.ZstdDecompressor()
+                encoded = (
+                    decompressor.decompress(
+                        compressed,
+                        max_output_size=signature.storage_nbytes,
+                    )
+                    if encoding == "xor"
+                    else decompressor.decompress(compressed)
                 )
                 stage_wall_s["decompress"] += time.perf_counter() - stage_started
-                if len(raw) != signature.storage_nbytes:
-                    raise RuntimeError(
-                        f"runtime delta size mismatch for {name!r}: "
-                        f"expected={signature.storage_nbytes} actual={len(raw)}"
+                if encoding == "xor":
+                    delta: RuntimeDelta = encoded
+                    if len(encoded) != signature.storage_nbytes:
+                        raise RuntimeError(
+                            f"runtime delta size mismatch for {name!r}: "
+                            f"expected={signature.storage_nbytes} "
+                            f"actual={len(encoded)}"
+                        )
+                else:
+                    delta = _decode_sparse_xor(
+                        encoded,
+                        signature.storage_nbytes,
                     )
+                    sparse_sources += 1
                 changed_sources += 1
-                logical_bytes += len(raw)
-                max_raw_bytes = max(max_raw_bytes, len(raw))
+                logical_bytes += signature.storage_nbytes
+                decoded_nbytes = (
+                    len(delta)
+                    if isinstance(delta, bytes)
+                    else delta.encoded_nbytes
+                )
+                decoded_bytes += decoded_nbytes
+                max_raw_bytes = max(max_raw_bytes, decoded_nbytes)
                 stage_started = time.perf_counter()
                 if name in self.runtime_copies:
-                    self._apply_direct_xor(host_image, name, raw)
+                    self._apply_direct_xor(host_image, name, delta)
                     stage_wall_s["direct"] += (
                         time.perf_counter() - stage_started
                     )
@@ -681,7 +745,7 @@ class RuntimeDeltaPlan:
                 context = RuntimeDeltaUpdateContext(
                     plan=self,
                     host_image=host_image,
-                    source_deltas={name: raw},
+                    source_deltas={name: delta},
                 )
                 module_name = self.quant_adapter_sources.get(name)
                 if module_name is not None:
@@ -792,6 +856,8 @@ class RuntimeDeltaPlan:
             "target_version": target_version,
             "changed_sources": changed_sources,
             "logical_bytes": logical_bytes,
+            "decoded_bytes": decoded_bytes,
+            "sparse_sources": sparse_sources,
             "hook_sources": len(
                 changed_names - self.runtime_copies.keys()
             ),
@@ -807,19 +873,49 @@ class RuntimeDeltaPlan:
         self,
         host_image: torch.Tensor,
         source_name: str,
-        raw_delta: bytes,
+        raw_delta: RuntimeDelta,
         *,
         copies: Optional[list[RuntimeCopy]] = None,
     ) -> None:
+        selected_copies = (
+            self.runtime_copies[source_name] if copies is None else copies
+        )
+        if isinstance(raw_delta, SparseXorDelta):
+            mapped_copies = []
+            for copy in selected_copies:
+                mapped = self._sparse_copy_bytes(
+                    source_name=source_name,
+                    delta=raw_delta,
+                    source_view=copy.source_view,
+                    destination_view=copy.destination_view,
+                    destination_dtype=copy.dtype,
+                )
+                if mapped is None:
+                    self._apply_direct_xor(
+                        host_image,
+                        source_name,
+                        raw_delta.materialize(),
+                        copies=selected_copies,
+                    )
+                    return
+                mapped_copies.append((copy, mapped))
+            for copy, (positions, values) in mapped_copies:
+                if positions.numel():
+                    positions = positions + copy.image_storage_offset
+                    host_image[positions] = host_image[positions].bitwise_xor(
+                        values
+                    )
+            return
+
         signature = self.source_signatures[source_name]
-        source_bytes = _readonly_bytes_as_tensor(raw_delta)
+        source_bytes = _buffer_as_tensor(raw_delta)
         source = torch.empty(0, dtype=signature.dtype).set_(
             source_bytes.untyped_storage(),
             signature.storage_offset,
             signature.shape,
             signature.stride,
         )
-        for copy in self.runtime_copies[source_name] if copies is None else copies:
+        for copy in selected_copies:
             element_size = torch.empty((), dtype=copy.dtype).element_size()
             destination_element_offset = (
                 copy.image_storage_offset // element_size
@@ -840,6 +936,36 @@ class RuntimeDeltaPlan:
                 source_view.contiguous().view(torch.uint8)
             )
 
+    def _sparse_copy_bytes(
+        self,
+        *,
+        source_name: str,
+        delta: SparseXorDelta,
+        source_view: TensorViewSpec,
+        destination_view: TensorViewSpec,
+        destination_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Map contiguous source-storage byte positions to destination storage."""
+
+        signature = self.source_signatures[source_name]
+        if (
+            signature.dtype != destination_dtype
+            or source_view.shape != destination_view.shape
+            or not _view_is_contiguous(source_view)
+            or not _view_is_contiguous(destination_view)
+        ):
+            return None
+        element_size = torch.empty((), dtype=signature.dtype).element_size()
+        view_nbytes = _view_numel(source_view) * element_size
+        source_begin = source_view.storage_offset * element_size
+        source_end = source_begin + view_nbytes
+        mask = (delta.positions >= source_begin) & (
+            delta.positions < source_end
+        )
+        relative = delta.positions[mask] - source_begin
+        destination_begin = destination_view.storage_offset * element_size
+        return destination_begin + relative, delta.values[mask]
+
 
 class RuntimeDeltaUpdateContext:
     """Bounded access to one delta batch and the pinned final-layout image."""
@@ -849,7 +975,7 @@ class RuntimeDeltaUpdateContext:
         *,
         plan: RuntimeDeltaPlan,
         host_image: torch.Tensor,
-        source_deltas: dict[str, bytes],
+        source_deltas: dict[str, RuntimeDelta],
     ) -> None:
         self.plan = plan
         self.host_image = host_image
@@ -857,7 +983,12 @@ class RuntimeDeltaUpdateContext:
 
     def source_tensor(self, source_name: str) -> torch.Tensor:
         signature = self.plan.source_signatures[source_name]
-        source_bytes = _readonly_bytes_as_tensor(self.source_deltas[source_name])
+        delta = self.source_deltas[source_name]
+        source_bytes = _buffer_as_tensor(
+            delta.materialize()
+            if isinstance(delta, SparseXorDelta)
+            else delta
+        )
         return torch.empty(0, dtype=signature.dtype).set_(
             source_bytes.untyped_storage(),
             signature.storage_offset,
@@ -894,6 +1025,68 @@ class RuntimeDeltaUpdateContext:
     def direct_copies(self, source_name: str) -> list[DirectCopy]:
         return self.plan.direct_copies[source_name]
 
+    def sparse_delta(self, source_name: str) -> SparseXorDelta | None:
+        delta = self.source_deltas[source_name]
+        return delta if isinstance(delta, SparseXorDelta) else None
+
+    def sparse_copy_bytes(
+        self,
+        source_name: str,
+        copy: DirectCopy,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        delta = self.sparse_delta(source_name)
+        if delta is None:
+            return None
+        return self.plan._sparse_copy_bytes(
+            source_name=source_name,
+            delta=delta,
+            source_view=copy.source_view,
+            destination_view=copy.destination_view,
+            destination_dtype=copy.parameter_signature.dtype,
+        )
+
+    def xor_contiguous_target(
+        self,
+        source_name: str,
+        target: torch.Tensor,
+    ) -> None:
+        """Apply an entire contiguous source XOR to an equal-shaped target."""
+
+        signature = self.plan.source_signatures[source_name]
+        delta = self.source_deltas[source_name]
+        if (
+            target.dtype != signature.dtype
+            or tuple(target.shape) != signature.shape
+            or not target.is_contiguous()
+        ):
+            raise RuntimeDeltaCoverageError(
+                "contiguous runtime target does not match checkpoint source: "
+                f"{source_name!r} source={signature.shape}/{signature.dtype} "
+                f"target={tuple(target.shape)}/{target.dtype}"
+            )
+        target_bytes = target.view(torch.uint8).reshape(-1)
+        if isinstance(delta, SparseXorDelta):
+            element_size = target.element_size()
+            source_begin = signature.storage_offset * element_size
+            positions = delta.positions - source_begin
+            if (
+                positions.numel()
+                and (
+                    positions[0].item() < 0
+                    or positions[-1].item() >= target_bytes.numel()
+                )
+            ):
+                raise RuntimeDeltaCoverageError(
+                    f"sparse XOR is outside source view for {source_name!r}"
+                )
+            target_bytes[positions] = target_bytes[positions].bitwise_xor(
+                delta.values
+            )
+            return
+        target_bytes.bitwise_xor_(
+            self.source_tensor(source_name).contiguous().view(torch.uint8)
+        )
+
     def xor_direct(self, source_name: str) -> None:
         try:
             copies = self.plan.resolved_copies[source_name]
@@ -911,6 +1104,12 @@ class RuntimeDeltaUpdateContext:
     def apply_dtype_conversion(self, source_name: str) -> None:
         """Apply a direct loader copy whose only transform is dtype conversion."""
 
+        delta = self.sparse_delta(source_name)
+        if delta is not None and self._apply_sparse_dtype_conversion(
+            source_name,
+            delta,
+        ):
+            return
         source = self.source_tensor(source_name)
         source_signature = self.plan.source_signatures[source_name]
         for direct, runtime in zip(
@@ -942,9 +1141,88 @@ class RuntimeDeltaUpdateContext:
             )
             destination.copy_(reconstructed)
 
+    def _apply_sparse_dtype_conversion(
+        self,
+        source_name: str,
+        delta: SparseXorDelta,
+    ) -> bool:
+        source_signature = self.plan.source_signatures[source_name]
+        source_element_size = torch.empty(
+            (),
+            dtype=source_signature.dtype,
+        ).element_size()
+        pending = []
+        for direct, runtime in zip(
+            self.plan.direct_copies[source_name],
+            self.plan.resolved_copies[source_name],
+        ):
+            if (
+                direct.source_view.shape != runtime.destination_view.shape
+                or not _view_is_contiguous(direct.source_view)
+                or not _view_is_contiguous(runtime.destination_view)
+            ):
+                return False
+            source_begin = (
+                direct.source_view.storage_offset * source_element_size
+            )
+            source_end = source_begin + (
+                _view_numel(direct.source_view) * source_element_size
+            )
+            mask = (delta.positions >= source_begin) & (
+                delta.positions < source_end
+            )
+            relative = delta.positions[mask] - source_begin
+            pending.append((runtime, relative, delta.values[mask]))
 
-def _readonly_bytes_as_tensor(value: bytes) -> torch.Tensor:
-    """Create a zero-copy read-only byte view without PyTorch's one-time warning."""
+        for runtime, relative, values in pending:
+            destination_element_size = torch.empty(
+                (),
+                dtype=runtime.dtype,
+            ).element_size()
+            destination = torch.empty(0, dtype=runtime.dtype).set_(
+                self.host_image.untyped_storage(),
+                runtime.image_storage_offset // destination_element_size
+                + runtime.destination_view.storage_offset,
+                runtime.destination_view.shape,
+                runtime.destination_view.stride,
+            )
+            flat_destination = destination.reshape(-1)
+            source_elements = torch.div(
+                relative,
+                source_element_size,
+                rounding_mode="floor",
+            )
+            lanes = relative.remainder(source_element_size)
+            unique_elements, inverse = torch.unique(
+                source_elements,
+                sorted=True,
+                return_inverse=True,
+            )
+            reconstructed = (
+                flat_destination[unique_elements]
+                .to(source_signature.dtype)
+                .contiguous()
+            )
+            reconstructed_bytes = reconstructed.view(torch.uint8).reshape(
+                -1,
+                source_element_size,
+            )
+            reconstructed_bytes[inverse, lanes] = reconstructed_bytes[
+                inverse,
+                lanes,
+            ].bitwise_xor(values)
+            flat_destination[unique_elements] = reconstructed.to(runtime.dtype)
+        return True
+
+
+def _buffer_as_tensor(
+    value,
+    *,
+    dtype: torch.dtype = torch.uint8,
+    count: int = -1,
+    offset: int = 0,
+) -> torch.Tensor:
+    """Create a zero-copy buffer view without PyTorch's read-only warning."""
 
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -952,7 +1230,54 @@ def _readonly_bytes_as_tensor(value: bytes) -> torch.Tensor:
             message="The given buffer is not writable",
             category=UserWarning,
         )
-        return torch.frombuffer(value, dtype=torch.uint8)
+        return torch.frombuffer(
+            value,
+            dtype=dtype,
+            count=count,
+            offset=offset,
+        )
+
+
+def _decode_sparse_xor(encoded: bytes, logical_nbytes: int) -> SparseXorDelta:
+    if len(encoded) < 8:
+        raise RuntimeError(
+            f"sparse XOR payload is shorter than its count: {len(encoded)}B"
+        )
+    (count,) = struct.unpack_from("<Q", encoded)
+    expected = 8 + count * 8 + count
+    if len(encoded) != expected:
+        raise RuntimeError(
+            "sparse XOR payload size mismatch: "
+            f"count={count} actual={len(encoded)} expected={expected}"
+        )
+    positions = _buffer_as_tensor(
+        encoded,
+        dtype=torch.int64,
+        count=count,
+        offset=8,
+    )
+    values = _buffer_as_tensor(
+        encoded,
+        count=count,
+        offset=8 + count * 8,
+    )
+    if count:
+        if positions[0].item() < 0 or positions[-1].item() >= logical_nbytes:
+            raise RuntimeError(
+                "sparse XOR position out of bounds: "
+                f"first={positions[0].item()} last={positions[-1].item()} "
+                f"logical_nbytes={logical_nbytes}"
+            )
+        if count > 1 and torch.any(positions[1:] <= positions[:-1]).item():
+            raise RuntimeError(
+                "sparse XOR positions must be strictly increasing"
+            )
+    return SparseXorDelta(
+        encoded=encoded,
+        positions=positions,
+        values=values,
+        logical_nbytes=logical_nbytes,
+    )
 
 
 def _safetensors_size(blob: bytes) -> Optional[int]:

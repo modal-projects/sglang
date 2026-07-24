@@ -1949,6 +1949,16 @@ def _apply_trtllm_nvfp4_moe_source_xor(
 
     from sglang.srt.weight_sync.runtime_delta import RuntimeDeltaCoverageError
 
+    if context.sparse_delta(source_name) is not None:
+        _apply_sparse_trtllm_nvfp4_moe_source_xor(
+            context=context,
+            source_name=source_name,
+            copy=copy,
+            local_name=local_name,
+            is_gated=is_gated,
+        )
+        return
+
     parameter_shape = copy.parameter_signature.shape
     parameter_stride = copy.parameter_signature.stride
     if (
@@ -2012,6 +2022,121 @@ def _apply_trtllm_nvfp4_moe_source_xor(
             f"runtime={tuple(target_expert.shape)}"
         )
     target_expert.view(torch.uint8).bitwise_xor_(transformed)
+
+
+def _apply_sparse_trtllm_nvfp4_moe_source_xor(
+    *,
+    context,
+    source_name: str,
+    copy,
+    local_name: str,
+    is_gated: bool,
+) -> None:
+    """Map sparse source bytes through TRT-LLM's fixed expert permutations."""
+
+    from sglang.srt.weight_sync.runtime_delta import RuntimeDeltaCoverageError
+
+    parameter_shape = copy.parameter_signature.shape
+    parameter_stride = copy.parameter_signature.stride
+    if (
+        len(parameter_shape) != 3
+        or parameter_stride[-1] != 1
+        or parameter_stride[0] != parameter_shape[1] * parameter_shape[2]
+        or parameter_stride[1] != parameter_shape[2]
+    ):
+        raise RuntimeDeltaCoverageError(
+            "NVFP4 sparse runtime adapter requires contiguous [E,M,K] "
+            f"parameters, got {copy.parameter_name!r} "
+            f"shape={parameter_shape} stride={parameter_stride}"
+        )
+    mapped = context.sparse_copy_bytes(source_name, copy)
+    if mapped is None:
+        raise RuntimeDeltaCoverageError(
+            f"NVFP4 sparse source view is not contiguous: {source_name!r}"
+        )
+    positions, values = mapped
+    if not positions.numel():
+        return
+
+    element_size = torch.empty(
+        (),
+        dtype=copy.parameter_signature.dtype,
+    ).element_size()
+    parameter_begin = copy.parameter_signature.storage_offset * element_size
+    positions = positions - parameter_begin
+    expert_nbytes = parameter_stride[0] * element_size
+    expert_ids = torch.div(positions, expert_nbytes, rounding_mode="floor")
+    expert_id = expert_ids[0].item()
+    if torch.any(expert_ids != expert_id).item():
+        raise RuntimeDeltaCoverageError(
+            f"one NVFP4 source spans multiple experts: {source_name!r}"
+        )
+    if not 0 <= expert_id < parameter_shape[0]:
+        raise RuntimeDeltaCoverageError(
+            f"NVFP4 expert offset is out of range for {source_name!r}: "
+            f"expert={expert_id} shape={parameter_shape}"
+        )
+
+    destination_positions, expected_nbytes = (
+        _trtllm_nvfp4_sparse_byte_permutation(
+            positions.remainder(expert_nbytes),
+            rows=parameter_shape[1],
+            columns=parameter_shape[2] * element_size,
+            gated_w13=local_name.startswith("w13_") and is_gated,
+            interleave_scales=local_name.endswith("_weight_scale"),
+        )
+    )
+
+    target = context.host_tensor(copy.parameter_name)
+    target_expert = target[expert_id].view(torch.uint8).reshape(-1)
+    if target_expert.numel() != expected_nbytes:
+        raise RuntimeDeltaCoverageError(
+            "NVFP4 sparse transformed size does not match final runtime layout: "
+            f"{source_name!r} transformed={expected_nbytes} "
+            f"runtime={target_expert.numel()}"
+        )
+    target_expert[destination_positions] = target_expert[
+        destination_positions
+    ].bitwise_xor(values)
+
+
+def _trtllm_nvfp4_sparse_byte_permutation(
+    raw_positions: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+    gated_w13: bool,
+    interleave_scales: bool,
+) -> tuple[torch.Tensor, int]:
+    """Map raw expert byte offsets through the dense TRT-LLM transforms."""
+
+    row = torch.div(raw_positions, columns, rounding_mode="floor")
+    column = raw_positions.remainder(columns)
+    if gated_w13:
+        if rows % 2:
+            raise ValueError(f"gated W13 row count must be even, got {rows}")
+        half = rows // 2
+        row = torch.where(row < half, row * 2, (row - half) * 2 + 1)
+
+    row = (
+        torch.div(row, 32, rounding_mode="floor") * 32
+        + row.remainder(4) * 8
+        + torch.div(row.remainder(32), 4, rounding_mode="floor")
+    )
+    if not interleave_scales:
+        return row * columns + column, rows * columns
+
+    padded_rows = round_up(rows, 128)
+    padded_columns = round_up(columns, 4)
+    destination_positions = (
+        torch.div(row, 128, rounding_mode="floor")
+        * (128 * padded_columns)
+        + torch.div(column, 4, rounding_mode="floor") * 512
+        + row.remainder(32) * 16
+        + torch.div(row.remainder(128), 32, rounding_mode="floor") * 4
+        + column.remainder(4)
+    )
+    return destination_positions, padded_rows * padded_columns
 
 
 def _host_runtime_delta_local_name(plan, source_name: str) -> str:

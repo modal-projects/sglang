@@ -8,7 +8,8 @@ directory of one of two kinds, distinguished by its index metadata:
   ``local_checkpoint_dir``, replacing whatever is there — no history needed.
 - **delta** (index metadata carries ``delta_encoding``): safetensors files
   holding zstd-compressed per-tensor diffs against version N-1, plus per-tensor
-  checksums of the new state. Pulling it patches the local checkpoint in place.
+  checksums of the new state. Dense XOR and position/value sparse XOR are both
+  byte-level and dtype-independent. Pulling patches the checkpoint in place.
 
 Version 0 is the engine's own base checkpoint (``model_path``). Every host of a
 (possibly multi-node) deployment runs the same pull; the engine then reloads the
@@ -562,8 +563,56 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                 with lock:
                     mismatches.append((name, want, actual))
 
+        def apply_sparse_xor(item) -> None:
+            name, compressed, path, offset, nbytes, want = item
+            encoded = zstandard.ZstdDecompressor().decompress(compressed)
+            if len(encoded) < 8:
+                raise RuntimeError(
+                    f"sparse XOR payload for {name!r} is shorter than its count"
+                )
+            (count,) = struct.unpack_from("<Q", encoded)
+            expected_size = 8 + count * 8 + count
+            if len(encoded) != expected_size:
+                raise RuntimeError(
+                    f"sparse XOR payload size mismatch for {name!r}: "
+                    f"count={count} actual={len(encoded)} "
+                    f"expected={expected_size}"
+                )
+            positions = np.frombuffer(
+                encoded,
+                dtype="<u8",
+                count=count,
+                offset=8,
+            )
+            values = np.frombuffer(
+                encoded,
+                dtype=np.uint8,
+                count=count,
+                offset=8 + count * 8,
+            )
+            if count and (
+                positions[-1] >= nbytes
+                or (count > 1 and np.any(positions[1:] <= positions[:-1]))
+            ):
+                raise RuntimeError(
+                    f"sparse XOR positions for {name!r} are invalid or out of bounds"
+                )
+            region = np.ndarray(
+                (nbytes,),
+                dtype=np.uint8,
+                buffer=open_mmaps[path][1],
+                offset=offset,
+            )
+            region[positions] ^= values
+            actual = _checksum(algorithm, region)
+            if actual != want:
+                with lock:
+                    mismatches.append((name, want, actual))
+
         if encoding == "xor":
             apply_tensor = apply_xor
+        elif encoding == "xor_sparse":
+            apply_tensor = apply_sparse_xor
         elif encoding == "overwrite":
             apply_tensor = apply_overwrite
         else:

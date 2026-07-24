@@ -87,7 +87,7 @@ class Publisher:
         self.versions = {0: dict(self.state)}
         write_safetensors(os.path.join(self.base_dir, self.SHARD), self.state)
 
-    def publish_delta(self, version, changed):
+    def publish_delta(self, version, changed, encoding="xor"):
         """changed: {name: new_bytes}; unchanged tensors are omitted."""
         vdir = os.path.join(self.source_dir, f"weight_v{version:06d}")
         os.makedirs(vdir)
@@ -97,8 +97,19 @@ class Publisher:
             old = self.state[name]
             diff = (
                 np.frombuffer(new, dtype=np.uint8) ^ np.frombuffer(old, dtype=np.uint8)
-            ).tobytes()
-            payloads[name] = zstandard.ZstdCompressor().compress(diff)
+            )
+            if encoding == "xor":
+                encoded = diff.tobytes()
+            elif encoding == "xor_sparse":
+                positions = np.flatnonzero(diff).astype("<u8")
+                encoded = (
+                    struct.pack("<Q", positions.size)
+                    + positions.tobytes()
+                    + diff[positions].tobytes()
+                )
+            else:
+                raise ValueError(encoding)
+            payloads[name] = zstandard.ZstdCompressor().compress(encoded)
             checksums[name] = adler32_hex(new)
             self.state[name] = new
         self.versions[version] = dict(self.state)
@@ -109,7 +120,7 @@ class Publisher:
                     "metadata": {
                         "version": f"{version:06d}",
                         "base_version": f"{version - 1:06d}",
-                        "delta_encoding": "xor",
+                        "delta_encoding": encoding,
                         "compression_format": "zstd",
                         "checksum_format": "adler32",
                     },
@@ -195,6 +206,18 @@ class PullTest(unittest.TestCase):
         self.assert_at_version(1)
         self.pull(2)
         self.assert_at_version(2)
+
+    def test_sparse_xor_updates_and_verifies_canonical_checkpoint(self):
+        new = bytearray(self.pub.state["layer.a"])
+        new[3] ^= 0x41
+        new[-1] ^= 0x80
+        self.pub.publish_delta(
+            3,
+            {"layer.a": bytes(new)},
+            encoding="xor_sparse",
+        )
+        self.pull(3)
+        self.assert_at_version(3)
 
     def test_torn_apply_fails_closed(self):
         self.pull(1)

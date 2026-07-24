@@ -201,27 +201,34 @@ class DeepseekV2WeightLoaderMixin:
             ):
                 target_name = f"{prefix}fused_qkv_a_proj_with_mqa.weight"
                 target = context.host_tensor(target_name)
-                delta = context.source_tensor(source_name).contiguous()
-                if delta.ndim != 2 or target.ndim != 2:
+                source_signature = context.plan.source_signatures[source_name]
+                if len(source_signature.shape) != 2 or target.ndim != 2:
                     raise RuntimeDeltaCoverageError(
                         "DeepSeek fused-A runtime update requires 2D weights: "
-                        f"source={source_name!r} source_shape={tuple(delta.shape)} "
+                        f"source={source_name!r} "
+                        f"source_shape={source_signature.shape} "
                         f"target_shape={tuple(target.shape)}"
                     )
-                if delta.dtype != target.dtype or delta.shape[1] != target.shape[1]:
+                if (
+                    source_signature.dtype != target.dtype
+                    or source_signature.shape[1] != target.shape[1]
+                ):
                     raise RuntimeDeltaCoverageError(
                         "DeepSeek fused-A runtime dtype/width mismatch: "
                         f"source={source_name!r} "
-                        f"source={tuple(delta.shape)}/{delta.dtype} "
+                        f"source={source_signature.shape}/"
+                        f"{source_signature.dtype} "
                         f"target={tuple(target.shape)}/{target.dtype}"
                     )
+                source_rows = source_signature.shape[0]
                 destination = (
-                    target[: delta.shape[0]]
+                    target[:source_rows]
                     if source_name.endswith(".q_a_proj.weight")
-                    else target[-delta.shape[0] :]
+                    else target[-source_rows:]
                 )
-                destination.view(torch.uint8).bitwise_xor_(
-                    delta.view(torch.uint8)
+                context.xor_contiguous_target(
+                    source_name,
+                    destination,
                 )
                 handled.add(source_name)
                 continue

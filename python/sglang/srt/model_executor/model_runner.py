@@ -2000,6 +2000,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        refresh_host_runtime: bool = False,
+        weight_version: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         profile_enabled = os.environ.get("SGLANG_PROFILE_WEIGHT_RELOAD", "0") == "1"
@@ -2139,10 +2141,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
         if self.host_runtime_state is not None:
-            self.host_runtime_state.invalidate(
-                "GPU weights were updated through the disk loader; restart or "
-                "explicitly reseed the host runtime image before prepared updates"
-            )
+            if refresh_host_runtime:
+                if weight_version is None:
+                    self.host_runtime_state.invalidate(
+                        "disk reload requested a host-runtime refresh without a "
+                        "weight_version"
+                    )
+                    return (
+                        False,
+                        "refresh_host_runtime requires an explicit weight_version.",
+                    )
+                try:
+                    stats = self.host_runtime_state.capture_from_model(
+                        weight_version
+                    )
+                except Exception:
+                    logger.exception(
+                        "Disk reload succeeded but host-runtime recapture of "
+                        "version %s failed",
+                        weight_version,
+                    )
+                    return False, traceback.format_exc()
+                logger.info(
+                    "[RL_HOST_RUNTIME_RESEED] %s",
+                    json.dumps(stats, sort_keys=True),
+                )
+            else:
+                self.host_runtime_state.invalidate(
+                    "GPU weights were updated through the disk loader; use "
+                    "refresh_host_runtime with an explicit weight_version to "
+                    "reseed before prepared updates"
+                )
         return True, "Succeeded to update model weights."
 
     def update_weights_from_prepared(

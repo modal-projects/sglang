@@ -106,6 +106,8 @@ class BaseTpWorker(ABC):
             recv_req.model_path,
             recv_req.load_format,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            refresh_host_runtime=recv_req.refresh_host_runtime,
+            weight_version=recv_req.weight_version,
         )
         return success, message
 

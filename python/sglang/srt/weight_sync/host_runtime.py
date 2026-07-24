@@ -151,11 +151,20 @@ class HostRuntimeState:
     def capture_from_model(self, version: str) -> dict[str, int | float | str]:
         """Seed or explicitly recover the host image from active GPU weights."""
 
-        copies, wall_s = self._copy_model_to_image()
+        self.valid = False
+        self.prepared = False
+        self.invalid_reason = f"host-runtime capture of version {version} is incomplete"
+        try:
+            copies, wall_s = self._copy_model_to_image()
+        except Exception as exc:
+            self.invalid_reason = (
+                f"host-runtime capture of version {version} failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
         self.host_version = version
         self.gpu_version = version
         self.valid = True
-        self.prepared = False
         self.invalid_reason = None
         return self._stats("capture", version, copies, wall_s)
 

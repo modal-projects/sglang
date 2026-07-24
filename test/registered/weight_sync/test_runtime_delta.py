@@ -9,14 +9,15 @@ import pytest
 import torch
 import zstandard
 
-from sglang.srt.weight_sync.runtime_delta import (
-    RuntimeDeltaCoverageError,
-    RuntimeDeltaPlan,
-)
 from sglang.srt.layers.quantization.modelopt_quant import (
     _interleave_trtllm_nvfp4_scales,
     _shuffle_trtllm_epilogue_rows,
     _trtllm_nvfp4_sparse_byte_permutation,
+)
+from sglang.srt.weight_sync.host_runtime import HostRuntimeState
+from sglang.srt.weight_sync.runtime_delta import (
+    RuntimeDeltaCoverageError,
+    RuntimeDeltaPlan,
 )
 
 
@@ -129,6 +130,23 @@ def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return torch.empty(0, dtype=torch.uint8).set_(
         storage, 0, (storage.nbytes(),), (1,)
     )
+
+
+def test_host_runtime_recapture_fails_closed():
+    state = object.__new__(HostRuntimeState)
+    state.valid = True
+    state.prepared = True
+    state.invalid_reason = None
+
+    def fail_copy():
+        raise RuntimeError("copy failed")
+
+    state._copy_model_to_image = fail_copy
+    with pytest.raises(RuntimeError, match="copy failed"):
+        state.capture_from_model("0")
+    assert state.valid is False
+    assert state.prepared is False
+    assert "capture of version 0 failed" in state.invalid_reason
 
 
 def _write_delta(

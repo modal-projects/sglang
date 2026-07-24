@@ -1527,6 +1527,10 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata
     manifest: Optional[Dict[str, Any]] = None
+    # Recapture the successfully loaded live model into the pinned host-runtime
+    # image. This is opt-in for lineage resets; an ordinary disk reload instead
+    # invalidates any host image whose version can no longer be trusted.
+    refresh_host_runtime: bool = False
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):

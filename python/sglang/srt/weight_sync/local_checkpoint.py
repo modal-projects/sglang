@@ -39,6 +39,7 @@ import struct
 import threading
 import time
 import zlib
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Optional
@@ -355,7 +356,12 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
     workers = min(_SEED_COPY_WORKERS, len(src_files) or 1)
     logger.info(
         "staging checkpoint v%d to local disk: %.0f GB in %d shards, %d parallel streams (%s -> %s)",
-        version, total_gb, len(src_files), workers, src_dir, local_checkpoint_dir,
+        version,
+        total_gb,
+        len(src_files),
+        workers,
+        src_dir,
+        local_checkpoint_dir,
     )
     start = time.monotonic()
     progress = {"done_gb": 0.0, "next_log_gb": _SEED_LOG_STEP_GB}
@@ -370,7 +376,9 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
             with open(entry.path, "rb") as src, open(dst, "wb") as out:
                 while chunk := src.read(_SEED_COPY_CHUNK):
                     out.write(chunk)
-            _drop_page_cache(entry.path)  # don't let the source evict the local copy we keep resident
+            _drop_page_cache(
+                entry.path
+            )  # don't let the source evict the local copy we keep resident
         with progress_lock:
             progress["done_gb"] += entry.stat().st_size / 1e9
             done = progress["done_gb"]
@@ -378,7 +386,11 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
                 rate = done / max(time.monotonic() - start, 1e-3)
                 logger.info(
                     "staging checkpoint v%d to local disk: %.0f/%.0f GB (%.0f%%), %.1f GB/s",
-                    version, done, total_gb, 100 * done / max(total_gb, 1e-9), rate,
+                    version,
+                    done,
+                    total_gb,
+                    100 * done / max(total_gb, 1e-9),
+                    rate,
                 )
                 progress["next_log_gb"] += _SEED_LOG_STEP_GB
 
@@ -441,6 +453,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     """Apply one version's delta in place: decompress + apply + checksum each tensor across a thread
     pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
     """
+    started = time.perf_counter()
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
         index = json.load(f)
     meta = index["metadata"]
@@ -473,9 +486,16 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     lock = threading.Lock()
     expected_names = set(index.get("weight_map", {}))
     seen_names: set[str] = set()
+    stage_wall_s: Counter[str] = Counter()
+    worker_cpu_s: Counter[str] = Counter()
+    compressed_bytes = 0
+    logical_bytes = 0
+    max_compressed_shard_bytes = 0
     try:
-        def apply_xor(item) -> None:
+
+        def apply_xor(item) -> dict[str, float]:
             name, compressed, path, offset, nbytes, want = item
+            worker_started = time.perf_counter()
             region = np.ndarray(
                 (nbytes,), dtype=np.uint8, buffer=open_mmaps[path][1], offset=offset
             )
@@ -495,26 +515,41 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             if actual != want:
                 with lock:
                     mismatches.append((name, want, actual))
+            return {"decompress_xor_checksum": time.perf_counter() - worker_started}
 
-        def apply_overwrite(item) -> None:
+        def apply_overwrite(item) -> dict[str, float]:
             name, compressed, path, offset, nbytes, want = item
+            stage_started = time.perf_counter()
             delta = np.frombuffer(
                 zstandard.ZstdDecompressor().decompress(compressed), dtype=np.uint8
             )
+            decompress_s = time.perf_counter() - stage_started
             region = np.ndarray(
                 (nbytes,), dtype=np.uint8, buffer=open_mmaps[path][1], offset=offset
             )
+            stage_started = time.perf_counter()
             count = int.from_bytes(delta[:4], "little")
             positions = np.frombuffer(delta[4 : 4 + 4 * count], dtype="<u4")
             region[positions] = delta[4 + 4 * count :]
+            mutate_s = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             actual = _checksum(algorithm, region)
+            checksum_s = time.perf_counter() - stage_started
             if actual != want:
                 with lock:
                     mismatches.append((name, want, actual))
+            return {
+                "decompress": decompress_s,
+                "mutate": mutate_s,
+                "checksum": checksum_s,
+            }
 
-        def apply_sparse_xor(item) -> None:
+        def apply_sparse_xor(item) -> dict[str, float]:
             name, compressed, path, offset, nbytes, want = item
+            stage_started = time.perf_counter()
             encoded = zstandard.ZstdDecompressor().decompress(compressed)
+            decompress_s = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             if len(encoded) < 8:
                 raise RuntimeError(
                     f"sparse XOR payload for {name!r} is shorter than its count"
@@ -553,10 +588,17 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                 offset=offset,
             )
             region[positions] ^= values
+            mutate_s = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
             actual = _checksum(algorithm, region)
+            checksum_s = time.perf_counter() - stage_started
             if actual != want:
                 with lock:
                     mismatches.append((name, want, actual))
+            return {
+                "decompress_and_mutate": decompress_s + mutate_s,
+                "checksum": checksum_s,
+            }
 
         if encoding == "xor":
             apply_tensor = apply_xor
@@ -574,8 +616,15 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
             for filename in sorted(set(index.get("weight_map", {}).values())):
                 delta_file = os.path.join(version_dir, filename)
+                stage_started = time.perf_counter()
                 with open(delta_file, "rb") as f:
                     blob = f.read()
+                stage_wall_s["read_compressed"] += time.perf_counter() - stage_started
+                compressed_bytes += len(blob)
+                max_compressed_shard_bytes = max(
+                    max_compressed_shard_bytes,
+                    len(blob),
+                )
                 # Verify the whole file arrived before mutating any tensor from
                 # it. A short read is source readiness, not local corruption.
                 expected = _safetensors_size(blob)
@@ -604,6 +653,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                     seen_names.add(name)
                     begin, end = info["data_offsets"]
                     path, offset, nbytes = locations[name]
+                    logical_bytes += nbytes
                     if path not in open_mmaps:
                         fh = open(path, "r+b")
                         mm = mmap.mmap(fh.fileno(), 0)
@@ -624,7 +674,13 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                             want_checksums.get(name),
                         )
                     )
-                list(pool.map(apply_tensor, items))
+                stage_started = time.perf_counter()
+                profiles = list(pool.map(apply_tensor, items))
+                stage_wall_s["apply_and_checksum"] += (
+                    time.perf_counter() - stage_started
+                )
+                for profile in profiles:
+                    worker_cpu_s.update(profile)
                 del items, view, blob
 
         if seen_names != expected_names:
@@ -637,8 +693,10 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         # durable over data pages that never made it to disk, or a power loss
         # after a "successful" apply would silently serve stale bytes forever.
         # Only the delta's dirty pages get written, so the cost is O(delta).
+        stage_started = time.perf_counter()
         for _, mm in open_mmaps.values():
             mm.flush()
+        stage_wall_s["flush"] += time.perf_counter() - stage_started
     finally:
         for fh, mm in open_mmaps.values():
             mm.close()
@@ -653,6 +711,30 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             f"{version_dir}: {sample}"
         )
     _write_applied_version(local_checkpoint_dir, int(meta["version"]))
+    logger.info(
+        "[RL_LOCAL_CHECKPOINT_APPLY] %s",
+        json.dumps(
+            {
+                "version": int(meta["version"]),
+                "encoding": encoding,
+                "tensors": len(seen_names),
+                "logical_bytes": logical_bytes,
+                "compressed_bytes": compressed_bytes,
+                "max_compressed_shard_bytes": max_compressed_shard_bytes,
+                "workers": NUM_WORKERS,
+                "stage_wall_s": {
+                    name: round(value, 6)
+                    for name, value in sorted(stage_wall_s.items())
+                },
+                "worker_cpu_s": {
+                    name: round(value, 6)
+                    for name, value in sorted(worker_cpu_s.items())
+                },
+                "wall_s": round(time.perf_counter() - started, 6),
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -> None:
@@ -684,8 +766,13 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
             raise RuntimeError(
                 f"out-of-order delta v{v}: builds on {meta['base_version']}, local at {prev}"
             )
-        if meta.get("delta_encoding") != "xor" or meta.get("compression_format") != "zstd":
-            for w in range(lo, hi + 1):  # not a pure-xor range — the safe per-version path
+        if (
+            meta.get("delta_encoding") != "xor"
+            or meta.get("compression_format") != "zstd"
+        ):
+            for w in range(
+                lo, hi + 1
+            ):  # not a pure-xor range — the safe per-version path
                 _apply_delta(local_checkpoint_dir, _version_dir(source_dir, w))
             return
         for blob_name in sorted(set(index.get("weight_map", {}).values())):
@@ -748,7 +835,9 @@ def _apply_range(local_checkpoint_dir: str, source_dir: str, lo: int, hi: int) -
                 touched = True
                 reader = dctx.stream_reader(view)
                 pos = 0
-                while pos < nbytes:  # stream: no full-tensor delta buffer, L2-resident chunks
+                while (
+                    pos < nbytes
+                ):  # stream: no full-tensor delta buffer, L2-resident chunks
                     block = reader.read(min(4 << 20, nbytes - pos))
                     if not block:
                         break

@@ -491,6 +491,15 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     compressed_bytes = 0
     logical_bytes = 0
     max_compressed_shard_bytes = 0
+    decoder_local = threading.local()
+
+    def thread_decompressor() -> zstandard.ZstdDecompressor:
+        decompressor = getattr(decoder_local, "zstd", None)
+        if decompressor is None:
+            decompressor = zstandard.ZstdDecompressor()
+            decoder_local.zstd = decompressor
+        return decompressor
+
     try:
 
         def apply_xor(item) -> dict[str, float]:
@@ -500,17 +509,17 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                 (nbytes,), dtype=np.uint8, buffer=open_mmaps[path][1], offset=offset
             )
             hasher = _new_hasher(algorithm)
-            reader = zstandard.ZstdDecompressor().stream_reader(compressed)
-            pos = 0
-            # 2 MB chunks stay L2-resident across decompress -> XOR -> checksum
-            while pos < nbytes:
-                block = reader.read(min(2 << 20, nbytes - pos))
-                if not block:
-                    break
-                chunk = np.frombuffer(block, dtype=np.uint8)
-                region[pos : pos + chunk.size] ^= chunk
-                hasher.update(region[pos : pos + chunk.size])
-                pos += chunk.size
+            with thread_decompressor().stream_reader(compressed) as reader:
+                pos = 0
+                # 2 MB chunks stay L2-resident across decompress -> XOR -> checksum
+                while pos < nbytes:
+                    block = reader.read(min(2 << 20, nbytes - pos))
+                    if not block:
+                        break
+                    chunk = np.frombuffer(block, dtype=np.uint8)
+                    region[pos : pos + chunk.size] ^= chunk
+                    hasher.update(region[pos : pos + chunk.size])
+                    pos += chunk.size
             actual = hasher.hexdigest()
             if actual != want:
                 with lock:
@@ -521,7 +530,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             name, compressed, path, offset, nbytes, want = item
             stage_started = time.perf_counter()
             delta = np.frombuffer(
-                zstandard.ZstdDecompressor().decompress(compressed), dtype=np.uint8
+                thread_decompressor().decompress(compressed), dtype=np.uint8
             )
             decompress_s = time.perf_counter() - stage_started
             region = np.ndarray(
@@ -547,7 +556,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         def apply_sparse_xor(item) -> dict[str, float]:
             name, compressed, path, offset, nbytes, want = item
             stage_started = time.perf_counter()
-            encoded = zstandard.ZstdDecompressor().decompress(compressed)
+            encoded = thread_decompressor().decompress(compressed)
             decompress_s = time.perf_counter() - stage_started
             stage_started = time.perf_counter()
             if len(encoded) < 8:

@@ -219,6 +219,38 @@ class PullTest(unittest.TestCase):
         self.pull(3)
         self.assert_at_version(3)
 
+    def test_sparse_xor_bad_target_checksum_fails_closed(self):
+        new = bytearray(self.pub.state["layer.a"])
+        new[3] ^= 0x41
+        self.pub.publish_delta(
+            3,
+            {"layer.a": bytes(new)},
+            encoding="xor_sparse",
+        )
+        shard = os.path.join(
+            self.pub.source_dir,
+            "weight_v000003",
+            Publisher.SHARD,
+        )
+        with open(shard, "rb") as f:
+            blob = f.read()
+        (header_len,) = struct.unpack("<Q", blob[:8])
+        header = json.loads(blob[8 : 8 + header_len])
+        expected = header["__metadata__"]["layer.a"]
+        header["__metadata__"]["layer.a"] = "0" * len(expected)
+        encoded_header = json.dumps(header, separators=(",", ":")).encode()
+        self.assertLessEqual(len(encoded_header), header_len)
+        encoded_header = encoded_header.ljust(header_len, b" ")
+        with open(shard, "wb") as f:
+            f.write(struct.pack("<Q", header_len))
+            f.write(encoded_header)
+            f.write(blob[8 + header_len :])
+
+        with self.assertRaises(local_checkpoint.CheckpointChecksumError):
+            self.pull(3)
+        with self.assertRaises(local_checkpoint.InvalidLocalCheckpointError):
+            local_checkpoint._read_applied_version(self.local)
+
     def test_torn_apply_fails_closed(self):
         self.pull(1)
         # Simulate an apply of v2 killed mid-mutation: marker still at 1, some

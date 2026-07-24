@@ -2014,6 +2014,23 @@ def _apply_trtllm_nvfp4_moe_source_xor(
     target_expert.view(torch.uint8).bitwise_xor_(transformed)
 
 
+def _host_runtime_delta_local_name(plan, source_name: str) -> str:
+    """Return the one fused-MoE parameter fed by a checkpoint source."""
+
+    from sglang.srt.weight_sync.runtime_delta import RuntimeDeltaCoverageError
+
+    local_names = {
+        copy.parameter_name.rsplit(".", 1)[-1]
+        for copy in plan.direct_copies[source_name]
+    }
+    if len(local_names) != 1:
+        raise RuntimeDeltaCoverageError(
+            "one NVFP4 checkpoint tensor must map to one fused-MoE parameter: "
+            f"{source_name!r} -> {sorted(local_names)}"
+        )
+    return next(iter(local_names))
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2069,23 +2086,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Packed weights and block scales undergo only fixed byte permutations,
         so the same permutations can be applied directly to XOR bytes. Small
-        raw scale parameters are updated in place and their derived runtime
-        scalars are then recomputed on CPU.
+        raw scale parameters are updated in place. Derived runtime scalars are
+        recomputed once, after all streamed sources have been applied, by
+        :meth:`finalize_host_runtime_delta`.
         """
 
         from sglang.srt.weight_sync.runtime_delta import (
             RuntimeDeltaCoverageError,
         )
-
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
-        if not moe_runner_backend.is_flashinfer_trtllm():
-            raise RuntimeDeltaCoverageError(
-                "ModelOpt NVFP4 host runtime updates currently require the "
-                "flashinfer_trtllm MoE layout; "
-                f"module={module_name!r} backend={moe_runner_backend}"
-            )
 
         transformed = {
             "w13_weight",
@@ -2100,21 +2108,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale",
         }
         handled: set[str] = set()
-        recompute_derived = False
         for source_name in sorted(source_names):
             copies = context.direct_copies(source_name)
-            local_names = {
-                copy.parameter_name.rsplit(".", 1)[-1] for copy in copies
-            }
-            if len(local_names) != 1:
-                raise RuntimeDeltaCoverageError(
-                    "one NVFP4 checkpoint tensor must map to one fused-MoE "
-                    f"parameter: {source_name!r} -> {sorted(local_names)}"
-                )
-            local_name = next(iter(local_names))
+            local_name = _host_runtime_delta_local_name(
+                context.plan,
+                source_name,
+            )
             if local_name in derived_inputs:
                 context.xor_direct(source_name)
-                recompute_derived = True
             elif local_name in transformed:
                 for copy in copies:
                     _apply_trtllm_nvfp4_moe_source_xor(
@@ -2131,13 +2132,77 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             handled.add(source_name)
 
-        if recompute_derived:
+        return handled
+
+    def validate_host_runtime_delta_sources(
+        self,
+        *,
+        layer: torch.nn.Module,
+        module_name: str,
+        plan,
+        source_names: set[str],
+    ) -> None:
+        """Reject an unsupported backend/source set before host-image mutation."""
+
+        from sglang.srt.weight_sync.runtime_delta import (
+            RuntimeDeltaCoverageError,
+        )
+
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if not moe_runner_backend.is_flashinfer_trtllm():
+            raise RuntimeDeltaCoverageError(
+                "ModelOpt NVFP4 host runtime updates currently require the "
+                "flashinfer_trtllm MoE layout; "
+                f"module={module_name!r} backend={moe_runner_backend}"
+            )
+        supported = {
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        }
+        unsupported = {
+            _host_runtime_delta_local_name(plan, source_name)
+            for source_name in source_names
+        } - supported
+        if unsupported:
+            raise RuntimeDeltaCoverageError(
+                "unsupported ModelOpt NVFP4 runtime inputs for "
+                f"{module_name!r}: {sorted(unsupported)}"
+            )
+
+    def finalize_host_runtime_delta(
+        self,
+        *,
+        layer: torch.nn.Module,
+        module_name: str,
+        context,
+        source_names: set[str],
+    ) -> None:
+        """Recompute values derived from raw scales once per updated module."""
+
+        derived_inputs = {
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        }
+        if any(
+            _host_runtime_delta_local_name(context.plan, source_name)
+            in derived_inputs
+            for source_name in source_names
+        ):
             self._recompute_host_runtime_derived_scales(
                 layer=layer,
                 module_name=module_name,
                 context=context,
             )
-        return handled
 
     def _recompute_host_runtime_derived_scales(
         self,

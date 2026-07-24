@@ -18,6 +18,7 @@ import os
 import struct
 import threading
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -560,9 +561,10 @@ class RuntimeDeltaPlan:
             )
 
         started = time.perf_counter()
+        stage_wall_s: Counter[str] = Counter()
         changed_sources = 0
         logical_bytes = 0
-        hook_payloads: dict[str, bytes] = {}
+        max_raw_bytes = 0
         versions: list[tuple[int, str]] = []
         changed_names: set[str] = set()
         for version in range(base_version + 1, target_version + 1):
@@ -622,18 +624,44 @@ class RuntimeDeltaPlan:
         if needed_model_hooks and validate_model_hook is not None:
             validate_model_hook(needed_model_hooks)
 
+        modules = dict(model.named_modules())
+        quant_sources_by_module: dict[str, set[str]] = {}
+        for name in changed_names & self.quant_adapter_sources.keys():
+            quant_sources_by_module.setdefault(
+                self.quant_adapter_sources[name],
+                set(),
+            ).add(name)
+        for module_name, names in quant_sources_by_module.items():
+            quant_method = getattr(modules[module_name], "quant_method", None)
+            validate_adapter = getattr(
+                quant_method,
+                "validate_host_runtime_delta_sources",
+                None,
+            )
+            if validate_adapter is not None:
+                validate_adapter(
+                    layer=modules[module_name],
+                    module_name=module_name,
+                    plan=self,
+                    source_names=names,
+                )
+
         for _, version_dir in versions:
+            stage_started = time.perf_counter()
             _, payloads = _read_delta_payloads(version_dir)
+            stage_wall_s["read_compressed"] += time.perf_counter() - stage_started
             for name, compressed in payloads.items():
                 signature = self.source_signatures.get(name)
                 if signature is None:
                     raise RuntimeError(
                         f"runtime delta source was absent from initial load: {name!r}"
                     )
+                stage_started = time.perf_counter()
                 raw = zstandard.ZstdDecompressor().decompress(
                     compressed,
                     max_output_size=signature.storage_nbytes,
                 )
+                stage_wall_s["decompress"] += time.perf_counter() - stage_started
                 if len(raw) != signature.storage_nbytes:
                     raise RuntimeError(
                         f"runtime delta size mismatch for {name!r}: "
@@ -641,78 +669,118 @@ class RuntimeDeltaPlan:
                     )
                 changed_sources += 1
                 logical_bytes += len(raw)
+                max_raw_bytes = max(max_raw_bytes, len(raw))
+                stage_started = time.perf_counter()
                 if name in self.runtime_copies:
                     self._apply_direct_xor(host_image, name, raw)
-                else:
-                    # The newest delta for a source supersedes neither an older
-                    # XOR nor its derived effects. Accumulate its XOR bytes.
-                    previous = hook_payloads.get(name)
-                    if previous is None:
-                        hook_payloads[name] = raw
-                    else:
-                        accumulated = torch.frombuffer(
-                            bytearray(previous), dtype=torch.uint8
-                        )
-                        accumulated.bitwise_xor_(
-                            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-                        )
-                        hook_payloads[name] = bytes(accumulated.numpy())
+                    stage_wall_s["direct"] += (
+                        time.perf_counter() - stage_started
+                    )
+                    continue
 
-        if hook_payloads:
-            context = RuntimeDeltaUpdateContext(
-                plan=self,
-                host_image=host_image,
-                source_deltas=hook_payloads,
-            )
-            handled: set[str] = set()
-            modules = dict(model.named_modules())
-            adapter_groups: dict[str, set[str]] = {}
-            for name in hook_payloads:
+                context = RuntimeDeltaUpdateContext(
+                    plan=self,
+                    host_image=host_image,
+                    source_deltas={name: raw},
+                )
                 module_name = self.quant_adapter_sources.get(name)
                 if module_name is not None:
-                    adapter_groups.setdefault(module_name, set()).add(name)
-            for module_name, names in adapter_groups.items():
-                module = modules[module_name]
-                quant_method = getattr(module, "quant_method", None)
-                apply_adapter = getattr(
-                    quant_method,
-                    "apply_host_runtime_delta",
-                    None,
-                )
-                if apply_adapter is None:
-                    raise RuntimeDeltaCoverageError(
-                        "quantization method declared host runtime sources but "
-                        "does not implement apply_host_runtime_delta: "
-                        f"module={module_name!r} "
-                        f"method={type(quant_method).__name__}"
+                    module = modules[module_name]
+                    quant_method = getattr(module, "quant_method", None)
+                    apply_adapter = getattr(
+                        quant_method,
+                        "apply_host_runtime_delta",
+                        None,
                     )
-                handled.update(
-                    apply_adapter(
-                        layer=module,
-                        module_name=module_name,
-                        context=context,
-                        source_names=names,
+                    if apply_adapter is None:
+                        raise RuntimeDeltaCoverageError(
+                            "quantization method declared host runtime sources but "
+                            "does not implement apply_host_runtime_delta: "
+                            f"module={module_name!r} "
+                            f"method={type(quant_method).__name__}"
+                        )
+                    handled = set(
+                        apply_adapter(
+                            layer=module,
+                            module_name=module_name,
+                            context=context,
+                            source_names={name},
+                        )
                     )
-                )
+                    if handled != {name}:
+                        raise RuntimeError(
+                            "runtime delta quant adapter coverage mismatch: "
+                            f"source={name!r} handled={sorted(handled)}"
+                        )
+                    stage_wall_s["quant_adapter"] += (
+                        time.perf_counter() - stage_started
+                    )
+                    continue
 
-            for name in set(hook_payloads) & self.dtype_conversion_sources:
-                context.apply_dtype_conversion(name)
-                handled.add(name)
+                if name in self.dtype_conversion_sources:
+                    context.apply_dtype_conversion(name)
+                    stage_wall_s["dtype_conversion"] += (
+                        time.perf_counter() - stage_started
+                    )
+                    continue
 
-            model_names = (
-                set(hook_payloads)
-                - self.quant_adapter_sources.keys()
-                - self.dtype_conversion_sources
-            )
-            if model_names:
-                handled.update(
+                handled = set(
                     model_hook(
                         context=context,
-                        source_names=model_names,
+                        source_names={name},
                     )
                 )
-            missing = set(hook_payloads) - handled
-            extra = handled - set(hook_payloads)
+                if handled != {name}:
+                    raise RuntimeError(
+                        "runtime delta model hook coverage mismatch: "
+                        f"source={name!r} handled={sorted(handled)}"
+                    )
+                stage_wall_s["model_hook"] += (
+                    time.perf_counter() - stage_started
+                )
+
+        finalize_started = time.perf_counter()
+        empty_context = RuntimeDeltaUpdateContext(
+            plan=self,
+            host_image=host_image,
+            source_deltas={},
+        )
+        for module_name, names in quant_sources_by_module.items():
+            module = modules[module_name]
+            quant_method = getattr(module, "quant_method", None)
+            finalize_adapter = getattr(
+                quant_method,
+                "finalize_host_runtime_delta",
+                None,
+            )
+            if finalize_adapter is not None:
+                finalize_adapter(
+                    layer=module,
+                    module_name=module_name,
+                    context=empty_context,
+                    source_names=names,
+                )
+        finalize_model_hook = getattr(
+            model,
+            "finalize_host_runtime_delta",
+            None,
+        )
+        if needed_model_hooks and finalize_model_hook is not None:
+            finalize_model_hook(
+                context=empty_context,
+                source_names=needed_model_hooks,
+            )
+        stage_wall_s["finalize"] += time.perf_counter() - finalize_started
+
+        accounted = (
+            changed_names & self.runtime_copies.keys()
+            | changed_names & self.quant_adapter_sources.keys()
+            | changed_names & self.dtype_conversion_sources
+            | needed_model_hooks
+        )
+        if accounted != changed_names:
+            missing = changed_names - accounted
+            extra = accounted - changed_names
             if missing or extra:
                 raise RuntimeError(
                     "runtime delta hook coverage mismatch: "
@@ -724,7 +792,14 @@ class RuntimeDeltaPlan:
             "target_version": target_version,
             "changed_sources": changed_sources,
             "logical_bytes": logical_bytes,
-            "hook_sources": len(hook_payloads),
+            "hook_sources": len(
+                changed_names - self.runtime_copies.keys()
+            ),
+            "max_raw_bytes": max_raw_bytes,
+            "stage_wall_s": {
+                name: round(value, 6)
+                for name, value in sorted(stage_wall_s.items())
+            },
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
@@ -737,7 +812,7 @@ class RuntimeDeltaPlan:
         copies: Optional[list[RuntimeCopy]] = None,
     ) -> None:
         signature = self.source_signatures[source_name]
-        source_bytes = torch.frombuffer(bytearray(raw_delta), dtype=torch.uint8)
+        source_bytes = _readonly_bytes_as_tensor(raw_delta)
         source = torch.empty(0, dtype=signature.dtype).set_(
             source_bytes.untyped_storage(),
             signature.storage_offset,
@@ -782,10 +857,7 @@ class RuntimeDeltaUpdateContext:
 
     def source_tensor(self, source_name: str) -> torch.Tensor:
         signature = self.plan.source_signatures[source_name]
-        source_bytes = torch.frombuffer(
-            bytearray(self.source_deltas[source_name]),
-            dtype=torch.uint8,
-        )
+        source_bytes = _readonly_bytes_as_tensor(self.source_deltas[source_name])
         return torch.empty(0, dtype=signature.dtype).set_(
             source_bytes.untyped_storage(),
             signature.storage_offset,
@@ -869,6 +941,18 @@ class RuntimeDeltaUpdateContext:
                 source_delta.contiguous().view(torch.uint8)
             )
             destination.copy_(reconstructed)
+
+
+def _readonly_bytes_as_tensor(value: bytes) -> torch.Tensor:
+    """Create a zero-copy read-only byte view without PyTorch's one-time warning."""
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given buffer is not writable",
+            category=UserWarning,
+        )
+        return torch.frombuffer(value, dtype=torch.uint8)
 
 
 def _safetensors_size(blob: bytes) -> Optional[int]:

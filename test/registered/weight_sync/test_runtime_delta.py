@@ -54,6 +54,38 @@ class _QuantAdapterWithoutApply:
         return ("weight",)
 
 
+class _StreamingQuantAdapter:
+    def __init__(self):
+        self.validated = 0
+        self.applied = 0
+        self.finalized = 0
+
+    @staticmethod
+    def host_runtime_delta_parameter_names(layer):
+        return ("weight",)
+
+    def validate_host_runtime_delta_sources(
+        self, *, layer, module_name, plan, source_names
+    ):
+        assert source_names == {"weight"}
+        self.validated += 1
+
+    def apply_host_runtime_delta(
+        self, *, layer, module_name, context, source_names
+    ):
+        assert source_names == {"weight"}
+        context.xor_direct("weight")
+        self.applied += 1
+        return source_names
+
+    def finalize_host_runtime_delta(
+        self, *, layer, module_name, context, source_names
+    ):
+        assert source_names == {"weight"}
+        assert context.source_deltas == {}
+        self.finalized += 1
+
+
 class _PaddedCopyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -183,6 +215,36 @@ def test_quantized_destination_requires_explicit_hook_before_mutation():
                 target_version=1,
             )
     assert torch.equal(host_image, before)
+
+
+def test_quant_adapter_streams_one_source_then_finalizes_once():
+    old = torch.arange(12, dtype=torch.int32)
+    new = old.clone()
+    new[3] = 700
+    new[8] = -123
+    model = _CopyModel()
+    adapter = _StreamingQuantAdapter()
+    model.quant_method = adapter
+    plan, stats = _record_and_finalize(model, old)
+    assert stats["hook_sources"] == 1
+
+    host_image = _storage_bytes(model.weight).clone()
+    with tempfile.TemporaryDirectory() as source_dir:
+        _write_delta(source_dir, old, new)
+        apply_stats = plan.apply_versions(
+            model=model,
+            host_image=host_image,
+            source_dir=source_dir,
+            base_version=0,
+            target_version=1,
+        )
+
+    assert torch.equal(host_image.view(torch.int32), new[2:10])
+    assert adapter.validated == 1
+    assert adapter.applied == 1
+    assert adapter.finalized == 1
+    assert apply_stats["max_raw_bytes"] == old.untyped_storage().nbytes()
+    assert apply_stats["stage_wall_s"]["quant_adapter"] >= 0
 
 
 def test_trtllm_row_shuffle_matches_flashinfer_index_definition():

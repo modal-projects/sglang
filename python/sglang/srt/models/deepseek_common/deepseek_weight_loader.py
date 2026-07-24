@@ -178,7 +178,7 @@ class DeepseekV2WeightLoaderMixin:
             )
 
     def apply_host_runtime_delta(self, *, context, source_names):
-        """Update DeepSeek fused-A and MLA-derived host runtime tensors."""
+        """Apply streamed DeepSeek checkpoint deltas to raw runtime tensors."""
 
         from sglang.srt.weight_sync.runtime_delta import (
             RuntimeDeltaCoverageError,
@@ -195,8 +195,6 @@ class DeepseekV2WeightLoaderMixin:
                     f"unsupported DeepSeek runtime delta source {source_name!r}"
                 )
             prefix = match.group("prefix")
-            layer_id = int(match.group("layer"))
-            self_attn = self.model.layers[layer_id].self_attn
 
             if source_name.endswith(
                 (".q_a_proj.weight", ".kv_a_proj_with_mqa.weight")
@@ -236,19 +234,6 @@ class DeepseekV2WeightLoaderMixin:
                         f"kv_b_proj, got {raw.dtype} for {source_name!r}"
                     )
                 context.xor_direct(source_name)
-                w_kc, w_vc = raw.unflatten(
-                    0,
-                    (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
-                ).split(
-                    [self_attn.qk_nope_head_dim, self_attn.v_head_dim],
-                    dim=1,
-                )
-                expected_kc = (
-                    w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
-                expected_vc = w_vc.contiguous().transpose(1, 2)
-                context.host_tensor(f"{prefix}w_kc").copy_(expected_kc)
-                context.host_tensor(f"{prefix}w_vc").copy_(expected_vc)
                 handled.add(source_name)
                 continue
 
@@ -256,6 +241,40 @@ class DeepseekV2WeightLoaderMixin:
                 f"unsupported DeepSeek runtime delta source {source_name!r}"
             )
         return handled
+
+    def finalize_host_runtime_delta(self, *, context, source_names) -> None:
+        """Rebuild MLA absorb weights once after all streamed XORs are applied."""
+
+        from sglang.srt.weight_sync.runtime_delta import (
+            RuntimeDeltaCoverageError,
+        )
+
+        for source_name in sorted(source_names):
+            if not source_name.endswith(".kv_b_proj.weight"):
+                continue
+            match = re.search(
+                r"(?P<prefix>.*model\.layers\.(?P<layer>\d+)\.self_attn\.)",
+                source_name,
+            )
+            if match is None:
+                raise RuntimeDeltaCoverageError(
+                    f"unsupported DeepSeek runtime delta source {source_name!r}"
+                )
+            prefix = match.group("prefix")
+            layer_id = int(match.group("layer"))
+            self_attn = self.model.layers[layer_id].self_attn
+            raw = context.host_tensor(f"{prefix}kv_b_proj.weight")
+            w_kc, w_vc = raw.unflatten(
+                0,
+                (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
+            ).split(
+                [self_attn.qk_nope_head_dim, self_attn.v_head_dim],
+                dim=1,
+            )
+            expected_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            expected_vc = w_vc.contiguous().transpose(1, 2)
+            context.host_tensor(f"{prefix}w_kc").copy_(expected_kc)
+            context.host_tensor(f"{prefix}w_vc").copy_(expected_vc)
 
     def do_load_weights(
         self,

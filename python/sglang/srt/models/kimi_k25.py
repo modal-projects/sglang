@@ -811,6 +811,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
             source_names=source_names,
         )
 
+    def finalize_host_runtime_delta(self, *, context, source_names):
+        if self.language_model is None:
+            return
+        self.language_model.finalize_host_runtime_delta(
+            context=context,
+            source_names=source_names,
+        )
+
     def validate_host_runtime_delta_sources(self, source_names):
         if self.language_model is None:
             return

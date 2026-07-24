@@ -222,14 +222,6 @@ class HostRuntimeState:
                 target_version=target_version,
             )
         except Exception as exc:
-            from sglang.srt.weight_sync.runtime_delta import (
-                RuntimeDeltaCoverageError,
-            )
-
-            if isinstance(exc, RuntimeDeltaCoverageError):
-                # Coverage is validated before the one-image state is mutated,
-                # so the existing host mirror remains trustworthy and retryable.
-                raise
             self.invalidate(
                 f"runtime preparation to v{target_version} failed: "
                 f"{type(exc).__name__}: {exc}"

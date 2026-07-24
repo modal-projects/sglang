@@ -471,60 +471,9 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     open_mmaps = {}
     mismatches: list[tuple[str, Optional[str], str]] = []
     lock = threading.Lock()
-    file_bytes = []  # keep alive: items hold zero-copy views into these
-    items = []  # (name, compressed_view, path, offset, nbytes, want_checksum)
+    expected_names = set(index.get("weight_map", {}))
+    seen_names: set[str] = set()
     try:
-        for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
-            with open(delta_file, "rb") as f:
-                # One whole-file read pulls a lazily-fetched mount in a single
-                # shot, and the XOR below reads from this in-memory buffer, so the
-                # apply is immune to the mount changing under it. (No on-disk
-                # staging step — the buffer IS the stable snapshot.)
-                blob = f.read()
-            # Verify the whole file arrived (its length matches its own
-            # safetensors header) BEFORE building any item: a short read == a
-            # not-yet-materialized source, so fail fast (FileNotFoundError ->
-            # caller reloads + retries) rather than XOR a partial delta and
-            # corrupt the checkpoint.
-            expected = _safetensors_size(blob)
-            if expected is None or len(blob) != expected:
-                raise FileNotFoundError(
-                    f"incomplete source blob {delta_file}: {len(blob)}B, header "
-                    f"declares {expected}B (not fully materialized)"
-                )
-            file_bytes.append(blob)
-            (header_len,) = struct.unpack("<Q", blob[:8])
-            header = json.loads(blob[8 : 8 + header_len])
-            want_checksums = header.get("__metadata__", {})
-            view = memoryview(blob)
-            for name, info in header.items():
-                if name == "__metadata__":
-                    continue
-                begin, end = info["data_offsets"]
-                path, offset, nbytes = locations[name]
-                if path not in open_mmaps:
-                    fh = open(path, "r+b")
-                    open_mmaps[path] = (fh, mmap.mmap(fh.fileno(), 0))
-                data_start = 8 + header_len
-                items.append(
-                    (
-                        name,
-                        view[data_start + begin : data_start + end],
-                        path,
-                        offset,
-                        nbytes,
-                        want_checksums.get(name),
-                    )
-                )
-
-        # prefetch into page cache (evicted during the rollout) so the apply
-        # doesn't fault from cold storage
-        for _, mm in open_mmaps.values():
-            try:
-                mm.madvise(mmap.MADV_WILLNEED)
-            except (OSError, AttributeError, ValueError):
-                pass
-
         def apply_xor(item) -> None:
             name, compressed, path, offset, nbytes, want = item
             region = np.ndarray(
@@ -617,8 +566,73 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             apply_tensor = apply_overwrite
         else:
             raise NotImplementedError(f"delta encoding {encoding!r} not supported")
+
+        # One whole-file read pulls a lazily-fetched mount into a stable,
+        # immutable buffer. Apply that shard completely, then release it before
+        # reading the next one: peak compressed memory is one safetensors shard,
+        # not the entire model-sized delta.
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
-            list(pool.map(apply_tensor, items))
+            for filename in sorted(set(index.get("weight_map", {}).values())):
+                delta_file = os.path.join(version_dir, filename)
+                with open(delta_file, "rb") as f:
+                    blob = f.read()
+                # Verify the whole file arrived before mutating any tensor from
+                # it. A short read is source readiness, not local corruption.
+                expected = _safetensors_size(blob)
+                if expected is None or len(blob) != expected:
+                    raise FileNotFoundError(
+                        f"incomplete source blob {delta_file}: {len(blob)}B, "
+                        f"header declares {expected}B (not fully materialized)"
+                    )
+                (header_len,) = struct.unpack("<Q", blob[:8])
+                header = json.loads(blob[8 : 8 + header_len])
+                want_checksums = header.get("__metadata__", {})
+                view = memoryview(blob)
+                data_start = 8 + header_len
+                items = []
+                for name, info in header.items():
+                    if name == "__metadata__":
+                        continue
+                    if name in seen_names:
+                        raise RuntimeError(f"duplicate delta tensor {name!r}")
+                    if index["weight_map"].get(name) != filename:
+                        raise RuntimeError(
+                            "delta index maps tensor to a different shard: "
+                            f"{name!r} index={index['weight_map'].get(name)!r} "
+                            f"actual={filename!r}"
+                        )
+                    seen_names.add(name)
+                    begin, end = info["data_offsets"]
+                    path, offset, nbytes = locations[name]
+                    if path not in open_mmaps:
+                        fh = open(path, "r+b")
+                        mm = mmap.mmap(fh.fileno(), 0)
+                        open_mmaps[path] = (fh, mm)
+                        # Prefetch the canonical target shard so the checksum
+                        # pass does not fault it from cold storage serially.
+                        try:
+                            mm.madvise(mmap.MADV_WILLNEED)
+                        except (OSError, AttributeError, ValueError):
+                            pass
+                    items.append(
+                        (
+                            name,
+                            view[data_start + begin : data_start + end],
+                            path,
+                            offset,
+                            nbytes,
+                            want_checksums.get(name),
+                        )
+                    )
+                list(pool.map(apply_tensor, items))
+                del items, view, blob
+
+        if seen_names != expected_names:
+            raise RuntimeError(
+                "delta index/payload mismatch: "
+                f"index_only={sorted(expected_names - seen_names)[:20]} "
+                f"payload_only={sorted(seen_names - expected_names)[:20]}"
+            )
         # msync BEFORE the applied-version marker: the marker must never become
         # durable over data pages that never made it to disk, or a power loss
         # after a "successful" apply would silently serve stale bytes forever.

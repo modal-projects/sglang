@@ -21,8 +21,8 @@ _ALIGNMENT = 4096
 _COPY_CHUNK_BYTES = 256 << 20
 
 
-class PartialWeightUpdateError(RuntimeError):
-    """A CPU-to-GPU update may have changed only part of the live model."""
+class IrrecoverableWeightCommitError(RuntimeError):
+    """A CPU-to-GPU commit failed after it may have changed live weights."""
 
 
 @dataclass(frozen=True)
@@ -341,7 +341,7 @@ class PreparedWeightImage:
                 f"commit of {expected_identity!r} failed after live weights may "
                 f"have been partially overwritten: {type(exc).__name__}: {exc}"
             )
-            raise PartialWeightUpdateError(self.invalid_reason) from exc
+            raise IrrecoverableWeightCommitError(self.invalid_reason) from exc
 
         self.prepared = False
         return self.stats("commit", time.perf_counter() - started)

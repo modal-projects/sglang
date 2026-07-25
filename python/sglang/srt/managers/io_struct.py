@@ -1527,7 +1527,22 @@ class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
 class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     """Broadcast from router to all workers to set is_pause state."""
 
+    request_id: str
     is_pause: bool
+    abort_all: bool = False
+
+
+class PauseContinueBroadcastAckReq(BaseReq, kw_only=True):
+    """Worker acknowledgement after applying a pause/continue broadcast."""
+
+    request_id: str
+    worker_ipc_name: str
+
+
+class PauseContinueBroadcastCompleteReq(BaseReq, kw_only=True):
+    """Router acknowledgement after every worker applied a broadcast."""
+
+    request_id: str
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):

@@ -105,7 +105,7 @@ class SchedulerWeightUpdaterManager:
         # Edge-trigger weight_load_duration_seconds at the end of each
         # update_weights_from_* call. Engine is paused during the update so
         # the periodic log_stats path can't carry this.
-        # `source` distinguishes disk vs distributed vs tensor vs ipc.
+        # `source` distinguishes disk, CPU, distributed, tensor, and IPC loads.
         t0 = time.perf_counter()
         try:
             yield
@@ -122,8 +122,29 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _pending_pull_message(self) -> str | None:
+        pull_pending = self._pending_pull is not None
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            pending_by_rank = [None] * world_size
+            torch.distributed.all_gather_object(
+                pending_by_rank,
+                pull_pending,
+                group=self.tp_cpu_group,
+            )
+        else:
+            pending_by_rank = [pull_pending]
+        if not any(pending_by_rank):
+            return None
+        return (
+            "A background weight pull or preparation is running; "
+            "live weights cannot be changed until it finishes."
+        )
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if message := self._pending_pull_message():
+            return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -140,10 +161,21 @@ class SchedulerWeightUpdaterManager:
     def pull_weights(self, recv_req: PullWeightsReqInput):
         """Pull weights in a background thread while inference continues."""
 
-        if self._pending_pull is not None:
+        if self._pending_pull_message() is not None:
             return PullWeightsReqOutput(
                 success=False,
                 message="Another weight pull or preparation is already running.",
+            )
+        if (
+            recv_req.destination == "cpu"
+            and GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags
+        ):
+            return PullWeightsReqOutput(
+                success=False,
+                message=(
+                    "CPU weight preparation requires the live model weights "
+                    "to be resident on the GPU."
+                ),
             )
 
         def pull():
@@ -311,10 +343,10 @@ class SchedulerWeightUpdaterManager:
         """Update from one complete, verified rank-ready CPU image."""
 
         with self._observe_weight_load("cpu"):
-            if self._pending_pull is not None:
+            if message := self._pending_pull_message():
                 return UpdateWeightsFromCPUReqOutput(
                     success=False,
-                    message="CPU weight preparation is still running.",
+                    message=message,
                 )
             if self.draft_worker is not None:
                 return UpdateWeightsFromCPUReqOutput(
@@ -348,11 +380,12 @@ class SchedulerWeightUpdaterManager:
                     ),
                 )
 
-            success, message, stats = self.tp_worker.update_weights_from_cpu(recv_req)
-            if success:
-                self.flush_cache_after_weight_update(recv_req)
-            else:
-                logger.error(message)
+            try:
+                success, message, stats = self.tp_worker.update_weights_from_cpu(
+                    recv_req
+                )
+            except Exception:
+                success, message, stats = False, traceback.format_exc(), None
 
             rank = (
                 torch.distributed.get_rank(group=self.tp_cpu_group)
@@ -372,6 +405,18 @@ class SchedulerWeightUpdaterManager:
                 message = (
                     "; ".join(msg for ok, msg, _ in rank_results if not ok) or message
                 )
+            if not success:
+                logger.critical(
+                    "CPU weight commit failed after distributed preflight. "
+                    "The engine cannot safely continue because one or more "
+                    "ranks may contain a partially committed model: %s",
+                    message,
+                )
+                raise RuntimeError(
+                    "CPU weight commit failed; terminating the engine to avoid "
+                    "serving a mixed or partially committed model. " + message
+                )
+            self.flush_cache_after_weight_update(recv_req)
             return UpdateWeightsFromCPUReqOutput(
                 success=success,
                 message=message,
@@ -396,6 +441,11 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if message := self._pending_pull_message():
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message=message,
+            )
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -408,6 +458,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if message := self._pending_pull_message():
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -423,6 +475,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if message := self._pending_pull_message():
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -440,6 +494,8 @@ class SchedulerWeightUpdaterManager:
         return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if message := self._pending_pull_message():
+            raise RuntimeError(message)
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -485,6 +541,8 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        if message := self._pending_pull_message():
+            raise RuntimeError(message)
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:

@@ -582,7 +582,7 @@ def clone_module_tensors(
     copy_data: bool = True,
     storage_factory: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.nn.Module:
-    """Clone tensor state and loader-owned mutable method objects."""
+    """Clone tensor state and mutable objects used by weight-loading hooks."""
 
     tensor_memo: dict[int, torch.Tensor] = {}
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor] = {}
@@ -627,6 +627,21 @@ def clone_module_tensors(
         for name, value in vars(current).items():
             if name in {"_parameters", "_buffers", "_modules"}:
                 continue
+            clone_for_preparation = getattr(
+                value,
+                "clone_for_weight_preparation",
+                None,
+            )
+            if callable(clone_for_preparation):
+                if id(value) not in loader_object_memo:
+                    cloned_value = clone_for_preparation()
+                    if cloned_value is value:
+                        raise RuntimeError(
+                            "clone_for_weight_preparation() returned the live object"
+                        )
+                    loader_object_memo[id(value)] = cloned_value
+                result.__dict__[name] = loader_object_memo[id(value)]
+                continue
             if name in {"quant_method", "scheme"} and value is not None:
                 if id(value) not in loader_object_memo:
                     loader_object_memo[id(value)] = copy.copy(value)
@@ -665,6 +680,14 @@ def clone_module_proxy(
             value = getattr(module, name, None)
             if value is not None:
                 result.__dict__[name] = copy.copy(value)
+        for name, value in vars(module).items():
+            clone_for_preparation = getattr(
+                value,
+                "clone_for_weight_preparation",
+                None,
+            )
+            if callable(clone_for_preparation):
+                result.__dict__[name] = clone_for_preparation()
         return result
 
     parts = path.split(".")
@@ -894,7 +917,7 @@ def _preapply_resident_checkpoint_transform(
 
 
 class CPUWeightCache:
-    """Compile complete runtime targets from delta checkpoints into pinned host images."""
+    """Compile indexed safetensors targets into complete pinned host images."""
 
     def __init__(
         self,
@@ -903,6 +926,11 @@ class CPUWeightCache:
         max_group_bytes: int,
         host_cpu_group: Any = None,
     ):
+        if getattr(model, "secondary_weights", None):
+            raise NotImplementedError(
+                "CPU weight preparation does not support models with secondary "
+                "checkpoint sources; use the disk update path for this model"
+            )
         self.model = model
         self.target_device = torch.device("cuda", torch.cuda.current_device())
         self.max_group_bytes = max_group_bytes
@@ -1521,6 +1549,11 @@ class CPUWeightCache:
                 unmapped.append(name)
             else:
                 names_by_group[group_path].append(name)
+        if unmapped:
+            raise RuntimeError(
+                "CPU weight preparation cannot map every checkpoint tensor "
+                f"to a runtime weight group; unmapped={unmapped[:20]}"
+            )
 
         if not self.image.preparing and not self.image.valid:
             # Failed preparation may have partially overwritten the sole host
@@ -1536,6 +1569,7 @@ class CPUWeightCache:
         source_stats = []
         try:
             self.image.register_host_memory()
+            progress_interval = max(1, math.ceil(len(self.groups) / 10))
             for (
                 group_updated,
                 group_bytes,
@@ -1550,6 +1584,21 @@ class CPUWeightCache:
                 updated_segments.update(group_updated)
                 copied_bytes += group_bytes
                 group_stats.append(stats)
+                completed_groups = len(group_stats)
+                if (
+                    completed_groups == 1
+                    or completed_groups % progress_interval == 0
+                    or completed_groups == len(self.groups)
+                ):
+                    logger.info(
+                        "CPU weight image %s progress: groups=%d/%d "
+                        "bytes=%d elapsed=%.3fs",
+                        identity,
+                        completed_groups,
+                        len(self.groups),
+                        copied_bytes,
+                        time.perf_counter() - started,
+                    )
 
             expected_segments = {id(value) for value in self.image.segments}
             missing = expected_segments - updated_segments

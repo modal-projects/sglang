@@ -27,9 +27,11 @@ import pickle
 import signal
 import sys
 import threading
+import uuid
 import zlib
+from collections import deque
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Type
 
 import psutil
 import setproctitle
@@ -39,6 +41,7 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -46,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
     FreezeGCReq,
+    PauseContinueBroadcastAckReq,
+    PauseContinueBroadcastCompleteReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
@@ -74,6 +79,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+PauseContinueReq = PauseGenerationReqInput | ContinueGenerationReqInput
 
 
 class SocketMapping:
@@ -458,6 +465,12 @@ class MultiTokenizerRouter:
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
+        self._tokenizer_worker_num = server_args.tokenizer_worker_num
+        self._pending_pause_continue: tuple[str, set[str], PauseContinueReq] | None = (
+            None
+        )
+        self._waiting_pause_continue: PauseContinueReq | None = None
+        self._deferred_scheduler_requests: deque[Any] = deque()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
@@ -490,25 +503,124 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
+                if (
+                    self._waiting_pause_continue is not None
+                    and len(self.all_worker_ipcs) == self._tokenizer_worker_num
+                ):
+                    waiting = self._waiting_pause_continue
+                    self._waiting_pause_continue = None
+                    await self._start_pause_continue(waiting)
+                continue
+
+            if isinstance(recv_obj, PauseContinueBroadcastAckReq):
+                await self._handle_pause_continue_ack(recv_obj)
+                continue
+
+            if self._is_abort_for_pending_pause(recv_obj):
+                await async_sock_send(self.send_to_scheduler, recv_obj)
+                continue
+
+            if (
+                self._pending_pause_continue is not None
+                or self._waiting_pause_continue is not None
+            ):
+                self._deferred_scheduler_requests.append(recv_obj)
                 continue
 
             if isinstance(
                 recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)
             ):
-                # Broadcast to ALL workers so every worker's is_pause is set
-                is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
-                for ipc_name in self.all_worker_ipcs:
-                    self.socket_mapping.send_output(ipc_name, broadcast)
-                # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
-                # ranks internally). Skip for abort mode which drains via polling.
-                if not (
-                    isinstance(recv_obj, PauseGenerationReqInput)
-                    and recv_obj.mode == "abort"
-                ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
+                if len(self.all_worker_ipcs) == self._tokenizer_worker_num:
+                    await self._start_pause_continue(recv_obj)
+                else:
+                    self._waiting_pause_continue = recv_obj
                 continue
 
+            await async_sock_send(self.send_to_scheduler, recv_obj)
+
+    async def _start_pause_continue(self, recv_obj: PauseContinueReq):
+        request_id = recv_obj.rid or uuid.uuid4().hex
+        recv_obj.rid = request_id
+        remaining_workers = set(self.all_worker_ipcs)
+        assert len(remaining_workers) == self._tokenizer_worker_num
+        self._pending_pause_continue = (
+            request_id,
+            remaining_workers,
+            recv_obj,
+        )
+        broadcast = PauseContinueBroadcastReq(
+            request_id=request_id,
+            is_pause=isinstance(recv_obj, PauseGenerationReqInput),
+            abort_all=(
+                isinstance(recv_obj, PauseGenerationReqInput)
+                and recv_obj.mode == "abort"
+            ),
+        )
+        for ipc_name in remaining_workers:
+            self.socket_mapping.send_output(ipc_name, broadcast)
+
+    def _is_abort_for_pending_pause(self, recv_obj: Any) -> bool:
+        if not isinstance(recv_obj, AbortReq) or not recv_obj.abort_all:
+            return False
+        pending = self._pending_pause_continue
+        return (
+            pending is not None
+            and isinstance(pending[2], PauseGenerationReqInput)
+            and pending[2].mode == "abort"
+        )
+
+    async def _handle_pause_continue_ack(self, ack: PauseContinueBroadcastAckReq):
+        pending = self._pending_pause_continue
+        if pending is None or pending[0] != ack.request_id:
+            logger.warning(
+                "Ignoring stale pause/continue acknowledgement %s from %s",
+                ack.request_id,
+                ack.worker_ipc_name,
+            )
+            return
+
+        _, remaining_workers, _ = pending
+        if ack.worker_ipc_name not in remaining_workers:
+            logger.warning(
+                "Ignoring duplicate pause/continue acknowledgement %s from %s",
+                ack.request_id,
+                ack.worker_ipc_name,
+            )
+            return
+        remaining_workers.remove(ack.worker_ipc_name)
+        if not remaining_workers:
+            await self._finish_pause_continue()
+
+    async def _finish_pause_continue(self):
+        request_id, _, recv_obj = self._pending_pause_continue
+        # Forward only after every worker has acquired is_pause_cond and applied
+        # the state. This prevents continue from racing a paused weight update
+        # running in a different tokenizer worker.
+        if not (
+            isinstance(recv_obj, PauseGenerationReqInput) and recv_obj.mode == "abort"
+        ):
+            await async_sock_send(self.send_to_scheduler, recv_obj)
+
+        if recv_obj.http_worker_ipc is None:
+            raise RuntimeError("Pause/continue request has no origin worker IPC.")
+        self.socket_mapping.send_output(
+            recv_obj.http_worker_ipc,
+            PauseContinueBroadcastCompleteReq(request_id=request_id),
+        )
+        self._pending_pause_continue = None
+        await self._drain_deferred_scheduler_requests()
+
+    async def _drain_deferred_scheduler_requests(self):
+        while self._deferred_scheduler_requests:
+            recv_obj = self._deferred_scheduler_requests.popleft()
+            if isinstance(
+                recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)
+            ):
+                if len(self.all_worker_ipcs) == self._tokenizer_worker_num:
+                    await self._start_pause_continue(recv_obj)
+                else:
+                    self._waiting_pause_continue = recv_obj
+                return
             await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
@@ -656,43 +768,52 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
 
-        # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
-        self._dispatch_to_scheduler(reg)
+        # Futures awaiting the router's all-worker pause/continue barrier.
+        self._pause_continue_futures: Dict[str, asyncio.Future] = {}
 
-        # Future for awaiting pause/continue broadcast confirmation
-        self._pause_continue_future: Optional[asyncio.Future] = None
-
-        # Register PauseContinueBroadcastReq in the result dispatcher so
-        # handle_loop routes it to _handle_pause_continue_broadcast
+        # Route router broadcasts and barrier completion messages.
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
+            [
+                (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (
+                    PauseContinueBroadcastCompleteReq,
+                    self._handle_pause_continue_complete,
+                ),
+            ]
         )
+        self.auto_create_handle_loop()
+
+        # Advertise the worker only after its result loop can receive broadcasts.
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self._dispatch_to_scheduler(reg)
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         loop = asyncio.get_event_loop()
-        self._pause_continue_future = loop.create_future()
+        request_id = uuid.uuid4().hex
+        obj.rid = request_id
+        future = loop.create_future()
+        self._pause_continue_futures[request_id] = future
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
         self._dispatch_to_scheduler(obj)
-        await self._pause_continue_future
-
-        if obj.mode == "abort":
-            # Abort polling: only the originator checks its own lock state
-            while True:
-                self.abort_request(abort_all=True)
-                is_locked = await self.model_update_lock.is_locked()
-                if not is_locked:
-                    break
-                await asyncio.sleep(1.0)
+        try:
+            await future
+        finally:
+            self._pause_continue_futures.pop(request_id, None)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
-        self._pause_continue_future = loop.create_future()
+        request_id = uuid.uuid4().hex
+        obj.rid = request_id
+        future = loop.create_future()
+        self._pause_continue_futures[request_id] = future
         self._dispatch_to_scheduler(obj)
-        await self._pause_continue_future
+        try:
+            await future
+        finally:
+            self._pause_continue_futures.pop(request_id, None)
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
@@ -708,10 +829,27 @@ class TokenizerWorker(TokenizerManager):
                 self.is_pause = False
                 self.is_pause_cond.notify_all()
 
-        # Resolve the pending future if this worker initiated the pause/continue
-        if self._pause_continue_future and not self._pause_continue_future.done():
-            self._pause_continue_future.set_result(True)
-            self._pause_continue_future = None
+            if obj.abort_all:
+                # Every worker drains the requests routed through it before
+                # acknowledging the router barrier.
+                while True:
+                    self.abort_request(abort_all=True)
+                    is_locked = await self.model_update_lock.is_locked()
+                    if not is_locked:
+                        break
+                    await asyncio.sleep(1.0)
+
+        self._dispatch_to_scheduler(
+            PauseContinueBroadcastAckReq(
+                request_id=obj.request_id,
+                worker_ipc_name=self.tokenizer_ipc_name,
+            )
+        )
+
+    def _handle_pause_continue_complete(self, obj: PauseContinueBroadcastCompleteReq):
+        future = self._pause_continue_futures.get(obj.request_id)
+        if future is not None and not future.done():
+            future.set_result(True)
 
 
 def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:

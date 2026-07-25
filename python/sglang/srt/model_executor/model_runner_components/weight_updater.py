@@ -329,7 +329,7 @@ class WeightUpdater:
                 stats["gbps"],
             )
             return True, "Updated weights from CPU memory.", stats
-        except Exception as exc:
+        except Exception:
             # After distributed preflight begins, a rank-local failure cannot
             # be rolled back without a second model-sized image.
             logger.critical(

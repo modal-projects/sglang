@@ -114,6 +114,13 @@ def _shared_delta_worker(rank: int, world_size: int, rendezvous: str):
 
 
 class TestInMemorySafeTensorsFile(unittest.TestCase):
+    def test_cpu_cache_rejects_secondary_checkpoint_sources(self):
+        model = torch.nn.Linear(2, 2)
+        model.secondary_weights = [object()]
+
+        with self.assertRaisesRegex(NotImplementedError, "secondary checkpoint"):
+            CPUWeightCache(model, max_group_bytes=1024)
+
     def test_positional_read_and_tensor_views(self):
         tensors = {
             "bf16": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),

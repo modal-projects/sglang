@@ -5,8 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import fastapi
 
@@ -135,6 +134,39 @@ class TokenizerControlMixin:
     profile, internal state, etc.) -- everything that talks to the scheduler via
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
+
+    async def _run_weight_sync_operation(
+        self: TokenizerManager,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Serialize a weight operation until every scheduler has responded."""
+
+        # Waiting for the lock remains cancellable: a request that has not
+        # started scheduler work must not run after its caller goes away.
+        await self.weight_sync_lock.acquire()
+        task = asyncio.create_task(operation())
+        release_when_done = False
+
+        def consume_exception(completed: asyncio.Task) -> None:
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(consume_exception)
+        try:
+            # Once scheduler work starts, shield it from caller cancellation.
+            # If the caller exits, the completion callback retains ownership of
+            # the lock until every scheduler response has arrived.
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                release_when_done = True
+                task.add_done_callback(
+                    lambda _completed: self.weight_sync_lock.release()
+                )
+            raise
+        finally:
+            if not release_when_done:
+                self.weight_sync_lock.release()
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
@@ -432,25 +464,32 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+        async def operation():
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
 
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
+            # Hold is_pause_cond while updating to prevent unpause from racing.
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    results = await self.update_weights_from_distributed_communicator(
+                        obj
+                    )
 
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_distributed_communicator(
+                        obj
+                    )
 
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            success, message = FanOutCommunicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message
+            return success, message
+
+        return await self._run_weight_sync_operation(operation)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -490,28 +529,31 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+        async def operation():
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
 
-        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
-            obj.serialized_named_tensors
-        )
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
+            )
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    results = await self.update_weights_from_tensor_communicator(obj)
 
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_tensor_communicator(obj)
 
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            success, message = FanOutCommunicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message
+            return success, message
+
+        return await self._run_weight_sync_operation(operation)
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -520,33 +562,42 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         """Update weights via IPC for checkpoint-engine integration."""
         self.auto_create_handle_loop()
-        try:
-            # For now, we only support single data parallel instance
-            assert (
-                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
-            logger.info("Starting IPC weight update")
 
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-                if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+        async def operation():
+            try:
+                # For now, we only support single data parallel instance
+                assert (
+                    self.server_args.dp_size == 1
+                    or self.server_args.enable_dp_attention
+                ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+                logger.info("Starting IPC weight update")
 
-            if not is_paused:
-                async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
-        except Exception as e:
-            error_msg = f"IPC weight update failed: {str(e)}"
-            logger.error(error_msg)
-            success, message = False, error_msg
+                async with self.is_pause_cond:
+                    is_paused = self.is_pause
+                    if is_paused:
+                        result = (await self.update_weights_from_ipc_communicator(obj))[
+                            0
+                        ]
+                        success, message = result.success, result.message
 
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+                if not is_paused:
+                    async with self.model_update_lock.writer_lock:
+                        result = (await self.update_weights_from_ipc_communicator(obj))[
+                            0
+                        ]
+                        success, message = result.success, result.message
+            except Exception as e:
+                error_msg = f"IPC weight update failed: {str(e)}"
+                logger.error(error_msg)
+                success, message = False, error_msg
 
-        return success, message
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+
+        return await self._run_weight_sync_operation(operation)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
@@ -767,7 +818,11 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+
+        async def operation():
+            await self.release_memory_occupation_communicator(obj)
+
+        await self._run_weight_sync_operation(operation)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -775,7 +830,11 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+
+        async def operation():
+            await self.resume_memory_occupation_communicator(obj)
+
+        await self._run_weight_sync_operation(operation)
 
     async def pull_weights(
         self: TokenizerManager,
@@ -783,12 +842,16 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str, List[Dict[str, Any]]]:
         self.auto_create_handle_loop()
-        results = await self.pull_weights_communicator(obj)
-        success, message = FanOutCommunicator.merge_results(results)
-        rank_stats = [
-            stats for result in results for stats in (result.rank_stats or [])
-        ]
-        return success, message, rank_stats
+
+        async def operation():
+            results = await self.pull_weights_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            rank_stats = [
+                stats for result in results for stats in (result.rank_stats or [])
+            ]
+            return success, message, rank_stats
+
+        return await self._run_weight_sync_operation(operation)
 
     async def update_weights_from_cpu(
         self: TokenizerManager,
@@ -796,25 +859,30 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str, List[Dict[str, Any]]]:
         self.auto_create_handle_loop()
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.update_weights_from_cpu_communicator(obj)
+        async def operation():
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
 
-        success, message = FanOutCommunicator.merge_results(results)
-        rank_stats = [
-            stats for result in results for stats in (result.rank_stats or [])
-        ]
-        if success:
-            self._update_weight_version_if_provided(str(obj.target_version))
-            message += f" Weight version updated to {obj.target_version}."
-        return success, message, rank_stats
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    results = await self.update_weights_from_cpu_communicator(obj)
+
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_cpu_communicator(obj)
+
+            success, message = FanOutCommunicator.merge_results(results)
+            rank_stats = [
+                stats for result in results for stats in (result.rank_stats or [])
+            ]
+            if success:
+                self._update_weight_version_if_provided(str(obj.target_version))
+                message += f" Weight version updated to {obj.target_version}."
+            return success, message, rank_stats
+
+        return await self._run_weight_sync_operation(operation)
 
     async def check_weights(
         self: TokenizerManager,

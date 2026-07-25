@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import weakref
 from abc import ABC, abstractmethod
 from enum import Enum

@@ -493,6 +493,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.initial_weights_loaded = False
 
         # Weight updates
+        # Serialize weight preparation, commits, and weight-memory transitions.
+        # This lock is independent of model_update_lock so preparation can
+        # continue in the background while inference holds reader locks.
+        self.weight_sync_lock = asyncio.Lock()
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
@@ -1755,31 +1759,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
-        # default the load format to the server_args
-        if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
-        logger.info("Start update_weights. Load format=%s", obj.load_format)
+        async def operation():
+            # default the load format to the server_args
+            if obj.load_format is None:
+                obj.load_format = self.server_args.load_format
+            logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if obj.abort_all_requests:
-            self.abort_request(abort_all=True)
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
+            # Immediately update the weights if the engine is in paused state
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    success, message, num_paused_requests = (
+                        await self._wait_for_model_update_from_disk(obj)
+                    )
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    success, message, num_paused_requests = (
+                        await self._wait_for_model_update_from_disk(obj)
+                    )
 
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message, num_paused_requests
+            return success, message, num_paused_requests
+
+        return await self._run_weight_sync_operation(operation)
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path

@@ -145,11 +145,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def restore_weights_before_loading(self, layer) -> None:
-        """Return the BLOCK-strategy scale to its checkpoint state before a
-        weight reload; see Fp8LinearMethod.restore_weights_before_loading for
-        the format_ue8m0 / repacked-layout rationale. CHANNEL and TENSOR keep
-        their checkpoint layout, so there is nothing to restore.
-        """
+        """Restore block scales to their checkpoint-facing state."""
         if self.strategy == QuantizationStrategy.BLOCK:
             restore_scale_checkpoint_state(getattr(layer, "weight_scale", None))
 

@@ -1913,6 +1913,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         self._cache_permute_indices = {}
 
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend

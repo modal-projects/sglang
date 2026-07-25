@@ -274,6 +274,9 @@ def should_deepgemm_weight_requant_ue8m0(
     return True
 
 
+STABLE_CPU_WEIGHT_SOURCE_ATTR = "_sglang_stable_cpu_weight_source"
+
+
 def should_async_load(weight: torch.Tensor) -> bool:
     """Return True if we should load the given weight asynchronously.
 

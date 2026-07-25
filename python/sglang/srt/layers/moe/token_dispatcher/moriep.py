@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from dataclasses import dataclass
@@ -416,6 +417,15 @@ class _MoriEPDispatcherImplBase:
 
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
+
+    def clone_for_weight_preparation(self):
+        cloned = copy.copy(self)
+        cloned.quant_config = (
+            None if self.quant_config is None else self.quant_config.copy()
+        )
+        cloned.overlap_args = None
+        cloned.meta_overlap_args = None
+        return cloned
 
     @property
     def mori_op(self):

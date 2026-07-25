@@ -1431,49 +1431,37 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     else:
         offloader.update_param(weight, new_weight)
 
-    kernel_buffer = getattr(weight_scale_inv, "_kernel_buffer", None)
+    kernel_buffer = getattr(weight_scale_inv, "_runtime_buffer", None)
     if (
         kernel_buffer is not None
         and kernel_buffer.shape == new_weight_scale_inv.shape
         and kernel_buffer.dtype == new_weight_scale_inv.dtype
     ):
-        # restore_weights_before_loading swapped in a checkpoint-shaped buffer
-        # for the refill; put the repacked scales back into the original
-        # kernel-layout storage.
         kernel_buffer.copy_(new_weight_scale_inv)
         weight_scale_inv.data = kernel_buffer
-        del weight_scale_inv._kernel_buffer
+        del weight_scale_inv._runtime_buffer
     else:
         weight_scale_inv.data = new_weight_scale_inv
 
 
 def snapshot_scale_checkpoint_state(scale) -> None:
-    """Record the scale state the first process pass starts from.
-
-    Captured at the first process_weights_after_loading call, i.e. after
-    create_weights and any model-__init__ override, but before the first
-    transform latches the format flag or repacks the layout.
-    restore_weights_before_loading returns to this state so a reloaded
-    checkpoint is loaded and processed exactly like initial loading.
-    """
-    if scale is not None and not hasattr(scale, "_ckpt_format_ue8m0"):
-        scale._ckpt_format_ue8m0 = scale.format_ue8m0
-        scale._ckpt_shape = tuple(scale.data.shape)
-        scale._ckpt_dtype = scale.data.dtype
+    """Record the scale layout expected by the checkpoint loader."""
+    if scale is not None and not hasattr(scale, "_checkpoint_format_ue8m0"):
+        scale._checkpoint_format_ue8m0 = scale.format_ue8m0
+        scale._checkpoint_shape = tuple(scale.data.shape)
+        scale._checkpoint_dtype = scale.data.dtype
 
 
 def restore_scale_checkpoint_state(scale) -> None:
-    if scale is None or not hasattr(scale, "_ckpt_format_ue8m0"):
+    if scale is None or not hasattr(scale, "_checkpoint_format_ue8m0"):
         return
-    scale.format_ue8m0 = scale._ckpt_format_ue8m0
-    if tuple(scale.data.shape) != scale._ckpt_shape:
-        # The UE8M0 requant repacked the scale layout. Hand the loader a
-        # checkpoint-shaped buffer to refill, and keep the kernel-layout
-        # buffer so the requant re-fills the SAME storage afterwards (CUDA
-        # graphs hold its pointer).
-        scale._kernel_buffer = scale.data
+    scale.format_ue8m0 = scale._checkpoint_format_ue8m0
+    if tuple(scale.data.shape) != scale._checkpoint_shape:
+        scale._runtime_buffer = scale.data
         scale.data = torch.empty(
-            scale._ckpt_shape, dtype=scale._ckpt_dtype, device=scale.data.device
+            scale._checkpoint_shape,
+            dtype=scale._checkpoint_dtype,
+            device=scale.data.device,
         )
 
 

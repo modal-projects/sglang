@@ -46,6 +46,9 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
+    def supports_batched_weight_loading(self) -> bool:
+        return False
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""

@@ -5910,6 +5910,11 @@ class ServerArgs:
         return self.chunked_prefill_size
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_cpu_weight_cache and self.enable_eplb:
+            raise ValueError(
+                "CPU weight preparation cannot run concurrently with "
+                "automatic EPLB weight reloads"
+            )
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(

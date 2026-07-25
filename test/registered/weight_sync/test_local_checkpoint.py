@@ -287,6 +287,26 @@ class PullTest(unittest.TestCase):
         self.pull(2)
         self.assert_at_version(2)
 
+    def test_non_checksum_failure_fails_fast_without_reseed(self):
+        reset_calls = []
+        orig_reset = local_checkpoint._reset_checkpoint
+
+        def _fail(*args, **kwargs):
+            reset_calls.append(args)
+            raise OSError("simulated checkpoint write failure")
+
+        local_checkpoint._reset_checkpoint = _fail
+        try:
+            with self.assertRaisesRegex(OSError, "simulated checkpoint write failure"):
+                self.pull(1)
+        finally:
+            local_checkpoint._reset_checkpoint = orig_reset
+        self.assertEqual(
+            len(reset_calls),
+            1,
+            "a non-checksum failure cannot be repaired by repeating the same seed",
+        )
+
     def test_incomplete_source_version_fails_fast_then_recovers(self):
         # A version whose index is visible but whose data blob has not finished
         # propagating (object-store read-after-write lag) must raise

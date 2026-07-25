@@ -71,6 +71,10 @@ _SEED_LOG_STEP_GB = 50
 SYNC_DIR = ".weight_sync"
 
 
+class _ChecksumMismatchError(RuntimeError):
+    """The reconstructed local tensor bytes do not match the published target."""
+
+
 def pull(
     local_checkpoint_dir: str,
     base_dir: str,
@@ -141,7 +145,7 @@ def pull(
             # the caller reloads and retries.
             _log_pull_not_found(source_dir, target_version)
             raise
-        except Exception:
+        except _ChecksumMismatchError:
             # A checksum mismatch on staged, complete bytes == corrupt local
             # state (incomplete sources are reclassified to FileNotFoundError
             # above and never reach here). Reseed from the pristine base and
@@ -717,7 +721,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> dict:
         close_wall_s = time.perf_counter() - close_started
 
     if mismatches:
-        raise RuntimeError(
+        raise _ChecksumMismatchError(
             f"checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: "
             f"{sorted(mismatches)[:20]}"
         )

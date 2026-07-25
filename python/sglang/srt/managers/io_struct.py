@@ -1562,6 +1562,39 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    # Host-local checkpoint used by the disk destination.
+    local_checkpoint_dir: Optional[str] = None
+    # Immutable version-0 checkpoint. Defaults to the boot model path.
+    base_checkpoint_dir: Optional[str] = None
+    # Directory containing weight_v{N:06d} checkpoint or delta versions.
+    source_dir: str
+    target_version: int
+    # Disk materializes any target checkpoint. CPU accepts delta targets only
+    # and builds rank-ready host images for a later /update_weights_from_cpu.
+    destination: Literal["disk", "cpu"] = "disk"
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
+class UpdateWeightsFromCPUReqInput(BaseReq, kw_only=True):
+    # Must match a completed CPU-destination /pull_weights request.
+    target_version: int
+    abort_all_requests: bool = False
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromCPUReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]

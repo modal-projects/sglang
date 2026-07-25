@@ -2618,6 +2618,18 @@ class ServerArgs:
             nargs="*",
         ),
     ] = None
+    weight_source_refresh_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading a published version.",
+    ] = None
+    enable_cpu_weight_cache: A[
+        bool,
+        "Cache one canonical checkpoint per host and one rank-ready CPU weight image per local model worker for background delta weight preparation.",
+    ] = False
+    cpu_weight_cache_max_staging_gb: A[
+        float,
+        "Target upper bound, in GiB, for each module staged while preparing CPU weights. Indivisible modules may exceed it.",
+    ] = 8.0
     weight_loader_disable_mmap: A[
         bool,
         "Disable mmap while loading weight using safetensors.",

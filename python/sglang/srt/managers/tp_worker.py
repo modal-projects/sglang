@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromCPUReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -112,6 +113,39 @@ class BaseTpWorker(ABC):
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def prepare_cpu_weights(
+        self,
+        *,
+        base_checkpoint_dir: str,
+        source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.prepare_cpu_weights(
+            base_checkpoint_dir=base_checkpoint_dir,
+            source_dir=source_dir,
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+        )
+
+    def initialize_cpu_weight_cache(self, host_cpu_group):
+        return self.model_runner.weight_updater.initialize_cpu_weight_cache(
+            host_cpu_group
+        )
+
+    def update_weights_from_cpu(
+        self,
+        recv_req: UpdateWeightsFromCPUReqInput,
+    ):
+        return self.model_runner.weight_updater.update_weights_from_cpu(
+            recv_req.target_version
+        )
+
+    def validate_cpu_weight_update(self, target_version: int):
+        return self.model_runner.weight_updater.validate_cpu_weight_update(
+            target_version
+        )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(

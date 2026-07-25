@@ -130,6 +130,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -138,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromCPUReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1195,6 +1197,52 @@ async def update_weights_from_disk(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/update_weights_from_cpu")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_cpu(
+    obj: Annotated[UpdateWeightsFromCPUReqInput, Body()],
+    request: Request,
+):
+    """Update weights from a complete rank-ready CPU image."""
+    (
+        success,
+        message,
+        rank_stats,
+    ) = await _global_state.tokenizer_manager.update_weights_from_cpu(
+        obj,
+        request,
+    )
+    content = {
+        "success": success,
+        "message": message,
+        "rank_stats": rank_stats,
+    }
+    return ORJSONResponse(
+        content,
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/pull_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
+    """Pull published weights to local disk or CPU memory."""
+    (
+        success,
+        message,
+        rank_stats,
+    ) = await _global_state.tokenizer_manager.pull_weights(obj, request)
+
+    content = {
+        "success": success,
+        "message": message,
+        "rank_stats": rank_stats,
+    }
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/init_weights_send_group_for_remote_instance")

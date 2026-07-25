@@ -18,6 +18,7 @@ import faulthandler
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from array import array
@@ -121,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -141,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromCPUReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -512,8 +515,8 @@ class Scheduler(
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
 
-        # Init watchdog, memory saver, input blocker and recv skipper
-        self.init_watch_dog_memory_saver_input_blocker()
+        # Start the watchdog after optional CPU weight cache initialization.
+        self.init_memory_saver_input_blocker()
 
         # Init profiler
         self.init_profiler()
@@ -531,6 +534,7 @@ class Scheduler(
         self.init_deterministic_inference_config()
 
         self.init_weight_updater()
+        self.init_watchdog()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1083,18 +1087,11 @@ class Scheduler(
                 self, watchdog_timeout=x, soft=True
             )
 
-    def init_watch_dog_memory_saver_input_blocker(self):
-        # Start watchdog thread
-        self.watchdog = create_scheduler_watchdog(
-            self, watchdog_timeout=self.server_args.watchdog_timeout
-        )
-
-        # Init memory saver, profiler and metric stats
+    def init_memory_saver_input_blocker(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
 
-        # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.ps.attn_tp_rank != 0)
@@ -1102,9 +1099,13 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def init_watchdog(self):
+        self.watchdog = create_scheduler_watchdog(
+            self, watchdog_timeout=self.server_args.watchdog_timeout
+        )
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -1349,6 +1350,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_disk,
                 ),
                 (
+                    UpdateWeightsFromCPUReqInput,
+                    self.weight_updater.update_weights_from_cpu,
+                ),
+                (
                     InitWeightsUpdateGroupReqInput,
                     self.weight_updater.init_weights_update_group,
                 ),
@@ -1391,6 +1396,10 @@ class Scheduler(
                 (
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
+                ),
+                (
+                    PullWeightsReqInput,
+                    self.weight_updater.pull_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
@@ -1682,6 +1691,7 @@ class Scheduler(
                         sock_send(self.ipc_channels.recv_from_rpc, output)
 
         self.flush_wrapper.check_pending()
+        self.weight_updater.check_pending_pull()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -1693,16 +1703,57 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        background_cpu_group = self.tp_cpu_group
+        host_cpu_group = self.tp_cpu_group
+        if tp_size > 1:
+            # Background collectives must not share a sequence with scheduler
+            # request broadcasts.
+            background_cpu_group = torch.distributed.new_group(
+                ranks=self.tp_group.ranks,
+                backend="gloo",
+            )
+            hosts = [None] * tp_size
+            torch.distributed.all_gather_object(
+                hosts,
+                socket.gethostname(),
+                group=self.tp_cpu_group,
+            )
+            if len(set(hosts)) == 1:
+                host_cpu_group = background_cpu_group
+            else:
+                global_rank = torch.distributed.get_rank()
+                for hostname in sorted(set(hosts)):
+                    ranks = [
+                        rank
+                        for rank, host in zip(self.tp_group.ranks, hosts)
+                        if host == hostname
+                    ]
+                    group = torch.distributed.new_group(
+                        ranks=ranks,
+                        backend="gloo",
+                    )
+                    if global_rank in ranks:
+                        host_cpu_group = group
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
             tp_cpu_group=self.tp_cpu_group,
+            background_cpu_group=background_cpu_group,
+            host_cpu_group=host_cpu_group,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+        if self.server_args.enable_cpu_weight_cache:
+            if self.draft_worker is not None:
+                raise NotImplementedError(
+                    "CPU weight cache does not yet support a speculative "
+                    "draft worker"
+                )
+            self.tp_worker.initialize_cpu_weight_cache(host_cpu_group)
 
     def init_lora_drainer(self) -> None:
         if self.server_args.lora_drain_wait_threshold > 0.0:

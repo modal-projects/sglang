@@ -289,6 +289,7 @@ class ModelRunner:
         self.enable_hisparse = server_args.enable_hisparse
 
         self.init_remote_instance_weight_transporter()
+        self.cpu_weight_cache = None
 
         self.init_msprobe()
 

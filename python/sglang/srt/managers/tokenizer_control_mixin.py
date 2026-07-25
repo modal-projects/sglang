@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -51,6 +52,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -66,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromCPUReqInput,
+    UpdateWeightsFromCPUReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -105,6 +110,8 @@ _COMMUNICATOR_SPECS = [
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
+    ("pull_weights", PullWeightsReqOutput),
+    ("update_weights_from_cpu", UpdateWeightsFromCPUReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
@@ -769,6 +776,45 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def pull_weights(
+        self: TokenizerManager,
+        obj: PullWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        self.auto_create_handle_loop()
+        results = await self.pull_weights_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        rank_stats = [
+            stats for result in results for stats in (result.rank_stats or [])
+        ]
+        return success, message, rank_stats
+
+    async def update_weights_from_cpu(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromCPUReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        self.auto_create_handle_loop()
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            results = await self.update_weights_from_cpu_communicator(obj)
+
+        success, message = FanOutCommunicator.merge_results(results)
+        rank_stats = [
+            stats for result in results for stats in (result.rank_stats or [])
+        ]
+        if success:
+            self._update_weight_version_if_provided(str(obj.target_version))
+            message += f" Weight version updated to {obj.target_version}."
+        return success, message, rank_stats
 
     async def check_weights(
         self: TokenizerManager,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -28,12 +29,16 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromCPUReqInput,
+    UpdateWeightsFromCPUReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -77,6 +82,8 @@ class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
     tp_cpu_group: Any
+    background_cpu_group: Any
+    host_cpu_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -84,6 +91,14 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    _pending_pull: Optional[Tuple[PullWeightsReqInput, threading.Thread]] = field(
+        default=None,
+        init=False,
+    )
+    _pull_result: Optional[PullWeightsReqOutput] = field(
+        default=None,
+        init=False,
+    )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -120,6 +135,247 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
+            )
+
+    def pull_weights(self, recv_req: PullWeightsReqInput):
+        """Pull weights in a background thread while inference continues."""
+
+        if self._pending_pull is not None:
+            return PullWeightsReqOutput(
+                success=False,
+                message="Another weight pull or preparation is already running.",
+            )
+
+        def pull():
+            self._pull_result = self._pull_weights_sync(recv_req)
+
+        thread = threading.Thread(
+            target=pull,
+            name="weight-pull",
+            daemon=True,
+        )
+        self._pending_pull = (recv_req, thread)
+        thread.start()
+        return None
+
+    def _pull_weights_sync(self, recv_req: PullWeightsReqInput):
+        """Pull one verified target to disk or rank-ready CPU memory."""
+        from sglang.srt.weight_sync import local_checkpoint
+
+        server_args = self.tp_worker.model_runner.server_args
+        started = time.perf_counter()
+        local_stats: Dict[str, Any] = {
+            "rank": (
+                torch.distributed.get_rank(group=self.tp_cpu_group)
+                if torch.distributed.is_initialized()
+                else 0
+            ),
+            "target_version": recv_req.target_version,
+            "destination": recv_req.destination,
+        }
+        try:
+            base_checkpoint_dir = recv_req.base_checkpoint_dir or server_args.model_path
+            if recv_req.destination == "cpu":
+                if self.draft_worker is not None:
+                    raise NotImplementedError(
+                        "CPU preparation does not yet support a speculative "
+                        "draft worker; refusing to update only the target model"
+                    )
+                refresh_started = time.perf_counter()
+                refresh_error = None
+                host_rank = (
+                    torch.distributed.get_rank(group=self.host_cpu_group)
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                if (
+                    host_rank == 0
+                    and recv_req.target_version > 0
+                    and server_args.weight_source_refresh_hook
+                ):
+                    try:
+                        local_checkpoint.refresh_source(
+                            recv_req.source_dir,
+                            recv_req.target_version,
+                            server_args.weight_source_refresh_hook,
+                        )
+                    except Exception:
+                        refresh_error = traceback.format_exc()
+                if torch.distributed.is_initialized():
+                    refresh_errors = [None] * torch.distributed.get_world_size(
+                        group=self.host_cpu_group
+                    )
+                    torch.distributed.all_gather_object(
+                        refresh_errors,
+                        refresh_error,
+                        group=self.host_cpu_group,
+                    )
+                else:
+                    refresh_errors = [refresh_error]
+                refresh_errors = [
+                    value for value in refresh_errors if value is not None
+                ]
+                if refresh_errors:
+                    raise RuntimeError(
+                        "weight source refresh failed: " + "; ".join(refresh_errors)
+                    )
+                local_stats["checkpoint_pull"] = {
+                    "operation": "cpu_prepare",
+                    "materialized_target_checkpoint": False,
+                    "source_refresh_wall_s": round(
+                        time.perf_counter() - refresh_started,
+                        6,
+                    ),
+                }
+                local_stats["checkpoint_pull_wall_s"] = 0.0
+                prepare_started = time.perf_counter()
+                success, message, prepare_stats = self.tp_worker.prepare_cpu_weights(
+                    base_checkpoint_dir=base_checkpoint_dir,
+                    source_dir=recv_req.source_dir,
+                    target_version=recv_req.target_version,
+                    host_cpu_group=self.host_cpu_group,
+                )
+                if not success:
+                    raise RuntimeError(message)
+                local_stats["runtime_prepare_wall_s"] = round(
+                    time.perf_counter() - prepare_started,
+                    6,
+                )
+                local_stats["runtime_prepare"] = prepare_stats
+            else:
+                if recv_req.local_checkpoint_dir is None:
+                    raise ValueError(
+                        "local_checkpoint_dir is required for the disk destination"
+                    )
+                pull_started = time.perf_counter()
+                pull_stats = local_checkpoint.pull(
+                    local_checkpoint_dir=recv_req.local_checkpoint_dir,
+                    base_dir=base_checkpoint_dir,
+                    source_dir=recv_req.source_dir,
+                    target_version=recv_req.target_version,
+                    source_refresh_hook=server_args.weight_source_refresh_hook,
+                )
+                local_stats["checkpoint_pull_wall_s"] = round(
+                    time.perf_counter() - pull_started,
+                    6,
+                )
+                local_stats["checkpoint_pull"] = pull_stats
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+        local_stats["total_wall_s"] = round(time.perf_counter() - started, 6)
+
+        tp_size = (
+            torch.distributed.get_world_size(group=self.background_cpu_group)
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        rank_stats = [local_stats]
+        if tp_size > 1:
+            results = [None] * tp_size
+            torch.distributed.all_gather_object(
+                results,
+                (success, message, local_stats),
+                group=self.background_cpu_group,
+            )
+            success = all(ok for ok, _, _ in results)
+            message = "; ".join(msg for ok, msg, _ in results if not ok) or message
+            rank_stats = [stats for _, _, stats in results]
+        return PullWeightsReqOutput(
+            success=success,
+            message=message,
+            rank_stats=rank_stats,
+        )
+
+    def check_pending_pull(self) -> None:
+        if self._pending_pull is None:
+            return
+        recv_req, thread = self._pending_pull
+        if thread.is_alive():
+            return
+        self._pending_pull = None
+        thread.join()
+        output = self._pull_result
+        self._pull_result = None
+        if output is None:
+            output = PullWeightsReqOutput(
+                success=False, message="Weight pull ended without a result."
+            )
+        self.scheduler.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
+    def update_weights_from_cpu(
+        self,
+        recv_req: UpdateWeightsFromCPUReqInput,
+    ):
+        """Update from one complete, verified rank-ready CPU image."""
+
+        with self._observe_weight_load("cpu"):
+            if self._pending_pull is not None:
+                return UpdateWeightsFromCPUReqOutput(
+                    success=False,
+                    message="CPU weight preparation is still running.",
+                )
+            if self.draft_worker is not None:
+                return UpdateWeightsFromCPUReqOutput(
+                    success=False,
+                    message=(
+                        "CPU updates do not yet support a speculative draft "
+                        "worker; refusing to update only the target model."
+                    ),
+                )
+            preflight = self.tp_worker.validate_cpu_weight_update(
+                recv_req.target_version
+            )
+            tp_size = (
+                torch.distributed.get_world_size(group=self.tp_cpu_group)
+                if torch.distributed.is_initialized()
+                else 1
+            )
+            preflight_results = [preflight]
+            if tp_size > 1:
+                preflight_results = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    preflight_results,
+                    preflight,
+                    group=self.tp_cpu_group,
+                )
+            if not all(success for success, _ in preflight_results):
+                return UpdateWeightsFromCPUReqOutput(
+                    success=False,
+                    message="; ".join(
+                        message for success, message in preflight_results if not success
+                    ),
+                )
+
+            success, message, stats = self.tp_worker.update_weights_from_cpu(recv_req)
+            if success:
+                self.flush_cache_after_weight_update(recv_req)
+            else:
+                logger.error(message)
+
+            rank = (
+                torch.distributed.get_rank(group=self.tp_cpu_group)
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            local_stats = {"rank": rank, **(stats or {})}
+            rank_results = [(success, message, local_stats)]
+            if tp_size > 1:
+                rank_results = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    rank_results,
+                    (success, message, local_stats),
+                    group=self.tp_cpu_group,
+                )
+                success = all(ok for ok, _, _ in rank_results)
+                message = (
+                    "; ".join(msg for ok, msg, _ in rank_results if not ok) or message
+                )
+            return UpdateWeightsFromCPUReqOutput(
+                success=success,
+                message=message,
+                rank_stats=[value for _, _, value in rank_results],
             )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):

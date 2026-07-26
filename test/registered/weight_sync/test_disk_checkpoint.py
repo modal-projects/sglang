@@ -119,6 +119,45 @@ class Publisher:
                 f,
             )
 
+    def publish_overwrite(self, version, changed):
+        """Publish sparse byte overwrites for the requested target tensors."""
+        vdir = os.path.join(self.source_dir, f"weight_v{version:06d}")
+        os.makedirs(vdir)
+        payloads = {}
+        checksums = {}
+        for name, new in changed.items():
+            old_array = np.frombuffer(self.state[name], dtype=np.uint8)
+            new_array = np.frombuffer(new, dtype=np.uint8)
+            positions = np.flatnonzero(old_array != new_array).astype("<u4")
+            payload = (
+                len(positions).to_bytes(4, "little")
+                + positions.tobytes()
+                + new_array[positions].tobytes()
+            )
+            payloads[name] = zstandard.ZstdCompressor().compress(payload)
+            checksums[name] = adler32_hex(new)
+            self.state[name] = new
+        self.versions[version] = dict(self.state)
+        write_safetensors(
+            os.path.join(vdir, self.SHARD),
+            payloads,
+            metadata=checksums,
+        )
+        with open(os.path.join(vdir, "model.safetensors.index.json"), "w") as file:
+            json.dump(
+                {
+                    "metadata": {
+                        "version": f"{version:06d}",
+                        "base_version": f"{version - 1:06d}",
+                        "delta_encoding": "overwrite",
+                        "compression_format": "zstd",
+                        "checksum_format": "adler32",
+                    },
+                    "weight_map": {name: self.SHARD for name in payloads},
+                },
+                file,
+            )
+
     def publish_full(self, version):
         vdir = os.path.join(self.source_dir, f"weight_v{version:06d}")
         os.makedirs(vdir)
@@ -565,7 +604,146 @@ class MaterializeTest(unittest.TestCase):
                 "layer.b": rng.integers(0, 256, 2048, dtype=np.uint8).tobytes(),
             },
         )
-        self.materialize(4)
+        target_reads = []
+        target_writes = []
+        original_pread = disk_checkpoint._pread_exact
+        original_pwrite = disk_checkpoint._pwrite_all
+        original_file_limit = disk_checkpoint._MAX_OPEN_FILES_PER_CACHE
+
+        def pread_spy(fd, offset, nbytes, *, source_path=None):
+            if source_path is None:
+                target_reads.append((offset, nbytes))
+            return original_pread(
+                fd,
+                offset,
+                nbytes,
+                source_path=source_path,
+            )
+
+        def pwrite_spy(fd, offset, data):
+            target_writes.append((offset, len(data)))
+            return original_pwrite(fd, offset, data)
+
+        disk_checkpoint._pread_exact = pread_spy
+        disk_checkpoint._pwrite_all = pwrite_spy
+        disk_checkpoint._MAX_OPEN_FILES_PER_CACHE = 1
+        try:
+            stats = self.materialize(4)
+        finally:
+            disk_checkpoint._pread_exact = original_pread
+            disk_checkpoint._pwrite_all = original_pwrite
+            disk_checkpoint._MAX_OPEN_FILES_PER_CACHE = original_file_limit
+
+        self.assert_at_version(4)
+        self.assertEqual(stats["apply"]["operation"], "apply_xor_chain")
+        self.assertEqual(stats["apply"]["versions"], 4)
+        self.assertEqual(stats["apply"]["delta_tensors"], 2)
+        self.assertEqual(stats["apply"]["delta_fragments"], 5)
+        self.assertEqual(stats["apply"]["target_tensor_bytes"], 6144)
+        self.assertEqual(stats["apply"]["file_descriptor_cache_limit"], 1)
+        self.assertEqual(stats["apply"]["peak_source_file_descriptors"], 1)
+        self.assertEqual(stats["apply"]["peak_target_file_descriptors"], 1)
+        self.assertEqual(len(target_reads), 2)
+        self.assertEqual(len(target_writes), 2)
+
+    def test_delta_published_during_fold_is_applied_by_next_request(self):
+        original_write_version = disk_checkpoint._write_applied_version
+        published = False
+
+        def write_version(local_checkpoint_dir, version):
+            nonlocal published
+            if version == 2 and not published:
+                published = True
+                self.pub.publish_delta(
+                    3,
+                    {
+                        "layer.a": np.random.default_rng(29)
+                        .integers(0, 256, 4096, dtype=np.uint8)
+                        .tobytes()
+                    },
+                )
+            return original_write_version(local_checkpoint_dir, version)
+
+        disk_checkpoint._write_applied_version = write_version
+        try:
+            self.materialize(2)
+        finally:
+            disk_checkpoint._write_applied_version = original_write_version
+
+        self.assertTrue(published)
+        self.assert_at_version(2)
+        stats = self.materialize(3)
+        self.assertEqual(stats["apply"]["operation"], "apply_xor")
+        self.assert_at_version(3)
+
+    def test_folded_chain_checks_the_final_target(self):
+        rng = np.random.default_rng(37)
+        self.pub.publish_delta(
+            3, {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()}
+        )
+        self.pub.publish_delta(
+            4, {"layer.b": rng.integers(0, 256, 2048, dtype=np.uint8).tobytes()}
+        )
+
+        shard = os.path.join(
+            self.pub.source_dir,
+            "weight_v000002",
+            Publisher.SHARD,
+        )
+        with open(shard, "rb") as file:
+            (header_len,) = struct.unpack("<Q", file.read(8))
+            header = json.loads(file.read(header_len))
+            compressed = file.read()
+        corrupted = bytearray(zstandard.ZstdDecompressor().decompress(compressed))
+        corrupted[0] ^= 0xFF
+        write_safetensors(
+            shard,
+            {"layer.b": zstandard.ZstdCompressor().compress(corrupted)},
+            metadata=header["__metadata__"],
+        )
+
+        with self.assertRaises(disk_checkpoint._ChecksumMismatchError):
+            self.materialize(4)
+        self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
+
+    def test_folded_chain_validates_lineage_before_mutating(self):
+        self.materialize(0)
+        initial = read_local(self.local)
+        index_path = os.path.join(
+            self.pub.source_dir,
+            "weight_v000002",
+            "model.safetensors.index.json",
+        )
+        with open(index_path) as file:
+            index = json.load(file)
+        index["metadata"]["base_version"] = "000009"
+        with open(index_path, "w") as file:
+            json.dump(index, file)
+
+        with self.assertRaisesRegex(RuntimeError, "out-of-order delta"):
+            self.materialize(2)
+        self.assertEqual(read_local(self.local), initial)
+        self.assertEqual(disk_checkpoint._read_applied_version(self.local), 0)
+
+    def test_mixed_delta_encodings_preserve_order(self):
+        rng = np.random.default_rng(41)
+        self.pub.publish_overwrite(
+            3,
+            {
+                "layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes(),
+            },
+        )
+        self.pub.publish_delta(
+            4,
+            {
+                "layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes(),
+                "layer.b": rng.integers(0, 256, 2048, dtype=np.uint8).tobytes(),
+            },
+        )
+
+        stats = self.materialize(4)
+        self.assertEqual(stats["apply"]["operation"], "apply_deltas")
+        self.assertEqual(stats["apply"]["versions"], 4)
         self.assert_at_version(4)
 
     def test_multi_delta_materialization_reseeds_corrupt_local_checkpoint(self):

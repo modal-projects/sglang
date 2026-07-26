@@ -747,8 +747,56 @@ def test_cpu_commit_failure_reaches_collective_before_failing_closed():
     ):
         manager.update_weights_from_cpu(request)
 
-    assert collective_calls == 3
-    manager.flush_cache.assert_not_called()
+    assert collective_calls == 4
+    manager.flush_cache.assert_called_once_with(empty_cache=False)
+
+
+def test_cpu_commit_rejects_failed_cache_flush_before_mutating_weights():
+    manager = _manager()
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.validate_staged_cpu_weight_update.return_value = (True, "ready")
+    manager.flush_cache.return_value = False
+
+    result = manager.update_weights_from_cpu(
+        SimpleNamespace(
+            target_version=1,
+            flush_cache=True,
+            torch_empty_cache=False,
+        )
+    )
+
+    assert not result.success
+    assert result.message == "Cache flush failed before CPU weight commit."
+    manager.tp_worker.update_weights_from_cpu.assert_not_called()
+
+
+def test_cpu_commit_flushes_cache_before_mutating_weights():
+    manager = _manager()
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.validate_staged_cpu_weight_update.return_value = (True, "ready")
+    order = []
+
+    def flush_cache(*, empty_cache):
+        order.append(("flush", empty_cache))
+        return True
+
+    def update_weights(_):
+        order.append(("commit", None))
+        return True, "committed", {}
+
+    manager.flush_cache.side_effect = flush_cache
+    manager.tp_worker.update_weights_from_cpu.side_effect = update_weights
+
+    result = manager.update_weights_from_cpu(
+        SimpleNamespace(
+            target_version=1,
+            flush_cache=True,
+            torch_empty_cache=False,
+        )
+    )
+
+    assert result.success
+    assert order == [("flush", False), ("commit", None)]
 
 
 def test_cpu_commit_updates_only_target_model():

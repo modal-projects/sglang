@@ -799,8 +799,8 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # The scheduler applies a complete image between batches. Existing
-        # requests do not need to drain before this live-weight commit.
+        # The scheduler applies the complete CPU image between batches. Callers
+        # may abort requests or retain their caches through the request options.
         results = await self.update_weights_from_cpu_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)

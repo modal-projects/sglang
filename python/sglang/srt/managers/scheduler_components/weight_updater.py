@@ -522,6 +522,22 @@ class SchedulerWeightUpdaterManager:
                     ),
                 )
 
+            if recv_req.flush_cache:
+                cache_flushed = self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+                cache_flush_results = [cache_flushed]
+                if tp_size > 1:
+                    cache_flush_results = [None] * tp_size
+                    torch.distributed.all_gather_object(
+                        cache_flush_results,
+                        cache_flushed,
+                        group=self.tp_cpu_group,
+                    )
+                if not all(cache_flush_results):
+                    return UpdateWeightFromCPUReqOutput(
+                        success=False,
+                        message="Cache flush failed before CPU weight commit.",
+                    )
+
             try:
                 success, message, stats = self.tp_worker.update_weights_from_cpu(
                     recv_req
@@ -558,7 +574,6 @@ class SchedulerWeightUpdaterManager:
                     "CPU weight commit failed; terminating the engine to avoid "
                     "serving a mixed or partially committed model. " + message
                 )
-            self.flush_cache_after_weight_update(recv_req)
             return UpdateWeightFromCPUReqOutput(
                 success=success,
                 message=message,

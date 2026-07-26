@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -74,7 +75,11 @@ def test_clone_preserves_tensor_subclasses_aliases_and_source_values():
 
 def test_clone_isolates_loader_owned_objects():
     class Loader:
-        pass
+        def callback(self):
+            self.called = True
+
+        def __init__(self):
+            self.callback_ref = self.callback
 
     source = _DerivedBlock(16)
     source.quant_method = Loader()
@@ -83,6 +88,31 @@ def test_clone_isolates_loader_owned_objects():
 
     assert cloned.quant_method is not source.quant_method
     assert cloned.scheme is cloned.quant_method
+    assert cloned.quant_method.callback_ref.__self__ is cloned.quant_method
+    cloned.quant_method.callback_ref()
+    assert cloned.quant_method.called
+    assert not hasattr(source.quant_method, "called")
+
+
+def test_clone_rebinds_parameter_weight_loaders_to_shadow_modules():
+    class LoaderBlock(_DerivedBlock):
+        def __init__(self):
+            super().__init__(16)
+            self.weight.weight_loader = self.load_weight
+
+        def load_weight(self, parameter, value):
+            parameter.data.copy_(value)
+            self.loader_called = True
+
+    source = LoaderBlock()
+    cloned = clone_module_tensors(source)
+
+    assert cloned.weight.weight_loader.__self__ is cloned
+    cloned.weight.weight_loader(cloned.weight, torch.full_like(cloned.weight, 7))
+    assert cloned.loader_called
+    assert not hasattr(source, "loader_called")
+    assert torch.all(cloned.weight == 7)
+    assert torch.any(source.weight != 7)
 
 
 def test_clone_uses_weight_preparation_protocol():
@@ -102,6 +132,30 @@ def test_clone_uses_weight_preparation_protocol():
     cloned.helper.value.append("prepared")
     assert cloned.helper is not source.helper
     assert source.helper.value == []
+
+
+def test_clone_isolates_deeply_nested_loader_tensor_state():
+    source = _DerivedBlock(16)
+    state_tensor = torch.arange(4)
+    source.loader_state = {"levels": [[[{"tensor": state_tensor}]]]}
+    source.loader_state_alias = source.loader_state
+
+    cloned = clone_module_tensors(source)
+    cloned_tensor = cloned.loader_state["levels"][0][0][0]["tensor"]
+
+    assert cloned.loader_state is cloned.loader_state_alias
+    assert cloned_tensor.data_ptr() != state_tensor.data_ptr()
+    torch.testing.assert_close(cloned_tensor, state_tensor)
+
+
+def test_clone_rejects_cyclic_immutable_loader_state():
+    source = _DerivedBlock(16)
+    cycle = []
+    source.loader_state = (cycle,)
+    cycle.append(source.loader_state)
+
+    with pytest.raises(ValueError, match="cyclic immutable loader state"):
+        clone_module_tensors(source)
 
 
 def test_clone_isolates_nested_dispatcher_state():

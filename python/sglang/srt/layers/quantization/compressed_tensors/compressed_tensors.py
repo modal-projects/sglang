@@ -971,13 +971,13 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
-    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
-        supports_cpu = getattr(
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str | None:
+        get_device = getattr(
             layer.scheme,
-            "supports_cpu_weight_postprocessing",
+            "weight_preparation_device",
             None,
         )
-        return callable(supports_cpu) and supports_cpu(layer)
+        return get_device(layer) if callable(get_device) else None
 
     def create_weights(
         self,
@@ -1037,13 +1037,13 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
-    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
-        supports_cpu = getattr(
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str | None:
+        get_device = getattr(
             layer.scheme,
-            "supports_cpu_weight_postprocessing",
+            "weight_preparation_device",
             None,
         )
-        return callable(supports_cpu) and supports_cpu(layer)
+        return get_device(layer) if callable(get_device) else None
 
     def create_weights(
         self,

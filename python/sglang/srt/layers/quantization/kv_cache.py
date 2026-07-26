@@ -84,5 +84,13 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
 
-    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
-        return True
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str:
+        return "cpu"
+
+    def process_weights_after_weight_commit(self, layer: torch.nn.Module) -> None:
+        k_scale = layer.k_scale.to("cpu").tolist()
+        v_scale = layer.v_scale.to("cpu").tolist()
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+        layer.k_scale_float = k_scale
+        layer.v_scale_float = v_scale

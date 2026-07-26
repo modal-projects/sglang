@@ -46,11 +46,20 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
-    def supports_cpu_weight_postprocessing(self, layer: nn.Module) -> bool:
-        """Return whether the current post-load transform can run on CPU."""
-        return False
+    def weight_preparation_device(self, layer: nn.Module) -> str | None:
+        """Return ``cpu`` or ``cuda`` when host-image preparation is supported.
+
+        A supported method must derive its runtime state only in registered
+        weights, persistent buffers, or tensors exposed by
+        ``prepared_weight_tensors()``. Methods with additional non-tensor
+        runtime state must provide a ``process_weights_after_weight_commit``
+        hook.
+        Returning ``None`` rejects CPU weight-cache initialization.
+        """
+        return None
 
     def supports_batched_weight_loading(self) -> bool:
+        """Return whether independent weight-loader writes may be deferred."""
         return False
 
 

@@ -6,13 +6,14 @@ import pytest
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _manager():
-    return SchedulerWeightUpdaterManager(
+    manager = SchedulerWeightUpdaterManager(
         tp_worker=mock.Mock(),
         draft_worker=None,
         tp_cpu_group=object(),
@@ -22,6 +23,38 @@ def _manager():
         flush_cache=mock.Mock(return_value=True),
         is_fully_idle=mock.Mock(return_value=True),
     )
+    manager.tp_worker.model_runner.cpu_weight_cache = None
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("cpu_offload_gb", 1, "CPU and layer offloading"),
+        ("offload_group_size", 1, "CPU and layer offloading"),
+        ("speculative_algorithm", "EAGLE", "speculative decoding"),
+    ],
+)
+def test_cpu_weight_cache_rejects_incompatible_launch_modes(
+    field,
+    value,
+    message,
+):
+    args = ServerArgs(model_path="dummy")
+    args.enable_cpu_weight_cache = True
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=message):
+        args._validate_weight_update_compatibility()
+
+
+def test_cpu_weight_cache_rejects_automatic_eplb():
+    args = ServerArgs(model_path="dummy")
+    args.enable_cpu_weight_cache = True
+    args.enable_eplb = True
+
+    with pytest.raises(ValueError, match="automatic EPLB"):
+        args._handle_eplb_and_dispatch()
 
 
 @pytest.mark.parametrize(
@@ -122,6 +155,88 @@ def test_cpu_preparation_rejects_offloaded_live_weights():
 
     assert not result.success
     assert "resident on the GPU" in result.message
+
+
+def test_cpu_preparation_requires_enabled_cache():
+    manager = _manager()
+
+    result = manager.pull_weights(SimpleNamespace(destination="cpu"))
+
+    assert not result.success
+    assert "--enable-cpu-weight-cache" in result.message
+    assert manager._pending_pull is None
+
+
+def test_cpu_preparation_preflight_is_collectively_consistent():
+    manager = _manager()
+    manager.tp_worker.model_runner.cpu_weight_cache = object()
+
+    def all_gather_object(output, value, *, group):
+        if isinstance(value, bool):
+            output[:] = [value, value]
+        else:
+            output[:] = [
+                value,
+                "CPU weight preparation requires GPU-resident weights.",
+            ]
+
+    with (
+        mock.patch(
+            "sglang.srt.managers.scheduler_components.weight_updater."
+            "torch.distributed.is_initialized",
+            return_value=True,
+        ),
+        mock.patch(
+            "sglang.srt.managers.scheduler_components.weight_updater."
+            "torch.distributed.get_world_size",
+            return_value=2,
+        ),
+        mock.patch(
+            "sglang.srt.managers.scheduler_components.weight_updater."
+            "torch.distributed.all_gather_object",
+            side_effect=all_gather_object,
+        ),
+    ):
+        result = manager.pull_weights(SimpleNamespace(destination="cpu"))
+
+    assert not result.success
+    assert "GPU-resident weights" in result.message
+    assert manager._pending_pull is None
+
+
+@pytest.mark.parametrize(
+    ("method_name", "worker_method"),
+    [
+        ("update_weights_from_disk", "update_weights_from_disk"),
+        ("update_weights_from_distributed", "update_weights_from_distributed"),
+        ("update_weights_from_tensor", "update_weights_from_tensor"),
+        ("update_weights_from_ipc", "update_weights_from_ipc"),
+    ],
+)
+def test_cpu_weight_cache_rejects_other_live_weight_mutations(
+    method_name,
+    worker_method,
+):
+    manager = _manager()
+    manager.tp_worker.model_runner.cpu_weight_cache = object()
+
+    result = getattr(manager, method_name)(SimpleNamespace())
+
+    assert not result.success
+    assert "CPU weight cache is enabled" in result.message
+    getattr(manager.tp_worker, worker_method).assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["release_memory_occupation", "resume_memory_occupation"],
+)
+def test_cpu_weight_cache_rejects_weight_memory_transitions(method_name):
+    manager = _manager()
+    manager.tp_worker.model_runner.cpu_weight_cache = object()
+
+    with pytest.raises(RuntimeError, match="CPU weight cache is enabled"):
+        getattr(manager, method_name)(SimpleNamespace(tags=["weights"]))
 
 
 def test_cpu_commit_failure_reaches_collective_before_failing_closed():

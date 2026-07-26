@@ -150,8 +150,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def supports_batched_weight_loading(self) -> bool:
         return True
 
-    def supports_cpu_weight_postprocessing(self, layer: Module) -> bool:
-        return _USE_OFFICIAL_SHUFFLE
+    def weight_preparation_device(self, layer: Module) -> str:
+        return "cpu" if _USE_OFFICIAL_SHUFFLE else "cuda"
 
     def process_weights_after_loading(self, layer: Module) -> None:
         self._fp8.process_weights_after_loading(layer)

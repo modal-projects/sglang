@@ -68,7 +68,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    create_custom_parallel_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -515,8 +518,11 @@ class Scheduler(
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
 
-        # Start the watchdog after optional CPU weight cache initialization.
-        self.init_memory_saver_input_blocker()
+        if self.server_args.enable_cpu_weight_cache:
+            # Building the initial host image can outlive the runtime watchdog.
+            self.init_memory_saver_input_blocker()
+        else:
+            self.init_watch_dog_memory_saver_input_blocker()
 
         # Init profiler
         self.init_profiler()
@@ -534,7 +540,8 @@ class Scheduler(
         self.init_deterministic_inference_config()
 
         self.init_weight_updater()
-        self.init_watchdog()
+        if self.server_args.enable_cpu_weight_cache:
+            self.init_watchdog()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1086,6 +1093,10 @@ class Scheduler(
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
+
+    def init_watch_dog_memory_saver_input_blocker(self):
+        self.init_watchdog()
+        self.init_memory_saver_input_blocker()
 
     def init_memory_saver_input_blocker(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1709,9 +1720,8 @@ class Scheduler(
         if tp_size > 1:
             # Background collectives must not share a sequence with scheduler
             # request broadcasts.
-            background_cpu_group = torch.distributed.new_group(
-                ranks=self.tp_group.ranks,
-                backend="gloo",
+            background_cpu_group = create_custom_parallel_group(
+                group_ranks=self.tp_group.ranks,
             )
             hosts = [None] * tp_size
             torch.distributed.all_gather_object(
@@ -1722,19 +1732,14 @@ class Scheduler(
             if len(set(hosts)) == 1:
                 host_cpu_group = background_cpu_group
             else:
-                global_rank = torch.distributed.get_rank()
-                for hostname in sorted(set(hosts)):
-                    ranks = [
+                local_hostname = socket.gethostname()
+                host_cpu_group = create_custom_parallel_group(
+                    group_ranks=[
                         rank
                         for rank, host in zip(self.tp_group.ranks, hosts)
-                        if host == hostname
-                    ]
-                    group = torch.distributed.new_group(
-                        ranks=ranks,
-                        backend="gloo",
-                    )
-                    if global_rank in ranks:
-                        host_cpu_group = group
+                        if host == local_hostname
+                    ],
+                )
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,

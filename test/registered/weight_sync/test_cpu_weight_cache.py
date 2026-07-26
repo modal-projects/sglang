@@ -145,7 +145,6 @@ class TestInMemorySafeTensorsFile(unittest.TestCase):
                 wall_s = _pread_file_to_tensor(
                     path,
                     source,
-                    workers=4,
                 )
             self.assertGreaterEqual(wall_s, 0.0)
 
@@ -786,8 +785,8 @@ class TestInMemorySafeTensorsFile(unittest.TestCase):
     def test_cpu_postprocessing_avoids_background_device_traffic(self):
         class CpuPostprocessor:
             @staticmethod
-            def supports_cpu_weight_postprocessing(layer):
-                return True
+            def weight_preparation_device(layer):
+                return "cpu"
 
             @staticmethod
             def process_weights_after_loading(layer):
@@ -842,6 +841,16 @@ class TestInMemorySafeTensorsFile(unittest.TestCase):
             image.view(torch.float32),
             torch.arange(1, 9, dtype=torch.float32),
         )
+
+    def test_unknown_quantization_method_is_not_assumed_safe(self):
+        shadow = torch.nn.Module()
+        shadow.quant_method = object()
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "unsupported for quantization method object",
+        ):
+            CPUWeightCache._weight_preparation_device(shadow)
 
     def test_modelopt_moe_batch_preserves_native_copy_views(self):
         layer = _CopyOnlyModelOptMoE()

@@ -573,13 +573,11 @@ class FusedMoE(torch.nn.Module):
         """Load many stable expert tensors with one multi-tensor copy.
 
         The existing ``weight_loader`` remains the source of expert placement,
-        TP slicing, padding, and backend layout decisions. Serialized ModelOpt
-        NVFP4 loading is mostly a set of independent copies, so defer those
-        copies while computing the exact same destination/source views.
-        Independent destination storages may be submitted concurrently;
+        TP slicing, padding, and backend layout decisions. Quantization methods
+        opt in only when those decisions do not depend on writes deferred by
+        the batch. Independent destination storages may be copied concurrently;
         storages containing overlapping or non-contiguous destinations retain
-        ordinary loader order. Other quantization schemes keep the ordinary
-        per-tensor behavior until they explicitly satisfy this contract.
+        ordinary loader order.
         """
 
         if not self.supports_batched_weight_loading():

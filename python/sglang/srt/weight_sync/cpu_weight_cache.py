@@ -17,6 +17,7 @@ changed and has no delta-format or sparsity-dependent path.
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import json
 import logging
@@ -24,7 +25,6 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -251,7 +251,6 @@ def _pread_file_to_tensor(
     path: Path,
     target: torch.Tensor,
     *,
-    workers: int = 1,
     drop_cache_after_read: bool = False,
 ) -> float:
     if target.numel() != path.stat().st_size:
@@ -259,56 +258,25 @@ def _pread_file_to_tensor(
             f"source buffer size mismatch for {path}: "
             f"buffer={target.numel()} file={path.stat().st_size}"
         )
-    if workers <= 0:
-        raise ValueError("positional I/O worker count must be positive")
-
     started = time.perf_counter()
     array = target.numpy()
     view = memoryview(array).cast("B")
-    chunk_count = math.ceil(target.numel() / _POSITIONAL_IO_CHUNK_BYTES)
-    worker_count = min(workers, chunk_count)
-
-    def read_extent(worker: int) -> int:
-        begin_chunk = worker * chunk_count // worker_count
-        end_chunk = (worker + 1) * chunk_count // worker_count
-        begin = begin_chunk * _POSITIONAL_IO_CHUNK_BYTES
-        extent_end = min(end_chunk * _POSITIONAL_IO_CHUNK_BYTES, target.numel())
-        fd = os.open(path, os.O_RDONLY)
-        offset = begin
-        try:
-            while offset < extent_end:
-                end = min(
-                    offset + _POSITIONAL_IO_CHUNK_BYTES,
-                    extent_end,
-                )
-                nread = os.preadv(fd, [view[offset:end]], offset)
-                if nread <= 0:
-                    raise EOFError(
-                        f"unexpected EOF reading {path}: "
-                        f"offset={offset} size={target.numel()}"
-                    )
-                offset += nread
-        finally:
-            os.close(fd)
-        return offset - begin
-
+    fd = os.open(path, os.O_RDONLY)
+    offset = 0
     try:
-        if worker_count == 1:
-            worker_stats = [read_extent(0)]
-        else:
-            with ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="prepared-weight-pread-extent",
-            ) as executor:
-                worker_stats = list(executor.map(read_extent, range(worker_count)))
+        while offset < target.numel():
+            end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, target.numel())
+            nread = os.preadv(fd, [view[offset:end]], offset)
+            if nread <= 0:
+                raise EOFError(
+                    f"unexpected EOF reading {path}: "
+                    f"offset={offset} size={target.numel()}"
+                )
+            offset += nread
     finally:
+        os.close(fd)
         view.release()
     wall_s = time.perf_counter() - started
-    if sum(worker_stats) != target.numel():
-        raise RuntimeError(
-            f"parallel positional read was incomplete for {path}: "
-            f"expected={target.numel()} actual={sum(worker_stats)}"
-        )
     if drop_cache_after_read and hasattr(os, "posix_fadvise"):
         try:
             fd = os.open(path, os.O_RDONLY)
@@ -518,11 +486,11 @@ def _clone_attribute(
     value: Any,
     tensor_memo: dict[int, torch.Tensor],
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor],
+    container_memo: dict[int, Any],
     *,
     target_device: torch.device | None,
     copy_data: bool,
     storage_factory: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
-    depth: int = 0,
 ) -> Any:
     if isinstance(value, torch.Tensor):
         return _clone_tensor(
@@ -533,47 +501,173 @@ def _clone_attribute(
             copy_data=copy_data,
             storage_factory=storage_factory,
         )
-    if depth >= 2:
-        return value
+    cached = container_memo.get(id(value))
+    if cached is _CONTAINER_CLONE_IN_PROGRESS:
+        raise ValueError("cyclic immutable loader state cannot be cloned safely")
+    if cached is not None:
+        return cached
     if isinstance(value, dict):
-        return {
-            key: _clone_attribute(
-                child,
-                tensor_memo,
-                storage_memo,
-                target_device=target_device,
-                copy_data=copy_data,
-                storage_factory=storage_factory,
-                depth=depth + 1,
+        cloned = copy.copy(value)
+        cloned.clear()
+        container_memo[id(value)] = cloned
+        cloned.update(
+            (
+                key,
+                _clone_attribute(
+                    child,
+                    tensor_memo,
+                    storage_memo,
+                    container_memo,
+                    target_device=target_device,
+                    copy_data=copy_data,
+                    storage_factory=storage_factory,
+                ),
             )
             for key, child in value.items()
-        }
+        )
+        return cloned
     if isinstance(value, list):
-        return [
+        cloned = copy.copy(value)
+        cloned.clear()
+        container_memo[id(value)] = cloned
+        cloned.extend(
             _clone_attribute(
                 child,
                 tensor_memo,
                 storage_memo,
+                container_memo,
                 target_device=target_device,
                 copy_data=copy_data,
                 storage_factory=storage_factory,
-                depth=depth + 1,
-            )
-            for child in value
-        ]
-    if isinstance(value, tuple):
-        return tuple(
-            _clone_attribute(
-                child,
-                tensor_memo,
-                storage_memo,
-                target_device=target_device,
-                copy_data=copy_data,
-                storage_factory=storage_factory,
-                depth=depth + 1,
             )
             for child in value
         )
+        return cloned
+    if isinstance(value, set):
+        cloned = copy.copy(value)
+        cloned.clear()
+        container_memo[id(value)] = cloned
+        cloned.update(
+            _clone_attribute(
+                child,
+                tensor_memo,
+                storage_memo,
+                container_memo,
+                target_device=target_device,
+                copy_data=copy_data,
+                storage_factory=storage_factory,
+            )
+            for child in value
+        )
+        return cloned
+    if isinstance(value, (tuple, frozenset)):
+        container_memo[id(value)] = _CONTAINER_CLONE_IN_PROGRESS
+        children = [
+            _clone_attribute(
+                child,
+                tensor_memo,
+                storage_memo,
+                container_memo,
+                target_device=target_device,
+                copy_data=copy_data,
+                storage_factory=storage_factory,
+            )
+            for child in value
+        ]
+        if isinstance(value, frozenset):
+            cloned = frozenset(children)
+        elif hasattr(value, "_fields"):
+            cloned = type(value)(*children)
+        else:
+            cloned = tuple(children)
+        container_memo[id(value)] = cloned
+        return cloned
+    return value
+
+
+_CONTAINER_CLONE_IN_PROGRESS = object()
+
+
+def _rebind_cloned_method_owners(
+    value: Any,
+    owner_memo: dict[int, Any],
+    value_memo: dict[int, Any],
+) -> Any:
+    cloned_value = owner_memo.get(id(value))
+    if cloned_value is not None:
+        return cloned_value
+    owner = getattr(value, "__self__", None)
+    function = getattr(value, "__func__", None)
+    if owner is not None and function is not None:
+        cloned_owner = owner_memo.get(id(owner))
+        return value if cloned_owner is None else function.__get__(cloned_owner)
+
+    cached = value_memo.get(id(value))
+    if cached is _CONTAINER_CLONE_IN_PROGRESS:
+        raise ValueError("cyclic immutable loader state cannot be rebound safely")
+    if cached is not None:
+        return cached
+    if isinstance(value, functools.partial):
+        cloned = functools.partial(
+            _rebind_cloned_method_owners(value.func, owner_memo, value_memo),
+            *(
+                _rebind_cloned_method_owners(item, owner_memo, value_memo)
+                for item in value.args
+            ),
+            **{
+                key: _rebind_cloned_method_owners(item, owner_memo, value_memo)
+                for key, item in (value.keywords or {}).items()
+            },
+        )
+        value_memo[id(value)] = cloned
+        cloned.__dict__.update(
+            {
+                key: _rebind_cloned_method_owners(item, owner_memo, value_memo)
+                for key, item in value.__dict__.items()
+            }
+        )
+        return cloned
+    if isinstance(value, dict):
+        cloned = copy.copy(value)
+        cloned.clear()
+        value_memo[id(value)] = cloned
+        cloned.update(
+            (
+                key,
+                _rebind_cloned_method_owners(item, owner_memo, value_memo),
+            )
+            for key, item in value.items()
+        )
+        return cloned
+    if isinstance(value, list):
+        cloned = copy.copy(value)
+        cloned.clear()
+        value_memo[id(value)] = cloned
+        cloned.extend(
+            _rebind_cloned_method_owners(item, owner_memo, value_memo) for item in value
+        )
+        return cloned
+    if isinstance(value, set):
+        cloned = copy.copy(value)
+        cloned.clear()
+        value_memo[id(value)] = cloned
+        cloned.update(
+            _rebind_cloned_method_owners(item, owner_memo, value_memo) for item in value
+        )
+        return cloned
+    if isinstance(value, (tuple, frozenset)):
+        value_memo[id(value)] = _CONTAINER_CLONE_IN_PROGRESS
+        items = [
+            _rebind_cloned_method_owners(item, owner_memo, value_memo) for item in value
+        ]
+        if isinstance(value, frozenset):
+            cloned = frozenset(items)
+        elif hasattr(value, "_fields"):
+            cloned = type(value)(*items)
+        else:
+            cloned = tuple(items)
+        value_memo[id(value)] = cloned
+        return cloned
     return value
 
 
@@ -588,10 +682,13 @@ def clone_module_tensors(
 
     tensor_memo: dict[int, torch.Tensor] = {}
     storage_memo: dict[tuple[int | None, int, int], torch.Tensor] = {}
+    container_memo: dict[int, Any] = {}
     loader_object_memo: dict[int, Any] = {}
+    module_memo: dict[int, torch.nn.Module] = {}
 
     def clone(current: torch.nn.Module) -> torch.nn.Module:
         result = copy.copy(current)
+        module_memo[id(current)] = result
         result._parameters = {
             name: (
                 None
@@ -626,6 +723,7 @@ def clone_module_tensors(
             name: None if child is None else clone(child)
             for name, child in current._modules.items()
         }
+        result._non_persistent_buffers_set = current._non_persistent_buffers_set.copy()
         for name, value in vars(current).items():
             if name in {"_parameters", "_buffers", "_modules"}:
                 continue
@@ -653,13 +751,42 @@ def clone_module_tensors(
                 value,
                 tensor_memo,
                 storage_memo,
+                container_memo,
                 target_device=target_device,
                 copy_data=copy_data,
                 storage_factory=storage_factory,
             )
         return result
 
-    return clone(module)
+    result = clone(module)
+    owner_memo = {**module_memo, **loader_object_memo}
+    value_memo: dict[int, Any] = {}
+    for cloned_module in module_memo.values():
+        for name, value in vars(cloned_module).items():
+            if name in {"_parameters", "_buffers", "_modules"}:
+                continue
+            cloned_module.__dict__[name] = _rebind_cloned_method_owners(
+                value,
+                owner_memo,
+                value_memo,
+            )
+    for cloned_object in loader_object_memo.values():
+        if not hasattr(cloned_object, "__dict__"):
+            continue
+        for name, value in vars(cloned_object).items():
+            cloned_object.__dict__[name] = _rebind_cloned_method_owners(
+                value,
+                owner_memo,
+                value_memo,
+            )
+    for cloned_tensor in tensor_memo.values():
+        for name, value in vars(cloned_tensor).items():
+            cloned_tensor.__dict__[name] = _rebind_cloned_method_owners(
+                value,
+                owner_memo,
+                value_memo,
+            )
+    return result
 
 
 def clone_module_proxy(
@@ -941,6 +1068,7 @@ class CPUWeightCache:
             model,
             max_group_bytes=max_group_bytes,
         )
+        self._weight_preparation_device(model)
         self.image = PreparedWeightImage(model)
         self._prepare_stream = torch.cuda.Stream(device=self.target_device)
         self._canonical_checkpoint: HostSharedCheckpoint | None = None
@@ -1143,19 +1271,27 @@ class CPUWeightCache:
         return updated, runtime_bytes, copied_bytes
 
     @staticmethod
-    def _supports_cpu_postprocessing(shadow: torch.nn.Module) -> bool:
-        for _, module in shadow.named_modules():
+    def _weight_preparation_device(shadow: torch.nn.Module) -> str:
+        device = "cpu"
+        for module_name, module in shadow.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is None:
                 continue
-            supports_cpu = getattr(
+            get_device = getattr(
                 quant_method,
-                "supports_cpu_weight_postprocessing",
+                "weight_preparation_device",
                 None,
             )
-            if not callable(supports_cpu) or not supports_cpu(module):
-                return False
-        return True
+            method_device = get_device(module) if callable(get_device) else None
+            if method_device not in {"cpu", "cuda"}:
+                raise NotImplementedError(
+                    "CPU weight preparation is unsupported for quantization "
+                    f"method {type(quant_method).__name__} at "
+                    f"{module_name or '<root>'}"
+                )
+            if method_device == "cuda":
+                device = "cuda"
+        return device
 
     def _image_backed_cpu_storage(
         self,
@@ -1253,7 +1389,8 @@ class CPUWeightCache:
         background_h2d_bytes = sum(
             nbytes for _, nbytes in loaded.gpu_stage_cpu_storages
         )
-        if self._supports_cpu_postprocessing(cpu_shadow):
+        postprocess_device = self._weight_preparation_device(cpu_shadow)
+        if postprocess_device == "cpu":
             phase_started = time.perf_counter()
             for _, module in cpu_shadow.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -1271,7 +1408,6 @@ class CPUWeightCache:
             image_copy_s = time.perf_counter() - phase_started
             h2d_submit_s = 0.0
             device_sync_s = 0.0
-            postprocess_device = "cpu"
             background_h2d_bytes = 0
             background_d2h_bytes = 0
             gpu_shadow = None
@@ -1324,7 +1460,6 @@ class CPUWeightCache:
             )
             image_copy_s = time.perf_counter() - phase_started
             cpu_image_copy_bytes = 0
-            postprocess_device = "cuda"
             background_d2h_bytes = group_bytes
         stats = {
             "path": group.path,
@@ -1427,8 +1562,6 @@ class CPUWeightCache:
             torch.distributed.get_world_size(group=cpu_group) if distributed else 1
         )
         rank = torch.distributed.get_rank(group=cpu_group) if distributed else 0
-        available_cpus = len(os.sched_getaffinity(0))
-        per_rank_cpus = max(1, available_cpus // world_size)
         owned_reads = []
         local_error = None
         try:
@@ -1436,15 +1569,12 @@ class CPUWeightCache:
                 if file_index % world_size != rank:
                     continue
                 file_nbytes = file_sizes[filename]
-                useful_workers = max(1, math.ceil(file_nbytes / (1 << 30)))
-                workers = min(8, per_rank_cpus, useful_workers)
                 wall_s = _pread_file_to_tensor(
                     root / filename,
                     checkpoint.view(
                         file_nbytes,
                         offset=offsets[filename],
                     ),
-                    workers=workers,
                     drop_cache_after_read=True,
                 )
                 owned_reads.append(

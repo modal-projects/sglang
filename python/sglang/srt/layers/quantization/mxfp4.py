@@ -530,8 +530,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def supports_batched_weight_loading(self) -> bool:
         return True
 
-    def supports_cpu_weight_postprocessing(self, layer) -> bool:
-        return self.use_flashinfer and self._fi_kernel == "trtllm_sm100"
+    def weight_preparation_device(self, layer) -> str:
+        return (
+            "cpu"
+            if self.use_flashinfer and self._fi_kernel == "trtllm_sm100"
+            else "cuda"
+        )
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:

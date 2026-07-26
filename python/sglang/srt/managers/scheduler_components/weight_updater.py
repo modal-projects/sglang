@@ -141,9 +141,46 @@ class SchedulerWeightUpdaterManager:
             "live weights cannot be changed until it finishes."
         )
 
+    def _cpu_weight_cache_conflict(self, operation: str) -> str | None:
+        cache = getattr(self.tp_worker.model_runner, "cpu_weight_cache", None)
+        if cache is None:
+            return None
+        return (
+            f"{operation} is unavailable while the CPU weight cache is enabled. "
+            "Use /pull_weights with destination=cpu followed by "
+            "/update_weights_from_cpu, or launch without "
+            "--enable-cpu-weight-cache."
+        )
+
+    def _pull_preflight_message(self, recv_req: PullWeightsReqInput) -> str | None:
+        message = None
+        if recv_req.destination == "cpu":
+            if GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags:
+                message = (
+                    "CPU weight preparation requires the live model weights "
+                    "to be resident on the GPU."
+                )
+            elif self.tp_worker.model_runner.cpu_weight_cache is None:
+                message = "CPU weight preparation requires --enable-cpu-weight-cache."
+
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            messages = [None] * world_size
+            torch.distributed.all_gather_object(
+                messages,
+                message,
+                group=self.tp_cpu_group,
+            )
+        else:
+            messages = [message]
+        messages = sorted({value for value in messages if value is not None})
+        return "; ".join(messages) if messages else None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         if message := self._pending_pull_message():
+            return UpdateWeightFromDiskReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("/update_weights_from_disk"):
             return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
@@ -166,16 +203,10 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="Another weight pull or preparation is already running.",
             )
-        if (
-            recv_req.destination == "cpu"
-            and GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags
-        ):
+        if message := self._pull_preflight_message(recv_req):
             return PullWeightsReqOutput(
                 success=False,
-                message=(
-                    "CPU weight preparation requires the live model weights "
-                    "to be resident on the GPU."
-                ),
+                message=message,
             )
 
         def pull():
@@ -446,6 +477,13 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message=message,
             )
+        if message := self._cpu_weight_cache_conflict(
+            "/update_weights_from_distributed"
+        ):
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message=message,
+            )
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -459,6 +497,8 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
         if message := self._pending_pull_message():
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("/update_weights_from_tensor"):
             return UpdateWeightsFromTensorReqOutput(success=False, message=message)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
@@ -476,6 +516,8 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         if message := self._pending_pull_message():
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("/update_weights_from_ipc"):
             return UpdateWeightsFromIPCReqOutput(success=False, message=message)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
@@ -504,6 +546,10 @@ class SchedulerWeightUpdaterManager:
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+        if GPU_MEMORY_TYPE_WEIGHTS in tags and (
+            message := self._cpu_weight_cache_conflict("releasing model-weight memory")
+        ):
+            raise RuntimeError(message)
 
         for tag in tags:
             self.offload_tags.add(tag)
@@ -547,6 +593,10 @@ class SchedulerWeightUpdaterManager:
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+        if GPU_MEMORY_TYPE_WEIGHTS in tags and (
+            message := self._cpu_weight_cache_conflict("resuming model-weight memory")
+        ):
+            raise RuntimeError(message)
 
         for tag in tags:
             self.offload_tags.remove(tag)

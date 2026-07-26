@@ -168,6 +168,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str | None:
+        return "cpu" if not _is_cpu else None
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
@@ -198,8 +201,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
-    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
-        return not _is_cpu
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str | None:
+        return "cpu" if not _is_cpu else None
 
     def apply(
         self,
@@ -442,6 +445,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
+
+    def weight_preparation_device(self, layer: torch.nn.Module) -> str | None:
+        if _is_cpu or _is_npu:
+            return None
+        if _use_aiter or self.use_flashinfer_trtllm_moe:
+            return "cuda"
+        return "cpu"
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,

@@ -551,9 +551,12 @@ class DeltaCheckpointOverlay:
             }
 
         started = time.perf_counter()
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available_cpus = os.cpu_count() or 1
         worker_count = min(
-            8,
-            max(1, (os.cpu_count() or self.world_size) // self.world_size),
+            max(1, available_cpus // self.world_size),
             len(names),
         )
 

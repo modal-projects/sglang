@@ -141,6 +141,18 @@ class PreparedWeightImage:
         self.image = torch.empty(self.image_nbytes, dtype=torch.uint8)
         self._image_buffer = memoryview(self.image.numpy()).cast("B")
         self._stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._post_commit_hooks = [
+            (module, hook)
+            for module in model.modules()
+            if (quant_method := getattr(module, "quant_method", None)) is not None
+            and callable(
+                hook := getattr(
+                    quant_method,
+                    "process_weights_after_weight_commit",
+                    None,
+                )
+            )
+        ]
         self.registered = False
         self.registration_wall_s: float | None = None
         self.identity: str | None = None
@@ -336,6 +348,10 @@ class PreparedWeightImage:
                             non_blocking=True,
                         )
             self._stream.synchronize()
+            hook_started = time.perf_counter()
+            for module, hook in self._post_commit_hooks:
+                hook(module)
+            post_commit_hook_wall_s = time.perf_counter() - hook_started
         except Exception as exc:
             self.invalidate(
                 f"commit of {expected_identity!r} failed after live weights may "
@@ -344,7 +360,9 @@ class PreparedWeightImage:
             raise IrrecoverableWeightCommitError(self.invalid_reason) from exc
 
         self.prepared = False
-        return self.stats("commit", time.perf_counter() - started)
+        stats = self.stats("commit", time.perf_counter() - started)
+        stats["post_commit_hook_wall_s"] = round(post_commit_hook_wall_s, 6)
+        return stats
 
     def validate_against_active(self) -> dict[str, int | float | str]:
         """Validate the compiled image against the active startup weights."""

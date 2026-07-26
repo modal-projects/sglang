@@ -154,10 +154,16 @@ class TestMxfp4Reload(unittest.TestCase):
 
     def test_cpu_postprocessing_capability_is_backend_specific(self):
         method = _make_method()
-        self.assertTrue(method.supports_cpu_weight_postprocessing(torch.nn.Module()))
+        self.assertEqual(
+            method.weight_preparation_device(torch.nn.Module()),
+            "cpu",
+        )
 
         method._fi_kernel = "cutlass_sm90"
-        self.assertFalse(method.supports_cpu_weight_postprocessing(torch.nn.Module()))
+        self.assertEqual(
+            method.weight_preparation_device(torch.nn.Module()),
+            "cuda",
+        )
 
     def test_hybrid_mxfp4_repeated_reload_restores_checkpoint_layout(self):
         method = _make_hybrid_method()

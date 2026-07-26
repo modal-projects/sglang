@@ -607,8 +607,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             restore_scale_checkpoint_state(getattr(layer, "weight_scale_inv", None))
 
-    def supports_cpu_weight_postprocessing(self, layer: Module) -> bool:
-        if (
+    def weight_preparation_device(self, layer: Module) -> str:
+        requires_cuda = (
             not self.block_quant
             or not self.is_checkpoint_fp8_serialized
             or self.use_mxfp8
@@ -616,8 +616,9 @@ class Fp8LinearMethod(LinearMethodBase):
             or _is_fp8_fnuz
             or _is_cpu
             or _use_aiter_bpreshuffle_gfx95
-        ):
-            return False
+        )
+        if requires_cuda:
+            return "cuda"
         from sglang.srt.model_loader.utils import (
             should_deepgemm_weight_requant_ue8m0,
         )
@@ -625,13 +626,17 @@ class Fp8LinearMethod(LinearMethodBase):
         use_deepgemm_runner = (
             self.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
         )
-        return not (
-            use_deepgemm_runner
-            and should_deepgemm_weight_requant_ue8m0(
-                weight_block_size=self.quant_config.weight_block_size,
-                output_dtype=getattr(layer, "orig_dtype", None),
-                weight_shape=layer.weight.shape,
+        return (
+            "cuda"
+            if (
+                use_deepgemm_runner
+                and should_deepgemm_weight_requant_ue8m0(
+                    weight_block_size=self.quant_config.weight_block_size,
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
+                )
             )
+            else "cpu"
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
@@ -1355,8 +1360,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             restore_scale_checkpoint_state(getattr(layer, "w13_weight_scale_inv", None))
             restore_scale_checkpoint_state(getattr(layer, "w2_weight_scale_inv", None))
 
-    def supports_cpu_weight_postprocessing(self, layer: Module) -> bool:
-        if (
+    def weight_preparation_device(self, layer: Module) -> str:
+        requires_cuda = (
             not self.block_quant
             or not self.quant_config.is_checkpoint_fp8_serialized
             or self.use_mxfp8
@@ -1365,17 +1370,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or _is_fp8_fnuz
             or _use_aiter
             or _is_cpu
-        ):
-            return False
+        )
+        if requires_cuda:
+            return "cuda"
         from sglang.srt.model_loader.utils import (
             should_deepgemm_weight_requant_ue8m0,
         )
 
-        return not (
-            self.is_deepgemm_moe_runner_backend_enabled()
-            and should_deepgemm_weight_requant_ue8m0(
-                weight_block_size=self.quant_config.weight_block_size,
+        return (
+            "cuda"
+            if (
+                self.is_deepgemm_moe_runner_backend_enabled()
+                and should_deepgemm_weight_requant_ue8m0(
+                    weight_block_size=self.quant_config.weight_block_size,
+                )
             )
+            else "cpu"
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:

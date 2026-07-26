@@ -86,13 +86,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     def supports_batched_weight_loading(self) -> bool:
         return True
 
-    def supports_cpu_weight_postprocessing(self, layer) -> bool:
-        return (
+    def weight_preparation_device(self, layer) -> str:
+        supports_cpu = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and not self.static_input_scales
             and not is_fp8_fnuz()
             and not _use_aiter
         )
+        return "cpu" if supports_cpu else "cuda"
 
     def create_weights(
         self,

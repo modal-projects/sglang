@@ -2624,7 +2624,7 @@ class ServerArgs:
     ] = None
     enable_cpu_weight_cache: A[
         bool,
-        "Cache one canonical checkpoint per host and one rank-ready CPU weight image per local model worker for background delta weight preparation.",
+        "Cache one canonical checkpoint per host-local model replica and one rank-ready CPU weight image per local model worker for background delta weight preparation.",
     ] = False
     cpu_weight_cache_max_staging_gb: A[
         float,
@@ -3041,6 +3041,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._validate_weight_update_compatibility()
 
         # Needs the draft-token count derived just above.
         self._validate_gdn_replayssm_spec_ring()
@@ -5940,6 +5941,19 @@ class ServerArgs:
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
+
+    def _validate_weight_update_compatibility(self):
+        if not self.enable_cpu_weight_cache:
+            return
+        if self.cpu_offload_gb > 0 or self.offload_group_size > 0:
+            raise ValueError(
+                "--enable-cpu-weight-cache requires model weights to remain "
+                "resident on the GPU; CPU and layer offloading are unsupported"
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support speculative decoding"
+            )
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_rejoin:

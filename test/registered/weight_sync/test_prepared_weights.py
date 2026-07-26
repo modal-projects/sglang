@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.weight_sync.prepared_weights import (
     build_prepared_weight_plan,
     iter_weight_tensors,
@@ -61,3 +62,15 @@ def test_weight_plan_excludes_non_persistent_runtime_buffers():
         "weight",
         "checkpoint_buffer",
     ]
+
+
+def test_kv_cache_method_refreshes_non_tensor_state_after_commit():
+    layer = torch.nn.Module()
+    layer.k_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
+    layer.v_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    method = object.__new__(BaseKVCacheMethod)
+
+    method.process_weights_after_weight_commit(layer)
+
+    assert layer.k_scale_float == 0.25
+    assert layer.v_scale_float == 0.5

@@ -1802,6 +1802,14 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
+    def get_additional_weight_tensors(self):
+        """Expose checkpoint-derived MLA tensors that are not registered state."""
+
+        for name in ("w_kc", "w_vc", "w_scale", "w_scale_k", "w_scale_v"):
+            tensor = getattr(self, name, None)
+            if isinstance(tensor, torch.Tensor):
+                yield name, tensor
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:

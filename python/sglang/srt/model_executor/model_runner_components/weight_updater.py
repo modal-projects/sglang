@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -230,6 +231,187 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    @torch.no_grad()
+    def stage_cpu_weight_update(
+        self,
+        *,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        """Build a complete rank-ready CPU image from a delta lineage."""
+        try:
+            if self.device != "cuda":
+                raise RuntimeError(
+                    "CPU weight update staging requires a CUDA model runner"
+                )
+            runner = self.get_model_runner()
+            if not runner.server_args.enable_cpu_weight_cache:
+                raise RuntimeError(
+                    "CPU weight update staging requires --enable-cpu-weight-cache"
+                )
+            cache = runner.cpu_weight_cache
+            if cache is None:
+                raise RuntimeError("CPU weight cache was not initialized")
+            if cache.host_cpu_group is not host_cpu_group:
+                raise ValueError(
+                    "host CPU process group cannot change after cache initialization"
+                )
+            with torch.cuda.device(self.gpu_id):
+                stats = cache.stage_from_delta_lineage(
+                    base_checkpoint_dir=base_checkpoint_dir,
+                    checkpoint_source_dir=checkpoint_source_dir,
+                    target_version=target_version,
+                )
+            logger.info(
+                "Staged CPU weights for version %d: bytes=%d groups=%d "
+                "wall_time=%.3fs",
+                target_version,
+                stats["bytes"],
+                stats["groups"],
+                stats["wall_s"],
+            )
+            return True, "Staged weights in CPU memory.", stats
+        except Exception as exc:
+            logger.exception(
+                "Failed to stage CPU weights for version %s",
+                target_version,
+            )
+            return (
+                False,
+                f"Failed to stage CPU weights: {type(exc).__name__}: {exc}",
+                None,
+            )
+
+    def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
+        """Construct and populate the CPU weight cache."""
+        runner = self.get_model_runner()
+        if not runner.server_args.enable_cpu_weight_cache:
+            return None
+        if self.device != "cuda":
+            raise RuntimeError("CPU weight cache requires a CUDA model runner")
+
+        max_group_bytes = int(
+            runner.server_args.cpu_weight_cache_max_compile_group_gb * (1 << 30)
+        )
+        if max_group_bytes <= 0:
+            raise ValueError("cpu_weight_cache_max_compile_group_gb must be positive")
+        if runner.cpu_weight_cache is not None:
+            raise RuntimeError("CPU weight cache is already initialized")
+
+        from sglang.srt.weight_sync.cpu_weight_cache import (
+            CPUWeightCache,
+        )
+
+        with torch.cuda.device(self.gpu_id):
+            started = time.perf_counter()
+            cache = None
+            construction_error = None
+            try:
+                cache = CPUWeightCache(
+                    self.get_model(),
+                    max_group_bytes=max_group_bytes,
+                    host_cpu_group=host_cpu_group,
+                )
+            except Exception as exc:
+                construction_error = f"{type(exc).__name__}: {exc}"
+            if torch.distributed.is_initialized():
+                host_world_size = torch.distributed.get_world_size(group=host_cpu_group)
+                construction_errors = [None] * host_world_size
+                torch.distributed.all_gather_object(
+                    construction_errors,
+                    construction_error,
+                    group=host_cpu_group,
+                )
+            else:
+                construction_errors = [construction_error]
+            construction_errors = [
+                error for error in construction_errors if error is not None
+            ]
+            if construction_errors:
+                if cache is not None:
+                    cache.close("distributed CPU weight cache construction failed")
+                raise RuntimeError(
+                    "CPU weight cache construction failed: "
+                    + "; ".join(construction_errors)
+                )
+            if cache is None:
+                raise RuntimeError(
+                    "CPU weight cache construction completed without a cache"
+                )
+            construction_wall_s = time.perf_counter() - started
+            try:
+                stats = cache.initialize_from_checkpoint(
+                    base_checkpoint_dir=base_checkpoint_dir,
+                )
+            except Exception:
+                cache.close("CPU weight cache initialization failed")
+                raise
+            runner.cpu_weight_cache = cache
+            stats["cache_population_wall_s"] = stats["wall_s"]
+            stats["cache_construction_wall_s"] = round(construction_wall_s, 6)
+            stats["wall_s"] = round(
+                time.perf_counter() - started,
+                6,
+            )
+            return stats
+
+    @torch.no_grad()
+    def update_weights_from_cpu(self, target_version: int):
+        """Update existing CUDA storages from a rank-ready CPU image."""
+        runner = self.get_model_runner()
+        if runner.cpu_weight_cache is None:
+            return False, "CPU weight cache is not enabled.", None
+
+        try:
+            with torch.cuda.device(self.gpu_id):
+                torch.cuda.synchronize(self.gpu_id)
+                stats = runner.cpu_weight_cache.commit(target_version)
+            logger.info(
+                "Updated weights from CPU for version %d: bytes=%d "
+                "wall_time=%.3fs bandwidth=%.3fGB/s",
+                target_version,
+                stats["bytes"],
+                stats["wall_s"],
+                stats["gbps"],
+            )
+            return True, "Updated weights from CPU memory.", stats
+        except Exception:
+            # After distributed preflight begins, a rank-local failure cannot
+            # be rolled back without a second model-sized image.
+            logger.critical(
+                "CPU weight update failed for version %s",
+                target_version,
+                exc_info=True,
+            )
+            raise
+
+    def validate_staged_cpu_weight_update(self, target_version: int):
+        runner = self.get_model_runner()
+        if runner.cpu_weight_cache is None:
+            return False, "CPU weight cache is not enabled."
+        try:
+            runner.cpu_weight_cache.image.validate_commit(target_version)
+            return True, "CPU weights are ready."
+        except Exception as exc:
+            return (
+                False,
+                f"CPU weights are not ready: {type(exc).__name__}: {exc}",
+            )
+
+    def invalidate_staged_cpu_weight_update(self, reason: str) -> None:
+        cache = self.get_model_runner().cpu_weight_cache
+        if cache is not None:
+            cache.invalidate_stage(reason)
+
+    def discard_cpu_weight_cache(self, reason: str) -> None:
+        runner = self.get_model_runner()
+        cache = runner.cpu_weight_cache
+        runner.cpu_weight_cache = None
+        if cache is not None:
+            cache.close(reason)
 
     def update_weights_from_distributed(
         self: WeightUpdater,

@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import concurrent.futures
 import logging
+import os
 from enum import Enum
 from functools import cached_property
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -15,6 +17,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_tp_group,
+    get_world_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -91,6 +94,28 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _batched_weight_copy_workers() -> int:
+    """Give each local model worker an equal share of available CPUs."""
+
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available_cpus = os.cpu_count() or 1
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        return available_cpus
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        server_args = get_server_args()
+        local_model_workers = world_group.local_size or (
+            world_group.world_size // server_args.nnodes
+        )
+        if not server_args.enable_dp_attention:
+            local_model_workers *= server_args.dp_size
+    else:
+        local_model_workers = 1
+    return max(available_cpus // local_model_workers, 1)
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -497,6 +522,170 @@ class FusedMoE(torch.nn.Module):
 
         return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
 
+    def _copy_loaded_weight(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+    ) -> None:
+        copy_pairs = getattr(self, "_batched_weight_copy_pairs", None)
+        if copy_pairs is None:
+            target.copy_(source)
+        else:
+            copy_pairs.append((target, source))
+
+    def supports_batched_weight_loading(self) -> bool:
+        """Return whether this loader is a pure set of independent copies."""
+
+        method = self.quant_method
+        if hasattr(self, "scheme"):
+            method = self.scheme
+        supports_batching = getattr(
+            method,
+            "supports_batched_weight_loading",
+            None,
+        )
+        return callable(supports_batching) and supports_batching()
+
+    def _execute_batched_weight_copies(
+        self,
+        copy_pairs: List[Tuple[torch.Tensor, torch.Tensor]],
+        *,
+        executor: concurrent.futures.Executor | None,
+    ) -> None:
+        if copy_pairs:
+            pairs_by_storage = {}
+            for target, _ in copy_pairs:
+                storage = target.untyped_storage()
+                key = (
+                    target.device,
+                    storage.data_ptr(),
+                    storage.nbytes(),
+                )
+                pairs_by_storage.setdefault(key, []).append(
+                    (
+                        target.is_contiguous(),
+                        target.data_ptr(),
+                        target.data_ptr() + target.numel() * target.element_size(),
+                    )
+                )
+
+            ordered_storage_keys = set()
+            for key, entries in pairs_by_storage.items():
+                if any(not contiguous for contiguous, _, _ in entries):
+                    ordered_storage_keys.add(key)
+                    continue
+                ranges = sorted(
+                    (begin, end) for _, begin, end in entries if begin < end
+                )
+                if any(
+                    current[0] < previous[1]
+                    for previous, current in zip(ranges, ranges[1:])
+                ):
+                    ordered_storage_keys.add(key)
+
+            parallel_pairs = []
+            ordered_pairs = []
+            for target, source in copy_pairs:
+                storage = target.untyped_storage()
+                key = (
+                    target.device,
+                    storage.data_ptr(),
+                    storage.nbytes(),
+                )
+                destination = (
+                    ordered_pairs if key in ordered_storage_keys else parallel_pairs
+                )
+                destination.append((target, source))
+
+            def copy_group(
+                pairs: List[Tuple[torch.Tensor, torch.Tensor]],
+            ) -> None:
+                groups = {}
+                for target, source in pairs:
+                    key = (
+                        target.device,
+                        source.device,
+                        target.dtype,
+                        source.dtype,
+                    )
+                    targets, sources = groups.setdefault(key, ([], []))
+                    targets.append(target)
+                    sources.append(source)
+                for targets, sources in groups.values():
+                    if hasattr(torch, "_foreach_copy_"):
+                        torch._foreach_copy_(targets, sources)
+                    else:
+                        for target, source in zip(targets, sources):
+                            target.copy_(source)
+
+            if parallel_pairs:
+                copy_workers = (
+                    1
+                    if executor is None
+                    else min(
+                        _batched_weight_copy_workers(),
+                        len(parallel_pairs),
+                    )
+                )
+                if copy_workers == 1:
+                    copy_group(parallel_pairs)
+                else:
+                    chunks = [[] for _ in range(copy_workers)]
+                    chunk_bytes = [0] * copy_workers
+                    weighted_pairs = sorted(
+                        parallel_pairs,
+                        key=lambda pair: (pair[0].numel() * pair[0].element_size()),
+                        reverse=True,
+                    )
+                    for pair in weighted_pairs:
+                        chunk_index = min(
+                            range(copy_workers),
+                            key=chunk_bytes.__getitem__,
+                        )
+                        chunks[chunk_index].append(pair)
+                        chunk_bytes[chunk_index] += (
+                            pair[0].numel() * pair[0].element_size()
+                        )
+                    chunks = [chunk for chunk in chunks if chunk]
+                    futures = [executor.submit(copy_group, chunk) for chunk in chunks]
+                    for future in futures:
+                        future.result()
+            for target, source in ordered_pairs:
+                target.copy_(source)
+
+    def batched_weight_loader(
+        self,
+        calls: List[Tuple[Tuple[Any, ...], dict[str, Any]]],
+        *,
+        executor: concurrent.futures.Executor | None = None,
+    ) -> None:
+        """Load many stable expert tensors with one multi-tensor copy.
+
+        The existing ``weight_loader`` remains the source of expert placement,
+        TP slicing, padding, and backend layout decisions. Quantization methods
+        opt in only when those decisions do not depend on writes deferred by
+        the batch. Independent destination storages may be copied concurrently;
+        storages containing overlapping or non-contiguous destinations retain
+        ordinary loader order.
+        """
+
+        if not self.supports_batched_weight_loading():
+            raise RuntimeError("FusedMoE weight-loader batching is not supported")
+        if getattr(self, "_batched_weight_copy_pairs", None) is not None:
+            raise RuntimeError("nested FusedMoE weight-loader batching is unsupported")
+
+        copy_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._batched_weight_copy_pairs = copy_pairs
+        try:
+            for args, kwargs in calls:
+                self.weight_loader(*args, **kwargs)
+            self._execute_batched_weight_copies(
+                copy_pairs,
+                executor=executor,
+            )
+        finally:
+            self._batched_weight_copy_pairs = None
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -511,12 +700,15 @@ class FusedMoE(torch.nn.Module):
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
             if self.moe_runner_config.is_gated:
-                param_data[expert_id][idx] = loaded_weight
+                self._copy_loaded_weight(
+                    param_data[expert_id][idx],
+                    loaded_weight,
+                )
             else:
-                param_data[expert_id] = loaded_weight
+                self._copy_loaded_weight(param_data[expert_id], loaded_weight)
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
-            param_data[expert_id] = loaded_weight
+            self._copy_loaded_weight(param_data[expert_id], loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -558,7 +750,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            self._copy_loaded_weight(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -635,16 +827,13 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-
-        # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice and leave the
-        # trailing padding as zeros.
         if loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]:
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            expert_data = expert_data.narrow(
+                shard_dim,
+                0,
+                loaded_weight.shape[shard_dim],
             )
-        else:
-            expert_data.copy_(loaded_weight)
+        self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -717,14 +906,13 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice only.
         if loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]:
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            expert_data = expert_data.narrow(
+                shard_dim,
+                0,
+                loaded_weight.shape[shard_dim],
             )
-        else:
-            expert_data.copy_(loaded_weight)
+        self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -819,7 +1007,7 @@ class FusedMoE(torch.nn.Module):
         param_data = param.data
 
         # Input scales can be loaded directly and should be equal.
-        param_data[expert_id] = loaded_weight
+        self._copy_loaded_weight(param_data[expert_id], loaded_weight)
 
     def _load_g_idx(
         self,
@@ -839,7 +1027,7 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             assert shard_id in ("w1", "w3")
-            expert_data.copy_(loaded_weight)
+            self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         start_idx = self._expert_storage_rank * self._num_local_routed
@@ -869,11 +1057,14 @@ class FusedMoE(torch.nn.Module):
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                self._copy_loaded_weight(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                self._copy_loaded_weight(
+                    param.data[:, :dim1, :dim2],
+                    loaded_weight,
+                )
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()

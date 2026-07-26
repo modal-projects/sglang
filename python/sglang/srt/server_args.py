@@ -3093,6 +3093,18 @@ class ServerArgs:
         ),
         NS("model"),
     ] = None
+    checkpoint_source_refresh_hook: A[
+        Optional[str],
+        "Import path of a hook(checkpoint_source_dir, target_version) that /stage_weight_update invokes once per host before reading a published version.",
+    ] = None
+    enable_cpu_weight_cache: A[
+        bool,
+        "Allow /stage_weight_update with destination=cpu to cache one host-shared canonical checkpoint per model replica and one rank-ready CPU weight image per local target-model worker for background delta weight staging. Speculative draft-model weights are not updated.",
+    ] = False
+    cpu_weight_cache_max_compile_group_gb: A[
+        float,
+        "Target upper bound, in GiB, for each module group compiled while staging a CPU weight update. Indivisible modules may exceed it.",
+    ] = 8.0
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
@@ -3576,6 +3588,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._validate_cpu_weight_cache_compatibility()
 
         # Needs the draft-token count derived just above.
         self._validate_linear_replayssm_spec_ring()
@@ -6638,6 +6651,39 @@ class ServerArgs:
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
+
+    def _validate_cpu_weight_cache_compatibility(self):
+        if not self.enable_cpu_weight_cache:
+            return
+        if self.cpu_weight_cache_max_compile_group_gb <= 0:
+            raise ValueError("--cpu-weight-cache-max-compile-group-gb must be positive")
+        if self.cpu_offload_gb > 0 or self.offload_group_size > 0:
+            raise ValueError(
+                "--enable-cpu-weight-cache requires model weights to remain "
+                "resident on the GPU; CPU and layer offloading are unsupported"
+            )
+        if self.speculative_algorithm is not None:
+            logger.info(
+                "CPU weight cache updates target-model weights only; "
+                "speculative draft-model weights remain unchanged."
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support pipeline parallelism"
+            )
+        if self.enable_eplb:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support automatic EPLB "
+                "weight reloads"
+            )
+        if self.enable_lora or self.lora_paths:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support dynamic LoRA weights"
+            )
+        if self.elastic_ep_backend is not None or self.enable_elastic_expert_backup:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support elastic expert weights"
+            )
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_rejoin:

@@ -7,10 +7,11 @@ updates then apply only the delta versions after the canonical checkpoint. Every
 changed canonical tensor is verified before the ordinary SGLang loader compiles
 the target into rank-ready CPU images.
 
-Compressed delta blobs are prefetched once into a host-shared CPU arena. Base
-checkpoint files are read once, and exactly one local rank owns reconstruction
-of each file before publishing it to the other ranks. No runtime-layout or
-tensor-sparsity assumption enters this module.
+Compressed payloads are streamed once into bounded work buffers while exactly
+one local rank owns reconstruction of each canonical checkpoint file. The
+complete checkpoint and rank-ready image stay in CPU memory; no lineage-sized
+delta arena, runtime-layout assumption, or tensor-sparsity assumption enters
+this module.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +33,7 @@ import zstandard
 
 from sglang.srt.environ import envs
 from sglang.srt.weight_sync.checksum import create_checksum
-from sglang.srt.weight_sync.host_shared_memory import HostSharedMemoryBuffer
+from sglang.srt.weight_sync.file_io import PositionalFileRangeReader, read_exact
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,15 @@ def _checkpoint_index(
     try:
         payload = json.loads(path.read_text())
     except FileNotFoundError as exc:
+        if expected_version is None:
+            # Base checkpoints follow the ordinary loader and may be a single
+            # unindexed safetensors file.
+            from sglang.srt.weight_sync.cpu_weight_cache import (
+                _checkpoint_weight_map,
+            )
+
+            weight_map, _ = _checkpoint_weight_map(str(root))
+            return {"metadata": {}, "weight_map": weight_map}
         raise FileNotFoundError(f"checkpoint index is missing: {path}") from exc
     weight_map = payload.get("weight_map")
     if not isinstance(weight_map, dict):
@@ -95,38 +105,39 @@ def validate_delta_target(checkpoint_source_dir: str, target_version: int) -> No
         )
 
 
-def _pread_file_to_tensor(path: Path, target: torch.Tensor) -> float:
+def _pread_exact(fd: int, offset: int, nbytes: int, path: Path) -> bytearray:
+    result = bytearray(nbytes)
+    view = memoryview(result)
+    position = 0
+    while position < nbytes:
+        end = min(position + _POSITIONAL_IO_CHUNK_BYTES, nbytes)
+        nread = os.preadv(fd, [view[position:end]], offset + position)
+        if nread <= 0:
+            raise FileNotFoundError(
+                f"incomplete delta blob {path}: offset={offset} "
+                f"expected={nbytes} actual={position}"
+            )
+        position += nread
+    return result
+
+
+def _read_delta_header(path: Path) -> tuple[int, int, dict[str, Any]]:
     file_nbytes = path.stat().st_size
-    if target.numel() != file_nbytes:
-        raise ValueError(
-            f"delta arena size mismatch for {path}: "
-            f"buffer={target.numel()} file={file_nbytes}"
-        )
-    started = time.perf_counter()
-    view = memoryview(target.numpy()).cast("B")
     fd = os.open(path, os.O_RDONLY)
-    offset = 0
     try:
-        while offset < file_nbytes:
-            end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, file_nbytes)
-            nread = os.preadv(fd, [view[offset:end]], offset)
-            if nread <= 0:
-                raise EOFError(
-                    f"unexpected EOF staging delta blob {path}: "
-                    f"offset={offset} size={file_nbytes}"
-                )
-            offset += nread
+        prefix = _pread_exact(fd, 0, 8, path)
+        header_nbytes = int.from_bytes(prefix, "little")
+        if header_nbytes <= 0 or 8 + header_nbytes > file_nbytes:
+            raise FileNotFoundError(
+                f"incomplete delta blob {path}: invalid header length "
+                f"{header_nbytes}"
+            )
+        header = json.loads(_pread_exact(fd, 8, header_nbytes, path))
     finally:
         os.close(fd)
-        view.release()
-    return time.perf_counter() - started
-
-
-@dataclass(frozen=True)
-class _DeltaBlob:
-    path: Path
-    arena_offset: int
-    file_nbytes: int
+    if not isinstance(header, dict):
+        raise ValueError(f"invalid delta header: {path}")
+    return file_nbytes, 8 + header_nbytes, header
 
 
 @dataclass(frozen=True)
@@ -135,7 +146,8 @@ class _DeltaOperation:
     encoding: str
     checksum_algorithm: str
     expected_checksum: str
-    arena_offset: int
+    source_path: Path
+    source_offset: int
     compressed_nbytes: int
 
 
@@ -159,21 +171,6 @@ class _ByteBudget:
             with self.condition:
                 self.used -= charge
                 self.condition.notify_all()
-
-
-def _read_exact(reader: Any, nbytes: int) -> bytearray:
-    result = bytearray(nbytes)
-    view = memoryview(result)
-    position = 0
-    while position < nbytes:
-        nread = reader.readinto(view[position:])
-        if not nread:
-            raise EOFError(
-                f"unexpected end of compressed payload: "
-                f"expected={nbytes} actual={position}"
-            )
-        position += nread
-    return result
 
 
 def _resolve_lineage(
@@ -315,24 +312,24 @@ class DeltaCheckpointTransform:
             1,
             _HOST_DELTA_APPLY_MEMORY_BYTES // self.world_size,
         )
-        self.arena: HostSharedMemoryBuffer | None = None
         self.operations_by_file: dict[str, dict[str, list[_DeltaOperation]]] = {}
-        self.prefetch_stats: dict[str, Any] = {
-            "operation": "prefetch_delta_checkpoint",
+        self.setup_stats: dict[str, Any] = {
+            "operation": "plan_delta_checkpoint",
             "canonical_version": canonical_version,
             "target_version": target_version,
             "delta_versions": [],
             "compressed_bytes": 0,
+            "delta_blob_bytes": 0,
+            "working_memory_budget_bytes": self.working_memory_budget_bytes,
             "wall_s": 0.0,
         }
 
         checkpoint_root = Path(base_checkpoint_dir)
         deltas = []
-        base_weight_map = {}
-        blobs: list[_DeltaBlob] = []
-        blob_indexes: list[tuple[int, dict[str, Any], dict[str, Any], _DeltaBlob]] = []
-        arena_nbytes = 0
         plan_error = None
+        delta_blob_bytes = 0
+        compressed_bytes = 0
+        source_paths = set()
         try:
             checkpoint_root, resolved_canonical_version, deltas = _resolve_lineage(
                 base_checkpoint_dir=base_checkpoint_dir,
@@ -342,29 +339,115 @@ class DeltaCheckpointTransform:
                 canonical_version=canonical_version,
             )
             self.canonical_version = resolved_canonical_version
-            self.prefetch_stats["canonical_version"] = resolved_canonical_version
+            self.setup_stats["canonical_version"] = resolved_canonical_version
             base_weight_map = _checkpoint_index(checkpoint_root)["weight_map"]
             for version, root, index in deltas:
                 metadata = index["metadata"]
-                self.prefetch_stats["delta_versions"].append(version)
+                checksum_algorithm = metadata.get("checksum_format")
+                if not isinstance(checksum_algorithm, str):
+                    raise ValueError(f"delta v{version} has no valid checksum format")
+                create_checksum(checksum_algorithm)
+                self.setup_stats["delta_versions"].append(version)
                 for filename in sorted(set(index["weight_map"].values())):
                     path = root / filename
                     try:
-                        file_nbytes = path.stat().st_size
+                        file_nbytes, data_offset, header = _read_delta_header(path)
                     except FileNotFoundError as exc:
                         raise FileNotFoundError(
                             f"incomplete source version {root}: "
                             f"missing blob {filename}"
                         ) from exc
-                    arena_nbytes = (arena_nbytes + 4095) // 4096 * 4096
-                    blob = _DeltaBlob(
-                        path=path,
-                        arena_offset=arena_nbytes,
-                        file_nbytes=file_nbytes,
-                    )
-                    blobs.append(blob)
-                    blob_indexes.append((version, metadata, index, blob))
-                    arena_nbytes += file_nbytes
+                    checksums = header.get("__metadata__", {})
+                    if not isinstance(checksums, dict):
+                        raise ValueError(f"invalid delta checksums: {path}")
+                    ranges = []
+                    seen_names = set()
+                    for name, info in header.items():
+                        if name == "__metadata__":
+                            continue
+                        if index["weight_map"].get(name) != path.name:
+                            raise ValueError(
+                                f"delta blob {path} contains unindexed tensor {name!r}"
+                            )
+                        seen_names.add(name)
+                        if not isinstance(info, dict):
+                            raise ValueError(
+                                f"invalid delta metadata for {name!r} in {path}"
+                            )
+                        offsets = info.get("data_offsets")
+                        if (
+                            not isinstance(offsets, list)
+                            or len(offsets) != 2
+                            or not all(isinstance(value, int) for value in offsets)
+                        ):
+                            raise ValueError(
+                                f"invalid delta offsets for {name!r} in {path}"
+                            )
+                        begin, end = offsets
+                        if begin < 0 or begin > end or data_offset + end > file_nbytes:
+                            raise FileNotFoundError(
+                                f"incomplete delta range for {name!r} in {path}"
+                            )
+                        ranges.append((begin, end, name))
+                        base_filename = base_weight_map.get(name)
+                        if base_filename is None:
+                            raise KeyError(
+                                f"delta tensor {name!r} is absent from full "
+                                f"checkpoint {checkpoint_root}"
+                            )
+                        expected_checksum = checksums.get(name)
+                        if (
+                            not isinstance(expected_checksum, str)
+                            or not expected_checksum
+                        ):
+                            raise ValueError(
+                                f"delta tensor {name!r} has no target checksum"
+                            )
+                        self.operations_by_file.setdefault(
+                            base_filename,
+                            {},
+                        ).setdefault(name, []).append(
+                            _DeltaOperation(
+                                version=version,
+                                encoding=metadata["delta_encoding"],
+                                checksum_algorithm=checksum_algorithm,
+                                expected_checksum=expected_checksum,
+                                source_path=path,
+                                source_offset=data_offset + begin,
+                                compressed_nbytes=end - begin,
+                            )
+                        )
+                        compressed_bytes += end - begin
+                    cursor = 0
+                    for begin, end, name in sorted(ranges):
+                        if begin != cursor:
+                            relation = "overlaps" if begin < cursor else "leaves a gap"
+                            raise ValueError(
+                                f"delta range for {name!r} {relation} in "
+                                f"{path}: expected_begin={cursor} "
+                                f"actual_begin={begin}"
+                            )
+                        cursor = end
+                    expected_file_nbytes = data_offset + cursor
+                    if expected_file_nbytes != file_nbytes:
+                        raise FileNotFoundError(
+                            f"incomplete delta blob {path}: file has "
+                            f"{file_nbytes} bytes, header declares "
+                            f"{expected_file_nbytes}"
+                        )
+                    expected_names = {
+                        name
+                        for name, expected_filename in index["weight_map"].items()
+                        if expected_filename == path.name
+                    }
+                    if seen_names != expected_names:
+                        raise ValueError(
+                            f"delta blob/index tensor mismatch for {path}: "
+                            f"missing={sorted(expected_names - seen_names)[:20]} "
+                            f"extra={sorted(seen_names - expected_names)[:20]}"
+                        )
+                    source_paths.add(path)
+                    delta_blob_bytes += file_nbytes
         except Exception as exc:
             plan_error = f"{type(exc).__name__}: {exc}"
 
@@ -380,227 +463,36 @@ class DeltaCheckpointTransform:
         plan_errors = [value for value in plan_errors if value is not None]
         if plan_errors:
             raise RuntimeError(
-                "failed to resolve delta lineage: " + "; ".join(plan_errors)
-            )
-
-        self.checkpoint_root = checkpoint_root
-        if not deltas:
-            self.prefetch_stats["wall_s"] = round(time.perf_counter() - started, 6)
-            return
-        if not blobs:
-            self.prefetch_stats.update(
-                {
-                    "physical_host_copies": 0,
-                    "arena_bytes": 0,
-                    "owned_bytes": 0,
-                    "owned_read_wall_s": 0.0,
-                    "delta_tensors": 0,
-                    "wall_s": round(time.perf_counter() - started, 6),
-                }
-            )
-            return
-
-        self.arena = HostSharedMemoryBuffer(
-            nbytes=arena_nbytes,
-            cpu_group=cpu_group,
-            name="weight-delta",
-        )
-        owned_stats = []
-        local_error = None
-        try:
-            for blob_index, blob in enumerate(blobs):
-                if blob_index % self.world_size != self.rank:
-                    continue
-                wall_s = _pread_file_to_tensor(
-                    blob.path,
-                    self.arena.view(
-                        blob.file_nbytes,
-                        offset=blob.arena_offset,
-                    ),
-                )
-                owned_stats.append(
-                    {
-                        "path": str(blob.path),
-                        "bytes": blob.file_nbytes,
-                        "wall_s": round(wall_s, 6),
-                    }
-                )
-        except Exception as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-
-        if self.world_size > 1:
-            statuses: list[str | None] = [None] * self.world_size
-            torch.distributed.all_gather_object(
-                statuses,
-                local_error,
-                group=cpu_group,
-            )
-        else:
-            statuses = [local_error]
-        errors = [value for value in statuses if value is not None]
-        if errors:
-            self.close()
-            raise RuntimeError(
-                "failed to prefetch complete delta blobs into CPU memory: "
-                + "; ".join(errors)
-            )
-
-        parse_error = None
-        try:
-            for version, metadata, index, blob in blob_indexes:
-                file_tensor = self.arena.view(
-                    blob.file_nbytes,
-                    offset=blob.arena_offset,
-                )
-                if file_tensor.numel() < 8:
-                    raise FileNotFoundError(
-                        f"incomplete delta blob {blob.path}: "
-                        "shorter than header prefix"
-                    )
-                header_nbytes = int.from_bytes(
-                    file_tensor[:8].numpy().tobytes(), "little"
-                )
-                data_offset = 8 + header_nbytes
-                if header_nbytes <= 0 or data_offset > file_tensor.numel():
-                    raise FileNotFoundError(
-                        f"incomplete delta blob {blob.path}: invalid header "
-                        f"length {header_nbytes}"
-                    )
-                header = json.loads(
-                    file_tensor[8:data_offset].numpy().tobytes().decode("utf-8")
-                )
-                checksums = header.get("__metadata__", {})
-                ranges = []
-                seen_names = set()
-                for name, info in header.items():
-                    if name == "__metadata__":
-                        continue
-                    if index["weight_map"].get(name) != blob.path.name:
-                        raise ValueError(
-                            f"delta blob {blob.path} contains unindexed tensor "
-                            f"{name!r}"
-                        )
-                    seen_names.add(name)
-                    offsets = info.get("data_offsets")
-                    if (
-                        not isinstance(offsets, list)
-                        or len(offsets) != 2
-                        or not all(isinstance(value, int) for value in offsets)
-                    ):
-                        raise ValueError(
-                            f"invalid delta offsets for {name!r} in {blob.path}"
-                        )
-                    begin, end = offsets
-                    if begin < 0 or begin > end or data_offset + end > blob.file_nbytes:
-                        raise FileNotFoundError(
-                            f"incomplete delta range for {name!r} in {blob.path}"
-                        )
-                    ranges.append((begin, end, name))
-                    base_filename = base_weight_map.get(name)
-                    if base_filename is None:
-                        raise KeyError(
-                            f"delta tensor {name!r} is absent from full "
-                            f"checkpoint {self.checkpoint_root}"
-                        )
-                    expected_checksum = checksums.get(name)
-                    if not isinstance(expected_checksum, str) or not expected_checksum:
-                        raise ValueError(
-                            f"delta tensor {name!r} has no target checksum"
-                        )
-                    operation = _DeltaOperation(
-                        version=version,
-                        encoding=metadata["delta_encoding"],
-                        checksum_algorithm=metadata["checksum_format"],
-                        expected_checksum=expected_checksum,
-                        arena_offset=blob.arena_offset + data_offset + begin,
-                        compressed_nbytes=end - begin,
-                    )
-                    self.operations_by_file.setdefault(base_filename, {}).setdefault(
-                        name,
-                        [],
-                    ).append(operation)
-                cursor = 0
-                for begin, end, name in sorted(ranges):
-                    if begin != cursor:
-                        relation = "overlaps" if begin < cursor else "leaves a gap"
-                        raise ValueError(
-                            f"delta range for {name!r} {relation} in "
-                            f"{blob.path}: expected_begin={cursor} "
-                            f"actual_begin={begin}"
-                        )
-                    cursor = end
-                expected_file_nbytes = data_offset + cursor
-                if expected_file_nbytes != blob.file_nbytes:
-                    raise FileNotFoundError(
-                        f"incomplete delta blob {blob.path}: file has "
-                        f"{blob.file_nbytes} bytes, header declares "
-                        f"{expected_file_nbytes}"
-                    )
-                expected_names = {
-                    name
-                    for name, filename in index["weight_map"].items()
-                    if filename == blob.path.name
-                }
-                if seen_names != expected_names:
-                    raise ValueError(
-                        f"delta blob/index tensor mismatch for {blob.path}: "
-                        f"missing={sorted(expected_names - seen_names)[:20]} "
-                        f"extra={sorted(seen_names - expected_names)[:20]}"
-                    )
-        except Exception as exc:
-            parse_error = f"{type(exc).__name__}: {exc}"
-
-        if self.world_size > 1:
-            parse_errors: list[str | None] = [None] * self.world_size
-            torch.distributed.all_gather_object(
-                parse_errors,
-                parse_error,
-                group=cpu_group,
-            )
-        else:
-            parse_errors = [parse_error]
-        parse_errors = [value for value in parse_errors if value is not None]
-        if parse_errors:
-            self.close()
-            raise RuntimeError(
-                "failed to parse staged delta blobs: " + "; ".join(parse_errors)
+                "failed to plan delta lineage: " + "; ".join(plan_errors)
             )
 
         for names in self.operations_by_file.values():
             for operations in names.values():
                 operations.sort(key=lambda value: value.version)
 
-        self.prefetch_stats.update(
+        self.checkpoint_root = checkpoint_root
+        self.setup_stats.update(
             {
-                "compressed_bytes": sum(blob.file_nbytes for blob in blobs),
-                "physical_host_copies": 1,
-                "arena_bytes": self.arena.nbytes,
-                "owned_bytes": sum(value["bytes"] for value in owned_stats),
-                "owned_read_wall_s": round(
-                    sum(value["wall_s"] for value in owned_stats), 6
-                ),
+                "compressed_bytes": compressed_bytes,
+                "delta_blob_bytes": delta_blob_bytes,
+                "delta_shards": len(source_paths),
                 "delta_tensors": sum(
                     len(names) for names in self.operations_by_file.values()
+                ),
+                "delta_fragments": sum(
+                    len(operations)
+                    for names in self.operations_by_file.values()
+                    for operations in names.values()
                 ),
                 "wall_s": round(time.perf_counter() - started, 6),
             }
         )
         logger.info(
-            "Staged delta versions %s in CPU memory: compressed_bytes=%d "
-            "wall_time=%.3fs",
-            self.prefetch_stats["delta_versions"],
-            self.prefetch_stats["compressed_bytes"],
-            self.prefetch_stats["wall_s"],
+            "Planned CPU delta versions %s: compressed_bytes=%d wall_time=%.3fs",
+            self.setup_stats["delta_versions"],
+            self.setup_stats["compressed_bytes"],
+            self.setup_stats["wall_s"],
         )
-
-    def _compressed_view(self, operation: _DeltaOperation) -> memoryview:
-        if self.arena is None:
-            raise RuntimeError("staged delta buffer is not available")
-        tensor = self.arena.view(
-            operation.compressed_nbytes,
-            offset=operation.arena_offset,
-        )
-        return memoryview(tensor.numpy()).cast("B")
 
     def transform_file(self, filename: str, tensor_file: Any) -> dict[str, Any]:
         """Apply and verify this file's canonical target bytes in place."""
@@ -631,107 +523,156 @@ class DeltaCheckpointTransform:
             len(names),
         )
         memory_budget = _ByteBudget(self.working_memory_budget_bytes)
+        final_operation = {name: operations[-1] for name, operations in names.items()}
+        operations_by_source = {}
+        for name, operations in names.items():
+            for operation in operations:
+                operations_by_source.setdefault(
+                    (operation.version, operation.source_path),
+                    [],
+                ).append((name, operation))
 
-        def apply_tensor(item: tuple[str, list[_DeltaOperation]]) -> tuple[int, int]:
-            name, operations = item
+        def apply_operation(
+            item: tuple[str, _DeltaOperation],
+            source_fd: int,
+        ) -> tuple[int, int, float]:
+            name, operation = item
             region_tensor = tensor_file.get_tensor_bytes(name)
             region = region_tensor.numpy()
-            actual = None
-            for operation_index, operation in enumerate(operations):
-                is_final = operation_index == len(operations) - 1
-                hasher = (
-                    create_checksum(operation.checksum_algorithm) if is_final else None
+            is_final = operation is final_operation[name]
+            hasher = create_checksum(operation.checksum_algorithm) if is_final else None
+            max_payload_nbytes = (
+                _XOR_STREAM_CHUNK_BYTES
+                if operation.encoding == "xor"
+                else 4 + 5 * region.size
+            )
+            with memory_budget.reserve(max_payload_nbytes):
+                source = PositionalFileRangeReader(
+                    source_fd,
+                    operation.source_offset,
+                    operation.compressed_nbytes,
+                    operation.source_path,
+                    max_read_bytes=_XOR_STREAM_CHUNK_BYTES,
                 )
-                compressed = self._compressed_view(operation)
-                try:
-                    decompressor = zstandard.ZstdDecompressor()
-                    if operation.encoding == "xor":
-                        with decompressor.stream_reader(compressed) as reader:
-                            position = 0
-                            while position < region.size:
-                                block = reader.read(
-                                    min(
-                                        _XOR_STREAM_CHUNK_BYTES,
-                                        region.size - position,
-                                    )
+                decompressor = zstandard.ZstdDecompressor()
+                if operation.encoding == "xor":
+                    with decompressor.stream_reader(
+                        source,
+                        closefd=False,
+                    ) as reader:
+                        position = 0
+                        while position < region.size:
+                            block = reader.read(
+                                min(
+                                    _XOR_STREAM_CHUNK_BYTES,
+                                    region.size - position,
                                 )
-                                if not block:
-                                    break
-                                delta = np.frombuffer(block, dtype=np.uint8)
-                                np.bitwise_xor(
-                                    region[position : position + delta.size],
-                                    delta,
-                                    out=region[position : position + delta.size],
-                                )
-                                if hasher is not None:
-                                    hasher.update(
-                                        region[position : position + delta.size]
-                                    )
-                                position += delta.size
-                            if position != region.size or reader.read(1):
-                                raise RuntimeError(
-                                    f"decompressed XOR size mismatch for {name!r}: "
-                                    f"expected={region.size} actual={position}"
-                                )
-                    else:
-                        with decompressor.stream_reader(compressed) as reader:
-                            count = int.from_bytes(_read_exact(reader, 4), "little")
-                            if count > region.size:
-                                raise RuntimeError(
-                                    f"overwrite payload for {name!r} is invalid"
-                                )
-                            payload_nbytes = 5 * count
-                            with memory_budget.reserve(payload_nbytes):
-                                payload = _read_exact(reader, payload_nbytes)
-                                if reader.read(1):
-                                    raise RuntimeError(
-                                        f"overwrite payload for {name!r} is oversized"
-                                    )
-                                positions_nbytes = 4 * count
-                                positions = np.frombuffer(
-                                    payload,
-                                    dtype="<u4",
-                                    count=count,
-                                )
-                                values = np.frombuffer(
-                                    payload,
-                                    dtype=np.uint8,
-                                    count=count,
-                                    offset=positions_nbytes,
-                                )
-                                if count and int(positions.max()) >= region.size:
-                                    raise RuntimeError(
-                                        f"overwrite payload for {name!r} is invalid"
-                                    )
-                                region[positions] = values
-                                if hasher is not None:
-                                    hasher.update(region)
-                finally:
-                    compressed.release()
-                if hasher is not None:
-                    actual = hasher.hexdigest()
+                            )
+                            if not block:
+                                break
+                            delta = np.frombuffer(block, dtype=np.uint8)
+                            np.bitwise_xor(
+                                region[position : position + delta.size],
+                                delta,
+                                out=region[position : position + delta.size],
+                            )
+                            if hasher is not None:
+                                hasher.update(region[position : position + delta.size])
+                            position += delta.size
+                        if position != region.size or reader.read(1):
+                            raise RuntimeError(
+                                f"decompressed XOR size mismatch for {name!r}: "
+                                f"expected={region.size} actual={position}"
+                            )
+                else:
+                    with decompressor.stream_reader(
+                        source,
+                        closefd=False,
+                    ) as reader:
+                        count = int.from_bytes(read_exact(reader, 4), "little")
+                        if count > region.size:
+                            raise RuntimeError(
+                                f"overwrite payload for {name!r} is invalid"
+                            )
+                        payload_nbytes = 5 * count
+                        payload = read_exact(reader, payload_nbytes)
+                        if reader.read(1):
+                            raise RuntimeError(
+                                f"overwrite payload for {name!r} is oversized"
+                            )
+                        positions_nbytes = 4 * count
+                        positions = np.frombuffer(
+                            payload,
+                            dtype="<u4",
+                            count=count,
+                        )
+                        values = np.frombuffer(
+                            payload,
+                            dtype=np.uint8,
+                            count=count,
+                            offset=positions_nbytes,
+                        )
+                        if count and int(positions.max()) >= region.size:
+                            raise RuntimeError(
+                                f"overwrite payload for {name!r} is invalid"
+                            )
+                        region[positions] = values
+                        if hasher is not None:
+                            hasher.update(region)
+                if source.position != operation.compressed_nbytes:
+                    raise RuntimeError(
+                        f"compressed delta range was not fully consumed for {name!r}: "
+                        f"expected={operation.compressed_nbytes} "
+                        f"actual={source.position}"
+                    )
 
-            final = operations[-1]
-            if actual != final.expected_checksum:
-                raise RuntimeError(
-                    f"checksum mismatch after reconstructing {name!r}: "
-                    f"expected={final.expected_checksum} actual={actual}"
-                )
-            return region.size, sum(
-                operation.compressed_nbytes for operation in operations
+            if hasher is not None:
+                actual = hasher.hexdigest()
+                if actual != operation.expected_checksum:
+                    raise RuntimeError(
+                        f"checksum mismatch after reconstructing {name!r}: "
+                        f"expected={operation.expected_checksum} actual={actual}"
+                    )
+            return (
+                region.size if is_final else 0,
+                operation.compressed_nbytes,
+                source.read_wall_s,
             )
 
+        results = []
         with ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="weight-delta",
         ) as pool:
-            sizes = list(pool.map(apply_tensor, names.items()))
+            for (_, source_path), operations in sorted(
+                operations_by_source.items(),
+                key=lambda item: (item[0][0], str(item[0][1])),
+            ):
+                source_fd = os.open(source_path, os.O_RDONLY)
+                futures = []
+                try:
+                    for operation in operations:
+                        futures.append(
+                            pool.submit(
+                                apply_operation,
+                                operation,
+                                source_fd,
+                            )
+                        )
+                    wait(futures)
+                    results.extend(future.result() for future in futures)
+                finally:
+                    wait(futures)
+                    os.close(source_fd)
         stats = {
             "operation": "canonical_delta_transform",
             "filename": filename,
             "delta_tensors": len(names),
-            "target_tensor_bytes": sum(value[0] for value in sizes),
-            "compressed_bytes": sum(value[1] for value in sizes),
+            "delta_fragments": len(results),
+            "source_files": len(operations_by_source),
+            "target_tensor_bytes": sum(value[0] for value in results),
+            "compressed_bytes": sum(value[1] for value in results),
+            "source_read_worker_s": round(sum(value[2] for value in results), 6),
             "working_memory_budget_bytes": self.working_memory_budget_bytes,
             "workers": worker_count,
             "wall_s": round(time.perf_counter() - started, 6),
@@ -748,10 +689,6 @@ class DeltaCheckpointTransform:
 
     def close(self) -> None:
         self.operations_by_file.clear()
-        arena = getattr(self, "arena", None)
-        if arena is not None:
-            arena.close()
-            self.arena = None
 
     def __enter__(self) -> DeltaCheckpointTransform:
         return self

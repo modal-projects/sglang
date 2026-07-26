@@ -14,6 +14,8 @@
 
 import concurrent.futures
 import logging
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -40,6 +42,7 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
+    DEFERRED_WEIGHT_COPY_SAFE_ATTR,
     maybe_executor_submit,
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
@@ -69,6 +72,23 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
+
+
+def _expert_mapping_candidates(
+    name: str,
+    mappings: List[Tuple[str, str, int, str]],
+    mappings_by_expert: Dict[int, List[Tuple[str, str, int, str]]],
+) -> List[Tuple[str, str, int, str]]:
+    """Select mappings for an expert encoded in a checkpoint tensor name.
+
+    Non-standard names retain the existing full-list lookup.
+    """
+
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match is None:
+        return mappings
+    return mappings_by_expert.get(int(match.group(1)), mappings)
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -187,6 +207,9 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+        expert_params_mapping_by_expert = defaultdict(list)
+        for mapping in expert_params_mapping:
+            expert_params_mapping_by_expert[mapping[2]].append(mapping)
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -195,13 +218,54 @@ class DeepseekV2WeightLoaderMixin:
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
-
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
+            batched_weight_loads = defaultdict(list)
+
+            def submit_weight_load(
+                *,
+                use_async: bool,
+                func,
+                func_args,
+                func_kwargs=None,
+            ) -> None:
+                if func_kwargs is None:
+                    func_kwargs = {}
+                loaded_weight = func_args[1]
+                owner = getattr(func, "__self__", None)
+                batch_method = getattr(owner, "batched_weight_loader", None)
+                supports_batching = getattr(
+                    owner,
+                    "supports_batched_weight_loading",
+                    None,
+                )
+                ordinary_method = getattr(owner, "weight_loader", None)
+                if (
+                    getattr(
+                        loaded_weight,
+                        DEFERRED_WEIGHT_COPY_SAFE_ATTR,
+                        False,
+                    )
+                    and callable(batch_method)
+                    and callable(supports_batching)
+                    and supports_batching()
+                    and func == ordinary_method
+                ):
+                    batched_weight_loads[owner].append((func_args, func_kwargs))
+                    return
+                maybe_executor_submit(
+                    executor=executor,
+                    futures=futures,
+                    use_async=use_async,
+                    func=func,
+                    func_args=func_args,
+                    func_kwargs=func_kwargs,
+                )
+
             params_dict = dict(self.named_parameters())
             weight_names = []
 
@@ -224,7 +288,6 @@ class DeepseekV2WeightLoaderMixin:
                     )
 
                 weight_names.append(name)
-
                 match nextn_conf:
                     case NextNEnabledConfig(
                         nextn_layer_prefix=layer_prefix,
@@ -290,16 +353,18 @@ class DeepseekV2WeightLoaderMixin:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    maybe_executor_submit(
-                        executor=executor,
-                        futures=futures,
+                    submit_weight_load(
                         use_async=use_async_loading,
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in _expert_mapping_candidates(
+                        name,
+                        expert_params_mapping,
+                        expert_params_mapping_by_expert,
+                    ):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -310,9 +375,7 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
+                        submit_weight_load(
                             use_async=use_async_loading,
                             func=weight_loader,
                             func_args=(
@@ -393,9 +456,7 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                maybe_executor_submit(
-                                    executor=executor,
-                                    futures=futures,
+                                submit_weight_load(
                                     use_async=use_async_loading,
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
@@ -423,9 +484,7 @@ class DeepseekV2WeightLoaderMixin:
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            maybe_executor_submit(
-                                executor=executor,
-                                futures=futures,
+                            submit_weight_load(
                                 use_async=use_async_loading,
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
@@ -434,6 +493,9 @@ class DeepseekV2WeightLoaderMixin:
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+            if batched_weight_loads:
+                for owner, calls in batched_weight_loads.items():
+                    owner.batched_weight_loader(calls, executor=executor)
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

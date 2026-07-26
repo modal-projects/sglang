@@ -274,6 +274,9 @@ def should_deepgemm_weight_requant_ue8m0(
     return True
 
 
+DEFERRED_WEIGHT_COPY_SAFE_ATTR = "_sglang_deferred_weight_copy_safe"
+
+
 def should_async_load(weight: torch.Tensor) -> bool:
     """Return True if we should load the given weight asynchronously.
 

@@ -64,8 +64,12 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    StageWeightUpdateReqInput,
+    StageWeightUpdateReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightFromCPUReqInput,
+    UpdateWeightFromCPUReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -105,6 +109,8 @@ _COMMUNICATOR_SPECS = [
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
+    ("stage_weight_update", StageWeightUpdateReqOutput),
+    ("update_weights_from_cpu", UpdateWeightFromCPUReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
@@ -769,6 +775,42 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def stage_weight_update(
+        self: TokenizerManager,
+        obj: StageWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        self.auto_create_handle_loop()
+        results = await self.stage_weight_update_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        rank_stats = [
+            stats for result in results for stats in (result.rank_stats or [])
+        ]
+        return success, message, rank_stats
+
+    async def update_weights_from_cpu(
+        self: TokenizerManager,
+        obj: UpdateWeightFromCPUReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        self.auto_create_handle_loop()
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        # The scheduler applies a complete image between batches. Existing
+        # requests do not need to drain before this live-weight commit.
+        results = await self.update_weights_from_cpu_communicator(obj)
+
+        success, message = FanOutCommunicator.merge_results(results)
+        rank_stats = [
+            stats for result in results for stats in (result.rank_stats or [])
+        ]
+        if success:
+            self._update_weight_version_if_provided(str(obj.target_version))
+            message += f" Weight version updated to {obj.target_version}."
+        return success, message, rank_stats
 
     async def check_weights(
         self: TokenizerManager,

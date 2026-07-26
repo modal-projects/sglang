@@ -136,7 +136,9 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    StageWeightUpdateReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateWeightFromCPUReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1195,6 +1197,54 @@ async def update_weights_from_disk(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/update_weights_from_cpu")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_cpu(
+    obj: Annotated[UpdateWeightFromCPUReqInput, Body()],
+    request: Request,
+):
+    """Update weights from a complete rank-ready CPU image."""
+    (
+        success,
+        message,
+        rank_stats,
+    ) = await _global_state.tokenizer_manager.update_weights_from_cpu(
+        obj,
+        request,
+    )
+    content = {
+        "success": success,
+        "message": message,
+        "rank_stats": rank_stats,
+    }
+    return ORJSONResponse(
+        content,
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/stage_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def stage_weight_update(
+    obj: Annotated[StageWeightUpdateReqInput, Body()], request: Request
+):
+    """Stage a weight update without changing the live model."""
+    (
+        success,
+        message,
+        rank_stats,
+    ) = await _global_state.tokenizer_manager.stage_weight_update(obj, request)
+
+    content = {
+        "success": success,
+        "message": message,
+        "rank_stats": rank_stats,
+    }
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/init_weights_send_group_for_remote_instance")

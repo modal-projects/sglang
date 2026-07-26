@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateWeightFromCPUReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -112,6 +113,46 @@ class BaseTpWorker(ABC):
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def stage_cpu_weight_update(
+        self,
+        *,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update(
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+        )
+
+    def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
+        return self.model_runner.weight_updater.initialize_cpu_weight_cache(
+            host_cpu_group,
+            base_checkpoint_dir=base_checkpoint_dir,
+        )
+
+    def update_weights_from_cpu(
+        self,
+        recv_req: UpdateWeightFromCPUReqInput,
+    ):
+        return self.model_runner.weight_updater.update_weights_from_cpu(
+            recv_req.target_version
+        )
+
+    def validate_staged_cpu_weight_update(self, target_version: int):
+        return self.model_runner.weight_updater.validate_staged_cpu_weight_update(
+            target_version
+        )
+
+    def invalidate_staged_cpu_weight_update(self, reason: str) -> None:
+        self.model_runner.weight_updater.invalidate_staged_cpu_weight_update(reason)
+
+    def discard_cpu_weight_cache(self, reason: str) -> None:
+        self.model_runner.weight_updater.discard_cpu_weight_cache(reason)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(

@@ -5,6 +5,8 @@ import torch
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
+    record_ue8m0_scale_checkpoint_layout,
+    restore_ue8m0_scale_checkpoint_layout,
     transform_scale_ue8m0,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -41,6 +43,39 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
             assert torch.all(
                 sf_fp32_original == sf_fp32_recreated
             ), f"{sf_fp32_original=} {sf_fp32_recreated}"
+
+    def test_round_trip_with_partial_last_block(self):
+        mn = 385
+        scales = torch.tensor(
+            [
+                [0.5, 1.0, 2.0, 4.0],
+                [1.0, 2.0, 4.0, 8.0],
+                [2.0, 4.0, 8.0, 16.0],
+                [4.0, 8.0, 16.0, 32.0],
+            ],
+            device="cuda",
+        )
+        packed = transform_scale_ue8m0(scales, mn=mn)
+        restored = inverse_transform_scale_ue8m0(packed, mn=mn)
+        torch.testing.assert_close(restored, scales)
+
+    def test_restore_checkpoint_scale_layout(self):
+        scale = torch.nn.Parameter(torch.ones((3, 4)), requires_grad=False)
+        scale.format_ue8m0 = False
+        record_ue8m0_scale_checkpoint_layout(scale)
+
+        runtime_buffer = torch.zeros((9, 2), dtype=torch.int32)
+        scale.data = runtime_buffer
+        scale.format_ue8m0 = True
+        restore_ue8m0_scale_checkpoint_layout(scale)
+
+        self.assertEqual(scale.shape, (3, 4))
+        self.assertEqual(scale.dtype, torch.float32)
+        self.assertFalse(scale.format_ue8m0)
+        self.assertEqual(
+            scale._weight_update_runtime_buffer.data_ptr(),
+            runtime_buffer.data_ptr(),
+        )
 
 
 if __name__ == "__main__":

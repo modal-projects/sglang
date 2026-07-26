@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import gc
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -118,46 +117,98 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        if (
+            weight_name_filter is not None
+            and self.model_config.quantization is not None
+        ):
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "process_weights_after_loading re-derives kernel state for every "
+                "layer, which requires all source weights to be refilled."
+            )
 
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
+        runner = self.get_model_runner()
+        original_model_path = self.model_config.model_path
+        original_load_config = runner.load_config
+        self.model_config.model_path = model_path
+        load_config = replace(original_load_config, load_format=load_format)
+
+        try:
+            loader = get_model_loader(load_config, self.model_config)
+        except Exception as e:
+            self.model_config.model_path = original_model_path
+            return False, f"Failed to get model loader: {e}."
         if not isinstance(loader, DefaultModelLoader):
+            self.model_config.model_path = original_model_path
             message = f"Failed to get model loader: {loader}."
             return False, message
 
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
+        def get_weight_iter(
+            active_loader: DefaultModelLoader,
+            config,
+            *,
+            apply_filter: bool,
+        ):
+            iter = active_loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
             )
-            if weight_name_filter is not None:
+            if apply_filter and weight_name_filter is not None:
                 iter = (
                     (name, weight) for name, weight in iter if weight_name_filter(name)
                 )
 
             return iter
 
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+        def model_load_weights(model, iter, active_loader: DefaultModelLoader):
+            active_loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
+        def rollback():
+            self.model_config.model_path = original_model_path
+            original_loader = get_model_loader(
+                original_load_config,
+                self.model_config,
+            )
+            if not isinstance(original_loader, DefaultModelLoader):
+                raise TypeError(
+                    "original model loader does not support in-place rollback: "
+                    f"{original_loader}"
+                )
+            DefaultModelLoader.restore_weights_before_loading(
+                self.get_model(), target_device
+            )
+            original_iter = get_weight_iter(
+                original_loader,
+                self.model_config,
+                apply_filter=False,
+            )
+            model_load_weights(self.get_model(), original_iter, original_loader)
+
+        iter = None
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.get_model(), iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                if weight_name_filter is None:
+                    DefaultModelLoader.restore_weights_before_loading(
+                        self.get_model(), target_device
+                    )
+                iter = get_weight_iter(
+                    loader,
+                    self.model_config,
+                    apply_filter=True,
                 )
-                del iter
+                model = model_load_weights(self.get_model(), iter, loader)
+            except Exception as e:
+                message = f"Failed to update weights: {e}."
+                if iter is not None:
+                    del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                try:
+                    rollback()
+                except Exception as rollback_error:
+                    logger.exception("Failed to roll back model weights")
+                    message += f" Rollback also failed: {rollback_error}."
+                    return False, message
+                message += " Rolled back to the original weights."
                 return False, message
 
         self.update_model_fields(

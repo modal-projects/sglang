@@ -964,8 +964,20 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if hasattr(layer.scheme, "restore_weights_before_loading"):
+            layer.scheme.restore_weights_before_loading(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_update_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        get_device = getattr(
+            layer.scheme,
+            "weight_update_postprocess_device",
+            None,
+        )
+        return get_device(layer) if callable(get_device) else None
 
     def create_weights(
         self,
@@ -1018,8 +1030,20 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if hasattr(layer.scheme, "restore_weights_before_loading"):
+            layer.scheme.restore_weights_before_loading(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_update_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        get_device = getattr(
+            layer.scheme,
+            "weight_update_postprocess_device",
+            None,
+        )
+        return get_device(layer) if callable(get_device) else None
 
     def create_weights(
         self,

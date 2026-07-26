@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -24,9 +25,11 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.weight_sync import cpu_weight_cache
 from sglang.srt.weight_sync.cpu_weight_cache import (
+    CpuImageGroupLoad,
     CPUWeightCache,
     HostSharedCheckpoint,
     InMemorySafeTensorsFile,
+    WeightModuleGroup,
     _canonical_checkpoint_layout,
     _pread_file_to_tensor,
     _preapply_resident_checkpoint_transform,
@@ -38,6 +41,7 @@ from sglang.srt.weight_sync.delta_checkpoint import (
     _resolve_lineage,
     validate_delta_target,
 )
+from sglang.srt.weight_sync.prepared_weights import PreparedWeightSegment
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -778,6 +782,66 @@ class TestInMemorySafeTensorsFile(unittest.TestCase):
         torch.testing.assert_close(module.weight, original_weight)
         self.assertTrue(torch.all(image[16:64].view(torch.float32) == 5))
         self.assertEqual(shadow.metadata.item(), 37)
+
+    def test_cpu_postprocessing_avoids_background_device_traffic(self):
+        class CpuPostprocessor:
+            @staticmethod
+            def supports_cpu_weight_postprocessing(layer):
+                return True
+
+            @staticmethod
+            def process_weights_after_loading(layer):
+                layer.weight = torch.nn.Parameter(
+                    layer.weight + 1,
+                    requires_grad=False,
+                )
+
+        image = torch.arange(8, dtype=torch.float32).view(torch.uint8).clone()
+        image_buffer = memoryview(image.numpy()).cast("B")
+        shadow = torch.nn.Module()
+        shadow.weight = torch.nn.Parameter(
+            torch.frombuffer(image_buffer, dtype=torch.float32),
+            requires_grad=False,
+        )
+        shadow.quant_method = CpuPostprocessor()
+        segment = PreparedWeightSegment(
+            name="layer.weight",
+            image_offset=0,
+            nbytes=image.numel(),
+            device_bytes=torch.empty(0, dtype=torch.uint8),
+        )
+        group = WeightModuleGroup(path="layer", nbytes=image.numel())
+        compiler = object.__new__(CPUWeightCache)
+        compiler.groups = [group]
+        compiler.image = SimpleNamespace(
+            image=image,
+            segments_by_name={"layer.weight": segment},
+        )
+        loaded = CpuImageGroupLoad(
+            group_index=1,
+            group=group,
+            checkpoint_tensors=1,
+            transport="test",
+            cpu_shadow=shadow,
+            gpu_stage_cpu_storages={(1234, image.numel())},
+            group_started=0.0,
+            cpu_clone_s=0.0,
+            restore_s=0.0,
+            cpu_load_s=0.0,
+        )
+
+        updated, copied_bytes, stats = compiler._finalize_cpu_image_group(loaded)
+
+        self.assertEqual(updated, {id(segment)})
+        self.assertEqual(copied_bytes, image.numel())
+        self.assertEqual(stats["postprocess_device"], "cpu")
+        self.assertEqual(stats["background_h2d_bytes"], 0)
+        self.assertEqual(stats["background_d2h_bytes"], 0)
+        self.assertEqual(stats["cpu_image_copy_bytes"], image.numel())
+        torch.testing.assert_close(
+            image.view(torch.float32),
+            torch.arange(1, 9, dtype=torch.float32),
+        )
 
     def test_modelopt_moe_batch_preserves_native_copy_views(self):
         layer = _CopyOnlyModelOptMoE()

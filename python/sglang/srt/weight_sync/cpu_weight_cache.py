@@ -3,9 +3,11 @@
 Preparation deliberately reuses the model's ordinary loader and quantization
 hooks. CPU-rich delta preparation retains one canonical node-shared CPU
 snapshot. That source is not CUDA-registered because it only feeds CPU layout
-work. Preparation writes TP-sharded tensors into the persistent rank image
-before one bounded GPU post-processing pass. It then copies final runtime bytes into
-:class:`~sglang.srt.weight_sync.prepared_weights.PreparedWeightImage`.  The live
+work. Preparation writes TP-sharded tensors into the persistent rank image,
+then runs reload-safe post-load transforms on CPU. Quantization methods that
+require device kernels retain the bounded GPU-staging path. The resulting
+runtime bytes remain in
+:class:`~sglang.srt.weight_sync.prepared_weights.PreparedWeightImage`; the live
 model is never rebound or overwritten during preparation.
 
 This is a full-target cache. It does not inspect which checkpoint tensors
@@ -93,7 +95,7 @@ class SafeTensorsLayout:
 
 @dataclass
 class CpuImageGroupLoad:
-    """One CPU-loaded group awaiting bounded GPU post-processing."""
+    """One CPU-loaded group awaiting its post-load transforms."""
 
     group_index: int
     group: WeightModuleGroup
@@ -1094,6 +1096,67 @@ class CPUWeightCache:
         self.image.copy_device_segments_to_image(copies)
         return updated, copied_bytes
 
+    def _copy_cpu_shadow_to_image(
+        self,
+        path: str,
+        shadow: torch.nn.Module,
+    ) -> tuple[set[int], int, int]:
+        """Publish rebound CPU tensors while retaining image-backed writes."""
+
+        updated: set[int] = set()
+        runtime_bytes = 0
+        copied_bytes = 0
+        seen_shadow_storages: set[tuple[int | None, int, int]] = set()
+        for relative_name, tensor in iter_weight_tensors(shadow):
+            if tensor.device.type != "cpu":
+                continue
+            shadow_key = _storage_key(tensor)
+            if shadow_key in seen_shadow_storages:
+                continue
+            seen_shadow_storages.add(shadow_key)
+            full_name = f"{path}.{relative_name}" if relative_name else path
+            segment = self.image.segments_by_name.get(full_name)
+            if segment is None:
+                raise RuntimeError(
+                    f"prepared shadow produced unknown weight {full_name!r}"
+                )
+            source = torch.empty(0, dtype=torch.uint8).set_(
+                tensor.untyped_storage(),
+                0,
+                (tensor.untyped_storage().nbytes(),),
+                (1,),
+            )
+            if source.numel() != segment.nbytes:
+                raise RuntimeError(
+                    "prepared shadow storage size changed: "
+                    f"name={full_name!r} source={source.numel()} "
+                    f"target={segment.nbytes}"
+                )
+            target = self.image.image[
+                segment.image_offset : segment.image_offset + segment.nbytes
+            ]
+            if source.data_ptr() != target.data_ptr():
+                target.copy_(source)
+                copied_bytes += segment.nbytes
+            updated.add(id(segment))
+            runtime_bytes += segment.nbytes
+        return updated, runtime_bytes, copied_bytes
+
+    @staticmethod
+    def _supports_cpu_postprocessing(shadow: torch.nn.Module) -> bool:
+        for _, module in shadow.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            supports_cpu = getattr(
+                quant_method,
+                "supports_cpu_weight_postprocessing",
+                None,
+            )
+            if not callable(supports_cpu) or not supports_cpu(module):
+                return False
+        return True
+
     def _image_backed_cpu_storage(
         self,
         tensor: torch.Tensor,
@@ -1183,62 +1246,95 @@ class CPUWeightCache:
         self,
         loaded: CpuImageGroupLoad,
     ) -> tuple[set[int], int, dict[str, Any]]:
-        """Run bounded device transforms and write final bytes to the image."""
+        """Run post-load transforms and write final runtime bytes to the image."""
 
         group = loaded.group
         cpu_shadow = loaded.cpu_shadow
-
-        def gpu_storage_factory(
-            tensor: torch.Tensor,
-            source_bytes: torch.Tensor,
-        ) -> torch.Tensor:
-            storage = tensor.untyped_storage()
-            source_key = (storage.data_ptr(), storage.nbytes())
-            target_device = (
-                self.target_device
-                if source_key in loaded.gpu_stage_cpu_storages
-                else tensor.device
-            )
-            storage_bytes = torch.empty(
-                source_bytes.numel(),
-                dtype=torch.uint8,
-                device=target_device,
-            )
-            storage_bytes.copy_(source_bytes, non_blocking=True)
-            return storage_bytes
-
-        with torch.cuda.stream(self._prepare_stream):
+        background_h2d_bytes = sum(
+            nbytes for _, nbytes in loaded.gpu_stage_cpu_storages
+        )
+        if self._supports_cpu_postprocessing(cpu_shadow):
             phase_started = time.perf_counter()
-            gpu_shadow = clone_module_tensors(
-                cpu_shadow,
-                target_device=self.target_device,
-                copy_data=True,
-                storage_factory=gpu_storage_factory,
-            )
-            h2d_submit_s = time.perf_counter() - phase_started
-
-            phase_started = time.perf_counter()
-            for _, module in gpu_shadow.named_modules():
+            for _, module in cpu_shadow.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
             quant_submit_s = time.perf_counter() - phase_started
 
-        phase_started = time.perf_counter()
-        self._prepare_stream.synchronize()
-        device_sync_s = time.perf_counter() - phase_started
+            phase_started = time.perf_counter()
+            group_updated, group_bytes, cpu_image_copy_bytes = (
+                self._copy_cpu_shadow_to_image(
+                    group.path,
+                    cpu_shadow,
+                )
+            )
+            image_copy_s = time.perf_counter() - phase_started
+            h2d_submit_s = 0.0
+            device_sync_s = 0.0
+            postprocess_device = "cpu"
+            background_h2d_bytes = 0
+            background_d2h_bytes = 0
+            gpu_shadow = None
+        else:
 
-        phase_started = time.perf_counter()
-        group_updated, group_bytes = self._copy_shadow_to_image(
-            group.path,
-            gpu_shadow,
-        )
-        image_copy_s = time.perf_counter() - phase_started
+            def gpu_storage_factory(
+                tensor: torch.Tensor,
+                source_bytes: torch.Tensor,
+            ) -> torch.Tensor:
+                storage = tensor.untyped_storage()
+                source_key = (storage.data_ptr(), storage.nbytes())
+                target_device = (
+                    self.target_device
+                    if source_key in loaded.gpu_stage_cpu_storages
+                    else tensor.device
+                )
+                storage_bytes = torch.empty(
+                    source_bytes.numel(),
+                    dtype=torch.uint8,
+                    device=target_device,
+                )
+                storage_bytes.copy_(source_bytes, non_blocking=True)
+                return storage_bytes
+
+            with torch.cuda.stream(self._prepare_stream):
+                phase_started = time.perf_counter()
+                gpu_shadow = clone_module_tensors(
+                    cpu_shadow,
+                    target_device=self.target_device,
+                    copy_data=True,
+                    storage_factory=gpu_storage_factory,
+                )
+                h2d_submit_s = time.perf_counter() - phase_started
+
+                phase_started = time.perf_counter()
+                for _, module in gpu_shadow.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                quant_submit_s = time.perf_counter() - phase_started
+
+            phase_started = time.perf_counter()
+            self._prepare_stream.synchronize()
+            device_sync_s = time.perf_counter() - phase_started
+
+            phase_started = time.perf_counter()
+            group_updated, group_bytes = self._copy_shadow_to_image(
+                group.path,
+                gpu_shadow,
+            )
+            image_copy_s = time.perf_counter() - phase_started
+            cpu_image_copy_bytes = 0
+            postprocess_device = "cuda"
+            background_d2h_bytes = group_bytes
         stats = {
             "path": group.path,
             "transport": loaded.transport,
             "checkpoint_tensors": loaded.checkpoint_tensors,
             "bytes": group_bytes,
+            "postprocess_device": postprocess_device,
+            "background_h2d_bytes": background_h2d_bytes,
+            "background_d2h_bytes": background_d2h_bytes,
+            "cpu_image_copy_bytes": cpu_image_copy_bytes,
             "cpu_clone_s": round(loaded.cpu_clone_s, 6),
             "restore_s": round(loaded.restore_s, 6),
             "cpu_load_s": round(loaded.cpu_load_s, 6),
@@ -1250,12 +1346,14 @@ class CPUWeightCache:
         }
         logger.debug(
             "Prepared CPU weight group %d/%d: path=%s "
-            "bytes=%d wall_s=%.6f cpu_load_s=%.6f h2d_submit_s=%.6f "
+            "bytes=%d postprocess_device=%s wall_s=%.6f "
+            "cpu_load_s=%.6f h2d_submit_s=%.6f "
             "device_sync_s=%.6f image_copy_s=%.6f transport=%s",
             loaded.group_index,
             len(self.groups),
             group.path,
             group_bytes,
+            stats["postprocess_device"],
             stats["wall_s"],
             stats["cpu_load_s"],
             stats["h2d_submit_s"],
@@ -1635,6 +1733,22 @@ class CPUWeightCache:
                 "image_copy_s",
             )
         }
+        traffic = {
+            name: sum(value.get(name, 0) for value in group_stats)
+            for name in (
+                "background_h2d_bytes",
+                "background_d2h_bytes",
+                "cpu_image_copy_bytes",
+            )
+        }
+        postprocess_devices = {
+            device: sum(
+                value["bytes"]
+                for value in group_stats
+                if value.get("postprocess_device") == device
+            )
+            for device in ("cpu", "cuda")
+        }
         load_stats = [
             value
             for value in source_stats
@@ -1681,6 +1795,8 @@ class CPUWeightCache:
             "wall_s": wall_s,
             "source": source_summary,
             "phases": phase_totals,
+            "postprocess_bytes": postprocess_devices,
+            "traffic": traffic,
         }
 
     def prepare_from_delta_lineage(

@@ -198,6 +198,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
+    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
+        return not _is_cpu
+
     def apply(
         self,
         layer: torch.nn.Module,

@@ -149,6 +149,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         if self.strategy == QuantizationStrategy.BLOCK:
             restore_scale_checkpoint_state(getattr(layer, "weight_scale", None))
 
+    def supports_cpu_weight_postprocessing(self, layer) -> bool:
+        return (
+            self.strategy == QuantizationStrategy.CHANNEL
+            and not self.is_static_input_scheme
+            and not is_fp8_fnuz()
+            and not _use_aiter
+        )
+
     def process_weights_after_loading(self, layer) -> None:
         if self.strategy == QuantizationStrategy.BLOCK:
             snapshot_scale_checkpoint_state(getattr(layer, "weight_scale", None))

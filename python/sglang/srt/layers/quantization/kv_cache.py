@@ -83,3 +83,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+    def supports_cpu_weight_postprocessing(self, layer: torch.nn.Module) -> bool:
+        return True

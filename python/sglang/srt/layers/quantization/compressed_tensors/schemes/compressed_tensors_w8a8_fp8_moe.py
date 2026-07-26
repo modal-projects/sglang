@@ -83,6 +83,17 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # ampere and up
         return 80
 
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
+    def supports_cpu_weight_postprocessing(self, layer) -> bool:
+        return (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and not self.static_input_scales
+            and not is_fp8_fnuz()
+            and not _use_aiter
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,

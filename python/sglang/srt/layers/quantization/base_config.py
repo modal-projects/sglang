@@ -46,6 +46,10 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
+    def supports_cpu_weight_postprocessing(self, layer: nn.Module) -> bool:
+        """Return whether the current post-load transform can run on CPU."""
+        return False
+
     def supports_batched_weight_loading(self) -> bool:
         return False
 

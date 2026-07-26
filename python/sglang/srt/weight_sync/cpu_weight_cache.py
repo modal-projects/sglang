@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors import safe_open
 
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
@@ -983,17 +984,44 @@ def _map_checkpoint_names_to_groups(
     return result
 
 
-def _checkpoint_index(checkpoint_dir: str) -> tuple[dict[str, str], Path]:
+def _checkpoint_weight_map(checkpoint_dir: str) -> tuple[dict[str, str], Path]:
     root = Path(checkpoint_dir)
-    indexes = sorted(root.glob("*.safetensors.index.json"))
-    if len(indexes) != 1:
+    model_index = root / "model.safetensors.index.json"
+    indexes = (
+        [model_index]
+        if model_index.is_file()
+        else sorted(root.glob("*.safetensors.index.json"))
+    )
+    if len(indexes) > 1:
         raise ValueError(
-            f"expected one safetensors index in {checkpoint_dir!r}, found {indexes}"
+            f"expected at most one safetensors index in {checkpoint_dir!r}, "
+            f"found {indexes}"
         )
-    payload = json.loads(indexes[0].read_text())
-    weight_map = payload.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"invalid safetensors weight map: {indexes[0]}")
+    if indexes:
+        payload = json.loads(indexes[0].read_text())
+        weight_map = payload.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"invalid safetensors weight map: {indexes[0]}")
+        if not all(
+            isinstance(name, str) and isinstance(filename, str)
+            for name, filename in weight_map.items()
+        ):
+            raise ValueError(f"invalid safetensors weight map: {indexes[0]}")
+        return weight_map, root
+
+    files = sorted(root.glob("*.safetensors"))
+    if not files:
+        raise ValueError(f"no safetensors weights found in {checkpoint_dir!r}")
+    weight_map = {}
+    for path in files:
+        with safe_open(path, framework="pt", device="cpu") as tensor_file:
+            for name in tensor_file.keys():
+                if name in weight_map:
+                    raise ValueError(
+                        f"duplicate safetensors tensor {name!r} in "
+                        f"{weight_map[name]!r} and {path.name!r}"
+                    )
+                weight_map[name] = path.name
     return weight_map, root
 
 
@@ -1130,7 +1158,7 @@ def _transform_canonical_checkpoint(
 
 
 class CPUWeightCache:
-    """Compile indexed safetensors targets into complete pinned host images."""
+    """Compile safetensors targets into complete pinned host images."""
 
     def __init__(
         self,
@@ -1216,7 +1244,7 @@ class CPUWeightCache:
         )
 
         def inspect_checkpoint():
-            weight_map, root = _checkpoint_index(base_checkpoint_dir)
+            weight_map, root = _checkpoint_weight_map(base_checkpoint_dir)
             filenames = sorted(set(weight_map.values()))
             return (root, filenames) + _canonical_checkpoint_layout(root, filenames)
 
@@ -1816,7 +1844,7 @@ class CPUWeightCache:
         started = time.perf_counter()
 
         def inspect_checkpoint():
-            weight_map, root = _checkpoint_index(checkpoint_dir)
+            weight_map, root = _checkpoint_weight_map(checkpoint_dir)
             return (
                 weight_map,
                 root,
@@ -2037,7 +2065,7 @@ class CPUWeightCache:
                     else self._canonical_checkpoint_signature[0]
                 ),
             ) as delta_transform:
-                prefetch_stats = delta_transform.prefetch_stats
+                delta_setup_stats = delta_transform.setup_stats
                 stats = self._stage_from_checkpoint(
                     checkpoint_dir=str(delta_transform.checkpoint_root),
                     target_version=target_version,
@@ -2060,7 +2088,7 @@ class CPUWeightCache:
                 f"staging of v{target_version} did not complete",
             )
             raise
-        stats["delta_prefetch"] = prefetch_stats
+        stats["delta_setup"] = delta_setup_stats
         stats["canonical_checkpoint"] = {
             "version": self._canonical_checkpoint_version,
             "bytes": (

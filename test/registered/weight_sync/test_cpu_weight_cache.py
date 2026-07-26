@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.model_loader.utils import (
     DEFERRED_WEIGHT_COPY_SAFE_ATTR,
 )
-from sglang.srt.weight_sync import cpu_weight_cache
+from sglang.srt.weight_sync import cpu_delta_checkpoint, cpu_weight_cache
 from sglang.srt.weight_sync.cpu_delta_checkpoint import (
     DeltaCheckpointTransform,
     _resolve_lineage,
@@ -32,6 +32,7 @@ from sglang.srt.weight_sync.cpu_delta_checkpoint import (
 from sglang.srt.weight_sync.cpu_weight_cache import (
     CPUWeightCache,
     _canonical_checkpoint_layout,
+    _checkpoint_weight_map,
     _clone_weight_module,
     _HostSharedCheckpoint,
     _InMemorySafetensorsFile,
@@ -119,6 +120,27 @@ def _shared_delta_worker(rank: int, world_size: int, rendezvous: str):
 
 
 class TestCPUWeightCache(unittest.TestCase):
+    def test_checkpoint_weight_map_supports_unindexed_safetensors(self):
+        with tempfile.TemporaryDirectory() as root:
+            save_file(
+                {"layer.weight": torch.arange(4, dtype=torch.float32)},
+                Path(root) / "model.safetensors",
+            )
+
+            weight_map, checkpoint_root = _checkpoint_weight_map(root)
+
+            self.assertEqual(weight_map, {"layer.weight": "model.safetensors"})
+            self.assertEqual(checkpoint_root, Path(root))
+
+    def test_checkpoint_weight_map_rejects_duplicate_unindexed_tensors(self):
+        with tempfile.TemporaryDirectory() as root:
+            tensor = torch.arange(4, dtype=torch.float32)
+            save_file({"layer.weight": tensor}, Path(root) / "model-1.safetensors")
+            save_file({"layer.weight": tensor}, Path(root) / "model-2.safetensors")
+
+            with self.assertRaisesRegex(ValueError, "duplicate safetensors tensor"):
+                _checkpoint_weight_map(root)
+
     def test_cpu_cache_rejects_secondary_checkpoint_sources(self):
         model = torch.nn.Linear(2, 2)
         model.secondary_weights = [object()]
@@ -222,7 +244,7 @@ class TestCPUWeightCache(unittest.TestCase):
             base.mkdir()
             version.mkdir(parents=True)
             version_2.mkdir(parents=True)
-            shard = "model-00001-of-00001.safetensors"
+            shard = "model.safetensors"
 
             original = {
                 "layer.a": torch.arange(64, dtype=torch.uint8),
@@ -231,14 +253,6 @@ class TestCPUWeightCache(unittest.TestCase):
             target_a = torch.arange(64, dtype=torch.uint8).flip(0)
             target_a_2 = torch.arange(64, dtype=torch.uint8).roll(11)
             save_file(original, base / shard)
-            (base / "model.safetensors.index.json").write_text(
-                json.dumps(
-                    {
-                        "metadata": {},
-                        "weight_map": {name: shard for name in original},
-                    }
-                )
-            )
 
             difference = torch.bitwise_xor(original["layer.a"], target_a)
             compressed = zstandard.ZstdCompressor().compress(
@@ -301,11 +315,31 @@ class TestCPUWeightCache(unittest.TestCase):
                 cpu_group=None,
             )
             try:
+                self.assertFalse(hasattr(source, "arena"))
                 path = base / shard
                 encoded = torch.empty(path.stat().st_size, dtype=torch.uint8)
                 _pread_file_to_tensor(path, encoded)
                 tensor_file = _InMemorySafetensorsFile(encoded)
-                stats = source.transform_file(shard, tensor_file)
+                positional_read_sizes = []
+                original_pread = cpu_delta_checkpoint.os.pread
+
+                def pread(fd, nbytes, offset):
+                    positional_read_sizes.append(nbytes)
+                    return original_pread(fd, nbytes, offset)
+
+                with (
+                    mock.patch.object(
+                        cpu_delta_checkpoint,
+                        "_XOR_STREAM_CHUNK_BYTES",
+                        7,
+                    ),
+                    mock.patch.object(
+                        cpu_delta_checkpoint.os,
+                        "pread",
+                        side_effect=pread,
+                    ),
+                ):
+                    stats = source.transform_file(shard, tensor_file)
                 torch.testing.assert_close(
                     tensor_file.get_tensor("layer.a"),
                     target_a,
@@ -317,9 +351,39 @@ class TestCPUWeightCache(unittest.TestCase):
                 self.assertEqual(stats["delta_tensors"], 1)
                 self.assertEqual(stats["target_tensor_bytes"], 64)
                 self.assertEqual(stats["working_memory_budget_bytes"], 8 << 30)
-                self.assertEqual(source.prefetch_stats["physical_host_copies"], 1)
+                self.assertEqual(source.setup_stats["delta_versions"], [1])
+                self.assertLessEqual(max(positional_read_sizes), 7)
             finally:
                 source.close()
+
+            source_chain = DeltaCheckpointTransform(
+                base_checkpoint_dir=str(base),
+                checkpoint_source_dir=str(source_root),
+                target_version=2,
+                cpu_group=None,
+            )
+            try:
+                path = base / shard
+                encoded_chain = torch.empty(path.stat().st_size, dtype=torch.uint8)
+                _pread_file_to_tensor(path, encoded_chain)
+                tensor_file_chain = _InMemorySafetensorsFile(encoded_chain)
+                stats_chain = source_chain.transform_file(shard, tensor_file_chain)
+                torch.testing.assert_close(
+                    tensor_file_chain.get_tensor("layer.a"),
+                    target_a_2,
+                )
+                torch.testing.assert_close(
+                    tensor_file_chain.get_tensor("layer.b"),
+                    original["layer.b"],
+                )
+                self.assertEqual(
+                    source_chain.setup_stats["delta_versions"],
+                    [1, 2],
+                )
+                self.assertEqual(stats_chain["delta_tensors"], 1)
+                self.assertEqual(stats_chain["target_tensor_bytes"], 64)
+            finally:
+                source_chain.close()
 
             source_2 = DeltaCheckpointTransform(
                 base_checkpoint_dir=str(base),
@@ -339,10 +403,40 @@ class TestCPUWeightCache(unittest.TestCase):
                     tensor_file.get_tensor("layer.b"),
                     original["layer.b"],
                 )
-                self.assertEqual(source_2.prefetch_stats["delta_versions"], [2])
+                self.assertEqual(source_2.setup_stats["delta_versions"], [2])
                 self.assertEqual(stats_2["delta_tensors"], 1)
             finally:
                 source_2.close()
+
+            save_file(
+                {
+                    "layer.a": torch.tensor(
+                        list(compressed_2),
+                        dtype=torch.uint8,
+                    )
+                },
+                version_2 / shard,
+                metadata={"layer.a": "00000000"},
+            )
+            invalid = DeltaCheckpointTransform(
+                base_checkpoint_dir=str(base),
+                checkpoint_source_dir=str(source_root),
+                target_version=2,
+                cpu_group=None,
+            )
+            try:
+                encoded_invalid = torch.empty(
+                    (base / shard).stat().st_size,
+                    dtype=torch.uint8,
+                )
+                _pread_file_to_tensor(base / shard, encoded_invalid)
+                with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                    invalid.transform_file(
+                        shard,
+                        _InMemorySafetensorsFile(encoded_invalid),
+                    )
+            finally:
+                invalid.close()
 
     def test_runtime_overwrite_delta_reconstructs_and_verifies_target(self):
         with tempfile.TemporaryDirectory() as root_value:
@@ -694,9 +788,9 @@ class TestCPUWeightCache(unittest.TestCase):
                 cpu_group=None,
             )
             try:
-                self.assertIsNone(overlay.arena)
-                self.assertEqual(overlay.prefetch_stats["delta_versions"], [1])
-                self.assertEqual(overlay.prefetch_stats["delta_tensors"], 0)
+                self.assertFalse(hasattr(overlay, "arena"))
+                self.assertEqual(overlay.setup_stats["delta_versions"], [1])
+                self.assertEqual(overlay.setup_stats["delta_tensors"], 0)
             finally:
                 overlay.close()
 

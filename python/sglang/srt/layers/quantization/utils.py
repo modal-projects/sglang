@@ -594,32 +594,76 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
-def swizzle_blockscale(scale: torch.Tensor):
-    """
-    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
-    """
-    assert scale.dtype == torch.float8_e4m3fn
-    # Pad and blockwise interleave weight_scale
-    scale_ndim = scale.ndim
-    if scale.ndim == 2:
-        scale = scale.unsqueeze(0)
-    assert scale.ndim == 3
-    B, M, K = scale.shape
-    round_up_multiple = lambda x, m: (x + m - 1) // m * m
-    M_padded = round_up_multiple(M, 128)
-    K_padded = round_up_multiple(K, 4)
-    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
-    padded_scale[:B, :M, :K] = scale
-    batches, rows, cols = padded_scale.shape
-    assert rows % 128 == 0
-    assert cols % 4 == 0
-    padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-    swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+def block_scale_interleave(scale: torch.Tensor) -> torch.Tensor:
+    """Convert linear block scales to the device-independent 128x4 layout."""
+
+    if scale.ndim not in (2, 3):
+        raise ValueError(f"block scales must be 2D or 3D, got {scale.ndim}D")
+    batched_scale = scale.unsqueeze(0) if scale.ndim == 2 else scale
+    batches, rows, cols = batched_scale.shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 3) // 4 * 4
+    padded_scale = batched_scale.new_zeros((batches, padded_rows, padded_cols))
+    padded_scale[:, :rows, :cols] = batched_scale
     return (
-        swizzled_scale.reshape(M_padded, K_padded)
+        padded_scale.reshape(
+            batches,
+            padded_rows // 128,
+            4,
+            32,
+            padded_cols // 4,
+            4,
+        )
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
+def shuffle_block_scales(
+    scale: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: int = 16,
+) -> torch.Tensor:
+    """Apply TRT-LLM's row shuffle and 128x4 block-scale layout."""
+
+    from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
+
+    row_indices = get_shuffle_matrix_sf_a_row_indices(
+        scale,
+        epilogue_tile_m,
+        num_elts_per_sf=num_elts_per_sf,
+    )
+    return block_scale_interleave(scale.index_select(0, row_indices.to(scale.device)))
+
+
+def shuffle_matrix_rows(
+    matrix: torch.Tensor,
+    epilogue_tile_m: int,
+) -> torch.Tensor:
+    """Apply TRT-LLM's matrix-A row shuffle on the source device."""
+
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+    row_indices = get_shuffle_matrix_a_row_indices(matrix, epilogue_tile_m)
+    return matrix.index_select(0, row_indices.to(matrix.device)).contiguous()
+
+
+def swizzle_blockscale(scale: torch.Tensor):
+    """Swizzle NVFP4 scales while preserving the source device."""
+
+    assert scale.dtype == torch.float8_e4m3fn
+    scale_ndim = scale.ndim
+    batched_scale = scale.unsqueeze(0) if scale.ndim == 2 else scale
+    assert batched_scale.ndim == 3
+    batches, rows, cols = batched_scale.shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 3) // 4 * 4
+    swizzled_scale = block_scale_interleave(batched_scale)
+    return (
+        swizzled_scale.reshape(padded_rows, padded_cols)
         if scale_ndim == 2
-        else swizzled_scale.reshape(B, M_padded, K_padded)
+        else swizzled_scale.reshape(batches, padded_rows, padded_cols)
     )
 
 
@@ -737,7 +781,11 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             permute_sf_indices.to(gemm1_scales_linear_fp4.device),
             out=g1s_scratch,
         )
-        gemm1_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g1s_scratch)
+        gemm1_scales_fp4_shuffled[i] = (
+            block_scale_interleave(g1s_scratch)
+            if g1s_scratch.device.type == "cpu"
+            else nvfp4_block_scale_interleave(g1s_scratch)
+        )
 
         permute_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
@@ -760,7 +808,11 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             permute_sf_indices.to(gemm2_scales_linear_fp4.device),
             out=g2s_scratch,
         )
-        gemm2_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g2s_scratch)
+        gemm2_scales_fp4_shuffled[i] = (
+            block_scale_interleave(g2s_scratch)
+            if g2s_scratch.device.type == "cpu"
+            else nvfp4_block_scale_interleave(g2s_scratch)
+        )
 
     del g1s_scratch, g2s_scratch
 

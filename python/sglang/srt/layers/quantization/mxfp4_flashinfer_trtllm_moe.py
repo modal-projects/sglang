@@ -14,6 +14,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.quantization.utils import (
+    block_scale_interleave,
+    reorder_w1w3_to_w3w1,
+)
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
@@ -26,12 +31,7 @@ _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
     from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
-    from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -135,19 +135,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
-    def process_weights_after_loading(self, layer: Module) -> None:
-        from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        self._fp8.restore_weights_before_loading(layer)
+        for name in ("w13_weight", "w2_weight"):
+            parameter = getattr(layer, name)
+            checkpoint_dtype = getattr(
+                parameter,
+                "_mxfp4_checkpoint_dtype",
+                None,
+            )
+            if checkpoint_dtype is not None and parameter.dtype != checkpoint_dtype:
+                parameter.data = parameter.data.view(checkpoint_dtype)
 
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
+    def supports_cpu_weight_postprocessing(self, layer: Module) -> bool:
+        return _USE_OFFICIAL_SHUFFLE
+
+    def process_weights_after_loading(self, layer: Module) -> None:
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
+        for name in ("w13_weight", "w2_weight"):
+            parameter = getattr(layer, name)
+            if not hasattr(parameter, "_mxfp4_checkpoint_dtype"):
+                parameter._mxfp4_checkpoint_dtype = parameter.dtype
+
         w13_w, w13_s = reorder_w1w3_to_w3w1(
             layer.w13_weight.data, layer.w13_weight_scale_inv.data
         )
-        layer.w13_weight = Parameter(w13_w, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
+        copy_or_rebind_param(layer, "w13_weight", w13_w)
+        copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_s)
 
         log_info_on_rank0(
             logger,
@@ -168,6 +189,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         epilogue_tile_m = 128
         g1_w, g1_s, g2_w, g2_s = [], [], [], []
         if _USE_OFFICIAL_SHUFFLE:
+            from flashinfer.fp4_quantization import (
+                block_scale_interleave as flashinfer_block_scale_interleave,
+            )
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                get_w2_permute_indices_with_cache,
+            )
+
             cache: dict = {}
             for i in range(num_experts):
                 w13_u8 = w13[i].view(torch.uint8)
@@ -188,8 +217,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     num_elts_per_sf=16,
                 )
                 g1_s.append(
-                    block_scale_interleave(
-                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous()
+                    (
+                        block_scale_interleave
+                        if w13_s_u8.device.type == "cpu"
+                        else flashinfer_block_scale_interleave
+                    )(
+                        w13_s_u8[perm_sf.to(w13_s_u8.device)].contiguous(),
                     )
                 )
 
@@ -206,8 +239,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     num_elts_per_sf=16,
                 )
                 g2_s.append(
-                    block_scale_interleave(
-                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous()
+                    (
+                        block_scale_interleave
+                        if w2_s_u8.device.type == "cpu"
+                        else flashinfer_block_scale_interleave
+                    )(
+                        w2_s_u8[perm_sf.to(w2_s_u8.device)].contiguous(),
                     )
                 )
         else:
@@ -221,23 +258,53 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     shuffle_matrix_sf_a(w2_scale[i].view(torch.uint8), epilogue_tile_m)
                 )
 
-        layer.w13_weight = Parameter(torch.stack(g1_w), requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(
+        self._publish_runtime_parameter(layer, "w13_weight", torch.stack(g1_w))
+        self._publish_runtime_parameter(
+            layer,
+            "w13_weight_scale_inv",
             torch.stack(g1_s)
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, w13.shape[1], -1),
-            requires_grad=False,
         )
-        layer.w2_weight = Parameter(torch.stack(g2_w), requires_grad=False)
-        layer.w2_weight_scale_inv = Parameter(
+        self._publish_runtime_parameter(layer, "w2_weight", torch.stack(g2_w))
+        self._publish_runtime_parameter(
+            layer,
+            "w2_weight_scale_inv",
             torch.stack(g2_s)
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, w2.shape[1], -1),
-            requires_grad=False,
         )
 
         self._register_static_scale_ones(layer)
-        torch.cuda.empty_cache()
+        if layer.w13_weight.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _publish_runtime_parameter(
+        layer: Module,
+        name: str,
+        value: torch.Tensor,
+    ) -> None:
+        parameter = getattr(layer, name)
+        runtime_buffer = getattr(parameter, "_runtime_buffer", None)
+        if (
+            runtime_buffer is not None
+            and runtime_buffer.shape == value.shape
+            and runtime_buffer.dtype == value.dtype
+        ):
+            runtime_buffer.copy_(value)
+            parameter.data = runtime_buffer
+            del parameter._runtime_buffer
+            return
+        if (
+            parameter.shape == value.shape
+            and parameter.element_size() == value.element_size()
+            and parameter.dtype != value.dtype
+        ):
+            parameter.data = parameter.data.view(value.dtype)
+        copy_or_rebind_param(layer, name, value)
+        if runtime_buffer is not None:
+            del parameter._runtime_buffer
 
     def _register_static_scale_ones(self, layer: Module) -> None:
         device = layer.w13_weight.device

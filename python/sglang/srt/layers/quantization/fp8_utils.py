@@ -1456,7 +1456,10 @@ def restore_scale_checkpoint_state(scale) -> None:
     if scale is None or not hasattr(scale, "_checkpoint_format_ue8m0"):
         return
     scale.format_ue8m0 = scale._checkpoint_format_ue8m0
-    if tuple(scale.data.shape) != scale._checkpoint_shape:
+    if (
+        tuple(scale.data.shape) != scale._checkpoint_shape
+        or scale.data.dtype != scale._checkpoint_dtype
+    ):
         scale._runtime_buffer = scale.data
         scale.data = torch.empty(
             scale._checkpoint_shape,

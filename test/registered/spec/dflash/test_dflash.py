@@ -124,6 +124,22 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
 
+    def test_logprobs(self):
+        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
+        response = client.completions.create(
+            model=self.model,
+            prompt="The capital of France is",
+            max_tokens=32,
+            temperature=0,
+            logprobs=1,
+        )
+        logprobs = response.choices[0].logprobs
+        self.assertIsNotNone(logprobs)
+        self.assertEqual(len(logprobs.tokens), len(logprobs.token_logprobs))
+        self.assertEqual(len(logprobs.tokens), len(logprobs.top_logprobs))
+        self.assertTrue(logprobs.tokens)
+        assert self.process.poll() is None
+
 
 class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256

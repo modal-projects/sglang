@@ -366,18 +366,20 @@ class SchedulerWeightUpdaterManager:
                     server_args.cpu_weight_cache_canonical_checkpoint_dir
                 )
                 if recv_req.target_version == 0:
+                    materialization = None
                     if canonical_checkpoint_dir is not None:
-                        local_stats["canonical_checkpoint_materialization"] = (
-                            disk_checkpoint.materialize(
-                                local_checkpoint_dir=canonical_checkpoint_dir,
-                                base_checkpoint_dir=base_checkpoint_dir,
-                                checkpoint_source_dir=base_checkpoint_dir,
-                                target_version=0,
-                            )
+                        materialization = disk_checkpoint.materialize(
+                            local_checkpoint_dir=canonical_checkpoint_dir,
+                            base_checkpoint_dir=base_checkpoint_dir,
+                            checkpoint_source_dir=base_checkpoint_dir,
+                            target_version=0,
                         )
-                    local_stats["stage"] = self._initialize_cpu_weight_cache(
-                        base_checkpoint_dir
-                    )
+                    stage_stats = self._initialize_cpu_weight_cache(base_checkpoint_dir)
+                    if materialization is not None:
+                        stage_stats["canonical_checkpoint_materialization"] = (
+                            materialization
+                        )
+                    local_stats["stage"] = stage_stats
                 else:
                     if self._cpu_weight_cache_initialization_error is not None:
                         raise RuntimeError(

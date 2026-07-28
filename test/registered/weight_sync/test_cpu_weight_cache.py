@@ -37,7 +37,10 @@ from sglang.srt.weight_sync.cpu_weight_cache import (
     _HostSharedCheckpoint,
     _InMemorySafetensorsFile,
     _LoadedWeightGroup,
+    _populate_shared_checkpoint_group,
     _pread_file_to_tensor,
+    _shared_checkpoint_groups,
+    _SharedCheckpointGroupView,
     _transform_canonical_checkpoint,
     _WeightModuleGroup,
 )
@@ -116,6 +119,61 @@ def _shared_delta_worker(rank: int, world_size: int, rendezvous: str):
     finally:
         if arena is not None:
             arena.close()
+        torch.distributed.destroy_process_group()
+
+
+def _shared_checkpoint_group_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    root_value: str,
+):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=world_size,
+    )
+    buffer = None
+    try:
+        root = Path(root_value)
+        weight_map = {
+            f"layer.{index}": f"{index}.safetensors" for index in range(world_size)
+        }
+        group = _shared_checkpoint_groups(
+            root=root,
+            weight_map=weight_map,
+            names_by_group={"model": sorted(weight_map)},
+        )["model"]
+        buffer = HostSharedMemoryBuffer(
+            nbytes=group.buffer_bytes,
+            cpu_group=torch.distributed.group.WORLD,
+            name="weight-checkpoint-group-test",
+        )
+        stats = _populate_shared_checkpoint_group(
+            root=root,
+            group=group,
+            buffer=buffer,
+            cpu_group=torch.distributed.group.WORLD,
+        )
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(gathered, stats)
+        if sum(item["owned_bytes"] for item in gathered) != group.source_bytes:
+            raise AssertionError("checkpoint bytes were not read exactly once")
+        if sum(len(item["owned_reads"]) for item in gathered) != len(group.reads):
+            raise AssertionError("checkpoint ranges were not owned exactly once")
+        source = _SharedCheckpointGroupView(buffer, group.tensors)
+        for index in range(world_size):
+            expected = torch.full((8,), index + 1, dtype=torch.int32)
+            actual = source.get_tensor(f"layer.{index}")
+            if not torch.equal(actual, expected):
+                raise AssertionError(
+                    f"rank {rank} observed invalid tensor {index}: {actual}"
+                )
+        torch.distributed.barrier()
+    finally:
+        if buffer is not None:
+            buffer.close()
         torch.distributed.destroy_process_group()
 
 
@@ -805,6 +863,30 @@ class TestCPUWeightCache(unittest.TestCase):
                 start_method="fork",
             )
 
+    def test_shared_checkpoint_groups_are_read_once_per_host(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            world_size = 4
+            for index in range(world_size):
+                save_file(
+                    {
+                        f"layer.{index}": torch.full(
+                            (8,),
+                            index + 1,
+                            dtype=torch.int32,
+                        )
+                    },
+                    root / f"{index}.safetensors",
+                )
+            rendezvous = str(root / "gloo-group-rendezvous")
+            torch.multiprocessing.start_processes(
+                _shared_checkpoint_group_worker,
+                args=(world_size, rendezvous, root_value),
+                nprocs=world_size,
+                join=True,
+                start_method="fork",
+            )
+
     def test_canonical_checkpoint_population_reads_each_file_once(self):
         source = None
         with tempfile.TemporaryDirectory() as root_value:
@@ -851,12 +933,13 @@ class TestCPUWeightCache(unittest.TestCase):
                 if source is not None:
                     source.close()
 
-    def test_disk_checkpoint_compilation_reads_mapped_safetensors(self):
+    def test_disk_checkpoint_compilation_reads_one_shared_group(self):
         with tempfile.TemporaryDirectory() as root_value:
             root = Path(root_value)
             expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
             save_file({"weight": expected}, root / "model.safetensors")
             compiler = object.__new__(CPUWeightCache)
+            compiler.host_cpu_group = None
             group = _WeightModuleGroup(path="model", nbytes=expected.nbytes)
             compiler.groups = [group]
             loaded_group = object()

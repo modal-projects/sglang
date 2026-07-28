@@ -1,12 +1,11 @@
-"""Cache a canonical checkpoint and rank-ready CPU weight image.
+"""Compile canonical checkpoints into rank-ready CPU weight images.
 
 Staging deliberately reuses the model's ordinary loader and quantization
-hooks. CPU-rich delta staging retains one canonical checkpoint shared by the
-local workers of a model replica. That source is not CUDA-registered because it
-only feeds CPU layout work. Compilation writes TP-sharded tensors into the
-persistent rank image, then runs reload-safe post-load transforms on CPU.
-Quantization methods that require device kernels retain the bounded GPU-staging
-path. The resulting runtime bytes remain in
+hooks. The canonical checkpoint can remain in memory shared by a model
+replica's local workers or be materialized on host-local disk. Compilation
+writes TP-sharded tensors into the persistent rank image, then runs reload-safe
+post-load transforms on CPU. Quantization methods that require device kernels
+retain the bounded GPU-staging path. The resulting runtime bytes remain in
 :class:`~sglang.srt.weight_sync.cpu_weight_image.CPUWeightImage`; the live
 model is never rebound or overwritten during staging.
 
@@ -25,9 +24,10 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from safetensors import safe_open
@@ -1166,6 +1166,7 @@ class CPUWeightCache:
         *,
         max_group_bytes: int,
         host_cpu_group: Any = None,
+        canonical_checkpoint_storage: Literal["memory", "disk"] = "memory",
     ):
         if getattr(model, "secondary_weights", None):
             raise NotImplementedError(
@@ -1176,6 +1177,9 @@ class CPUWeightCache:
         self.target_device = torch.device("cuda", torch.cuda.current_device())
         self.max_group_bytes = max_group_bytes
         self.host_cpu_group = host_cpu_group
+        self.canonical_checkpoint_storage = canonical_checkpoint_storage
+        if canonical_checkpoint_storage not in {"memory", "disk"}:
+            raise ValueError("canonical_checkpoint_storage must be 'memory' or 'disk'")
         self.groups = _build_weight_module_groups(
             model,
             max_group_bytes=max_group_bytes,
@@ -1195,11 +1199,12 @@ class CPUWeightCache:
         self._canonical_checkpoint_version: int | None = None
         logger.info(
             "CPU weight cache layout: groups=%d storages=%d bytes=%d "
-            "max_compile_group_bytes=%d",
+            "max_compile_group_bytes=%d canonical_checkpoint_storage=%s",
             len(self.groups),
             len(self.image.segments),
             self.image.image_nbytes,
             self.max_group_bytes,
+            self.canonical_checkpoint_storage,
         )
 
     def _run_on_all_host_ranks(self, description: str, function: Callable[[], Any]):
@@ -1231,7 +1236,7 @@ class CPUWeightCache:
         return result
 
     def initialize_from_checkpoint(self, *, base_checkpoint_dir: str) -> dict[str, Any]:
-        """Allocate and populate the persistent CPU checkpoint and weight image."""
+        """Populate the canonical checkpoint and rank-ready weight image."""
 
         started = time.perf_counter()
         registration = self._run_on_all_host_ranks(
@@ -1246,35 +1251,44 @@ class CPUWeightCache:
         def inspect_checkpoint():
             weight_map, root = _checkpoint_weight_map(base_checkpoint_dir)
             filenames = sorted(set(weight_map.values()))
-            return (root, filenames) + _canonical_checkpoint_layout(root, filenames)
+            checkpoint_bytes = sum((root / name).stat().st_size for name in filenames)
+            return root, filenames, checkpoint_bytes
 
-        (
-            root,
-            filenames,
-            file_sizes,
-            offsets,
-            capacity,
-            signature,
-        ) = self._run_on_all_host_ranks(
+        root, filenames, canonical_checkpoint_bytes = self._run_on_all_host_ranks(
             "CPU weight cache checkpoint inspection",
             inspect_checkpoint,
         )
-        checkpoint, created = self._get_canonical_checkpoint(
-            capacity=capacity,
-            signature=signature,
-        )
-        if not created:
-            raise RuntimeError(
-                "canonical checkpoint already exists during cache initialization"
+        if self.canonical_checkpoint_storage == "memory":
+            (
+                file_sizes,
+                offsets,
+                capacity,
+                signature,
+            ) = self._run_on_all_host_ranks(
+                "CPU weight cache checkpoint layout inspection",
+                lambda: _canonical_checkpoint_layout(root, filenames),
             )
-        canonical_checkpoint_stats = self._populate_canonical_checkpoint(
-            root=root,
-            filenames=filenames,
-            file_sizes=file_sizes,
-            offsets=offsets,
-            checkpoint=checkpoint,
-        )
-        self._canonical_checkpoint_version = 0
+            checkpoint, created = self._get_canonical_checkpoint(
+                capacity=capacity,
+                signature=signature,
+            )
+            if not created:
+                raise RuntimeError(
+                    "canonical checkpoint already exists during cache initialization"
+                )
+            canonical_checkpoint_stats = self._populate_canonical_checkpoint(
+                root=root,
+                filenames=filenames,
+                file_sizes=file_sizes,
+                offsets=offsets,
+                checkpoint=checkpoint,
+            )
+            self._canonical_checkpoint_version = 0
+        else:
+            canonical_checkpoint_stats = {
+                "setup_wall_s": 0.0,
+                "wall_s": 0.0,
+            }
         baseline_stage = self._stage_from_checkpoint(
             checkpoint_dir=base_checkpoint_dir,
             target_version=0,
@@ -1284,7 +1298,8 @@ class CPUWeightCache:
         self.image.accept_staged_baseline()
         stats = {
             "operation": "initialize_cpu_weight_cache",
-            "canonical_checkpoint_bytes": sum(file_sizes.values()),
+            "canonical_checkpoint_storage": self.canonical_checkpoint_storage,
+            "canonical_checkpoint_bytes": canonical_checkpoint_bytes,
             "rank_image_bytes": self.image.image_nbytes,
             "rank_weight_bytes": self.image.weight_nbytes,
             "compile_group_limit_bytes": self.max_group_bytes,
@@ -1298,9 +1313,11 @@ class CPUWeightCache:
         }
         logger.info(
             "CPU weight cache ready: rank_image_bytes=%d "
-            "canonical_checkpoint_bytes=%d compile_time=%.3fs wall_time=%.3fs",
+            "canonical_checkpoint_bytes=%d canonical_checkpoint_storage=%s "
+            "compile_time=%.3fs wall_time=%.3fs",
             self.image.image_nbytes,
             stats["canonical_checkpoint_bytes"],
+            stats["canonical_checkpoint_storage"],
             stats["initial_compile_wall_s"],
             stats["wall_s"],
         )
@@ -1752,7 +1769,7 @@ class CPUWeightCache:
             return 0
         return self._canonical_checkpoint_version or 0
 
-    def _compile_canonical_checkpoint(
+    def _compile_memory_checkpoint(
         self,
         *,
         root: Path,
@@ -1832,6 +1849,52 @@ class CPUWeightCache:
             handles.clear()
             gc.collect()
 
+    def _compile_disk_checkpoint(
+        self,
+        *,
+        root: Path,
+        weight_map: dict[str, str],
+        names_by_group: dict[str, list[str]],
+    ):
+        """Compile directly from a verified canonical checkpoint on local disk."""
+
+        filenames = sorted(set(weight_map.values()))
+        try:
+            with ExitStack() as stack:
+                handles = {
+                    filename: stack.enter_context(
+                        safe_open(root / filename, framework="pt", device="cpu")
+                    )
+                    for filename in filenames
+                }
+
+                def get_tensor(name: str) -> torch.Tensor:
+                    tensor = handles[weight_map[name]].get_tensor(name)
+                    setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
+                    return tensor
+
+                for group_index, group in enumerate(self.groups, start=1):
+                    loaded = self._load_group_into_cpu_image(
+                        group_index=group_index,
+                        group=group,
+                        names=names_by_group[group.path],
+                        get_tensor=get_tensor,
+                    )
+                    result = self._finalize_cpu_image_group(loaded)
+                    del loaded
+                    yield result
+        finally:
+            if hasattr(os, "posix_fadvise"):
+                for filename in filenames:
+                    try:
+                        fd = os.open(root / filename, os.O_RDONLY)
+                        try:
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        pass
+
     def _stage_from_checkpoint(
         self,
         *,
@@ -1893,17 +1956,30 @@ class CPUWeightCache:
                 begin_stage,
             )
             progress_interval = max(1, math.ceil(len(self.groups) / 10))
+            if self.canonical_checkpoint_storage == "memory":
+                compiler = self._compile_memory_checkpoint(
+                    root=root,
+                    weight_map=weight_map,
+                    names_by_group=names_by_group,
+                    source_stats=source_stats,
+                    checkpoint_transform=checkpoint_transform,
+                )
+            else:
+                if not isinstance(checkpoint_transform, _NoOpCheckpointTransform):
+                    raise RuntimeError(
+                        "disk-backed canonical checkpoints must be materialized "
+                        "before CPU image compilation"
+                    )
+                compiler = self._compile_disk_checkpoint(
+                    root=root,
+                    weight_map=weight_map,
+                    names_by_group=names_by_group,
+                )
             for (
                 group_updated,
                 group_bytes,
                 stats,
-            ) in self._compile_canonical_checkpoint(
-                root=root,
-                weight_map=weight_map,
-                names_by_group=names_by_group,
-                source_stats=source_stats,
-                checkpoint_transform=checkpoint_transform,
-            ):
+            ) in compiler:
                 updated_segments.update(group_updated)
                 copied_bytes += group_bytes
                 group_stats.append(stats)
@@ -1974,30 +2050,47 @@ class CPUWeightCache:
             )
             for device in ("cpu", "cuda")
         }
-        load_stats = [
-            value
-            for value in source_stats
-            if value.get("operation") == "populate_canonical_cpu_checkpoint"
-        ]
-        transform_stats = next(
-            value
-            for value in source_stats
-            if value.get("operation") == "transform_canonical_checkpoint"
-        )
-        source_summary = {
-            "checkpoint_bytes": (
-                self._canonical_checkpoint.capacity
-                if self._canonical_checkpoint is not None
-                else 0
-            ),
-            "loaded_from_disk": bool(load_stats),
-            "load_wall_s": round(
-                sum(value["wall_s"] for value in load_stats),
-                6,
-            ),
-            "transform_wall_s": transform_stats["transform_wall_s"],
-            "synchronization_wall_s": transform_stats["verify_barrier_s"],
-        }
+        if self.canonical_checkpoint_storage == "memory":
+            load_stats = [
+                value
+                for value in source_stats
+                if value.get("operation") == "populate_canonical_cpu_checkpoint"
+            ]
+            transform_stats = next(
+                value
+                for value in source_stats
+                if value.get("operation") == "transform_canonical_checkpoint"
+            )
+            source_summary = {
+                "storage": "memory",
+                "checkpoint_bytes": (
+                    self._canonical_checkpoint.capacity
+                    if self._canonical_checkpoint is not None
+                    else 0
+                ),
+                "loaded_from_disk": bool(load_stats),
+                "load_wall_s": round(
+                    sum(value["wall_s"] for value in load_stats),
+                    6,
+                ),
+                "transform_wall_s": transform_stats["transform_wall_s"],
+                "synchronization_wall_s": transform_stats["verify_barrier_s"],
+            }
+        else:
+            source_summary = {
+                "storage": "disk",
+                "checkpoint_bytes": sum(
+                    (root / filename).stat().st_size
+                    for filename in set(weight_map.values())
+                ),
+                "loaded_from_disk": True,
+                "load_wall_s": round(
+                    sum(value["cpu_load_s"] for value in group_stats),
+                    6,
+                ),
+                "transform_wall_s": 0.0,
+                "synchronization_wall_s": 0.0,
+            }
         wall_s = round(time.perf_counter() - started, 6)
         logger.info(
             "Staged CPU weight image %s: bytes=%d wall_time=%.3fs "
@@ -2015,7 +2108,11 @@ class CPUWeightCache:
             "checkpoint_tensors": len(weight_map),
             "runtime_storages": len(updated_segments),
             "bytes": copied_bytes,
-            "transport": "canonical_cpu_checkpoint",
+            "transport": (
+                "canonical_cpu_checkpoint"
+                if self.canonical_checkpoint_storage == "memory"
+                else "canonical_disk_checkpoint"
+            ),
             "wall_s": wall_s,
             "compile_wall_s": round(
                 sum(value["wall_s"] for value in group_stats),
@@ -2027,6 +2124,31 @@ class CPUWeightCache:
             "traffic": traffic,
         }
 
+    def stage_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Compile a verified local checkpoint into the rank-ready CPU image."""
+
+        if self.canonical_checkpoint_storage != "disk":
+            raise RuntimeError(
+                "stage_from_checkpoint requires a disk-backed canonical checkpoint"
+            )
+        stats = self._stage_from_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            target_version=target_version,
+            checkpoint_transform=_NoOpCheckpointTransform(),
+        )
+        stats["canonical_checkpoint"] = {
+            "version": target_version,
+            "bytes": stats["source"]["checkpoint_bytes"],
+            "storage": "disk",
+            "physical_host_copies": 1,
+        }
+        return stats
+
     def stage_from_delta_lineage(
         self,
         *,
@@ -2036,6 +2158,10 @@ class CPUWeightCache:
     ) -> dict[str, Any]:
         """Reconstruct and compile a target without materializing it on disk."""
 
+        if self.canonical_checkpoint_storage != "memory":
+            raise RuntimeError(
+                "stage_from_delta_lineage requires an in-memory canonical checkpoint"
+            )
         started = time.perf_counter()
         from sglang.srt.weight_sync.cpu_delta_checkpoint import (
             DeltaCheckpointTransform,
@@ -2096,6 +2222,7 @@ class CPUWeightCache:
                 if self._canonical_checkpoint is None
                 else self._canonical_checkpoint.capacity
             ),
+            "storage": "memory",
             "physical_host_copies": 1,
         }
         stats["wall_s"] = round(time.perf_counter() - started, 6)

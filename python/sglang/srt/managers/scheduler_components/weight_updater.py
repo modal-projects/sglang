@@ -499,7 +499,21 @@ class SchedulerWeightUpdaterManager:
                 else 0
             )
             if host_rank == 0:
-                disk_checkpoint.drop_checkpoint_page_cache(canonical_checkpoint_dir)
+                logger.info(
+                    "Releasing canonical checkpoint page cache: path=%s",
+                    canonical_checkpoint_dir,
+                )
+                started = time.perf_counter()
+                files = disk_checkpoint.drop_checkpoint_page_cache(
+                    canonical_checkpoint_dir
+                )
+                logger.info(
+                    "Released canonical checkpoint page cache: path=%s "
+                    "files=%d wall_time=%.3fs",
+                    canonical_checkpoint_dir,
+                    files,
+                    time.perf_counter() - started,
+                )
             if torch.distributed.is_initialized():
                 torch.distributed.barrier(group=self.host_cpu_group)
         if recv_req.destination == "cpu" and recv_req.target_version == 0:

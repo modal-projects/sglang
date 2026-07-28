@@ -1859,7 +1859,8 @@ class CPUWeightCache:
         """Compile directly from a verified canonical checkpoint on local disk."""
 
         filenames = sorted(set(weight_map.values()))
-        with ExitStack() as stack:
+        stack = ExitStack()
+        try:
             handles = {
                 filename: stack.enter_context(
                     safe_open(root / filename, framework="pt", device="cpu")
@@ -1882,6 +1883,18 @@ class CPUWeightCache:
                 result = self._finalize_cpu_image_group(loaded)
                 del loaded
                 yield result
+        finally:
+            logger.info(
+                "Releasing canonical checkpoint mappings: files=%d",
+                len(filenames),
+            )
+            started = time.perf_counter()
+            stack.close()
+            logger.info(
+                "Released canonical checkpoint mappings: files=%d wall_time=%.3fs",
+                len(filenames),
+                time.perf_counter() - started,
+            )
 
     def _stage_from_checkpoint(
         self,

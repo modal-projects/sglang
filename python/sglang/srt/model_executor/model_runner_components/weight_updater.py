@@ -382,12 +382,15 @@ class WeightUpdater:
                 )
             construction_wall_s = time.perf_counter() - started
             try:
-                checkpoint_dir = (
+                canonical_checkpoint_dir = (
                     runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
-                    or base_checkpoint_dir
                 )
                 stats = cache.initialize_from_checkpoint(
-                    base_checkpoint_dir=checkpoint_dir,
+                    checkpoint_dir=(
+                        canonical_checkpoint_dir
+                        if canonical_checkpoint_dir is not None
+                        else base_checkpoint_dir
+                    ),
                 )
             except Exception:
                 cache.close("CPU weight cache initialization failed")

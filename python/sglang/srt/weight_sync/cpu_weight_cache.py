@@ -1235,7 +1235,7 @@ class CPUWeightCache:
             raise RuntimeError(f"{description} failed: " + "; ".join(errors))
         return result
 
-    def initialize_from_checkpoint(self, *, base_checkpoint_dir: str) -> dict[str, Any]:
+    def initialize_from_checkpoint(self, *, checkpoint_dir: str) -> dict[str, Any]:
         """Populate the canonical checkpoint and rank-ready weight image."""
 
         started = time.perf_counter()
@@ -1249,7 +1249,7 @@ class CPUWeightCache:
         )
 
         def inspect_checkpoint():
-            weight_map, root = _checkpoint_weight_map(base_checkpoint_dir)
+            weight_map, root = _checkpoint_weight_map(checkpoint_dir)
             filenames = sorted(set(weight_map.values()))
             checkpoint_bytes = sum((root / name).stat().st_size for name in filenames)
             return root, filenames, checkpoint_bytes
@@ -1290,7 +1290,7 @@ class CPUWeightCache:
                 "wall_s": 0.0,
             }
         baseline_stage = self._stage_from_checkpoint(
-            checkpoint_dir=base_checkpoint_dir,
+            checkpoint_dir=checkpoint_dir,
             target_version=0,
             checkpoint_transform=_NoOpCheckpointTransform(),
         )

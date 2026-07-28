@@ -310,14 +310,15 @@ def test_cpu_base_uses_cache_initialization():
     )
 
 
-def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
+@pytest.mark.parametrize("drop_cache", [False, True])
+def test_cpu_base_materializes_disk_backed_canonical_checkpoint(drop_cache):
     manager = _manager()
     manager.tp_worker.model_runner.server_args = SimpleNamespace(
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
         cpu_weight_cache_canonical_checkpoint_dir="/canonical",
-        weight_loader_drop_cache_after_load=True,
+        weight_loader_drop_cache_after_load=drop_cache,
     )
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {
         "operation": "initialize_cpu_weight_cache"
@@ -356,7 +357,10 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
         manager.host_cpu_group,
         base_checkpoint_dir="/base",
     )
-    drop_page_cache.assert_called_once_with("/canonical")
+    if drop_cache:
+        drop_page_cache.assert_called_once_with("/canonical")
+    else:
+        drop_page_cache.assert_not_called()
 
 
 def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint():
@@ -382,10 +386,23 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         checkpoint_source_dir="/published",
         target_version=3,
     )
+    refreshed = False
+
+    def refresh(*_args):
+        nonlocal refreshed
+        refreshed = True
+
+    def validate_after_refresh(**_kwargs):
+        assert refreshed
 
     with (
         mock.patch(
-            "sglang.srt.weight_sync.cpu_delta_checkpoint.validate_delta_target"
+            "sglang.srt.weight_sync.disk_checkpoint.refresh_checkpoint_source",
+            side_effect=refresh,
+        ) as refresh_source,
+        mock.patch(
+            "sglang.srt.weight_sync.cpu_delta_checkpoint.validate_delta_target",
+            side_effect=validate_after_refresh,
         ) as validate,
         mock.patch(
             "sglang.srt.weight_sync.disk_checkpoint.materialize",
@@ -402,12 +419,12 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         checkpoint_source_dir="/published",
         target_version=3,
     )
+    refresh_source.assert_called_once_with("/published", 3, "package.refresh")
     materialize.assert_called_once_with(
         local_checkpoint_dir="/canonical",
         base_checkpoint_dir="/base",
         checkpoint_source_dir="/published",
         target_version=3,
-        checkpoint_source_refresh_hook="package.refresh",
     )
     manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_called_once_with(
         checkpoint_dir="/canonical",

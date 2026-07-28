@@ -347,7 +347,10 @@ class WeightUpdater:
                     host_cpu_group=host_cpu_group,
                     canonical_checkpoint_storage=(
                         "disk"
-                        if runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
+                        if (
+                            runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
+                            is not None
+                        )
                         else "memory"
                     ),
                 )

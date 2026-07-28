@@ -18,13 +18,13 @@ from __future__ import annotations
 import copy
 import functools
 import gc
+import hashlib
 import json
 import logging
 import math
 import os
 import time
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -43,6 +43,7 @@ from sglang.srt.weight_sync.host_shared_memory import HostSharedMemoryBuffer
 logger = logging.getLogger(__name__)
 
 _POSITIONAL_IO_CHUNK_BYTES = 64 << 20
+_SHARED_TENSOR_ALIGNMENT = 64
 
 
 def _safetensors_dtypes() -> dict[str, torch.dtype]:
@@ -96,6 +97,126 @@ class _SafetensorsLayout:
     tensors: dict[str, _SafetensorsEntry]
 
 
+def _parse_safetensors_layout(
+    *,
+    header_nbytes: int,
+    header_bytes: bytes,
+    file_nbytes: int,
+) -> _SafetensorsLayout:
+    data_offset = 8 + header_nbytes
+    if (
+        header_nbytes <= 0
+        or len(header_bytes) != header_nbytes
+        or data_offset > file_nbytes
+    ):
+        raise ValueError(
+            "invalid safetensors header length: "
+            f"header={header_nbytes} file={file_nbytes}"
+        )
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid safetensors JSON header") from exc
+    if not isinstance(header, dict):
+        raise ValueError("safetensors header is not an object")
+    header.pop("__metadata__", None)
+    tensors = {}
+    for name, metadata in header.items():
+        if not isinstance(name, str) or not isinstance(metadata, dict):
+            raise ValueError("invalid safetensors tensor metadata")
+        dtype_code = metadata.get("dtype")
+        dtype = _SAFETENSORS_DTYPES.get(dtype_code)
+        if dtype is None:
+            raise TypeError(f"unsupported safetensors dtype {dtype_code!r}")
+        shape = metadata.get("shape")
+        offsets = metadata.get("data_offsets")
+        if (
+            not isinstance(shape, list)
+            or not all(isinstance(value, int) and value >= 0 for value in shape)
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(value, int) for value in offsets)
+        ):
+            raise ValueError(f"invalid safetensors metadata for {name!r}")
+        relative_begin, relative_end = offsets
+        begin = data_offset + relative_begin
+        end = data_offset + relative_end
+        if relative_begin < 0 or begin > end or end > file_nbytes:
+            raise ValueError(
+                f"safetensors offsets are out of bounds for {name!r}: {offsets}"
+            )
+        shape_tuple = tuple(shape)
+        if dtype_code == "F4":
+            if not shape_tuple or shape_tuple[-1] % 2:
+                raise ValueError(
+                    f"F4 tensor {name!r} must have an even final dimension"
+                )
+            tensor_shape = shape_tuple[:-1] + (shape_tuple[-1] // 2,)
+        else:
+            tensor_shape = shape_tuple
+        expected_bytes = (
+            math.prod(tensor_shape) * torch.empty((), dtype=dtype).element_size()
+        )
+        actual_bytes = relative_end - relative_begin
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"tensor byte size mismatch for {name!r}: "
+                f"expected={expected_bytes} actual={actual_bytes}"
+            )
+        tensors[name] = _SafetensorsEntry(
+            dtype=dtype,
+            dtype_code=dtype_code,
+            shape=tensor_shape,
+            relative_begin=relative_begin,
+            relative_end=relative_end,
+        )
+    cursor = 0
+    for name, entry in sorted(
+        tensors.items(),
+        key=lambda item: (
+            item[1].relative_begin,
+            item[1].relative_end,
+            item[0],
+        ),
+    ):
+        if entry.relative_begin != cursor:
+            relation = (
+                "overlaps another tensor"
+                if entry.relative_begin < cursor
+                else "leaves a gap"
+            )
+            raise ValueError(
+                f"safetensors range for {name!r} {relation}: "
+                f"expected_begin={cursor} actual_begin={entry.relative_begin}"
+            )
+        cursor = entry.relative_end
+    data_nbytes = file_nbytes - data_offset
+    if cursor != data_nbytes:
+        raise ValueError(
+            "safetensors tensor ranges do not cover the data buffer: "
+            f"covered={cursor} data={data_nbytes}"
+        )
+    return _SafetensorsLayout(
+        data_offset=data_offset,
+        file_nbytes=file_nbytes,
+        tensors=tensors,
+    )
+
+
+def _read_safetensors_layout(path: Path) -> _SafetensorsLayout:
+    with path.open("rb") as file:
+        prefix = file.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"safetensors source is shorter than its header: {path}")
+        header_nbytes = int.from_bytes(prefix, "little")
+        header_bytes = file.read(header_nbytes)
+    return _parse_safetensors_layout(
+        header_nbytes=header_nbytes,
+        header_bytes=header_bytes,
+        file_nbytes=path.stat().st_size,
+    )
+
+
 class _InMemorySafetensorsFile:
     """Expose safetensors views from one bounded CPU or CUDA byte tensor.
 
@@ -143,98 +264,10 @@ class _InMemorySafetensorsFile:
         prefix = buffer[:8].numpy().tobytes()
         header_nbytes = int.from_bytes(prefix, "little")
         data_offset = 8 + header_nbytes
-        if header_nbytes <= 0 or data_offset > buffer.numel():
-            raise ValueError(
-                "invalid safetensors header length: "
-                f"header={header_nbytes} file={buffer.numel()}"
-            )
-        try:
-            header = json.loads(buffer[8:data_offset].numpy().tobytes().decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("invalid safetensors JSON header") from exc
-        if not isinstance(header, dict):
-            raise ValueError("safetensors header is not an object")
-        header.pop("__metadata__", None)
-        tensors = {}
-        for name, metadata in header.items():
-            if not isinstance(name, str) or not isinstance(metadata, dict):
-                raise ValueError("invalid safetensors tensor metadata")
-            dtype_code = metadata.get("dtype")
-            dtype = _SAFETENSORS_DTYPES.get(dtype_code)
-            if dtype is None:
-                raise TypeError(f"unsupported safetensors dtype {dtype_code!r}")
-            shape = metadata.get("shape")
-            offsets = metadata.get("data_offsets")
-            if (
-                not isinstance(shape, list)
-                or not all(isinstance(value, int) and value >= 0 for value in shape)
-                or not isinstance(offsets, list)
-                or len(offsets) != 2
-                or not all(isinstance(value, int) for value in offsets)
-            ):
-                raise ValueError(f"invalid safetensors metadata for {name!r}")
-            relative_begin, relative_end = offsets
-            begin = data_offset + relative_begin
-            end = data_offset + relative_end
-            if relative_begin < 0 or begin > end or end > buffer.numel():
-                raise ValueError(
-                    f"safetensors offsets are out of bounds for {name!r}: {offsets}"
-                )
-            shape_tuple = tuple(shape)
-            if dtype_code == "F4":
-                if not shape_tuple or shape_tuple[-1] % 2:
-                    raise ValueError(
-                        f"F4 tensor {name!r} must have an even final dimension"
-                    )
-                tensor_shape = shape_tuple[:-1] + (shape_tuple[-1] // 2,)
-            else:
-                tensor_shape = shape_tuple
-            expected_bytes = (
-                math.prod(tensor_shape) * torch.empty((), dtype=dtype).element_size()
-            )
-            actual_bytes = relative_end - relative_begin
-            if actual_bytes != expected_bytes:
-                raise ValueError(
-                    f"tensor byte size mismatch for {name!r}: "
-                    f"expected={expected_bytes} actual={actual_bytes}"
-                )
-            tensors[name] = _SafetensorsEntry(
-                dtype=dtype,
-                dtype_code=dtype_code,
-                shape=tensor_shape,
-                relative_begin=relative_begin,
-                relative_end=relative_end,
-            )
-        cursor = 0
-        for name, entry in sorted(
-            tensors.items(),
-            key=lambda item: (
-                item[1].relative_begin,
-                item[1].relative_end,
-                item[0],
-            ),
-        ):
-            if entry.relative_begin != cursor:
-                relation = (
-                    "overlaps another tensor"
-                    if entry.relative_begin < cursor
-                    else "leaves a gap"
-                )
-                raise ValueError(
-                    f"safetensors range for {name!r} {relation}: "
-                    f"expected_begin={cursor} actual_begin={entry.relative_begin}"
-                )
-            cursor = entry.relative_end
-        data_nbytes = buffer.numel() - data_offset
-        if cursor != data_nbytes:
-            raise ValueError(
-                "safetensors tensor ranges do not cover the data buffer: "
-                f"covered={cursor} data={data_nbytes}"
-            )
-        return _SafetensorsLayout(
-            data_offset=data_offset,
+        return _parse_safetensors_layout(
+            header_nbytes=header_nbytes,
+            header_bytes=buffer[8:data_offset].numpy().tobytes(),
             file_nbytes=buffer.numel(),
-            tensors=tensors,
         )
 
     def get_tensor(self, name: str) -> torch.Tensor:
@@ -276,6 +309,33 @@ def _pread_file_to_tensor(
             f"source buffer size mismatch for {path}: "
             f"buffer={target.numel()} file={path.stat().st_size}"
         )
+    return _pread_range_to_tensor(
+        path,
+        target,
+        file_offset=0,
+        drop_cache_after_read=drop_cache_after_read,
+    )
+
+
+def _pread_range_to_tensor(
+    path: Path,
+    target: torch.Tensor,
+    *,
+    file_offset: int,
+    drop_cache_after_read: bool = False,
+) -> float:
+    if (
+        target.device.type != "cpu"
+        or target.dtype != torch.uint8
+        or target.ndim != 1
+        or not target.is_contiguous()
+    ):
+        raise ValueError("positional read target must be contiguous CPU bytes")
+    if file_offset < 0 or file_offset + target.numel() > path.stat().st_size:
+        raise ValueError(
+            f"source range exceeds {path}: offset={file_offset} "
+            f"bytes={target.numel()} file={path.stat().st_size}"
+        )
     started = time.perf_counter()
     array = target.numpy()
     view = memoryview(array).cast("B")
@@ -284,30 +344,30 @@ def _pread_file_to_tensor(
     try:
         while offset < target.numel():
             end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, target.numel())
-            nread = os.preadv(fd, [view[offset:end]], offset)
+            nread = os.preadv(fd, [view[offset:end]], file_offset + offset)
             if nread <= 0:
                 raise EOFError(
                     f"unexpected EOF reading {path}: "
-                    f"offset={offset} size={target.numel()}"
+                    f"offset={file_offset + offset} size={target.numel()}"
                 )
             offset += nread
+        if drop_cache_after_read and hasattr(os, "posix_fadvise"):
+            try:
+                os.posix_fadvise(
+                    fd,
+                    file_offset,
+                    target.numel(),
+                    os.POSIX_FADV_DONTNEED,
+                )
+            except OSError:
+                # Cache eviction is a memory-pressure optimization. Some remote
+                # or virtual filesystems do not implement fadvise; correctness
+                # does not depend on it.
+                pass
     finally:
         os.close(fd)
         view.release()
-    wall_s = time.perf_counter() - started
-    if drop_cache_after_read and hasattr(os, "posix_fadvise"):
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
-        except OSError:
-            # Cache eviction is a memory-pressure optimization. Some remote or
-            # virtual filesystems do not implement fadvise; correctness does
-            # not depend on it.
-            pass
-    return wall_s
+    return time.perf_counter() - started
 
 
 class _HostSharedCheckpoint(HostSharedMemoryBuffer):
@@ -335,6 +395,268 @@ class _HostSharedCheckpoint(HostSharedMemoryBuffer):
             "physical_host_copies": 1,
             "setup_wall_s": round(self.setup_wall_s, 6),
         }
+
+
+@dataclass(frozen=True)
+class _DiskTensorSource:
+    filename: str
+    file_begin: int
+    file_end: int
+    entry: _SafetensorsEntry
+
+
+@dataclass(frozen=True)
+class _SharedTensorSource:
+    buffer_offset: int
+    entry: _SafetensorsEntry
+
+
+@dataclass(frozen=True)
+class _SharedCheckpointRead:
+    filename: str
+    file_offset: int
+    buffer_offset: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class _SharedCheckpointGroup:
+    path: str
+    tensors: dict[str, _SharedTensorSource]
+    reads: tuple[_SharedCheckpointRead, ...]
+    source_bytes: int
+    buffer_bytes: int
+
+
+class _SharedCheckpointGroupView:
+    """Expose one immutable checkpoint group from a reusable shared buffer."""
+
+    def __init__(
+        self,
+        buffer: HostSharedMemoryBuffer,
+        tensors: dict[str, _SharedTensorSource],
+    ):
+        self.buffer = buffer
+        self.tensors = tensors
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        source = self.tensors.get(name)
+        if source is None:
+            raise KeyError(f"shared checkpoint group has no tensor {name!r}")
+        entry = source.entry
+        nbytes = entry.relative_end - entry.relative_begin
+        try:
+            tensor = (
+                self.buffer.view(nbytes, offset=source.buffer_offset)
+                .view(entry.dtype)
+                .reshape(entry.shape)
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"cannot construct shared checkpoint view for {name!r}"
+            ) from exc
+        setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
+        return tensor
+
+
+def _align_shared_tensor_offset(value: int) -> int:
+    return (
+        (value + _SHARED_TENSOR_ALIGNMENT - 1)
+        // _SHARED_TENSOR_ALIGNMENT
+        * _SHARED_TENSOR_ALIGNMENT
+    )
+
+
+def _shared_checkpoint_groups(
+    *,
+    root: Path,
+    weight_map: dict[str, str],
+    names_by_group: dict[str, list[str]],
+) -> dict[str, _SharedCheckpointGroup]:
+    """Plan bounded, physically ordered reads for every runtime module group."""
+
+    layouts = {
+        filename: _read_safetensors_layout(root / filename)
+        for filename in sorted(set(weight_map.values()))
+    }
+    disk_tensors = {}
+    for name, filename in weight_map.items():
+        layout = layouts[filename]
+        try:
+            entry = layout.tensors[name]
+        except KeyError as exc:
+            raise ValueError(
+                f"checkpoint index maps {name!r} to {filename!r}, "
+                "but the tensor is absent from that file"
+            ) from exc
+        disk_tensors[name] = _DiskTensorSource(
+            filename=filename,
+            file_begin=layout.data_offset + entry.relative_begin,
+            file_end=layout.data_offset + entry.relative_end,
+            entry=entry,
+        )
+
+    result = {}
+    for group_path, names in names_by_group.items():
+        sources = []
+        for name in names:
+            try:
+                sources.append((name, disk_tensors[name]))
+            except KeyError as exc:
+                raise ValueError(
+                    f"runtime group {group_path!r} references unknown "
+                    f"checkpoint tensor {name!r}"
+                ) from exc
+        sources.sort(
+            key=lambda item: (
+                item[1].filename,
+                item[1].file_begin,
+                item[1].file_end,
+                item[0],
+            )
+        )
+
+        reads = []
+        tensors = {}
+        source_bytes = 0
+        buffer_bytes = 0
+        run = []
+
+        def finish_run() -> None:
+            nonlocal buffer_bytes
+            if not run:
+                return
+            buffer_bytes = _align_shared_tensor_offset(buffer_bytes)
+            first = run[0][1]
+            last = run[-1][1]
+            reads.append(
+                _SharedCheckpointRead(
+                    filename=first.filename,
+                    file_offset=first.file_begin,
+                    buffer_offset=buffer_bytes,
+                    nbytes=last.file_end - first.file_begin,
+                )
+            )
+            for name, source in run:
+                tensors[name] = _SharedTensorSource(
+                    buffer_offset=(buffer_bytes + source.file_begin - first.file_begin),
+                    entry=source.entry,
+                )
+            buffer_bytes += last.file_end - first.file_begin
+            run.clear()
+
+        for name, source in sources:
+            nbytes = source.file_end - source.file_begin
+            source_bytes += nbytes
+            if run:
+                previous = run[-1][1]
+                if (
+                    source.filename != previous.filename
+                    or source.file_begin != previous.file_end
+                ):
+                    finish_run()
+            run.append((name, source))
+        finish_run()
+        result[group_path] = _SharedCheckpointGroup(
+            path=group_path,
+            tensors=tensors,
+            reads=tuple(reads),
+            source_bytes=source_bytes,
+            buffer_bytes=buffer_bytes,
+        )
+    return result
+
+
+def _populate_shared_checkpoint_group(
+    *,
+    root: Path,
+    group: _SharedCheckpointGroup,
+    buffer: HostSharedMemoryBuffer,
+    cpu_group: Any,
+) -> dict[str, Any]:
+    """Read every source range exactly once across the local TP ranks."""
+
+    started = time.perf_counter()
+    distributed = torch.distributed.is_initialized()
+    world_size = torch.distributed.get_world_size(group=cpu_group) if distributed else 1
+    rank = torch.distributed.get_rank(group=cpu_group) if distributed else 0
+    owned_reads = []
+    for read_index, read in enumerate(group.reads):
+        if read_index % world_size != rank:
+            continue
+        target = buffer.view(
+            read.nbytes,
+            offset=read.buffer_offset,
+        )
+        try:
+            wall_s = _pread_range_to_tensor(
+                root / read.filename,
+                target,
+                file_offset=read.file_offset,
+            )
+        finally:
+            del target
+        owned_reads.append(
+            {
+                "filename": read.filename,
+                "file_offset": read.file_offset,
+                "bytes": read.nbytes,
+                "wall_s": round(wall_s, 6),
+            }
+        )
+    return {
+        "owner_rank": rank,
+        "owned_reads": owned_reads,
+        "owned_bytes": sum(read["bytes"] for read in owned_reads),
+        "wall_s": round(time.perf_counter() - started, 6),
+    }
+
+
+def _validate_shared_checkpoint_groups(
+    groups: dict[str, _SharedCheckpointGroup],
+    *,
+    cpu_group: Any,
+) -> None:
+    """Fail before shared allocation if local TP layouts disagree."""
+
+    if not torch.distributed.is_initialized():
+        return
+    digest = hashlib.sha256()
+    for path, group in groups.items():
+        digest.update(path.encode())
+        digest.update(b"\0")
+        digest.update(str(group.source_bytes).encode())
+        digest.update(b"\0")
+        digest.update(str(group.buffer_bytes).encode())
+        digest.update(b"\0")
+        for name, source in sorted(group.tensors.items()):
+            digest.update(name.encode())
+            digest.update(b"\0")
+            digest.update(source.entry.dtype_code.encode())
+            digest.update(b"\0")
+            digest.update(str(source.entry.shape).encode())
+            digest.update(b"\0")
+            digest.update(str(source.buffer_offset).encode())
+            digest.update(b"\0")
+        for read in group.reads:
+            digest.update(read.filename.encode())
+            digest.update(b"\0")
+            digest.update(
+                f"{read.file_offset}:{read.buffer_offset}:{read.nbytes}".encode()
+            )
+            digest.update(b"\0")
+    signature = digest.hexdigest()
+    signatures = [None] * torch.distributed.get_world_size(group=cpu_group)
+    torch.distributed.all_gather_object(
+        signatures,
+        signature,
+        group=cpu_group,
+    )
+    if len(set(signatures)) != 1:
+        raise RuntimeError(
+            "disk-backed CPU weight compilation requires identical checkpoint "
+            f"groups on every local TP rank: {signatures}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1856,43 +2178,81 @@ class CPUWeightCache:
         weight_map: dict[str, str],
         names_by_group: dict[str, list[str]],
     ):
-        """Compile directly from a verified canonical checkpoint on local disk."""
+        """Compile bounded groups after reading each canonical byte once per host."""
 
-        filenames = sorted(set(weight_map.values()))
-        stack = ExitStack()
+        groups = _shared_checkpoint_groups(
+            root=root,
+            weight_map=weight_map,
+            names_by_group=names_by_group,
+        )
+        _validate_shared_checkpoint_groups(
+            groups,
+            cpu_group=self.host_cpu_group,
+        )
+        capacity = max(
+            (group.buffer_bytes for group in groups.values()),
+            default=0,
+        )
+        shared_buffer = HostSharedMemoryBuffer(
+            nbytes=max(1, capacity),
+            cpu_group=self.host_cpu_group,
+            name="weight-checkpoint-group",
+        )
         try:
-            handles = {
-                filename: stack.enter_context(
-                    safe_open(root / filename, framework="pt", device="cpu")
-                )
-                for filename in filenames
-            }
-
-            def get_tensor(name: str) -> torch.Tensor:
-                tensor = handles[weight_map[name]].get_tensor(name)
-                setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
-                return tensor
-
             for group_index, group in enumerate(self.groups, start=1):
-                loaded = self._load_group_into_cpu_image(
-                    group_index=group_index,
-                    group=group,
-                    names=names_by_group[group.path],
-                    get_tensor=get_tensor,
+                source = groups[group.path]
+
+                read_started = time.perf_counter()
+                self._run_on_all_host_ranks(
+                    f"canonical checkpoint read for group {group.path!r}",
+                    lambda: _populate_shared_checkpoint_group(
+                        root=root,
+                        group=source,
+                        buffer=shared_buffer,
+                        cpu_group=self.host_cpu_group,
+                    ),
                 )
-                result = self._finalize_cpu_image_group(loaded)
-                del loaded
+                read_wall_s = time.perf_counter() - read_started
+                tensor_file = _SharedCheckpointGroupView(
+                    shared_buffer,
+                    source.tensors,
+                )
+
+                def compile_group():
+                    loaded = self._load_group_into_cpu_image(
+                        group_index=group_index,
+                        group=group,
+                        names=names_by_group[group.path],
+                        get_tensor=tensor_file.get_tensor,
+                    )
+                    try:
+                        return self._finalize_cpu_image_group(loaded)
+                    finally:
+                        del loaded
+
+                result = self._run_on_all_host_ranks(
+                    f"runtime compilation for group {group.path!r}",
+                    compile_group,
+                )
+                stats = result[2]
+                stats["canonical_read_s"] = round(read_wall_s, 6)
+                stats["canonical_read_bytes"] = source.source_bytes
+                stats["canonical_read_runs"] = len(source.reads)
+                stats["canonical_buffer_bytes"] = source.buffer_bytes
+                stats["wall_s"] = round(stats["wall_s"] + read_wall_s, 6)
                 yield result
         finally:
             logger.info(
-                "Releasing canonical checkpoint mappings: files=%d",
-                len(filenames),
+                "Releasing shared canonical checkpoint group buffer: bytes=%d",
+                shared_buffer.nbytes,
             )
             started = time.perf_counter()
-            stack.close()
+            gc.collect()
+            shared_buffer.close()
             logger.info(
-                "Released canonical checkpoint mappings: files=%d wall_time=%.3fs",
-                len(filenames),
+                "Released shared canonical checkpoint group buffer: "
+                "bytes=%d wall_time=%.3fs",
+                shared_buffer.nbytes,
                 time.perf_counter() - started,
             )
 
@@ -2026,6 +2386,7 @@ class CPUWeightCache:
                 6,
             )
             for phase in (
+                "canonical_read_s",
                 "cpu_clone_s",
                 "restore_s",
                 "cpu_load_s",
@@ -2078,6 +2439,8 @@ class CPUWeightCache:
                 "synchronization_wall_s": transform_stats["verify_barrier_s"],
             }
         else:
+            canonical_read_s = sum(value["canonical_read_s"] for value in group_stats)
+            cpu_load_s = sum(value["cpu_load_s"] for value in group_stats)
             source_summary = {
                 "storage": "disk",
                 "checkpoint_bytes": sum(
@@ -2085,10 +2448,16 @@ class CPUWeightCache:
                     for filename in set(weight_map.values())
                 ),
                 "loaded_from_disk": True,
-                "load_wall_s": round(
-                    sum(value["cpu_load_s"] for value in group_stats),
-                    6,
+                "physical_host_read_bytes": sum(
+                    value["canonical_read_bytes"] for value in group_stats
                 ),
+                "shared_buffer_bytes": max(
+                    value["canonical_buffer_bytes"] for value in group_stats
+                ),
+                "read_runs": sum(value["canonical_read_runs"] for value in group_stats),
+                "read_wall_s": round(canonical_read_s, 6),
+                "cpu_load_wall_s": round(cpu_load_s, 6),
+                "load_wall_s": round(canonical_read_s + cpu_load_s, 6),
                 "transform_wall_s": 0.0,
                 "synchronization_wall_s": 0.0,
             }

@@ -259,6 +259,46 @@ class SchedulerWeightUpdaterManager:
         messages = sorted({value for value in messages if value is not None})
         return "; ".join(messages) if messages else None
 
+    def _refresh_checkpoint_source(
+        self,
+        checkpoint_source_dir: str,
+        target_version: int,
+        checkpoint_source_refresh_hook: str | None,
+    ) -> float:
+        from sglang.srt.weight_sync import disk_checkpoint
+
+        started = time.perf_counter()
+        error = None
+        host_rank = (
+            torch.distributed.get_rank(group=self.host_cpu_group)
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        if host_rank == 0 and checkpoint_source_refresh_hook:
+            try:
+                disk_checkpoint.refresh_checkpoint_source(
+                    checkpoint_source_dir,
+                    target_version,
+                    checkpoint_source_refresh_hook,
+                )
+            except Exception:
+                error = traceback.format_exc()
+        if torch.distributed.is_initialized():
+            errors = [None] * torch.distributed.get_world_size(
+                group=self.host_cpu_group
+            )
+            torch.distributed.all_gather_object(
+                errors,
+                error,
+                group=self.host_cpu_group,
+            )
+        else:
+            errors = [error]
+        errors = [value for value in errors if value is not None]
+        if errors:
+            raise RuntimeError("checkpoint source refresh failed: " + "; ".join(errors))
+        return round(time.perf_counter() - started, 6)
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         if message := self._pending_weight_update_stage_message():
@@ -359,6 +399,11 @@ class SchedulerWeightUpdaterManager:
                             f"{self._cpu_weight_cache_base_checkpoint_dir!r}."
                         )
                     assert recv_req.checkpoint_source_dir is not None
+                    source_refresh_wall_s = self._refresh_checkpoint_source(
+                        recv_req.checkpoint_source_dir,
+                        recv_req.target_version,
+                        server_args.checkpoint_source_refresh_hook,
+                    )
                     if canonical_checkpoint_dir is not None:
                         from sglang.srt.weight_sync.cpu_delta_checkpoint import (
                             validate_delta_target,
@@ -373,9 +418,6 @@ class SchedulerWeightUpdaterManager:
                             base_checkpoint_dir=base_checkpoint_dir,
                             checkpoint_source_dir=recv_req.checkpoint_source_dir,
                             target_version=recv_req.target_version,
-                            checkpoint_source_refresh_hook=(
-                                server_args.checkpoint_source_refresh_hook
-                            ),
                         )
                         success, message, stage_stats = (
                             self.tp_worker.stage_cpu_weight_update_from_checkpoint(
@@ -390,48 +432,6 @@ class SchedulerWeightUpdaterManager:
                             materialization
                         )
                     else:
-                        refresh_started = time.perf_counter()
-                        refresh_error = None
-                        host_rank = (
-                            torch.distributed.get_rank(group=self.host_cpu_group)
-                            if torch.distributed.is_initialized()
-                            else 0
-                        )
-                        if (
-                            host_rank == 0
-                            and server_args.checkpoint_source_refresh_hook
-                        ):
-                            try:
-                                disk_checkpoint.refresh_checkpoint_source(
-                                    recv_req.checkpoint_source_dir,
-                                    recv_req.target_version,
-                                    server_args.checkpoint_source_refresh_hook,
-                                )
-                            except Exception:
-                                refresh_error = traceback.format_exc()
-                        if torch.distributed.is_initialized():
-                            refresh_errors = [None] * torch.distributed.get_world_size(
-                                group=self.host_cpu_group
-                            )
-                            torch.distributed.all_gather_object(
-                                refresh_errors,
-                                refresh_error,
-                                group=self.host_cpu_group,
-                            )
-                        else:
-                            refresh_errors = [refresh_error]
-                        refresh_errors = [
-                            value for value in refresh_errors if value is not None
-                        ]
-                        if refresh_errors:
-                            raise RuntimeError(
-                                "checkpoint source refresh failed: "
-                                + "; ".join(refresh_errors)
-                            )
-                        source_refresh_wall_s = round(
-                            time.perf_counter() - refresh_started,
-                            6,
-                        )
                         success, message, stage_stats = (
                             self.tp_worker.stage_cpu_weight_update_from_delta_lineage(
                                 base_checkpoint_dir=base_checkpoint_dir,
@@ -442,7 +442,7 @@ class SchedulerWeightUpdaterManager:
                         )
                         if not success:
                             raise RuntimeError(message)
-                        stage_stats["source_refresh_wall_s"] = source_refresh_wall_s
+                    stage_stats["source_refresh_wall_s"] = source_refresh_wall_s
                     local_stats["stage"] = stage_stats
             else:
                 if recv_req.local_checkpoint_dir is None:

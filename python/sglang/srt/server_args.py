@@ -3099,7 +3099,7 @@ class ServerArgs:
     ] = None
     enable_cpu_weight_cache: A[
         bool,
-        "Allow /stage_weight_update with destination=cpu to cache one host-shared canonical checkpoint per model replica and one rank-ready CPU weight image per local target-model worker for background delta weight staging. Speculative draft-model weights are not updated.",
+        "Allow /stage_weight_update with destination=cpu to retain one canonical checkpoint per model replica and one rank-ready CPU weight image per local target-model worker for background delta weight staging. The canonical checkpoint uses host-shared memory by default or --cpu-weight-cache-canonical-checkpoint-dir when configured. Speculative draft-model weights are not updated.",
     ] = False
     cpu_weight_cache_max_compile_group_gb: A[
         float,

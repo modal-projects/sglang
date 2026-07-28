@@ -344,7 +344,9 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint(drop_cache):
 
     assert result.success
     assert (
-        result.rank_stats[0]["canonical_checkpoint_materialization"]["operation"]
+        result.rank_stats[0]["stage"]["canonical_checkpoint_materialization"][
+            "operation"
+        ]
         == "materialize"
     )
     materialize.assert_called_once_with(

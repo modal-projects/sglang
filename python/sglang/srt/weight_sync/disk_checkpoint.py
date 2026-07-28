@@ -364,6 +364,15 @@ def _drop_page_cache(path: str) -> None:
         pass
 
 
+def drop_checkpoint_page_cache(checkpoint_dir: str) -> int:
+    """Release clean safetensors pages after a checkpoint consumer is done."""
+
+    paths = glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))
+    for path in paths:
+        _drop_page_cache(path)
+    return len(paths)
+
+
 def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
     """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
     (files the new checkpoint doesn't have — e.g. differently-sharded old ones —

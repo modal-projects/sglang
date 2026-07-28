@@ -6665,6 +6665,10 @@ class ServerArgs:
                 "--cpu-weight-cache-canonical-checkpoint-dir requires "
                 "--enable-cpu-weight-cache"
             )
+        if self.cpu_weight_cache_canonical_checkpoint_dir == "":
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir must not be empty"
+            )
         if not self.enable_cpu_weight_cache:
             return
         if self.cpu_weight_cache_max_compile_group_gb <= 0:

@@ -84,6 +84,15 @@ def test_cpu_weight_cache_canonical_checkpoint_dir_requires_cache():
         args._validate_cpu_weight_cache_compatibility()
 
 
+def test_cpu_weight_cache_canonical_checkpoint_dir_must_not_be_empty():
+    args = ServerArgs(model_path="dummy")
+    args.enable_cpu_weight_cache = True
+    args.cpu_weight_cache_canonical_checkpoint_dir = ""
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        args._validate_cpu_weight_cache_compatibility()
+
+
 @pytest.mark.parametrize(
     ("method_name", "worker_method"),
     [
@@ -308,6 +317,7 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
         model_path="/base",
         checkpoint_source_refresh_hook=None,
         cpu_weight_cache_canonical_checkpoint_dir="/canonical",
+        weight_loader_drop_cache_after_load=True,
     )
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {
         "operation": "initialize_cpu_weight_cache"
@@ -320,10 +330,15 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
         target_version=0,
     )
 
-    with mock.patch(
-        "sglang.srt.weight_sync.disk_checkpoint.materialize",
-        return_value={"operation": "materialize"},
-    ) as materialize:
+    with (
+        mock.patch(
+            "sglang.srt.weight_sync.disk_checkpoint.materialize",
+            return_value={"operation": "materialize"},
+        ) as materialize,
+        mock.patch(
+            "sglang.srt.weight_sync.disk_checkpoint.drop_checkpoint_page_cache"
+        ) as drop_page_cache,
+    ):
         result = manager._stage_weight_update_sync(request)
 
     assert result.success
@@ -341,6 +356,7 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
         manager.host_cpu_group,
         base_checkpoint_dir="/base",
     )
+    drop_page_cache.assert_called_once_with("/canonical")
 
 
 def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint():
@@ -350,6 +366,7 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         model_path="/base",
         checkpoint_source_refresh_hook="package.refresh",
         cpu_weight_cache_canonical_checkpoint_dir="/canonical",
+        weight_loader_drop_cache_after_load=True,
     )
     manager._cpu_weight_cache_base_checkpoint_dir = "/base"
     manager._cpu_weight_cache_initialization_stats = {}
@@ -374,6 +391,9 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
             "sglang.srt.weight_sync.disk_checkpoint.materialize",
             return_value={"operation": "materialize", "target_version": 3},
         ) as materialize,
+        mock.patch(
+            "sglang.srt.weight_sync.disk_checkpoint.drop_checkpoint_page_cache"
+        ) as drop_page_cache,
     ):
         result = manager._stage_weight_update_sync(request)
 
@@ -395,6 +415,7 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         host_cpu_group=manager.host_cpu_group,
     )
     manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
+    drop_page_cache.assert_called_once_with("/canonical")
     assert (
         result.rank_stats[0]["stage"]["canonical_checkpoint_materialization"][
             "target_version"

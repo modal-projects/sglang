@@ -482,6 +482,24 @@ class SchedulerWeightUpdaterManager:
             success = all(ok for ok, _, _ in results)
             message = "; ".join(msg for ok, msg, _ in results if not ok) or message
             rank_stats = [stats for _, _, stats in results]
+        canonical_checkpoint_dir = (
+            server_args.cpu_weight_cache_canonical_checkpoint_dir
+            if recv_req.destination == "cpu"
+            else None
+        )
+        if (
+            canonical_checkpoint_dir is not None
+            and server_args.weight_loader_drop_cache_after_load
+        ):
+            host_rank = (
+                torch.distributed.get_rank(group=self.host_cpu_group)
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if host_rank == 0:
+                disk_checkpoint.drop_checkpoint_page_cache(canonical_checkpoint_dir)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier(group=self.host_cpu_group)
         if recv_req.destination == "cpu" and recv_req.target_version == 0:
             if not success:
                 failed_before_stage = (

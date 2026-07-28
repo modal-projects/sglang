@@ -1859,41 +1859,29 @@ class CPUWeightCache:
         """Compile directly from a verified canonical checkpoint on local disk."""
 
         filenames = sorted(set(weight_map.values()))
-        try:
-            with ExitStack() as stack:
-                handles = {
-                    filename: stack.enter_context(
-                        safe_open(root / filename, framework="pt", device="cpu")
-                    )
-                    for filename in filenames
-                }
+        with ExitStack() as stack:
+            handles = {
+                filename: stack.enter_context(
+                    safe_open(root / filename, framework="pt", device="cpu")
+                )
+                for filename in filenames
+            }
 
-                def get_tensor(name: str) -> torch.Tensor:
-                    tensor = handles[weight_map[name]].get_tensor(name)
-                    setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
-                    return tensor
+            def get_tensor(name: str) -> torch.Tensor:
+                tensor = handles[weight_map[name]].get_tensor(name)
+                setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
+                return tensor
 
-                for group_index, group in enumerate(self.groups, start=1):
-                    loaded = self._load_group_into_cpu_image(
-                        group_index=group_index,
-                        group=group,
-                        names=names_by_group[group.path],
-                        get_tensor=get_tensor,
-                    )
-                    result = self._finalize_cpu_image_group(loaded)
-                    del loaded
-                    yield result
-        finally:
-            if hasattr(os, "posix_fadvise"):
-                for filename in filenames:
-                    try:
-                        fd = os.open(root / filename, os.O_RDONLY)
-                        try:
-                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        finally:
-                            os.close(fd)
-                    except OSError:
-                        pass
+            for group_index, group in enumerate(self.groups, start=1):
+                loaded = self._load_group_into_cpu_image(
+                    group_index=group_index,
+                    group=group,
+                    names=names_by_group[group.path],
+                    get_tensor=get_tensor,
+                )
+                result = self._finalize_cpu_image_group(loaded)
+                del loaded
+                yield result
 
     def _stage_from_checkpoint(
         self,

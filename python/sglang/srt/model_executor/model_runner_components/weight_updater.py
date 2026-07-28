@@ -271,16 +271,13 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
-    @torch.no_grad()
-    def stage_cpu_weight_update(
+    def _stage_cpu_weight_update(
         self,
         *,
-        base_checkpoint_dir: str,
-        checkpoint_source_dir: str,
         target_version: int,
         host_cpu_group,
+        stage: Callable[[Any], dict[str, Any]],
     ):
-        """Build a complete rank-ready CPU image from a delta lineage."""
         try:
             if self.device != "cuda":
                 raise RuntimeError(
@@ -299,11 +296,7 @@ class WeightUpdater:
                     "host CPU process group cannot change after cache initialization"
                 )
             with torch.cuda.device(self.gpu_id):
-                stats = cache.stage_from_delta_lineage(
-                    base_checkpoint_dir=base_checkpoint_dir,
-                    checkpoint_source_dir=checkpoint_source_dir,
-                    target_version=target_version,
-                )
+                stats = stage(cache)
             logger.info(
                 "Staged CPU weights for version %d: bytes=%d groups=%d "
                 "wall_time=%.3fs",
@@ -323,6 +316,44 @@ class WeightUpdater:
                 f"Failed to stage CPU weights: {type(exc).__name__}: {exc}",
                 None,
             )
+
+    @torch.no_grad()
+    def stage_cpu_weight_update_from_delta_lineage(
+        self,
+        *,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        """Build a complete rank-ready CPU image from a delta lineage."""
+        return self._stage_cpu_weight_update(
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+            stage=lambda cache: cache.stage_from_delta_lineage(
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+            ),
+        )
+
+    @torch.no_grad()
+    def stage_cpu_weight_update_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        """Build a complete rank-ready CPU image from a local checkpoint."""
+        return self._stage_cpu_weight_update(
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+            stage=lambda cache: cache.stage_from_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                target_version=target_version,
+            ),
+        )
 
     def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
         """Construct and populate the CPU weight cache."""
@@ -353,6 +384,11 @@ class WeightUpdater:
                     self.get_model(),
                     max_group_bytes=max_group_bytes,
                     host_cpu_group=host_cpu_group,
+                    canonical_checkpoint_storage=(
+                        "disk"
+                        if runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
+                        else "memory"
+                    ),
                 )
             except Exception as exc:
                 construction_error = f"{type(exc).__name__}: {exc}"
@@ -382,8 +418,12 @@ class WeightUpdater:
                 )
             construction_wall_s = time.perf_counter() - started
             try:
+                checkpoint_dir = (
+                    runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
+                    or base_checkpoint_dir
+                )
                 stats = cache.initialize_from_checkpoint(
-                    base_checkpoint_dir=base_checkpoint_dir,
+                    base_checkpoint_dir=checkpoint_dir,
                 )
             except Exception:
                 cache.close("CPU weight cache initialization failed")

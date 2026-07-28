@@ -851,6 +851,39 @@ class TestCPUWeightCache(unittest.TestCase):
                 if source is not None:
                     source.close()
 
+    def test_disk_checkpoint_compilation_reads_mapped_safetensors(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            save_file({"weight": expected}, root / "model.safetensors")
+            compiler = object.__new__(CPUWeightCache)
+            group = _WeightModuleGroup(path="model", nbytes=expected.nbytes)
+            compiler.groups = [group]
+            loaded_group = object()
+
+            def load_group(*, group_index, group, names, get_tensor):
+                self.assertEqual(group_index, 1)
+                self.assertEqual(names, ["weight"])
+                tensor = get_tensor("weight")
+                self.assertTrue(torch.equal(tensor, expected))
+                self.assertTrue(getattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False))
+                return loaded_group
+
+            compiler._load_group_into_cpu_image = mock.Mock(side_effect=load_group)
+            compiled = ({1}, expected.nbytes, {"wall_s": 0.1})
+            compiler._finalize_cpu_image_group = mock.Mock(return_value=compiled)
+
+            results = list(
+                compiler._compile_disk_checkpoint(
+                    root=root,
+                    weight_map={"weight": "model.safetensors"},
+                    names_by_group={"model": ["weight"]},
+                )
+            )
+
+            self.assertEqual(results, [compiled])
+            compiler._finalize_cpu_image_group.assert_called_once_with(loaded_group)
+
     def test_canonical_transform_finishes_before_runtime_compilation(self):
         class RecordingTransform:
             def __init__(self):

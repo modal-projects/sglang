@@ -28,6 +28,7 @@ def _manager():
     manager.tp_worker.model_runner.cpu_weight_cache = None
     manager.tp_worker.model_runner.server_args = SimpleNamespace(
         enable_cpu_weight_cache=False,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     return manager
 
@@ -73,6 +74,14 @@ def test_cpu_weight_cache_supports_speculative_decoding():
     args.speculative_algorithm = "EAGLE"
 
     args._validate_cpu_weight_cache_compatibility()
+
+
+def test_cpu_weight_cache_canonical_checkpoint_dir_requires_cache():
+    args = ServerArgs(model_path="dummy")
+    args.cpu_weight_cache_canonical_checkpoint_dir = "/local-checkpoint"
+
+    with pytest.raises(ValueError, match="requires --enable-cpu-weight-cache"):
+        args._validate_cpu_weight_cache_compatibility()
 
 
 @pytest.mark.parametrize(
@@ -234,6 +243,7 @@ def test_disk_staging_defaults_to_immutable_boot_model():
         enable_cpu_weight_cache=False,
         model_path="/latest/local/checkpoint",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     request = SimpleNamespace(
         base_checkpoint_dir=None,
@@ -265,6 +275,7 @@ def test_cpu_base_uses_cache_initialization():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {
         "operation": "initialize_cpu_weight_cache"
@@ -290,12 +301,115 @@ def test_cpu_base_uses_cache_initialization():
     )
 
 
+def test_cpu_base_materializes_disk_backed_canonical_checkpoint():
+    manager = _manager()
+    manager.tp_worker.model_runner.server_args = SimpleNamespace(
+        enable_cpu_weight_cache=True,
+        model_path="/base",
+        checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir="/canonical",
+    )
+    manager.tp_worker.initialize_cpu_weight_cache.return_value = {
+        "operation": "initialize_cpu_weight_cache"
+    }
+    request = SimpleNamespace(
+        base_checkpoint_dir=None,
+        destination="cpu",
+        local_checkpoint_dir=None,
+        checkpoint_source_dir=None,
+        target_version=0,
+    )
+
+    with mock.patch(
+        "sglang.srt.weight_sync.disk_checkpoint.materialize",
+        return_value={"operation": "materialize"},
+    ) as materialize:
+        result = manager._stage_weight_update_sync(request)
+
+    assert result.success
+    assert (
+        result.rank_stats[0]["canonical_checkpoint_materialization"]["operation"]
+        == "materialize"
+    )
+    materialize.assert_called_once_with(
+        local_checkpoint_dir="/canonical",
+        base_checkpoint_dir="/base",
+        checkpoint_source_dir="/base",
+        target_version=0,
+    )
+    manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
+        manager.host_cpu_group,
+        base_checkpoint_dir="/base",
+    )
+
+
+def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint():
+    manager = _manager()
+    manager.tp_worker.model_runner.server_args = SimpleNamespace(
+        enable_cpu_weight_cache=True,
+        model_path="/base",
+        checkpoint_source_refresh_hook="package.refresh",
+        cpu_weight_cache_canonical_checkpoint_dir="/canonical",
+    )
+    manager._cpu_weight_cache_base_checkpoint_dir = "/base"
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.return_value = (
+        True,
+        "staged",
+        {},
+    )
+    request = SimpleNamespace(
+        base_checkpoint_dir=None,
+        destination="cpu",
+        local_checkpoint_dir=None,
+        checkpoint_source_dir="/published",
+        target_version=3,
+    )
+
+    with (
+        mock.patch(
+            "sglang.srt.weight_sync.cpu_delta_checkpoint.validate_delta_target"
+        ) as validate,
+        mock.patch(
+            "sglang.srt.weight_sync.disk_checkpoint.materialize",
+            return_value={"operation": "materialize", "target_version": 3},
+        ) as materialize,
+    ):
+        result = manager._stage_weight_update_sync(request)
+
+    assert result.success
+    validate.assert_called_once_with(
+        checkpoint_source_dir="/published",
+        target_version=3,
+    )
+    materialize.assert_called_once_with(
+        local_checkpoint_dir="/canonical",
+        base_checkpoint_dir="/base",
+        checkpoint_source_dir="/published",
+        target_version=3,
+        checkpoint_source_refresh_hook="package.refresh",
+    )
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_called_once_with(
+        checkpoint_dir="/canonical",
+        target_version=3,
+        host_cpu_group=manager.host_cpu_group,
+    )
+    manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
+    assert (
+        result.rank_stats[0]["stage"]["canonical_checkpoint_materialization"][
+            "target_version"
+        ]
+        == 3
+    )
+
+
 def test_cpu_weight_cache_initialization_runs_in_background():
     manager = _manager()
     manager.tp_worker.model_runner.server_args = SimpleNamespace(
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     started = threading.Event()
     release = threading.Event()
@@ -337,6 +451,7 @@ def test_cpu_weight_cache_initialization_can_retry_after_cleanup():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager.tp_worker.initialize_cpu_weight_cache.side_effect = [
         RuntimeError("broken"),
@@ -382,6 +497,7 @@ def test_cpu_weight_cache_rejects_a_different_checkpoint():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {}
 
@@ -416,6 +532,7 @@ def test_cpu_weight_cache_initialization_failure_is_collective_and_retryable():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {"rank": 0}
 
@@ -481,6 +598,7 @@ def test_cpu_commit_rejects_initializing_cache():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     release = threading.Event()
 
@@ -561,9 +679,10 @@ def test_cpu_staging_failure_invalidates_every_rank():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager._cpu_weight_cache_initialization_stats = {}
-    manager.tp_worker.stage_cpu_weight_update.return_value = (
+    manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.return_value = (
         True,
         "staged",
         {},
@@ -620,6 +739,7 @@ def test_cpu_staging_requires_initialized_cache():
         enable_cpu_weight_cache=True,
         model_path="/base",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     request = SimpleNamespace(
         base_checkpoint_dir="/base",
@@ -633,7 +753,7 @@ def test_cpu_staging_requires_initialized_cache():
 
     assert not result.success
     assert "is not initialized" in result.message
-    manager.tp_worker.stage_cpu_weight_update.assert_not_called()
+    manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
     manager.tp_worker.invalidate_staged_cpu_weight_update.assert_called_once()
 
 
@@ -643,6 +763,7 @@ def test_cpu_staging_requires_initialized_base_checkpoint():
         enable_cpu_weight_cache=True,
         model_path="/boot",
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
     )
     manager._cpu_weight_cache_base_checkpoint_dir = "/local/base"
     manager._cpu_weight_cache_initialization_stats = {}
@@ -658,7 +779,7 @@ def test_cpu_staging_requires_initialized_base_checkpoint():
 
     assert not result.success
     assert "does not match the initialized cache" in result.message
-    manager.tp_worker.stage_cpu_weight_update.assert_not_called()
+    manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
     manager.tp_worker.invalidate_staged_cpu_weight_update.assert_called_once()
 
 

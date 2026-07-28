@@ -3105,6 +3105,10 @@ class ServerArgs:
         float,
         "Target upper bound, in GiB, for each module group compiled while staging a CPU weight update. Indivisible modules may exceed it.",
     ] = 8.0
+    cpu_weight_cache_canonical_checkpoint_dir: A[
+        Optional[str],
+        "Writable host-local directory for the CPU weight cache's canonical checkpoint. When unset, the canonical checkpoint remains in host-shared memory. Set this to local NVMe to retain only rank-ready images in RAM; preparation then materializes and reads the verified canonical checkpoint on disk.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
@@ -6657,6 +6661,14 @@ class ServerArgs:
             assert self._resolved().ep_size > 1
 
     def _validate_cpu_weight_cache_compatibility(self):
+        if (
+            self.cpu_weight_cache_canonical_checkpoint_dir is not None
+            and not self.enable_cpu_weight_cache
+        ):
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir requires "
+                "--enable-cpu-weight-cache"
+            )
         if not self.enable_cpu_weight_cache:
             return
         if self.cpu_weight_cache_max_compile_group_gb <= 0:

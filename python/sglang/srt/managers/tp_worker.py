@@ -114,7 +114,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def stage_cpu_weight_update(
+    def stage_cpu_weight_update_from_delta_lineage(
         self,
         *,
         base_checkpoint_dir: str,
@@ -122,9 +122,24 @@ class BaseTpWorker(ABC):
         target_version: int,
         host_cpu_group,
     ):
-        return self.model_runner.weight_updater.stage_cpu_weight_update(
-            base_checkpoint_dir=base_checkpoint_dir,
-            checkpoint_source_dir=checkpoint_source_dir,
+        return (
+            self.model_runner.weight_updater.stage_cpu_weight_update_from_delta_lineage(
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+                host_cpu_group=host_cpu_group,
+            )
+        )
+
+    def stage_cpu_weight_update_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update_from_checkpoint(
+            checkpoint_dir=checkpoint_dir,
             target_version=target_version,
             host_cpu_group=host_cpu_group,
         )

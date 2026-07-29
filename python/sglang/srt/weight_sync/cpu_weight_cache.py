@@ -40,6 +40,7 @@ from safetensors import safe_open
 
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
+from sglang.srt.utils import override_weight_loading_cpu_workers
 from sglang.srt.weight_sync.cpu_weight_image import (
     CPUWeightImage,
     iter_weight_tensors,
@@ -1039,6 +1040,48 @@ class _HostRankPhaseCoordinator:
             self.buffer = None
 
 
+def _process_cpu_affinity() -> frozenset[int]:
+    try:
+        return frozenset(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return frozenset(range(os.cpu_count() or 1))
+
+
+def _host_rank_cpu_workers(cpu_group: Any) -> int:
+    affinity = _process_cpu_affinity()
+    if not torch.distributed.is_initialized():
+        return len(affinity)
+
+    world_size = torch.distributed.get_world_size(group=cpu_group)
+    rank = torch.distributed.get_rank(group=cpu_group)
+    affinities: list[frozenset[int] | None] = [None] * world_size
+    torch.distributed.all_gather_object(
+        affinities,
+        affinity,
+        group=cpu_group,
+    )
+    if any(value is None for value in affinities):
+        raise RuntimeError("host-rank CPU affinity was not gathered")
+    peer_affinities = [value for value in affinities if value is not None]
+    identical = [
+        peer_rank
+        for peer_rank, peer_affinity in enumerate(peer_affinities)
+        if peer_affinity == affinity
+    ]
+    if all(
+        peer_affinity == affinity or peer_affinity.isdisjoint(affinity)
+        for peer_affinity in peer_affinities
+    ):
+        workers, remainder = divmod(len(affinity), len(identical))
+        return max(workers + (identical.index(rank) < remainder), 1)
+
+    contention = {
+        cpu: sum(cpu in peer_affinity for peer_affinity in peer_affinities)
+        for cpu in affinity
+    }
+    return max(math.floor(sum(1 / contention[cpu] for cpu in affinity)), 1)
+
+
 def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     storage = tensor.untyped_storage()
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
@@ -1880,6 +1923,7 @@ class CPUWeightCache:
         self._canonical_checkpoint_version: int | None = None
         self._host_rank_coordinator: _HostRankPhaseCoordinator | None = None
         self._host_rank_sync_s = 0.0
+        self._cpu_workers = 1
         logger.info(
             "CPU weight cache layout: groups=%d storages=%d bytes=%d "
             "max_compile_group_bytes=%d canonical_checkpoint_storage=%s",
@@ -1894,6 +1938,13 @@ class CPUWeightCache:
         if self._host_rank_coordinator is not None:
             raise RuntimeError("host-rank coordinator is already initialized")
         self._host_rank_coordinator = _HostRankPhaseCoordinator(self.host_cpu_group)
+        self._cpu_workers = _host_rank_cpu_workers(self.host_cpu_group)
+        logger.info(
+            "CPU weight cache workers: rank=%d workers=%d affinity_cpus=%d",
+            self._host_rank_coordinator.rank,
+            self._cpu_workers,
+            len(_process_cpu_affinity()),
+        )
 
     def _run_on_all_host_ranks(self, description: str, function: Callable[[], Any]):
         result = None
@@ -2875,29 +2926,30 @@ class CPUWeightCache:
                     source_stats=source_stats,
                     checkpoint_transform=checkpoint_transform,
                 )
-            for (
-                group_updated,
-                group_bytes,
-                stats,
-            ) in compiler:
-                updated_segments.update(group_updated)
-                copied_bytes += group_bytes
-                group_stats.append(stats)
-                completed_groups = len(group_stats)
-                if (
-                    completed_groups == 1
-                    or completed_groups % progress_interval == 0
-                    or completed_groups == len(self.groups)
-                ):
-                    logger.info(
-                        "CPU weight image %s progress: groups=%d/%d "
-                        "bytes=%d elapsed=%.3fs",
-                        target_version,
-                        completed_groups,
-                        len(self.groups),
-                        copied_bytes,
-                        time.perf_counter() - started,
-                    )
+            with override_weight_loading_cpu_workers(self._cpu_workers):
+                for (
+                    group_updated,
+                    group_bytes,
+                    stats,
+                ) in compiler:
+                    updated_segments.update(group_updated)
+                    copied_bytes += group_bytes
+                    group_stats.append(stats)
+                    completed_groups = len(group_stats)
+                    if (
+                        completed_groups == 1
+                        or completed_groups % progress_interval == 0
+                        or completed_groups == len(self.groups)
+                    ):
+                        logger.info(
+                            "CPU weight image %s progress: groups=%d/%d "
+                            "bytes=%d elapsed=%.3fs",
+                            target_version,
+                            completed_groups,
+                            len(self.groups),
+                            copied_bytes,
+                            time.perf_counter() - started,
+                        )
 
             expected_segments = {id(value) for value in self.image.segments}
             missing = expected_segments - updated_segments
@@ -2941,6 +2993,7 @@ class CPUWeightCache:
             self._host_rank_sync_s - host_rank_sync_started,
             6,
         )
+        phase_totals["cpu_workers"] = self._cpu_workers
         traffic = {
             name: sum(value.get(name, 0) for value in group_stats)
             for name in (

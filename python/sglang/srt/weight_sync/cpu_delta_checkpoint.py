@@ -32,6 +32,7 @@ import torch
 import zstandard
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_weight_loading_cpu_workers
 from sglang.srt.weight_sync.checksum import create_checksum
 from sglang.srt.weight_sync.file_io import PositionalFileRangeReader, read_exact
 
@@ -536,12 +537,13 @@ class DeltaCheckpointTransform:
             available_cpus = len(os.sched_getaffinity(0))
         except (AttributeError, OSError):
             available_cpus = os.cpu_count() or 1
+        default_workers = (
+            available_cpus
+            if envs.SGLANG_SET_CPU_AFFINITY.get()
+            else max(1, available_cpus // self.world_size)
+        )
         worker_count = min(
-            (
-                available_cpus
-                if envs.SGLANG_SET_CPU_AFFINITY.get()
-                else max(1, available_cpus // self.world_size)
-            ),
+            get_weight_loading_cpu_workers(default_workers),
             len(names),
         )
         memory_budget = _ByteBudget(self.working_memory_budget_bytes)

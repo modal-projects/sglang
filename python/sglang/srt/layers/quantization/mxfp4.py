@@ -56,6 +56,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_weight_loading_cpu_workers,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -121,7 +122,7 @@ def _cpu_weight_transform_workers() -> int:
     )
     if not server_args.enable_dp_attention:
         local_model_workers *= server_args.dp_size
-    return max(available_cpus // local_model_workers, 1)
+    return get_weight_loading_cpu_workers(max(available_cpus // local_model_workers, 1))
 
 
 def _parallel_cpu_index_select(

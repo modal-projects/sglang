@@ -1,23 +1,23 @@
 """Checkpoint-delta reconstruction for CPU weight staging.
 
-The disk reload path materializes a complete target checkpoint. CPU weight
-staging instead maintains one host-shared canonical CPU checkpoint.
-CPU weight-cache initialization populates it from the immutable full checkpoint;
-updates then apply only the delta versions after the canonical checkpoint. Every
-changed canonical tensor is verified before the ordinary SGLang loader compiles
-the target into rank-ready CPU images.
+CPU weight staging maintains one canonical checkpoint in host memory or on
+host-local disk. Updates apply only the delta versions after that checkpoint,
+and every changed tensor is verified before the ordinary SGLang loader can
+publish a rank-ready CPU image.
 
 Compressed payloads are streamed once into bounded work buffers while exactly
 one local rank owns reconstruction of each canonical checkpoint file. The
 complete checkpoint and rank-ready image stay in CPU memory; no lineage-sized
 delta arena, runtime-layout assumption, or tensor-sparsity assumption enters
-this module.
+this module. Disk-backed callers may persist each verified bounded buffer while
+the loader consumes the same bytes.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -192,12 +192,7 @@ def _resolve_lineage(
             f"target version {target_version} precedes canonical "
             f"version {canonical_version}"
         )
-    if canonical_version:
-        if canonical_checkpoint_layout_dir is None:
-            raise ValueError(
-                "canonical_checkpoint_layout_dir is required when advancing a "
-                "canonical checkpoint"
-            )
+    if canonical_checkpoint_layout_dir is not None:
         checkpoint_root = Path(canonical_checkpoint_layout_dir)
         _checkpoint_index(checkpoint_root)
         deltas = []
@@ -234,6 +229,11 @@ def _resolve_lineage(
             deltas.append((version, root, index))
             previous = version
         return checkpoint_root, canonical_version, deltas
+    if canonical_version:
+        raise ValueError(
+            "canonical_checkpoint_layout_dir is required when advancing a "
+            "canonical checkpoint"
+        )
     if target_version == 0:
         root = Path(base_checkpoint_dir)
         _checkpoint_index(root)
@@ -469,6 +469,11 @@ class DeltaCheckpointTransform:
         for names in self.operations_by_file.values():
             for operations in names.values():
                 operations.sort(key=lambda value: value.version)
+        self.operations_by_name = {
+            name: operations
+            for names in self.operations_by_file.values()
+            for name, operations in names.items()
+        }
 
         self.checkpoint_root = checkpoint_root
         self.setup_stats.update(
@@ -494,14 +499,31 @@ class DeltaCheckpointTransform:
             self.setup_stats["wall_s"],
         )
 
-    def transform_file(self, filename: str, tensor_file: Any) -> dict[str, Any]:
-        """Apply and verify this file's canonical target bytes in place."""
+    def transform_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        description: str,
+        write_tensor: Any = None,
+        write_block_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply and verify canonical target tensors in caller-owned buffers."""
 
-        names = self.operations_by_file.get(filename)
+        if write_tensor is not None and (
+            write_block_bytes is None or write_block_bytes <= 0
+        ):
+            raise ValueError("write_block_bytes must be positive when persisting")
+        if write_tensor is not None:
+            assert write_block_bytes is not None
+        names = {
+            name: self.operations_by_name[name]
+            for name in tensors
+            if name in self.operations_by_name
+        }
         if not names:
             return {
                 "operation": "canonical_delta_transform",
-                "filename": filename,
+                "description": description,
                 "delta_tensors": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
@@ -524,6 +546,17 @@ class DeltaCheckpointTransform:
         )
         memory_budget = _ByteBudget(self.working_memory_budget_bytes)
         final_operation = {name: operations[-1] for name, operations in names.items()}
+        dirty_blocks = (
+            {
+                name: np.zeros(
+                    math.ceil(tensors[name].numel() / write_block_bytes),
+                    dtype=np.bool_,
+                )
+                for name in names
+            }
+            if write_tensor is not None
+            else {}
+        )
         operations_by_source = {}
         for name, operations in names.items():
             for operation in operations:
@@ -537,7 +570,7 @@ class DeltaCheckpointTransform:
             source_fd: int,
         ) -> tuple[int, int, float]:
             name, operation = item
-            region_tensor = tensor_file.get_tensor_bytes(name)
+            region_tensor = tensors[name]
             region = region_tensor.numpy()
             is_final = operation is final_operation[name]
             hasher = create_checksum(operation.checksum_algorithm) if is_final else None
@@ -571,11 +604,42 @@ class DeltaCheckpointTransform:
                             if not block:
                                 break
                             delta = np.frombuffer(block, dtype=np.uint8)
-                            np.bitwise_xor(
-                                region[position : position + delta.size],
-                                delta,
-                                out=region[position : position + delta.size],
-                            )
+                            has_changes = True
+                            if write_tensor is not None:
+                                block_begin = position // write_block_bytes
+                                complete_bytes = (
+                                    delta.size // write_block_bytes * write_block_bytes
+                                )
+                                block_changes = np.any(
+                                    delta[:complete_bytes].reshape(
+                                        -1,
+                                        write_block_bytes,
+                                    ),
+                                    axis=1,
+                                )
+                                if complete_bytes:
+                                    dirty_blocks[name][
+                                        block_begin : block_begin
+                                        + complete_bytes // write_block_bytes
+                                    ] |= block_changes
+                                tail_has_changes = (
+                                    complete_bytes != delta.size
+                                    and np.any(delta[complete_bytes:])
+                                )
+                                if tail_has_changes:
+                                    dirty_blocks[name][
+                                        block_begin
+                                        + complete_bytes // write_block_bytes
+                                    ] = True
+                                has_changes = bool(
+                                    np.any(block_changes) or tail_has_changes
+                                )
+                            if has_changes:
+                                np.bitwise_xor(
+                                    region[position : position + delta.size],
+                                    delta,
+                                    out=region[position : position + delta.size],
+                                )
                             if hasher is not None:
                                 hasher.update(region[position : position + delta.size])
                             position += delta.size
@@ -617,6 +681,10 @@ class DeltaCheckpointTransform:
                                 f"overwrite payload for {name!r} is invalid"
                             )
                         region[positions] = values
+                        if write_tensor is not None and count:
+                            dirty_blocks[name][
+                                np.unique(positions // write_block_bytes)
+                            ] = True
                         if hasher is not None:
                             hasher.update(region)
                 if source.position != operation.compressed_nbytes:
@@ -632,6 +700,29 @@ class DeltaCheckpointTransform:
                     raise RuntimeError(
                         f"checksum mismatch after reconstructing {name!r}: "
                         f"expected={operation.expected_checksum} actual={actual}"
+                    )
+                if write_tensor is not None:
+                    changes = np.flatnonzero(
+                        np.diff(
+                            np.concatenate(
+                                (
+                                    np.array([False]),
+                                    dirty_blocks[name],
+                                    np.array([False]),
+                                )
+                            )
+                        )
+                    )
+                    write_tensor(
+                        name,
+                        region,
+                        [
+                            (
+                                int(begin) * write_block_bytes,
+                                min(int(end) * write_block_bytes, region.size),
+                            )
+                            for begin, end in changes.reshape(-1, 2)
+                        ],
                     )
             return (
                 region.size if is_final else 0,
@@ -666,7 +757,7 @@ class DeltaCheckpointTransform:
                     os.close(source_fd)
         stats = {
             "operation": "canonical_delta_transform",
-            "filename": filename,
+            "description": description,
             "delta_tensors": len(names),
             "delta_fragments": len(results),
             "source_files": len(operations_by_source),
@@ -678,17 +769,29 @@ class DeltaCheckpointTransform:
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.debug(
-            "Applied canonical delta file %s: tensors=%d target_bytes=%d "
+            "Applied canonical delta group %s: tensors=%d target_bytes=%d "
             "wall_time=%.3fs",
-            filename,
+            description,
             stats["delta_tensors"],
             stats["target_tensor_bytes"],
             stats["wall_s"],
         )
         return stats
 
+    def transform_file(self, filename: str, tensor_file: Any) -> dict[str, Any]:
+        """Apply and verify one in-memory canonical checkpoint file."""
+
+        names = self.operations_by_file.get(filename, {})
+        stats = self.transform_tensors(
+            {name: tensor_file.get_tensor_bytes(name) for name in names},
+            description=filename,
+        )
+        stats["filename"] = filename
+        return stats
+
     def close(self) -> None:
         self.operations_by_file.clear()
+        self.operations_by_name.clear()
 
     def __enter__(self) -> DeltaCheckpointTransform:
         return self

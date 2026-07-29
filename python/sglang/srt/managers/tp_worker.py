@@ -114,7 +114,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def stage_cpu_weight_update(
+    def stage_cpu_weight_update_from_delta_lineage(
         self,
         *,
         base_checkpoint_dir: str,
@@ -122,17 +122,56 @@ class BaseTpWorker(ABC):
         target_version: int,
         host_cpu_group,
     ):
-        return self.model_runner.weight_updater.stage_cpu_weight_update(
+        return (
+            self.model_runner.weight_updater.stage_cpu_weight_update_from_delta_lineage(
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+                host_cpu_group=host_cpu_group,
+            )
+        )
+
+    def stage_cpu_weight_update_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update_from_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+        )
+
+    def stage_cpu_weight_update_from_disk_delta_lineage(
+        self,
+        *,
+        checkpoint_dir: str,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update_from_disk_delta_lineage(
+            checkpoint_dir=checkpoint_dir,
             base_checkpoint_dir=base_checkpoint_dir,
             checkpoint_source_dir=checkpoint_source_dir,
             target_version=target_version,
             host_cpu_group=host_cpu_group,
         )
 
-    def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
+    def initialize_cpu_weight_cache(
+        self,
+        host_cpu_group,
+        *,
+        base_checkpoint_dir: str,
+        seed_from_active_weights: bool,
+    ):
         return self.model_runner.weight_updater.initialize_cpu_weight_cache(
             host_cpu_group,
             base_checkpoint_dir=base_checkpoint_dir,
+            seed_from_active_weights=seed_from_active_weights,
         )
 
     def update_weights_from_cpu(

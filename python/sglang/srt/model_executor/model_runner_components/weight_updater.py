@@ -316,7 +316,13 @@ class WeightUpdater:
             ),
         )
 
-    def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
+    def initialize_cpu_weight_cache(
+        self,
+        host_cpu_group,
+        *,
+        base_checkpoint_dir: str,
+        seed_from_active_weights: bool,
+    ):
         """Construct and populate the CPU weight cache."""
         runner = self.get_model_runner()
         if not runner.server_args.enable_cpu_weight_cache:
@@ -387,10 +393,11 @@ class WeightUpdater:
                 )
                 stats = cache.initialize_from_checkpoint(
                     checkpoint_dir=(
-                        canonical_checkpoint_dir
-                        if canonical_checkpoint_dir is not None
-                        else base_checkpoint_dir
+                        base_checkpoint_dir
+                        if seed_from_active_weights or canonical_checkpoint_dir is None
+                        else canonical_checkpoint_dir
                     ),
+                    seed_from_active_weights=seed_from_active_weights,
                 )
             except Exception:
                 cache.close("CPU weight cache initialization failed")

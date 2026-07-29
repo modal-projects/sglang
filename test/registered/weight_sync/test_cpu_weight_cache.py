@@ -210,6 +210,36 @@ class TestCPUWeightCache(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "secondary checkpoint"):
             CPUWeightCache(model, max_group_bytes=1024)
 
+    def test_active_baseline_does_not_recompile_the_boot_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            save_file(
+                {"layer.weight": torch.arange(4, dtype=torch.float32)},
+                Path(root) / "model.safetensors",
+            )
+            image = SimpleNamespace(
+                image_nbytes=64,
+                weight_nbytes=64,
+                register_host_memory=mock.Mock(return_value={"wall_s": 1.0}),
+                capture_active_weights=mock.Mock(return_value={"wall_s": 2.0}),
+            )
+            cache = object.__new__(CPUWeightCache)
+            cache.image = image
+            cache.host_cpu_group = None
+            cache.canonical_checkpoint_storage = "disk"
+            cache.max_group_bytes = 1024
+            cache._run_on_all_host_ranks = lambda _, function: function()
+            cache._stage_from_checkpoint = mock.Mock()
+
+            stats = cache.initialize_from_checkpoint(
+                checkpoint_dir=root,
+                seed_from_active_weights=True,
+            )
+
+            cache._stage_from_checkpoint.assert_not_called()
+            self.assertEqual(stats["rank_image_source"], "active_model")
+            self.assertEqual(stats["initial_compile_wall_s"], 0.0)
+            self.assertEqual(stats["validation_wall_s"], 0.0)
+
     def test_positional_read_and_tensor_views(self):
         tensors = {
             "bf16": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),

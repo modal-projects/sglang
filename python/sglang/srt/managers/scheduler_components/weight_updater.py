@@ -172,6 +172,7 @@ class SchedulerWeightUpdaterManager:
             stats = self.tp_worker.initialize_cpu_weight_cache(
                 self.host_cpu_group,
                 base_checkpoint_dir=base_checkpoint_dir,
+                seed_from_active_weights=self._is_boot_checkpoint(base_checkpoint_dir),
             )
         except Exception:
             self._cpu_weight_cache_initialization_error = traceback.format_exc()
@@ -188,6 +189,11 @@ class SchedulerWeightUpdaterManager:
             "initialization": stats,
             "wall_s": round(time.perf_counter() - started, 6),
         }
+
+    def _is_boot_checkpoint(self, checkpoint_dir: str) -> bool:
+        return os.path.realpath(checkpoint_dir) == os.path.realpath(
+            self.boot_model_path
+        )
 
     def _pending_weight_update_stage_message(self) -> str | None:
         stage_pending = self._pending_weight_update_stage is not None
@@ -367,7 +373,10 @@ class SchedulerWeightUpdaterManager:
                 )
                 if recv_req.target_version == 0:
                     materialization = None
-                    if canonical_checkpoint_dir is not None:
+                    if (
+                        canonical_checkpoint_dir is not None
+                        and not self._is_boot_checkpoint(base_checkpoint_dir)
+                    ):
                         materialization = disk_checkpoint.materialize(
                             local_checkpoint_dir=canonical_checkpoint_dir,
                             base_checkpoint_dir=base_checkpoint_dir,
@@ -375,6 +384,13 @@ class SchedulerWeightUpdaterManager:
                             target_version=0,
                         )
                     stage_stats = self._initialize_cpu_weight_cache(base_checkpoint_dir)
+                    if canonical_checkpoint_dir is not None and materialization is None:
+                        materialization = disk_checkpoint.materialize(
+                            local_checkpoint_dir=canonical_checkpoint_dir,
+                            base_checkpoint_dir=base_checkpoint_dir,
+                            checkpoint_source_dir=base_checkpoint_dir,
+                            target_version=0,
+                        )
                     if materialization is not None:
                         stage_stats["canonical_checkpoint_materialization"] = (
                             materialization

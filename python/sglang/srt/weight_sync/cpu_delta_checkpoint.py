@@ -5,12 +5,12 @@ host-local disk. Updates apply only the delta versions after that checkpoint,
 and every changed tensor is verified before the ordinary SGLang loader can
 publish a rank-ready CPU image.
 
-Compressed payloads are streamed once into bounded work buffers while exactly
-one local rank owns reconstruction of each canonical checkpoint file. The
-complete checkpoint and rank-ready image stay in CPU memory; no lineage-sized
-delta arena, runtime-layout assumption, or tensor-sparsity assumption enters
-this module. Disk-backed callers may persist each verified bounded buffer while
-the loader consumes the same bytes.
+Compressed payloads are streamed once into bounded work buffers while local
+ranks reconstruct disjoint canonical tensors. The canonical target remains in
+host memory or on local disk, and the rank-ready image remains in CPU memory;
+no lineage-sized delta arena, runtime-layout assumption, or tensor-sparsity
+assumption enters this module. Disk-backed callers may persist each verified
+bounded buffer while the loader consumes the same bytes.
 """
 
 from __future__ import annotations

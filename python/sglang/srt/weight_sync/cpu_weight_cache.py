@@ -604,7 +604,7 @@ class _CanonicalCheckpointWriter:
             operations_by_file,
             world_size,
         )
-        self.flush_files = {
+        self.owned_files = {
             filename
             for index, filename in enumerate(filenames)
             if index % world_size == rank
@@ -624,7 +624,7 @@ class _CanonicalCheckpointWriter:
         self.expected_names = {
             name
             for name, source in self.sources.items()
-            if source.filename in self.flush_files
+            if source.filename in self.owned_files
         }
         self.last_group = {}
         for group_index, group in enumerate(sources):
@@ -633,7 +633,7 @@ class _CanonicalCheckpointWriter:
                     self.last_group[source.filename] = group_index
         self.fds = {}
         try:
-            for filename in self.flush_files:
+            for filename in self.owned_files:
                 self.fds[filename] = os.open(root / filename, os.O_RDWR)
         except Exception:
             self.close()
@@ -642,6 +642,7 @@ class _CanonicalCheckpointWriter:
         self.written_names = set()
         self.logical_bytes = 0
         self.write_bytes = 0
+        self.dirty_range_exchange_s = 0.0
         self.write_worker_s = 0.0
         self.flush_worker_s = 0.0
         self._pending_writes = []
@@ -650,7 +651,7 @@ class _CanonicalCheckpointWriter:
     def owns(self, name: str) -> bool:
         return name in self.transform_sources
 
-    def write(
+    def record_dirty_ranges(
         self,
         name: str,
         _region: Any,
@@ -661,7 +662,7 @@ class _CanonicalCheckpointWriter:
         with self.lock:
             self._pending_writes.append((name, ranges))
 
-    def write_pending_group(
+    def persist_pending_group(
         self,
         get_tensor_bytes: Callable[[str], torch.Tensor],
     ) -> None:
@@ -670,6 +671,7 @@ class _CanonicalCheckpointWriter:
             self._pending_writes = []
 
         if self._world_size > 1:
+            started = time.perf_counter()
             writes_by_rank = [None] * self._world_size
             torch.distributed.all_gather_object(
                 writes_by_rank,
@@ -679,11 +681,12 @@ class _CanonicalCheckpointWriter:
             pending_writes = [
                 write for rank_writes in writes_by_rank for write in rank_writes
             ]
+            self.dirty_range_exchange_s += time.perf_counter() - started
 
         writes_by_file = {}
         for name, ranges in pending_writes:
             source = self.sources[name]
-            if source.filename in self.flush_files:
+            if source.filename in self.owned_files:
                 writes_by_file.setdefault(source.filename, []).append(
                     (name, source.file_offset, ranges)
                 )
@@ -726,8 +729,6 @@ class _CanonicalCheckpointWriter:
                     self.dirty_files.add(filename)
 
     def finish_group(self, group_index: int) -> None:
-        if self._pending_writes:
-            raise RuntimeError("canonical checkpoint writes are still pending")
         filenames = [
             filename
             for filename, last_group in self.last_group.items()
@@ -735,7 +736,7 @@ class _CanonicalCheckpointWriter:
         ]
         for filename in filenames:
             fd = self.fds.pop(filename, None)
-            if filename in self.flush_files:
+            if filename in self.owned_files:
                 if fd is None:
                     raise RuntimeError(
                         f"canonical checkpoint file is already closed: {filename}"
@@ -745,7 +746,7 @@ class _CanonicalCheckpointWriter:
                 self.flush_worker_s += time.perf_counter() - started
             if fd is not None:
                 os.close(fd)
-            if self.drop_cache_after_write and filename in self.flush_files:
+            if self.drop_cache_after_write and filename in self.owned_files:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
@@ -754,6 +755,8 @@ class _CanonicalCheckpointWriter:
         self.fds.clear()
 
     def validate(self) -> None:
+        if self._pending_writes:
+            raise RuntimeError("canonical checkpoint writes are still pending")
         if self.written_names != self.expected_names:
             raise RuntimeError(
                 "canonical checkpoint transform did not persist every delta tensor: "
@@ -770,6 +773,10 @@ class _CanonicalCheckpointWriter:
         return {
             "target_logical_bytes": self.logical_bytes,
             "target_write_bytes": self.write_bytes,
+            "target_dirty_range_exchange_s": round(
+                self.dirty_range_exchange_s,
+                6,
+            ),
             "target_write_worker_s": round(self.write_worker_s, 6),
             "target_flush_worker_s": round(self.flush_worker_s, 6),
             "target_files": len(self.dirty_files),
@@ -2750,7 +2757,10 @@ class CPUWeightCache:
             with ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="weight-checkpoint-read",
-            ) as reader:
+            ) as reader, ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="weight-checkpoint-write",
+            ) as writer_pool:
 
                 def submit_read(index: int):
                     return reader.submit(
@@ -2763,28 +2773,29 @@ class CPUWeightCache:
                     )
 
                 pending_read = submit_read(0) if sources else None
+                pending_finalizations = []
+                current_read_result = None
+                current_read_wait_s = 0.0
+                if pending_read is not None:
+
+                    def finish_initial_read():
+                        nonlocal current_read_wait_s
+                        wait_started = time.perf_counter()
+                        try:
+                            return pending_read.result()
+                        finally:
+                            current_read_wait_s = time.perf_counter() - wait_started
+
+                    current_read_result = self._run_on_all_host_ranks(
+                        "initial canonical checkpoint read",
+                        finish_initial_read,
+                    )
                 for source_index, (group, source) in enumerate(
                     zip(self.groups, sources)
                 ):
-                    wait_started = time.perf_counter()
-                    read_result = None
-                    read_error = None
-                    try:
-                        assert pending_read is not None
-                        read_result = pending_read.result()
-                    except Exception as exc:
-                        read_error = f"{type(exc).__name__}: {exc}"
-
-                    def finish_read():
-                        if read_error is not None:
-                            raise RuntimeError(read_error)
-                        return read_result
-
-                    read_result = self._run_on_all_host_ranks(
-                        f"canonical checkpoint read for group {group.path!r}",
-                        finish_read,
-                    )
-                    read_wait_s = time.perf_counter() - wait_started
+                    assert current_read_result is not None
+                    read_result = current_read_result
+                    read_wait_s = current_read_wait_s
                     next_index = source_index + 1
                     pending_read = (
                         submit_read(next_index) if next_index < len(sources) else None
@@ -2808,7 +2819,7 @@ class CPUWeightCache:
                                     for name in owned_names
                                 },
                                 description=group.path,
-                                write_tensor=writer.write,
+                                write_tensor=writer.record_dirty_ranges,
                                 write_block_bytes=writer.write_block_bytes,
                             )
                             return result
@@ -2818,20 +2829,14 @@ class CPUWeightCache:
                             transform_group,
                         )
                         source_stats.append(transform_stats)
-                        self._run_on_all_host_ranks(
-                            f"canonical checkpoint writes for group {group.path!r}",
-                            functools.partial(
-                                writer.write_pending_group,
-                                tensor_file.get_tensor_bytes,
-                            ),
+                        pending_write = writer_pool.submit(
+                            writer.persist_pending_group,
+                            tensor_file.get_tensor_bytes,
                         )
+                    else:
+                        pending_write = None
 
                     def compile_group():
-                        if writer is not None:
-                            # The write barrier above makes every positional
-                            # update visible before one rank flushes and closes
-                            # the completed checkpoint files.
-                            writer.finish_group(source_index)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,
                             group=group,
@@ -2843,13 +2848,53 @@ class CPUWeightCache:
                         finally:
                             del loaded
 
-                    result = self._run_on_all_host_ranks(
-                        f"runtime compilation for group {group.path!r}",
-                        compile_group,
+                    compile_result = None
+                    compile_error = None
+                    persistence_wait_s = 0.0
+                    try:
+                        compile_result = compile_group()
+                    except Exception as exc:
+                        compile_error = exc
+
+                    def finish_group_work():
+                        nonlocal current_read_wait_s, persistence_wait_s
+                        if pending_write is not None:
+                            wait_started = time.perf_counter()
+                            try:
+                                pending_write.result()
+                            finally:
+                                persistence_wait_s = time.perf_counter() - wait_started
+                        if compile_error is not None:
+                            raise compile_error
+                        next_read_result = None
+                        current_read_wait_s = 0.0
+                        if pending_read is not None:
+                            wait_started = time.perf_counter()
+                            try:
+                                next_read_result = pending_read.result()
+                            finally:
+                                current_read_wait_s = time.perf_counter() - wait_started
+                        return compile_result, next_read_result
+
+                    result, current_read_result = self._run_on_all_host_ranks(
+                        f"runtime compilation, canonical persistence, and next "
+                        f"checkpoint read for group {group.path!r}",
+                        finish_group_work,
                     )
+                    if writer is not None:
+                        pending_finalizations.append(
+                            writer_pool.submit(
+                                writer.finish_group,
+                                source_index,
+                            )
+                        )
                     stats = result[2]
                     stats["canonical_read_s"] = read_result["wall_s"]
                     stats["canonical_read_wait_s"] = round(read_wait_s, 6)
+                    stats["canonical_persistence_wait_s"] = round(
+                        persistence_wait_s,
+                        6,
+                    )
                     stats["canonical_read_bytes"] = source.source_bytes
                     stats["canonical_read_runs"] = len(source.reads)
                     stats["canonical_direct_io_bytes"] = sum(
@@ -2876,9 +2921,15 @@ class CPUWeightCache:
                     )
                     yield result
             if writer is not None:
+
+                def finish_persistence():
+                    for pending_finalization in pending_finalizations:
+                        pending_finalization.result()
+                    writer.validate()
+
                 self._run_on_all_host_ranks(
                     "canonical checkpoint persistence",
-                    writer.validate,
+                    finish_persistence,
                 )
         finally:
             logger.info(
@@ -3034,6 +3085,7 @@ class CPUWeightCache:
             for phase in (
                 "canonical_read_s",
                 "canonical_read_wait_s",
+                "canonical_persistence_wait_s",
                 "canonical_transform_s",
                 "cpu_clone_s",
                 "restore_s",

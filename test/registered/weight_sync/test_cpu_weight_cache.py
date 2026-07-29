@@ -1282,15 +1282,73 @@ class TestCPUWeightCache(unittest.TestCase):
                     "a": torch.tensor([11] * 32, dtype=torch.uint8),
                     "b": torch.tensor([29] * 32, dtype=torch.uint8),
                 }
-                writer.write("a", tensors["a"], [(0, 32)])
-                writer.write("b", tensors["b"], [(0, 32)])
+                writer.record_dirty_ranges("a", tensors["a"], [(0, 32)])
+                writer.record_dirty_ranges("b", tensors["b"], [(0, 32)])
                 self.assertEqual(path.read_bytes(), bytes(64))
 
-                writer.write_pending_group(tensors.__getitem__)
+                writer.persist_pending_group(tensors.__getitem__)
                 writer.finish_group(0)
                 writer.validate()
 
                 self.assertEqual(path.read_bytes(), bytes([11] * 32 + [29] * 32))
+            finally:
+                writer.close()
+
+    def test_canonical_file_writer_closes_completed_files_with_later_writes_pending(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            filenames = ("a.safetensors", "b.safetensors")
+            for filename in filenames:
+                (root / filename).write_bytes(bytes(16))
+            sources = [
+                SimpleNamespace(
+                    tensors={
+                        "a": SimpleNamespace(
+                            filename=filenames[0],
+                            file_offset=0,
+                            entry=SimpleNamespace(relative_begin=0, relative_end=16),
+                        )
+                    }
+                ),
+                SimpleNamespace(
+                    tensors={
+                        "b": SimpleNamespace(
+                            filename=filenames[1],
+                            file_offset=0,
+                            entry=SimpleNamespace(relative_begin=0, relative_end=16),
+                        )
+                    }
+                ),
+            ]
+            writer = _CanonicalCheckpointWriter(
+                root=root,
+                sources=sources,
+                operations_by_file={
+                    filenames[0]: {"a": [None]},
+                    filenames[1]: {"b": [None]},
+                },
+                rank=0,
+                world_size=1,
+                cpu_group=None,
+                drop_cache_after_write=False,
+            )
+            try:
+                tensors = {
+                    "a": torch.full((16,), 3, dtype=torch.uint8),
+                    "b": torch.full((16,), 7, dtype=torch.uint8),
+                }
+                writer.record_dirty_ranges("a", tensors["a"], [(0, 16)])
+                writer.persist_pending_group(tensors.__getitem__)
+                writer.record_dirty_ranges("b", tensors["b"], [(0, 16)])
+                writer.finish_group(0)
+                writer.persist_pending_group(tensors.__getitem__)
+                writer.finish_group(1)
+                writer.validate()
+
+                self.assertEqual((root / filenames[0]).read_bytes(), bytes([3] * 16))
+                self.assertEqual((root / filenames[1]).read_bytes(), bytes([7] * 16))
             finally:
                 writer.close()
 

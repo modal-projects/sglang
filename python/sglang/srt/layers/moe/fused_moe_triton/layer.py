@@ -679,6 +679,14 @@ class FusedMoE(torch.nn.Module):
         try:
             for args, kwargs in calls:
                 self.weight_loader(*args, **kwargs)
+            method = self.quant_method
+            if hasattr(self, "scheme"):
+                method = self.scheme
+            copy_pairs = method.load_batched_weights_for_cpu_staging(
+                self,
+                copy_pairs,
+                executor=executor,
+            )
             self._execute_batched_weight_copies(
                 copy_pairs,
                 executor=executor,

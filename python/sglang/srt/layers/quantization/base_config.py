@@ -109,6 +109,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         """Return whether independent expert-loader writes may be deferred."""
         return False
 
+    def load_batched_weights_for_cpu_staging(
+        self,
+        layer: nn.Module,
+        copy_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        executor: Any,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Consume copies that can be written directly in runtime layout."""
+        return copy_pairs
+
     def create_weights(
         self,
         layer: torch.nn.Module,

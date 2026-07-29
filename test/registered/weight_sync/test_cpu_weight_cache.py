@@ -444,17 +444,27 @@ class TestCPUWeightCache(unittest.TestCase):
             }
             target_a = torch.arange(64, dtype=torch.uint8).flip(0)
             target_a_2 = torch.arange(64, dtype=torch.uint8).roll(11)
+            target_b = torch.arange(31, dtype=torch.uint8).flip(0)
             save_file(original, base / shard)
 
-            difference = torch.bitwise_xor(original["layer.a"], target_a)
-            compressed = zstandard.ZstdCompressor().compress(
-                difference.numpy().tobytes()
+            difference_a = torch.bitwise_xor(original["layer.a"], target_a)
+            difference_b = torch.bitwise_xor(original["layer.b"], target_b)
+            compressed_a = zstandard.ZstdCompressor().compress(
+                difference_a.numpy().tobytes()
             )
-            checksum = f"{zlib.adler32(target_a.numpy(), 1):08x}"
+            compressed_b = zstandard.ZstdCompressor().compress(
+                difference_b.numpy().tobytes()
+            )
             save_file(
-                {"layer.a": torch.tensor(list(compressed), dtype=torch.uint8)},
+                {
+                    "layer.a": torch.tensor(list(compressed_a), dtype=torch.uint8),
+                    "layer.b": torch.tensor(list(compressed_b), dtype=torch.uint8),
+                },
                 version / shard,
-                metadata={"layer.a": checksum},
+                metadata={
+                    "layer.a": f"{zlib.adler32(target_a.numpy(), 1):08x}",
+                    "layer.b": f"{zlib.adler32(target_b.numpy(), 1):08x}",
+                },
             )
             (version / "model.safetensors.index.json").write_text(
                 json.dumps(
@@ -466,7 +476,10 @@ class TestCPUWeightCache(unittest.TestCase):
                             "compression_format": "zstd",
                             "checksum_format": "adler32",
                         },
-                        "weight_map": {"layer.a": shard},
+                        "weight_map": {
+                            "layer.a": shard,
+                            "layer.b": shard,
+                        },
                     }
                 )
             )
@@ -538,10 +551,10 @@ class TestCPUWeightCache(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     tensor_file.get_tensor("layer.b"),
-                    original["layer.b"],
+                    target_b,
                 )
-                self.assertEqual(stats["delta_tensors"], 1)
-                self.assertEqual(stats["target_tensor_bytes"], 64)
+                self.assertEqual(stats["delta_tensors"], 2)
+                self.assertEqual(stats["target_tensor_bytes"], 95)
                 self.assertEqual(stats["working_memory_budget_bytes"], 8 << 30)
                 self.assertEqual(source.setup_stats["delta_versions"], [1])
                 self.assertLessEqual(max(positional_read_sizes), 7)
@@ -566,14 +579,14 @@ class TestCPUWeightCache(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     tensor_file_chain.get_tensor("layer.b"),
-                    original["layer.b"],
+                    target_b,
                 )
                 self.assertEqual(
                     source_chain.setup_stats["delta_versions"],
                     [1, 2],
                 )
-                self.assertEqual(stats_chain["delta_tensors"], 1)
-                self.assertEqual(stats_chain["target_tensor_bytes"], 64)
+                self.assertEqual(stats_chain["delta_tensors"], 2)
+                self.assertEqual(stats_chain["target_tensor_bytes"], 95)
             finally:
                 source_chain.close()
 
@@ -593,7 +606,7 @@ class TestCPUWeightCache(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     tensor_file.get_tensor("layer.b"),
-                    original["layer.b"],
+                    target_b,
                 )
                 self.assertEqual(source_2.setup_stats["delta_versions"], [2])
                 self.assertEqual(stats_2["delta_tensors"], 1)

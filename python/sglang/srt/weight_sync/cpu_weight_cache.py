@@ -587,6 +587,7 @@ def _populate_shared_checkpoint_group(
     group: _SharedCheckpointGroup,
     buffer: HostSharedMemoryBuffer,
     cpu_group: Any,
+    drop_cache_after_read: bool = False,
 ) -> dict[str, Any]:
     """Read every source range exactly once across the local TP ranks."""
 
@@ -607,6 +608,7 @@ def _populate_shared_checkpoint_group(
                 root / read.filename,
                 target,
                 file_offset=read.file_offset,
+                drop_cache_after_read=drop_cache_after_read,
             )
         finally:
             del target
@@ -1503,6 +1505,7 @@ class CPUWeightCache:
         max_group_bytes: int,
         host_cpu_group: Any = None,
         canonical_checkpoint_storage: Literal["memory", "disk"] = "memory",
+        drop_cache_after_load: bool = False,
     ):
         if getattr(model, "secondary_weights", None):
             raise NotImplementedError(
@@ -1514,6 +1517,7 @@ class CPUWeightCache:
         self.max_group_bytes = max_group_bytes
         self.host_cpu_group = host_cpu_group
         self.canonical_checkpoint_storage = canonical_checkpoint_storage
+        self.drop_cache_after_load = drop_cache_after_load
         if canonical_checkpoint_storage not in {"memory", "disk"}:
             raise ValueError("canonical_checkpoint_storage must be 'memory' or 'disk'")
         self.groups = _build_weight_module_groups(
@@ -2257,6 +2261,7 @@ class CPUWeightCache:
                         group=sources[index],
                         buffer=shared_buffers[index % 2],
                         cpu_group=self.host_cpu_group,
+                        drop_cache_after_read=self.drop_cache_after_load,
                     )
 
                 pending_read = submit_read(0) if sources else None

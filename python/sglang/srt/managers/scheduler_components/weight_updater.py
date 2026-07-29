@@ -508,6 +508,7 @@ class SchedulerWeightUpdaterManager:
         if (
             canonical_checkpoint_dir is not None
             and server_args.weight_loader_drop_cache_after_load
+            and (recv_req.target_version == 0 or not success)
         ):
             host_rank = (
                 torch.distributed.get_rank(group=self.host_cpu_group)

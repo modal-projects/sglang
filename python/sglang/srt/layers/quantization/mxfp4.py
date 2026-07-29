@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
@@ -28,7 +29,7 @@ from torch.nn.parameter import Parameter
 # cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_tp_group, get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -102,6 +103,60 @@ _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
     tuple[tuple[int, ...], int, int, str, int], torch.Tensor
 ] = {}
+
+
+def _cpu_weight_transform_workers() -> int:
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available_cpus = os.cpu_count() or 1
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        return available_cpus
+    if not torch.distributed.is_initialized():
+        return available_cpus
+    world_group = get_world_group()
+    server_args = get_server_args()
+    local_model_workers = world_group.local_size or (
+        world_group.world_size // server_args.nnodes
+    )
+    if not server_args.enable_dp_attention:
+        local_model_workers *= server_args.dp_size
+    return max(available_cpus // local_model_workers, 1)
+
+
+def _parallel_cpu_index_select(
+    tensor: torch.Tensor,
+    index: torch.Tensor,
+) -> torch.Tensor:
+    workers = min(_cpu_weight_transform_workers(), tensor.shape[0])
+    if workers <= 1:
+        return tensor.index_select(1, index).contiguous()
+
+    shape = list(tensor.shape)
+    shape[1] = index.numel()
+    output = tensor.new_empty(shape)
+    ranges = [
+        (
+            worker * tensor.shape[0] // workers,
+            (worker + 1) * tensor.shape[0] // workers,
+        )
+        for worker in range(workers)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                torch.index_select,
+                tensor[begin:end],
+                1,
+                index,
+                out=output[begin:end],
+            )
+            for begin, end in ranges
+            if begin < end
+        ]
+        for future in futures:
+            future.result()
+    return output
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -641,43 +696,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
 
-            # Swap w1 and w3 as the definition of
-            # swiglu is different in the trtllm-gen
-            def swap_every_two_rows(x, axis=-1):
-                shape = x.shape
-                if axis < 0:
-                    axis = len(shape) + axis
-
-                # Create a new shape with pairs swapped along specified axis
-                new_shape = list(shape)
-                new_shape[axis] = shape[axis] // 2
-                new_shape.insert(axis + 1, 2)
-
-                # Reshape to expose pairs, swap them, and reshape back
-                x = x.reshape(*new_shape)
-                x = x.flip(axis + 1)
-                new_shape = list(shape)
-                return x.reshape(*new_shape)
-
-            w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-            w13_weight = swap_every_two_rows(w13_weight, -2)
-            w13_bias = swap_every_two_rows(w13_bias, -1)
-
-            # Shuffle weights and scaling factors for transposed mma output
+            # TRT-LLM swaps adjacent w1/w3 rows before its output-layout
+            # permutation. Compose both permutations to avoid another full copy.
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             w13_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight[0].view(torch.uint8),
                 epilogue_tile_m,
-            )
+            ).bitwise_xor(1)
             w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight_scale[0].view(torch.uint8),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
-            )
+            ).bitwise_xor(1)
             w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_bias[0].reshape(-1, 1),
                 epilogue_tile_m,
-            )
+            ).bitwise_xor(1)
 
             w2_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_weight[0].view(torch.uint8),
@@ -698,7 +732,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 indices: torch.Tensor,
             ) -> torch.Tensor:
                 if device.type == "cpu":
-                    return tensor.index_select(1, indices).contiguous()
+                    return _parallel_cpu_index_select(tensor, indices)
                 return torch.stack(
                     [expert.index_select(0, indices).contiguous() for expert in tensor]
                 )

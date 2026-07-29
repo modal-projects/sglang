@@ -2759,7 +2759,10 @@ class CPUWeightCache:
             with ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="weight-checkpoint-read",
-            ) as reader:
+            ) as reader, ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="weight-checkpoint-write",
+            ) as writer_pool:
 
                 def submit_read(index: int):
                     return reader.submit(
@@ -2827,20 +2830,14 @@ class CPUWeightCache:
                             transform_group,
                         )
                         source_stats.append(transform_stats)
-                        self._run_on_all_host_ranks(
-                            f"canonical checkpoint writes for group {group.path!r}",
-                            functools.partial(
-                                writer.persist_pending_group,
-                                tensor_file.get_tensor_bytes,
-                            ),
+                        pending_write = writer_pool.submit(
+                            writer.persist_pending_group,
+                            tensor_file.get_tensor_bytes,
                         )
+                    else:
+                        pending_write = None
 
                     def compile_group():
-                        if writer is not None:
-                            # The write barrier above makes every positional
-                            # update visible before one rank flushes and closes
-                            # the completed checkpoint files.
-                            writer.finish_group(source_index)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,
                             group=group,
@@ -2852,10 +2849,33 @@ class CPUWeightCache:
                         finally:
                             del loaded
 
+                    compile_result = None
+                    compile_error = None
+                    try:
+                        compile_result = compile_group()
+                    except Exception as exc:
+                        compile_error = exc
+
+                    def finish_group_work():
+                        if pending_write is not None:
+                            pending_write.result()
+                        if compile_error is not None:
+                            raise compile_error
+                        return compile_result
+
                     result = self._run_on_all_host_ranks(
                         f"runtime compilation for group {group.path!r}",
-                        compile_group,
+                        finish_group_work,
                     )
+                    if writer is not None:
+                        self._run_on_all_host_ranks(
+                            f"canonical checkpoint finalization for "
+                            f"group {group.path!r}",
+                            functools.partial(
+                                writer.finish_group,
+                                source_index,
+                            ),
+                        )
                     stats = result[2]
                     stats["canonical_read_s"] = read_result["wall_s"]
                     stats["canonical_read_wait_s"] = round(read_wait_s, 6)

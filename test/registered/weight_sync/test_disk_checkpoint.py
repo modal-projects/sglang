@@ -249,6 +249,36 @@ class MaterializeTest(unittest.TestCase):
         self.materialize(2)
         self.assert_at_version(2)
 
+    def test_seed_falls_back_when_reflink_is_unsupported(self):
+        original = disk_checkpoint.fcntl.ioctl
+        calls = []
+
+        def unsupported(*args):
+            calls.append(args)
+            raise OSError(disk_checkpoint.errno.EOPNOTSUPP, "unsupported")
+
+        disk_checkpoint.fcntl.ioctl = unsupported
+        try:
+            self.materialize(0)
+        finally:
+            disk_checkpoint.fcntl.ioctl = original
+        self.assertTrue(calls)
+        self.assert_at_version(0)
+
+    def test_seed_does_not_hide_unexpected_reflink_errors(self):
+        original = disk_checkpoint.fcntl.ioctl
+
+        def fail(*args):
+            raise OSError(disk_checkpoint.errno.EIO, "I/O error")
+
+        disk_checkpoint.fcntl.ioctl = fail
+        try:
+            with self.assertRaises(OSError):
+                self.materialize(0)
+        finally:
+            disk_checkpoint.fcntl.ioctl = original
+        self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
+
     def test_seed_evicts_local_checkpoint_pages_when_requested(self):
         dropped = []
         original = disk_checkpoint.drop_file_page_cache

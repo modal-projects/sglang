@@ -1445,7 +1445,8 @@ class TestCPUWeightCache(unittest.TestCase):
                 writer.write("b", tensors["b"], [(0, 32)])
                 self.assertEqual(path.read_bytes(), bytes(64))
 
-                writer.write_pending_group(tensors.__getitem__)
+                pending = writer.submit_pending_group(tensors.__getitem__)
+                writer.finish_pending_group(pending)
                 writer.finish_group(0)
                 writer.validate()
 

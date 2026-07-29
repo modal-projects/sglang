@@ -30,7 +30,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -38,6 +38,7 @@ from typing import Any, Literal
 import torch
 from safetensors import safe_open
 
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
 from sglang.srt.weight_sync.cpu_weight_image import (
@@ -632,15 +633,15 @@ class _CanonicalCheckpointWriter:
             available_cpus = os.cpu_count() or 1
         write_workers = min(
             len(self.flush_files),
-            max(1, available_cpus // world_size),
+            (
+                available_cpus
+                if envs.SGLANG_SET_CPU_AFFINITY.get()
+                else max(1, available_cpus // world_size)
+            ),
         )
-        self._write_executor = (
-            ThreadPoolExecutor(
-                max_workers=write_workers,
-                thread_name_prefix="canonical-checkpoint-write",
-            )
-            if write_workers > 1
-            else None
+        self._write_executor = ThreadPoolExecutor(
+            max_workers=max(1, write_workers),
+            thread_name_prefix="canonical-checkpoint-write",
         )
         self.last_group = {}
         for group_index, group in enumerate(sources):
@@ -659,6 +660,8 @@ class _CanonicalCheckpointWriter:
         self.logical_bytes = 0
         self.write_bytes = 0
         self.write_worker_s = 0.0
+        self.write_wall_s = 0.0
+        self.write_wait_s = 0.0
         self.flush_worker_s = 0.0
         self._pending_writes = []
         self.lock = threading.Lock()
@@ -677,10 +680,10 @@ class _CanonicalCheckpointWriter:
         with self.lock:
             self._pending_writes.append((name, ranges))
 
-    def write_pending_group(
+    def submit_pending_group(
         self,
         get_tensor_bytes: Callable[[str], torch.Tensor],
-    ) -> None:
+    ) -> tuple[float, list[Future]]:
         with self.lock:
             pending_writes = self._pending_writes
             self._pending_writes = []
@@ -710,6 +713,7 @@ class _CanonicalCheckpointWriter:
             write_bytes = 0
             logical_bytes = 0
             written_names = set()
+            started = time.perf_counter()
             for name, file_offset, ranges in sorted(
                 writes,
                 key=lambda item: item[1],
@@ -737,21 +741,48 @@ class _CanonicalCheckpointWriter:
                             )
                         position += written
                         write_bytes += written
-            return filename, written_names, logical_bytes, write_bytes
+            finished_at = time.perf_counter()
+            return (
+                filename,
+                written_names,
+                logical_bytes,
+                write_bytes,
+                finished_at - started,
+                finished_at,
+            )
 
         items = sorted(writes_by_file.items())
         started = time.perf_counter()
-        if self._write_executor is None:
-            results = map(write_file, items)
-        else:
-            results = self._write_executor.map(write_file, items)
-        for filename, written_names, logical_bytes, write_bytes in results:
+        return (
+            started,
+            [self._write_executor.submit(write_file, item) for item in items],
+        )
+
+    def finish_pending_group(
+        self,
+        pending: tuple[float, list[Future]],
+    ) -> None:
+        started, futures = pending
+        wait_started = time.perf_counter()
+        finished = started
+        for future in futures:
+            (
+                filename,
+                written_names,
+                logical_bytes,
+                write_bytes,
+                worker_s,
+                finished_at,
+            ) = future.result()
             self.written_names.update(written_names)
             self.logical_bytes += logical_bytes
             self.write_bytes += write_bytes
+            self.write_worker_s += worker_s
+            finished = max(finished, finished_at)
             if write_bytes:
                 self.dirty_files.add(filename)
-        self.write_worker_s += time.perf_counter() - started
+        self.write_wall_s += finished - started
+        self.write_wait_s += time.perf_counter() - wait_started
 
     def finish_group(self, group_index: int) -> None:
         if self._pending_writes:
@@ -777,9 +808,7 @@ class _CanonicalCheckpointWriter:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
-        if self._write_executor is not None:
-            self._write_executor.shutdown(wait=True)
-            self._write_executor = None
+        self._write_executor.shutdown(wait=True)
         for fd in self.fds.values():
             os.close(fd)
         self.fds.clear()
@@ -802,6 +831,8 @@ class _CanonicalCheckpointWriter:
             "target_logical_bytes": self.logical_bytes,
             "target_write_bytes": self.write_bytes,
             "target_write_worker_s": round(self.write_worker_s, 6),
+            "target_write_wall_s": round(self.write_wall_s, 6),
+            "target_write_wait_s": round(self.write_wait_s, 6),
             "target_flush_worker_s": round(self.flush_worker_s, 6),
             "target_files": len(self.dirty_files),
         }
@@ -2808,16 +2839,17 @@ class CPUWeightCache:
             )
             for buffer_index in range(2)
         ]
-        shared_buffers = [
-            HostSharedMemoryBuffer(
-                nbytes=max(1, capacity),
-                cpu_group=self.host_cpu_group,
-                name=f"weight-checkpoint-group-{index}",
-            )
-            for index, capacity in enumerate(capacities)
-        ]
-        shared_buffer_bytes = sum(buffer.nbytes for buffer in shared_buffers)
+        shared_buffers = []
         try:
+            for index, capacity in enumerate(capacities):
+                shared_buffers.append(
+                    HostSharedMemoryBuffer(
+                        nbytes=max(1, capacity),
+                        cpu_group=self.host_cpu_group,
+                        name=f"weight-checkpoint-group-{index}",
+                    )
+                )
+            shared_buffer_bytes = sum(buffer.nbytes for buffer in shared_buffers)
             with ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="weight-checkpoint-read",
@@ -2875,6 +2907,7 @@ class CPUWeightCache:
                         source.tensors,
                     )
                     transform_stats = None
+                    pending_writes = None
                     if writer is not None:
 
                         def transform_batch():
@@ -2903,9 +2936,7 @@ class CPUWeightCache:
                         source_stats.append(transform_stats)
                         write_error = None
                         try:
-                            # File owners persist locally while other ranks
-                            # begin compiling from the same immutable buffer.
-                            writer.write_pending_group(
+                            pending_writes = writer.submit_pending_group(
                                 tensor_file.get_tensor_bytes,
                             )
                         except Exception as exc:
@@ -2931,6 +2962,8 @@ class CPUWeightCache:
                             finally:
                                 del loaded
                         if writer is not None:
+                            assert pending_writes is not None
+                            writer.finish_pending_group(pending_writes)
                             writer.finish_group(source_index)
                         next_read_result = None
                         next_read_wait_s = 0.0
@@ -2985,22 +3018,23 @@ class CPUWeightCache:
                     writer.validate,
                 )
         finally:
+            shared_buffer_bytes = sum(buffer.nbytes for buffer in shared_buffers)
             logger.info(
                 "Releasing shared canonical checkpoint group buffer: bytes=%d",
                 shared_buffer_bytes,
             )
             started = time.perf_counter()
             gc.collect()
-            for shared_buffer in shared_buffers:
-                shared_buffer.close()
             if writer is not None:
+                writer.close()
                 source_stats.append(
                     {
                         "operation": "persist_canonical_checkpoint",
                         **writer.stats(),
                     }
                 )
-                writer.close()
+            for shared_buffer in shared_buffers:
+                shared_buffer.close()
             logger.info(
                 "Released shared canonical checkpoint group buffer: "
                 "bytes=%d wall_time=%.3fs",

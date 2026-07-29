@@ -121,6 +121,7 @@ def _make_hybrid_layer(seed: int) -> torch.nn.Module:
 class TestMxfp4Reload(unittest.TestCase):
     def test_cpu_staging_keeps_runtime_buffers(self):
         method = _make_method()
+        method.weight_update_postprocess_device = lambda _: "cpu"
         layer = _make_layer(seed=1)
         method.process_weights_after_loading(layer)
         staged_names = ("w13_weight", "w2_weight")
@@ -273,11 +274,11 @@ class TestMxfp4Reload(unittest.TestCase):
                     runtime_pointers[name],
                 )
 
-    def test_cpu_postprocessing_capability_is_backend_specific(self):
+    def test_cuda_postprocessing_capability_is_backend_specific(self):
         method = _make_method()
         self.assertEqual(
             method.weight_update_postprocess_device(torch.nn.Module()),
-            "cpu",
+            "cuda",
         )
 
         method._fi_kernel = "cutlass_sm90"

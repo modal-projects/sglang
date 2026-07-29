@@ -697,6 +697,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             != layer.intermediate_size_per_partition
             or self.hidden_size != layer.hidden_size
         )
+        if self.weight_update_postprocess_device(layer) == "cuda":
+            if padded:
+                self._zero_checkpoint_buffers(layer)
+            return
         for name in ("w13_weight", "w2_weight"):
             parameter = getattr(layer, name)
             runtime_buffer = getattr(
@@ -714,7 +718,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def weight_update_postprocess_device(self, layer) -> str | None:
         if self.use_flashinfer and self._fi_kernel == "trtllm_sm100":
-            return "cpu"
+            return "cuda"
         return None
 
     def process_weights_after_loading(self, layer):
@@ -1005,10 +1009,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 ("w2_weight", w2_weight),
             ):
                 parameter = getattr(layer, name)
-                runtime_buffer = getattr(
-                    parameter,
-                    "_weight_update_runtime_buffer",
-                    None,
+                runtime_buffer = (
+                    getattr(
+                        parameter,
+                        "_weight_update_runtime_buffer",
+                        None,
+                    )
+                    if device.type == "cpu"
+                    else None
                 )
                 if runtime_buffer is None:
                     copy_or_rebind_param(layer, name, value)

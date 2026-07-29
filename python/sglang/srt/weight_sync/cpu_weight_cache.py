@@ -587,14 +587,11 @@ class _CanonicalCheckpointWriter:
         operations_by_file: dict[str, dict[str, Any]],
         rank: int,
         world_size: int,
-        cpu_group: Any,
         drop_cache_after_write: bool,
     ):
         from sglang.srt.weight_sync.disk_checkpoint import drop_file_page_cache
 
         self.root = root
-        self._world_size = world_size
-        self._cpu_group = cpu_group
         self.drop_file_page_cache = drop_file_page_cache
         self.drop_cache_after_write = drop_cache_after_write
         filesystem = os.statvfs(root)
@@ -605,16 +602,10 @@ class _CanonicalCheckpointWriter:
             operations_by_file,
             world_size,
         )
-        self.flush_files = {
+        self.sync_files = {
             filename
             for index, filename in enumerate(filenames)
             if index % world_size == rank
-        }
-        self.sources = {
-            name: source
-            for group in sources
-            for name, source in group.tensors.items()
-            if name in owners
         }
         self.transform_sources = {
             name: source
@@ -622,20 +613,19 @@ class _CanonicalCheckpointWriter:
             for name, source in group.tensors.items()
             if owners.get(name) == rank
         }
-        self.expected_names = {
-            name
-            for name, source in self.sources.items()
-            if source.filename in self.flush_files
+        self.expected_names = set(self.transform_sources)
+        open_files = self.sync_files | {
+            source.filename for source in self.transform_sources.values()
         }
         self.last_group = {}
         for group_index, group in enumerate(sources):
             for name, source in group.tensors.items():
-                if name in self.expected_names:
+                if name in owners and source.filename in open_files:
                     self.last_group[source.filename] = group_index
         self.fds = {}
         self.mappings = {}
         try:
-            for filename in self.flush_files:
+            for filename in open_files:
                 fd = os.open(root / filename, os.O_RDWR)
                 self.fds[filename] = fd
                 try:
@@ -664,7 +654,7 @@ class _CanonicalCheckpointWriter:
     def owns(self, name: str) -> bool:
         return name in self.transform_sources
 
-    def write(
+    def record_dirty_ranges(
         self,
         name: str,
         _region: Any,
@@ -675,7 +665,7 @@ class _CanonicalCheckpointWriter:
         with self.lock:
             self._pending_writes.append((name, ranges))
 
-    def write_pending_group(
+    def persist_pending_group(
         self,
         get_tensor_bytes: Callable[[str], torch.Tensor],
     ) -> None:
@@ -683,24 +673,12 @@ class _CanonicalCheckpointWriter:
             pending_writes = self._pending_writes
             self._pending_writes = []
 
-        if self._world_size > 1:
-            writes_by_rank = [None] * self._world_size
-            torch.distributed.all_gather_object(
-                writes_by_rank,
-                pending_writes,
-                group=self._cpu_group,
-            )
-            pending_writes = [
-                write for rank_writes in writes_by_rank for write in rank_writes
-            ]
-
         writes_by_file = {}
         for name, ranges in pending_writes:
-            source = self.sources[name]
-            if source.filename in self.flush_files:
-                writes_by_file.setdefault(source.filename, []).append(
-                    (name, source.file_offset, ranges)
-                )
+            source = self.transform_sources[name]
+            writes_by_file.setdefault(source.filename, []).append(
+                (name, source.file_offset, ranges)
+            )
 
         for filename, writes in sorted(writes_by_file.items()):
             fd = self.fds[filename]
@@ -755,21 +733,24 @@ class _CanonicalCheckpointWriter:
             if last_group == group_index
         ]
         for filename in filenames:
-            fd = self.fds.pop(filename, None)
-            mapping = self.mappings.pop(filename, None)
-            if filename in self.flush_files:
-                if fd is None:
-                    raise RuntimeError(
-                        f"canonical checkpoint file is already closed: {filename}"
-                    )
-                started = time.perf_counter()
-                os.fsync(fd)
-                self.flush_worker_s += time.perf_counter() - started
-            if mapping is not None:
-                mapping.close()
-            if fd is not None:
+            fd = self.fds.get(filename)
+            mapping = self.mappings.get(filename)
+            if fd is None:
+                raise RuntimeError(
+                    f"canonical checkpoint file is already closed: {filename}"
+                )
+            try:
+                if filename in self.sync_files:
+                    started = time.perf_counter()
+                    os.fsync(fd)
+                    self.flush_worker_s += time.perf_counter() - started
+            finally:
+                if mapping is not None:
+                    mapping.close()
                 os.close(fd)
-            if self.drop_cache_after_write and filename in self.flush_files:
+                self.mappings.pop(filename, None)
+                self.fds.pop(filename, None)
+            if self.drop_cache_after_write and filename in self.sync_files:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
@@ -2744,7 +2725,6 @@ class CPUWeightCache:
                     operations_by_file=checkpoint_transform.operations_by_file,
                     rank=rank,
                     world_size=world_size,
-                    cpu_group=self.host_cpu_group,
                     drop_cache_after_write=self.drop_cache_after_load,
                 )
 
@@ -2839,7 +2819,7 @@ class CPUWeightCache:
                                     for name in owned_names
                                 },
                                 description=group.path,
-                                write_tensor=writer.write,
+                                write_tensor=writer.record_dirty_ranges,
                                 write_block_bytes=writer.write_block_bytes,
                             )
                             return result
@@ -2852,7 +2832,7 @@ class CPUWeightCache:
                         self._run_on_all_host_ranks(
                             f"canonical checkpoint writes for group {group.path!r}",
                             functools.partial(
-                                writer.write_pending_group,
+                                writer.persist_pending_group,
                                 tensor_file.get_tensor_bytes,
                             ),
                         )

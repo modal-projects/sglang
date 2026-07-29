@@ -1274,7 +1274,6 @@ class TestCPUWeightCache(unittest.TestCase):
                 operations_by_file=operations,
                 rank=0,
                 world_size=1,
-                cpu_group=None,
                 drop_cache_after_write=False,
             )
             try:
@@ -1282,15 +1281,53 @@ class TestCPUWeightCache(unittest.TestCase):
                     "a": torch.tensor([11] * 32, dtype=torch.uint8),
                     "b": torch.tensor([29] * 32, dtype=torch.uint8),
                 }
-                writer.write("a", tensors["a"], [(0, 32)])
-                writer.write("b", tensors["b"], [(0, 32)])
+                writer.record_dirty_ranges("a", tensors["a"], [(0, 32)])
+                writer.record_dirty_ranges("b", tensors["b"], [(0, 32)])
                 self.assertEqual(path.read_bytes(), bytes(64))
 
-                writer.write_pending_group(tensors.__getitem__)
+                writer.persist_pending_group(tensors.__getitem__)
                 writer.finish_group(0)
                 writer.validate()
 
                 self.assertEqual(path.read_bytes(), bytes([11] * 32 + [29] * 32))
+            finally:
+                writer.close()
+
+    def test_canonical_file_writer_falls_back_to_positional_writes(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            filename = "model.safetensors"
+            path = root / filename
+            path.write_bytes(bytes(32))
+            source = SimpleNamespace(
+                filename=filename,
+                file_offset=0,
+                entry=SimpleNamespace(relative_begin=0, relative_end=32),
+            )
+            with mock.patch(
+                "sglang.srt.weight_sync.cpu_weight_cache.mmap.mmap",
+                side_effect=OSError("mapping unavailable"),
+            ):
+                writer = _CanonicalCheckpointWriter(
+                    root=root,
+                    sources=[SimpleNamespace(tensors={"weight": source})],
+                    operations_by_file={filename: {"weight": [None]}},
+                    rank=0,
+                    world_size=1,
+                    drop_cache_after_write=False,
+                )
+            try:
+                tensor = torch.arange(32, dtype=torch.uint8)
+                writer.record_dirty_ranges("weight", tensor, [(8, 24)])
+                writer.persist_pending_group(lambda _name: tensor)
+                writer.finish_group(0)
+                writer.validate()
+
+                self.assertEqual(
+                    path.read_bytes(),
+                    bytes(8) + bytes(range(8, 24)) + bytes(8),
+                )
+                self.assertEqual(writer.stats()["target_mapped_files"], 0)
             finally:
                 writer.close()
 

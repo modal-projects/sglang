@@ -18,6 +18,7 @@ tensor-level sparsity.
 from __future__ import annotations
 
 import copy
+import errno
 import functools
 import gc
 import hashlib
@@ -47,7 +48,7 @@ from sglang.srt.weight_sync.host_shared_memory import HostSharedMemoryBuffer
 logger = logging.getLogger(__name__)
 
 _POSITIONAL_IO_CHUNK_BYTES = 64 << 20
-_SHARED_TENSOR_ALIGNMENT = 64
+_DIRECT_IO_ALIGNMENT = 4096
 
 
 def _safetensors_dtypes() -> dict[str, torch.dtype]:
@@ -318,7 +319,13 @@ def _pread_file_to_tensor(
         target,
         file_offset=0,
         drop_cache_after_read=drop_cache_after_read,
-    )
+    ).wall_s
+
+
+@dataclass(frozen=True)
+class _PositionalReadResult:
+    wall_s: float
+    direct_io: bool
 
 
 def _pread_range_to_tensor(
@@ -326,8 +333,9 @@ def _pread_range_to_tensor(
     target: torch.Tensor,
     *,
     file_offset: int,
+    direct_io: bool = False,
     drop_cache_after_read: bool = False,
-) -> float:
+) -> _PositionalReadResult:
     if (
         target.device.type != "cpu"
         or target.dtype != torch.uint8
@@ -340,21 +348,74 @@ def _pread_range_to_tensor(
             f"source range exceeds {path}: offset={file_offset} "
             f"bytes={target.numel()} file={path.stat().st_size}"
         )
+    if direct_io and (
+        file_offset % _DIRECT_IO_ALIGNMENT
+        or target.numel() % _DIRECT_IO_ALIGNMENT
+        or target.data_ptr() % _DIRECT_IO_ALIGNMENT
+    ):
+        raise ValueError(
+            "direct positional reads require aligned file offsets, buffers, "
+            f"and lengths: offset={file_offset} address={target.data_ptr()} "
+            f"bytes={target.numel()}"
+        )
+
     started = time.perf_counter()
     array = target.numpy()
     view = memoryview(array).cast("B")
-    fd = os.open(path, os.O_RDONLY)
+    use_direct_io = direct_io and hasattr(os, "O_DIRECT")
+    flags = os.O_RDONLY | (os.O_DIRECT if use_direct_io else 0)
+    fd = None
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if not use_direct_io or exc.errno not in {
+            errno.EINVAL,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+            errno.EPERM,
+        }:
+            view.release()
+            raise
+        use_direct_io = False
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except Exception:
+            view.release()
+            raise
     offset = 0
     try:
-        while offset < target.numel():
-            end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, target.numel())
-            nread = os.preadv(fd, [view[offset:end]], file_offset + offset)
-            if nread <= 0:
-                raise EOFError(
-                    f"unexpected EOF reading {path}: "
-                    f"offset={file_offset + offset} size={target.numel()}"
-                )
-            offset += nread
+        try:
+            while offset < target.numel():
+                end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, target.numel())
+                nread = os.preadv(fd, [view[offset:end]], file_offset + offset)
+                if nread <= 0:
+                    raise EOFError(
+                        f"unexpected EOF reading {path}: "
+                        f"offset={file_offset + offset} size={target.numel()}"
+                    )
+                offset += nread
+        except OSError as exc:
+            if not use_direct_io or exc.errno not in {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+                errno.EPERM,
+            }:
+                raise
+            os.close(fd)
+            fd = None
+            use_direct_io = False
+            fd = os.open(path, os.O_RDONLY)
+            offset = 0
+            while offset < target.numel():
+                end = min(offset + _POSITIONAL_IO_CHUNK_BYTES, target.numel())
+                nread = os.preadv(fd, [view[offset:end]], file_offset + offset)
+                if nread <= 0:
+                    raise EOFError(
+                        f"unexpected EOF reading {path}: "
+                        f"offset={file_offset + offset} size={target.numel()}"
+                    )
+                offset += nread
         if drop_cache_after_read and hasattr(os, "posix_fadvise"):
             try:
                 os.posix_fadvise(
@@ -369,9 +430,13 @@ def _pread_range_to_tensor(
                 # does not depend on it.
                 pass
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         view.release()
-    return time.perf_counter() - started
+    return _PositionalReadResult(
+        wall_s=time.perf_counter() - started,
+        direct_io=use_direct_io,
+    )
 
 
 class _HostSharedCheckpoint(HostSharedMemoryBuffer):
@@ -423,6 +488,7 @@ class _SharedCheckpointRead:
     file_offset: int
     buffer_offset: int
     nbytes: int
+    direct_io: bool
 
 
 @dataclass(frozen=True)
@@ -612,14 +678,6 @@ class _CanonicalCheckpointWriter:
         }
 
 
-def _align_shared_tensor_offset(value: int) -> int:
-    return (
-        (value + _SHARED_TENSOR_ALIGNMENT - 1)
-        // _SHARED_TENSOR_ALIGNMENT
-        * _SHARED_TENSOR_ALIGNMENT
-    )
-
-
 def _shared_checkpoint_groups(
     *,
     root: Path,
@@ -682,35 +740,98 @@ def _shared_checkpoint_groups(
             nonlocal buffer_bytes
             if not run:
                 return
-            buffer_bytes = _align_shared_tensor_offset(buffer_bytes)
             first = run[0][1]
             last = run[-1][1]
             run_nbytes = last.file_end - first.file_begin
-            if run_nbytes:
+            aligned_buffer_begin = (
+                (buffer_bytes + _DIRECT_IO_ALIGNMENT - 1)
+                // _DIRECT_IO_ALIGNMENT
+                * _DIRECT_IO_ALIGNMENT
+            )
+            data_buffer_begin = (
+                aligned_buffer_begin + first.file_begin % _DIRECT_IO_ALIGNMENT
+            )
+            direct_begin = (
+                (first.file_begin + _DIRECT_IO_ALIGNMENT - 1)
+                // _DIRECT_IO_ALIGNMENT
+                * _DIRECT_IO_ALIGNMENT
+            )
+            direct_end = last.file_end // _DIRECT_IO_ALIGNMENT * _DIRECT_IO_ALIGNMENT
+            if direct_begin < direct_end:
+                if first.file_begin < direct_begin:
+                    reads.append(
+                        _SharedCheckpointRead(
+                            filename=first.filename,
+                            file_offset=first.file_begin,
+                            buffer_offset=data_buffer_begin,
+                            nbytes=direct_begin - first.file_begin,
+                            direct_io=False,
+                        )
+                    )
+                direct_nbytes = direct_end - direct_begin
+                read_chunks = min(
+                    read_parallelism,
+                    math.ceil(direct_nbytes / _POSITIONAL_IO_CHUNK_BYTES),
+                )
+                chunk_blocks = math.ceil(
+                    direct_nbytes / _DIRECT_IO_ALIGNMENT / read_chunks
+                )
+                chunk_bytes = chunk_blocks * _DIRECT_IO_ALIGNMENT
+                reads.extend(
+                    (
+                        _SharedCheckpointRead(
+                            filename=first.filename,
+                            file_offset=direct_begin + offset,
+                            buffer_offset=(
+                                data_buffer_begin
+                                + direct_begin
+                                - first.file_begin
+                                + offset
+                            ),
+                            nbytes=min(chunk_bytes, direct_nbytes - offset),
+                            direct_io=True,
+                        )
+                        for offset in range(0, direct_nbytes, chunk_bytes)
+                    )
+                )
+                if direct_end < last.file_end:
+                    reads.append(
+                        _SharedCheckpointRead(
+                            filename=first.filename,
+                            file_offset=direct_end,
+                            buffer_offset=(
+                                data_buffer_begin + direct_end - first.file_begin
+                            ),
+                            nbytes=last.file_end - direct_end,
+                            direct_io=False,
+                        )
+                    )
+            elif run_nbytes:
                 read_chunks = min(
                     read_parallelism,
                     math.ceil(run_nbytes / _POSITIONAL_IO_CHUNK_BYTES),
                 )
                 chunk_bytes = math.ceil(run_nbytes / read_chunks)
                 reads.extend(
-                    (
-                        _SharedCheckpointRead(
-                            filename=first.filename,
-                            file_offset=first.file_begin + offset,
-                            buffer_offset=buffer_bytes + offset,
-                            nbytes=min(chunk_bytes, run_nbytes - offset),
-                        )
-                        for offset in range(0, run_nbytes, chunk_bytes)
+                    _SharedCheckpointRead(
+                        filename=first.filename,
+                        file_offset=first.file_begin + offset,
+                        buffer_offset=data_buffer_begin + offset,
+                        nbytes=min(chunk_bytes, run_nbytes - offset),
+                        direct_io=False,
                     )
+                    for offset in range(0, run_nbytes, chunk_bytes)
                 )
             for name, source in run:
                 tensors[name] = _SharedTensorSource(
                     filename=source.filename,
                     file_offset=source.file_begin,
-                    buffer_offset=(buffer_bytes + source.file_begin - first.file_begin),
+                    buffer_offset=(
+                        data_buffer_begin + source.file_begin - first.file_begin
+                    ),
                     entry=source.entry,
                 )
-            buffer_bytes += run_nbytes
+            buffer_bytes = data_buffer_begin + run_nbytes
             run.clear()
 
         for name, source in sources:
@@ -758,10 +879,11 @@ def _populate_shared_checkpoint_group(
             offset=read.buffer_offset,
         )
         try:
-            wall_s = _pread_range_to_tensor(
+            read_result = _pread_range_to_tensor(
                 root / read.filename,
                 target,
                 file_offset=read.file_offset,
+                direct_io=read.direct_io,
                 drop_cache_after_read=drop_cache_after_read,
             )
         finally:
@@ -771,13 +893,17 @@ def _populate_shared_checkpoint_group(
                 "filename": read.filename,
                 "file_offset": read.file_offset,
                 "bytes": read.nbytes,
-                "wall_s": round(wall_s, 6),
+                "direct_io": read_result.direct_io,
+                "wall_s": round(read_result.wall_s, 6),
             }
         )
     return {
         "owner_rank": rank,
         "owned_reads": owned_reads,
         "owned_bytes": sum(read["bytes"] for read in owned_reads),
+        "owned_direct_io_bytes": sum(
+            read["bytes"] for read in owned_reads if read["direct_io"]
+        ),
         "wall_s": round(time.perf_counter() - started, 6),
     }
 
@@ -2535,6 +2661,13 @@ class CPUWeightCache:
                     stats["canonical_read_wait_s"] = round(read_wait_s, 6)
                     stats["canonical_read_bytes"] = source.source_bytes
                     stats["canonical_read_runs"] = len(source.reads)
+                    stats["canonical_direct_io_bytes"] = sum(
+                        read.nbytes for read in source.reads if read.direct_io
+                    )
+                    stats["canonical_rank_direct_io_bytes"] = read_result.get(
+                        "owned_direct_io_bytes",
+                        0,
+                    )
                     stats["canonical_buffer_bytes"] = source.buffer_bytes
                     stats["canonical_shared_buffer_bytes"] = shared_buffer_bytes
                     if transform_stats is not None:
@@ -2789,6 +2922,12 @@ class CPUWeightCache:
                 "loaded_from_disk": True,
                 "physical_host_read_bytes": sum(
                     value["canonical_read_bytes"] for value in group_stats
+                ),
+                "direct_io_bytes": sum(
+                    value["canonical_direct_io_bytes"] for value in group_stats
+                ),
+                "rank_direct_io_bytes": sum(
+                    value["canonical_rank_direct_io_bytes"] for value in group_stats
                 ),
                 "shared_buffer_bytes": max(
                     value["canonical_shared_buffer_bytes"] for value in group_stats

@@ -298,6 +298,55 @@ class TestCPUWeightCache(unittest.TestCase):
                         )
                     )
 
+    def test_shared_checkpoint_groups_use_aligned_direct_reads(self):
+        buffer = None
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            expected = torch.arange(1 << 20, dtype=torch.int32)
+            save_file({"model.weight": expected}, root / "model.safetensors")
+            group = _shared_checkpoint_groups(
+                root=root,
+                weight_map={"model.weight": "model.safetensors"},
+                names_by_group={"model": ["model.weight"]},
+                read_parallelism=4,
+            )["model"]
+            direct_reads = [read for read in group.reads if read.direct_io]
+            self.assertTrue(direct_reads)
+            for read in direct_reads:
+                self.assertEqual(
+                    read.file_offset % cpu_weight_cache._DIRECT_IO_ALIGNMENT,
+                    0,
+                )
+                self.assertEqual(
+                    read.buffer_offset % cpu_weight_cache._DIRECT_IO_ALIGNMENT,
+                    0,
+                )
+                self.assertEqual(
+                    read.nbytes % cpu_weight_cache._DIRECT_IO_ALIGNMENT,
+                    0,
+                )
+
+            try:
+                buffer = HostSharedMemoryBuffer(
+                    nbytes=group.buffer_bytes,
+                    cpu_group=None,
+                    name="weight-checkpoint-direct-read-test",
+                )
+                stats = _populate_shared_checkpoint_group(
+                    root=root,
+                    group=group,
+                    buffer=buffer,
+                    cpu_group=None,
+                )
+                self.assertEqual(stats["owned_bytes"], group.source_bytes)
+                source = _SharedCheckpointGroupView(buffer, group.tensors)
+                self.assertTrue(
+                    torch.equal(source.get_tensor("model.weight"), expected)
+                )
+            finally:
+                if buffer is not None:
+                    buffer.close()
+
     def test_invalid_header_fails_loudly(self):
         source = torch.tensor(
             list((1024).to_bytes(8, "little")) + [0] * 8,

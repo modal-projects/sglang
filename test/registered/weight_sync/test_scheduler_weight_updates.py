@@ -307,6 +307,7 @@ def test_cpu_base_uses_cache_initialization():
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         manager.host_cpu_group,
         base_checkpoint_dir="/base",
+        seed_from_active_weights=True,
     )
 
 
@@ -358,6 +359,7 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint(drop_cache):
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         manager.host_cpu_group,
         base_checkpoint_dir="/base",
+        seed_from_active_weights=True,
     )
     if drop_cache:
         drop_page_cache.assert_called_once_with("/canonical")
@@ -434,7 +436,7 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         host_cpu_group=manager.host_cpu_group,
     )
     manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
-    drop_page_cache.assert_called_once_with("/canonical")
+    drop_page_cache.assert_not_called()
     assert (
         result.rank_stats[0]["stage"]["canonical_checkpoint_materialization"][
             "target_version"
@@ -454,9 +456,15 @@ def test_cpu_weight_cache_initialization_runs_in_background():
     started = threading.Event()
     release = threading.Event()
 
-    def initialize(host_cpu_group, *, base_checkpoint_dir):
+    def initialize(
+        host_cpu_group,
+        *,
+        base_checkpoint_dir,
+        seed_from_active_weights,
+    ):
         assert host_cpu_group is manager.host_cpu_group
         assert base_checkpoint_dir == "/base"
+        assert seed_from_active_weights
         started.set()
         assert release.wait(timeout=5)
         return {"operation": "initialize_cpu_weight_cache"}

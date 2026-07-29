@@ -3,6 +3,7 @@
 import concurrent.futures
 import json
 import tempfile
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -920,6 +921,70 @@ class TestCPUWeightCache(unittest.TestCase):
                 join=True,
                 start_method="fork",
             )
+
+    def test_disk_checkpoint_read_overlaps_runtime_compilation(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            save_file(
+                {"group0.weight": torch.arange(8)},
+                root / "group0.safetensors",
+            )
+            save_file(
+                {"group1.weight": torch.arange(8)},
+                root / "group1.safetensors",
+            )
+            cache = object.__new__(CPUWeightCache)
+            cache.host_cpu_group = None
+            cache.groups = [
+                _WeightModuleGroup(path="group0", nbytes=64),
+                _WeightModuleGroup(path="group1", nbytes=64),
+            ]
+            cache._run_on_all_host_ranks = lambda _, function: function()
+
+            second_read_started = threading.Event()
+            finish_second_read = threading.Event()
+
+            def populate(*, group, **_):
+                if group.path == "group1":
+                    second_read_started.set()
+                    if not finish_second_read.wait(timeout=2):
+                        raise TimeoutError("runtime compilation did not overlap read")
+                return {"wall_s": 0.01}
+
+            def load_group(*, group, **_):
+                if group.path == "group0":
+                    if not second_read_started.wait(timeout=2):
+                        raise TimeoutError("next checkpoint group was not prefetched")
+                    finish_second_read.set()
+                return group
+
+            cache._load_group_into_cpu_image = load_group
+            cache._finalize_cpu_image_group = lambda _: (
+                set(),
+                0,
+                {"wall_s": 0.01},
+            )
+
+            with mock.patch.object(
+                cpu_weight_cache,
+                "_populate_shared_checkpoint_group",
+                side_effect=populate,
+            ):
+                results = list(
+                    cache._compile_disk_checkpoint(
+                        root=root,
+                        weight_map={
+                            "group0.weight": "group0.safetensors",
+                            "group1.weight": "group1.safetensors",
+                        },
+                        names_by_group={
+                            "group0": ["group0.weight"],
+                            "group1": ["group1.weight"],
+                        },
+                    )
+                )
+
+            self.assertEqual(len(results), 2)
 
     def test_canonical_checkpoint_population_reads_each_file_once(self):
         source = None

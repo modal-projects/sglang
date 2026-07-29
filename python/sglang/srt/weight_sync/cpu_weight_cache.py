@@ -25,6 +25,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -2222,70 +2223,112 @@ class CPUWeightCache:
             groups,
             cpu_group=self.host_cpu_group,
         )
-        capacity = max(
-            (group.buffer_bytes for group in groups.values()),
-            default=0,
-        )
-        shared_buffer = HostSharedMemoryBuffer(
-            nbytes=max(1, capacity),
-            cpu_group=self.host_cpu_group,
-            name="weight-checkpoint-group",
-        )
+        sources = [groups[group.path] for group in self.groups]
+        capacities = [
+            max(
+                (
+                    source.buffer_bytes
+                    for index, source in enumerate(sources)
+                    if index % 2 == buffer_index
+                ),
+                default=0,
+            )
+            for buffer_index in range(2)
+        ]
+        shared_buffers = [
+            HostSharedMemoryBuffer(
+                nbytes=max(1, capacity),
+                cpu_group=self.host_cpu_group,
+                name=f"weight-checkpoint-group-{index}",
+            )
+            for index, capacity in enumerate(capacities)
+        ]
+        shared_buffer_bytes = sum(buffer.nbytes for buffer in shared_buffers)
         try:
-            for group_index, group in enumerate(self.groups, start=1):
-                source = groups[group.path]
+            with ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="weight-checkpoint-read",
+            ) as reader:
 
-                read_started = time.perf_counter()
-                self._run_on_all_host_ranks(
-                    f"canonical checkpoint read for group {group.path!r}",
-                    lambda: _populate_shared_checkpoint_group(
+                def submit_read(index: int):
+                    return reader.submit(
+                        _populate_shared_checkpoint_group,
                         root=root,
-                        group=source,
-                        buffer=shared_buffer,
+                        group=sources[index],
+                        buffer=shared_buffers[index % 2],
                         cpu_group=self.host_cpu_group,
-                    ),
-                )
-                read_wall_s = time.perf_counter() - read_started
-                tensor_file = _SharedCheckpointGroupView(
-                    shared_buffer,
-                    source.tensors,
-                )
-
-                def compile_group():
-                    loaded = self._load_group_into_cpu_image(
-                        group_index=group_index,
-                        group=group,
-                        names=names_by_group[group.path],
-                        get_tensor=tensor_file.get_tensor,
                     )
-                    try:
-                        return self._finalize_cpu_image_group(loaded)
-                    finally:
-                        del loaded
 
-                result = self._run_on_all_host_ranks(
-                    f"runtime compilation for group {group.path!r}",
-                    compile_group,
-                )
-                stats = result[2]
-                stats["canonical_read_s"] = round(read_wall_s, 6)
-                stats["canonical_read_bytes"] = source.source_bytes
-                stats["canonical_read_runs"] = len(source.reads)
-                stats["canonical_buffer_bytes"] = source.buffer_bytes
-                stats["wall_s"] = round(stats["wall_s"] + read_wall_s, 6)
-                yield result
+                pending_read = submit_read(0) if sources else None
+                for source_index, (group, source) in enumerate(
+                    zip(self.groups, sources)
+                ):
+                    wait_started = time.perf_counter()
+                    read_result = None
+                    read_error = None
+                    try:
+                        assert pending_read is not None
+                        read_result = pending_read.result()
+                    except Exception as exc:
+                        read_error = f"{type(exc).__name__}: {exc}"
+
+                    def finish_read():
+                        if read_error is not None:
+                            raise RuntimeError(read_error)
+                        return read_result
+
+                    read_result = self._run_on_all_host_ranks(
+                        f"canonical checkpoint read for group {group.path!r}",
+                        finish_read,
+                    )
+                    read_wait_s = time.perf_counter() - wait_started
+                    next_index = source_index + 1
+                    pending_read = (
+                        submit_read(next_index) if next_index < len(sources) else None
+                    )
+                    tensor_file = _SharedCheckpointGroupView(
+                        shared_buffers[source_index % 2],
+                        source.tensors,
+                    )
+
+                    def compile_group():
+                        loaded = self._load_group_into_cpu_image(
+                            group_index=next_index,
+                            group=group,
+                            names=names_by_group[group.path],
+                            get_tensor=tensor_file.get_tensor,
+                        )
+                        try:
+                            return self._finalize_cpu_image_group(loaded)
+                        finally:
+                            del loaded
+
+                    result = self._run_on_all_host_ranks(
+                        f"runtime compilation for group {group.path!r}",
+                        compile_group,
+                    )
+                    stats = result[2]
+                    stats["canonical_read_s"] = read_result["wall_s"]
+                    stats["canonical_read_wait_s"] = round(read_wait_s, 6)
+                    stats["canonical_read_bytes"] = source.source_bytes
+                    stats["canonical_read_runs"] = len(source.reads)
+                    stats["canonical_buffer_bytes"] = source.buffer_bytes
+                    stats["canonical_shared_buffer_bytes"] = shared_buffer_bytes
+                    stats["wall_s"] = round(stats["wall_s"] + read_wait_s, 6)
+                    yield result
         finally:
             logger.info(
                 "Releasing shared canonical checkpoint group buffer: bytes=%d",
-                shared_buffer.nbytes,
+                shared_buffer_bytes,
             )
             started = time.perf_counter()
             gc.collect()
-            shared_buffer.close()
+            for shared_buffer in shared_buffers:
+                shared_buffer.close()
             logger.info(
                 "Released shared canonical checkpoint group buffer: "
                 "bytes=%d wall_time=%.3fs",
-                shared_buffer.nbytes,
+                shared_buffer_bytes,
                 time.perf_counter() - started,
             )
 
@@ -2420,6 +2463,7 @@ class CPUWeightCache:
             )
             for phase in (
                 "canonical_read_s",
+                "canonical_read_wait_s",
                 "cpu_clone_s",
                 "restore_s",
                 "cpu_load_s",
@@ -2473,6 +2517,9 @@ class CPUWeightCache:
             }
         else:
             canonical_read_s = sum(value["canonical_read_s"] for value in group_stats)
+            canonical_read_wait_s = sum(
+                value["canonical_read_wait_s"] for value in group_stats
+            )
             cpu_load_s = sum(value["cpu_load_s"] for value in group_stats)
             source_summary = {
                 "storage": "disk",
@@ -2485,10 +2532,11 @@ class CPUWeightCache:
                     value["canonical_read_bytes"] for value in group_stats
                 ),
                 "shared_buffer_bytes": max(
-                    value["canonical_buffer_bytes"] for value in group_stats
+                    value["canonical_shared_buffer_bytes"] for value in group_stats
                 ),
                 "read_runs": sum(value["canonical_read_runs"] for value in group_stats),
                 "read_wall_s": round(canonical_read_s, 6),
+                "read_wait_wall_s": round(canonical_read_wait_s, 6),
                 "cpu_load_wall_s": round(cpu_load_s, 6),
                 "load_wall_s": round(canonical_read_s + cpu_load_s, 6),
                 "transform_wall_s": 0.0,

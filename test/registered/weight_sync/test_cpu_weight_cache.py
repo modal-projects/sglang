@@ -1242,7 +1242,7 @@ class TestCPUWeightCache(unittest.TestCase):
             },
         )
 
-    def test_canonical_transform_writers_persist_disjoint_tensor_ranges(self):
+    def test_canonical_file_writer_persists_disjoint_tensor_ranges(self):
         with tempfile.TemporaryDirectory() as root_value:
             root = Path(root_value)
             filename = "model.safetensors"
@@ -1268,32 +1268,31 @@ class TestCPUWeightCache(unittest.TestCase):
                 )
             ]
             operations = {filename: {"a": [None], "b": [None]}}
-            writers = [
-                _CanonicalCheckpointWriter(
-                    root=root,
-                    sources=sources,
-                    operations_by_file=operations,
-                    rank=rank,
-                    world_size=2,
-                    drop_cache_after_write=False,
-                )
-                for rank in range(2)
-            ]
+            writer = _CanonicalCheckpointWriter(
+                root=root,
+                sources=sources,
+                operations_by_file=operations,
+                rank=0,
+                world_size=1,
+                cpu_group=None,
+                drop_cache_after_write=False,
+            )
             try:
-                self.assertEqual(set(writers[0].sources), {"a"})
-                self.assertEqual(set(writers[1].sources), {"b"})
-                writers[0].write("a", bytearray([11] * 32), [(0, 32)])
-                writers[1].write("b", bytearray([29] * 32), [(0, 32)])
+                tensors = {
+                    "a": torch.tensor([11] * 32, dtype=torch.uint8),
+                    "b": torch.tensor([29] * 32, dtype=torch.uint8),
+                }
+                writer.write("a", tensors["a"], [(0, 32)])
+                writer.write("b", tensors["b"], [(0, 32)])
+                self.assertEqual(path.read_bytes(), bytes(64))
 
-                for writer in writers:
-                    writer.finish_group(0)
-                for writer in writers:
-                    writer.validate()
+                writer.write_pending_group(tensors.__getitem__)
+                writer.finish_group(0)
+                writer.validate()
 
                 self.assertEqual(path.read_bytes(), bytes([11] * 32 + [29] * 32))
             finally:
-                for writer in writers:
-                    writer.close()
+                writer.close()
 
     def test_disk_delta_transform_persists_the_compiled_shared_buffer(self):
         class Transform:

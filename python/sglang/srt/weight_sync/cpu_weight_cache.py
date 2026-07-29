@@ -586,11 +586,14 @@ class _CanonicalCheckpointWriter:
         operations_by_file: dict[str, dict[str, Any]],
         rank: int,
         world_size: int,
+        cpu_group: Any,
         drop_cache_after_write: bool,
     ):
         from sglang.srt.weight_sync.disk_checkpoint import drop_file_page_cache
 
         self.root = root
+        self._world_size = world_size
+        self._cpu_group = cpu_group
         self.drop_file_page_cache = drop_file_page_cache
         self.drop_cache_after_write = drop_cache_after_write
         filesystem = os.statvfs(root)
@@ -610,20 +613,27 @@ class _CanonicalCheckpointWriter:
             name: source
             for group in sources
             for name, source in group.tensors.items()
+            if name in owners
+        }
+        self.transform_sources = {
+            name: source
+            for group in sources
+            for name, source in group.tensors.items()
             if owners.get(name) == rank
         }
-        self.expected_names = set(self.sources)
+        self.expected_names = {
+            name
+            for name, source in self.sources.items()
+            if source.filename in self.flush_files
+        }
         self.last_group = {}
         for group_index, group in enumerate(sources):
             for name, source in group.tensors.items():
-                if name in owners:
+                if name in self.expected_names:
                     self.last_group[source.filename] = group_index
-        open_files = self.flush_files | {
-            source.filename for source in self.sources.values()
-        }
         self.fds = {}
         try:
-            for filename in open_files:
+            for filename in self.flush_files:
                 self.fds[filename] = os.open(root / filename, os.O_RDWR)
         except Exception:
             self.close()
@@ -634,47 +644,90 @@ class _CanonicalCheckpointWriter:
         self.write_bytes = 0
         self.write_worker_s = 0.0
         self.flush_worker_s = 0.0
+        self._pending_writes = []
         self.lock = threading.Lock()
 
     def owns(self, name: str) -> bool:
-        return name in self.sources
+        return name in self.transform_sources
 
     def write(
         self,
         name: str,
-        region: Any,
+        _region: Any,
         ranges: list[tuple[int, int]],
     ) -> None:
-        source = self.sources[name]
-        view = memoryview(region).cast("B")
-        started = time.perf_counter()
-        fd = self.fds[source.filename]
-        write_bytes = 0
-        for begin, end in ranges:
-            position = begin
-            while position < end:
-                chunk_end = min(position + _POSITIONAL_IO_CHUNK_BYTES, end)
-                written = os.pwrite(
-                    fd,
-                    view[position:chunk_end],
-                    source.file_offset + position,
-                )
-                if written <= 0:
-                    raise RuntimeError(
-                        f"short canonical checkpoint write for {name!r}: "
-                        f"range=({begin}, {end}) actual={position - begin}"
-                    )
-                position += written
-                write_bytes += written
+        if name not in self.transform_sources:
+            raise RuntimeError(f"rank does not own canonical tensor {name!r}")
         with self.lock:
-            self.write_worker_s += time.perf_counter() - started
-            self.logical_bytes += len(view)
-            self.write_bytes += write_bytes
-            if write_bytes:
-                self.dirty_files.add(source.filename)
-            self.written_names.add(name)
+            self._pending_writes.append((name, ranges))
+
+    def write_pending_group(
+        self,
+        get_tensor_bytes: Callable[[str], torch.Tensor],
+    ) -> None:
+        with self.lock:
+            pending_writes = self._pending_writes
+            self._pending_writes = []
+
+        if self._world_size > 1:
+            writes_by_rank = [None] * self._world_size
+            torch.distributed.all_gather_object(
+                writes_by_rank,
+                pending_writes,
+                group=self._cpu_group,
+            )
+            pending_writes = [
+                write for rank_writes in writes_by_rank for write in rank_writes
+            ]
+
+        writes_by_file = {}
+        for name, ranges in pending_writes:
+            source = self.sources[name]
+            if source.filename in self.flush_files:
+                writes_by_file.setdefault(source.filename, []).append(
+                    (name, source.file_offset, ranges)
+                )
+
+        for filename, writes in sorted(writes_by_file.items()):
+            fd = self.fds[filename]
+            write_bytes = 0
+            started = time.perf_counter()
+            for name, file_offset, ranges in sorted(
+                writes,
+                key=lambda item: item[1],
+            ):
+                view = memoryview(get_tensor_bytes(name).numpy()).cast("B")
+                self.logical_bytes += len(view)
+                self.written_names.add(name)
+                for begin, end in ranges:
+                    position = begin
+                    while position < end:
+                        chunk_end = min(
+                            position + _POSITIONAL_IO_CHUNK_BYTES,
+                            end,
+                        )
+                        written = os.pwrite(
+                            fd,
+                            view[position:chunk_end],
+                            file_offset + position,
+                        )
+                        if written <= 0:
+                            raise RuntimeError(
+                                "short canonical checkpoint write for "
+                                f"{name!r}: range=({begin}, {end}) "
+                                f"actual={position - begin}"
+                            )
+                        position += written
+                        write_bytes += written
+            with self.lock:
+                self.write_worker_s += time.perf_counter() - started
+                self.write_bytes += write_bytes
+                if write_bytes:
+                    self.dirty_files.add(filename)
 
     def finish_group(self, group_index: int) -> None:
+        if self._pending_writes:
+            raise RuntimeError("canonical checkpoint writes are still pending")
         filenames = [
             filename
             for filename, last_group in self.last_group.items()
@@ -2660,6 +2713,7 @@ class CPUWeightCache:
                     operations_by_file=checkpoint_transform.operations_by_file,
                     rank=rank,
                     world_size=world_size,
+                    cpu_group=self.host_cpu_group,
                     drop_cache_after_write=self.drop_cache_after_load,
                 )
 
@@ -2764,12 +2818,19 @@ class CPUWeightCache:
                             transform_group,
                         )
                         source_stats.append(transform_stats)
+                        self._run_on_all_host_ranks(
+                            f"canonical checkpoint writes for group {group.path!r}",
+                            functools.partial(
+                                writer.write_pending_group,
+                                tensor_file.get_tensor_bytes,
+                            ),
+                        )
 
                     def compile_group():
                         if writer is not None:
-                            # The transform barrier above makes every disjoint
-                            # positional write visible before one rank flushes
-                            # and closes the completed checkpoint files.
+                            # The write barrier above makes every positional
+                            # update visible before one rank flushes and closes
+                            # the completed checkpoint files.
                             writer.finish_group(source_index)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,

@@ -359,6 +359,9 @@ class WeightUpdater:
                         )
                         else "memory"
                     ),
+                    drop_cache_after_load=(
+                        runner.server_args.weight_loader_drop_cache_after_load
+                    ),
                 )
             except Exception as exc:
                 construction_error = f"{type(exc).__name__}: {exc}"

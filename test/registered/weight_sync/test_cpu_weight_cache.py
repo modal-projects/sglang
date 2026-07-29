@@ -935,6 +935,7 @@ class TestCPUWeightCache(unittest.TestCase):
             )
             cache = object.__new__(CPUWeightCache)
             cache.host_cpu_group = None
+            cache.drop_cache_after_load = True
             cache.groups = [
                 _WeightModuleGroup(path="group0", nbytes=64),
                 _WeightModuleGroup(path="group1", nbytes=64),
@@ -943,8 +944,10 @@ class TestCPUWeightCache(unittest.TestCase):
 
             second_read_started = threading.Event()
             finish_second_read = threading.Event()
+            drop_cache_flags = []
 
-            def populate(*, group, **_):
+            def populate(*, group, drop_cache_after_read, **_):
+                drop_cache_flags.append(drop_cache_after_read)
                 if group.path == "group1":
                     second_read_started.set()
                     if not finish_second_read.wait(timeout=2):
@@ -985,6 +988,7 @@ class TestCPUWeightCache(unittest.TestCase):
                 )
 
             self.assertEqual(len(results), 2)
+            self.assertEqual(drop_cache_flags, [True, True])
 
     def test_canonical_checkpoint_population_reads_each_file_once(self):
         source = None
@@ -1039,6 +1043,7 @@ class TestCPUWeightCache(unittest.TestCase):
             save_file({"weight": expected}, root / "model.safetensors")
             compiler = object.__new__(CPUWeightCache)
             compiler.host_cpu_group = None
+            compiler.drop_cache_after_load = False
             group = _WeightModuleGroup(path="model", nbytes=expected.nbytes)
             compiler.groups = [group]
             loaded_group = object()

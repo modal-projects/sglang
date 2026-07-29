@@ -472,9 +472,12 @@ def _shared_checkpoint_groups(
     root: Path,
     weight_map: dict[str, str],
     names_by_group: dict[str, list[str]],
+    read_parallelism: int = 1,
 ) -> dict[str, _SharedCheckpointGroup]:
     """Plan bounded, physically ordered reads for every runtime module group."""
 
+    if read_parallelism <= 0:
+        raise ValueError("checkpoint read parallelism must be positive")
     layouts = {
         filename: _read_safetensors_layout(root / filename)
         for filename in sorted(set(weight_map.values()))
@@ -529,20 +532,30 @@ def _shared_checkpoint_groups(
             buffer_bytes = _align_shared_tensor_offset(buffer_bytes)
             first = run[0][1]
             last = run[-1][1]
-            reads.append(
-                _SharedCheckpointRead(
-                    filename=first.filename,
-                    file_offset=first.file_begin,
-                    buffer_offset=buffer_bytes,
-                    nbytes=last.file_end - first.file_begin,
+            run_nbytes = last.file_end - first.file_begin
+            if run_nbytes:
+                read_chunks = min(
+                    read_parallelism,
+                    math.ceil(run_nbytes / _POSITIONAL_IO_CHUNK_BYTES),
                 )
-            )
+                chunk_bytes = math.ceil(run_nbytes / read_chunks)
+                reads.extend(
+                    (
+                        _SharedCheckpointRead(
+                            filename=first.filename,
+                            file_offset=first.file_begin + offset,
+                            buffer_offset=buffer_bytes + offset,
+                            nbytes=min(chunk_bytes, run_nbytes - offset),
+                        )
+                        for offset in range(0, run_nbytes, chunk_bytes)
+                    )
+                )
             for name, source in run:
                 tensors[name] = _SharedTensorSource(
                     buffer_offset=(buffer_bytes + source.file_begin - first.file_begin),
                     entry=source.entry,
                 )
-            buffer_bytes += last.file_end - first.file_begin
+            buffer_bytes += run_nbytes
             run.clear()
 
         for name, source in sources:
@@ -2180,10 +2193,16 @@ class CPUWeightCache:
     ):
         """Compile bounded groups after reading each canonical byte once per host."""
 
+        read_parallelism = (
+            torch.distributed.get_world_size(group=self.host_cpu_group)
+            if torch.distributed.is_initialized()
+            else 1
+        )
         groups = _shared_checkpoint_groups(
             root=root,
             weight_map=weight_map,
             names_by_group=names_by_group,
+            read_parallelism=read_parallelism,
         )
         _validate_shared_checkpoint_groups(
             groups,

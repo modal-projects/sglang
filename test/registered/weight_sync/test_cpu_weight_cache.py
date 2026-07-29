@@ -137,6 +137,7 @@ def _shared_checkpoint_group_worker(
     buffer = None
     try:
         root = Path(root_value)
+        cpu_weight_cache._POSITIONAL_IO_CHUNK_BYTES = 16
         weight_map = {
             f"layer.{index}": f"{index}.safetensors" for index in range(world_size)
         }
@@ -144,7 +145,10 @@ def _shared_checkpoint_group_worker(
             root=root,
             weight_map=weight_map,
             names_by_group={"model": sorted(weight_map)},
+            read_parallelism=world_size,
         )["model"]
+        if len(group.reads) <= len(weight_map):
+            raise AssertionError("checkpoint ranges were not split across ranks")
         buffer = HostSharedMemoryBuffer(
             nbytes=group.buffer_bytes,
             cpu_group=torch.distributed.group.WORLD,

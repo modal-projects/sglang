@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import fcntl
 import functools
 import gc
 import hashlib
@@ -591,6 +592,7 @@ class _CanonicalCheckpointWriter:
         from sglang.srt.weight_sync.disk_checkpoint import drop_file_page_cache
 
         self.root = root
+        self._rank = rank
         self.drop_file_page_cache = drop_file_page_cache
         self.drop_cache_after_write = drop_cache_after_write
         filesystem = os.statvfs(root)
@@ -634,6 +636,7 @@ class _CanonicalCheckpointWriter:
         self.write_bytes = 0
         self.write_worker_s = 0.0
         self.flush_worker_s = 0.0
+        self._pending_writes = []
         self.lock = threading.Lock()
 
     def owns(self, name: str) -> bool:
@@ -645,36 +648,72 @@ class _CanonicalCheckpointWriter:
         region: Any,
         ranges: list[tuple[int, int]],
     ) -> None:
-        source = self.sources[name]
         view = memoryview(region).cast("B")
-        started = time.perf_counter()
-        fd = self.fds[source.filename]
-        write_bytes = 0
-        for begin, end in ranges:
-            position = begin
-            while position < end:
-                chunk_end = min(position + _POSITIONAL_IO_CHUNK_BYTES, end)
-                written = os.pwrite(
-                    fd,
-                    view[position:chunk_end],
-                    source.file_offset + position,
-                )
-                if written <= 0:
-                    raise RuntimeError(
-                        f"short canonical checkpoint write for {name!r}: "
-                        f"range=({begin}, {end}) actual={position - begin}"
-                    )
-                position += written
-                write_bytes += written
         with self.lock:
-            self.write_worker_s += time.perf_counter() - started
             self.logical_bytes += len(view)
-            self.write_bytes += write_bytes
-            if write_bytes:
-                self.dirty_files.add(source.filename)
             self.written_names.add(name)
+            self._pending_writes.append((name, view, ranges))
+
+    def write_pending_group(self) -> None:
+        with self.lock:
+            pending_writes = self._pending_writes
+            self._pending_writes = []
+
+        writes_by_file = {}
+        for name, view, ranges in pending_writes:
+            source = self.sources[name]
+            writes_by_file.setdefault(source.filename, []).append(
+                (name, source.file_offset, view, ranges)
+            )
+
+        filenames = sorted(self.fds)
+        if filenames:
+            offset = self._rank % len(filenames)
+            filenames = filenames[offset:] + filenames[:offset]
+        for filename in filenames:
+            writes = writes_by_file.get(filename)
+            if not writes:
+                continue
+            fd = self.fds[filename]
+            write_bytes = 0
+            started = time.perf_counter()
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                for name, file_offset, view, ranges in sorted(
+                    writes,
+                    key=lambda item: item[1],
+                ):
+                    for begin, end in ranges:
+                        position = begin
+                        while position < end:
+                            chunk_end = min(
+                                position + _POSITIONAL_IO_CHUNK_BYTES,
+                                end,
+                            )
+                            written = os.pwrite(
+                                fd,
+                                view[position:chunk_end],
+                                file_offset + position,
+                            )
+                            if written <= 0:
+                                raise RuntimeError(
+                                    "short canonical checkpoint write for "
+                                    f"{name!r}: range=({begin}, {end}) "
+                                    f"actual={position - begin}"
+                                )
+                            position += written
+                            write_bytes += written
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with self.lock:
+                self.write_worker_s += time.perf_counter() - started
+                self.write_bytes += write_bytes
+                if write_bytes:
+                    self.dirty_files.add(filename)
 
     def finish_group(self, group_index: int) -> None:
+        if self._pending_writes:
+            raise RuntimeError("canonical checkpoint writes are still pending")
         filenames = [
             filename
             for filename, last_group in self.last_group.items()
@@ -2764,12 +2803,16 @@ class CPUWeightCache:
                             transform_group,
                         )
                         source_stats.append(transform_stats)
+                        self._run_on_all_host_ranks(
+                            f"canonical checkpoint writes for group {group.path!r}",
+                            writer.write_pending_group,
+                        )
 
                     def compile_group():
                         if writer is not None:
-                            # The transform barrier above makes every disjoint
-                            # positional write visible before one rank flushes
-                            # and closes the completed checkpoint files.
+                            # The write barrier above makes every positional
+                            # update visible before one rank flushes and closes
+                            # the completed checkpoint files.
                             writer.finish_group(source_index)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,

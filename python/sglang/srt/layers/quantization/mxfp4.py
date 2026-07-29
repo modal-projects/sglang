@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Optional
 
@@ -156,6 +158,38 @@ def _parallel_cpu_index_select(
         for future in futures:
             future.result()
     return output
+
+
+def _parallel_cpu_zero_(tensors: Iterable[torch.Tensor]) -> None:
+    byte_views = []
+    seen = set()
+    for tensor in tensors:
+        byte_view = tensor.view(torch.uint8).reshape(-1)
+        key = (byte_view.data_ptr(), byte_view.numel())
+        if key in seen:
+            continue
+        seen.add(key)
+        byte_views.append(byte_view)
+
+    if not byte_views:
+        return
+    total_bytes = sum(byte_view.numel() for byte_view in byte_views)
+    workers = min(_cpu_weight_transform_workers(), total_bytes)
+    if workers <= 1:
+        for byte_view in byte_views:
+            byte_view.zero_()
+        return
+
+    chunk_bytes = max(1, math.ceil(total_bytes / workers))
+    chunks = [
+        byte_view[offset : offset + chunk_bytes]
+        for byte_view in byte_views
+        for offset in range(0, byte_view.numel(), chunk_bytes)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(chunk.zero_) for chunk in chunks]
+        for future in futures:
+            future.result()
 
 
 def _compose_trtllm_gate_up_permutation(
@@ -620,15 +654,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             parameter = getattr(layer, name)
             if parameter.dtype != torch.uint8:
                 parameter.data = parameter.data.view(torch.uint8)
-        for name in (
-            "w13_weight",
-            "w13_weight_scale",
-            "w13_weight_bias",
-            "w2_weight",
-            "w2_weight_scale",
-            "w2_weight_bias",
-        ):
-            getattr(layer, name).data.zero_()
+        tensors = [
+            getattr(layer, name).data
+            for name in (
+                "w13_weight",
+                "w13_weight_scale",
+                "w13_weight_bias",
+                "w2_weight",
+                "w2_weight_scale",
+                "w2_weight_bias",
+            )
+        ]
+        if tensors[0].device.type == "cpu":
+            _parallel_cpu_zero_(tensors)
+        else:
+            for tensor in tensors:
+                tensor.zero_()
 
     def supports_batched_weight_loading(self) -> bool:
         return True

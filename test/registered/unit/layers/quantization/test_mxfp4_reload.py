@@ -10,6 +10,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.mxfp4 import (
     Mxfp4MoEMethod,
     _compose_trtllm_gate_up_permutation,
+    _parallel_cpu_zero_,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
@@ -116,6 +117,21 @@ def _make_hybrid_layer(seed: int) -> torch.nn.Module:
 
 
 class TestMxfp4Reload(unittest.TestCase):
+    def test_parallel_cpu_zero_preserves_tensor_boundaries(self):
+        storage = torch.full((32,), 7, dtype=torch.uint8)
+        first = storage[4:12]
+        second = storage[16:28].view(torch.bfloat16)
+
+        _parallel_cpu_zero_((first, first, second))
+
+        torch.testing.assert_close(storage[:4], torch.full((4,), 7, dtype=torch.uint8))
+        torch.testing.assert_close(storage[4:12], torch.zeros(8, dtype=torch.uint8))
+        torch.testing.assert_close(
+            storage[12:16], torch.full((4,), 7, dtype=torch.uint8)
+        )
+        torch.testing.assert_close(storage[16:28], torch.zeros(12, dtype=torch.uint8))
+        torch.testing.assert_close(storage[28:], torch.full((4,), 7, dtype=torch.uint8))
+
     def test_gate_up_reordering_is_composed_with_runtime_permutation(self):
         indices = torch.tensor([3, 0, 2, 1])
         rows = torch.arange(4)

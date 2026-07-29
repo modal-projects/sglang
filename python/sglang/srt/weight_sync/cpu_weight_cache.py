@@ -1570,7 +1570,12 @@ class CPUWeightCache:
             raise RuntimeError(f"{description} failed: " + "; ".join(errors))
         return result
 
-    def initialize_from_checkpoint(self, *, checkpoint_dir: str) -> dict[str, Any]:
+    def initialize_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        seed_from_active_weights: bool,
+    ) -> dict[str, Any]:
         """Populate the canonical checkpoint and rank-ready weight image."""
 
         started = time.perf_counter()
@@ -1624,26 +1629,35 @@ class CPUWeightCache:
                 "setup_wall_s": 0.0,
                 "wall_s": 0.0,
             }
-        baseline_stage = self._stage_from_checkpoint(
-            checkpoint_dir=checkpoint_dir,
-            target_version=0,
-            checkpoint_transform=_NoOpCheckpointTransform(),
-        )
-        validation = self.image.validate_against_active()
-        self.image.accept_staged_baseline()
+        if seed_from_active_weights:
+            initial_compile_wall_s = 0.0
+            validation_wall_s = 0.0
+            rank_image_source = "active_model"
+        else:
+            baseline_stage = self._stage_from_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                target_version=0,
+                checkpoint_transform=_NoOpCheckpointTransform(),
+            )
+            validation = self.image.validate_against_active()
+            self.image.accept_staged_baseline()
+            initial_compile_wall_s = baseline_stage["wall_s"]
+            validation_wall_s = validation["wall_s"]
+            rank_image_source = "checkpoint"
         stats = {
             "operation": "initialize_cpu_weight_cache",
             "canonical_checkpoint_storage": self.canonical_checkpoint_storage,
             "canonical_checkpoint_bytes": canonical_checkpoint_bytes,
             "rank_image_bytes": self.image.image_nbytes,
             "rank_weight_bytes": self.image.weight_nbytes,
+            "rank_image_source": rank_image_source,
             "compile_group_limit_bytes": self.max_group_bytes,
             "registration_wall_s": registration["wall_s"],
             "capture_wall_s": seed["wall_s"],
             "canonical_setup_wall_s": canonical_checkpoint_stats["setup_wall_s"],
             "canonical_load_wall_s": canonical_checkpoint_stats["wall_s"],
-            "initial_compile_wall_s": baseline_stage["wall_s"],
-            "validation_wall_s": validation["wall_s"],
+            "initial_compile_wall_s": initial_compile_wall_s,
+            "validation_wall_s": validation_wall_s,
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.info(

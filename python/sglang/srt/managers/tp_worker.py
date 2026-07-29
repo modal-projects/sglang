@@ -144,10 +144,17 @@ class BaseTpWorker(ABC):
             host_cpu_group=host_cpu_group,
         )
 
-    def initialize_cpu_weight_cache(self, host_cpu_group, *, base_checkpoint_dir: str):
+    def initialize_cpu_weight_cache(
+        self,
+        host_cpu_group,
+        *,
+        base_checkpoint_dir: str,
+        seed_from_active_weights: bool,
+    ):
         return self.model_runner.weight_updater.initialize_cpu_weight_cache(
             host_cpu_group,
             base_checkpoint_dir=base_checkpoint_dir,
+            seed_from_active_weights=seed_from_active_weights,
         )
 
     def update_weights_from_cpu(

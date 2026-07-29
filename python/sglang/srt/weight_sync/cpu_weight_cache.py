@@ -626,6 +626,22 @@ class _CanonicalCheckpointWriter:
             for name, source in self.sources.items()
             if source.filename in self.flush_files
         }
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available_cpus = os.cpu_count() or 1
+        write_workers = min(
+            len(self.flush_files),
+            max(1, available_cpus // world_size),
+        )
+        self._write_executor = (
+            ThreadPoolExecutor(
+                max_workers=write_workers,
+                thread_name_prefix="canonical-checkpoint-write",
+            )
+            if write_workers > 1
+            else None
+        )
         self.last_group = {}
         for group_index, group in enumerate(sources):
             for name, source in group.tensors.items():
@@ -688,17 +704,19 @@ class _CanonicalCheckpointWriter:
                     (name, source.file_offset, ranges)
                 )
 
-        for filename, writes in sorted(writes_by_file.items()):
+        def write_file(item):
+            filename, writes = item
             fd = self.fds[filename]
             write_bytes = 0
-            started = time.perf_counter()
+            logical_bytes = 0
+            written_names = set()
             for name, file_offset, ranges in sorted(
                 writes,
                 key=lambda item: item[1],
             ):
                 view = memoryview(get_tensor_bytes(name).numpy()).cast("B")
-                self.logical_bytes += len(view)
-                self.written_names.add(name)
+                logical_bytes += len(view)
+                written_names.add(name)
                 for begin, end in ranges:
                     position = begin
                     while position < end:
@@ -719,11 +737,21 @@ class _CanonicalCheckpointWriter:
                             )
                         position += written
                         write_bytes += written
-            with self.lock:
-                self.write_worker_s += time.perf_counter() - started
-                self.write_bytes += write_bytes
-                if write_bytes:
-                    self.dirty_files.add(filename)
+            return filename, written_names, logical_bytes, write_bytes
+
+        items = sorted(writes_by_file.items())
+        started = time.perf_counter()
+        if self._write_executor is None:
+            results = map(write_file, items)
+        else:
+            results = self._write_executor.map(write_file, items)
+        for filename, written_names, logical_bytes, write_bytes in results:
+            self.written_names.update(written_names)
+            self.logical_bytes += logical_bytes
+            self.write_bytes += write_bytes
+            if write_bytes:
+                self.dirty_files.add(filename)
+        self.write_worker_s += time.perf_counter() - started
 
     def finish_group(self, group_index: int) -> None:
         if self._pending_writes:
@@ -749,6 +777,9 @@ class _CanonicalCheckpointWriter:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
+        if self._write_executor is not None:
+            self._write_executor.shutdown(wait=True)
+            self._write_executor = None
         for fd in self.fds.values():
             os.close(fd)
         self.fds.clear()

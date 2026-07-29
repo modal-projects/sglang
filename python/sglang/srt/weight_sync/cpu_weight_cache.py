@@ -1984,10 +1984,10 @@ class CPUWeightCache:
         self._host_rank_coordinator = _HostRankPhaseCoordinator(self.host_cpu_group)
         self._cpu_workers = _host_rank_cpu_workers(self.host_cpu_group)
         logger.info(
-            "CPU weight cache workers: rank=%d workers=%d affinity=%s",
+            "CPU weight cache workers: rank=%d available_cpus=%d workers=%d",
             self._host_rank_coordinator.rank,
+            len(_process_cpu_affinity()),
             self._cpu_workers,
-            sorted(_process_cpu_affinity()),
         )
 
     def _run_on_all_host_ranks(self, description: str, function: Callable[[], Any]):

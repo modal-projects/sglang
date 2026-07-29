@@ -10,6 +10,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -110,7 +111,12 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
+from sglang.srt.utils import (
+    get_weight_loading_cpu_workers,
+    is_blackwell_supported,
+    is_hip,
+    make_layers,
+)
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -2931,8 +2937,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                     load_weight(weight_loader, param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
-        for owner, calls in batched_weight_loads.items():
-            owner.batched_weight_loader(calls)
+        copy_workers = get_weight_loading_cpu_workers(1)
+        if copy_workers == 1:
+            for owner, calls in batched_weight_loads.items():
+                owner.batched_weight_loader(calls)
+        else:
+            with ThreadPoolExecutor(max_workers=copy_workers) as executor:
+                for owner, calls in batched_weight_loads.items():
+                    owner.batched_weight_loader(calls, executor=executor)
         self.post_load_weights(weight_names=loaded_params)
 
     def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):

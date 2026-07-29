@@ -119,23 +119,33 @@ def _make_hybrid_layer(seed: int) -> torch.nn.Module:
 
 
 class TestMxfp4Reload(unittest.TestCase):
-    def test_cpu_staging_preserves_complete_unpadded_buffers(self):
+    def test_cpu_staging_keeps_runtime_buffers(self):
         method = _make_method()
         layer = _make_layer(seed=1)
         method.process_weights_after_loading(layer)
-        before = {
-            name: parameter.detach().clone()
-            for name, parameter in layer.named_parameters()
-        }
+        staged_names = ("w13_weight", "w2_weight")
+        before = {name: getattr(layer, name).detach().clone() for name in staged_names}
 
         method.restore_weights_before_cpu_staging(layer)
 
         for name, expected in before.items():
-            actual = getattr(layer, name)
+            parameter = getattr(layer, name)
+            runtime_buffer = parameter._weight_update_runtime_buffer
             torch.testing.assert_close(
-                actual.view(torch.uint8),
+                runtime_buffer.view(torch.uint8),
                 expected.view(torch.uint8),
             )
+            self.assertNotEqual(parameter.data_ptr(), runtime_buffer.data_ptr())
+
+        method.restore_weights_before_cpu_staging(layer)
+        for name, expected in before.items():
+            parameter = getattr(layer, name)
+            runtime_buffer = parameter._weight_update_runtime_buffer
+            torch.testing.assert_close(
+                runtime_buffer.view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            self.assertNotEqual(parameter.data_ptr(), runtime_buffer.data_ptr())
 
     def test_cpu_staging_rebuilds_unpadded_runtime_layout(self):
         method = _make_method()
@@ -143,6 +153,9 @@ class TestMxfp4Reload(unittest.TestCase):
         target = _make_layer(seed=2)
         reference = _make_layer(seed=2)
         method.process_weights_after_loading(layer)
+        runtime_pointers = {
+            name: parameter.data_ptr() for name, parameter in layer.named_parameters()
+        }
 
         method.restore_weights_before_cpu_staging(layer)
         for name, parameter in target.named_parameters():
@@ -159,6 +172,7 @@ class TestMxfp4Reload(unittest.TestCase):
                 )
             else:
                 torch.testing.assert_close(actual, expected)
+            self.assertEqual(actual.data_ptr(), runtime_pointers[name])
 
     def test_parallel_cpu_zero_preserves_tensor_boundaries(self):
         storage = torch.full((32,), 7, dtype=torch.uint8)

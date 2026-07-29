@@ -207,9 +207,7 @@ class TestMxfp4Reload(unittest.TestCase):
         method.restore_weights_before_cpu_staging(layer)
 
         for name in (
-            "w13_weight_scale",
             "w13_weight_bias",
-            "w2_weight_scale",
             "w2_weight_bias",
         ):
             getattr(layer, name).data.copy_(getattr(target, name))
@@ -228,8 +226,20 @@ class TestMxfp4Reload(unittest.TestCase):
                         target.w13_weight[expert_id, half_rows:],
                     ),
                     (
+                        layer.w13_weight_scale[expert_id, :half_rows],
+                        target.w13_weight_scale[expert_id, :half_rows],
+                    ),
+                    (
+                        layer.w13_weight_scale[expert_id, half_rows:],
+                        target.w13_weight_scale[expert_id, half_rows:],
+                    ),
+                    (
                         layer.w2_weight[expert_id],
                         target.w2_weight[expert_id],
+                    ),
+                    (
+                        layer.w2_weight_scale[expert_id],
+                        target.w2_weight_scale[expert_id],
                     ),
                 )
             )

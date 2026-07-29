@@ -255,6 +255,33 @@ def _trtllm_mxfp4_source_order_view(
     ).transpose(2, 3)
 
 
+def _trtllm_mxfp4_scale_source_order_view(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    """View interleaved TRT-LLM scales in their checkpoint order."""
+
+    if tensor.ndim != 3:
+        raise ValueError(f"MXFP4 scale must be three-dimensional: {tensor.shape}")
+    if tensor.shape[1] % 128 or tensor.shape[2] % 4:
+        raise ValueError(
+            "MXFP4 scale does not match the TRT-LLM 128x4 layout: "
+            f"shape={tuple(tensor.shape)}"
+        )
+    return (
+        tensor.view(
+            tensor.shape[0],
+            tensor.shape[1] // 128,
+            tensor.shape[2] // 4,
+            32,
+            4,
+            4,
+        )
+        .permute(0, 1, 4, 3, 2, 5)
+        .unflatten(3, (4, 8))
+        .transpose(3, 4)
+    )
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
@@ -756,10 +783,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return copy_pairs
 
         parameters = {
-            name: getattr(layer, name) for name in ("w13_weight", "w2_weight")
+            name: getattr(layer, name)
+            for name in (
+                "w13_weight",
+                "w13_weight_scale",
+                "w2_weight",
+                "w2_weight_scale",
+            )
         }
         runtime_buffers = {
-            name: getattr(parameter, "_weight_update_runtime_buffer", None)
+            name: (
+                getattr(parameter, "_weight_update_runtime_buffer", None)
+                if name.endswith("_weight")
+                else parameter.data
+            )
             for name, parameter in parameters.items()
         }
         if any(buffer is None for buffer in runtime_buffers.values()):
@@ -784,6 +821,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             parameter = parameters[name]
             if (
                 not target.is_contiguous()
+                or not source.is_contiguous()
                 or target.dtype != source.dtype
                 or target.numel() != source.numel()
             ):
@@ -791,6 +829,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             expert_bytes = parameter[0].numel() * parameter.element_size()
             relative_bytes = target.data_ptr() - parameter.data_ptr()
+            if relative_bytes < 0:
+                return copy_pairs
             expert_id, expert_offset = divmod(relative_bytes, expert_bytes)
             row_bytes = parameter.shape[2] * parameter.element_size()
             row_begin, remainder = divmod(expert_offset, row_bytes)
@@ -804,14 +844,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             direct_pairs.append((name, expert_id, row_begin, target, source))
             covered_ranges.add((name, expert_id, row_begin, target.shape[0]))
 
-        w13_half_rows = parameters["w13_weight"].shape[1] // 2
         expected_ranges = {
             (name, expert_id, row_begin, row_count)
             for name, parameter in parameters.items()
             for expert_id in range(parameter.shape[0])
             for row_begin, row_count in (
-                ((0, w13_half_rows), (w13_half_rows, w13_half_rows))
-                if name == "w13_weight"
+                (
+                    (0, parameter.shape[1] // 2),
+                    (parameter.shape[1] // 2, parameter.shape[1] // 2),
+                )
+                if name.startswith("w13_")
                 else ((0, parameter.shape[1]),)
             )
         }
@@ -823,9 +865,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         epilogue_tile_m = 128
         runtime_views = {
-            name: _trtllm_mxfp4_source_order_view(
-                runtime_buffers[name].view(torch.uint8),
-                epilogue_tile_m,
+            name: (
+                _trtllm_mxfp4_source_order_view(
+                    runtime_buffers[name].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                if name.endswith("_weight")
+                else _trtllm_mxfp4_scale_source_order_view(
+                    runtime_buffers[name].view(torch.uint8),
+                )
             )
             for name in parameters
         }
@@ -833,8 +881,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         def copy_direct(pair) -> None:
             name, expert_id, row_begin, target, source = pair
             runtime_view = runtime_views[name]
-            if name == "w13_weight":
-                if row_begin == 0:
+            if name.startswith("w13_"):
+                parity = slice(1, None, 2) if row_begin == 0 else slice(0, None, 2)
+                if name.endswith("_scale"):
+                    destination = runtime_view[expert_id, :, :, :, parity, :, :]
+                elif row_begin == 0:
                     destination = runtime_view[expert_id, :, :, 1::2, :]
                 else:
                     destination = runtime_view[expert_id, :, :, 0::2, :]
@@ -868,7 +919,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             for future in futures:
                 future.result()
 
-        layer._mxfp4_cpu_staging_weights_ready = True
+        layer._mxfp4_cpu_staging_runtime_ready = True
         return remaining_pairs
 
     def weight_update_postprocess_device(self, layer) -> str | None:
@@ -1041,7 +1092,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
             direct_cpu_staging = getattr(
                 layer,
-                "_mxfp4_cpu_staging_weights_ready",
+                "_mxfp4_cpu_staging_runtime_ready",
                 False,
             )
 
@@ -1057,11 +1108,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # TRT-LLM swaps adjacent w1/w3 rows before its output-layout
             # permutation. Compose both permutations to avoid another full copy.
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-            w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w13_weight_scale[0].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
             w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_bias[0].reshape(-1, 1),
                 epilogue_tile_m,
@@ -1072,24 +1118,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "gate_up_interleaved",
                 True,
             )
-            w13_scale_permute_indices = _compose_trtllm_gate_up_permutation(
-                w13_scale_permute_indices,
-                gate_up_interleaved=gate_up_interleaved,
-            )
             w13_bias_permute_indices = _compose_trtllm_gate_up_permutation(
                 w13_bias_permute_indices,
                 gate_up_interleaved=gate_up_interleaved,
             )
 
-            w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w2_weight_scale[0].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
             w2_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_bias[0].reshape(-1, 1),
                 epilogue_tile_m,
             )
+            if not direct_cpu_staging:
+                w13_scale_permute_indices = (
+                    _get_flashinfer_mxfp4_device_permute_indices(
+                        w13_weight_scale[0].view(torch.uint8),
+                        epilogue_tile_m,
+                        num_elts_per_sf=16,
+                    )
+                )
+                w13_scale_permute_indices = _compose_trtllm_gate_up_permutation(
+                    w13_scale_permute_indices,
+                    gate_up_interleaved=gate_up_interleaved,
+                )
+                w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                    w2_weight_scale[0].view(torch.uint8),
+                    epilogue_tile_m,
+                    num_elts_per_sf=16,
+                )
 
             def shuffle_rows(
                 tensor: torch.Tensor,
@@ -1121,6 +1175,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     raise RuntimeError(
                         "direct MXFP4 CPU staging has no runtime buffers"
                     )
+                w13_weight_scale = w13_weight_scale.view(torch.float8_e4m3fn)
+                w2_weight_scale = w2_weight_scale.view(torch.float8_e4m3fn)
             else:
                 w13_weight_permute_indices = (
                     _get_flashinfer_mxfp4_device_permute_indices(
@@ -1148,17 +1204,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w2_weight_permute_indices,
                     out=cpu_staging_output("w2_weight"),
                 )
-            w13_weight_scale = shuffle_scales(
-                w13_weight_scale,
-                w13_scale_permute_indices,
-            )
+                w13_weight_scale = shuffle_scales(
+                    w13_weight_scale,
+                    w13_scale_permute_indices,
+                )
+                w2_weight_scale = shuffle_scales(
+                    w2_weight_scale,
+                    w2_scale_permute_indices,
+                )
             w13_bias = shuffle_rows(
                 w13_bias.unsqueeze(-1),
                 w13_bias_permute_indices,
-            )
-            w2_weight_scale = shuffle_scales(
-                w2_weight_scale,
-                w2_scale_permute_indices,
             )
             w2_bias = shuffle_rows(
                 w2_bias.unsqueeze(-1),
@@ -1196,7 +1252,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 parameter.data = runtime_buffer
                 del parameter._weight_update_runtime_buffer
             if direct_cpu_staging:
-                del layer._mxfp4_cpu_staging_weights_ready
+                del layer._mxfp4_cpu_staging_runtime_ready
 
             for name, value in (
                 ("w13_weight_scale", w13_weight_scale),
@@ -1209,7 +1265,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     and parameter.dtype != value.dtype
                 ):
                     parameter.data = parameter.data.view(value.dtype)
-                copy_or_rebind_param(layer, name, value)
+                if parameter.data_ptr() != value.data_ptr():
+                    copy_or_rebind_param(layer, name, value)
             copy_or_rebind_param(
                 layer,
                 "w13_weight_bias",

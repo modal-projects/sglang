@@ -10,6 +10,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -2931,8 +2932,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     load_weight(weight_loader, param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
-        for owner, calls in batched_weight_loads.items():
-            owner.batched_weight_loader(calls)
+        with ThreadPoolExecutor() as executor:
+            for owner, calls in batched_weight_loads.items():
+                owner.batched_weight_loader(calls, executor=executor)
         self.post_load_weights(weight_names=loaded_params)
 
     def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):

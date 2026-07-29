@@ -33,6 +33,7 @@ from sglang.srt.weight_sync.cpu_delta_checkpoint import (
 )
 from sglang.srt.weight_sync.cpu_weight_cache import (
     CPUWeightCache,
+    _batch_weight_module_groups,
     _canonical_checkpoint_layout,
     _canonical_transform_owners,
     _CanonicalCheckpointWriter,
@@ -209,6 +210,23 @@ def _shared_checkpoint_group_worker(
 
 
 class TestCPUWeightCache(unittest.TestCase):
+    def test_weight_module_groups_are_batched_to_the_compile_bound(self):
+        groups = [
+            _WeightModuleGroup(path=f"group{index}", nbytes=nbytes)
+            for index, nbytes in enumerate((3, 4, 5, 11, 2))
+        ]
+
+        batches = _batch_weight_module_groups(groups, max_batch_bytes=10)
+
+        self.assertEqual(
+            [[group.path for _, group in batch] for batch in batches],
+            [["group0", "group1"], ["group2"], ["group3"], ["group4"]],
+        )
+        self.assertEqual(
+            [[index for index, _ in batch] for batch in batches],
+            [[1, 2], [3], [4], [5]],
+        )
+
     def test_checkpoint_weight_map_supports_unindexed_safetensors(self):
         with tempfile.TemporaryDirectory() as root:
             save_file(
@@ -1060,6 +1078,7 @@ class TestCPUWeightCache(unittest.TestCase):
             cache = object.__new__(CPUWeightCache)
             cache.host_cpu_group = None
             cache.drop_cache_after_load = True
+            cache.max_group_bytes = 64
             cache.groups = [
                 _WeightModuleGroup(path="group0", nbytes=64),
                 _WeightModuleGroup(path="group1", nbytes=64),
@@ -1072,7 +1091,7 @@ class TestCPUWeightCache(unittest.TestCase):
 
             def populate(*, group, drop_cache_after_read, **_):
                 drop_cache_flags.append(drop_cache_after_read)
-                if group.path == "group1":
+                if len(drop_cache_flags) == 2:
                     second_read_started.set()
                     if not finish_second_read.wait(timeout=2):
                         raise TimeoutError("runtime compilation did not overlap read")
@@ -1113,6 +1132,64 @@ class TestCPUWeightCache(unittest.TestCase):
 
             self.assertEqual(len(results), 2)
             self.assertEqual(drop_cache_flags, [True, True])
+
+    def test_disk_checkpoint_batches_adjacent_runtime_groups(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            weights = {
+                "group0.weight": torch.arange(8),
+                "group1.weight": torch.arange(8, 16),
+            }
+            for name, value in weights.items():
+                save_file({name: value}, root / f"{name}.safetensors")
+
+            cache = object.__new__(CPUWeightCache)
+            cache.host_cpu_group = None
+            cache.drop_cache_after_load = False
+            cache.max_group_bytes = 128
+            cache.groups = [
+                _WeightModuleGroup(path="group0", nbytes=64),
+                _WeightModuleGroup(path="group1", nbytes=64),
+            ]
+            cache._run_on_all_host_ranks = lambda _, function: function()
+            loaded_paths = []
+
+            def load_group(*, group_index, group, get_tensor, **_):
+                loaded_paths.append((group_index, group.path))
+                self.assertTrue(
+                    torch.equal(
+                        get_tensor(f"{group.path}.weight"),
+                        weights[f"{group.path}.weight"],
+                    )
+                )
+                return group
+
+            cache._load_group_into_cpu_image = load_group
+            cache._finalize_cpu_image_group = lambda _: (
+                set(),
+                64,
+                {"wall_s": 0.01},
+            )
+
+            with mock.patch.object(
+                cpu_weight_cache,
+                "_populate_shared_checkpoint_group",
+                wraps=_populate_shared_checkpoint_group,
+            ) as populate:
+                results = list(
+                    cache._compile_disk_checkpoint(
+                        root=root,
+                        weight_map={name: f"{name}.safetensors" for name in weights},
+                        names_by_group={
+                            "group0": ["group0.weight"],
+                            "group1": ["group1.weight"],
+                        },
+                    )
+                )
+
+            self.assertEqual(loaded_paths, [(1, "group0"), (2, "group1")])
+            self.assertEqual(len(results), 2)
+            populate.assert_called_once()
 
     def test_canonical_checkpoint_population_reads_each_file_once(self):
         source = None
@@ -1168,6 +1245,7 @@ class TestCPUWeightCache(unittest.TestCase):
             compiler = object.__new__(CPUWeightCache)
             compiler.host_cpu_group = None
             compiler.drop_cache_after_load = False
+            compiler.max_group_bytes = expected.nbytes
             group = _WeightModuleGroup(path="model", nbytes=expected.nbytes)
             compiler.groups = [group]
             loaded_group = object()
@@ -1334,6 +1412,7 @@ class TestCPUWeightCache(unittest.TestCase):
             compiler = object.__new__(CPUWeightCache)
             compiler.host_cpu_group = None
             compiler.drop_cache_after_load = False
+            compiler.max_group_bytes = initial.nbytes
             compiler.groups = [_WeightModuleGroup(path="model", nbytes=initial.nbytes)]
             loaded_group = object()
 

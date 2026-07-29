@@ -2199,9 +2199,7 @@ class CPUWeightCache:
         cpu_clone_s = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
-        DefaultModelLoader.restore_weights_before_loading(
-            cpu_shadow, torch.device("cpu")
-        )
+        DefaultModelLoader.restore_weights_before_cpu_staging(cpu_shadow)
         restore_s = time.perf_counter() - phase_started
 
         weights = ((name, get_tensor(name)) for name in names)

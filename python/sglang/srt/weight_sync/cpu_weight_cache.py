@@ -2820,20 +2820,21 @@ class CPUWeightCache:
                             transform_group,
                         )
                         source_stats.append(transform_stats)
-                        self._run_on_all_host_ranks(
-                            f"canonical checkpoint writes for group {group.path!r}",
-                            functools.partial(
-                                writer.write_pending_group,
+                        write_error = None
+                        try:
+                            # File owners persist locally while other ranks
+                            # begin compiling from the same immutable buffer.
+                            writer.write_pending_group(
                                 tensor_file.get_tensor_bytes,
-                            ),
-                        )
+                            )
+                        except Exception as exc:
+                            write_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        write_error = None
 
                     def compile_group():
-                        if writer is not None:
-                            # The write barrier above makes every positional
-                            # update visible before one rank flushes and closes
-                            # the completed checkpoint files.
-                            writer.finish_group(source_index)
+                        if write_error is not None:
+                            raise RuntimeError(write_error)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,
                             group=group,
@@ -2841,9 +2842,12 @@ class CPUWeightCache:
                             get_tensor=tensor_file.get_tensor,
                         )
                         try:
-                            return self._finalize_cpu_image_group(loaded)
+                            result = self._finalize_cpu_image_group(loaded)
                         finally:
                             del loaded
+                        if writer is not None:
+                            writer.finish_group(source_index)
+                        return result
 
                     result = self._run_on_all_host_ranks(
                         f"runtime compilation for group {group.path!r}",

@@ -12,6 +12,7 @@ triggers one clean reseed before failing loudly.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import glob
 import json
@@ -50,6 +51,15 @@ _MAX_DELTA_APPLY_WORKERS = 32
 _MAX_OPEN_FILES_PER_CACHE = 256
 _SEED_COPY_CHUNK_BYTES = 16 << 20
 _SEED_LOG_STEP_GB = 50
+_FICLONE = 0x40049409
+_REFLINK_FALLBACK_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTTY,
+    errno.EOPNOTSUPP,
+    errno.EPERM,
+    errno.EXDEV,
+}
 
 # Per-checkpoint dir holding the applied-version marker and materialization lock.
 _SYNC_DIR = ".weight_sync"
@@ -424,6 +434,22 @@ def drop_checkpoint_page_cache(checkpoint_dir: str) -> int:
     return len(paths)
 
 
+def _clone_or_copy_file(src, dst) -> bool:
+    """Clone immutable file extents when possible, otherwise copy the bytes."""
+
+    try:
+        fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+        return True
+    except OSError as exc:
+        if exc.errno not in _REFLINK_FALLBACK_ERRNOS:
+            raise
+    dst.seek(0)
+    dst.truncate()
+    while chunk := src.read(_SEED_COPY_CHUNK_BYTES):
+        dst.write(chunk)
+    return False
+
+
 def _reset_checkpoint(
     src_dir: str,
     local_checkpoint_dir: str,
@@ -461,14 +487,17 @@ def _reset_checkpoint(
         local_checkpoint_dir,
     )
     start = time.monotonic()
-    progress = {"done_gb": 0.0, "next_log_gb": _SEED_LOG_STEP_GB}
+    progress = {
+        "done_gb": 0.0,
+        "reflinked_gb": 0.0,
+        "next_log_gb": _SEED_LOG_STEP_GB,
+    }
     progress_lock = threading.Lock()
 
     def copy_one(entry) -> None:
         dst = os.path.join(local_checkpoint_dir, entry.name)
         with open(entry.path, "rb") as src, open(dst, "wb") as out:
-            while chunk := src.read(_SEED_COPY_CHUNK_BYTES):
-                out.write(chunk)
+            reflinked = _clone_or_copy_file(src, out)
             out.flush()
             os.fsync(out.fileno())
         # The immutable source no longer needs to occupy the page cache.
@@ -476,7 +505,10 @@ def _reset_checkpoint(
         if drop_cache_after_copy:
             drop_file_page_cache(dst)
         with progress_lock:
-            progress["done_gb"] += entry.stat().st_size / 1e9
+            file_gb = entry.stat().st_size / 1e9
+            progress["done_gb"] += file_gb
+            if reflinked:
+                progress["reflinked_gb"] += file_gb
             done = progress["done_gb"]
             if done >= progress["next_log_gb"] or done >= total_gb:
                 rate = done / max(time.monotonic() - start, 1e-3)
@@ -507,6 +539,15 @@ def _reset_checkpoint(
             )
     _fsync_dir(local_checkpoint_dir)
     _write_applied_version(local_checkpoint_dir, version)
+    logger.info(
+        "staged checkpoint v%d to local disk: %.0f GB in %.3fs "
+        "(reflinked=%.0f GB copied=%.0f GB)",
+        version,
+        total_gb,
+        time.monotonic() - start,
+        progress["reflinked_gb"],
+        total_gb - progress["reflinked_gb"],
+    )
 
 
 def _tensor_locations(ckpt_dir: str) -> dict:

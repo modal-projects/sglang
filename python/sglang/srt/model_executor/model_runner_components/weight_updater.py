@@ -450,8 +450,9 @@ class WeightUpdater:
                 raise RuntimeError(
                     "CPU weight cache construction completed without a cache"
                 )
-            construction_wall_s = time.perf_counter() - started
             try:
+                cache.initialize_host_rank_coordinator()
+                construction_wall_s = time.perf_counter() - started
                 canonical_checkpoint_dir = (
                     runner.server_args.cpu_weight_cache_canonical_checkpoint_dir
                 )

@@ -36,6 +36,7 @@ from sglang.srt.weight_sync.cpu_weight_cache import (
     _canonical_checkpoint_layout,
     _checkpoint_weight_map,
     _clone_weight_module,
+    _HostRankPhaseCoordinator,
     _HostSharedCheckpoint,
     _InMemorySafetensorsFile,
     _LoadedWeightGroup,
@@ -121,6 +122,28 @@ def _shared_delta_worker(rank: int, world_size: int, rendezvous: str):
     finally:
         if arena is not None:
             arena.close()
+        torch.distributed.destroy_process_group()
+
+
+def _host_rank_coordinator_worker(rank: int, world_size: int, rendezvous: str):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=world_size,
+    )
+    coordinator = None
+    try:
+        coordinator = _HostRankPhaseCoordinator(torch.distributed.group.WORLD)
+        for phase in range(32):
+            failed = phase == 17 and rank == 2
+            if coordinator.arrive(failed) != (phase == 17):
+                raise AssertionError(
+                    f"rank {rank} observed the wrong status for phase {phase}"
+                )
+    finally:
+        if coordinator is not None:
+            coordinator.close()
         torch.distributed.destroy_process_group()
 
 
@@ -216,7 +239,7 @@ class TestCPUWeightCache(unittest.TestCase):
     @mock.patch.object(torch.distributed, "get_world_size", return_value=2)
     @mock.patch.object(torch.distributed, "all_gather_object")
     @mock.patch.object(torch.distributed, "all_reduce")
-    def test_successful_host_rank_sync_avoids_object_gather(
+    def test_successful_host_rank_sync_uses_shared_memory(
         self,
         all_reduce,
         all_gather_object,
@@ -225,11 +248,15 @@ class TestCPUWeightCache(unittest.TestCase):
     ):
         cache = object.__new__(CPUWeightCache)
         cache.host_cpu_group = object()
+        cache._host_rank_coordinator = mock.Mock()
+        cache._host_rank_coordinator.arrive.return_value = False
+        cache._host_rank_sync_s = 0.0
 
         result = cache._run_on_all_host_ranks("test operation", lambda: 7)
 
         self.assertEqual(result, 7)
-        all_reduce.assert_called_once()
+        cache._host_rank_coordinator.arrive.assert_called_once_with(False)
+        all_reduce.assert_not_called()
         all_gather_object.assert_not_called()
 
     def test_active_baseline_does_not_recompile_the_boot_checkpoint(self):
@@ -1328,6 +1355,17 @@ class TestCPUWeightCache(unittest.TestCase):
             rendezvous = str(Path(root) / "gloo-delta-rendezvous")
             torch.multiprocessing.start_processes(
                 _shared_delta_worker,
+                args=(4, rendezvous),
+                nprocs=4,
+                join=True,
+                start_method="fork",
+            )
+
+    def test_host_rank_coordinator_is_visible_to_all_local_ranks(self):
+        with tempfile.TemporaryDirectory() as root:
+            rendezvous = str(Path(root) / "gloo-coordinator-rendezvous")
+            torch.multiprocessing.start_processes(
+                _host_rank_coordinator_worker,
                 args=(4, rendezvous),
                 nprocs=4,
                 join=True,

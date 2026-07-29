@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -978,6 +979,66 @@ class _LoadedWeightGroup:
     cpu_load_s: float
 
 
+class _HostRankPhaseCoordinator:
+    """Coordinate repeated host-local phases without network collectives."""
+
+    def __init__(self, cpu_group: Any):
+        distributed = torch.distributed.is_initialized()
+        self.world_size = (
+            torch.distributed.get_world_size(group=cpu_group) if distributed else 1
+        )
+        self.rank = torch.distributed.get_rank(group=cpu_group) if distributed else 0
+        self.phase = 0
+        self.buffer = (
+            HostSharedMemoryBuffer(
+                nbytes=self.world_size * 16,
+                cpu_group=cpu_group,
+                name="weight-phase-coordinator",
+            )
+            if self.world_size > 1
+            else None
+        )
+        self._format = f"{self.world_size}q"
+
+    def arrive(self, failed: bool) -> bool:
+        if self.buffer is None:
+            return failed
+        self.phase += 1
+        value = -self.phase if failed else self.phase
+        struct.pack_into(
+            "q",
+            self.buffer.mapping,
+            self.rank * 8,
+            value,
+        )
+        while True:
+            values = struct.unpack_from(self._format, self.buffer.mapping)
+            if all(abs(value) == self.phase for value in values):
+                any_failed = any(value < 0 for value in values)
+                break
+            time.sleep(0.001)
+        struct.pack_into(
+            "q",
+            self.buffer.mapping,
+            (self.world_size + self.rank) * 8,
+            self.phase,
+        )
+        while True:
+            departed = struct.unpack_from(
+                self._format,
+                self.buffer.mapping,
+                self.world_size * 8,
+            )
+            if all(value == self.phase for value in departed):
+                return any_failed
+            time.sleep(0.001)
+
+    def close(self) -> None:
+        if self.buffer is not None:
+            self.buffer.close()
+            self.buffer = None
+
+
 def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     storage = tensor.untyped_storage()
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
@@ -1817,6 +1878,8 @@ class CPUWeightCache:
         ) = None
         self._canonical_lineage: tuple[str, str] | None = None
         self._canonical_checkpoint_version: int | None = None
+        self._host_rank_coordinator: _HostRankPhaseCoordinator | None = None
+        self._host_rank_sync_s = 0.0
         logger.info(
             "CPU weight cache layout: groups=%d storages=%d bytes=%d "
             "max_compile_group_bytes=%d canonical_checkpoint_storage=%s",
@@ -1826,6 +1889,11 @@ class CPUWeightCache:
             self.max_group_bytes,
             self.canonical_checkpoint_storage,
         )
+
+    def initialize_host_rank_coordinator(self) -> None:
+        if self._host_rank_coordinator is not None:
+            raise RuntimeError("host-rank coordinator is already initialized")
+        self._host_rank_coordinator = _HostRankPhaseCoordinator(self.host_cpu_group)
 
     def _run_on_all_host_ranks(self, description: str, function: Callable[[], Any]):
         result = None
@@ -1842,13 +1910,20 @@ class CPUWeightCache:
             else 1
         )
         if world_size > 1:
-            failed = torch.tensor([error is not None], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                failed,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.host_cpu_group,
-            )
-            if failed.item():
+            sync_started = time.perf_counter()
+            coordinator = self._host_rank_coordinator
+            if coordinator is None:
+                failed = torch.tensor([error is not None], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    failed,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=self.host_cpu_group,
+                )
+                any_failed = bool(failed.item())
+            else:
+                any_failed = coordinator.arrive(error is not None)
+            self._host_rank_sync_s += time.perf_counter() - sync_started
+            if any_failed:
                 errors: list[str | None] = [None] * world_size
                 torch.distributed.all_gather_object(
                     errors,
@@ -2732,6 +2807,7 @@ class CPUWeightCache:
         """Compile every bounded module from a complete canonical checkpoint."""
 
         started = time.perf_counter()
+        host_rank_sync_started = self._host_rank_sync_s
 
         def inspect_checkpoint():
             weight_map, root = _checkpoint_weight_map(checkpoint_dir)
@@ -2861,6 +2937,10 @@ class CPUWeightCache:
                 "image_copy_s",
             )
         }
+        phase_totals["host_rank_sync_s"] = round(
+            self._host_rank_sync_s - host_rank_sync_started,
+            6,
+        )
         traffic = {
             name: sum(value.get(name, 0) for value in group_stats)
             for name in (
@@ -3276,6 +3356,9 @@ class CPUWeightCache:
     def close(self, reason: str) -> None:
         self._discard_canonical_checkpoint(reason)
         self.image.close()
+        if self._host_rank_coordinator is not None:
+            self._host_rank_coordinator.close()
+            self._host_rank_coordinator = None
 
     def commit(
         self,

@@ -1842,12 +1842,21 @@ class CPUWeightCache:
             else 1
         )
         if world_size > 1:
-            errors: list[str | None] = [None] * world_size
-            torch.distributed.all_gather_object(
-                errors,
-                error,
+            failed = torch.tensor([error is not None], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                failed,
+                op=torch.distributed.ReduceOp.MAX,
                 group=self.host_cpu_group,
             )
+            if failed.item():
+                errors: list[str | None] = [None] * world_size
+                torch.distributed.all_gather_object(
+                    errors,
+                    error,
+                    group=self.host_cpu_group,
+                )
+            else:
+                errors = []
         else:
             errors = [error]
         errors = [value for value in errors if value is not None]

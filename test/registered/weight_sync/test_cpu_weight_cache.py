@@ -212,6 +212,26 @@ class TestCPUWeightCache(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "secondary checkpoint"):
             CPUWeightCache(model, max_group_bytes=1024)
 
+    @mock.patch.object(torch.distributed, "is_initialized", return_value=True)
+    @mock.patch.object(torch.distributed, "get_world_size", return_value=2)
+    @mock.patch.object(torch.distributed, "all_gather_object")
+    @mock.patch.object(torch.distributed, "all_reduce")
+    def test_successful_host_rank_sync_avoids_object_gather(
+        self,
+        all_reduce,
+        all_gather_object,
+        _get_world_size,
+        _is_initialized,
+    ):
+        cache = object.__new__(CPUWeightCache)
+        cache.host_cpu_group = object()
+
+        result = cache._run_on_all_host_ranks("test operation", lambda: 7)
+
+        self.assertEqual(result, 7)
+        all_reduce.assert_called_once()
+        all_gather_object.assert_not_called()
+
     def test_active_baseline_does_not_recompile_the_boot_checkpoint(self):
         with tempfile.TemporaryDirectory() as root:
             save_file(

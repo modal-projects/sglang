@@ -3,6 +3,7 @@
 import concurrent.futures
 import json
 import tempfile
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest import mock
 
 import torch
 import zstandard
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -37,7 +39,10 @@ from sglang.srt.weight_sync.cpu_weight_cache import (
     _HostSharedCheckpoint,
     _InMemorySafetensorsFile,
     _LoadedWeightGroup,
+    _populate_shared_checkpoint_group,
     _pread_file_to_tensor,
+    _shared_checkpoint_groups,
+    _SharedCheckpointGroupView,
     _transform_canonical_checkpoint,
     _WeightModuleGroup,
 )
@@ -119,6 +124,65 @@ def _shared_delta_worker(rank: int, world_size: int, rendezvous: str):
         torch.distributed.destroy_process_group()
 
 
+def _shared_checkpoint_group_worker(
+    rank: int,
+    world_size: int,
+    rendezvous: str,
+    root_value: str,
+):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=world_size,
+    )
+    buffer = None
+    try:
+        root = Path(root_value)
+        cpu_weight_cache._POSITIONAL_IO_CHUNK_BYTES = 16
+        weight_map = {
+            f"layer.{index}": f"{index}.safetensors" for index in range(world_size)
+        }
+        group = _shared_checkpoint_groups(
+            root=root,
+            weight_map=weight_map,
+            names_by_group={"model": sorted(weight_map)},
+            read_parallelism=world_size,
+        )["model"]
+        if len(group.reads) <= len(weight_map):
+            raise AssertionError("checkpoint ranges were not split across ranks")
+        buffer = HostSharedMemoryBuffer(
+            nbytes=group.buffer_bytes,
+            cpu_group=torch.distributed.group.WORLD,
+            name="weight-checkpoint-group-test",
+        )
+        stats = _populate_shared_checkpoint_group(
+            root=root,
+            group=group,
+            buffer=buffer,
+            cpu_group=torch.distributed.group.WORLD,
+        )
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(gathered, stats)
+        if sum(item["owned_bytes"] for item in gathered) != group.source_bytes:
+            raise AssertionError("checkpoint bytes were not read exactly once")
+        if sum(len(item["owned_reads"]) for item in gathered) != len(group.reads):
+            raise AssertionError("checkpoint ranges were not owned exactly once")
+        source = _SharedCheckpointGroupView(buffer, group.tensors)
+        for index in range(world_size):
+            expected = torch.full((8,), index + 1, dtype=torch.int32)
+            actual = source.get_tensor(f"layer.{index}")
+            if not torch.equal(actual, expected):
+                raise AssertionError(
+                    f"rank {rank} observed invalid tensor {index}: {actual}"
+                )
+        torch.distributed.barrier()
+    finally:
+        if buffer is not None:
+            buffer.close()
+        torch.distributed.destroy_process_group()
+
+
 class TestCPUWeightCache(unittest.TestCase):
     def test_checkpoint_weight_map_supports_unindexed_safetensors(self):
         with tempfile.TemporaryDirectory() as root:
@@ -147,6 +211,36 @@ class TestCPUWeightCache(unittest.TestCase):
 
         with self.assertRaisesRegex(NotImplementedError, "secondary checkpoint"):
             CPUWeightCache(model, max_group_bytes=1024)
+
+    def test_active_baseline_does_not_recompile_the_boot_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            save_file(
+                {"layer.weight": torch.arange(4, dtype=torch.float32)},
+                Path(root) / "model.safetensors",
+            )
+            image = SimpleNamespace(
+                image_nbytes=64,
+                weight_nbytes=64,
+                register_host_memory=mock.Mock(return_value={"wall_s": 1.0}),
+                capture_active_weights=mock.Mock(return_value={"wall_s": 2.0}),
+            )
+            cache = object.__new__(CPUWeightCache)
+            cache.image = image
+            cache.host_cpu_group = None
+            cache.canonical_checkpoint_storage = "disk"
+            cache.max_group_bytes = 1024
+            cache._run_on_all_host_ranks = lambda _, function: function()
+            cache._stage_from_checkpoint = mock.Mock()
+
+            stats = cache.initialize_from_checkpoint(
+                checkpoint_dir=root,
+                seed_from_active_weights=True,
+            )
+
+            cache._stage_from_checkpoint.assert_not_called()
+            self.assertEqual(stats["rank_image_source"], "active_model")
+            self.assertEqual(stats["initial_compile_wall_s"], 0.0)
+            self.assertEqual(stats["validation_wall_s"], 0.0)
 
     def test_positional_read_and_tensor_views(self):
         tensors = {
@@ -805,6 +899,98 @@ class TestCPUWeightCache(unittest.TestCase):
                 start_method="fork",
             )
 
+    def test_shared_checkpoint_groups_are_read_once_per_host(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            world_size = 4
+            for index in range(world_size):
+                save_file(
+                    {
+                        f"layer.{index}": torch.full(
+                            (8,),
+                            index + 1,
+                            dtype=torch.int32,
+                        )
+                    },
+                    root / f"{index}.safetensors",
+                )
+            rendezvous = str(root / "gloo-group-rendezvous")
+            torch.multiprocessing.start_processes(
+                _shared_checkpoint_group_worker,
+                args=(world_size, rendezvous, root_value),
+                nprocs=world_size,
+                join=True,
+                start_method="fork",
+            )
+
+    def test_disk_checkpoint_read_overlaps_runtime_compilation(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            save_file(
+                {"group0.weight": torch.arange(8)},
+                root / "group0.safetensors",
+            )
+            save_file(
+                {"group1.weight": torch.arange(8)},
+                root / "group1.safetensors",
+            )
+            cache = object.__new__(CPUWeightCache)
+            cache.host_cpu_group = None
+            cache.drop_cache_after_load = True
+            cache.groups = [
+                _WeightModuleGroup(path="group0", nbytes=64),
+                _WeightModuleGroup(path="group1", nbytes=64),
+            ]
+            cache._run_on_all_host_ranks = lambda _, function: function()
+
+            second_read_started = threading.Event()
+            finish_second_read = threading.Event()
+            drop_cache_flags = []
+
+            def populate(*, group, drop_cache_after_read, **_):
+                drop_cache_flags.append(drop_cache_after_read)
+                if group.path == "group1":
+                    second_read_started.set()
+                    if not finish_second_read.wait(timeout=2):
+                        raise TimeoutError("runtime compilation did not overlap read")
+                return {"wall_s": 0.01}
+
+            def load_group(*, group, **_):
+                if group.path == "group0":
+                    if not second_read_started.wait(timeout=2):
+                        raise TimeoutError("next checkpoint group was not prefetched")
+                    finish_second_read.set()
+                return group
+
+            cache._load_group_into_cpu_image = load_group
+            cache._finalize_cpu_image_group = lambda _: (
+                set(),
+                0,
+                {"wall_s": 0.01},
+            )
+
+            with mock.patch.object(
+                cpu_weight_cache,
+                "_populate_shared_checkpoint_group",
+                side_effect=populate,
+            ):
+                results = list(
+                    cache._compile_disk_checkpoint(
+                        root=root,
+                        weight_map={
+                            "group0.weight": "group0.safetensors",
+                            "group1.weight": "group1.safetensors",
+                        },
+                        names_by_group={
+                            "group0": ["group0.weight"],
+                            "group1": ["group1.weight"],
+                        },
+                    )
+                )
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(drop_cache_flags, [True, True])
+
     def test_canonical_checkpoint_population_reads_each_file_once(self):
         source = None
         with tempfile.TemporaryDirectory() as root_value:
@@ -850,6 +1036,115 @@ class TestCPUWeightCache(unittest.TestCase):
             finally:
                 if source is not None:
                     source.close()
+
+    def test_disk_checkpoint_compilation_reads_one_shared_group(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            save_file({"weight": expected}, root / "model.safetensors")
+            compiler = object.__new__(CPUWeightCache)
+            compiler.host_cpu_group = None
+            compiler.drop_cache_after_load = False
+            group = _WeightModuleGroup(path="model", nbytes=expected.nbytes)
+            compiler.groups = [group]
+            loaded_group = object()
+
+            def load_group(*, group_index, group, names, get_tensor):
+                self.assertEqual(group_index, 1)
+                self.assertEqual(names, ["weight"])
+                tensor = get_tensor("weight")
+                self.assertTrue(torch.equal(tensor, expected))
+                self.assertTrue(getattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False))
+                return loaded_group
+
+            compiler._load_group_into_cpu_image = mock.Mock(side_effect=load_group)
+            compiled = ({1}, expected.nbytes, {"wall_s": 0.1})
+            compiler._finalize_cpu_image_group = mock.Mock(return_value=compiled)
+
+            results = list(
+                compiler._compile_disk_checkpoint(
+                    root=root,
+                    weight_map={"weight": "model.safetensors"},
+                    names_by_group={"model": ["weight"]},
+                )
+            )
+
+            self.assertEqual(results, [compiled])
+            compiler._finalize_cpu_image_group.assert_called_once_with(loaded_group)
+
+    def test_disk_delta_transform_persists_the_compiled_shared_buffer(self):
+        class Transform:
+            operations_by_file = {"model.safetensors": {"weight": []}}
+
+            def transform_tensors(
+                self,
+                tensors,
+                *,
+                description,
+                write_tensor,
+                write_block_bytes,
+            ):
+                assert description == "model"
+                assert write_block_bytes > 0
+                tensor = tensors["weight"].view(torch.int64)
+                tensor[0].add_(1)
+                write_tensor(
+                    "weight",
+                    tensors["weight"].numpy(),
+                    [(0, tensor.element_size())],
+                )
+                return {
+                    "operation": "canonical_delta_transform",
+                    "description": description,
+                    "delta_tensors": 1,
+                    "target_tensor_bytes": tensors["weight"].numel(),
+                    "compressed_bytes": 0,
+                    "working_memory_budget_bytes": 0,
+                    "wall_s": 0.01,
+                }
+
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            initial = torch.arange(8, dtype=torch.int64)
+            expected = initial.clone()
+            expected[0].add_(1)
+            save_file({"weight": initial}, root / "model.safetensors")
+            compiler = object.__new__(CPUWeightCache)
+            compiler.host_cpu_group = None
+            compiler.drop_cache_after_load = False
+            compiler.groups = [_WeightModuleGroup(path="model", nbytes=initial.nbytes)]
+            loaded_group = object()
+
+            def load_group(*, get_tensor, **_):
+                self.assertTrue(torch.equal(get_tensor("weight"), expected))
+                return loaded_group
+
+            compiler._load_group_into_cpu_image = mock.Mock(side_effect=load_group)
+            compiled = ({1}, expected.nbytes, {"wall_s": 0.1})
+            compiler._finalize_cpu_image_group = mock.Mock(return_value=compiled)
+            compiler._run_on_all_host_ranks = lambda _, function: function()
+            source_stats = []
+
+            results = list(
+                compiler._compile_disk_checkpoint(
+                    root=root,
+                    weight_map={"weight": "model.safetensors"},
+                    names_by_group={"model": ["weight"]},
+                    source_stats=source_stats,
+                    checkpoint_transform=Transform(),
+                )
+            )
+
+            self.assertEqual(results, [compiled])
+            with safe_open(root / "model.safetensors", framework="pt") as checkpoint:
+                self.assertTrue(torch.equal(checkpoint.get_tensor("weight"), expected))
+            persist = next(
+                item
+                for item in source_stats
+                if item["operation"] == "persist_canonical_checkpoint"
+            )
+            self.assertEqual(persist["target_logical_bytes"], initial.nbytes)
+            self.assertEqual(persist["target_write_bytes"], initial.element_size())
 
     def test_canonical_transform_finishes_before_runtime_compilation(self):
         class RecordingTransform:

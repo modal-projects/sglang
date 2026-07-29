@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -6,7 +7,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     record_ue8m0_scale_checkpoint_layout,
     restore_ue8m0_scale_checkpoint_layout,
 )
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from sglang.srt.layers.quantization.mxfp4 import (
+    Mxfp4MoEMethod,
+    _compose_trtllm_gate_up_permutation,
+)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
 )
@@ -19,6 +23,7 @@ def _make_method() -> Mxfp4MoEMethod:
     method = object.__new__(Mxfp4MoEMethod)
     method.use_marlin = False
     method.use_flashinfer = True
+    method.use_deep_gemm = False
     method._fi_kernel = "trtllm_sm100"
     method.num_experts = 2
     method.intermediate_size_per_partition = 128
@@ -29,6 +34,8 @@ def _make_method() -> Mxfp4MoEMethod:
 def _make_layer(seed: int) -> torch.nn.Module:
     generator = torch.Generator().manual_seed(seed)
     layer = torch.nn.Module()
+    layer.num_local_experts = 2
+    layer.moe_runner_config = SimpleNamespace(gate_up_interleaved=True)
 
     def parameter(shape, dtype):
         if dtype == torch.bfloat16:
@@ -109,6 +116,29 @@ def _make_hybrid_layer(seed: int) -> torch.nn.Module:
 
 
 class TestMxfp4Reload(unittest.TestCase):
+    def test_gate_up_reordering_is_composed_with_runtime_permutation(self):
+        indices = torch.tensor([3, 0, 2, 1])
+        rows = torch.arange(4)
+
+        interleaved = _compose_trtllm_gate_up_permutation(
+            indices,
+            gate_up_interleaved=True,
+        )
+        torch.testing.assert_close(
+            rows.index_select(0, interleaved),
+            rows.view(2, 2).flip(1).reshape(-1).index_select(0, indices),
+        )
+
+        blocked_gate_up = torch.tensor([2, 0, 3, 1])
+        blocked = _compose_trtllm_gate_up_permutation(
+            indices,
+            gate_up_interleaved=False,
+        )
+        torch.testing.assert_close(
+            rows.index_select(0, blocked),
+            rows.index_select(0, blocked_gate_up).index_select(0, indices),
+        )
+
     def test_repeated_reload_restores_checkpoint_scale_bytes(self):
         method = _make_method()
         layer = _make_layer(seed=1)

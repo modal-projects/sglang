@@ -81,6 +81,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_weight_loading_cpu_workers,
     is_cpu,
     is_hip,
     is_npu,
@@ -115,7 +116,7 @@ def _batched_weight_copy_workers() -> int:
             local_model_workers *= server_args.dp_size
     else:
         local_model_workers = 1
-    return max(available_cpus // local_model_workers, 1)
+    return get_weight_loading_cpu_workers(max(available_cpus // local_model_workers, 1))
 
 
 def _get_deepep_comm_group(a2a_backend):

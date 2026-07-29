@@ -49,6 +49,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -1270,6 +1271,28 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+_weight_loading_cpu_workers: ContextVar[int | None] = ContextVar(
+    "weight_loading_cpu_workers",
+    default=None,
+)
+
+
+@contextmanager
+def override_weight_loading_cpu_workers(workers: int):
+    if workers <= 0:
+        raise ValueError("weight-loading CPU worker count must be positive")
+    token = _weight_loading_cpu_workers.set(workers)
+    try:
+        yield
+    finally:
+        _weight_loading_cpu_workers.reset(token)
+
+
+def get_weight_loading_cpu_workers(default: int) -> int:
+    workers = _weight_loading_cpu_workers.get()
+    return default if workers is None else workers
 
 
 @contextmanager

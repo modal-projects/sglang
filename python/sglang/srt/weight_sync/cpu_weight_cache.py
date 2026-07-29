@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import math
+import mmap
 import os
 import struct
 import threading
@@ -632,12 +633,25 @@ class _CanonicalCheckpointWriter:
                 if name in self.expected_names:
                     self.last_group[source.filename] = group_index
         self.fds = {}
+        self.mappings = {}
         try:
             for filename in self.flush_files:
-                self.fds[filename] = os.open(root / filename, os.O_RDWR)
+                fd = os.open(root / filename, os.O_RDWR)
+                self.fds[filename] = fd
+                try:
+                    self.mappings[filename] = mmap.mmap(
+                        fd,
+                        0,
+                        access=mmap.ACCESS_WRITE,
+                    )
+                except (OSError, ValueError):
+                    self.mappings[filename] = None
         except Exception:
             self.close()
             raise
+        self.mapped_file_count = sum(
+            mapping is not None for mapping in self.mappings.values()
+        )
         self.dirty_files = set()
         self.written_names = set()
         self.logical_bytes = 0
@@ -690,6 +704,7 @@ class _CanonicalCheckpointWriter:
 
         for filename, writes in sorted(writes_by_file.items()):
             fd = self.fds[filename]
+            mapping = self.mappings[filename]
             write_bytes = 0
             started = time.perf_counter()
             for name, file_offset, ranges in sorted(
@@ -706,17 +721,23 @@ class _CanonicalCheckpointWriter:
                             position + _POSITIONAL_IO_CHUNK_BYTES,
                             end,
                         )
-                        written = os.pwrite(
-                            fd,
-                            view[position:chunk_end],
-                            file_offset + position,
-                        )
-                        if written <= 0:
-                            raise RuntimeError(
-                                "short canonical checkpoint write for "
-                                f"{name!r}: range=({begin}, {end}) "
-                                f"actual={position - begin}"
+                        if mapping is None:
+                            written = os.pwrite(
+                                fd,
+                                view[position:chunk_end],
+                                file_offset + position,
                             )
+                            if written <= 0:
+                                raise RuntimeError(
+                                    "short canonical checkpoint write for "
+                                    f"{name!r}: range=({begin}, {end}) "
+                                    f"actual={position - begin}"
+                                )
+                        else:
+                            mapping[
+                                file_offset + position : file_offset + chunk_end
+                            ] = view[position:chunk_end]
+                            written = chunk_end - position
                         position += written
                         write_bytes += written
             with self.lock:
@@ -735,6 +756,7 @@ class _CanonicalCheckpointWriter:
         ]
         for filename in filenames:
             fd = self.fds.pop(filename, None)
+            mapping = self.mappings.pop(filename, None)
             if filename in self.flush_files:
                 if fd is None:
                     raise RuntimeError(
@@ -743,12 +765,18 @@ class _CanonicalCheckpointWriter:
                 started = time.perf_counter()
                 os.fsync(fd)
                 self.flush_worker_s += time.perf_counter() - started
+            if mapping is not None:
+                mapping.close()
             if fd is not None:
                 os.close(fd)
             if self.drop_cache_after_write and filename in self.flush_files:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
+        for mapping in self.mappings.values():
+            if mapping is not None:
+                mapping.close()
+        self.mappings.clear()
         for fd in self.fds.values():
             os.close(fd)
         self.fds.clear()
@@ -773,6 +801,7 @@ class _CanonicalCheckpointWriter:
             "target_write_worker_s": round(self.write_worker_s, 6),
             "target_flush_worker_s": round(self.flush_worker_s, 6),
             "target_files": len(self.dirty_files),
+            "target_mapped_files": self.mapped_file_count,
         }
 
 

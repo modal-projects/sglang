@@ -979,6 +979,22 @@ def _apply_xor_delta_chain(
     all_items = [
         item for operations in operations_by_name.values() for item in operations
     ]
+    operations_by_target_path: dict[
+        str,
+        list[tuple[str, list[_DiskDeltaItem]]],
+    ] = {}
+    for name, operations in operations_by_name.items():
+        operations_by_target_path.setdefault(
+            operations[0].target_path,
+            [],
+        ).append((name, operations))
+    for tensor_operations in operations_by_target_path.values():
+        tensor_operations.sort(key=lambda item: item[1][0].target_offset)
+    target_batches = sorted(
+        operations_by_target_path.items(),
+        key=lambda item: sum(operations[0].target_nbytes for _, operations in item[1]),
+        reverse=True,
+    )
     source_paths = {item.source_path for item in all_items}
     target_paths = {item.target_path for item in all_items}
     file_cache_limit = _file_descriptor_cache_limit()
@@ -990,17 +1006,19 @@ def _apply_xor_delta_chain(
     try:
         memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
 
-        def apply_tensor(item: tuple[str, list[_DiskDeltaItem]]) -> None:
-            name, operations = item
+        def apply_tensor(
+            name: str,
+            operations: list[_DiskDeltaItem],
+            target_fd: int,
+        ) -> None:
             first = operations[0]
             working_nbytes = first.target_nbytes + _XOR_STREAM_CHUNK_BYTES
             with memory_budget.reserve(working_nbytes):
-                with target_files.acquire(first.target_path) as target_fd:
-                    region = _pread_exact(
-                        target_fd,
-                        first.target_offset,
-                        first.target_nbytes,
-                    )
+                region = _pread_exact(
+                    target_fd,
+                    first.target_offset,
+                    first.target_nbytes,
+                )
                 region_view = np.frombuffer(region, dtype=np.uint8)
                 final = operations[-1]
                 hasher = create_checksum(final.checksum_algorithm)
@@ -1056,24 +1074,28 @@ def _apply_xor_delta_chain(
                     with mismatch_lock:
                         mismatches.append(name)
                 else:
-                    with target_files.acquire(
-                        final.target_path,
-                        write=True,
-                    ) as target_fd:
-                        _pwrite_all(
-                            target_fd,
-                            final.target_offset,
-                            region,
-                        )
+                    _pwrite_all(
+                        target_fd,
+                        final.target_offset,
+                        region,
+                    )
+
+        def apply_checkpoint_shard(
+            batch: tuple[str, list[tuple[str, list[_DiskDeltaItem]]]],
+        ) -> None:
+            target_path, tensor_operations = batch
+            with target_files.acquire(target_path, write=True) as target_fd:
+                for name, operations in tensor_operations:
+                    apply_tensor(name, operations, target_fd)
 
         apply_started = time.perf_counter()
         workers = min(
             _MAX_DELTA_APPLY_WORKERS,
             _available_cpu_count(),
-            len(operations_by_name) or 1,
+            len(target_batches) or 1,
         )
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(apply_tensor, operations_by_name.items()))
+            list(pool.map(apply_checkpoint_shard, target_batches))
         apply_wall_s = time.perf_counter() - apply_started
 
         flush_started = time.perf_counter()
@@ -1110,6 +1132,8 @@ def _apply_xor_delta_chain(
         "target_tensor_bytes": sum(
             operations[0].target_nbytes for operations in operations_by_name.values()
         ),
+        "apply_work_items": len(target_batches),
+        "scheduling": "checkpoint_shard_offset_order",
         "workers": workers,
         "io_backend": (
             "pread_pwrite" if len(deltas) == 1 else "pread_pwrite_xor_chain"

@@ -254,6 +254,11 @@ class MaterializeTest(unittest.TestCase):
         self.assertEqual(stats["apply"]["operation"], "apply_xor")
         self.assertEqual(stats["apply"]["io_backend"], "pread_pwrite")
         self.assertEqual(stats["apply"]["delta_tensors"], 1)
+        self.assertEqual(stats["apply"]["apply_work_items"], 1)
+        self.assertEqual(
+            stats["apply"]["scheduling"],
+            "checkpoint_shard_offset_order",
+        )
         self.assertEqual(stats["apply"]["target_tensor_bytes"], 4096)
         self.assertGreaterEqual(stats["apply"]["phases"]["apply_wall_s"], 0)
         self.assert_at_version(1)
@@ -640,6 +645,7 @@ class MaterializeTest(unittest.TestCase):
         self.assertEqual(stats["apply"]["delta_tensors"], 2)
         self.assertEqual(stats["apply"]["delta_fragments"], 5)
         self.assertEqual(stats["apply"]["target_tensor_bytes"], 6144)
+        self.assertEqual(stats["apply"]["apply_work_items"], 1)
         self.assertEqual(stats["apply"]["file_descriptor_cache_limit"], 1)
         self.assertEqual(stats["apply"]["peak_source_file_descriptors"], 1)
         self.assertEqual(stats["apply"]["peak_target_file_descriptors"], 1)

@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Optional
 
@@ -126,14 +128,25 @@ def _cpu_weight_transform_workers() -> int:
 def _parallel_cpu_index_select(
     tensor: torch.Tensor,
     index: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     workers = min(_cpu_weight_transform_workers(), tensor.shape[0])
     if workers <= 1:
-        return tensor.index_select(1, index).contiguous()
+        if out is None:
+            return tensor.index_select(1, index).contiguous()
+        torch.index_select(tensor, 1, index, out=out)
+        return out
 
     shape = list(tensor.shape)
     shape[1] = index.numel()
-    output = tensor.new_empty(shape)
+    output = tensor.new_empty(shape) if out is None else out
+    if list(output.shape) != shape or output.dtype != tensor.dtype:
+        raise ValueError(
+            "CPU index-select output does not match the selected tensor: "
+            f"expected={tuple(shape)}/{tensor.dtype} "
+            f"actual={tuple(output.shape)}/{output.dtype}"
+        )
     ranges = [
         (
             worker * tensor.shape[0] // workers,
@@ -156,6 +169,38 @@ def _parallel_cpu_index_select(
         for future in futures:
             future.result()
     return output
+
+
+def _parallel_cpu_zero_(tensors: Iterable[torch.Tensor]) -> None:
+    byte_views = []
+    seen = set()
+    for tensor in tensors:
+        byte_view = tensor.view(torch.uint8).reshape(-1)
+        key = (byte_view.data_ptr(), byte_view.numel())
+        if key in seen:
+            continue
+        seen.add(key)
+        byte_views.append(byte_view)
+
+    if not byte_views:
+        return
+    total_bytes = sum(byte_view.numel() for byte_view in byte_views)
+    workers = min(_cpu_weight_transform_workers(), total_bytes)
+    if workers <= 1:
+        for byte_view in byte_views:
+            byte_view.zero_()
+        return
+
+    chunk_bytes = max(1, math.ceil(total_bytes / workers))
+    chunks = [
+        byte_view[offset : offset + chunk_bytes]
+        for byte_view in byte_views
+        for offset in range(0, byte_view.numel(), chunk_bytes)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(chunk.zero_) for chunk in chunks]
+        for future in futures:
+            future.result()
 
 
 def _compose_trtllm_gate_up_permutation(
@@ -613,22 +658,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
-    def restore_weights_before_loading(self, layer) -> None:
+    def _restore_checkpoint_scale_dtype(self, layer) -> bool:
         if self._fi_kernel != "trtllm_sm100":
-            return
+            return False
         for name in ("w13_weight_scale", "w2_weight_scale"):
             parameter = getattr(layer, name)
             if parameter.dtype != torch.uint8:
                 parameter.data = parameter.data.view(torch.uint8)
-        for name in (
-            "w13_weight",
-            "w13_weight_scale",
-            "w13_weight_bias",
-            "w2_weight",
-            "w2_weight_scale",
-            "w2_weight_bias",
-        ):
-            getattr(layer, name).data.zero_()
+        return True
+
+    def _zero_checkpoint_buffers(self, layer) -> None:
+        tensors = [
+            getattr(layer, name).data
+            for name in (
+                "w13_weight",
+                "w13_weight_scale",
+                "w13_weight_bias",
+                "w2_weight",
+                "w2_weight_scale",
+                "w2_weight_bias",
+            )
+        ]
+        if tensors[0].device.type == "cpu":
+            _parallel_cpu_zero_(tensors)
+        else:
+            for tensor in tensors:
+                tensor.zero_()
+
+    def restore_weights_before_loading(self, layer) -> None:
+        if self._restore_checkpoint_scale_dtype(layer):
+            self._zero_checkpoint_buffers(layer)
+
+    def restore_weights_before_cpu_staging(self, layer) -> None:
+        if not self._restore_checkpoint_scale_dtype(layer):
+            return
+        padded = (
+            self.intermediate_size_per_partition
+            != layer.intermediate_size_per_partition
+            or self.hidden_size != layer.hidden_size
+        )
+        for name in ("w13_weight", "w2_weight"):
+            parameter = getattr(layer, name)
+            runtime_buffer = getattr(
+                parameter,
+                "_weight_update_runtime_buffer",
+                parameter.data,
+            )
+            parameter._weight_update_runtime_buffer = runtime_buffer
+            parameter.data = torch.empty_like(runtime_buffer)
+        if padded:
+            self._zero_checkpoint_buffers(layer)
 
     def supports_batched_weight_loading(self) -> bool:
         return True
@@ -802,6 +881,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
 
+            def cpu_staging_output(name: str) -> torch.Tensor | None:
+                if device.type != "cpu":
+                    return None
+                return getattr(
+                    getattr(layer, name),
+                    "_weight_update_runtime_buffer",
+                    None,
+                )
+
             # TRT-LLM swaps adjacent w1/w3 rows before its output-layout
             # permutation. Compose both permutations to avoid another full copy.
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
@@ -854,9 +942,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             def shuffle_rows(
                 tensor: torch.Tensor,
                 indices: torch.Tensor,
+                *,
+                out: torch.Tensor | None = None,
             ) -> torch.Tensor:
                 if device.type == "cpu":
-                    return _parallel_cpu_index_select(tensor, indices)
+                    return _parallel_cpu_index_select(tensor, indices, out=out)
                 return torch.stack(
                     [expert.index_select(0, indices).contiguous() for expert in tensor]
                 )
@@ -875,6 +965,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_weight = shuffle_rows(
                 w13_weight.view(torch.uint8),
                 w13_weight_permute_indices,
+                out=cpu_staging_output("w13_weight"),
             )
             w13_weight_scale = shuffle_scales(
                 w13_weight_scale,
@@ -887,6 +978,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight = shuffle_rows(
                 w2_weight.view(torch.uint8),
                 w2_weight_permute_indices,
+                out=cpu_staging_output("w2_weight"),
             )
             w2_weight_scale = shuffle_scales(
                 w2_weight_scale,
@@ -908,8 +1000,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size_per_partition // sf_block_size,
             ).view(torch.float8_e4m3fn)
 
-            copy_or_rebind_param(layer, "w13_weight", w13_weight)
-            copy_or_rebind_param(layer, "w2_weight", w2_weight)
+            for name, value in (
+                ("w13_weight", w13_weight),
+                ("w2_weight", w2_weight),
+            ):
+                parameter = getattr(layer, name)
+                runtime_buffer = getattr(
+                    parameter,
+                    "_weight_update_runtime_buffer",
+                    None,
+                )
+                if runtime_buffer is None:
+                    copy_or_rebind_param(layer, name, value)
+                    continue
+                if value.data_ptr() != runtime_buffer.data_ptr():
+                    raise RuntimeError(
+                        f"{name} was not written into its CPU staging buffer"
+                    )
+                parameter.data = runtime_buffer
+                del parameter._weight_update_runtime_buffer
+
             for name, value in (
                 ("w13_weight_scale", w13_weight_scale),
                 ("w2_weight_scale", w2_weight_scale),

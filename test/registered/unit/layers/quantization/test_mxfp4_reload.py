@@ -10,6 +10,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.mxfp4 import (
     Mxfp4MoEMethod,
     _compose_trtllm_gate_up_permutation,
+    _parallel_cpu_zero_,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
@@ -35,6 +36,8 @@ def _make_layer(seed: int) -> torch.nn.Module:
     generator = torch.Generator().manual_seed(seed)
     layer = torch.nn.Module()
     layer.num_local_experts = 2
+    layer.intermediate_size_per_partition = 128
+    layer.hidden_size = 128
     layer.moe_runner_config = SimpleNamespace(gate_up_interleaved=True)
 
     def parameter(shape, dtype):
@@ -116,6 +119,76 @@ def _make_hybrid_layer(seed: int) -> torch.nn.Module:
 
 
 class TestMxfp4Reload(unittest.TestCase):
+    def test_cpu_staging_keeps_runtime_buffers(self):
+        method = _make_method()
+        layer = _make_layer(seed=1)
+        method.process_weights_after_loading(layer)
+        staged_names = ("w13_weight", "w2_weight")
+        before = {name: getattr(layer, name).detach().clone() for name in staged_names}
+
+        method.restore_weights_before_cpu_staging(layer)
+
+        for name, expected in before.items():
+            parameter = getattr(layer, name)
+            runtime_buffer = parameter._weight_update_runtime_buffer
+            torch.testing.assert_close(
+                runtime_buffer.view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            self.assertNotEqual(parameter.data_ptr(), runtime_buffer.data_ptr())
+
+        method.restore_weights_before_cpu_staging(layer)
+        for name, expected in before.items():
+            parameter = getattr(layer, name)
+            runtime_buffer = parameter._weight_update_runtime_buffer
+            torch.testing.assert_close(
+                runtime_buffer.view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            self.assertNotEqual(parameter.data_ptr(), runtime_buffer.data_ptr())
+
+    def test_cpu_staging_rebuilds_unpadded_runtime_layout(self):
+        method = _make_method()
+        layer = _make_layer(seed=1)
+        target = _make_layer(seed=2)
+        reference = _make_layer(seed=2)
+        method.process_weights_after_loading(layer)
+        runtime_pointers = {
+            name: parameter.data_ptr() for name, parameter in layer.named_parameters()
+        }
+
+        method.restore_weights_before_cpu_staging(layer)
+        for name, parameter in target.named_parameters():
+            getattr(layer, name).data.copy_(parameter)
+        method.process_weights_after_loading(layer)
+        method.process_weights_after_loading(reference)
+
+        for name, expected in _runtime_state(reference).items():
+            actual = getattr(layer, name)
+            if actual.dtype == torch.float8_e4m3fn:
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    expected.view(torch.uint8),
+                )
+            else:
+                torch.testing.assert_close(actual, expected)
+            self.assertEqual(actual.data_ptr(), runtime_pointers[name])
+
+    def test_parallel_cpu_zero_preserves_tensor_boundaries(self):
+        storage = torch.full((32,), 7, dtype=torch.uint8)
+        first = storage[4:12]
+        second = storage[16:28].view(torch.bfloat16)
+
+        _parallel_cpu_zero_((first, first, second))
+
+        torch.testing.assert_close(storage[:4], torch.full((4,), 7, dtype=torch.uint8))
+        torch.testing.assert_close(storage[4:12], torch.zeros(8, dtype=torch.uint8))
+        torch.testing.assert_close(
+            storage[12:16], torch.full((4,), 7, dtype=torch.uint8)
+        )
+        torch.testing.assert_close(storage[16:28], torch.zeros(12, dtype=torch.uint8))
+        torch.testing.assert_close(storage[28:], torch.full((4,), 7, dtype=torch.uint8))
+
     def test_gate_up_reordering_is_composed_with_runtime_permutation(self):
         indices = torch.tensor([3, 0, 2, 1])
         rows = torch.arange(4)

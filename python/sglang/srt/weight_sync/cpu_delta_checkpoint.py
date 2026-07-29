@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -504,9 +505,16 @@ class DeltaCheckpointTransform:
         *,
         description: str,
         write_tensor: Any = None,
+        write_block_bytes: int | None = None,
     ) -> dict[str, Any]:
         """Apply and verify canonical target tensors in caller-owned buffers."""
 
+        if write_tensor is not None and (
+            write_block_bytes is None or write_block_bytes <= 0
+        ):
+            raise ValueError("write_block_bytes must be positive when persisting")
+        if write_tensor is not None:
+            assert write_block_bytes is not None
         names = {
             name: self.operations_by_name[name]
             for name in tensors
@@ -538,6 +546,17 @@ class DeltaCheckpointTransform:
         )
         memory_budget = _ByteBudget(self.working_memory_budget_bytes)
         final_operation = {name: operations[-1] for name, operations in names.items()}
+        dirty_blocks = (
+            {
+                name: np.zeros(
+                    math.ceil(tensors[name].numel() / write_block_bytes),
+                    dtype=np.bool_,
+                )
+                for name in names
+            }
+            if write_tensor is not None
+            else {}
+        )
         operations_by_source = {}
         for name, operations in names.items():
             for operation in operations:
@@ -585,11 +604,42 @@ class DeltaCheckpointTransform:
                             if not block:
                                 break
                             delta = np.frombuffer(block, dtype=np.uint8)
-                            np.bitwise_xor(
-                                region[position : position + delta.size],
-                                delta,
-                                out=region[position : position + delta.size],
-                            )
+                            has_changes = True
+                            if write_tensor is not None:
+                                block_begin = position // write_block_bytes
+                                complete_bytes = (
+                                    delta.size // write_block_bytes * write_block_bytes
+                                )
+                                block_changes = np.any(
+                                    delta[:complete_bytes].reshape(
+                                        -1,
+                                        write_block_bytes,
+                                    ),
+                                    axis=1,
+                                )
+                                if complete_bytes:
+                                    dirty_blocks[name][
+                                        block_begin : block_begin
+                                        + complete_bytes // write_block_bytes
+                                    ] |= block_changes
+                                tail_has_changes = (
+                                    complete_bytes != delta.size
+                                    and np.any(delta[complete_bytes:])
+                                )
+                                if tail_has_changes:
+                                    dirty_blocks[name][
+                                        block_begin
+                                        + complete_bytes // write_block_bytes
+                                    ] = True
+                                has_changes = bool(
+                                    np.any(block_changes) or tail_has_changes
+                                )
+                            if has_changes:
+                                np.bitwise_xor(
+                                    region[position : position + delta.size],
+                                    delta,
+                                    out=region[position : position + delta.size],
+                                )
                             if hasher is not None:
                                 hasher.update(region[position : position + delta.size])
                             position += delta.size
@@ -631,6 +681,10 @@ class DeltaCheckpointTransform:
                                 f"overwrite payload for {name!r} is invalid"
                             )
                         region[positions] = values
+                        if write_tensor is not None and count:
+                            dirty_blocks[name][
+                                np.unique(positions // write_block_bytes)
+                            ] = True
                         if hasher is not None:
                             hasher.update(region)
                 if source.position != operation.compressed_nbytes:
@@ -648,7 +702,28 @@ class DeltaCheckpointTransform:
                         f"expected={operation.expected_checksum} actual={actual}"
                     )
                 if write_tensor is not None:
-                    write_tensor(name, region)
+                    changes = np.flatnonzero(
+                        np.diff(
+                            np.concatenate(
+                                (
+                                    np.array([False]),
+                                    dirty_blocks[name],
+                                    np.array([False]),
+                                )
+                            )
+                        )
+                    )
+                    write_tensor(
+                        name,
+                        region,
+                        [
+                            (
+                                int(begin) * write_block_bytes,
+                                min(int(end) * write_block_bytes, region.size),
+                            )
+                            for begin, end in changes.reshape(-1, 2)
+                        ],
+                    )
             return (
                 region.size if is_final else 0,
                 operation.compressed_nbytes,

@@ -1082,11 +1082,17 @@ class TestCPUWeightCache(unittest.TestCase):
                 *,
                 description,
                 write_tensor,
+                write_block_bytes,
             ):
                 assert description == "model"
+                assert write_block_bytes > 0
                 tensor = tensors["weight"].view(torch.int64)
-                tensor.add_(1)
-                write_tensor("weight", tensors["weight"].numpy())
+                tensor[0].add_(1)
+                write_tensor(
+                    "weight",
+                    tensors["weight"].numpy(),
+                    [(0, tensor.element_size())],
+                )
                 return {
                     "operation": "canonical_delta_transform",
                     "description": description,
@@ -1100,7 +1106,8 @@ class TestCPUWeightCache(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root_value:
             root = Path(root_value)
             initial = torch.arange(8, dtype=torch.int64)
-            expected = initial + 1
+            expected = initial.clone()
+            expected[0].add_(1)
             save_file({"weight": initial}, root / "model.safetensors")
             compiler = object.__new__(CPUWeightCache)
             compiler.host_cpu_group = None
@@ -1136,7 +1143,8 @@ class TestCPUWeightCache(unittest.TestCase):
                 for item in source_stats
                 if item["operation"] == "persist_canonical_checkpoint"
             )
-            self.assertEqual(persist["target_write_bytes"], initial.nbytes)
+            self.assertEqual(persist["target_logical_bytes"], initial.nbytes)
+            self.assertEqual(persist["target_write_bytes"], initial.element_size())
 
     def test_canonical_transform_finishes_before_runtime_compilation(self):
         class RecordingTransform:

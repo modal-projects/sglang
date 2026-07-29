@@ -1284,7 +1284,10 @@ class TestCPUWeightCache(unittest.TestCase):
                 self.assertEqual(set(writers[1].sources), {"b"})
                 writers[0].write("a", bytearray([11] * 32), [(0, 32)])
                 writers[1].write("b", bytearray([29] * 32), [(0, 32)])
+                self.assertEqual(path.read_bytes(), bytes(64))
 
+                for writer in writers:
+                    writer.write_pending_group()
                 for writer in writers:
                     writer.finish_group(0)
                 for writer in writers:

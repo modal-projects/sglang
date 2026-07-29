@@ -192,6 +192,77 @@ class TestMxfp4Reload(unittest.TestCase):
                 torch.testing.assert_close(actual, expected)
             self.assertEqual(actual.data_ptr(), runtime_pointers[name])
 
+    def test_cpu_staging_loads_noninterleaved_weights_in_runtime_layout(self):
+        method = _make_method()
+        layer = _make_layer(seed=1)
+        target = _make_layer(seed=2)
+        reference = _make_layer(seed=2)
+        for value in (layer, target, reference):
+            value.moe_runner_config.gate_up_interleaved = False
+
+        method.process_weights_after_loading(layer)
+        runtime_pointers = {
+            name: parameter.data_ptr() for name, parameter in layer.named_parameters()
+        }
+        method.restore_weights_before_cpu_staging(layer)
+
+        for name in (
+            "w13_weight_scale",
+            "w13_weight_bias",
+            "w2_weight_scale",
+            "w2_weight_bias",
+        ):
+            getattr(layer, name).data.copy_(getattr(target, name))
+
+        copy_pairs = []
+        half_rows = layer.w13_weight.shape[1] // 2
+        for expert_id in range(layer.num_local_experts):
+            copy_pairs.extend(
+                (
+                    (
+                        layer.w13_weight[expert_id, :half_rows],
+                        target.w13_weight[expert_id, :half_rows],
+                    ),
+                    (
+                        layer.w13_weight[expert_id, half_rows:],
+                        target.w13_weight[expert_id, half_rows:],
+                    ),
+                    (
+                        layer.w2_weight[expert_id],
+                        target.w2_weight[expert_id],
+                    ),
+                )
+            )
+        incomplete = copy_pairs[:-1]
+        self.assertIs(
+            method.load_batched_weights_for_cpu_staging(
+                layer,
+                incomplete,
+                executor=None,
+            ),
+            incomplete,
+        )
+        remaining = method.load_batched_weights_for_cpu_staging(
+            layer,
+            copy_pairs,
+            executor=None,
+        )
+        self.assertEqual(remaining, [])
+
+        method.process_weights_after_loading(layer)
+        method.process_weights_after_loading(reference)
+
+        for name, expected in _runtime_state(reference).items():
+            actual = getattr(layer, name)
+            if actual.dtype == torch.float8_e4m3fn:
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    expected.view(torch.uint8),
+                )
+            else:
+                torch.testing.assert_close(actual, expected)
+            self.assertEqual(actual.data_ptr(), runtime_pointers[name])
+
     def test_parallel_cpu_zero_preserves_tensor_boundaries(self):
         storage = torch.full((32,), 7, dtype=torch.uint8)
         first = storage[4:12]

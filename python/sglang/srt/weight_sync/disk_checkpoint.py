@@ -79,12 +79,15 @@ def materialize(
     checkpoint_source_dir: str,
     target_version: int,
     checkpoint_source_refresh_hook: Optional[str] = None,
+    *,
+    drop_cache_after_seed: bool = False,
 ) -> dict:
     """Bring the host-local checkpoint up to ``target_version``.
 
     Missing or incomplete source files raise ``FileNotFoundError`` without
     reseeding. A checksum mismatch on a complete source is treated as corrupt
-    local state and gets one replay from a clean seed.
+    local state and gets one replay from a clean seed. ``drop_cache_after_seed``
+    releases each durable local shard instead of retaining it for a consumer.
     """
     if target_version < 0:
         raise ValueError("target_version must be non-negative")
@@ -129,6 +132,7 @@ def materialize(
                 checkpoint_source_dir,
                 target_version,
                 reseed=applied is not None and applied > target_version,
+                drop_cache_after_seed=drop_cache_after_seed,
             )
         except FileNotFoundError:
             # A source version is missing or not fully materialized — a readiness
@@ -153,6 +157,7 @@ def materialize(
                 checkpoint_source_dir,
                 target_version,
                 reseed=True,
+                drop_cache_after_seed=drop_cache_after_seed,
             )
             stats["reseed_after_failed_apply"] = True
         stats["initial_version"] = applied
@@ -169,6 +174,7 @@ def _materialize_locked(
     checkpoint_source_dir: str,
     target_version: int,
     reseed: bool,
+    drop_cache_after_seed: bool,
 ) -> dict:
     # A torn local state (reseed=True) is treated like a fresh host: the
     # applied-version marker can't be trusted over partially-mutated files.
@@ -189,7 +195,12 @@ def _materialize_locked(
             else _version_dir(checkpoint_source_dir, start)
         )
         seed_started = time.perf_counter()
-        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+        _reset_checkpoint(
+            seed_dir,
+            local_checkpoint_dir,
+            start,
+            drop_cache_after_copy=drop_cache_after_seed,
+        )
         seed_wall_s = time.perf_counter() - seed_started
     else:
         start = applied
@@ -373,7 +384,13 @@ def drop_checkpoint_page_cache(checkpoint_dir: str) -> int:
     return len(paths)
 
 
-def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
+def _reset_checkpoint(
+    src_dir: str,
+    local_checkpoint_dir: str,
+    version: int,
+    *,
+    drop_cache_after_copy: bool,
+) -> None:
     """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
     (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
     are pruned). Later deltas chain on top of this state."""
@@ -414,8 +431,10 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
                 out.write(chunk)
             out.flush()
             os.fsync(out.fileno())
-        # Don't let the source evict the local copy we keep resident.
+        # The immutable source no longer needs to occupy the page cache.
         _drop_page_cache(entry.path)
+        if drop_cache_after_copy:
+            _drop_page_cache(dst)
         with progress_lock:
             progress["done_gb"] += entry.stat().st_size / 1e9
             done = progress["done_gb"]

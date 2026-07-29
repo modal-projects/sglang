@@ -568,6 +568,7 @@ class DeltaCheckpointTransform:
         def apply_operation(
             item: tuple[str, _DeltaOperation],
             source_fd: int,
+            decompressor: zstandard.ZstdDecompressor,
         ) -> tuple[int, int, float]:
             name, operation = item
             region_tensor = tensors[name]
@@ -587,7 +588,6 @@ class DeltaCheckpointTransform:
                     operation.source_path,
                     max_read_bytes=_XOR_STREAM_CHUNK_BYTES,
                 )
-                decompressor = zstandard.ZstdDecompressor()
                 if operation.encoding == "xor":
                     with decompressor.stream_reader(
                         source,
@@ -742,16 +742,35 @@ class DeltaCheckpointTransform:
                 source_fd = os.open(source_path, os.O_RDONLY)
                 futures = []
                 try:
-                    for operation in operations:
-                        futures.append(
-                            pool.submit(
-                                apply_operation,
-                                operation,
-                                source_fd,
-                            )
+                    # Keep executor and decompressor setup proportional to
+                    # workers rather than checkpoint tensor count.
+                    chunk_count = min(worker_count, len(operations))
+                    chunks = [[] for _ in range(chunk_count)]
+                    chunk_bytes = [0] * chunk_count
+                    for operation in sorted(
+                        operations,
+                        key=lambda item: (-tensors[item[0]].numel(), item[0]),
+                    ):
+                        chunk_index = min(
+                            range(chunk_count),
+                            key=chunk_bytes.__getitem__,
                         )
+                        chunks[chunk_index].append(operation)
+                        chunk_bytes[chunk_index] += tensors[operation[0]].numel()
+
+                    def apply_chunk(chunk):
+                        decompressor = zstandard.ZstdDecompressor()
+                        return [
+                            apply_operation(operation, source_fd, decompressor)
+                            for operation in chunk
+                        ]
+
+                    futures = [
+                        pool.submit(apply_chunk, chunk) for chunk in chunks if chunk
+                    ]
                     wait(futures)
-                    results.extend(future.result() for future in futures)
+                    for future in futures:
+                        results.extend(future.result())
                 finally:
                     wait(futures)
                     os.close(source_fd)

@@ -249,6 +249,43 @@ class MaterializeTest(unittest.TestCase):
         self.materialize(2)
         self.assert_at_version(2)
 
+    def test_seed_evicts_local_checkpoint_pages_when_requested(self):
+        dropped = []
+        original = disk_checkpoint._drop_page_cache
+        disk_checkpoint._drop_page_cache = dropped.append
+        try:
+            disk_checkpoint.materialize(
+                self.local,
+                self.pub.base_dir,
+                self.pub.source_dir,
+                0,
+                drop_cache_after_seed=True,
+            )
+        finally:
+            disk_checkpoint._drop_page_cache = original
+
+        self.assertEqual(
+            dropped,
+            [
+                os.path.join(self.pub.base_dir, self.pub.SHARD),
+                os.path.join(self.local, self.pub.SHARD),
+            ],
+        )
+
+    def test_seed_retains_local_checkpoint_pages_by_default(self):
+        dropped = []
+        original = disk_checkpoint._drop_page_cache
+        disk_checkpoint._drop_page_cache = dropped.append
+        try:
+            self.materialize(0)
+        finally:
+            disk_checkpoint._drop_page_cache = original
+
+        self.assertEqual(
+            dropped,
+            [os.path.join(self.pub.base_dir, self.pub.SHARD)],
+        )
+
     def test_incremental_materialization_is_idempotent(self):
         stats = self.materialize(1)
         self.assertEqual(stats["apply"]["operation"], "apply_xor")

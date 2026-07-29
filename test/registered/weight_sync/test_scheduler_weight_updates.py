@@ -355,6 +355,7 @@ def test_cpu_base_materializes_disk_backed_canonical_checkpoint(drop_cache):
         base_checkpoint_dir="/base",
         checkpoint_source_dir="/base",
         target_version=0,
+        drop_cache_after_seed=drop_cache,
     )
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         manager.host_cpu_group,
@@ -429,6 +430,7 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         base_checkpoint_dir="/base",
         checkpoint_source_dir="/published",
         target_version=3,
+        drop_cache_after_seed=True,
     )
     manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_called_once_with(
         checkpoint_dir="/canonical",

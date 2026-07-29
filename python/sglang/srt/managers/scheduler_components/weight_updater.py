@@ -382,6 +382,9 @@ class SchedulerWeightUpdaterManager:
                             base_checkpoint_dir=base_checkpoint_dir,
                             checkpoint_source_dir=base_checkpoint_dir,
                             target_version=0,
+                            drop_cache_after_seed=(
+                                server_args.weight_loader_drop_cache_after_load
+                            ),
                         )
                     stage_stats = self._initialize_cpu_weight_cache(base_checkpoint_dir)
                     if canonical_checkpoint_dir is not None and materialization is None:
@@ -390,6 +393,9 @@ class SchedulerWeightUpdaterManager:
                             base_checkpoint_dir=base_checkpoint_dir,
                             checkpoint_source_dir=base_checkpoint_dir,
                             target_version=0,
+                            drop_cache_after_seed=(
+                                server_args.weight_loader_drop_cache_after_load
+                            ),
                         )
                     if materialization is not None:
                         stage_stats["canonical_checkpoint_materialization"] = (
@@ -436,6 +442,9 @@ class SchedulerWeightUpdaterManager:
                             base_checkpoint_dir=base_checkpoint_dir,
                             checkpoint_source_dir=recv_req.checkpoint_source_dir,
                             target_version=recv_req.target_version,
+                            drop_cache_after_seed=(
+                                server_args.weight_loader_drop_cache_after_load
+                            ),
                         )
                         success, message, stage_stats = (
                             self.tp_worker.stage_cpu_weight_update_from_checkpoint(

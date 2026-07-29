@@ -437,27 +437,17 @@ class SchedulerWeightUpdaterManager:
                             checkpoint_source_dir=recv_req.checkpoint_source_dir,
                             target_version=recv_req.target_version,
                         )
-                        materialization = disk_checkpoint.materialize(
-                            local_checkpoint_dir=canonical_checkpoint_dir,
-                            base_checkpoint_dir=base_checkpoint_dir,
-                            checkpoint_source_dir=recv_req.checkpoint_source_dir,
-                            target_version=recv_req.target_version,
-                            drop_cache_after_seed=(
-                                server_args.weight_loader_drop_cache_after_load
-                            ),
-                        )
                         success, message, stage_stats = (
-                            self.tp_worker.stage_cpu_weight_update_from_checkpoint(
+                            self.tp_worker.stage_cpu_weight_update_from_disk_delta_lineage(
                                 checkpoint_dir=canonical_checkpoint_dir,
+                                base_checkpoint_dir=base_checkpoint_dir,
+                                checkpoint_source_dir=recv_req.checkpoint_source_dir,
                                 target_version=recv_req.target_version,
                                 host_cpu_group=self.host_cpu_group,
                             )
                         )
                         if not success:
                             raise RuntimeError(message)
-                        stage_stats["canonical_checkpoint_materialization"] = (
-                            materialization
-                        )
                     else:
                         success, message, stage_stats = (
                             self.tp_worker.stage_cpu_weight_update_from_delta_lineage(

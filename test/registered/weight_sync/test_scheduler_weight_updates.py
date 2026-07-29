@@ -379,7 +379,7 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
     )
     manager._cpu_weight_cache_base_checkpoint_dir = "/base"
     manager._cpu_weight_cache_initialization_stats = {}
-    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.return_value = (
+    manager.tp_worker.stage_cpu_weight_update_from_disk_delta_lineage.return_value = (
         True,
         "staged",
         {},
@@ -410,10 +410,6 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
             side_effect=validate_after_refresh,
         ) as validate,
         mock.patch(
-            "sglang.srt.weight_sync.disk_checkpoint.materialize",
-            return_value={"operation": "materialize", "target_version": 3},
-        ) as materialize,
-        mock.patch(
             "sglang.srt.weight_sync.disk_checkpoint.drop_checkpoint_page_cache"
         ) as drop_page_cache,
     ):
@@ -425,26 +421,16 @@ def test_cpu_delta_materializes_then_compiles_disk_backed_canonical_checkpoint()
         target_version=3,
     )
     refresh_source.assert_called_once_with("/published", 3, "package.refresh")
-    materialize.assert_called_once_with(
-        local_checkpoint_dir="/canonical",
+    manager.tp_worker.stage_cpu_weight_update_from_disk_delta_lineage.assert_called_once_with(
+        checkpoint_dir="/canonical",
         base_checkpoint_dir="/base",
         checkpoint_source_dir="/published",
         target_version=3,
-        drop_cache_after_seed=True,
-    )
-    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_called_once_with(
-        checkpoint_dir="/canonical",
-        target_version=3,
         host_cpu_group=manager.host_cpu_group,
     )
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_not_called()
     manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.assert_not_called()
     drop_page_cache.assert_not_called()
-    assert (
-        result.rank_stats[0]["stage"]["canonical_checkpoint_materialization"][
-            "target_version"
-        ]
-        == 3
-    )
 
 
 def test_cpu_weight_cache_initialization_runs_in_background():

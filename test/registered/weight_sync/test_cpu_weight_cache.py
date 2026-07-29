@@ -34,6 +34,8 @@ from sglang.srt.weight_sync.cpu_delta_checkpoint import (
 from sglang.srt.weight_sync.cpu_weight_cache import (
     CPUWeightCache,
     _canonical_checkpoint_layout,
+    _canonical_transform_owners,
+    _CanonicalCheckpointWriter,
     _checkpoint_weight_map,
     _clone_weight_module,
     _HostRankPhaseCoordinator,
@@ -1167,6 +1169,106 @@ class TestCPUWeightCache(unittest.TestCase):
 
             self.assertEqual(results, [compiled])
             compiler._finalize_cpu_image_group.assert_called_once_with(loaded_group)
+
+    def test_canonical_transform_ownership_balances_each_compile_group(self):
+        def tensor_source(filename, nbytes):
+            return SimpleNamespace(
+                filename=filename,
+                entry=SimpleNamespace(relative_begin=0, relative_end=nbytes),
+            )
+
+        sources = [
+            SimpleNamespace(
+                tensors={
+                    "group0.large": tensor_source("a.safetensors", 80),
+                    "group0.medium": tensor_source("a.safetensors", 50),
+                    "group0.small": tensor_source("b.safetensors", 30),
+                }
+            ),
+            SimpleNamespace(
+                tensors={
+                    "group1.large": tensor_source("b.safetensors", 70),
+                    "group1.small": tensor_source("b.safetensors", 20),
+                }
+            ),
+        ]
+        operations = {
+            "a.safetensors": {
+                "group0.large": [None],
+                "group0.medium": [None],
+            },
+            "b.safetensors": {
+                "group0.small": [None],
+                "group1.large": [None],
+                "group1.small": [None],
+            },
+        }
+
+        owners = _canonical_transform_owners(sources, operations, world_size=2)
+
+        self.assertEqual(
+            owners,
+            {
+                "group0.large": 0,
+                "group0.medium": 1,
+                "group0.small": 1,
+                "group1.large": 0,
+                "group1.small": 1,
+            },
+        )
+
+    def test_canonical_transform_writers_persist_disjoint_tensor_ranges(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            filename = "model.safetensors"
+            path = root / filename
+            path.write_bytes(bytes(64))
+
+            def tensor_source(begin, end):
+                return SimpleNamespace(
+                    filename=filename,
+                    file_offset=begin,
+                    entry=SimpleNamespace(
+                        relative_begin=begin,
+                        relative_end=end,
+                    ),
+                )
+
+            sources = [
+                SimpleNamespace(
+                    tensors={
+                        "a": tensor_source(0, 32),
+                        "b": tensor_source(32, 64),
+                    }
+                )
+            ]
+            operations = {filename: {"a": [None], "b": [None]}}
+            writers = [
+                _CanonicalCheckpointWriter(
+                    root=root,
+                    sources=sources,
+                    operations_by_file=operations,
+                    rank=rank,
+                    world_size=2,
+                    drop_cache_after_write=False,
+                )
+                for rank in range(2)
+            ]
+            try:
+                self.assertEqual(set(writers[0].sources), {"a"})
+                self.assertEqual(set(writers[1].sources), {"b"})
+                writers[0].write("a", bytearray([11] * 32), [(0, 32)])
+                writers[1].write("b", bytearray([29] * 32), [(0, 32)])
+
+                for writer in writers:
+                    writer.finish_group(0)
+                for writer in writers:
+                    writer.validate()
+
+                self.assertEqual(path.read_bytes(), bytes([11] * 32 + [29] * 32))
+            finally:
+                for writer in writers:
+                    writer.close()
 
     def test_disk_delta_transform_persists_the_compiled_shared_buffer(self):
         class Transform:

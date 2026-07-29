@@ -12,6 +12,7 @@ triggers one clean reseed before failing loudly.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import glob
 import json
@@ -50,6 +51,15 @@ _MAX_DELTA_APPLY_WORKERS = 32
 _MAX_OPEN_FILES_PER_CACHE = 256
 _SEED_COPY_CHUNK_BYTES = 16 << 20
 _SEED_LOG_STEP_GB = 50
+_FICLONE = 0x40049409
+_REFLINK_FALLBACK_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTTY,
+    errno.EOPNOTSUPP,
+    errno.EPERM,
+    errno.EXDEV,
+}
 
 # Per-checkpoint dir holding the applied-version marker and materialization lock.
 _SYNC_DIR = ".weight_sync"
@@ -79,12 +89,15 @@ def materialize(
     checkpoint_source_dir: str,
     target_version: int,
     checkpoint_source_refresh_hook: Optional[str] = None,
+    *,
+    drop_cache_after_seed: bool = False,
 ) -> dict:
     """Bring the host-local checkpoint up to ``target_version``.
 
     Missing or incomplete source files raise ``FileNotFoundError`` without
     reseeding. A checksum mismatch on a complete source is treated as corrupt
-    local state and gets one replay from a clean seed.
+    local state and gets one replay from a clean seed. ``drop_cache_after_seed``
+    releases each durable local shard instead of retaining it for a consumer.
     """
     if target_version < 0:
         raise ValueError("target_version must be non-negative")
@@ -129,6 +142,7 @@ def materialize(
                 checkpoint_source_dir,
                 target_version,
                 reseed=applied is not None and applied > target_version,
+                drop_cache_after_seed=drop_cache_after_seed,
             )
         except FileNotFoundError:
             # A source version is missing or not fully materialized — a readiness
@@ -153,6 +167,7 @@ def materialize(
                 checkpoint_source_dir,
                 target_version,
                 reseed=True,
+                drop_cache_after_seed=drop_cache_after_seed,
             )
             stats["reseed_after_failed_apply"] = True
         stats["initial_version"] = applied
@@ -169,6 +184,7 @@ def _materialize_locked(
     checkpoint_source_dir: str,
     target_version: int,
     reseed: bool,
+    drop_cache_after_seed: bool,
 ) -> dict:
     # A torn local state (reseed=True) is treated like a fresh host: the
     # applied-version marker can't be trusted over partially-mutated files.
@@ -189,7 +205,12 @@ def _materialize_locked(
             else _version_dir(checkpoint_source_dir, start)
         )
         seed_started = time.perf_counter()
-        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+        _reset_checkpoint(
+            seed_dir,
+            local_checkpoint_dir,
+            start,
+            drop_cache_after_copy=drop_cache_after_seed,
+        )
         seed_wall_s = time.perf_counter() - seed_started
     else:
         start = applied
@@ -313,6 +334,46 @@ def _materialization_lock(local_checkpoint_dir: str):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+class LocalCheckpointTransaction:
+    """Publish an in-place checkpoint mutation under the materialization lock."""
+
+    def __init__(self, local_checkpoint_dir: str):
+        self.local_checkpoint_dir = local_checkpoint_dir
+        self.initial_version: Optional[int] = None
+        self._lock = None
+        self._mutation_started = False
+        self._committed = False
+
+    def __enter__(self):
+        self._lock = _materialization_lock(self.local_checkpoint_dir)
+        self._lock.__enter__()
+        self.initial_version = _read_applied_version(self.local_checkpoint_dir)
+        return self
+
+    def begin(self, expected_version: int) -> None:
+        if self.initial_version != expected_version:
+            raise RuntimeError(
+                "canonical checkpoint version changed before mutation: "
+                f"expected={expected_version} actual={self.initial_version}"
+            )
+        _clear_applied_version(self.local_checkpoint_dir)
+        self._mutation_started = True
+
+    def commit(self, target_version: int) -> None:
+        if not self._mutation_started:
+            raise RuntimeError("canonical checkpoint mutation has not started")
+        _write_applied_version(self.local_checkpoint_dir, target_version)
+        self._committed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self._mutation_started and not self._committed:
+                _clear_applied_version(self.local_checkpoint_dir)
+        finally:
+            assert self._lock is not None
+            self._lock.__exit__(exc_type, exc, traceback)
+
+
 def _read_applied_version(local_checkpoint_dir: str) -> Optional[int]:
     try:
         with open(os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json")) as f:
@@ -350,7 +411,7 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
-def _drop_page_cache(path: str) -> None:
+def drop_file_page_cache(path: str) -> None:
     """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
     if not hasattr(os, "posix_fadvise"):  # POSIX-only (absent on macOS/Windows)
         return
@@ -364,7 +425,38 @@ def _drop_page_cache(path: str) -> None:
         pass
 
 
-def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
+def drop_checkpoint_page_cache(checkpoint_dir: str) -> int:
+    """Release clean safetensors pages after a checkpoint consumer is done."""
+
+    paths = glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))
+    for path in paths:
+        drop_file_page_cache(path)
+    return len(paths)
+
+
+def _clone_or_copy_file(src, dst) -> bool:
+    """Clone immutable file extents when possible, otherwise copy the bytes."""
+
+    try:
+        fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+        return True
+    except OSError as exc:
+        if exc.errno not in _REFLINK_FALLBACK_ERRNOS:
+            raise
+    dst.seek(0)
+    dst.truncate()
+    while chunk := src.read(_SEED_COPY_CHUNK_BYTES):
+        dst.write(chunk)
+    return False
+
+
+def _reset_checkpoint(
+    src_dir: str,
+    local_checkpoint_dir: str,
+    version: int,
+    *,
+    drop_cache_after_copy: bool,
+) -> None:
     """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
     (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
     are pruned). Later deltas chain on top of this state."""
@@ -395,20 +487,28 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
         local_checkpoint_dir,
     )
     start = time.monotonic()
-    progress = {"done_gb": 0.0, "next_log_gb": _SEED_LOG_STEP_GB}
+    progress = {
+        "done_gb": 0.0,
+        "reflinked_gb": 0.0,
+        "next_log_gb": _SEED_LOG_STEP_GB,
+    }
     progress_lock = threading.Lock()
 
     def copy_one(entry) -> None:
         dst = os.path.join(local_checkpoint_dir, entry.name)
         with open(entry.path, "rb") as src, open(dst, "wb") as out:
-            while chunk := src.read(_SEED_COPY_CHUNK_BYTES):
-                out.write(chunk)
+            reflinked = _clone_or_copy_file(src, out)
             out.flush()
             os.fsync(out.fileno())
-        # Don't let the source evict the local copy we keep resident.
-        _drop_page_cache(entry.path)
+        # The immutable source no longer needs to occupy the page cache.
+        drop_file_page_cache(entry.path)
+        if drop_cache_after_copy:
+            drop_file_page_cache(dst)
         with progress_lock:
-            progress["done_gb"] += entry.stat().st_size / 1e9
+            file_gb = entry.stat().st_size / 1e9
+            progress["done_gb"] += file_gb
+            if reflinked:
+                progress["reflinked_gb"] += file_gb
             done = progress["done_gb"]
             if done >= progress["next_log_gb"] or done >= total_gb:
                 rate = done / max(time.monotonic() - start, 1e-3)
@@ -439,6 +539,15 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
             )
     _fsync_dir(local_checkpoint_dir)
     _write_applied_version(local_checkpoint_dir, version)
+    logger.info(
+        "staged checkpoint v%d to local disk: %.0f GB in %.3fs "
+        "(reflinked=%.0f GB copied=%.0f GB)",
+        version,
+        total_gb,
+        time.monotonic() - start,
+        progress["reflinked_gb"],
+        total_gb - progress["reflinked_gb"],
+    )
 
 
 def _tensor_locations(ckpt_dir: str) -> dict:
@@ -970,6 +1079,22 @@ def _apply_xor_delta_chain(
     all_items = [
         item for operations in operations_by_name.values() for item in operations
     ]
+    operations_by_target_path: dict[
+        str,
+        list[tuple[str, list[_DiskDeltaItem]]],
+    ] = {}
+    for name, operations in operations_by_name.items():
+        operations_by_target_path.setdefault(
+            operations[0].target_path,
+            [],
+        ).append((name, operations))
+    for tensor_operations in operations_by_target_path.values():
+        tensor_operations.sort(key=lambda item: item[1][0].target_offset)
+    target_batches = sorted(
+        operations_by_target_path.items(),
+        key=lambda item: sum(operations[0].target_nbytes for _, operations in item[1]),
+        reverse=True,
+    )
     source_paths = {item.source_path for item in all_items}
     target_paths = {item.target_path for item in all_items}
     file_cache_limit = _file_descriptor_cache_limit()
@@ -981,17 +1106,20 @@ def _apply_xor_delta_chain(
     try:
         memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
 
-        def apply_tensor(item: tuple[str, list[_DiskDeltaItem]]) -> None:
-            name, operations = item
+        def apply_tensor(
+            name: str,
+            operations: list[_DiskDeltaItem],
+            target_fd: int,
+            decompressor: zstandard.ZstdDecompressor,
+        ) -> None:
             first = operations[0]
             working_nbytes = first.target_nbytes + _XOR_STREAM_CHUNK_BYTES
             with memory_budget.reserve(working_nbytes):
-                with target_files.acquire(first.target_path) as target_fd:
-                    region = _pread_exact(
-                        target_fd,
-                        first.target_offset,
-                        first.target_nbytes,
-                    )
+                region = _pread_exact(
+                    target_fd,
+                    first.target_offset,
+                    first.target_nbytes,
+                )
                 region_view = np.frombuffer(region, dtype=np.uint8)
                 final = operations[-1]
                 hasher = create_checksum(final.checksum_algorithm)
@@ -1005,7 +1133,7 @@ def _apply_xor_delta_chain(
                             operation.source_path,
                             max_read_bytes=_XOR_STREAM_CHUNK_BYTES,
                         )
-                        with zstandard.ZstdDecompressor().stream_reader(
+                        with decompressor.stream_reader(
                             source,
                             closefd=False,
                         ) as reader:
@@ -1047,24 +1175,29 @@ def _apply_xor_delta_chain(
                     with mismatch_lock:
                         mismatches.append(name)
                 else:
-                    with target_files.acquire(
-                        final.target_path,
-                        write=True,
-                    ) as target_fd:
-                        _pwrite_all(
-                            target_fd,
-                            final.target_offset,
-                            region,
-                        )
+                    _pwrite_all(
+                        target_fd,
+                        final.target_offset,
+                        region,
+                    )
+
+        def apply_checkpoint_shard(
+            batch: tuple[str, list[tuple[str, list[_DiskDeltaItem]]]],
+        ) -> None:
+            target_path, tensor_operations = batch
+            decompressor = zstandard.ZstdDecompressor()
+            with target_files.acquire(target_path, write=True) as target_fd:
+                for name, operations in tensor_operations:
+                    apply_tensor(name, operations, target_fd, decompressor)
 
         apply_started = time.perf_counter()
         workers = min(
             _MAX_DELTA_APPLY_WORKERS,
             _available_cpu_count(),
-            len(operations_by_name) or 1,
+            len(target_batches) or 1,
         )
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(apply_tensor, operations_by_name.items()))
+            list(pool.map(apply_checkpoint_shard, target_batches))
         apply_wall_s = time.perf_counter() - apply_started
 
         flush_started = time.perf_counter()
@@ -1101,6 +1234,8 @@ def _apply_xor_delta_chain(
         "target_tensor_bytes": sum(
             operations[0].target_nbytes for operations in operations_by_name.values()
         ),
+        "apply_work_items": len(target_batches),
+        "scheduling": "checkpoint_shard_offset_order",
         "workers": workers,
         "io_backend": (
             "pread_pwrite" if len(deltas) == 1 else "pread_pwrite_xor_chain"

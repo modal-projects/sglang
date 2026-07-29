@@ -249,11 +249,83 @@ class MaterializeTest(unittest.TestCase):
         self.materialize(2)
         self.assert_at_version(2)
 
+    def test_seed_falls_back_when_reflink_is_unsupported(self):
+        original = disk_checkpoint.fcntl.ioctl
+        calls = []
+
+        def unsupported(*args):
+            calls.append(args)
+            raise OSError(disk_checkpoint.errno.EOPNOTSUPP, "unsupported")
+
+        disk_checkpoint.fcntl.ioctl = unsupported
+        try:
+            self.materialize(0)
+        finally:
+            disk_checkpoint.fcntl.ioctl = original
+        self.assertTrue(calls)
+        self.assert_at_version(0)
+
+    def test_seed_does_not_hide_unexpected_reflink_errors(self):
+        original = disk_checkpoint.fcntl.ioctl
+
+        def fail(*args):
+            raise OSError(disk_checkpoint.errno.EIO, "I/O error")
+
+        disk_checkpoint.fcntl.ioctl = fail
+        try:
+            with self.assertRaises(OSError):
+                self.materialize(0)
+        finally:
+            disk_checkpoint.fcntl.ioctl = original
+        self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
+
+    def test_seed_evicts_local_checkpoint_pages_when_requested(self):
+        dropped = []
+        original = disk_checkpoint.drop_file_page_cache
+        disk_checkpoint.drop_file_page_cache = dropped.append
+        try:
+            disk_checkpoint.materialize(
+                self.local,
+                self.pub.base_dir,
+                self.pub.source_dir,
+                0,
+                drop_cache_after_seed=True,
+            )
+        finally:
+            disk_checkpoint.drop_file_page_cache = original
+
+        self.assertEqual(
+            dropped,
+            [
+                os.path.join(self.pub.base_dir, self.pub.SHARD),
+                os.path.join(self.local, self.pub.SHARD),
+            ],
+        )
+
+    def test_seed_retains_local_checkpoint_pages_by_default(self):
+        dropped = []
+        original = disk_checkpoint.drop_file_page_cache
+        disk_checkpoint.drop_file_page_cache = dropped.append
+        try:
+            self.materialize(0)
+        finally:
+            disk_checkpoint.drop_file_page_cache = original
+
+        self.assertEqual(
+            dropped,
+            [os.path.join(self.pub.base_dir, self.pub.SHARD)],
+        )
+
     def test_incremental_materialization_is_idempotent(self):
         stats = self.materialize(1)
         self.assertEqual(stats["apply"]["operation"], "apply_xor")
         self.assertEqual(stats["apply"]["io_backend"], "pread_pwrite")
         self.assertEqual(stats["apply"]["delta_tensors"], 1)
+        self.assertEqual(stats["apply"]["apply_work_items"], 1)
+        self.assertEqual(
+            stats["apply"]["scheduling"],
+            "checkpoint_shard_offset_order",
+        )
         self.assertEqual(stats["apply"]["target_tensor_bytes"], 4096)
         self.assertGreaterEqual(stats["apply"]["phases"]["apply_wall_s"], 0)
         self.assert_at_version(1)
@@ -262,6 +334,19 @@ class MaterializeTest(unittest.TestCase):
         self.assert_at_version(1)
         self.materialize(2)
         self.assert_at_version(2)
+
+    def test_local_checkpoint_transaction_publishes_only_on_commit(self):
+        self.materialize(0)
+        with disk_checkpoint.LocalCheckpointTransaction(self.local) as transaction:
+            self.assertEqual(transaction.initial_version, 0)
+            transaction.begin(0)
+        self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
+
+        self.materialize(0)
+        with disk_checkpoint.LocalCheckpointTransaction(self.local) as transaction:
+            transaction.begin(0)
+            transaction.commit(0)
+        self.assertEqual(disk_checkpoint._read_applied_version(self.local), 0)
 
     def test_materialization_can_rollback_to_an_older_version(self):
         self.materialize(2)
@@ -640,6 +725,7 @@ class MaterializeTest(unittest.TestCase):
         self.assertEqual(stats["apply"]["delta_tensors"], 2)
         self.assertEqual(stats["apply"]["delta_fragments"], 5)
         self.assertEqual(stats["apply"]["target_tensor_bytes"], 6144)
+        self.assertEqual(stats["apply"]["apply_work_items"], 1)
         self.assertEqual(stats["apply"]["file_descriptor_cache_limit"], 1)
         self.assertEqual(stats["apply"]["peak_source_file_descriptors"], 1)
         self.assertEqual(stats["apply"]["peak_target_file_descriptors"], 1)

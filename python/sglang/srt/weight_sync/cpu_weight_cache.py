@@ -1061,6 +1061,28 @@ class _WeightModuleGroup:
     nbytes: int
 
 
+def _batch_weight_module_groups(
+    groups: list[_WeightModuleGroup],
+    *,
+    max_batch_bytes: int,
+) -> list[list[tuple[int, _WeightModuleGroup]]]:
+    """Pack adjacent groups so ranks synchronize at the configured byte bound."""
+
+    batches = []
+    current = []
+    current_bytes = 0
+    for group_index, group in enumerate(groups, start=1):
+        if current and current_bytes + group.nbytes > max_batch_bytes:
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append((group_index, group))
+        current_bytes += group.nbytes
+    if current:
+        batches.append(current)
+    return batches
+
+
 @dataclass
 class _LoadedWeightGroup:
     """One loaded module group awaiting its post-load transforms."""
@@ -2682,17 +2704,35 @@ class CPUWeightCache:
             if torch.distributed.is_initialized()
             else 1
         )
-        groups = _shared_checkpoint_groups(
+        module_batches = _batch_weight_module_groups(
+            self.groups,
+            max_batch_bytes=self.max_group_bytes,
+        )
+        names_by_batch = {
+            str(batch_index): [
+                name for _, group in batch for name in names_by_group[group.path]
+            ]
+            for batch_index, batch in enumerate(module_batches)
+        }
+        checkpoint_batches = _shared_checkpoint_groups(
             root=root,
             weight_map=weight_map,
-            names_by_group=names_by_group,
+            names_by_group=names_by_batch,
             read_parallelism=read_parallelism,
         )
         _validate_shared_checkpoint_groups(
-            groups,
+            checkpoint_batches,
             cpu_group=self.host_cpu_group,
         )
-        sources = [groups[group.path] for group in self.groups]
+        sources = [
+            checkpoint_batches[str(batch_index)]
+            for batch_index in range(len(module_batches))
+        ]
+        logger.info(
+            "Disk-backed CPU weight compilation: groups=%d batches=%d",
+            len(self.groups),
+            len(module_batches),
+        )
         distributed = torch.distributed.is_initialized()
         world_size = (
             torch.distributed.get_world_size(group=self.host_cpu_group)
@@ -2779,9 +2819,17 @@ class CPUWeightCache:
                         "initial canonical checkpoint read",
                         finish_initial_read,
                     )
-                for source_index, (group, source) in enumerate(
-                    zip(self.groups, sources)
+                for source_index, (module_batch, source) in enumerate(
+                    zip(module_batches, sources)
                 ):
+                    batch_description = (
+                        module_batch[0][1].path
+                        if len(module_batch) == 1
+                        else (
+                            f"{module_batch[0][1].path} through "
+                            f"{module_batch[-1][1].path}"
+                        )
+                    )
                     assert current_read_result is not None
                     read_result = current_read_result
                     read_wait_s = current_read_wait_s
@@ -2799,6 +2847,7 @@ class CPUWeightCache:
                         def transform_group():
                             owned_names = [
                                 name
+                                for _, group in module_batch
                                 for name in names_by_group[group.path]
                                 if writer.owns(name)
                             ]
@@ -2807,14 +2856,15 @@ class CPUWeightCache:
                                     name: tensor_file.get_tensor_bytes(name)
                                     for name in owned_names
                                 },
-                                description=group.path,
+                                description=batch_description,
                                 write_tensor=writer.write,
                                 write_block_bytes=writer.write_block_bytes,
                             )
                             return result
 
                         transform_stats = self._run_on_all_host_ranks(
-                            f"canonical delta transform for group {group.path!r}",
+                            f"canonical delta transform for groups "
+                            f"{batch_description!r}",
                             transform_group,
                         )
                         source_stats.append(transform_stats)
@@ -2833,16 +2883,20 @@ class CPUWeightCache:
                     def compile_group():
                         if write_error is not None:
                             raise RuntimeError(write_error)
-                        loaded = self._load_group_into_cpu_image(
-                            group_index=next_index,
-                            group=group,
-                            names=names_by_group[group.path],
-                            get_tensor=tensor_file.get_tensor,
-                        )
-                        try:
-                            result = self._finalize_cpu_image_group(loaded)
-                        finally:
-                            del loaded
+                        results = []
+                        for group_index, group in module_batch:
+                            loaded = self._load_group_into_cpu_image(
+                                group_index=group_index,
+                                group=group,
+                                names=names_by_group[group.path],
+                                get_tensor=tensor_file.get_tensor,
+                            )
+                            try:
+                                results.append(
+                                    self._finalize_cpu_image_group(loaded),
+                                )
+                            finally:
+                                del loaded
                         if writer is not None:
                             writer.finish_group(source_index)
                         next_read_result = None
@@ -2853,18 +2907,18 @@ class CPUWeightCache:
                                 next_read_result = pending_read.result()
                             finally:
                                 next_read_wait_s = time.perf_counter() - wait_started
-                        return result, next_read_result, next_read_wait_s
+                        return results, next_read_result, next_read_wait_s
 
                     (
-                        result,
+                        results,
                         current_read_result,
                         current_read_wait_s,
                     ) = self._run_on_all_host_ranks(
                         f"runtime compilation and next checkpoint read "
-                        f"for group {group.path!r}",
+                        f"for groups {batch_description!r}",
                         compile_group,
                     )
-                    stats = result[2]
+                    stats = results[0][2]
                     stats["canonical_read_s"] = read_result["wall_s"]
                     stats["canonical_read_wait_s"] = round(read_wait_s, 6)
                     stats["canonical_read_bytes"] = source.source_bytes
@@ -2891,7 +2945,7 @@ class CPUWeightCache:
                         ),
                         6,
                     )
-                    yield result
+                    yield from results
             if writer is not None:
                 self._run_on_all_host_ranks(
                     "canonical checkpoint persistence",

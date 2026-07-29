@@ -12,6 +12,7 @@ from unittest import mock
 
 import torch
 import zstandard
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -1070,6 +1071,72 @@ class TestCPUWeightCache(unittest.TestCase):
 
             self.assertEqual(results, [compiled])
             compiler._finalize_cpu_image_group.assert_called_once_with(loaded_group)
+
+    def test_disk_delta_transform_persists_the_compiled_shared_buffer(self):
+        class Transform:
+            operations_by_file = {"model.safetensors": {"weight": []}}
+
+            def transform_tensors(
+                self,
+                tensors,
+                *,
+                description,
+                write_tensor,
+            ):
+                assert description == "model"
+                tensor = tensors["weight"].view(torch.int64)
+                tensor.add_(1)
+                write_tensor("weight", tensors["weight"].numpy())
+                return {
+                    "operation": "canonical_delta_transform",
+                    "description": description,
+                    "delta_tensors": 1,
+                    "target_tensor_bytes": tensors["weight"].numel(),
+                    "compressed_bytes": 0,
+                    "working_memory_budget_bytes": 0,
+                    "wall_s": 0.01,
+                }
+
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            initial = torch.arange(8, dtype=torch.int64)
+            expected = initial + 1
+            save_file({"weight": initial}, root / "model.safetensors")
+            compiler = object.__new__(CPUWeightCache)
+            compiler.host_cpu_group = None
+            compiler.drop_cache_after_load = False
+            compiler.groups = [_WeightModuleGroup(path="model", nbytes=initial.nbytes)]
+            loaded_group = object()
+
+            def load_group(*, get_tensor, **_):
+                self.assertTrue(torch.equal(get_tensor("weight"), expected))
+                return loaded_group
+
+            compiler._load_group_into_cpu_image = mock.Mock(side_effect=load_group)
+            compiled = ({1}, expected.nbytes, {"wall_s": 0.1})
+            compiler._finalize_cpu_image_group = mock.Mock(return_value=compiled)
+            compiler._run_on_all_host_ranks = lambda _, function: function()
+            source_stats = []
+
+            results = list(
+                compiler._compile_disk_checkpoint(
+                    root=root,
+                    weight_map={"weight": "model.safetensors"},
+                    names_by_group={"model": ["weight"]},
+                    source_stats=source_stats,
+                    checkpoint_transform=Transform(),
+                )
+            )
+
+            self.assertEqual(results, [compiled])
+            with safe_open(root / "model.safetensors", framework="pt") as checkpoint:
+                self.assertTrue(torch.equal(checkpoint.get_tensor("weight"), expected))
+            persist = next(
+                item
+                for item in source_stats
+                if item["operation"] == "persist_canonical_checkpoint"
+            )
+            self.assertEqual(persist["target_write_bytes"], initial.nbytes)
 
     def test_canonical_transform_finishes_before_runtime_compilation(self):
         class RecordingTransform:

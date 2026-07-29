@@ -251,8 +251,8 @@ class MaterializeTest(unittest.TestCase):
 
     def test_seed_evicts_local_checkpoint_pages_when_requested(self):
         dropped = []
-        original = disk_checkpoint._drop_page_cache
-        disk_checkpoint._drop_page_cache = dropped.append
+        original = disk_checkpoint.drop_file_page_cache
+        disk_checkpoint.drop_file_page_cache = dropped.append
         try:
             disk_checkpoint.materialize(
                 self.local,
@@ -262,7 +262,7 @@ class MaterializeTest(unittest.TestCase):
                 drop_cache_after_seed=True,
             )
         finally:
-            disk_checkpoint._drop_page_cache = original
+            disk_checkpoint.drop_file_page_cache = original
 
         self.assertEqual(
             dropped,
@@ -274,12 +274,12 @@ class MaterializeTest(unittest.TestCase):
 
     def test_seed_retains_local_checkpoint_pages_by_default(self):
         dropped = []
-        original = disk_checkpoint._drop_page_cache
-        disk_checkpoint._drop_page_cache = dropped.append
+        original = disk_checkpoint.drop_file_page_cache
+        disk_checkpoint.drop_file_page_cache = dropped.append
         try:
             self.materialize(0)
         finally:
-            disk_checkpoint._drop_page_cache = original
+            disk_checkpoint.drop_file_page_cache = original
 
         self.assertEqual(
             dropped,
@@ -304,6 +304,19 @@ class MaterializeTest(unittest.TestCase):
         self.assert_at_version(1)
         self.materialize(2)
         self.assert_at_version(2)
+
+    def test_local_checkpoint_transaction_publishes_only_on_commit(self):
+        self.materialize(0)
+        with disk_checkpoint.LocalCheckpointTransaction(self.local) as transaction:
+            self.assertEqual(transaction.initial_version, 0)
+            transaction.begin(0)
+        self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
+
+        self.materialize(0)
+        with disk_checkpoint.LocalCheckpointTransaction(self.local) as transaction:
+            transaction.begin(0)
+            transaction.commit(0)
+        self.assertEqual(disk_checkpoint._read_applied_version(self.local), 0)
 
     def test_materialization_can_rollback_to_an_older_version(self):
         self.materialize(2)

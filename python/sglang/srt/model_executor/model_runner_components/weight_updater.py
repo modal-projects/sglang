@@ -355,6 +355,28 @@ class WeightUpdater:
             ),
         )
 
+    @torch.no_grad()
+    def stage_cpu_weight_update_from_disk_delta_lineage(
+        self,
+        *,
+        checkpoint_dir: str,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        """Persist and compile a delta target from shared bounded buffers."""
+        return self._stage_cpu_weight_update(
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+            stage=lambda cache: cache.stage_from_disk_delta_lineage(
+                checkpoint_dir=checkpoint_dir,
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+            ),
+        )
+
     def initialize_cpu_weight_cache(
         self,
         host_cpu_group,
@@ -595,7 +617,7 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "

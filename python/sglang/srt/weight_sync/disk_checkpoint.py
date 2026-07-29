@@ -324,6 +324,46 @@ def _materialization_lock(local_checkpoint_dir: str):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+class LocalCheckpointTransaction:
+    """Publish an in-place checkpoint mutation under the materialization lock."""
+
+    def __init__(self, local_checkpoint_dir: str):
+        self.local_checkpoint_dir = local_checkpoint_dir
+        self.initial_version: Optional[int] = None
+        self._lock = None
+        self._mutation_started = False
+        self._committed = False
+
+    def __enter__(self):
+        self._lock = _materialization_lock(self.local_checkpoint_dir)
+        self._lock.__enter__()
+        self.initial_version = _read_applied_version(self.local_checkpoint_dir)
+        return self
+
+    def begin(self, expected_version: int) -> None:
+        if self.initial_version != expected_version:
+            raise RuntimeError(
+                "canonical checkpoint version changed before mutation: "
+                f"expected={expected_version} actual={self.initial_version}"
+            )
+        _clear_applied_version(self.local_checkpoint_dir)
+        self._mutation_started = True
+
+    def commit(self, target_version: int) -> None:
+        if not self._mutation_started:
+            raise RuntimeError("canonical checkpoint mutation has not started")
+        _write_applied_version(self.local_checkpoint_dir, target_version)
+        self._committed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self._mutation_started and not self._committed:
+                _clear_applied_version(self.local_checkpoint_dir)
+        finally:
+            assert self._lock is not None
+            self._lock.__exit__(exc_type, exc, traceback)
+
+
 def _read_applied_version(local_checkpoint_dir: str) -> Optional[int]:
     try:
         with open(os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json")) as f:
@@ -361,7 +401,7 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
-def _drop_page_cache(path: str) -> None:
+def drop_file_page_cache(path: str) -> None:
     """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
     if not hasattr(os, "posix_fadvise"):  # POSIX-only (absent on macOS/Windows)
         return
@@ -380,7 +420,7 @@ def drop_checkpoint_page_cache(checkpoint_dir: str) -> int:
 
     paths = glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))
     for path in paths:
-        _drop_page_cache(path)
+        drop_file_page_cache(path)
     return len(paths)
 
 
@@ -432,9 +472,9 @@ def _reset_checkpoint(
             out.flush()
             os.fsync(out.fileno())
         # The immutable source no longer needs to occupy the page cache.
-        _drop_page_cache(entry.path)
+        drop_file_page_cache(entry.path)
         if drop_cache_after_copy:
-            _drop_page_cache(dst)
+            drop_file_page_cache(dst)
         with progress_lock:
             progress["done_gb"] += entry.stat().st_size / 1e9
             done = progress["done_gb"]

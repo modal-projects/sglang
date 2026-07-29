@@ -9,8 +9,10 @@ retain the bounded GPU-staging path. The resulting runtime bytes remain in
 :class:`~sglang.srt.weight_sync.cpu_weight_image.CPUWeightImage`; the live
 model is never rebound or overwritten during staging.
 
-Each delta advances the canonical checkpoint first. Runtime compilation then
-processes the complete target and does not depend on tensor-level sparsity.
+Each delta is verified in canonical checkpoint space before the staged image
+becomes valid. Disk-backed staging shares each bounded target buffer between
+checkpoint persistence and runtime compilation. Neither path depends on
+tensor-level sparsity.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -408,6 +411,8 @@ class _DiskTensorSource:
 
 @dataclass(frozen=True)
 class _SharedTensorSource:
+    filename: str
+    file_offset: int
     buffer_offset: int
     entry: _SafetensorsEntry
 
@@ -430,7 +435,7 @@ class _SharedCheckpointGroup:
 
 
 class _SharedCheckpointGroupView:
-    """Expose one immutable checkpoint group from a reusable shared buffer."""
+    """Expose one checkpoint group from a reusable shared buffer."""
 
     def __init__(
         self,
@@ -458,6 +463,139 @@ class _SharedCheckpointGroupView:
             ) from exc
         setattr(tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, True)
         return tensor
+
+    def get_tensor_bytes(self, name: str) -> torch.Tensor:
+        source = self.tensors.get(name)
+        if source is None:
+            raise KeyError(f"shared checkpoint group has no tensor {name!r}")
+        nbytes = source.entry.relative_end - source.entry.relative_begin
+        return self.buffer.view(nbytes, offset=source.buffer_offset)
+
+
+class _CanonicalCheckpointWriter:
+    """Persist verified shared-buffer tensors once, then release their pages."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        sources: list[_SharedCheckpointGroup],
+        operations_by_file: dict[str, dict[str, Any]],
+        rank: int,
+        world_size: int,
+        drop_cache_after_write: bool,
+    ):
+        from sglang.srt.weight_sync.disk_checkpoint import drop_file_page_cache
+
+        self.root = root
+        self.drop_file_page_cache = drop_file_page_cache
+        self.drop_cache_after_write = drop_cache_after_write
+        filenames = sorted(operations_by_file)
+        self.owned_files = {
+            filename
+            for index, filename in enumerate(filenames)
+            if index % world_size == rank
+        }
+        self.sources = {
+            name: source
+            for group in sources
+            for name, source in group.tensors.items()
+            if source.filename in self.owned_files
+        }
+        self.expected_names = {
+            name
+            for filename, names in operations_by_file.items()
+            if filename in self.owned_files
+            for name in names
+        }
+        self.last_group = {}
+        for group_index, group in enumerate(sources):
+            for source in group.tensors.values():
+                if source.filename in self.owned_files:
+                    self.last_group[source.filename] = group_index
+        self.fds = {}
+        try:
+            for filename in self.owned_files:
+                self.fds[filename] = os.open(root / filename, os.O_RDWR)
+        except Exception:
+            self.close()
+            raise
+        self.dirty_files = set()
+        self.written_names = set()
+        self.write_bytes = 0
+        self.write_worker_s = 0.0
+        self.flush_worker_s = 0.0
+        self.lock = threading.Lock()
+
+    def owns(self, name: str) -> bool:
+        return name in self.sources
+
+    def write(self, name: str, region: Any) -> None:
+        source = self.sources[name]
+        view = memoryview(region).cast("B")
+        started = time.perf_counter()
+        position = 0
+        fd = self.fds[source.filename]
+        while position < len(view):
+            end = min(position + _POSITIONAL_IO_CHUNK_BYTES, len(view))
+            written = os.pwrite(
+                fd,
+                view[position:end],
+                source.file_offset + position,
+            )
+            if written <= 0:
+                raise RuntimeError(
+                    f"short canonical checkpoint write for {name!r}: "
+                    f"expected={len(view)} actual={position}"
+                )
+            position += written
+        with self.lock:
+            self.write_worker_s += time.perf_counter() - started
+            self.write_bytes += len(view)
+            self.dirty_files.add(source.filename)
+            self.written_names.add(name)
+
+    def finish_group(self, group_index: int) -> None:
+        filenames = [
+            filename
+            for filename, last_group in self.last_group.items()
+            if last_group == group_index
+        ]
+        for filename in filenames:
+            fd = self.fds.pop(filename)
+            if filename in self.dirty_files:
+                started = time.perf_counter()
+                os.fsync(fd)
+                self.flush_worker_s += time.perf_counter() - started
+            os.close(fd)
+            if self.drop_cache_after_write:
+                self.drop_file_page_cache(str(self.root / filename))
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            os.close(fd)
+        self.fds.clear()
+
+    def validate(self) -> None:
+        if self.written_names != self.expected_names:
+            raise RuntimeError(
+                "canonical checkpoint transform did not persist every delta tensor: "
+                f"missing={sorted(self.expected_names - self.written_names)[:20]} "
+                f"extra={sorted(self.written_names - self.expected_names)[:20]}"
+            )
+        if self.fds:
+            raise RuntimeError(
+                "canonical checkpoint files were not finalized: "
+                f"{sorted(self.fds)[:20]}"
+            )
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "target_write_bytes": self.write_bytes,
+            "target_write_worker_s": round(self.write_worker_s, 6),
+            "target_flush_worker_s": round(self.flush_worker_s, 6),
+            "target_files": len(self.dirty_files),
+        }
 
 
 def _align_shared_tensor_offset(value: int) -> int:
@@ -553,6 +691,8 @@ def _shared_checkpoint_groups(
                 )
             for name, source in run:
                 tensors[name] = _SharedTensorSource(
+                    filename=source.filename,
+                    file_offset=source.file_begin,
                     buffer_offset=(buffer_bytes + source.file_begin - first.file_begin),
                     entry=source.entry,
                 )
@@ -2209,9 +2349,15 @@ class CPUWeightCache:
         root: Path,
         weight_map: dict[str, str],
         names_by_group: dict[str, list[str]],
+        source_stats: list[dict[str, Any]] | None = None,
+        checkpoint_transform: Any = None,
     ):
-        """Compile bounded groups after reading each canonical byte once per host."""
+        """Compile bounded groups from canonical bytes read once per host."""
 
+        if source_stats is None:
+            source_stats = []
+        if checkpoint_transform is None:
+            checkpoint_transform = _NoOpCheckpointTransform()
         read_parallelism = (
             torch.distributed.get_world_size(group=self.host_cpu_group)
             if torch.distributed.is_initialized()
@@ -2228,6 +2374,38 @@ class CPUWeightCache:
             cpu_group=self.host_cpu_group,
         )
         sources = [groups[group.path] for group in self.groups]
+        distributed = torch.distributed.is_initialized()
+        world_size = (
+            torch.distributed.get_world_size(group=self.host_cpu_group)
+            if distributed
+            else 1
+        )
+        rank = (
+            torch.distributed.get_rank(group=self.host_cpu_group) if distributed else 0
+        )
+        writer = None
+        if not isinstance(checkpoint_transform, _NoOpCheckpointTransform):
+
+            def build_writer():
+                nonlocal writer
+                writer = _CanonicalCheckpointWriter(
+                    root=root,
+                    sources=sources,
+                    operations_by_file=checkpoint_transform.operations_by_file,
+                    rank=rank,
+                    world_size=world_size,
+                    drop_cache_after_write=self.drop_cache_after_load,
+                )
+
+            try:
+                self._run_on_all_host_ranks(
+                    "canonical checkpoint writer construction",
+                    build_writer,
+                )
+            except Exception:
+                if writer is not None:
+                    writer.close()
+                raise
         capacities = [
             max(
                 (
@@ -2295,6 +2473,31 @@ class CPUWeightCache:
                         shared_buffers[source_index % 2],
                         source.tensors,
                     )
+                    transform_stats = None
+                    if writer is not None:
+
+                        def transform_group():
+                            owned_names = [
+                                name
+                                for name in names_by_group[group.path]
+                                if writer.owns(name)
+                            ]
+                            result = checkpoint_transform.transform_tensors(
+                                {
+                                    name: tensor_file.get_tensor_bytes(name)
+                                    for name in owned_names
+                                },
+                                description=group.path,
+                                write_tensor=writer.write,
+                            )
+                            writer.finish_group(source_index)
+                            return result
+
+                        transform_stats = self._run_on_all_host_ranks(
+                            f"canonical delta transform for group {group.path!r}",
+                            transform_group,
+                        )
+                        source_stats.append(transform_stats)
 
                     def compile_group():
                         loaded = self._load_group_into_cpu_image(
@@ -2319,8 +2522,25 @@ class CPUWeightCache:
                     stats["canonical_read_runs"] = len(source.reads)
                     stats["canonical_buffer_bytes"] = source.buffer_bytes
                     stats["canonical_shared_buffer_bytes"] = shared_buffer_bytes
-                    stats["wall_s"] = round(stats["wall_s"] + read_wait_s, 6)
+                    if transform_stats is not None:
+                        stats["canonical_transform"] = transform_stats
+                        stats["canonical_transform_s"] = transform_stats["wall_s"]
+                    stats["wall_s"] = round(
+                        stats["wall_s"]
+                        + read_wait_s
+                        + (
+                            0.0
+                            if transform_stats is None
+                            else transform_stats["wall_s"]
+                        ),
+                        6,
+                    )
                     yield result
+            if writer is not None:
+                self._run_on_all_host_ranks(
+                    "canonical checkpoint persistence",
+                    writer.validate,
+                )
         finally:
             logger.info(
                 "Releasing shared canonical checkpoint group buffer: bytes=%d",
@@ -2330,6 +2550,14 @@ class CPUWeightCache:
             gc.collect()
             for shared_buffer in shared_buffers:
                 shared_buffer.close()
+            if writer is not None:
+                source_stats.append(
+                    {
+                        "operation": "persist_canonical_checkpoint",
+                        **writer.stats(),
+                    }
+                )
+                writer.close()
             logger.info(
                 "Released shared canonical checkpoint group buffer: "
                 "bytes=%d wall_time=%.3fs",
@@ -2407,15 +2635,12 @@ class CPUWeightCache:
                     checkpoint_transform=checkpoint_transform,
                 )
             else:
-                if not isinstance(checkpoint_transform, _NoOpCheckpointTransform):
-                    raise RuntimeError(
-                        "disk-backed canonical checkpoints must be materialized "
-                        "before CPU image compilation"
-                    )
                 compiler = self._compile_disk_checkpoint(
                     root=root,
                     weight_map=weight_map,
                     names_by_group=names_by_group,
+                    source_stats=source_stats,
+                    checkpoint_transform=checkpoint_transform,
                 )
             for (
                 group_updated,
@@ -2469,6 +2694,7 @@ class CPUWeightCache:
             for phase in (
                 "canonical_read_s",
                 "canonical_read_wait_s",
+                "canonical_transform_s",
                 "cpu_clone_s",
                 "restore_s",
                 "cpu_load_s",
@@ -2526,6 +2752,19 @@ class CPUWeightCache:
                 value["canonical_read_wait_s"] for value in group_stats
             )
             cpu_load_s = sum(value["cpu_load_s"] for value in group_stats)
+            transform_stats = [
+                value
+                for value in source_stats
+                if value.get("operation") == "canonical_delta_transform"
+            ]
+            persist_stats = next(
+                (
+                    value
+                    for value in source_stats
+                    if value.get("operation") == "persist_canonical_checkpoint"
+                ),
+                {},
+            )
             source_summary = {
                 "storage": "disk",
                 "checkpoint_bytes": sum(
@@ -2544,8 +2783,16 @@ class CPUWeightCache:
                 "read_wait_wall_s": round(canonical_read_wait_s, 6),
                 "cpu_load_wall_s": round(cpu_load_s, 6),
                 "load_wall_s": round(canonical_read_s + cpu_load_s, 6),
-                "transform_wall_s": 0.0,
+                "transform_wall_s": round(
+                    sum(value["wall_s"] for value in transform_stats),
+                    6,
+                ),
                 "synchronization_wall_s": 0.0,
+                **{
+                    key: value
+                    for key, value in persist_stats.items()
+                    if key != "operation"
+                },
             }
         wall_s = round(time.perf_counter() - started, 6)
         logger.info(
@@ -2604,6 +2851,179 @@ class CPUWeightCache:
             "physical_host_copies": 1,
         }
         return stats
+
+    def stage_from_disk_delta_lineage(
+        self,
+        *,
+        checkpoint_dir: str,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Persist and compile verified delta bytes from one bounded buffer."""
+
+        if self.canonical_checkpoint_storage != "disk":
+            raise RuntimeError(
+                "stage_from_disk_delta_lineage requires a disk-backed "
+                "canonical checkpoint"
+            )
+
+        from sglang.srt.weight_sync import disk_checkpoint
+        from sglang.srt.weight_sync.cpu_delta_checkpoint import (
+            DeltaCheckpointTransform,
+        )
+
+        distributed = torch.distributed.is_initialized()
+        world_size = (
+            torch.distributed.get_world_size(group=self.host_cpu_group)
+            if distributed
+            else 1
+        )
+        rank = (
+            torch.distributed.get_rank(group=self.host_cpu_group) if distributed else 0
+        )
+        transaction = None
+        transform = None
+        mutation_started = False
+        started = time.perf_counter()
+        try:
+
+            def acquire_transaction():
+                nonlocal transaction
+                if rank == 0:
+                    candidate = disk_checkpoint.LocalCheckpointTransaction(
+                        checkpoint_dir
+                    )
+                    candidate.__enter__()
+                    transaction = candidate
+
+            self._run_on_all_host_ranks(
+                "canonical checkpoint transaction acquisition",
+                acquire_transaction,
+            )
+            versions = [None] * world_size
+            local_version = (
+                transaction.initial_version if transaction is not None else None
+            )
+            if distributed:
+                torch.distributed.all_gather_object(
+                    versions,
+                    local_version,
+                    group=self.host_cpu_group,
+                )
+            else:
+                versions[0] = local_version
+            canonical_version = versions[0]
+
+            if canonical_version is not None and canonical_version <= target_version:
+                transform = DeltaCheckpointTransform(
+                    base_checkpoint_dir=base_checkpoint_dir,
+                    checkpoint_source_dir=checkpoint_source_dir,
+                    target_version=target_version,
+                    cpu_group=self.host_cpu_group,
+                    canonical_version=canonical_version,
+                    canonical_checkpoint_layout_dir=checkpoint_dir,
+                )
+                can_fuse = (
+                    transform.canonical_version == canonical_version
+                    and os.path.realpath(transform.checkpoint_root)
+                    == os.path.realpath(checkpoint_dir)
+                )
+            else:
+                can_fuse = False
+
+            if not can_fuse:
+                logger.info(
+                    "Rebuilding the NVMe canonical checkpoint before staging "
+                    "version %d",
+                    target_version,
+                )
+                if transform is not None:
+                    transform.close()
+                    transform = None
+                if transaction is not None:
+                    transaction.__exit__(None, None, None)
+                    transaction = None
+                self._run_on_all_host_ranks(
+                    "canonical checkpoint transaction release",
+                    lambda: None,
+                )
+                materialization = None
+
+                def materialize_checkpoint():
+                    nonlocal materialization
+                    if rank == 0:
+                        materialization = disk_checkpoint.materialize(
+                            local_checkpoint_dir=checkpoint_dir,
+                            base_checkpoint_dir=base_checkpoint_dir,
+                            checkpoint_source_dir=checkpoint_source_dir,
+                            target_version=target_version,
+                            drop_cache_after_seed=self.drop_cache_after_load,
+                        )
+
+                self._run_on_all_host_ranks(
+                    "canonical checkpoint fallback materialization",
+                    materialize_checkpoint,
+                )
+                stats = self._stage_from_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    target_version=target_version,
+                    checkpoint_transform=_NoOpCheckpointTransform(),
+                )
+                stats["canonical_checkpoint_materialization"] = materialization
+                return stats
+
+            assert canonical_version is not None
+            logger.info(
+                "Staging version %d from NVMe canonical checkpoint version %d "
+                "with one bounded read/write pass",
+                target_version,
+                canonical_version,
+            )
+
+            def begin_mutation():
+                if transaction is not None:
+                    transaction.begin(canonical_version)
+
+            self._run_on_all_host_ranks(
+                "canonical checkpoint mutation",
+                begin_mutation,
+            )
+            mutation_started = True
+            stats = self._stage_from_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                target_version=target_version,
+                checkpoint_transform=transform,
+            )
+
+            def commit_mutation():
+                if transaction is not None:
+                    transaction.commit(target_version)
+
+            self._run_on_all_host_ranks(
+                "canonical checkpoint commit",
+                commit_mutation,
+            )
+            stats["delta_setup"] = transform.setup_stats
+            stats["canonical_checkpoint"] = {
+                "version": target_version,
+                "bytes": stats["source"]["checkpoint_bytes"],
+                "storage": "disk",
+                "physical_host_copies": 1,
+            }
+            stats["wall_s"] = round(time.perf_counter() - started, 6)
+            return stats
+        except Exception:
+            if mutation_started:
+                self.image.invalidate(
+                    f"disk-backed canonical staging of v{target_version} failed"
+                )
+            raise
+        finally:
+            if transform is not None:
+                transform.close()
+            if transaction is not None:
+                transaction.__exit__(None, None, None)
 
     def stage_from_delta_lineage(
         self,

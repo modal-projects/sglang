@@ -144,6 +144,23 @@ class BaseTpWorker(ABC):
             host_cpu_group=host_cpu_group,
         )
 
+    def stage_cpu_weight_update_from_disk_delta_lineage(
+        self,
+        *,
+        checkpoint_dir: str,
+        base_checkpoint_dir: str,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_cpu_group,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update_from_disk_delta_lineage(
+            checkpoint_dir=checkpoint_dir,
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+            target_version=target_version,
+            host_cpu_group=host_cpu_group,
+        )
+
     def initialize_cpu_weight_cache(
         self,
         host_cpu_group,

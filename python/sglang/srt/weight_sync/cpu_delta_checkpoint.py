@@ -1,17 +1,16 @@
 """Checkpoint-delta reconstruction for CPU weight staging.
 
-The disk reload path materializes a complete target checkpoint. CPU weight
-staging instead maintains one host-shared canonical CPU checkpoint.
-CPU weight-cache initialization populates it from the immutable full checkpoint;
-updates then apply only the delta versions after the canonical checkpoint. Every
-changed canonical tensor is verified before the ordinary SGLang loader compiles
-the target into rank-ready CPU images.
+CPU weight staging maintains one canonical checkpoint in host memory or on
+host-local disk. Updates apply only the delta versions after that checkpoint,
+and every changed tensor is verified before the ordinary SGLang loader can
+publish a rank-ready CPU image.
 
 Compressed payloads are streamed once into bounded work buffers while exactly
 one local rank owns reconstruction of each canonical checkpoint file. The
 complete checkpoint and rank-ready image stay in CPU memory; no lineage-sized
 delta arena, runtime-layout assumption, or tensor-sparsity assumption enters
-this module.
+this module. Disk-backed callers may persist each verified bounded buffer while
+the loader consumes the same bytes.
 """
 
 from __future__ import annotations
@@ -192,12 +191,7 @@ def _resolve_lineage(
             f"target version {target_version} precedes canonical "
             f"version {canonical_version}"
         )
-    if canonical_version:
-        if canonical_checkpoint_layout_dir is None:
-            raise ValueError(
-                "canonical_checkpoint_layout_dir is required when advancing a "
-                "canonical checkpoint"
-            )
+    if canonical_checkpoint_layout_dir is not None:
         checkpoint_root = Path(canonical_checkpoint_layout_dir)
         _checkpoint_index(checkpoint_root)
         deltas = []
@@ -234,6 +228,11 @@ def _resolve_lineage(
             deltas.append((version, root, index))
             previous = version
         return checkpoint_root, canonical_version, deltas
+    if canonical_version:
+        raise ValueError(
+            "canonical_checkpoint_layout_dir is required when advancing a "
+            "canonical checkpoint"
+        )
     if target_version == 0:
         root = Path(base_checkpoint_dir)
         _checkpoint_index(root)
@@ -469,6 +468,11 @@ class DeltaCheckpointTransform:
         for names in self.operations_by_file.values():
             for operations in names.values():
                 operations.sort(key=lambda value: value.version)
+        self.operations_by_name = {
+            name: operations
+            for names in self.operations_by_file.values()
+            for name, operations in names.items()
+        }
 
         self.checkpoint_root = checkpoint_root
         self.setup_stats.update(
@@ -494,14 +498,24 @@ class DeltaCheckpointTransform:
             self.setup_stats["wall_s"],
         )
 
-    def transform_file(self, filename: str, tensor_file: Any) -> dict[str, Any]:
-        """Apply and verify this file's canonical target bytes in place."""
+    def transform_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        description: str,
+        write_tensor: Any = None,
+    ) -> dict[str, Any]:
+        """Apply and verify canonical target tensors in caller-owned buffers."""
 
-        names = self.operations_by_file.get(filename)
+        names = {
+            name: self.operations_by_name[name]
+            for name in tensors
+            if name in self.operations_by_name
+        }
         if not names:
             return {
                 "operation": "canonical_delta_transform",
-                "filename": filename,
+                "description": description,
                 "delta_tensors": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
@@ -537,7 +551,7 @@ class DeltaCheckpointTransform:
             source_fd: int,
         ) -> tuple[int, int, float]:
             name, operation = item
-            region_tensor = tensor_file.get_tensor_bytes(name)
+            region_tensor = tensors[name]
             region = region_tensor.numpy()
             is_final = operation is final_operation[name]
             hasher = create_checksum(operation.checksum_algorithm) if is_final else None
@@ -633,6 +647,8 @@ class DeltaCheckpointTransform:
                         f"checksum mismatch after reconstructing {name!r}: "
                         f"expected={operation.expected_checksum} actual={actual}"
                     )
+                if write_tensor is not None:
+                    write_tensor(name, region)
             return (
                 region.size if is_final else 0,
                 operation.compressed_nbytes,
@@ -666,7 +682,7 @@ class DeltaCheckpointTransform:
                     os.close(source_fd)
         stats = {
             "operation": "canonical_delta_transform",
-            "filename": filename,
+            "description": description,
             "delta_tensors": len(names),
             "delta_fragments": len(results),
             "source_files": len(operations_by_source),
@@ -678,17 +694,29 @@ class DeltaCheckpointTransform:
             "wall_s": round(time.perf_counter() - started, 6),
         }
         logger.debug(
-            "Applied canonical delta file %s: tensors=%d target_bytes=%d "
+            "Applied canonical delta group %s: tensors=%d target_bytes=%d "
             "wall_time=%.3fs",
-            filename,
+            description,
             stats["delta_tensors"],
             stats["target_tensor_bytes"],
             stats["wall_s"],
         )
         return stats
 
+    def transform_file(self, filename: str, tensor_file: Any) -> dict[str, Any]:
+        """Apply and verify one in-memory canonical checkpoint file."""
+
+        names = self.operations_by_file.get(filename, {})
+        stats = self.transform_tensors(
+            {name: tensor_file.get_tensor_bytes(name) for name in names},
+            description=filename,
+        )
+        stats["filename"] = filename
+        return stats
+
     def close(self) -> None:
         self.operations_by_file.clear()
+        self.operations_by_name.clear()
 
     def __enter__(self) -> DeltaCheckpointTransform:
         return self

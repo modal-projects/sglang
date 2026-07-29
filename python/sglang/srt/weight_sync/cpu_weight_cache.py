@@ -2763,28 +2763,28 @@ class CPUWeightCache:
                     )
 
                 pending_read = submit_read(0) if sources else None
+                current_read_result = None
+                current_read_wait_s = 0.0
+                if pending_read is not None:
+
+                    def finish_initial_read():
+                        nonlocal current_read_wait_s
+                        wait_started = time.perf_counter()
+                        try:
+                            return pending_read.result()
+                        finally:
+                            current_read_wait_s = time.perf_counter() - wait_started
+
+                    current_read_result = self._run_on_all_host_ranks(
+                        "initial canonical checkpoint read",
+                        finish_initial_read,
+                    )
                 for source_index, (group, source) in enumerate(
                     zip(self.groups, sources)
                 ):
-                    wait_started = time.perf_counter()
-                    read_result = None
-                    read_error = None
-                    try:
-                        assert pending_read is not None
-                        read_result = pending_read.result()
-                    except Exception as exc:
-                        read_error = f"{type(exc).__name__}: {exc}"
-
-                    def finish_read():
-                        if read_error is not None:
-                            raise RuntimeError(read_error)
-                        return read_result
-
-                    read_result = self._run_on_all_host_ranks(
-                        f"canonical checkpoint read for group {group.path!r}",
-                        finish_read,
-                    )
-                    read_wait_s = time.perf_counter() - wait_started
+                    assert current_read_result is not None
+                    read_result = current_read_result
+                    read_wait_s = current_read_wait_s
                     next_index = source_index + 1
                     pending_read = (
                         submit_read(next_index) if next_index < len(sources) else None
@@ -2845,10 +2845,23 @@ class CPUWeightCache:
                             del loaded
                         if writer is not None:
                             writer.finish_group(source_index)
-                        return result
+                        next_read_result = None
+                        next_read_wait_s = 0.0
+                        if pending_read is not None:
+                            wait_started = time.perf_counter()
+                            try:
+                                next_read_result = pending_read.result()
+                            finally:
+                                next_read_wait_s = time.perf_counter() - wait_started
+                        return result, next_read_result, next_read_wait_s
 
-                    result = self._run_on_all_host_ranks(
-                        f"runtime compilation for group {group.path!r}",
+                    (
+                        result,
+                        current_read_result,
+                        current_read_wait_s,
+                    ) = self._run_on_all_host_ranks(
+                        f"runtime compilation and next checkpoint read "
+                        f"for group {group.path!r}",
                         compile_group,
                     )
                     stats = result[2]

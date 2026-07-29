@@ -38,6 +38,7 @@ from sglang.srt.weight_sync.cpu_weight_cache import (
     _CanonicalCheckpointWriter,
     _checkpoint_weight_map,
     _clone_weight_module,
+    _host_rank_cpu_workers,
     _HostRankPhaseCoordinator,
     _HostSharedCheckpoint,
     _InMemorySafetensorsFile,
@@ -220,6 +221,35 @@ class TestCPUWeightCache(unittest.TestCase):
 
             self.assertEqual(weight_map, {"layer.weight": "model.safetensors"})
             self.assertEqual(checkpoint_root, Path(root))
+
+    @mock.patch.object(torch.distributed, "is_initialized", return_value=True)
+    @mock.patch.object(torch.distributed, "get_rank", return_value=1)
+    @mock.patch.object(torch.distributed, "get_world_size", return_value=4)
+    @mock.patch.object(torch.distributed, "all_gather_object")
+    @mock.patch.object(
+        cpu_weight_cache.os,
+        "sched_getaffinity",
+        return_value={0, 1, 2, 3, 4, 5},
+    )
+    def test_host_rank_workers_share_overlapping_affinities(
+        self,
+        _sched_getaffinity,
+        all_gather_object,
+        _get_world_size,
+        _get_rank,
+        _is_initialized,
+    ):
+        def gather(output, _value, **_kwargs):
+            output[:] = [
+                frozenset({0, 1, 2, 3}),
+                frozenset({0, 1, 2, 3, 4, 5}),
+                frozenset({4, 5, 6, 7}),
+                frozenset({8, 9, 10}),
+            ]
+
+        all_gather_object.side_effect = gather
+
+        self.assertEqual(_host_rank_cpu_workers(object()), 3)
 
     def test_checkpoint_weight_map_rejects_duplicate_unindexed_tensors(self):
         with tempfile.TemporaryDirectory() as root:

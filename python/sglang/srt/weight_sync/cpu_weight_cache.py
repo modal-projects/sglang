@@ -539,6 +539,42 @@ class _SharedCheckpointGroupView:
         return self.buffer.view(nbytes, offset=source.buffer_offset)
 
 
+def _canonical_transform_owners(
+    sources: list[_SharedCheckpointGroup],
+    operations_by_file: dict[str, dict[str, Any]],
+    world_size: int,
+) -> dict[str, int]:
+    """Balance canonical tensor reconstruction within each compile group."""
+
+    if world_size <= 0:
+        raise ValueError("canonical transform world size must be positive")
+    owners = {}
+    for group in sources:
+        rank_bytes = [0] * world_size
+        tensors = [
+            (
+                name,
+                (source.entry.relative_end - source.entry.relative_begin)
+                * len(operations_by_file[source.filename][name]),
+            )
+            for name, source in group.tensors.items()
+            if name in operations_by_file.get(source.filename, {})
+        ]
+        for name, nbytes in sorted(tensors, key=lambda item: (-item[1], item[0])):
+            owner = min(range(world_size), key=lambda rank: (rank_bytes[rank], rank))
+            owners[name] = owner
+            rank_bytes[owner] += nbytes
+
+    expected_names = {name for names in operations_by_file.values() for name in names}
+    if owners.keys() != expected_names:
+        raise RuntimeError(
+            "canonical checkpoint groups do not cover every delta tensor: "
+            f"missing={sorted(expected_names - owners.keys())[:20]} "
+            f"extra={sorted(owners.keys() - expected_names)[:20]}"
+        )
+    return owners
+
+
 class _CanonicalCheckpointWriter:
     """Persist verified shared-buffer tensors once, then release their pages."""
 
@@ -560,7 +596,12 @@ class _CanonicalCheckpointWriter:
         filesystem = os.statvfs(root)
         self.write_block_bytes = filesystem.f_frsize or filesystem.f_bsize
         filenames = sorted(operations_by_file)
-        self.owned_files = {
+        owners = _canonical_transform_owners(
+            sources,
+            operations_by_file,
+            world_size,
+        )
+        self.flush_files = {
             filename
             for index, filename in enumerate(filenames)
             if index % world_size == rank
@@ -569,22 +610,20 @@ class _CanonicalCheckpointWriter:
             name: source
             for group in sources
             for name, source in group.tensors.items()
-            if source.filename in self.owned_files
+            if owners.get(name) == rank
         }
-        self.expected_names = {
-            name
-            for filename, names in operations_by_file.items()
-            if filename in self.owned_files
-            for name in names
-        }
+        self.expected_names = set(self.sources)
         self.last_group = {}
         for group_index, group in enumerate(sources):
-            for source in group.tensors.values():
-                if source.filename in self.owned_files:
+            for name, source in group.tensors.items():
+                if name in owners:
                     self.last_group[source.filename] = group_index
+        open_files = self.flush_files | {
+            source.filename for source in self.sources.values()
+        }
         self.fds = {}
         try:
-            for filename in self.owned_files:
+            for filename in open_files:
                 self.fds[filename] = os.open(root / filename, os.O_RDWR)
         except Exception:
             self.close()
@@ -642,13 +681,18 @@ class _CanonicalCheckpointWriter:
             if last_group == group_index
         ]
         for filename in filenames:
-            fd = self.fds.pop(filename)
-            if filename in self.dirty_files:
+            fd = self.fds.pop(filename, None)
+            if filename in self.flush_files:
+                if fd is None:
+                    raise RuntimeError(
+                        f"canonical checkpoint file is already closed: {filename}"
+                    )
                 started = time.perf_counter()
                 os.fsync(fd)
                 self.flush_worker_s += time.perf_counter() - started
-            os.close(fd)
-            if self.drop_cache_after_write:
+            if fd is not None:
+                os.close(fd)
+            if self.drop_cache_after_write and filename in self.flush_files:
                 self.drop_file_page_cache(str(self.root / filename))
 
     def close(self) -> None:
@@ -2715,7 +2759,6 @@ class CPUWeightCache:
                                 write_tensor=writer.write,
                                 write_block_bytes=writer.write_block_bytes,
                             )
-                            writer.finish_group(source_index)
                             return result
 
                         transform_stats = self._run_on_all_host_ranks(
@@ -2725,6 +2768,11 @@ class CPUWeightCache:
                         source_stats.append(transform_stats)
 
                     def compile_group():
+                        if writer is not None:
+                            # The transform barrier above makes every disjoint
+                            # positional write visible before one rank flushes
+                            # and closes the completed checkpoint files.
+                            writer.finish_group(source_index)
                         loaded = self._load_group_into_cpu_image(
                             group_index=next_index,
                             group=group,

@@ -1029,6 +1029,7 @@ def _apply_xor_delta_chain(
             name: str,
             operations: list[_DiskDeltaItem],
             target_fd: int,
+            decompressor: zstandard.ZstdDecompressor,
         ) -> None:
             first = operations[0]
             working_nbytes = first.target_nbytes + _XOR_STREAM_CHUNK_BYTES
@@ -1051,7 +1052,7 @@ def _apply_xor_delta_chain(
                             operation.source_path,
                             max_read_bytes=_XOR_STREAM_CHUNK_BYTES,
                         )
-                        with zstandard.ZstdDecompressor().stream_reader(
+                        with decompressor.stream_reader(
                             source,
                             closefd=False,
                         ) as reader:
@@ -1103,9 +1104,10 @@ def _apply_xor_delta_chain(
             batch: tuple[str, list[tuple[str, list[_DiskDeltaItem]]]],
         ) -> None:
             target_path, tensor_operations = batch
+            decompressor = zstandard.ZstdDecompressor()
             with target_files.acquire(target_path, write=True) as target_fd:
                 for name, operations in tensor_operations:
-                    apply_tensor(name, operations, target_fd)
+                    apply_tensor(name, operations, target_fd, decompressor)
 
         apply_started = time.perf_counter()
         workers = min(

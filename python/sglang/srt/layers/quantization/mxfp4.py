@@ -648,13 +648,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
-    def restore_weights_before_loading(self, layer) -> None:
+    def _restore_checkpoint_scale_dtype(self, layer) -> bool:
         if self._fi_kernel != "trtllm_sm100":
-            return
+            return False
         for name in ("w13_weight_scale", "w2_weight_scale"):
             parameter = getattr(layer, name)
             if parameter.dtype != torch.uint8:
                 parameter.data = parameter.data.view(torch.uint8)
+        return True
+
+    def _zero_checkpoint_buffers(self, layer) -> None:
         tensors = [
             getattr(layer, name).data
             for name in (
@@ -671,6 +674,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             for tensor in tensors:
                 tensor.zero_()
+
+    def restore_weights_before_loading(self, layer) -> None:
+        if self._restore_checkpoint_scale_dtype(layer):
+            self._zero_checkpoint_buffers(layer)
+
+    def restore_weights_before_cpu_staging(self, layer) -> None:
+        if not self._restore_checkpoint_scale_dtype(layer):
+            return
+        if (
+            self.intermediate_size_per_partition
+            != layer.intermediate_size_per_partition
+            or self.hidden_size != layer.hidden_size
+        ):
+            self._zero_checkpoint_buffers(layer)
 
     def supports_batched_weight_loading(self) -> bool:
         return True

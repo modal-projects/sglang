@@ -51,6 +51,31 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def get_hicache_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    enable_hierarchical_cache: bool,
+):
+    """Concrete draft pool that will receive a mirrored L2 cache -- the
+    dedup host-budget planning input (K3 helper adapted to the draft-plan
+    flow; the plan is the authority on which device pools get mirrored)."""
+    if not enable_hierarchical_cache or draft_worker is None:
+        return None
+    if spec_algorithm is not None and spec_algorithm.is_ngram():
+        return None
+    plan = getattr(draft_worker, "hicache_draft_plan", None)
+    device_pools = getattr(plan, "device_pools", None) if plan is not None else None
+    if not device_pools:
+        return None
+    pool = device_pools[0]
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
@@ -82,6 +107,7 @@ def maybe_register_hicache_draft(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
         server_args=server_args,
+        enable_hierarchical_cache=enable_hierarchical_cache,
     )
     tree_cache.register_hicache_draft_pools(specs, entries)
 
@@ -104,9 +130,20 @@ def _register_legacy_hicache_draft(
     if pool.layer_num == 0:
         return
 
+
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
+    if tree_cache.cache_controller.mla_broadcast_enabled:
+        from sglang.srt.mem_cache.mla_host_dedup import (
+            enforce_dedup_draft_host_budget,
+        )
+
+        enforce_dedup_draft_host_budget(
+            tree_cache.cache_controller,
+            pool,
+            page_size=page_size,
+        )
     host_pool_kwargs = dict(
         host_to_device_ratio=primary_host_pool.size / pool.size,
         host_size=0,
@@ -147,6 +184,7 @@ def build_kv_cache(
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
+    hicache_draft_kv_pool=None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -213,6 +251,7 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        hicache_draft_kv_pool=hicache_draft_kv_pool,
         # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
         # TreeCache.page_size should keep the same as allocator.page_size to
         # avoid kv page eviction conflicts.

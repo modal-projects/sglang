@@ -192,6 +192,14 @@ def process_content_for_template_format(
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility
                     processed_content_parts.append({"type": "video"})
+                elif chunk_type == "input_audio":
+                    audio_obj = chunk.get("input_audio") or {}
+                    audio_data.append(
+                        "data:audio/{};base64,{}".format(
+                            audio_obj.get("format", "wav"), audio_obj.get("data", "")
+                        )
+                    )
+                    processed_content_parts.append({"type": "audio"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type

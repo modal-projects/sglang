@@ -533,9 +533,28 @@ class ChatCompletionMessageContentVideoPart(BaseModel):
     video_url: ChatCompletionMessageContentVideoURL
 
 
-class ChatCompletionMessageContentAudioPart(BaseModel):
+class ChatCompletionMessageContentAudioURL(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
+
+
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    data: str
+    format: Literal["wav", "mp3"]
+
+
+class ChatCompletionMessageContentAudioBase64Inline(BaseModel):
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
+# Audio arrives in one of two shapes: `audio_url` references it by URL or data
+# URI, while OpenAI's `input_audio` carries base64 inline. The inline form is
+# rewritten to a data URI during parsing.
+ChatCompletionMessageContentAudioPart = Union[
+    ChatCompletionMessageContentAudioURL,
+    ChatCompletionMessageContentAudioBase64Inline,
+]
 
 
 class ChatCompletionMessageContentToolReferenceBlock(BaseModel):

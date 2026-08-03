@@ -45,6 +45,7 @@ from openai.types.responses import (
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -533,27 +534,54 @@ class ChatCompletionMessageContentVideoPart(BaseModel):
     video_url: ChatCompletionMessageContentVideoURL
 
 
-class ChatCompletionMessageContentAudioURL(BaseModel):
-    type: Literal["audio_url"]
-    audio_url: ChatCompletionMessageContentAudioURL
-
-
 class ChatCompletionMessageContentInputAudio(BaseModel):
     data: str
     format: Literal["wav", "mp3"]
 
 
-class ChatCompletionMessageContentAudioBase64Inline(BaseModel):
+_AUDIO_FORMAT_TO_MIME_TYPE = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+}
+
+
+class ChatCompletionMessageContentAudioURLPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
+class ChatCompletionMessageContentAudioInlinePart(BaseModel):
     type: Literal["input_audio"]
     input_audio: ChatCompletionMessageContentInputAudio
 
 
-# Audio arrives in one of two shapes: `audio_url` references it by URL or data
-# URI, while OpenAI's `input_audio` carries base64 inline. The inline form is
-# rewritten to a data URI during parsing.
-ChatCompletionMessageContentAudioPart = Union[
-    ChatCompletionMessageContentAudioURL,
-    ChatCompletionMessageContentAudioBase64Inline,
+def _to_audio_url_part(
+    part: Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+) -> ChatCompletionMessageContentAudioURLPart:
+    if isinstance(part, ChatCompletionMessageContentAudioURLPart):
+        return part
+
+    audio = part.input_audio
+    return ChatCompletionMessageContentAudioURLPart(
+        type="audio_url",
+        audio_url=ChatCompletionMessageContentAudioURL(
+            url=f"data:{_AUDIO_FORMAT_TO_MIME_TYPE[audio.format]};base64,{audio.data}"
+        ),
+    )
+
+
+# Audio arrives by reference as `audio_url`, holding a URL or a data URI, or
+# inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
+# the equivalent data URI as it validates.
+ChatCompletionMessageContentAudioPart = Annotated[
+    Union[
+        ChatCompletionMessageContentAudioURLPart,
+        ChatCompletionMessageContentAudioInlinePart,
+    ],
+    AfterValidator(_to_audio_url_part),
 ]
 
 

@@ -405,8 +405,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
                 raise ValueError("Inkling reasoning_effort must be in [0.0, 1.0]")
             return parsed
+        # Mirrors the effort_map in Inkling's published chat template
+        # `xhigh` is an sglang-side alias for the top tier.
         _EFFORT_MAP = {
             "none": 0.0,
+            "minimal": 0.1,
             "low": 0.2,
             "medium": 0.7,
             "high": 0.9,

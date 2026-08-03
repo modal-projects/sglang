@@ -732,13 +732,13 @@ class ChatCompletionRequest(BaseModel):
     return_meta_info: bool = False
     reasoning_effort: Optional[
         Union[
-            Literal["none", "low", "medium", "high", "xhigh", "max"],
+            Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"],
             Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
         ]
     ] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
         "float in [0.0, 1.0] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -858,6 +858,7 @@ class ChatCompletionRequest(BaseModel):
                 effort = r.get("reasoning_effort")
             if isinstance(effort, str) and effort in {
                 "none",
+                "minimal",
                 "low",
                 "medium",
                 "high",

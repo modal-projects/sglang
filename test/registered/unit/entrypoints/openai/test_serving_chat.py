@@ -2350,6 +2350,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_named_levels(self):
         parse = OpenAIServingChat._parse_inkling_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
+        self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
         self.assertEqual(parse("medium"), 0.7)
         self.assertEqual(parse("high"), 0.9)

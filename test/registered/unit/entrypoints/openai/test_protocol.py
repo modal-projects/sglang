@@ -264,7 +264,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
-        for effort in ("xhigh", "max"):
+        for effort in ("minimal", "xhigh", "max"):
             with self.subTest(effort=effort, request_form="top-level"):
                 request = ChatCompletionRequest(
                     model="test-model",

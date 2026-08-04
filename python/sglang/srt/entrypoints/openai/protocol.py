@@ -747,6 +747,7 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
+    return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

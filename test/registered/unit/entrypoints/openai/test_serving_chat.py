@@ -144,9 +144,12 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
+            self.basic_req.return_sampling_mask = True
+            self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -160,6 +163,20 @@ class ServingChatTestCase(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError, "return_prompt_token_ids is not supported with streaming"
+        ):
+            self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_convert_to_internal_request_rejects_sampling_mask_without_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_sampling_mask=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "return_sampling_mask requires return_meta_info=true"
         ):
             self.chat._convert_to_internal_request(req, self.fastapi_request)
 

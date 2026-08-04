@@ -567,6 +567,11 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
+    # Caps the resolution, in pixels, handed to Kimi-K2.5 GPU image
+    # preprocessing; 0 disables the cap. Bounds preprocessing VRAM at a real
+    # image-quality cost -- see kimi_k25.py before enabling.
+    SGLANG_KIMI_MM_MAX_GPU_RESIZE_PIXELS = EnvInt(0)
+
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)

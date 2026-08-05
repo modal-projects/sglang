@@ -39,6 +39,33 @@ class TestPrepareServerArgs(CustomTestCase):
         )
 
 
+class TestMultimodalPreprocessArgs(unittest.TestCase):
+    def test_defaults(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.mm_preprocess_device, "auto")
+        self.assertEqual(server_args.mm_preprocess_microbatch_size, 1)
+        self.assertFalse(server_args.keep_mm_feature_on_device)
+
+    def test_explicit_values(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_preprocess_device="cpu",
+            mm_preprocess_microbatch_size=4,
+            keep_mm_feature_on_device=True,
+        )
+        self.assertEqual(server_args.mm_preprocess_device, "cpu")
+        self.assertEqual(server_args.mm_preprocess_microbatch_size, 4)
+        self.assertTrue(server_args.keep_mm_feature_on_device)
+
+    def test_invalid_device(self):
+        with self.assertRaisesRegex(ValueError, "mm_preprocess_device"):
+            ServerArgs(model_path="dummy", mm_preprocess_device="tpu")
+
+    def test_invalid_microbatch_size(self):
+        with self.assertRaisesRegex(ValueError, "mm_preprocess_microbatch_size"):
+            ServerArgs(model_path="dummy", mm_preprocess_microbatch_size=0)
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")

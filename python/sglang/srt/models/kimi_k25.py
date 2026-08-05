@@ -623,6 +623,10 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # get_image_feature concatenates CPU-backed per-item features before one H2D
+    # transfer, so mm_utils should not move each item to GPU independently.
+    handles_cpu_mm_features = True
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json

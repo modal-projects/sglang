@@ -121,76 +121,115 @@ def _gpu_preprocess_images(
     image_mean: torch.Tensor,
     image_std_inv: torch.Tensor,
     patch_size: int,
+    microbatch_size: int,
+    offload_to_cpu: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """GPU preprocessing pipeline for a batch of images.
+    """Preprocess bounded image microbatches on GPU.
 
-    Groups images with the same target padded size for batch processing.
+    When ``offload_to_cpu`` is enabled, processed patches are copied directly
+    into a CPU output tensor so the complete request does not remain resident
+    on GPU while chunked language-model prefill runs.
     """
     n = len(images)
+    output_device = torch.device("cpu") if offload_to_cpu else image_mean.device
     if n == 0:
-        device = image_mean.device
         return (
-            torch.empty(0, 3, patch_size, patch_size, device=device),
-            torch.empty(0, 3, dtype=torch.int64, device=device),
+            torch.empty(
+                0,
+                3,
+                patch_size,
+                patch_size,
+                dtype=torch.float32,
+                device=output_device,
+            ),
+            torch.empty(0, 3, dtype=torch.int64),
         )
 
+    offsets = [0]
+    grid_rows = []
     groups = defaultdict(list)
-    for idx, (image, config) in enumerate(zip(images, resize_configs)):
+    for idx, config in enumerate(resize_configs):
         padded_h = config["new_height"] + config["pad_height"]
         padded_w = config["new_width"] + config["pad_width"]
-        target_h = config["new_height"]
-        target_w = config["new_width"]
-        groups[(target_h, target_w, padded_h, padded_w)].append((idx, image, config))
+        gh, gw = padded_h // patch_size, padded_w // patch_size
+        offsets.append(offsets[-1] + gh * gw)
+        grid_rows.append((1, gh, gw))
+        groups[
+            (
+                config["new_height"],
+                config["new_width"],
+                padded_h,
+                padded_w,
+            )
+        ].append(idx)
 
-    all_patches = [None] * n
-    all_grids = [None] * n
+    pixel_values = torch.empty(
+        offsets[-1],
+        3,
+        patch_size,
+        patch_size,
+        dtype=torch.float32,
+        device=output_device,
+    )
+    grid_thws = torch.tensor(grid_rows, dtype=torch.int64)
 
     for (target_h, target_w, padded_h, padded_w), group in groups.items():
-        if len(group) == 1:
-            idx, image, config = group[0]
-            patches, grid = _process_single_image(
-                image, config, image_mean, image_std_inv, patch_size
-            )
-            all_patches[idx] = patches
-            all_grids[idx] = grid
-        else:
-            tensors = []
-            for _, image, _ in group:
+        for begin in range(0, len(group), microbatch_size):
+            image_indices = group[begin : begin + microbatch_size]
+            full_size_tensors = []
+            for image_idx in image_indices:
+                image = images[image_idx]
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
-                tensors.append(image.unsqueeze(0).float())
+                full_size_tensors.append(image.unsqueeze(0).float())
+                # The processed patches are the only representation needed
+                # after this point. Release nvJPEG CUDA tensors incrementally.
+                images[image_idx] = None
+                image = None
 
-            resized = []
-            for t in tensors:
-                r = F.interpolate(
-                    t, size=(target_h, target_w), mode="bicubic", align_corners=False
+            resized = [
+                F.interpolate(
+                    tensor,
+                    size=(target_h, target_w),
+                    mode="bicubic",
+                    align_corners=False,
                 )
-                resized.append(r)
-            batch = torch.cat(resized, dim=0)
+                for tensor in full_size_tensors
+            ]
+            batch = resized[0] if len(resized) == 1 else torch.cat(resized, dim=0)
+            del resized, full_size_tensors
 
             pad_h = padded_h - target_h
             pad_w = padded_w - target_w
             if pad_h > 0 or pad_w > 0:
                 batch = F.pad(batch, (0, pad_w, 0, pad_h), value=0.0)
 
-            batch = batch / 255.0
-            batch = (batch - image_mean) * image_std_inv
-
-            B, C, H, W = batch.shape
-            T = 1
-            gh, gw = H // patch_size, W // patch_size
-            batch = batch.view(B, C, gh, patch_size, gw, patch_size)
-            batch = batch.permute(0, 2, 4, 1, 3, 5).reshape(
-                B, -1, C, patch_size, patch_size
+            batch.div_(255.0).sub_(image_mean).mul_(image_std_inv)
+            batch_size, channels, height, width = batch.shape
+            gh, gw = height // patch_size, width // patch_size
+            patches = (
+                batch.view(
+                    batch_size,
+                    channels,
+                    gh,
+                    patch_size,
+                    gw,
+                    patch_size,
+                )
+                .permute(0, 2, 4, 1, 3, 5)
+                .reshape(batch_size, -1, channels, patch_size, patch_size)
             )
 
-            grid = torch.tensor([T, gh, gw], dtype=torch.int64, device=batch.device)
-            for i, (idx, _, _) in enumerate(group):
-                all_patches[idx] = batch[i]
-                all_grids[idx] = grid
+            for local_idx, image_idx in enumerate(image_indices):
+                output = pixel_values[offsets[image_idx] : offsets[image_idx + 1]]
+                output.copy_(patches[local_idx], non_blocking=False)
 
-    pixel_values = torch.cat(all_patches, dim=0)
-    grid_thws = torch.stack(all_grids, dim=0)
+            del patches, batch
+
+    if offload_to_cpu:
+        # The tokenizer/processor is a separate CUDA-using process. Return its
+        # temporary allocator reservations to the model workers.
+        torch.cuda.empty_cache()
     return pixel_values, grid_thws
 
 
@@ -200,10 +239,10 @@ def _gpu_preprocess_images(
 
 
 class KimiGPUProcessorWrapper:
-    """Wraps Kimi's HF processor to do GPU image preprocessing.
+    """Wraps Kimi's HF processor with configurable image preprocessing.
 
     GPU path: nvJPEG CUDA tensor / PIL -> _gpu_preprocess_images()
-    CPU fallback: PIL -> medias kwarg -> original HF KimiK25Processor.__call__
+    CPU path: PIL -> medias kwarg -> original HF KimiK25Processor.__call__
 
     Exposes attributes that base class's process_mm_data needs so it behaves
     like a normal HF processor from the outside.
@@ -220,6 +259,9 @@ class KimiGPUProcessorWrapper:
         fixed_output_tokens,
         image_mean,
         image_std,
+        preprocess_device,
+        preprocess_microbatch_size,
+        keep_feature_on_device,
     ):
         self._hf_processor = hf_processor
         self._image_token = image_token
@@ -230,6 +272,9 @@ class KimiGPUProcessorWrapper:
         self._fixed_output_tokens = fixed_output_tokens
         self._image_mean = image_mean
         self._image_std = image_std
+        self._preprocess_device = preprocess_device
+        self._preprocess_microbatch_size = preprocess_microbatch_size
+        self._offload_to_cpu = not keep_feature_on_device
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
@@ -244,8 +289,11 @@ class KimiGPUProcessorWrapper:
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
 
-        if images and torch.cuda.is_available():
+        if images and self._preprocess_device == "gpu":
             return self._gpu_call(text, images)
+        # BaseMultiModalProcessor may select a CUDA device for fast image
+        # processors. Explicit CPU preprocessing must override that choice.
+        kwargs.pop("device", None)
         return self._cpu_call(text, images, **kwargs)
 
     def _gpu_call(self, text, images):
@@ -281,10 +329,14 @@ class KimiGPUProcessorWrapper:
         # 4. GPU image preprocessing
         image_mean, image_std_inv = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_mean, image_std_inv, self._patch_size
+            images,
+            resize_configs,
+            image_mean,
+            image_std_inv,
+            self._patch_size,
+            self._preprocess_microbatch_size,
+            self._offload_to_cpu,
         )
-
-        grid_thws = grid_thws.cpu()
 
         return {
             "input_ids": text_inputs["input_ids"],
@@ -316,6 +368,10 @@ class KimiGPUProcessorWrapper:
         grid_thws = out.pop("grid_thws", None)
         if grid_thws is not None:
             out["image_grid_thw"] = grid_thws
+        if not self._offload_to_cpu and isinstance(
+            out.get("pixel_values"), torch.Tensor
+        ):
+            out["pixel_values"] = out["pixel_values"].to("cuda")
         return out
 
     def _get_gpu_norm_tensors(self, device="cuda"):
@@ -342,6 +398,16 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        preprocess_device = server_args.mm_preprocess_device
+        if preprocess_device == "auto":
+            preprocess_device = "gpu" if torch.cuda.is_available() else "cpu"
+        elif preprocess_device == "gpu" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "--mm-preprocess-device=gpu requires CUDA to be available"
+            )
+        # CPU preprocessing requires PIL/CPU inputs rather than nvJPEG CUDA
+        # tensors. This instance setting is consumed by load_mm_data().
+        self.gpu_image_decode = preprocess_device == "gpu"
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             # TODO: could we convert in MultimodalSpecialTokens?
@@ -363,6 +429,9 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             fixed_output_tokens=media_proc_cfg.get("fixed_output_tokens"),
             image_mean=media_proc_cfg["image_mean"],
             image_std=media_proc_cfg["image_std"],
+            preprocess_device=preprocess_device,
+            preprocess_microbatch_size=server_args.mm_preprocess_microbatch_size,
+            keep_feature_on_device=server_args.keep_mm_feature_on_device,
         )
 
     async def process_mm_data_async(

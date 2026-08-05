@@ -769,6 +769,8 @@ class ServerArgs:
     enforce_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    mm_preprocess_device: str = "auto"
+    mm_preprocess_microbatch_size: int = 1
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
@@ -1118,6 +1120,16 @@ class ServerArgs:
 
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
+        if self.mm_preprocess_device not in ("auto", "cpu", "gpu"):
+            raise ValueError(
+                "mm_preprocess_device must be one of: auto, cpu, gpu; "
+                f"got {self.mm_preprocess_device!r}"
+            )
+        if self.mm_preprocess_microbatch_size < 1:
+            raise ValueError(
+                "mm_preprocess_microbatch_size must be at least 1; "
+                f"got {self.mm_preprocess_microbatch_size}"
+            )
         if self.mm_process_config is not None:
             if not isinstance(self.mm_process_config, dict):
                 raise TypeError(
@@ -6645,6 +6657,18 @@ class ServerArgs:
             "--disable-fast-image-processor",
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
+        )
+        parser.add_argument(
+            "--mm-preprocess-device",
+            choices=["auto", "cpu", "gpu"],
+            default=ServerArgs.mm_preprocess_device,
+            help="Device used for multimodal preprocessing. 'auto' uses GPU preprocessing when supported and available.",
+        )
+        parser.add_argument(
+            "--mm-preprocess-microbatch-size",
+            type=int,
+            default=ServerArgs.mm_preprocess_microbatch_size,
+            help="Maximum number of multimodal inputs processed together by GPU preprocessing.",
         )
         parser.add_argument(
             "--keep-mm-feature-on-device",

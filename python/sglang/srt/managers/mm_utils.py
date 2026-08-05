@@ -470,10 +470,10 @@ DataEmbeddingFunc = Callable[
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """qwen-vl visual forward already moves batched features to the target device.
+    """Return whether a multimodal embedder handles its own feature device move.
 
-    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
-    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+    Models that concatenate CPU features before moving them can avoid multiple
+    per-item H2D copies followed by another concatenation allocation on GPU.
     """
     owner = getattr(data_embedding_func, "__self__", None)
     if owner is None:
@@ -483,12 +483,15 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "get_video_feature",
     ):
         return False
-    return owner.__class__.__name__ in {
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }
+    return getattr(owner, "handles_cpu_mm_features", False) or (
+        owner.__class__.__name__
+        in {
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        }
+    )
 
 
 def _move_items_to_device(
@@ -592,7 +595,8 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        _move_items_to_device(miss_item_list, device)
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]

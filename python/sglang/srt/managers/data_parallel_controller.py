@@ -66,7 +66,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket_on_host,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -844,14 +844,24 @@ def run_data_parallel_controller_process(
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
-        # The primary owns routing for the expanded scheduler set.
-        if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
-            controller.event_loop()
-        for proc in controller.scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=controller.scheduler_procs,
+            process_names=[
+                f"scheduler_{rank}" for rank in range(len(controller.scheduler_procs))
+            ],
+        )
+        subprocess_watchdog.start()
+        try:
+            # The primary owns routing for the expanded scheduler set.
+            if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
+                controller.event_loop()
+            for proc in controller.scheduler_procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
+        finally:
+            subprocess_watchdog.stop()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")

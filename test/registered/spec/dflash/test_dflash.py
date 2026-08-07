@@ -171,6 +171,34 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
 class TestDFlashServerSpecV2(TestDFlashServerBase):
     disable_overlap = False
 
+    def test_sampling_mask(self):
+        import requests
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "max_new_tokens": 7,
+                    "ignore_eos": True,
+                },
+                "return_sampling_mask": True,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        output_ids = output["output_ids"]
+        masks = output["meta_info"]["output_token_sampling_mask"]
+        logprobs = output["meta_info"]["output_token_sampling_logprobs"]
+        self.assertEqual(len(output_ids), 7)
+        self.assertEqual(len(masks), len(output_ids))
+        self.assertEqual(len(logprobs), len(output_ids))
+        for output_id, mask in zip(output_ids, masks, strict=True):
+            self.assertIn(output_id, mask)
+
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
         assert self.process.poll() is None

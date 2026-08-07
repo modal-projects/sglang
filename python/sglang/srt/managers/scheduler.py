@@ -2403,23 +2403,44 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
+        if (
+            req.return_sampling_mask
+            and req.sampling_params.top_k == TOP_K_ALL
+            and req.sampling_params.top_p >= 1.0
+        ):
             error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
+                "return_sampling_mask cannot return the full vocabulary; set "
+                "top_p < 1 or a finite top_k."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
+        if req.return_sampling_mask and not (
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_dflash()
+        ):
+            # Other spec workers do not emit one sampling support per accepted
+            # token, so the returned mask would not align 1:1 with generated tokens.
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash()
+            and (
+                self.server_args.speculative_accept_threshold_single != 1.0
+                or self.server_args.speculative_accept_threshold_acc != 1.0
+            )
+        ):
+            error_msg = (
+                "return_sampling_mask with DFLASH requires speculative acceptance "
+                "thresholds of 1.0."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)

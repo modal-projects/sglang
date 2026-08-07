@@ -2511,12 +2511,30 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
+        if req.return_sampling_mask and not (
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_dflash()
+        ):
+            # Other spec workers do not emit one sampling support per accepted
+            # token, so the returned mask would not align 1:1 with generated tokens.
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            req.return_sampling_mask
+            and self.spec_algorithm.is_dflash()
+            and (
+                get_spec().speculative_accept_threshold_single != 1.0
+                or get_spec().speculative_accept_threshold_acc != 1.0
+            )
+        ):
+            error_msg = (
+                "return_sampling_mask with DFLASH requires speculative acceptance "
+                "thresholds of 1.0."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)

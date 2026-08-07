@@ -352,6 +352,16 @@ class ModelConfig:
                     "vision_config/audio_config not found in the model config "
                     "(likely a text-only MiMoV2 variant)."
                 )
+            elif getattr(self.hf_config, "language_model_only", False):
+                # Text-only exports of multimodal families (e.g. Qwen3.8-Max)
+                # keep the ForConditionalGeneration architecture and a vestigial
+                # vision_config, but ship no vision weights.
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled: the model config declares "
+                    "language_model_only=true (text-only checkpoint of a "
+                    "multimodal architecture). To enable it, set --enable-multimodal."
+                )
             else:
                 enable_multimodal = True
 

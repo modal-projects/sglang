@@ -59,6 +59,32 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+def _trim_dflash_prefill_hidden_states(
+    target_hidden: torch.Tensor,
+    *,
+    cache_loc_tokens: int,
+    attention_tp_size: int,
+) -> torch.Tensor:
+    """Remove only the trailing rows introduced by attention-TP alignment."""
+    hidden_tokens = int(target_hidden.shape[0])
+    if hidden_tokens == cache_loc_tokens:
+        return target_hidden
+
+    expected_padded_tokens = (
+        math.ceil(cache_loc_tokens / attention_tp_size) * attention_tp_size
+        if attention_tp_size > 0
+        else cache_loc_tokens
+    )
+    if attention_tp_size <= 1 or hidden_tokens != expected_padded_tokens:
+        raise ValueError(
+            "DFLASH cache_loc length mismatch: "
+            f"cache_loc={cache_loc_tokens}, target_hidden={hidden_tokens}, "
+            f"attention_tp_size={attention_tp_size}."
+        )
+
+    return target_hidden[:cache_loc_tokens]
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -1409,6 +1435,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
+            target_hidden = _trim_dflash_prefill_hidden_states(
+                logits_output.hidden_states,
+                cache_loc_tokens=int(batch.out_cache_loc.numel()),
+                attention_tp_size=int(self.ps.attn_tp_size),
+            )
             positions, _ = compute_position(
                 self.model_runner.server_args.attention_backend,
                 draft_seq_lens,
@@ -1416,7 +1447,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
+                target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
             )

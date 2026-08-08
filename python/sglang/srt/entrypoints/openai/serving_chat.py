@@ -688,7 +688,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     "Please set stream=false when using return_meta_info=true."
                 )
 
-        if request.return_sampling_mask and not request.return_meta_info:
+        return_sampling_mask = request.return_sampling_mask or bool(
+            (request.custom_params or {}).get("miles_return_sampling_mask", False)
+        )
+        if return_sampling_mask and not request.return_meta_info:
             raise ValueError(
                 "return_sampling_mask requires return_meta_info=true so the "
                 "sampling support is present in the chat response."
@@ -752,7 +755,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
-            return_sampling_mask=request.return_sampling_mask,
+            return_sampling_mask=return_sampling_mask,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,

@@ -71,6 +71,25 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def _normalize_modelopt_fp4_expert_weight(
+    name: str,
+    weight: torch.Tensor,
+) -> Tuple[str, torch.Tensor]:
+    if name.endswith(".weight_scale_inv"):
+        name = name.removesuffix("weight_scale_inv") + "weight_scale"
+    elif name.endswith(".weight_scale_global"):
+        name = name.removesuffix("weight_scale_global") + "weight_scale_2"
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None and weight.dtype == fp4_dtype:
+        packed_weight = weight.view(torch.uint8)
+        if getattr(weight, RUNAI_STREAMER_TENSOR_ATTR, False):
+            setattr(packed_weight, RUNAI_STREAMER_TENSOR_ATTR, True)
+        weight = packed_weight
+
+    return name, weight
+
+
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
@@ -221,6 +240,14 @@ class DeepseekV2WeightLoaderMixin:
                     name = name.replace(
                         "mlp.shared_experts",
                         f"mlp.experts.{self.config.n_routed_experts}",
+                    )
+                if (
+                    self.quant_config is not None
+                    and self.quant_config.get_name() == "modelopt_fp4"
+                    and ".mlp.experts." in name
+                ):
+                    name, loaded_weight = _normalize_modelopt_fp4_expert_weight(
+                        name, loaded_weight
                     )
 
                 weight_names.append(name)

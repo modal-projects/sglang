@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -34,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_observability,
     mamba_extra_buffer_lazy_enabled,
@@ -315,7 +317,24 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if req.beam_group is not None:
+                    # A request already finishing keeps its reason: an aborted
+                    # row still runs one forward pass and would otherwise have
+                    # its admission-time message replaced by the mask cap.
+                    sampling_mask_error = (
+                        None
+                        if req.to_finish is not None
+                        else self.get_sampling_mask_overflow_error(
+                            i, req, logits_output
+                        )
+                    )
+                    if sampling_mask_error is not None:
+                        req.to_finish = FINISH_ABORT(
+                            sampling_mask_error,
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        req.update_finish_state()
+                    elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
                         # append; the group owns all finish semantics.
                         self.beam_coordinator.commit_prefill(
@@ -358,7 +377,11 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
+                            store=sampling_mask_error is None,
                         )
+
+                    if sampling_mask_error is not None:
+                        continue
 
                     if req.return_sampling_mask:
                         self.add_sampling_mask_return_values(i, req, logits_output)
@@ -507,6 +530,7 @@ class SchedulerBatchResultProcessor:
         extend_logprob_start_len_per_req: Optional[List[int]],
         next_token_ids: List[int],
         logprob_pt: int,
+        store: bool,
     ) -> int:
         assert extend_logprob_start_len_per_req is not None
         assert extend_input_len_per_req is not None
@@ -519,7 +543,7 @@ class SchedulerBatchResultProcessor:
             extend_logprob_start_len,
         )
 
-        if req.return_logprob:
+        if store and req.return_logprob:
             self.logprob_result_processor.add_logprob_return_values(
                 i,
                 req,
@@ -953,14 +977,32 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            req.output_ids.extend(next_token_id)
-            new_accept_len = len(next_token_id)
-
-            self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
+            # A request already finishing for another reason keeps its reason:
+            # an aborted row still runs one forward pass and would otherwise
+            # have its admission-time message replaced by the mask cap.
+            sampling_mask_error = (
+                None
+                if req.to_finish is not None
+                else self.get_sampling_mask_overflow_error(i, req, logits_output)
+            )
+            if sampling_mask_error is not None:
+                req.to_finish = FINISH_ABORT(
+                    sampling_mask_error,
+                    HTTPStatus.BAD_REQUEST,
+                    "BadRequestError",
+                )
+                new_accept_len = 0
+            else:
+                req.output_ids.extend(next_token_id)
+                new_accept_len = len(next_token_id)
+                self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+
+            if sampling_mask_error is not None:
+                continue
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1107,6 +1149,24 @@ class SchedulerBatchResultProcessor:
         req.output_token_sampling_mask.append(None if mask is None else mask[i])
         req.output_token_sampling_logprobs.append(
             None if logprobs is None else logprobs[i]
+        )
+
+    def get_sampling_mask_overflow_error(
+        self,
+        i: int,
+        req: Req,
+        output: Optional[LogitsProcessorOutput],
+    ) -> Optional[str]:
+        if not req.return_sampling_mask:
+            return None
+        assert output is not None
+        masks = output.next_token_sampling_mask_idx
+        if masks is None or masks[i] is not None:
+            return None
+        return (
+            "Sampling mask support exceeds --sampling-mask-max-tokens="
+            f"{get_exec().features.sampling_mask_max_tokens}. Lower top_p or set a "
+            "smaller finite top_k."
         )
 
     def _handle_finish_state_updated_req(

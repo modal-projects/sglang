@@ -19,13 +19,13 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
 _TOP_K = 10
+_SAMPLING_MASK_MAX_TOKENS = 16
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
-)
-_INVALID_SAMPLING_MASK_ERROR = (
-    "top_p-only sampling is valid but can return huge masks in the tail"
+    "--sampling-mask-max-tokens",
+    str(_SAMPLING_MASK_MAX_TOKENS),
 )
 
 
@@ -80,12 +80,6 @@ class SamplingMaskTestMixin:
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
         return sampling_masks
-
-    def _assert_rejects_unbounded_sampling_mask(self, sampling_params):
-        response = self._post_generate(sampling_params)
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn(_INVALID_SAMPLING_MASK_ERROR, response.text)
-
 
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
     @classmethod
@@ -222,22 +216,34 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
 
-    def test_generate_rejects_unbounded_sampling_mask(self):
-        self._assert_rejects_unbounded_sampling_mask(
-            {
-                "temperature": 1.0,
-                "top_p": _TOP_P,
-                "max_new_tokens": _MAX_NEW_TOKENS,
-                "ignore_eos": True,
-            }
-        )
-        self._assert_rejects_unbounded_sampling_mask(
+    def test_generate_rejects_full_vocabulary_sampling_mask(self):
+        response = self._post_generate(
             {
                 "temperature": 1.0,
                 "top_p": 1.0,
                 "max_new_tokens": _MAX_NEW_TOKENS,
                 "ignore_eos": True,
             }
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "return_sampling_mask cannot return the full vocabulary", response.text
+        )
+
+    def test_generate_rejects_sampling_mask_above_cap(self):
+        response = self._post_generate(
+            {
+                "temperature": 1.0,
+                "top_k": _SAMPLING_MASK_MAX_TOKENS + 1,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+            return_logprob=True,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "Sampling mask support exceeds --sampling-mask-max-tokens=16",
+            response.text,
         )
 
 

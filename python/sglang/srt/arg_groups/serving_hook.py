@@ -452,6 +452,11 @@ def handle_environment_variables(server_args: Any):
 
 def handle_other_validations(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.sampling_mask_max_tokens <= 0:
+        raise ValueError(
+            "--sampling-mask-max-tokens must be positive "
+            f"(got {cfg.sampling_mask_max_tokens})."
+        )
     if cfg.default_chat_template_kwargs is not None and not isinstance(
         cfg.default_chat_template_kwargs, dict
     ):

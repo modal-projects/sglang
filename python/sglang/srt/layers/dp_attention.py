@@ -429,11 +429,13 @@ def get_dp_local_slice_cpu(
     cuda_graph_batch: Optional[int],
 ) -> Tuple[int, int]:
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
-    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    # Returns Python ints (no D2H sync). A decode graph supplies its fixed
+    # per-rank stride; eager forwards and prefill graphs do not and are densely
+    # packed according to global_num_tokens_cpu.
     global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_attention_dp_rank()
     local_num_tokens = global_num_tokens[dp_rank]
-    if can_run_graph:
+    if can_run_graph and cuda_graph_batch is not None:
         local_start_pos = dp_rank * cuda_graph_batch
     else:
         local_start_pos = sum(global_num_tokens[:dp_rank])

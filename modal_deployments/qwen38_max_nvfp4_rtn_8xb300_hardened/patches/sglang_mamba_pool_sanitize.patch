@@ -1,0 +1,213 @@
+diff -ruN a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py	2026-08-08 03:40:05.775275371 +0000
++++ b/python/sglang/srt/managers/scheduler.py	2026-08-08 03:40:05.779275324 +0000
+@@ -4160,6 +4160,13 @@
+ 
+     def flush_cache(self, empty_cache: bool = True):
+         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
++        # Unconditional WARNING-level trace: recycle boundaries must be visible
++        # in every log capture (INFO filtering / per-rank stats gating must not
++        # hide them) so a silent sanitization chain is itself diagnostic.
++        logger.warning(
++            "[flush-sanitize] scheduler.flush_cache invoked (fully_idle=%s)",
++            self.is_fully_idle(),
++        )
+         if self.is_fully_idle():
+             self.cur_batch_for_debug = None
+             self.last_batch = None
+@@ -4176,6 +4183,7 @@
+                 current_platform.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
++            logger.warning("[flush-sanitize] scheduler.flush_cache completed (pools cleared)")
+             if self.metrics_reporter.is_stats_logging_rank:
+                 logger.info("Cache flushed successfully!")
+             success = True
+diff -ruN a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py	2026-08-08 03:40:05.774275382 +0000
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py	2026-08-08 03:40:05.780275312 +0000
+@@ -494,6 +494,16 @@
+         self.full_lru_list = LRUList(mamba=False)
+         self.mamba_lru_list = LRUList(mamba=True)
+         self._record_all_cleared_event()
++        # Recycle-boundary sanitization (defense in depth alongside
++        # HybridReqToTokenPool.clear): a tree reset abandons every tree-held
++        # mamba slot; whichever teardown order the caller uses, no stale slot
++        # state may survive into the next allocation generation. The getattr
++        # guard covers the __init__-time reset (attributes already set) and any
++        # subclass that lacks a mamba pool. Logs unconditionally at WARNING.
++        _pool = getattr(self, "req_to_token_pool", None)
++        _mamba_pool = getattr(_pool, "mamba_pool", None) if _pool is not None else None
++        if _mamba_pool is not None and hasattr(_mamba_pool, "sanitize_all"):
++            _mamba_pool.sanitize_all(reason="MambaRadixCache.reset")
+ 
+     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+         """Find the matching prefix from the radix tree.
+diff -ruN a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+--- a/python/sglang/srt/mem_cache/memory_pool.py	2026-08-08 03:40:05.774275382 +0000
++++ b/python/sglang/srt/mem_cache/memory_pool.py	2026-08-08 03:40:05.782275289 +0000
+@@ -94,6 +94,21 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Mamba-state sanitization gates. The GDN chunked-scan prefill consumes
++# ``temporal[slot]`` as the initial recurrent state UNCONDITIONALLY (there is
++# no has_initial_state gate on the SSM side, only on the conv side), so any
++# slot that reaches a forward without having been zeroed (per-request clear)
++# or overwritten (radix COW) is a live input from the request's first token.
++# SGLANG_MAMBA_SANITIZE_ON_EXTEND=0 disables the extend-admission check;
++# SGLANG_MAMBA_SANITIZE_VERBOSE=1 additionally syncs to log poisoned-slot
++# counts per batch (debug only; the sync stalls the forward stream).
++_MAMBA_SANITIZE_ON_EXTEND = os.environ.get(
++    "SGLANG_MAMBA_SANITIZE_ON_EXTEND", "1"
++).lower() not in ("0", "false")
++_MAMBA_SANITIZE_VERBOSE = os.environ.get(
++    "SGLANG_MAMBA_SANITIZE_VERBOSE", "0"
++).lower() not in ("0", "false")
++
+ # Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
+ # forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
+ # the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
+@@ -906,6 +921,108 @@
+     def _should_fuse_slot_ops(self) -> bool:
+         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
+ 
++    # Logged unconditionally at WARNING so silence is diagnostic (INFO-level or
++    # per-rank log filtering must never hide a sanitization event).
++    _sanitize_admission_logged = False
++
++    def sanitize_all(self, reason: str = "unspecified") -> int:
++        """Zero every state tensor in the pool (conv + temporal + ReplaySSM
++        rings/cursors + speculative snapshots) and return the slot count.
++
++        A cache flush/reset recycles every slot at once; sanitizing the whole
++        pool at that boundary makes the flush (and, by the same token, the
++        cold-boot) path safe regardless of the per-request clear choreography:
++        the GDN prefill reads ``temporal[slot]`` as the initial recurrent
++        state unconditionally, so a stale slot is a live model input from a
++        fresh request's very first token. Logs unconditionally (even for an
++        already-clean pool) so post-mortems can see which recycle boundaries
++        actually fired.
++        """
++        for conv in self.mamba_cache.conv:
++            conv.zero_()
++        self.mamba_cache.temporal.zero_()
++        for name in (
++            "replayssm_d",
++            "replayssm_k",
++            "replayssm_g",
++            "replayssm_rawv",
++            "replayssm_rawk",
++            "replayssm_beta",
++        ):
++            t = getattr(self.mamba_cache, name, None)
++            if t is not None:
++                t.zero_()
++        if isinstance(self.mamba_cache, self.SpeculativeState):
++            if self.mamba_cache.intermediate_ssm is not None:
++                self.mamba_cache.intermediate_ssm.zero_()
++            for conv_window in self.mamba_cache.intermediate_conv_window or []:
++                conv_window.zero_()
++        for name in ("replayssm_write_pos", "replayssm_cache_base", "replayssm_is_flush"):
++            t = getattr(self, name, None)
++            if t is not None:
++                t.zero_()
++        num_slots = int(self.mamba_cache.temporal.shape[1])
++        logger.warning(
++            "[mamba-pool] sanitize_all: zeroed %d slots (reason=%s)",
++            num_slots,
++            reason,
++        )
++        return num_slots
++
++    def maybe_sanitize_slots_nonfinite(self, slots: torch.Tensor) -> None:
++        """Zero, in place, every slot in ``slots`` whose conv or temporal state
++        contains a non-finite value. Runs fully on-GPU with no host sync (the
++        forward stream is never stalled) unless SGLANG_MAMBA_SANITIZE_VERBOSE=1,
++        which additionally syncs to log the poisoned-slot count.
++
++        Belt-and-suspenders for extend admission: a slot that escaped the
++        per-request clear / radix COW, or that inherited a poisoned checkpoint,
++        must never feed the GDN prefill (see ``sanitize_all``). Zeroing restarts
++        the recurrent state -- wrong-but-finite output is strictly better than a
++        NaN request that poisons downstream state and caches. Logs a one-time
++        liveness line so its presence on the serving path is verifiable from
++        any boot log.
++        """
++        if not _MAMBA_SANITIZE_ON_EXTEND or slots.numel() == 0:
++            return
++        if not MambaPool._sanitize_admission_logged:
++            MambaPool._sanitize_admission_logged = True
++            logger.warning(
++                "[mamba-pool] extend-admission non-finite sanitization ACTIVE "
++                "(first extend batch reached it; set "
++                "SGLANG_MAMBA_SANITIZE_VERBOSE=1 for per-batch counts)"
++            )
++        slots = slots.to(dtype=torch.long)
++        temporal = self.mamba_cache.temporal
++        state = temporal[:, slots]
++        # per-slot "all values finite", reduced over layers and state dims
++        keep = torch.isfinite(state)
++        keep = keep.reshape(keep.shape[0], keep.shape[1], -1).all(dim=-1).all(dim=0)
++        for conv in self.mamba_cache.conv:
++            cfin = torch.isfinite(conv[:, slots])
++            keep &= cfin.reshape(cfin.shape[0], cfin.shape[1], -1).all(dim=-1).all(dim=0)
++        if _MAMBA_SANITIZE_VERBOSE:
++            bad_mask = ~keep
++            bad = int(bad_mask.sum().item())  # host sync -- debug only
++            if bad:
++                # Slot ids vs batch positions discriminate the two candidate
++                # poison geometries: a recurring slot id across victims means
++                # slot-identity (stale slot memory); a recurring batch position
++                # with varying slot ids means a batch-shaped medium.
++                logger.warning(
++                    "[mamba-pool] zeroed %d non-finite slot(s) at extend "
++                    "admission: slot_ids=%s batch_positions=%s",
++                    bad,
++                    slots[bad_mask].tolist(),
++                    bad_mask.nonzero(as_tuple=True)[0].tolist(),
++                )
++        keep_t = keep.view([1, keep.shape[0]] + [1] * (temporal.dim() - 2))
++        temporal[:, slots] = torch.where(keep_t, state, torch.zeros_like(state))
++        for conv in self.mamba_cache.conv:
++            cstate = conv[:, slots]
++            keep_c = keep.view([1, keep.shape[0]] + [1] * (conv.dim() - 2))
++            conv[:, slots] = torch.where(keep_c, cstate, torch.zeros_like(cstate))
++
+     def clear_slots(self, indices: torch.Tensor):
+         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+         if self._should_fuse_slot_ops():
+@@ -1514,9 +1631,14 @@
+             req.mamba_next_track_idx = None
+ 
+     def clear(self):
+-        logger.info("Reset HybridReqToTokenPool")
++        logger.warning("[mamba-pool] HybridReqToTokenPool.clear invoked")
+         super().clear()
+         self.mamba_allocator.clear()
++        # A flush/reset recycles every mamba slot at once; stale (possibly
++        # non-finite) state must not survive into the next allocation
++        # generation. /flush_cache was demonstrated to hand poisoned slots to
++        # fresh requests without this.
++        self.mamba_pool.sanitize_all(reason="HybridReqToTokenPool.clear")
+         # The int8 checkpoint pool holds radix-cached states in its own slots; a
+         # flush/reset drops the radix tree, so its slots must be released too,
+         # otherwise the (now unreferenced) slots leak and break the int8-pool
+diff -ruN a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+--- a/python/sglang/srt/model_executor/model_runner.py	2026-08-08 03:40:05.775275371 +0000
++++ b/python/sglang/srt/model_executor/model_runner.py	2026-08-08 03:40:05.781275301 +0000
+@@ -1524,6 +1524,14 @@
+                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
+                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                 )
++        if forward_batch.req_pool_indices is not None:
++            # Belt-and-suspenders: after the deferred clears and COW copies,
++            # zero (on-GPU, no host sync) any batch slot whose admitted state
++            # is non-finite; see MambaPool.maybe_sanitize_slots_nonfinite.
++            batch_slots = pool.translate_mamba_indices(
++                pool.get_mamba_indices(forward_batch.req_pool_indices)
++            )
++            pool.mamba_pool.maybe_sanitize_slots_nonfinite(batch_slots)
+         forward_batch.mamba_clear_indices = None
+         forward_batch.mamba_cow_src_indices = None
+         forward_batch.mamba_cow_dst_indices = None

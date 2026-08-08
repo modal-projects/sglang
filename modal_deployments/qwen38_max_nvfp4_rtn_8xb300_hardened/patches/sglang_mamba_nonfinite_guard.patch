@@ -1,0 +1,96 @@
+diff -ruN a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py	2026-08-07 20:16:47.089048411 +0000
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py	2026-08-07 20:17:21.159653921 +0000
+@@ -25,6 +25,7 @@
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+ import torch
++
+ from numpy import float64
+ 
+ from sglang.srt.mem_cache.allocator import (
+@@ -62,6 +63,12 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Cache-admission bulkhead for poisoned (NaN/Inf) recurrent state. Default ON;
++# set SGLANG_MAMBA_NONFINITE_CACHE_GUARD=0 to disable the check.
++_MAMBA_NONFINITE_CACHE_GUARD = os.environ.get(
++    "SGLANG_MAMBA_NONFINITE_CACHE_GUARD", "1"
++).lower() not in ("0", "false")
++
+ # Debug-only invariant checks in the Mamba slot-donation path call tensor.item(),
+ # which forces a per-request cudaStreamSynchronize on the scheduler thread. Under
+ # load this can serialize/stall the scheduler. Gate them off by default; set
+@@ -555,6 +562,24 @@
+             req.req_pool_idx, :kv_len_to_handle
+         ]
+ 
++        if (
++            is_insert
++            and _MAMBA_NONFINITE_CACHE_GUARD
++            and req.mamba_pool_idx is not None
++            and not self.req_to_token_pool.mamba_pool.slots_state_is_finite(
++                self.req_to_token_pool.translate_mamba_indices(
++                    req.mamba_pool_idx.view(-1)
++                )
++            )
++        ):
++            # Poisoned recurrent state (NaN/Inf): never donate it to the tree.
++            logger.warning(
++                "MambaRadixCache: dropping non-finite mamba state of finished "
++                "request %s from cache admission.",
++                req.rid,
++            )
++            is_insert = False
++
+         if is_insert:
+             if self.enable_mamba_extra_buffer:
+                 cache_len = req.mamba_last_track_seqlen
+@@ -683,6 +708,22 @@
+         )
+         if self.disable or cache_len is None:
+             return _skip_cache_unfinished_req(req)
++        if (
++            _MAMBA_NONFINITE_CACHE_GUARD
++            and req.mamba_pool_idx is not None
++            and not self.req_to_token_pool.mamba_pool.slots_state_is_finite(
++                self.req_to_token_pool.translate_mamba_indices(
++                    req.mamba_pool_idx.view(-1)
++                )
++            )
++        ):
++            # Poisoned recurrent state (NaN/Inf): never donate it to the tree.
++            logger.warning(
++                "MambaRadixCache: skipping cache of non-finite mamba state for "
++                "unfinished request %s.",
++                req.rid,
++            )
++            return _skip_cache_unfinished_req(req)
+ 
+         kv_indices_orig = self.req_to_token_pool.req_to_token[
+             req.req_pool_idx, : len(token_ids)
+diff -ruN a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+--- a/python/sglang/srt/mem_cache/memory_pool.py	2026-08-07 20:16:47.089048411 +0000
++++ b/python/sglang/srt/mem_cache/memory_pool.py	2026-08-07 20:16:47.089048411 +0000
+@@ -936,6 +936,20 @@
+             t = self.mamba_cache.temporal
+             t[:, indices] = 0
+ 
++    def slots_state_is_finite(self, indices: torch.Tensor) -> bool:
++        """True iff every conv + temporal state value at ``indices`` is finite.
++
++        Used as a cache-admission bulkhead: a request whose recurrent state was
++        poisoned by a transient NaN/Inf must never donate that state to the
++        radix tree (a cached non-finite state re-poisons every future request
++        that prefix-matches it). Costs one small reduction + a host sync per
++        call; callers gate on SGLANG_MAMBA_NONFINITE_CACHE_GUARD.
++        """
++        ok = torch.isfinite(self.mamba_cache.temporal[:, indices]).all()
++        for conv in self.mamba_cache.conv:
++            ok &= torch.isfinite(conv[:, indices]).all()
++        return bool(ok.item())
++
+     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+         """Clone mamba state (conv + temporal) from src slots into dst slots.
+ 

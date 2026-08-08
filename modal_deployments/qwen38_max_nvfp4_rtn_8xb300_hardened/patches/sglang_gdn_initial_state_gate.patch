@@ -1,0 +1,193 @@
+diff -ruN a/python/sglang/kernels/ops/attention/fla/chunk_delta_h.py b/python/sglang/kernels/ops/attention/fla/chunk_delta_h.py
+--- a/python/sglang/kernels/ops/attention/fla/chunk_delta_h.py	2026-08-08 03:39:39.372582270 +0000
++++ b/python/sglang/kernels/ops/attention/fla/chunk_delta_h.py	2026-08-08 03:39:39.372582270 +0000
+@@ -60,6 +60,7 @@
+     h,
+     initial_state,
+     initial_state_indices,
++    has_initial_state,
+     stride_init_state,
+     cu_seqlens,
+     chunk_offsets,
+@@ -73,6 +74,7 @@
+     USE_G: tl.constexpr,
+     USE_GK: tl.constexpr,
+     USE_INITIAL_STATE: tl.constexpr,
++    USE_H0_MASK: tl.constexpr,
+     INPLACE_UPDATE: tl.constexpr,
+     SAVE_NEW_VALUE: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
+@@ -126,25 +128,38 @@
+     if INPLACE_UPDATE:
+         ht = ht + i_h * V * K
+ 
+-    # load initial state
++    # Load the initial state. With a slot-pool `initial_state` +
++    # `initial_state_indices`, USE_INITIAL_STATE is grid-wide True, so without
++    # the per-sequence mask every sequence -- including one whose prefix
++    # semantically starts empty -- consumes whatever bytes its slot holds
++    # (read-before-write). `has_initial_state[i_n] == 0` skips the load, which
++    # is exactly the zero initial state (the accumulators start at zero); the
++    # final-state write-back below stays unconditional so fresh sequences
++    # still persist their computed state into the slot.
+     if USE_INITIAL_STATE:
+-        p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
+-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+-        if K > 64:
+-            p_h0_2 = tl.make_block_ptr(
+-                h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+-            )
+-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+-        if K > 128:
+-            p_h0_3 = tl.make_block_ptr(
+-                h0, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
++        b_use_h0 = True
++        if USE_H0_MASK:
++            b_use_h0 = tl.load(has_initial_state + i_n) != 0
++        if b_use_h0:
++            p_h0_1 = tl.make_block_ptr(
++                h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+             )
+-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+-        if K > 192:
+-            p_h0_4 = tl.make_block_ptr(
+-                h0, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+-            )
+-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
++            b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
++            if K > 64:
++                p_h0_2 = tl.make_block_ptr(
++                    h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
++                )
++                b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
++            if K > 128:
++                p_h0_3 = tl.make_block_ptr(
++                    h0, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
++                )
++                b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
++            if K > 192:
++                p_h0_4 = tl.make_block_ptr(
++                    h0, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
++                )
++                b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+ 
+     # main recurrence
+     for i_t in range(NT):
+@@ -318,6 +333,7 @@
+     gk: Optional[torch.Tensor] = None,
+     initial_state: Optional[torch.Tensor] = None,
+     initial_state_indices: Optional[torch.Tensor] = None,
++    has_initial_state: Optional[torch.Tensor] = None,
+     save_new_value: bool = True,
+     cu_seqlens: Optional[torch.LongTensor] = None,
+     chunk_indices: Optional[torch.LongTensor] = None,
+@@ -343,6 +359,10 @@
+         )
+     assert K <= 256, "current kernel does not support head dimension larger than 256."
+ 
++    if has_initial_state is not None and has_initial_state.dtype == torch.bool:
++        # bool loads are int1 in triton; widen for a portable scalar load
++        has_initial_state = has_initial_state.to(torch.int8)
++
+     h = k.new_empty(B, NT, H, V, K)
+ 
+     v_new = torch.empty_like(u) if save_new_value else None
+@@ -360,6 +380,7 @@
+         h=h,
+         initial_state=initial_state,
+         initial_state_indices=initial_state_indices,
++        has_initial_state=has_initial_state,
+         # Envelope-strided state pools (page-major / unified memory) have a
+         # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
+         stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
+@@ -374,6 +395,7 @@
+         USE_G=g is not None,
+         USE_GK=gk is not None,
+         USE_INITIAL_STATE=initial_state is not None,
++        USE_H0_MASK=has_initial_state is not None,
+         INPLACE_UPDATE=True,
+         SAVE_NEW_VALUE=v_new is not None,
+         IS_VARLEN=cu_seqlens is not None,
+diff -ruN a/python/sglang/kernels/ops/attention/fla/chunk.py b/python/sglang/kernels/ops/attention/fla/chunk.py
+--- a/python/sglang/kernels/ops/attention/fla/chunk.py	2026-08-08 03:39:39.372582270 +0000
++++ b/python/sglang/kernels/ops/attention/fla/chunk.py	2026-08-08 03:39:39.372582270 +0000
+@@ -44,6 +44,7 @@
+     initial_state_indices: torch.Tensor,
+     cu_seqlens: Optional[torch.LongTensor] = None,
+     chunk_indices: torch.LongTensor | None = None,
++    has_initial_state: Optional[torch.Tensor] = None,
+ ):
+     g = chunk_local_cumsum(
+         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+@@ -66,6 +67,7 @@
+         g=g,
+         initial_state=initial_state,
+         initial_state_indices=initial_state_indices,
++        has_initial_state=has_initial_state,
+         cu_seqlens=cu_seqlens,
+         chunk_indices=chunk_indices,
+     )
+@@ -101,6 +103,7 @@
+         initial_state_indices: torch.Tensor,
+         cu_seqlens: Optional[torch.LongTensor] = None,
+         use_qk_l2norm_in_kernel: bool = False,
++        has_initial_state: Optional[torch.Tensor] = None,
+     ):
+         q_orig = q
+         k_orig = k
+@@ -125,6 +128,7 @@
+             initial_state_indices=initial_state_indices,
+             cu_seqlens=cu_seqlens,
+             chunk_indices=chunk_indices,
++            has_initial_state=has_initial_state,
+         )
+         return o.to(q.dtype), h
+ 
+@@ -142,6 +146,7 @@
+     cu_seqlens: Optional[torch.LongTensor] = None,
+     head_first: bool = False,
+     use_qk_l2norm_in_kernel: bool = False,
++    has_initial_state: Optional[torch.Tensor] = None,
+ ):
+     r"""
+     Args:
+@@ -256,6 +261,7 @@
+         initial_state_indices,
+         cu_seqlens,
+         use_qk_l2norm_in_kernel,
++        has_initial_state,
+     )
+     if head_first:
+         o = rearrange(o, "b t h ... -> b h t ...")
+diff -ruN a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py	2026-08-08 03:39:39.372582270 +0000
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py	2026-08-08 03:39:39.372582270 +0000
+@@ -674,6 +674,9 @@
+                 ssm_states=ssm_states_contig,
+                 cache_indices=state_cache_indices,
+                 query_start_loc=query_start_loc,
++                # Same per-request flag the conv branch consumes: gate the SSM
++                # initial-state read so fresh sequences never read slot memory.
++                has_initial_state=has_initial_states,
+                 state_checkpoint_cu_starts=(
+                     forward_metadata.state_checkpoint_cu_starts
+                 ),
+diff -ruN a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py	2026-08-08 03:39:39.372582270 +0000
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py	2026-08-08 03:39:39.372582270 +0000
+@@ -184,6 +184,15 @@
+         if is_npu():
+             recurrent_state = ssm_states[cache_indices]
+             recurrent_state_indices_args = {}
++        else:
++            # Per-sequence initial-state gate: a sequence whose prefix
++            # semantically starts empty must never consume slot memory
++            # (read-before-write), mirroring the conv branch's
++            # has_initial_state semantics. None keeps the legacy
++            # unconditional-read behavior.
++            recurrent_state_indices_args["has_initial_state"] = kwargs.get(
++                "has_initial_state"
++            )
+ 
+         return chunk_gated_delta_rule(
+             q=q,

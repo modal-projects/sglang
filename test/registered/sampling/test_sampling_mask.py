@@ -19,10 +19,13 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
 _TOP_K = 10
+_SAMPLING_MASK_MAX_TOKENS = 16
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
+    "--sampling-mask-max-tokens",
+    str(_SAMPLING_MASK_MAX_TOKENS),
 )
 
 
@@ -237,6 +240,22 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn(
             "return_sampling_mask cannot return the full vocabulary", response.text
+        )
+
+    def test_generate_rejects_sampling_mask_above_cap(self):
+        response = self._post_generate(
+            {
+                "temperature": 1.0,
+                "top_k": _SAMPLING_MASK_MAX_TOKENS + 1,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            },
+            return_logprob=True,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn(
+            "Sampling mask support exceeds --sampling-mask-max-tokens=16",
+            response.text,
         )
 
 

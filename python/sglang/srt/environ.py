@@ -729,6 +729,9 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
+    # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
+    SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -1427,6 +1430,8 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
+    # The PR #4266 direct dense BF16 GEMM kernel now ships in flashinfer itself.
+    _print_deprecated_env("SGLANG_FLASHINFER_PR4266_SOURCE")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(

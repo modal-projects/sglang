@@ -304,7 +304,12 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = [
+    "auto",
+    "cutedsl",
+    "flashinfer_pr4266",
+    "torch",
+]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1729,7 +1734,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'flashinfer_pr4266' (legacy compatibility alias for the optimized CuTe DSL path), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),

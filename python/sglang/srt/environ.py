@@ -1332,6 +1332,13 @@ class Envs:
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Qwen3.5 experimental integration for FlashInfer's MNNVL CuTe DSL
+    # AllReduce-fusion backend. One switch enables deferred MoE finalize and
+    # ordinary AR + residual + RMSNorm in decode and prefill.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION = EnvBool(False)
+    # Distinct workspace configurations allowed in one process. Production
+    # uses one model/configuration per rank, so fail closed on accidental reuse.
+    SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

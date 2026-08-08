@@ -13,6 +13,9 @@ from compressed_tensors.quantization import QuantizationStrategy
 import sglang.srt.layers.quantization.fp8_utils as fp8_utils
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization import fp8 as fp8_quant
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w8a8_fp8 as compressed_fp8,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
@@ -159,9 +162,72 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         ) as requant:
             scheme.process_weights_after_loading(layer)
             scheme.process_weights_after_loading(layer)
+            self.assertTrue(layer.weight_scale.format_ue8m0)
+            requant.assert_called_once()
 
-        self.assertTrue(layer.weight_scale.format_ue8m0)
-        requant.assert_called_once()
+            scheme.restore_weights_before_loading(layer)
+            self.assertFalse(layer.weight_scale.format_ue8m0)
+            scheme.process_weights_after_loading(layer)
+            self.assertEqual(requant.call_count, 2)
+
+    def test_reload_reuses_fp8_runtime_buffers(self):
+        weight = torch.nn.Parameter(torch.zeros((2, 2)), requires_grad=False)
+        scale = torch.nn.Parameter(torch.ones((1, 1)), requires_grad=False)
+        scale.format_ue8m0 = False
+        fp8_utils.record_ue8m0_scale_checkpoint_layout(scale)
+
+        runtime_scale = torch.zeros((4, 2), dtype=torch.int32)
+        scale.data = runtime_scale
+        scale.format_ue8m0 = True
+        fp8_utils.restore_ue8m0_scale_checkpoint_layout(scale)
+
+        self.assertEqual(scale.shape, (1, 1))
+        self.assertEqual(scale.dtype, torch.float32)
+        self.assertFalse(scale.format_ue8m0)
+
+        weight_ptr = weight.data_ptr()
+        runtime_scale_ptr = runtime_scale.data_ptr()
+        new_weight = torch.full_like(weight, 3)
+        new_runtime_scale = torch.full_like(runtime_scale, 7)
+        with patch.object(
+            fp8_utils,
+            "requant_weight_ue8m0",
+            return_value=(new_weight, new_runtime_scale),
+        ):
+            fp8_utils.requant_weight_ue8m0_inplace(weight, scale, BLOCK_SIZE)
+
+        self.assertEqual(weight.data_ptr(), weight_ptr)
+        self.assertEqual(scale.data_ptr(), runtime_scale_ptr)
+        torch.testing.assert_close(weight, new_weight)
+        torch.testing.assert_close(scale, new_runtime_scale)
+        self.assertFalse(hasattr(scale, "_reload_runtime_buffer"))
+
+    def test_compressed_tensors_channel_weight_keeps_checkpoint_layout(self):
+        scheme = CompressedTensorsW8A8Fp8.__new__(CompressedTensorsW8A8Fp8)
+        scheme.strategy = QuantizationStrategy.CHANNEL
+        scheme.is_static_input_scheme = False
+        scheme.weight_block_size = None
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(torch.ones((2, 1)), requires_grad=False)
+        checkpoint_weight = layer.weight
+
+        with (
+            patch.object(compressed_fp8, "is_fp8_fnuz", return_value=False),
+            patch.object(compressed_fp8, "_use_aiter", False),
+        ):
+            scheme.process_weights_after_loading(layer)
+
+        self.assertIs(layer.weight, checkpoint_weight)
+        self.assertEqual(layer.weight_t.data_ptr(), layer.weight.data_ptr())
+        torch.testing.assert_close(layer.weight_t, layer.weight.t())
+
+        layer.weight.data.fill_(5)
+        torch.testing.assert_close(layer.weight_t, layer.weight.t())
 
     def test_fp8_moe_requants_standard_layer_for_deepgemm(self):
         method = fp8_quant.Fp8MoEMethod.__new__(fp8_quant.Fp8MoEMethod)

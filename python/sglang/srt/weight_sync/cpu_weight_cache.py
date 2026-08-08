@@ -1,0 +1,255 @@
+"""Lifecycle for canonical checkpoints and rank-ready CPU weight images."""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from sglang.srt.weight_sync.canonical_checkpoint import CanonicalCheckpoint
+from sglang.srt.weight_sync.cpu_delta_checkpoint import DeltaCheckpointTransform
+from sglang.srt.weight_sync.cpu_weight_compiler import CPUWeightCompiler
+
+logger = logging.getLogger(__name__)
+
+
+class CPUWeightCache:
+    """Own the background preparation state for one target-model worker.
+
+    One canonical checkpoint is shared by the model workers on a host. Each
+    worker compiles that source into its own rank-ready pinned image. Staging
+    never mutates live model weights; :meth:`commit` is the only operation that
+    copies prepared bytes to CUDA weights.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        max_compile_group_bytes: int,
+        host_group: torch.distributed.ProcessGroup | None,
+    ):
+        self.host_group = host_group
+        self.compiler = CPUWeightCompiler(
+            model,
+            max_group_bytes=max_compile_group_bytes,
+        )
+        self._base_checkpoint_dir: str | None = None
+        self._checkpoint_source_dir: str | None = None
+        self._canonical_checkpoint: CanonicalCheckpoint | None = None
+        self._operation_lock = threading.Lock()
+
+    @contextmanager
+    def _exclusive(self, operation: str):
+        if not self._operation_lock.acquire(blocking=False):
+            raise RuntimeError(
+                f"cannot {operation} while another CPU weight cache operation "
+                "is running"
+            )
+        try:
+            yield
+        finally:
+            self._operation_lock.release()
+
+    @property
+    def image(self):
+        return self.compiler.image
+
+    @property
+    def canonical_version(self) -> int | None:
+        checkpoint = self._canonical_checkpoint
+        return checkpoint.version if checkpoint is not None else None
+
+    def _seed_canonical_checkpoint(
+        self, *, reason: str | None = None
+    ) -> CanonicalCheckpoint:
+        if self._base_checkpoint_dir is None:
+            raise RuntimeError("CPU weight cache has no base checkpoint")
+        previous = self._canonical_checkpoint
+        self._canonical_checkpoint = None
+        self._checkpoint_source_dir = None
+        if previous is not None:
+            previous.close()
+        self._canonical_checkpoint = CanonicalCheckpoint(
+            self._base_checkpoint_dir,
+            host_group=self.host_group,
+        )
+        if reason is not None:
+            logger.info("Reset canonical CPU checkpoint: %s", reason)
+        return self._canonical_checkpoint
+
+    def initialize_from_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+    ) -> dict[str, Any]:
+        """Build and validate the reusable CPU state from active version zero."""
+
+        with self._exclusive("initialize"):
+            return self._initialize_from_checkpoint(checkpoint_dir)
+
+    def _initialize_from_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+    ) -> dict[str, Any]:
+        if self._base_checkpoint_dir is not None:
+            raise RuntimeError("CPU weight cache is already initialized")
+        started = time.perf_counter()
+        self._base_checkpoint_dir = os.path.realpath(checkpoint_dir)
+        try:
+            image_initialization = self.compiler.initialize_from_active()
+            checkpoint = self._seed_canonical_checkpoint()
+            baseline_compile = self.compiler.compile(
+                checkpoint,
+                target_version=0,
+            )
+            validation = self.image.validate_against_active()
+            self.image.accept_staged_baseline()
+        except Exception:
+            self._discard_canonical_checkpoint("CPU weight cache initialization failed")
+            self._base_checkpoint_dir = None
+            raise
+
+        canonical_stats = checkpoint.stats()
+        stats = {
+            "operation": "initialize_cpu_weight_cache",
+            "canonical_checkpoint": canonical_stats,
+            "rank_image_bytes": self.image.image_nbytes,
+            "rank_weight_bytes": self.image.weight_nbytes,
+            "image_initialization": image_initialization,
+            "baseline_compile": baseline_compile,
+            "validation": validation,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+        logger.info(
+            "Initialized CPU weight cache: canonical_bytes=%d "
+            "rank_image_bytes=%d wall_time=%.3fs",
+            canonical_stats["checkpoint_bytes"],
+            self.image.image_nbytes,
+            stats["wall_s"],
+        )
+        return stats
+
+    def _canonical_checkpoint_for_lineage(
+        self,
+        *,
+        checkpoint_source_dir: str | Path,
+        target_version: int,
+    ) -> tuple[CanonicalCheckpoint, bool]:
+        if self._base_checkpoint_dir is None:
+            raise RuntimeError("CPU weight cache is not initialized")
+        source = os.path.realpath(checkpoint_source_dir)
+        checkpoint = self._canonical_checkpoint
+        reset_reason = None
+        if checkpoint is None or not checkpoint.valid:
+            reset_reason = "canonical checkpoint is unavailable"
+        elif target_version < checkpoint.version:
+            reset_reason = (
+                f"requested rollback from v{checkpoint.version} to v{target_version}"
+            )
+        elif (
+            self._checkpoint_source_dir is not None
+            and self._checkpoint_source_dir != source
+            and checkpoint.version > 0
+        ):
+            reset_reason = "checkpoint lineage changed"
+
+        if reset_reason is not None:
+            checkpoint = self._seed_canonical_checkpoint(reason=reset_reason)
+        if checkpoint is None:
+            raise RuntimeError("canonical checkpoint is unavailable")
+        self._checkpoint_source_dir = source
+        return checkpoint, reset_reason is not None
+
+    def stage_delta_lineage(
+        self,
+        *,
+        checkpoint_source_dir: str | Path,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Advance and compile one delta target while inference continues."""
+
+        with self._exclusive("stage weights"):
+            return self._stage_delta_lineage(
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+            )
+
+    def _stage_delta_lineage(
+        self,
+        *,
+        checkpoint_source_dir: str | Path,
+        target_version: int,
+    ) -> dict[str, Any]:
+        if target_version <= 0:
+            raise ValueError("CPU delta staging requires a positive target version")
+        started = time.perf_counter()
+        checkpoint, canonical_reset = self._canonical_checkpoint_for_lineage(
+            checkpoint_source_dir=checkpoint_source_dir,
+            target_version=target_version,
+        )
+        try:
+            transform = DeltaCheckpointTransform(
+                checkpoint,
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+                host_group=self.host_group,
+            )
+            transform_stats = transform.apply()
+            compile_stats = self.compiler.compile(
+                checkpoint,
+                target_version=target_version,
+            )
+        except Exception:
+            if not checkpoint.valid:
+                self._discard_canonical_checkpoint(
+                    f"staging of version {target_version} left it invalid"
+                )
+            raise
+
+        stats = {
+            "operation": "stage_cpu_weight_update",
+            "target_version": target_version,
+            "canonical_reset": canonical_reset,
+            "delta_setup": transform.setup_stats,
+            "delta_transform": transform_stats,
+            "compile": compile_stats,
+            "canonical_checkpoint": checkpoint.stats(),
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+        logger.info(
+            "Staged CPU weight image v%d: canonical_reset=%s wall_time=%.3fs",
+            target_version,
+            canonical_reset,
+            stats["wall_s"],
+        )
+        return stats
+
+    def invalidate_stage(self, reason: str) -> None:
+        """Discard distributed preparation state after any worker fails."""
+
+        with self._operation_lock:
+            self.image.invalidate(reason)
+            self._discard_canonical_checkpoint(reason)
+
+    def _discard_canonical_checkpoint(self, reason: str) -> None:
+        checkpoint = self._canonical_checkpoint
+        self._canonical_checkpoint = None
+        self._checkpoint_source_dir = None
+        if checkpoint is not None:
+            checkpoint.close()
+            logger.warning("Discarded canonical CPU checkpoint: %s", reason)
+
+    def commit(self, target_version: int) -> dict[str, Any]:
+        with self._exclusive("commit weights"):
+            return self.image.commit(target_version)
+
+    def close(self, reason: str = "CPU weight cache closed") -> None:
+        with self._operation_lock:
+            self._discard_canonical_checkpoint(reason)
+            self.compiler.close()

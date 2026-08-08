@@ -123,9 +123,6 @@ class CanonicalCheckpoint:
     ):
         if version < 0:
             raise ValueError("canonical checkpoint version must be non-negative")
-        indexed_weight_map, files, capacity, signature = _checkpoint_manifest(
-            checkpoint_dir
-        )
         distributed = torch.distributed.is_initialized()
         world_size = (
             torch.distributed.get_world_size(group=host_group) if distributed else 1
@@ -135,6 +132,34 @@ class CanonicalCheckpoint:
             raise RuntimeError(
                 "canonical checkpoint caching requires a host-local process group"
             )
+
+        local_error = None
+        local_exception = None
+        manifest = None
+        try:
+            manifest = _checkpoint_manifest(checkpoint_dir)
+        except Exception as exc:
+            local_exception = exc
+            local_error = f"rank {rank}: {type(exc).__name__}: {exc}"
+        if world_size > 1:
+            errors: list[str | None] = [None] * world_size
+            torch.distributed.all_gather_object(
+                errors,
+                local_error,
+                group=host_group,
+            )
+        else:
+            errors = [local_error]
+        errors = [error for error in errors if error is not None]
+        if errors:
+            if world_size == 1 and local_exception is not None:
+                raise local_exception
+            raise RuntimeError(
+                "failed to discover canonical checkpoint: " + "; ".join(errors)
+            )
+        if manifest is None:
+            raise RuntimeError("canonical checkpoint discovery returned no manifest")
+        indexed_weight_map, files, capacity, signature = manifest
 
         local_manifest = (capacity, signature)
         if world_size > 1:
@@ -195,6 +220,8 @@ class CanonicalCheckpoint:
 
         self._files = {}
         discovered_weight_map = {}
+        layout_error = None
+        layout_exception = None
         try:
             for checkpoint_file in files:
                 source = self._storage.view(
@@ -230,10 +257,28 @@ class CanonicalCheckpoint:
                     f"missing={missing[:8]} extra={extra[:8]} "
                     f"misplaced={misplaced[:8]}"
                 )
-        except Exception:
+        except Exception as exc:
+            layout_exception = exc
+            layout_error = f"rank {rank}: {type(exc).__name__}: {exc}"
+
+        if world_size > 1:
+            layout_errors: list[str | None] = [None] * world_size
+            torch.distributed.all_gather_object(
+                layout_errors,
+                layout_error,
+                group=host_group,
+            )
+        else:
+            layout_errors = [layout_error]
+        errors = [error for error in layout_errors if error is not None]
+        if errors:
             self._files.clear()
             self._storage.close()
-            raise
+            if world_size == 1 and layout_exception is not None:
+                raise layout_exception
+            raise RuntimeError(
+                "failed to parse canonical checkpoint: " + "; ".join(errors)
+            )
 
         self.weight_map = indexed_weight_map or discovered_weight_map
         self.checkpoint_bytes = sum(file.nbytes for file in files)

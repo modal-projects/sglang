@@ -135,6 +135,48 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def initialize_cpu_weight_cache(
+        self,
+        *,
+        checkpoint_dir: str,
+        host_group: torch.distributed.ProcessGroup | None,
+        max_compile_group_bytes: int,
+    ):
+        return self.model_runner.weight_updater.initialize_cpu_weight_cache(
+            checkpoint_dir=checkpoint_dir,
+            host_group=host_group,
+            max_compile_group_bytes=max_compile_group_bytes,
+        )
+
+    def stage_cpu_weight_update_from_delta_lineage(
+        self,
+        *,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+    ):
+        return (
+            self.model_runner.weight_updater.stage_cpu_weight_update_from_delta_lineage(
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+                host_group=host_group,
+            )
+        )
+
+    def validate_staged_cpu_weight_update(self, target_version: int):
+        return self.model_runner.weight_updater.validate_staged_cpu_weight_update(
+            target_version
+        )
+
+    def update_weights_from_cpu(self, target_version: int):
+        return self.model_runner.weight_updater.update_weights_from_cpu(target_version)
+
+    def invalidate_staged_cpu_weight_update(self, reason: str) -> None:
+        self.model_runner.weight_updater.invalidate_staged_cpu_weight_update(reason)
+
+    def discard_cpu_weight_cache(self, reason: str) -> None:
+        self.model_runner.weight_updater.discard_cpu_weight_cache(reason)
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,

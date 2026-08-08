@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -841,21 +842,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        weight = lm_head.weight  # [local_vocab_padded, hidden]
+        weight = lm_head.weight  # [local_vocab_padded, hidden] when unpacked
         weight_dtype = weight.dtype
+        quant_method = getattr(lm_head, "quant_method", None)
+        use_quant_method = should_apply_lm_head_quant_method(lm_head, quant_method)
         num_tokens = int(hidden_states.shape[0])
         out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+        def _compute_local_logits(x: torch.Tensor) -> torch.Tensor:
+            if use_quant_method:
+                return quant_method.apply(lm_head, x, getattr(lm_head, "bias", None))
+            if x.dtype != weight_dtype:
+                x = x.to(weight_dtype)
+            return torch.matmul(x, weight.T)
 
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
-                hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                hs = hidden_states[start:end]
+                logits = _compute_local_logits(hs)
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -908,9 +915,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             fast_chunk_size = max(int(chunk_size), 1024)
             for start in range(0, num_tokens, fast_chunk_size):
                 end = min(num_tokens, start + fast_chunk_size)
-                hs = _cast_hs(hidden_states[start:end])
+                hs = hidden_states[start:end]
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = _compute_local_logits(hs)[:, :num_org]
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -923,12 +930,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
-            hs = _cast_hs(hidden_states[start:end])
+            hs = hidden_states[start:end]
             chunk_len = int(hs.shape[0])
+            local_logits = _compute_local_logits(hs)
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = local_logits[:, :num_org]
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -936,8 +944,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 local_max = torch.full(
                     (chunk_len,),
-                    torch.finfo(weight_dtype).min,
-                    dtype=weight_dtype,
+                    torch.finfo(local_logits.dtype).min,
+                    dtype=local_logits.dtype,
                     device=hs.device,
                 )
                 local_arg = torch.zeros(
@@ -948,9 +956,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
-                )
+                added_logits = local_logits[:, added_slice_start:added_slice_end]
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)

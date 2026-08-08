@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -32,6 +34,10 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    StageWeightUpdateReqInput,
+    StageWeightUpdateReqOutput,
+    UpdateWeightFromCPUReqInput,
+    UpdateWeightFromCPUReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -77,20 +83,43 @@ class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
     tp_cpu_group: Any
+    weight_update_stage_cpu_group: Any
+    host_cpu_group: Any
+    boot_model_path: str
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    send_control_output: Callable[[Any, Any], None]
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    _pending_weight_update_stage: Optional[
+        Tuple[StageWeightUpdateReqInput, threading.Thread]
+    ] = field(default=None, init=False)
+    _weight_update_stage_result: Optional[StageWeightUpdateReqOutput] = field(
+        default=None,
+        init=False,
+    )
+    _cpu_weight_cache_checkpoint_dir: Optional[str] = field(
+        default=None,
+        init=False,
+    )
+    _cpu_weight_cache_initialization_stats: Optional[Dict[str, Any]] = field(
+        default=None,
+        init=False,
+    )
+    _cpu_weight_cache_initialization_error: Optional[str] = field(
+        default=None,
+        init=False,
+    )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
         # update_weights_from_* call. Engine is paused during the update so
         # the periodic log_stats path can't carry this.
-        # `source` distinguishes disk vs distributed vs tensor vs ipc.
+        # `source` distinguishes disk, CPU, distributed, tensor, and IPC loads.
         t0 = time.perf_counter()
         try:
             yield
@@ -107,8 +136,124 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    @staticmethod
+    def _all_gather(value: Any, group: Any) -> list[Any]:
+        if not torch.distributed.is_initialized():
+            return [value]
+        world_size = torch.distributed.get_world_size(group=group)
+        if world_size == 1:
+            return [value]
+        values = [None] * world_size
+        torch.distributed.all_gather_object(values, value, group=group)
+        return values
+
+    def _initialize_cpu_weight_cache(self, checkpoint_dir: str) -> Dict[str, Any]:
+        checkpoint_dir = os.path.realpath(checkpoint_dir)
+        started = time.perf_counter()
+        if self._cpu_weight_cache_initialization_stats is not None:
+            if self._cpu_weight_cache_checkpoint_dir != checkpoint_dir:
+                raise RuntimeError(
+                    "CPU weight cache was initialized from a different checkpoint: "
+                    f"{self._cpu_weight_cache_checkpoint_dir!r} != "
+                    f"{checkpoint_dir!r}"
+                )
+            return {
+                "operation": "initialize_cpu_weight_cache",
+                "checkpoint_dir": checkpoint_dir,
+                "initialized": False,
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
+
+        if self._cpu_weight_cache_initialization_error is not None:
+            logger.warning("Retrying CPU weight cache initialization")
+            self._cpu_weight_cache_initialization_error = None
+        self._cpu_weight_cache_checkpoint_dir = checkpoint_dir
+        server_args = self.tp_worker.model_runner.server_args
+        try:
+            stats = self.tp_worker.initialize_cpu_weight_cache(
+                checkpoint_dir=checkpoint_dir,
+                host_group=self.host_cpu_group,
+                max_compile_group_bytes=int(
+                    server_args.cpu_weight_cache_max_compile_group_gb * (1 << 30)
+                ),
+            )
+        except Exception:
+            self._cpu_weight_cache_initialization_error = traceback.format_exc()
+            logger.exception("CPU weight cache initialization failed")
+            raise RuntimeError(
+                "CPU weight cache initialization failed:\n"
+                + self._cpu_weight_cache_initialization_error
+            ) from None
+        self._cpu_weight_cache_initialization_stats = stats
+        return {
+            "operation": "initialize_cpu_weight_cache",
+            "checkpoint_dir": checkpoint_dir,
+            "initialized": True,
+            "initialization": stats,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+
+    def _pending_weight_update_stage_message(self) -> str | None:
+        pending = self._pending_weight_update_stage is not None
+        if not any(self._all_gather(pending, self.tp_cpu_group)):
+            return None
+        return (
+            "A background weight update stage is running; live weights cannot "
+            "change until it finishes."
+        )
+
+    def _cpu_weight_cache_conflict(self, operation: str) -> str | None:
+        if not self.tp_worker.model_runner.server_args.enable_cpu_weight_cache:
+            return None
+        return (
+            f"{operation} is unavailable while the CPU weight cache is enabled. "
+            "Stage and commit CPU weight updates through their dedicated APIs, "
+            "or launch without --enable-cpu-weight-cache."
+        )
+
+    def _stage_weight_update_preflight_message(
+        self,
+        recv_req: StageWeightUpdateReqInput,
+    ) -> str | None:
+        server_args = self.tp_worker.model_runner.server_args
+        message = None
+        if recv_req.target_version < 0:
+            message = "target_version must be non-negative."
+        elif recv_req.target_version > 0 and recv_req.checkpoint_source_dir is None:
+            message = "checkpoint_source_dir is required after version 0."
+        elif recv_req.destination == "disk":
+            if recv_req.local_checkpoint_dir is None:
+                message = "local_checkpoint_dir is required for disk staging."
+            elif server_args.enable_cpu_weight_cache:
+                message = (
+                    "Disk staging is unavailable while the CPU weight cache is "
+                    "enabled."
+                )
+        elif recv_req.destination == "cpu":
+            if not server_args.enable_cpu_weight_cache:
+                message = "CPU staging requires --enable-cpu-weight-cache."
+            elif GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags:
+                message = "CPU staging requires live GPU weights to be resident."
+        else:
+            message = (
+                f"unsupported weight staging destination: {recv_req.destination!r}"
+            )
+
+        messages = sorted(
+            {
+                value
+                for value in self._all_gather(message, self.tp_cpu_group)
+                if value is not None
+            }
+        )
+        return "; ".join(messages) if messages else None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if message := self._pending_weight_update_stage_message():
+            return UpdateWeightFromDiskReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("update_weights_from_disk"):
+            return UpdateWeightFromDiskReqOutput(success=False, message=message)
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -120,6 +265,278 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
+            )
+
+    def stage_weight_update(self, recv_req: StageWeightUpdateReqInput):
+        """Start staging a verified target while inference continues."""
+
+        if self._pending_weight_update_stage_message() is not None:
+            return StageWeightUpdateReqOutput(
+                success=False,
+                message="Another weight update stage is already running.",
+            )
+        if message := self._stage_weight_update_preflight_message(recv_req):
+            return StageWeightUpdateReqOutput(success=False, message=message)
+
+        def stage() -> None:
+            try:
+                output = self._stage_weight_update_sync(recv_req)
+            except Exception:
+                logger.exception("Background weight update staging failed")
+                output = StageWeightUpdateReqOutput(
+                    success=False,
+                    message=traceback.format_exc(),
+                )
+            self._weight_update_stage_result = output
+
+        thread = threading.Thread(
+            target=stage,
+            name="weight-update-stage",
+            daemon=True,
+        )
+        self._pending_weight_update_stage = (recv_req, thread)
+        thread.start()
+        return None
+
+    def _refresh_checkpoint_source(
+        self,
+        checkpoint_source_dir: str,
+        target_version: int,
+    ) -> float:
+        from sglang.srt.weight_sync.disk_checkpoint import refresh_checkpoint_source
+
+        started = time.perf_counter()
+        host_rank = (
+            torch.distributed.get_rank(group=self.host_cpu_group)
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        local_error = None
+        if host_rank == 0:
+            try:
+                refresh_checkpoint_source(
+                    checkpoint_source_dir,
+                    target_version,
+                    self.tp_worker.model_runner.server_args.checkpoint_source_refresh_hook,
+                )
+            except Exception:
+                local_error = traceback.format_exc()
+        errors = [
+            error
+            for error in self._all_gather(local_error, self.host_cpu_group)
+            if error is not None
+        ]
+        if errors:
+            raise RuntimeError("checkpoint source refresh failed: " + "; ".join(errors))
+        return time.perf_counter() - started
+
+    def _stage_weight_update_sync(
+        self,
+        recv_req: StageWeightUpdateReqInput,
+    ) -> StageWeightUpdateReqOutput:
+        """Stage one target on disk or in a rank-ready CPU image."""
+
+        from sglang.srt.weight_sync import disk_checkpoint
+
+        started = time.perf_counter()
+        rank = (
+            torch.distributed.get_rank(group=self.weight_update_stage_cpu_group)
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        local_stats: Dict[str, Any] = {
+            "rank": rank,
+            "target_version": recv_req.target_version,
+            "destination": recv_req.destination,
+        }
+        try:
+            checkpoint_dir = recv_req.base_checkpoint_dir or self.boot_model_path
+            if recv_req.destination == "cpu":
+                if recv_req.target_version == 0:
+                    local_stats["stage"] = self._initialize_cpu_weight_cache(
+                        checkpoint_dir
+                    )
+                else:
+                    if self._cpu_weight_cache_initialization_error is not None:
+                        raise RuntimeError(
+                            "CPU weight cache initialization failed:\n"
+                            + self._cpu_weight_cache_initialization_error
+                        )
+                    if self._cpu_weight_cache_initialization_stats is None:
+                        raise RuntimeError(
+                            "CPU weight cache is not initialized. Stage version 0 "
+                            "to CPU before staging a delta target."
+                        )
+                    if self._cpu_weight_cache_checkpoint_dir != os.path.realpath(
+                        checkpoint_dir
+                    ):
+                        raise RuntimeError(
+                            "CPU weight cache base checkpoint does not match the "
+                            f"initialized cache: {checkpoint_dir!r} != "
+                            f"{self._cpu_weight_cache_checkpoint_dir!r}"
+                        )
+                    checkpoint_source_dir = recv_req.checkpoint_source_dir
+                    if checkpoint_source_dir is None:
+                        raise ValueError(
+                            "checkpoint_source_dir is required after version 0"
+                        )
+                    source_refresh_wall_s = self._refresh_checkpoint_source(
+                        checkpoint_source_dir,
+                        recv_req.target_version,
+                    )
+                    success, message, stage_stats = (
+                        self.tp_worker.stage_cpu_weight_update_from_delta_lineage(
+                            checkpoint_source_dir=checkpoint_source_dir,
+                            target_version=recv_req.target_version,
+                            host_group=self.host_cpu_group,
+                        )
+                    )
+                    if not success or stage_stats is None:
+                        raise RuntimeError(message)
+                    stage_stats["source_refresh_wall_s"] = round(
+                        source_refresh_wall_s,
+                        6,
+                    )
+                    local_stats["stage"] = stage_stats
+            else:
+                local_checkpoint_dir = recv_req.local_checkpoint_dir
+                if local_checkpoint_dir is None:
+                    raise ValueError(
+                        "local_checkpoint_dir is required for disk staging"
+                    )
+                local_stats["stage"] = disk_checkpoint.materialize(
+                    local_checkpoint_dir=local_checkpoint_dir,
+                    base_checkpoint_dir=checkpoint_dir,
+                    checkpoint_source_dir=(
+                        recv_req.checkpoint_source_dir or checkpoint_dir
+                    ),
+                    target_version=recv_req.target_version,
+                    checkpoint_source_refresh_hook=(
+                        self.tp_worker.model_runner.server_args.checkpoint_source_refresh_hook
+                    ),
+                )
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+        local_stats["wall_s"] = round(time.perf_counter() - started, 6)
+
+        results = self._all_gather(
+            (success, message, local_stats),
+            self.weight_update_stage_cpu_group,
+        )
+        success = all(result[0] for result in results)
+        if not success:
+            messages = list(
+                dict.fromkeys(result[1] for result in results if not result[0])
+            )
+            message = "\n".join(messages)
+        rank_stats = [result[2] for result in results]
+
+        if recv_req.destination == "cpu" and not success:
+            if recv_req.target_version == 0:
+                self.tp_worker.discard_cpu_weight_cache(
+                    "distributed CPU weight cache initialization failed"
+                )
+                self._cpu_weight_cache_checkpoint_dir = None
+                self._cpu_weight_cache_initialization_stats = None
+                self._cpu_weight_cache_initialization_error = message
+            else:
+                self.tp_worker.invalidate_staged_cpu_weight_update(
+                    "distributed CPU weight update staging failed"
+                )
+        return StageWeightUpdateReqOutput(
+            success=success,
+            message=message,
+            rank_stats=rank_stats,
+        )
+
+    def check_pending_weight_update_stage(self) -> None:
+        pending = self._pending_weight_update_stage
+        if pending is None:
+            return
+        recv_req, thread = pending
+        if thread.is_alive():
+            return
+        self._pending_weight_update_stage = None
+        thread.join()
+        output = self._weight_update_stage_result
+        self._weight_update_stage_result = None
+        if output is None:
+            output = StageWeightUpdateReqOutput(
+                success=False,
+                message="Weight update staging ended without a result.",
+            )
+        self.send_control_output(recv_req, output)
+
+    def update_weights_from_cpu(
+        self,
+        recv_req: UpdateWeightFromCPUReqInput,
+    ) -> UpdateWeightFromCPUReqOutput:
+        """Commit a complete target image to the target model."""
+
+        with self._observe_weight_load("cpu"):
+            if message := self._pending_weight_update_stage_message():
+                return UpdateWeightFromCPUReqOutput(success=False, message=message)
+            if self._cpu_weight_cache_initialization_error is not None:
+                preflight = (False, "CPU weight cache initialization failed.")
+            elif self._cpu_weight_cache_initialization_stats is None:
+                preflight = (False, "CPU weight cache is not initialized.")
+            else:
+                preflight = self.tp_worker.validate_staged_cpu_weight_update(
+                    recv_req.target_version
+                )
+            preflight_results = self._all_gather(preflight, self.tp_cpu_group)
+            if not all(result[0] for result in preflight_results):
+                return UpdateWeightFromCPUReqOutput(
+                    success=False,
+                    message="; ".join(
+                        result[1] for result in preflight_results if not result[0]
+                    ),
+                )
+
+            if recv_req.flush_cache:
+                cache_flushed = self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+                if not all(self._all_gather(cache_flushed, self.tp_cpu_group)):
+                    return UpdateWeightFromCPUReqOutput(
+                        success=False,
+                        message="Cache flush failed before CPU weight commit.",
+                    )
+
+            try:
+                success, message, stats = self.tp_worker.update_weights_from_cpu(
+                    recv_req.target_version
+                )
+            except Exception:
+                success, message, stats = False, traceback.format_exc(), None
+
+            rank = (
+                torch.distributed.get_rank(group=self.tp_cpu_group)
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            rank_results = self._all_gather(
+                (success, message, {"rank": rank, **(stats or {})}),
+                self.tp_cpu_group,
+            )
+            success = all(result[0] for result in rank_results)
+            if not success:
+                message = "; ".join(
+                    result[1] for result in rank_results if not result[0]
+                )
+                logger.critical(
+                    "CPU weight commit failed after distributed preflight. "
+                    "The engine may contain partially committed weights: %s",
+                    message,
+                )
+                raise RuntimeError(
+                    "CPU weight commit failed; terminating the engine to avoid "
+                    "serving a mixed model. " + message
+                )
+            return UpdateWeightFromCPUReqOutput(
+                success=True,
+                message=message,
+                rank_stats=[result[2] for result in rank_results],
             )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
@@ -140,6 +557,18 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        if message := self._pending_weight_update_stage_message():
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message=message,
+            )
+        if message := self._cpu_weight_cache_conflict(
+            "update_weights_from_distributed"
+        ):
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message=message,
+            )
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -152,6 +581,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        if message := self._pending_weight_update_stage_message():
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("update_weights_from_tensor"):
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -167,6 +600,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if message := self._pending_weight_update_stage_message():
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
+        if message := self._cpu_weight_cache_conflict("update_weights_from_ipc"):
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -200,6 +637,8 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if message := self._pending_weight_update_stage_message():
+            raise RuntimeError(message)
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -208,6 +647,10 @@ class SchedulerWeightUpdaterManager:
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+        if GPU_MEMORY_TYPE_WEIGHTS in tags and (
+            message := self._cpu_weight_cache_conflict("releasing model-weight memory")
+        ):
+            raise RuntimeError(message)
 
         for tag in tags:
             self.offload_tags.add(tag)
@@ -246,10 +689,16 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        if message := self._pending_weight_update_stage_message():
+            raise RuntimeError(message)
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+        if GPU_MEMORY_TYPE_WEIGHTS in tags and (
+            message := self._cpu_weight_cache_conflict("resuming model-weight memory")
+        ):
+            raise RuntimeError(message)
 
         for tag in tags:
             self.offload_tags.remove(tag)

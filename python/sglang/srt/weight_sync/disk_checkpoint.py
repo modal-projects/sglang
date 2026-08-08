@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import numpy as np
 import zstandard
 
+from sglang.srt.utils import dynamic_import
 from sglang.srt.weight_sync.checksum import calculate_checksum, create_checksum
 
 logger = logging.getLogger(__name__)
@@ -73,11 +74,12 @@ def materialize(
     base_checkpoint_dir: str,
     checkpoint_source_dir: str,
     target_version: int,
+    checkpoint_source_refresh_hook: str | None = None,
 ) -> dict:
     """Bring the host-local checkpoint up to ``target_version``.
 
-    The caller must make the checkpoint source visible before calling this
-    filesystem-only primitive.
+    The optional refresh hook can make a newly published target visible before
+    the first local worker reads it.
 
     Missing or incomplete source files raise ``FileNotFoundError`` without
     reseeding. A checksum mismatch on a complete source is treated as corrupt
@@ -107,8 +109,16 @@ def materialize(
                 "initial_version": applied,
                 "target_version": target_version,
                 "lock_wait_s": round(lock_wait_s, 6),
+                "source_refresh_wall_s": 0.0,
                 "wall_s": round(time.perf_counter() - started, 6),
             }
+        refresh_started = time.perf_counter()
+        refresh_checkpoint_source(
+            checkpoint_source_dir,
+            target_version,
+            checkpoint_source_refresh_hook,
+        )
+        source_refresh_wall_s = time.perf_counter() - refresh_started
         try:
             stats = _materialize_locked(
                 local_checkpoint_dir,
@@ -145,8 +155,23 @@ def materialize(
         stats["initial_version"] = applied
         stats["target_version"] = target_version
         stats["lock_wait_s"] = round(lock_wait_s, 6)
+        stats["source_refresh_wall_s"] = round(source_refresh_wall_s, 6)
         stats["wall_s"] = round(time.perf_counter() - started, 6)
         return stats
+
+
+def refresh_checkpoint_source(
+    checkpoint_source_dir: str,
+    target_version: int,
+    checkpoint_source_refresh_hook: str | None,
+) -> None:
+    """Run an optional visibility hook before reading a published target."""
+
+    if target_version > 0 and checkpoint_source_refresh_hook is not None:
+        dynamic_import(checkpoint_source_refresh_hook)(
+            checkpoint_source_dir,
+            target_version,
+        )
 
 
 def _materialize_locked(

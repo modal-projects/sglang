@@ -1673,6 +1673,33 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class StageWeightUpdateReqInput(BaseReq, kw_only=True):
+    target_version: int
+    destination: Literal["disk", "cpu"] = "disk"
+    local_checkpoint_dir: Optional[str] = None
+    base_checkpoint_dir: Optional[str] = None
+    checkpoint_source_dir: Optional[str] = None
+
+
+class StageWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
+class UpdateWeightFromCPUReqInput(BaseReq, kw_only=True):
+    target_version: int
+    abort_all_requests: bool = False
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightFromCPUReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]

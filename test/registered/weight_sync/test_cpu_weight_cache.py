@@ -116,7 +116,13 @@ def _write_delta(
     )
 
 
-def _create_cache(tmp_path, monkeypatch, base_value):
+def _create_cache(
+    tmp_path,
+    monkeypatch,
+    base_value,
+    *,
+    seed_from_active_weights=False,
+):
     base = tmp_path / "base"
     shared_memory = tmp_path / "shared-memory"
     base.mkdir()
@@ -130,7 +136,10 @@ def _create_cache(tmp_path, monkeypatch, base_value):
         host_group=None,
     )
     with patch.object(host_memory, "_SHARED_MEMORY_ROOT", shared_memory):
-        initialization = cache.initialize_from_checkpoint(base)
+        initialization = cache.initialize_from_checkpoint(
+            base,
+            seed_from_active_weights=seed_from_active_weights,
+        )
     return cache, initialization, shared_memory
 
 
@@ -154,6 +163,25 @@ def test_cache_initializes_stages_and_commits(tmp_path, monkeypatch):
 
         cache.commit(1)
         assert cache.image.committed == [1]
+    finally:
+        cache.close()
+
+
+def test_boot_checkpoint_uses_captured_active_image(tmp_path, monkeypatch):
+    base = torch.arange(8, dtype=torch.uint8)
+    cache, initialization, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        seed_from_active_weights=True,
+    )
+    try:
+        assert initialization["rank_image_source"] == "active_model"
+        assert initialization["baseline_compile"] is None
+        assert initialization["validation"] is None
+        assert cache.compiler.compiled == []
+        assert cache.image.valid
+        assert not cache.image.staged
     finally:
         cache.close()
 

@@ -777,7 +777,10 @@ def build_dflash_sampling_mask_output(
     output_token_ids: torch.Tensor,
     output_lens: torch.Tensor,
     return_sampling_masks: List[bool],
+    max_mask_tokens: int,
 ) -> tuple[List[Optional[List[List[int]]]], List[Optional[List[float]]]]:
+    if max_mask_tokens <= 0:
+        raise ValueError("max_mask_tokens must be positive")
     bs, block_size = output_token_ids.shape
     output_lens_cpu = output_lens.cpu().tolist()
     output_token_ids_cpu = output_token_ids.cpu().tolist()
@@ -799,24 +802,49 @@ def build_dflash_sampling_mask_output(
         return masks, logprobs
 
     flat_probs = target_probs.view(bs * block_size, -1)
+    if not requested_rows:
+        return masks, logprobs
     row_indices = torch.tensor(
         [i * block_size + j for i, j in requested_rows],
+        dtype=torch.long,
         device=target_probs.device,
     )
     selected_rows = flat_probs[row_indices]
-    support_rows, support_ids = (selected_rows > 0).nonzero(as_tuple=True)
-    support_lens = (
-        torch.bincount(support_rows, minlength=len(requested_rows)).cpu().tolist()
+    overflow_rows = torch.count_nonzero(selected_rows, dim=-1) > max_mask_tokens
+    overflow_rows_cpu = overflow_rows.cpu().tolist()
+    overflow_requests = {
+        requested_rows[row][0]
+        for row, overflow in enumerate(overflow_rows_cpu)
+        if overflow
+    }
+    safe_rows = [
+        row
+        for row, (request_index, _) in enumerate(requested_rows)
+        if request_index not in overflow_requests
+    ]
+    if not safe_rows:
+        return masks, logprobs
+
+    safe_row_indices = torch.tensor(
+        safe_rows,
+        dtype=torch.long,
+        device=target_probs.device,
     )
+    selected_rows = selected_rows.index_select(0, safe_row_indices)
+    support_rows, support_ids = (selected_rows > 0).nonzero(as_tuple=True)
+    support_lens = torch.bincount(support_rows, minlength=len(safe_rows)).cpu().tolist()
     support_ids_cpu = support_ids.cpu().tolist()
     selected_token_ids = torch.tensor(
-        [output_token_ids_cpu[i][j] for i, j in requested_rows],
+        [
+            output_token_ids_cpu[requested_rows[row][0]][requested_rows[row][1]]
+            for row in safe_rows
+        ],
         device=target_probs.device,
     )
     selected_logprobs = (
         torch.log(
             selected_rows[
-                torch.arange(len(requested_rows), device=target_probs.device),
+                torch.arange(len(safe_rows), device=target_probs.device),
                 selected_token_ids,
             ]
         )
@@ -825,9 +853,10 @@ def build_dflash_sampling_mask_output(
     )
 
     cursor = 0
-    for row, ((i, _), support_len) in enumerate(
-        zip(requested_rows, support_lens, strict=True)
+    for row, (requested_row, support_len) in enumerate(
+        zip(safe_rows, support_lens, strict=True)
     ):
+        i, _ = requested_rows[requested_row]
         if masks[i] is None:
             masks[i], logprobs[i] = [], []
         masks[i].append(support_ids_cpu[cursor : cursor + support_len])

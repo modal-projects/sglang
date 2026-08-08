@@ -1875,6 +1875,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 output_token_ids=out_tokens,
                 output_lens=commit_lens,
                 return_sampling_masks=return_sampling_masks,
+                max_mask_tokens=get_exec().features.sampling_mask_max_tokens,
             )
 
         if batch.return_logprob:

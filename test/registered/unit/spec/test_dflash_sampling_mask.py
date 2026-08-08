@@ -27,6 +27,7 @@ class TestDFlashSamplingMask(CustomTestCase):
             output_token_ids=torch.tensor([[3, 4, 0], [3, 1, 2]]),
             output_lens=torch.tensor([2, 1]),
             return_sampling_masks=[True, False],
+            max_mask_tokens=5,
         )
 
         self.assertEqual(masks, [[[1, 3], [0, 2, 4]], None])
@@ -40,10 +41,31 @@ class TestDFlashSamplingMask(CustomTestCase):
             output_token_ids=torch.tensor([[3, 4], [2, 1]]),
             output_lens=torch.tensor([2, 1]),
             return_sampling_masks=[True, True],
+            max_mask_tokens=1,
         )
 
         self.assertEqual(masks, [[[3], [4]], [[2]]])
         self.assertEqual(logprobs, [[0.0, 0.0], [0.0]])
+
+    def test_one_oversized_token_rejects_its_whole_request(self):
+        target_probs = torch.tensor(
+            [
+                [[0.25, 0.25, 0.25, 0.25], [0.5, 0.5, 0.0, 0.0]],
+                [[0.5, 0.5, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+            ]
+        )
+        masks, logprobs = build_dflash_sampling_mask_output(
+            target_probs=target_probs,
+            output_token_ids=torch.tensor([[0, 1], [1, 0]]),
+            output_lens=torch.tensor([2, 1]),
+            return_sampling_masks=[True, True],
+            max_mask_tokens=2,
+        )
+
+        self.assertIsNone(masks[0])
+        self.assertIsNone(logprobs[0])
+        self.assertEqual(masks[1], [[0, 1]])
+        self.assertAlmostEqual(logprobs[1][0], math.log(0.5))
 
 
 if __name__ == "__main__":

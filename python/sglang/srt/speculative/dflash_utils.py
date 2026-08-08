@@ -644,7 +644,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -767,7 +768,72 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus
+    return correct_len, bonus, target_probs if return_target_probs else None
+
+
+def build_dflash_sampling_mask_output(
+    *,
+    target_probs: Optional[torch.Tensor],
+    output_token_ids: torch.Tensor,
+    output_lens: torch.Tensor,
+    return_sampling_masks: List[bool],
+) -> tuple[List[Optional[List[List[int]]]], List[Optional[List[float]]]]:
+    bs, block_size = output_token_ids.shape
+    output_lens_cpu = output_lens.cpu().tolist()
+    output_token_ids_cpu = output_token_ids.cpu().tolist()
+    masks: List[Optional[List[List[int]]]] = [None] * bs
+    logprobs: List[Optional[List[float]]] = [None] * bs
+
+    requested_rows = [
+        (i, j)
+        for i, should_return in enumerate(return_sampling_masks)
+        if should_return
+        for j in range(output_lens_cpu[i])
+    ]
+    if target_probs is None:
+        for i, j in requested_rows:
+            if masks[i] is None:
+                masks[i], logprobs[i] = [], []
+            masks[i].append([int(output_token_ids_cpu[i][j])])
+            logprobs[i].append(0.0)
+        return masks, logprobs
+
+    flat_probs = target_probs.view(bs * block_size, -1)
+    row_indices = torch.tensor(
+        [i * block_size + j for i, j in requested_rows],
+        device=target_probs.device,
+    )
+    selected_rows = flat_probs[row_indices]
+    support_rows, support_ids = (selected_rows > 0).nonzero(as_tuple=True)
+    support_lens = (
+        torch.bincount(support_rows, minlength=len(requested_rows)).cpu().tolist()
+    )
+    support_ids_cpu = support_ids.cpu().tolist()
+    selected_token_ids = torch.tensor(
+        [output_token_ids_cpu[i][j] for i, j in requested_rows],
+        device=target_probs.device,
+    )
+    selected_logprobs = (
+        torch.log(
+            selected_rows[
+                torch.arange(len(requested_rows), device=target_probs.device),
+                selected_token_ids,
+            ]
+        )
+        .cpu()
+        .tolist()
+    )
+
+    cursor = 0
+    for row, ((i, _), support_len) in enumerate(
+        zip(requested_rows, support_lens, strict=True)
+    ):
+        if masks[i] is None:
+            masks[i], logprobs[i] = [], []
+        masks[i].append(support_ids_cpu[cursor : cursor + support_len])
+        logprobs[i].append(float(selected_logprobs[row]))
+        cursor += support_len
+    return masks, logprobs
 
 
 def build_dflash_verify_target_probs(

@@ -36,6 +36,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_dflash_sampling_mask_output,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -1721,17 +1722,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Only the greedy branch sets target_predict; the simulated-acceptance
         # override below checks for it.
         target_predict = None
+        return_sampling_masks = (
+            sampling_info.return_sampling_masks if sampling_info is not None else []
+        )
+        needs_sampling_masks = any(return_sampling_masks or [])
+        target_probs = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            (
+                accept_len,
+                bonus,
+                target_probs,
+            ) = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                return_target_probs=needs_sampling_masks,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
@@ -1831,6 +1842,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        if needs_sampling_masks:
+            (
+                logits_output.next_token_sampling_mask_idx,
+                logits_output.next_token_sampling_logprobs,
+            ) = build_dflash_sampling_mask_output(
+                target_probs=target_probs,
+                output_token_ids=out_tokens,
+                output_lens=commit_lens,
+                return_sampling_masks=return_sampling_masks,
+            )
 
         if batch.return_logprob:
             output_indices = torch.arange(

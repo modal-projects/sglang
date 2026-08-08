@@ -1,7 +1,7 @@
-"""Unit tests for the DFlash spec-v2 host-sync removal: compact-rebuild
-kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
-upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
-keep-list."""
+"""Unit tests for DFlash prefill padding and spec-v2 host-sync removal:
+compact-rebuild kernel bit-exactness, vocab-parallel draft sampler select,
+host seq-lens upper bound, hybrid needs_cpu_seq_lens delegation, and
+filter_batch host keep-list."""
 
 import unittest
 from types import SimpleNamespace
@@ -14,6 +14,35 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
+
+
+class TestDFlashPrefillPadding(CustomTestCase):
+    def test_trims_trailing_padding_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import (
+            _trim_dflash_prefill_hidden_states,
+        )
+
+        hidden = torch.arange(24).reshape(8, 3)
+        actual = _trim_dflash_prefill_hidden_states(hidden, logical_num_tokens=5)
+        torch.testing.assert_close(actual, hidden[:5])
+
+    def test_preserves_unpadded_hidden_states(self):
+        from sglang.srt.speculative.dflash_worker_v2 import (
+            _trim_dflash_prefill_hidden_states,
+        )
+
+        hidden = torch.arange(15).reshape(5, 3)
+        actual = _trim_dflash_prefill_hidden_states(hidden, logical_num_tokens=5)
+        self.assertIs(actual, hidden)
+
+    def test_rejects_missing_hidden_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import (
+            _trim_dflash_prefill_hidden_states,
+        )
+
+        hidden = torch.arange(12).reshape(4, 3)
+        with self.assertRaisesRegex(ValueError, "fewer rows than cache locations"):
+            _trim_dflash_prefill_hidden_states(hidden, logical_num_tokens=5)
 
 
 def _compact_lens_exact(seq_lens, window, page):

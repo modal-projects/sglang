@@ -1,21 +1,24 @@
 """Qwen3.8-Max NVFP4-RTN on one 8xB300 node, TP8: hardened static-scales build.
 
-Hardened variant of ../qwen38_max_nvfp4_rtn_8xb300: same checkpoint and server
-shape, plus three sglang engine patches (mamba/GDN state hygiene; see patches/
-and README.md), NVMe weight staging, and a warmup contract that gates
-readiness on response CONTENT rather than HTTP status.
+Hardened variant of ../qwen38_max_nvfp4_rtn_8xb300 (same checkpoint, same
+server shape): three python-only sglang engine patches (see patches/ -- mamba
+non-finite radix-cache guard, mamba pool sanitize on flush/reset and extend
+admission, GDN per-sequence initial-state gate), NVMe weight staging, and a
+warmup contract that gates readiness on response CONTENT (HTTP 200 alone does
+not prove health here).
 
 Validated 2026-08-08: GPQA-Diamond 179/198 (90.4%) and 177/198 (89.4%) across
-two runs, both complete with zero request errors. Decode output is
-bitwise-stable across boot/warm/flush/double-flush at concurrency 1-16.
+two complete runs, zero request errors (198 questions, zero-shot CoT
+"Answer: <letter>", temperature 0.6, top_p 0.95, max_tokens 32768,
+concurrency 8).
 
-STATIC ACTIVATION SCALES ONLY: SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
-is hard-set to 0 below and must stay that way on this build. Per-token
-dynamic activation quant requires flashinfer kernel patches this config does
-not carry (without them the per-token requant NaN-collapses 100% of outputs
-to "!!!"), and even with them it has an open /flush_cache poisoning issue.
-The experimental per-token stack lives in the modal-share bundle
-(qwen38-nvfp4-zero-guard/), not here.
+NEVER enable per-token activation quant on this build:
+SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION is hard-set to 0. Per-token
+requires flashinfer kernel patches this config does not carry (without them
+it NaN-collapses 100% of outputs) and has an open /flush_cache poisoning
+issue even patched. That experimental stack, and the full investigation
+writeup, live in the modal-share bundle qwen38-nvfp4-zero-guard/
+(http://modal-share.tail5292b.ts.net/files/qwen38-nvfp4-zero-guard/).
 
 To deploy: set APP_NAME below (it ships unset so a checked-in copy can never
 redeploy someone else's app), then run (runc is required for sane

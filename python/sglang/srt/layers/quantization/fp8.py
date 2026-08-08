@@ -651,6 +651,35 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant and not self.use_mxfp8:
             restore_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
 
+    def weight_staging_postprocess_device(self, layer: Module) -> str | None:
+        if _is_cpu:
+            return None
+        requires_cuda = (
+            not self.block_quant
+            or not self.is_checkpoint_fp8_serialized
+            or self.use_mxfp8
+            or self.convert_mxfp8_to_block
+            or _is_fp8_fnuz
+            or _use_aiter_bpreshuffle_gfx95
+        )
+        if requires_cuda:
+            return "cuda"
+
+        from sglang.srt.model_loader.utils import (
+            should_deepgemm_weight_requant_ue8m0,
+        )
+
+        use_deepgemm_runner = (
+            self.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
+        if use_deepgemm_runner and should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=self.quant_config.weight_block_size,
+            output_dtype=getattr(layer, "orig_dtype", None),
+            weight_shape=layer.weight.shape,
+        ):
+            return "cuda"
+        return "cpu"
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if not self.use_mxfp8:
             record_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
@@ -1411,6 +1440,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.block_quant and not self.use_mxfp8 and not self.is_fp4_expert:
             restore_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
             restore_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)
+
+    def weight_staging_postprocess_device(self, layer: Module) -> str | None:
+        if _is_cpu or self.is_fp4_expert:
+            return None
+        requires_cuda = (
+            not self.block_quant
+            or not self.quant_config.is_checkpoint_fp8_serialized
+            or self.use_mxfp8
+            or self.convert_mxfp8_to_block
+            or _is_fp8_fnuz
+            or _use_aiter
+        )
+        if requires_cuda:
+            return "cuda"
+
+        from sglang.srt.model_loader.utils import (
+            should_deepgemm_weight_requant_ue8m0,
+        )
+
+        if (
+            self.is_deepgemm_moe_runner_backend_enabled()
+            and should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=self.quant_config.weight_block_size,
+            )
+        ):
+            return "cuda"
+        return "cpu"
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if not self.use_mxfp8 and not self.is_fp4_expert:

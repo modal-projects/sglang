@@ -16,33 +16,42 @@ import fcntl
 import glob
 import json
 import logging
-import mmap
 import os
+import resource
 import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import zstandard
 
 from sglang.srt.utils import dynamic_import
-from sglang.srt.weight_sync.checksum import calculate_checksum, create_checksum
+from sglang.srt.weight_sync.checksum import (
+    calculate_checksum,
+    create_checksum,
+    validate_checksum,
+)
+from sglang.srt.weight_sync.file_io import PositionalFileRangeReader, read_exact
 
 logger = logging.getLogger(__name__)
 
 # XOR targets are read and written through ordinary positional I/O instead of
 # mmap. An XOR delta must read and checksum every target byte, and positional
 # I/O keeps that access sequential instead of making progress page-fault bound.
-# Bound compressed, decompressed, and target work buffers across workers. A
-# single tensor larger than the budget is admitted alone.
+# Bound target and sparse-overwrite work buffers across workers. Compressed XOR
+# bytes are decoded through a fixed-size stream buffer. A single tensor larger
+# than the budget is admitted alone.
 _DELTA_APPLY_MEMORY_BYTES = 8 << 30
 _POSITIONAL_IO_CHUNK_BYTES = 64 << 20
+_DELTA_STREAM_CHUNK_BYTES = 4 << 20
 
 _MAX_SEED_COPY_WORKERS = 8
 _MAX_DELTA_APPLY_WORKERS = 32
+_MAX_OPEN_FILES_PER_CACHE = 256
 _MAX_SAFETENSORS_HEADER_BYTES = 100 << 20
 _SEED_COPY_CHUNK_BYTES = 16 << 20
 _SEED_LOG_STEP_GB = 50
@@ -211,21 +220,21 @@ def _materialize_locked(
             "wall_s": 0.0,
         }
     else:
-        applied_deltas = [
-            _apply_delta(
+        versions = list(range(start + 1, target_version + 1))
+        if len(versions) == 1:
+            apply_stats = _apply_delta(
                 local_checkpoint_dir,
-                _version_dir(checkpoint_source_dir, version),
-                version,
+                _version_dir(checkpoint_source_dir, target_version),
+                target_version,
             )
-            for version in range(start + 1, target_version + 1)
-        ]
-        apply_stats = {
-            "operation": "apply_deltas",
-            "versions": len(applied_deltas),
-            "wall_s": round(sum(value["wall_s"] for value in applied_deltas), 6),
-        }
-        if len(applied_deltas) == 1:
-            apply_stats = applied_deltas[0]
+        else:
+            apply_stats = _apply_delta_lineage(
+                local_checkpoint_dir,
+                [
+                    (_version_dir(checkpoint_source_dir, version), version)
+                    for version in versions
+                ],
+            )
     return {
         "operation": "reseed_and_apply" if reseed else "materialize",
         "seed_wall_s": round(seed_wall_s, 6),
@@ -528,6 +537,7 @@ def _validate_full_checkpoint(src_dir: str, *, version: int) -> None:
 
 @dataclass(frozen=True)
 class _DiskDeltaItem:
+    encoding: str
     name: str
     source_path: str
     source_offset: int
@@ -535,7 +545,18 @@ class _DiskDeltaItem:
     target_path: str
     target_offset: int
     target_nbytes: int
+    checksum_algorithm: str
     expected_checksum: str
+
+
+@dataclass(frozen=True)
+class _DiskDeltaPlan:
+    version: int
+    base_version: int
+    encoding: str
+    items: tuple[_DiskDeltaItem, ...]
+    metadata_wall_s: float
+    source_setup_wall_s: float
 
 
 class _ByteBudget:
@@ -558,6 +579,114 @@ class _ByteBudget:
             with self.condition:
                 self.used -= charge
                 self.condition.notify_all()
+
+
+@dataclass
+class _CachedFileDescriptor:
+    fd: int
+    users: int = 0
+    dirty: bool = False
+    last_used: int = 0
+
+
+class _FileDescriptorCache:
+    """Share positional-I/O descriptors under a fixed process-local bound."""
+
+    def __init__(self, flags: int, limit: int):
+        self.flags = flags
+        self.limit = limit
+        self.entries: dict[str, _CachedFileDescriptor] = {}
+        self.condition = threading.Condition()
+        self.clock = 0
+        self.peak_open_files = 0
+
+    @contextmanager
+    def acquire(self, path: str, *, write: bool = False):
+        with self.condition:
+            entry = self.entries.get(path)
+            while entry is None:
+                if len(self.entries) < self.limit:
+                    entry = _CachedFileDescriptor(fd=os.open(path, self.flags))
+                    self.entries[path] = entry
+                    self.peak_open_files = max(
+                        self.peak_open_files,
+                        len(self.entries),
+                    )
+                    break
+                idle_path, idle = min(
+                    (
+                        (candidate_path, candidate)
+                        for candidate_path, candidate in self.entries.items()
+                        if candidate.users == 0
+                    ),
+                    key=lambda item: item[1].last_used,
+                    default=(None, None),
+                )
+                if idle is None:
+                    self.condition.wait()
+                    entry = self.entries.get(path)
+                    continue
+                del self.entries[idle_path]
+                self._close(idle)
+            entry.users += 1
+            self.clock += 1
+            entry.last_used = self.clock
+            if write:
+                entry.dirty = True
+        try:
+            yield entry.fd
+        finally:
+            with self.condition:
+                entry.users -= 1
+                self.clock += 1
+                entry.last_used = self.clock
+                self.condition.notify()
+
+    def flush(self) -> None:
+        with self.condition:
+            for entry in self.entries.values():
+                if entry.dirty:
+                    os.fsync(entry.fd)
+                    entry.dirty = False
+
+    def close(self) -> None:
+        with self.condition:
+            entries = list(self.entries.values())
+            self.entries.clear()
+        error = None
+        for entry in entries:
+            try:
+                self._close(entry)
+            except OSError as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+
+    @staticmethod
+    def _close(entry: _CachedFileDescriptor) -> None:
+        try:
+            if entry.dirty:
+                os.fsync(entry.fd)
+        finally:
+            os.close(entry.fd)
+
+
+def _file_descriptor_cache_limit() -> int:
+    """Reserve descriptors for the server while bounding long lineages."""
+
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        soft_limit = _MAX_OPEN_FILES_PER_CACHE * 2 + 64
+    if soft_limit == resource.RLIM_INFINITY:
+        soft_limit = _MAX_OPEN_FILES_PER_CACHE * 2 + 64
+    return max(
+        1,
+        min(
+            _MAX_OPEN_FILES_PER_CACHE,
+            max(2, soft_limit - 64) // 2,
+        ),
+    )
 
 
 def _pread_exact(
@@ -602,66 +731,88 @@ def _pwrite_all(fd: int, offset: int, data: bytearray) -> None:
         position += written
 
 
-def _apply_delta(
-    local_checkpoint_dir: str,
+def _resolve_delta_path(version_dir: str, filename: object) -> str:
+    if not isinstance(filename, str):
+        raise ValueError(f"invalid delta shard path: {filename!r}")
+    relative = Path(filename)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"invalid delta shard path: {filename!r}")
+    root = os.path.realpath(version_dir)
+    path = os.path.realpath(os.path.join(root, filename))
+    if os.path.commonpath((root, path)) != root:
+        raise ValueError(f"invalid delta shard path: {filename!r}")
+    return path
+
+
+def _build_delta_plan(
     version_dir: str,
     expected_version: int,
-) -> dict:
-    """Apply one version's delta in place and fail on any checksum mismatch."""
-    started = time.perf_counter()
+    *,
+    expected_base_version: int | None,
+    locations: dict[str, tuple[str, int, int]],
+) -> _DiskDeltaPlan:
+    """Validate one published delta and resolve its source and target ranges."""
+
     metadata_started = time.perf_counter()
-    with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
-        index = json.load(f)
-    meta = _validate_published_version(
+    index_path = os.path.join(version_dir, "model.safetensors.index.json")
+    with open(index_path) as file:
+        index = json.load(file)
+    metadata = _validate_published_version(
         index.get("metadata"),
         expected_version,
-        os.path.join(version_dir, "model.safetensors.index.json"),
+        index_path,
     )
-    applied = _read_applied_version(local_checkpoint_dir)
-    if applied == int(meta["version"]):
-        return {
-            "operation": "noop",
-            "version": int(meta["version"]),
-            "wall_s": round(time.perf_counter() - started, 6),
-        }
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
         raise ValueError(f"invalid delta weight map: {version_dir}")
-    # Validate the source before reading it: every blob the index names must be
-    # present, or a half-propagated version would apply only the blobs that made
-    # it and report the rest as a checksum mismatch (misread as corruption). A
-    # missing blob is a not-ready source, so raise FileNotFoundError — staging
-    # fails fast and the caller reloads + retries instead of reseeding.
-    for blob in sorted(set(weight_map.values())):
-        if not os.path.exists(os.path.join(version_dir, blob)):
-            raise FileNotFoundError(
-                f"incomplete source version {version_dir}: missing blob {blob}"
-            )
-    if applied != int(meta["base_version"]):
+    try:
+        base_version = int(metadata["base_version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"delta has no valid base version: {index_path}") from exc
+    if base_version != expected_base_version:
         raise RuntimeError(
-            f"out-of-order delta: local at {applied}, delta builds on {meta['base_version']}"
+            f"out-of-order delta v{expected_version}: builds on "
+            f"{base_version}, expected {expected_base_version}"
         )
-    if meta["compression_format"] != "zstd":
+    if metadata.get("compression_format") != "zstd":
         raise NotImplementedError(
-            f"compression {meta['compression_format']!r} not supported"
+            f"compression {metadata.get('compression_format')!r} not supported"
         )
-    encoding = meta["delta_encoding"]
-    algorithm = meta["checksum_format"]
+    encoding = metadata.get("delta_encoding")
+    if encoding not in {"xor", "overwrite"}:
+        raise NotImplementedError(f"delta encoding {encoding!r} not supported")
+    checksum_algorithm = metadata.get("checksum_format")
+    if not isinstance(checksum_algorithm, str):
+        raise ValueError(f"delta has no valid checksum format: {index_path}")
+    create_checksum(checksum_algorithm)
+    if not all(isinstance(name, str) for name in weight_map):
+        raise ValueError(f"invalid delta tensor name in {index_path}")
+    if not all(isinstance(filename, str) for filename in weight_map.values()):
+        raise ValueError(f"invalid delta shard path in {index_path}")
     expected_delta_names = set(weight_map)
-    expected_delta_files = set(weight_map.values())
-    locations = _tensor_locations(local_checkpoint_dir)
     metadata_wall_s = time.perf_counter() - metadata_started
-    mismatches = []
-    lock = threading.Lock()
+
+    source_setup_started = time.perf_counter()
+    source_paths = {
+        filename: _resolve_delta_path(version_dir, filename)
+        for filename in set(weight_map.values())
+    }
+    for filename, path in source_paths.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"incomplete source version {version_dir}: missing blob {filename}"
+            )
+
     items: list[_DiskDeltaItem] = []
     seen_delta_names = set()
-    source_setup_started = time.perf_counter()
-    for delta_filename in sorted(expected_delta_files):
-        delta_file = os.path.join(version_dir, delta_filename)
+    for delta_filename, delta_file in sorted(source_paths.items()):
         header_len, header = _read_safetensors_header(delta_file)
-        want_checksums = header.get("__metadata__", {})
-        if not isinstance(want_checksums, dict):
+        expected_checksums = header.get("__metadata__", {})
+        if not isinstance(expected_checksums, dict):
             raise ValueError(f"invalid delta checksum metadata: {delta_file}")
+        expected_file_names = {
+            name for name, filename in weight_map.items() if filename == delta_filename
+        }
         seen_file_names = set()
         for name, info in header.items():
             if name == "__metadata__":
@@ -672,41 +823,59 @@ def _apply_delta(
                 )
             if name in seen_delta_names:
                 raise ValueError(f"duplicate delta tensor {name!r}")
+            if not isinstance(info, dict):
+                raise ValueError(f"invalid delta tensor metadata for {name!r}")
+            offsets = info.get("data_offsets")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(isinstance(value, int) for value in offsets)
+            ):
+                raise ValueError(f"invalid delta offsets for {name!r} in {delta_file}")
             seen_file_names.add(name)
             seen_delta_names.add(name)
-            begin, end = info["data_offsets"]
+            begin, end = offsets
             if begin < 0 or begin > end:
                 raise ValueError(f"invalid delta offsets for {name!r} in {delta_file}")
+            if info.get("dtype") != "U8" or info.get("shape") != [end - begin]:
+                raise ValueError(
+                    f"compressed delta tensor {name!r} must be one-dimensional U8"
+                )
             try:
                 path, offset, nbytes = locations[name]
             except KeyError as exc:
                 raise ValueError(
                     f"delta tensor {name!r} is absent from the local checkpoint"
                 ) from exc
-            data_start = 8 + header_len
-            want_checksum = want_checksums.get(name)
-            if not isinstance(want_checksum, str) or not want_checksum:
-                raise ValueError(f"delta tensor {name!r} has no target checksum")
+            expected_checksum = validate_checksum(
+                checksum_algorithm,
+                expected_checksums.get(name),
+            )
             items.append(
                 _DiskDeltaItem(
+                    encoding=encoding,
                     name=name,
                     source_path=delta_file,
-                    source_offset=data_start + begin,
+                    source_offset=8 + header_len + begin,
                     compressed_nbytes=end - begin,
                     target_path=path,
                     target_offset=offset,
                     target_nbytes=nbytes,
-                    expected_checksum=want_checksum,
+                    checksum_algorithm=checksum_algorithm,
+                    expected_checksum=expected_checksum,
                 )
             )
-        expected_file_names = {
-            name for name, filename in weight_map.items() if filename == delta_filename
-        }
         if seen_file_names != expected_file_names:
             raise ValueError(
                 f"delta blob/index tensor mismatch for {delta_file}: "
                 f"missing={sorted(expected_file_names - seen_file_names)[:20]} "
                 f"extra={sorted(seen_file_names - expected_file_names)[:20]}"
+            )
+        if set(expected_checksums) != expected_file_names:
+            raise ValueError(
+                f"delta checksum/index tensor mismatch for {delta_file}: "
+                f"missing={sorted(expected_file_names - set(expected_checksums))[:20]} "
+                f"extra={sorted(set(expected_checksums) - expected_file_names)[:20]}"
             )
     if seen_delta_names != expected_delta_names:
         raise ValueError(
@@ -714,210 +883,293 @@ def _apply_delta(
             f"missing={sorted(expected_delta_names - seen_delta_names)[:20]} "
             f"extra={sorted(seen_delta_names - expected_delta_names)[:20]}"
         )
-    source_setup_wall_s = time.perf_counter() - source_setup_started
+    return _DiskDeltaPlan(
+        version=expected_version,
+        base_version=base_version,
+        encoding=encoding,
+        items=tuple(items),
+        metadata_wall_s=metadata_wall_s,
+        source_setup_wall_s=time.perf_counter() - source_setup_started,
+    )
 
-    # The target is about to change in place. Remove the base marker only after
-    # the complete source has been validated; an interrupted mutation must
-    # never be mistaken for either the base or target version.
+
+def _apply_delta(
+    local_checkpoint_dir: str,
+    version_dir: str,
+    expected_version: int,
+) -> dict:
+    """Apply one version's delta in place and fail on checksum mismatch."""
+
+    applied = _read_applied_version(local_checkpoint_dir)
+    if applied == expected_version:
+        return {
+            "operation": "noop",
+            "version": expected_version,
+            "wall_s": 0.0,
+        }
+    return _apply_delta_lineage(
+        local_checkpoint_dir,
+        [(version_dir, expected_version)],
+    )
+
+
+def _apply_delta_lineage(
+    local_checkpoint_dir: str,
+    versions: list[tuple[str, int]],
+) -> dict:
+    """Apply an ordered lineage with one target read and write per tensor."""
+
+    if not versions:
+        raise ValueError("delta lineage must not be empty")
+    started = time.perf_counter()
+    applied = _read_applied_version(local_checkpoint_dir)
+    expected_base_version = applied
+    locations = _tensor_locations(local_checkpoint_dir)
+    plans = []
+    for version_dir, version in versions:
+        plan = _build_delta_plan(
+            version_dir,
+            version,
+            expected_base_version=expected_base_version,
+            locations=locations,
+        )
+        plans.append(plan)
+        expected_base_version = version
+
+    operations_by_name: dict[str, list[_DiskDeltaItem]] = {}
+    for plan in plans:
+        for item in plan.items:
+            operations = operations_by_name.setdefault(item.name, [])
+            if operations:
+                first = operations[0]
+                if (
+                    item.target_path,
+                    item.target_offset,
+                    item.target_nbytes,
+                ) != (
+                    first.target_path,
+                    first.target_offset,
+                    first.target_nbytes,
+                ):
+                    raise ValueError(
+                        f"target location changed across deltas for {item.name!r}"
+                    )
+            operations.append(item)
+
+    operations_by_target_path: dict[
+        str,
+        list[tuple[str, list[_DiskDeltaItem]]],
+    ] = {}
+    for name, operations in operations_by_name.items():
+        operations_by_target_path.setdefault(
+            operations[0].target_path,
+            [],
+        ).append((name, operations))
+    for tensor_operations in operations_by_target_path.values():
+        tensor_operations.sort(key=lambda value: value[1][0].target_offset)
+    target_batches = sorted(
+        operations_by_target_path.items(),
+        key=lambda value: sum(
+            operations[0].target_nbytes for _, operations in value[1]
+        ),
+        reverse=True,
+    )
+    all_items = [
+        item for operations in operations_by_name.values() for item in operations
+    ]
+
+    # Planning above validates the complete lineage before any local byte changes.
+    # An interruption after this point leaves no marker, forcing a clean seed.
     _clear_applied_version(local_checkpoint_dir)
-    source_files = {}
-    target_files = {}
-    prefetch_wall_s = 0.0
+    file_cache_limit = _file_descriptor_cache_limit()
+    source_files = _FileDescriptorCache(os.O_RDONLY, file_cache_limit)
+    target_files = _FileDescriptorCache(os.O_RDWR, file_cache_limit)
+    memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
+    mismatches = []
+    mismatch_lock = threading.Lock()
     close_wall_s = 0.0
+
+    def apply_tensor(
+        name: str,
+        operations: list[_DiskDeltaItem],
+        target_fd: int,
+        decompressor: zstandard.ZstdDecompressor,
+    ) -> None:
+        first = operations[0]
+        has_overwrite = any(item.encoding == "overwrite" for item in operations)
+        working_nbytes = first.target_nbytes + _DELTA_STREAM_CHUNK_BYTES
+        if has_overwrite:
+            working_nbytes += 4 * first.target_nbytes
+        with memory_budget.reserve(working_nbytes):
+            region = _pread_exact(
+                target_fd,
+                first.target_offset,
+                first.target_nbytes,
+            )
+            region_view = np.frombuffer(region, dtype=np.uint8)
+            for operation in operations:
+                with source_files.acquire(operation.source_path) as source_fd:
+                    source = PositionalFileRangeReader(
+                        source_fd,
+                        operation.source_offset,
+                        operation.compressed_nbytes,
+                        operation.source_path,
+                        max_read_bytes=_DELTA_STREAM_CHUNK_BYTES,
+                    )
+                    with decompressor.stream_reader(source, closefd=False) as reader:
+                        if operation.encoding == "xor":
+                            position = 0
+                            while position < operation.target_nbytes:
+                                block = reader.read(
+                                    min(
+                                        _DELTA_STREAM_CHUNK_BYTES,
+                                        operation.target_nbytes - position,
+                                    )
+                                )
+                                if not block:
+                                    break
+                                end = position + len(block)
+                                target = region_view[position:end]
+                                np.bitwise_xor(
+                                    target,
+                                    np.frombuffer(block, dtype=np.uint8),
+                                    out=target,
+                                )
+                                position = end
+                            if position != operation.target_nbytes or reader.read(1):
+                                raise RuntimeError(
+                                    f"decompressed XOR size mismatch for {name!r}: "
+                                    f"expected={operation.target_nbytes} "
+                                    f"actual={position}"
+                                )
+                        else:
+                            count = int.from_bytes(read_exact(reader, 4), "little")
+                            if count > operation.target_nbytes:
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            positions_buffer = read_exact(reader, 4 * count)
+                            positions = np.frombuffer(positions_buffer, dtype="<u4")
+                            if (
+                                count
+                                and int(positions.max()) >= operation.target_nbytes
+                            ):
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            value_offset = 0
+                            while value_offset < count:
+                                values = reader.read(
+                                    min(
+                                        _DELTA_STREAM_CHUNK_BYTES,
+                                        count - value_offset,
+                                    )
+                                )
+                                if not values:
+                                    break
+                                value_end = value_offset + len(values)
+                                region_view[positions[value_offset:value_end]] = (
+                                    np.frombuffer(values, dtype=np.uint8)
+                                )
+                                value_offset = value_end
+                            if value_offset != count or reader.read(1):
+                                raise RuntimeError(
+                                    f"overwrite payload size mismatch for {name!r}: "
+                                    f"expected={count} actual={value_offset}"
+                                )
+                    if source.position != operation.compressed_nbytes:
+                        raise RuntimeError(
+                            f"compressed delta range was not fully consumed for "
+                            f"{name!r}: expected={operation.compressed_nbytes} "
+                            f"actual={source.position}"
+                        )
+
+            final = operations[-1]
+            if (
+                calculate_checksum(final.checksum_algorithm, region)
+                != final.expected_checksum
+            ):
+                with mismatch_lock:
+                    mismatches.append(name)
+            else:
+                _pwrite_all(target_fd, first.target_offset, region)
+
+    def apply_checkpoint_shard(
+        batch: tuple[str, list[tuple[str, list[_DiskDeltaItem]]]],
+    ) -> None:
+        target_path, tensor_operations = batch
+        decompressor = zstandard.ZstdDecompressor()
+        with target_files.acquire(target_path, write=True) as target_fd:
+            for name, operations in tensor_operations:
+                apply_tensor(name, operations, target_fd, decompressor)
+
     try:
-        source_files = {
-            path: os.open(path, os.O_RDONLY)
-            for path in {item.source_path for item in items}
-        }
-        target_files = {
-            path: os.open(path, os.O_RDWR)
-            for path in {item.target_path for item in items}
-        }
-        memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
-        if encoding == "xor":
-
-            def apply_xor(item: _DiskDeltaItem) -> None:
-                working_nbytes = 2 * item.target_nbytes + item.compressed_nbytes
-                with memory_budget.reserve(working_nbytes):
-                    compressed = _pread_exact(
-                        source_files[item.source_path],
-                        item.source_offset,
-                        item.compressed_nbytes,
-                        source_path=item.source_path,
-                    )
-                    region = _pread_exact(
-                        target_files[item.target_path],
-                        item.target_offset,
-                        item.target_nbytes,
-                    )
-
-                    delta = zstandard.ZstdDecompressor().decompress(
-                        compressed,
-                        max_output_size=item.target_nbytes,
-                    )
-                    if len(delta) != item.target_nbytes:
-                        raise RuntimeError(
-                            f"decompressed delta size mismatch for {item.name!r}: "
-                            f"expected={item.target_nbytes} actual={len(delta)}"
-                        )
-
-                    region_view = np.frombuffer(region, dtype=np.uint8)
-                    delta_view = np.frombuffer(delta, dtype=np.uint8)
-                    hasher = create_checksum(algorithm)
-                    for position in range(
-                        0,
-                        item.target_nbytes,
-                        _POSITIONAL_IO_CHUNK_BYTES,
-                    ):
-                        end = min(
-                            position + _POSITIONAL_IO_CHUNK_BYTES,
-                            item.target_nbytes,
-                        )
-                        np.bitwise_xor(
-                            region_view[position:end],
-                            delta_view[position:end],
-                            out=region_view[position:end],
-                        )
-                        hasher.update(region_view[position:end])
-                    actual = hasher.hexdigest()
-                    if actual != item.expected_checksum:
-                        with lock:
-                            mismatches.append(item.name)
-                    else:
-                        _pwrite_all(
-                            target_files[item.target_path],
-                            item.target_offset,
-                            region,
-                        )
-
-            apply_tensor = apply_xor
-            io_backend = "pread_pwrite"
-        elif encoding == "overwrite":
-            open_mmaps = {
-                path: (
-                    (fh := open(path, "r+b")),
-                    mmap.mmap(fh.fileno(), 0),
-                )
-                for path in target_files
-            }
-
-            prefetch_started = time.perf_counter()
-            for _, mm in open_mmaps.values():
-                try:
-                    mm.madvise(mmap.MADV_WILLNEED)
-                except (OSError, AttributeError, ValueError):
-                    pass
-            prefetch_wall_s = time.perf_counter() - prefetch_started
-
-            def apply_overwrite(item: _DiskDeltaItem) -> None:
-                # The sparse format stores one uint32 position and one byte per
-                # changed target byte. Reject duplicate-heavy or malformed
-                # payloads by bounding the decompressed size accordingly.
-                max_payload_nbytes = 4 + 5 * item.target_nbytes
-                with memory_budget.reserve(item.compressed_nbytes + max_payload_nbytes):
-                    compressed = _pread_exact(
-                        source_files[item.source_path],
-                        item.source_offset,
-                        item.compressed_nbytes,
-                        source_path=item.source_path,
-                    )
-                    payload = zstandard.ZstdDecompressor().decompress(
-                        compressed,
-                        max_output_size=max_payload_nbytes,
-                    )
-                    if len(payload) < 4:
-                        raise RuntimeError(
-                            f"overwrite delta for {item.name!r} is truncated"
-                        )
-                    count = int.from_bytes(payload[:4], "little")
-                    positions_end = 4 + 4 * count
-                    if positions_end > len(payload):
-                        raise RuntimeError(
-                            f"overwrite positions for {item.name!r} are truncated"
-                        )
-                    positions = np.frombuffer(payload[4:positions_end], dtype="<u4")
-                    values = np.frombuffer(payload[positions_end:], dtype=np.uint8)
-                    if (
-                        count > item.target_nbytes
-                        or values.size != count
-                        or (count and int(positions.max()) >= item.target_nbytes)
-                    ):
-                        raise RuntimeError(
-                            f"overwrite payload for {item.name!r} is invalid"
-                        )
-                    region = np.ndarray(
-                        (item.target_nbytes,),
-                        dtype=np.uint8,
-                        buffer=open_mmaps[item.target_path][1],
-                        offset=item.target_offset,
-                    )
-                    region[positions] = values
-                    if calculate_checksum(algorithm, region) != item.expected_checksum:
-                        with lock:
-                            mismatches.append(item.name)
-
-            apply_tensor = apply_overwrite
-            io_backend = "mmap_sparse_overwrite"
-        else:
-            raise NotImplementedError(f"delta encoding {encoding!r} not supported")
-
         apply_started = time.perf_counter()
-        # Decompression, XOR/scatter, and checksumming release the GIL and are
-        # memory-bandwidth bound. Bound concurrency by both available CPUs and
-        # independent tensors; more than 32 streams only add scheduler pressure.
         workers = min(
             _MAX_DELTA_APPLY_WORKERS,
             _available_cpu_count(),
-            len(items) or 1,
+            len(target_batches) or 1,
         )
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(apply_tensor, items))
+            list(pool.map(apply_checkpoint_shard, target_batches))
         apply_wall_s = time.perf_counter() - apply_started
 
-        # Persist target bytes before the applied-version marker. A failure
-        # before the marker causes a checksum failure and clean reseed on retry.
         flush_started = time.perf_counter()
-        if encoding == "overwrite":
-            for _, mm in open_mmaps.values():
-                mm.flush()
-        else:
-            for fd in target_files.values():
-                os.fsync(fd)
+        target_files.flush()
         flush_wall_s = time.perf_counter() - flush_started
     finally:
         close_started = time.perf_counter()
-        if encoding == "overwrite" and "open_mmaps" in locals():
-            for fh, mm in open_mmaps.values():
-                mm.close()
-                fh.close()
-        for fd in target_files.values():
-            os.close(fd)
-        for fd in source_files.values():
-            os.close(fd)
+        try:
+            target_files.close()
+        finally:
+            source_files.close()
         close_wall_s = time.perf_counter() - close_started
 
     if mismatches:
         raise _ChecksumMismatchError(
-            f"checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: "
+            f"checksum mismatch for {len(mismatches)} tensors after applying "
+            f"delta lineage v{plans[0].version}..v{plans[-1].version}: "
             f"{sorted(mismatches)[:20]}"
         )
+
     marker_started = time.perf_counter()
-    _write_applied_version(local_checkpoint_dir, int(meta["version"]))
+    _write_applied_version(local_checkpoint_dir, plans[-1].version)
     marker_wall_s = time.perf_counter() - marker_started
+    encodings = {plan.encoding for plan in plans}
+    if len(plans) == 1:
+        operation = f"apply_{plans[0].encoding}"
+    elif encodings == {"xor"}:
+        operation = "apply_xor_chain"
+    else:
+        operation = "apply_delta_lineage"
     stats = {
-        "operation": f"apply_{encoding}",
-        "version": int(meta["version"]),
-        "delta_tensors": len(items),
-        "checkpoint_shards": len(target_files),
-        "compressed_bytes": sum(item.compressed_nbytes for item in items),
-        "target_tensor_bytes": sum(item.target_nbytes for item in items),
+        "operation": operation,
+        "base_version": plans[0].base_version,
+        "version": plans[-1].version,
+        "versions": len(plans),
+        "delta_tensors": len(operations_by_name),
+        "delta_fragments": len(all_items),
+        "checkpoint_shards": len(target_batches),
+        "delta_shards": len({item.source_path for item in all_items}),
+        "compressed_bytes": sum(item.compressed_nbytes for item in all_items),
+        "target_tensor_bytes": sum(
+            operations[0].target_nbytes for operations in operations_by_name.values()
+        ),
+        "apply_work_items": len(target_batches),
+        "scheduling": "checkpoint_shard_offset_order",
         "workers": workers,
-        "io_backend": io_backend,
+        "io_backend": (
+            "pread_pwrite" if len(plans) == 1 else "pread_pwrite_delta_lineage"
+        ),
         "working_memory_budget_bytes": _DELTA_APPLY_MEMORY_BYTES,
+        "file_descriptor_cache_limit": file_cache_limit,
+        "peak_source_file_descriptors": source_files.peak_open_files,
+        "peak_target_file_descriptors": target_files.peak_open_files,
         "phases": {
-            "metadata_wall_s": round(metadata_wall_s, 6),
-            "source_setup_wall_s": round(source_setup_wall_s, 6),
-            "prefetch_wall_s": round(prefetch_wall_s, 6),
+            "metadata_wall_s": round(sum(plan.metadata_wall_s for plan in plans), 6),
+            "source_setup_wall_s": round(
+                sum(plan.source_setup_wall_s for plan in plans), 6
+            ),
             "apply_wall_s": round(apply_wall_s, 6),
             "flush_wall_s": round(flush_wall_s, 6),
             "close_wall_s": round(close_wall_s, 6),
@@ -926,8 +1178,11 @@ def _apply_delta(
         "wall_s": round(time.perf_counter() - started, 6),
     }
     logger.info(
-        "Applied checkpoint delta v%d: tensors=%d target_bytes=%d wall_time=%.3fs",
-        stats["version"],
+        "Applied checkpoint delta lineage v%d..v%d: versions=%d tensors=%d "
+        "target_bytes=%d wall_time=%.3fs",
+        plans[0].version,
+        plans[-1].version,
+        stats["versions"],
         stats["delta_tensors"],
         stats["target_tensor_bytes"],
         stats["wall_s"],

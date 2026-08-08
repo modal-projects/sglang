@@ -707,8 +707,7 @@ class DiskCanonicalCheckpointUpdate:
         )
         if not self._groups:
             raise ValueError("canonical checkpoint has no runtime tensor groups")
-        self._groups_by_path = {group.path: group for group in self._groups}
-        if len(self._groups_by_path) != len(self._groups):
+        if len({group.path for group in self._groups}) != len(self._groups):
             raise ValueError("canonical runtime tensor group paths are not unique")
         self._validate_plan()
 

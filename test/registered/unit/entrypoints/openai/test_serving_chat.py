@@ -250,6 +250,31 @@ class ServingChatTestCase(unittest.TestCase):
         ):
             self.chat._convert_to_internal_request(req, self.fastapi_request)
 
+    def test_convert_to_internal_request_accepts_sampling_mask_compat_alias(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_meta_info=True,
+            custom_params={"miles_return_sampling_mask": True},
+        )
+
+        with patch.object(self.chat, "_process_messages") as process_messages:
+            process_messages.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+            adapted, _ = self.chat._convert_to_internal_request(
+                req,
+                self.fastapi_request,
+            )
+
+        self.assertTrue(adapted.return_sampling_mask)
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",

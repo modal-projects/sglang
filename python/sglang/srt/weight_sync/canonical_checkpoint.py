@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -107,11 +109,13 @@ def _checkpoint_manifest(
 
 
 class CanonicalCheckpoint:
-    """Cache one complete safetensors checkpoint once per inference host.
+    """Expose one complete safetensors checkpoint to local model workers.
 
-    Every local model worker maps the same pageable CPU storage. Workers read
-    disjoint checkpoint shards, then collectively publish the complete image.
-    Callers must synchronize before mutating the returned tensor bytes.
+    Memory storage copies each checkpoint once into host-shared pageable RAM.
+    Disk storage maps a materialized host-local checkpoint without allocating
+    another canonical copy. Callers must synchronize before mutating memory
+    storage; disk storage is immutable and must be advanced by the disk
+    checkpoint materializer.
     """
 
     def __init__(
@@ -120,14 +124,18 @@ class CanonicalCheckpoint:
         *,
         host_group: torch.distributed.ProcessGroup | None,
         version: int = 0,
+        storage: Literal["memory", "disk"] = "memory",
     ):
         if version < 0:
             raise ValueError("canonical checkpoint version must be non-negative")
+        if storage not in {"memory", "disk"}:
+            raise ValueError("canonical checkpoint storage must be memory or disk")
         distributed = torch.distributed.is_initialized()
         world_size = (
             torch.distributed.get_world_size(group=host_group) if distributed else 1
         )
         rank = torch.distributed.get_rank(group=host_group) if distributed else 0
+        self._host_rank = rank
         if world_size > 1 and host_group is None:
             raise RuntimeError(
                 "canonical checkpoint caching requires a host-local process group"
@@ -176,47 +184,50 @@ class CanonicalCheckpoint:
                 f"checkpoint manifests differ across local workers: {manifests}"
             )
 
-        self._storage = HostLocalSharedBuffer(
-            nbytes=capacity,
-            host_group=host_group,
-            name="weight-checkpoint",
-        )
+        self.storage = storage
+        self._storage = None
         started = time.perf_counter()
         local_error = None
-        try:
-            for index, checkpoint_file in enumerate(files):
-                if index % world_size != rank:
-                    continue
-                target = self._storage.view(
-                    checkpoint_file.nbytes,
-                    offset=checkpoint_file.offset,
-                )
-                try:
-                    read_file_into_tensor(
-                        checkpoint_file.path,
-                        target,
-                        drop_cache_after_read=True,
+        if storage == "memory":
+            self._storage = HostLocalSharedBuffer(
+                nbytes=capacity,
+                host_group=host_group,
+                name="weight-checkpoint",
+            )
+            try:
+                for index, checkpoint_file in enumerate(files):
+                    if index % world_size != rank:
+                        continue
+                    target = self._storage.view(
+                        checkpoint_file.nbytes,
+                        offset=checkpoint_file.offset,
                     )
-                finally:
-                    del target
-        except Exception as exc:
-            local_error = f"rank {rank}: {type(exc).__name__}: {exc}"
+                    try:
+                        read_file_into_tensor(
+                            checkpoint_file.path,
+                            target,
+                            drop_cache_after_read=True,
+                        )
+                    finally:
+                        del target
+            except Exception as exc:
+                local_error = f"rank {rank}: {type(exc).__name__}: {exc}"
 
-        if world_size > 1:
-            errors: list[str | None] = [None] * world_size
-            torch.distributed.all_gather_object(
-                errors,
-                local_error,
-                group=host_group,
-            )
-        else:
-            errors = [local_error]
-        errors = [error for error in errors if error is not None]
-        if errors:
-            self._storage.close()
-            raise RuntimeError(
-                "failed to cache canonical checkpoint: " + "; ".join(errors)
-            )
+            if world_size > 1:
+                errors: list[str | None] = [None] * world_size
+                torch.distributed.all_gather_object(
+                    errors,
+                    local_error,
+                    group=host_group,
+                )
+            else:
+                errors = [local_error]
+            errors = [error for error in errors if error is not None]
+            if errors:
+                self._storage.close()
+                raise RuntimeError(
+                    "failed to cache canonical checkpoint: " + "; ".join(errors)
+                )
 
         self._files = {}
         discovered_weight_map = {}
@@ -224,10 +235,18 @@ class CanonicalCheckpoint:
         layout_exception = None
         try:
             for checkpoint_file in files:
-                source = self._storage.view(
-                    checkpoint_file.nbytes,
-                    offset=checkpoint_file.offset,
-                )
+                if self._storage is None:
+                    source = torch.from_file(
+                        str(checkpoint_file.path),
+                        shared=False,
+                        size=checkpoint_file.nbytes,
+                        dtype=torch.uint8,
+                    )
+                else:
+                    source = self._storage.view(
+                        checkpoint_file.nbytes,
+                        offset=checkpoint_file.offset,
+                    )
                 tensor_file = SafetensorsBuffer(source)
                 self._files[checkpoint_file.name] = tensor_file
                 for name in tensor_file.layout.tensors:
@@ -273,7 +292,8 @@ class CanonicalCheckpoint:
         errors = [error for error in layout_errors if error is not None]
         if errors:
             self._files.clear()
-            self._storage.close()
+            if self._storage is not None:
+                self._storage.close()
             if world_size == 1 and layout_exception is not None:
                 raise layout_exception
             raise RuntimeError(
@@ -281,6 +301,7 @@ class CanonicalCheckpoint:
             )
 
         self.weight_map = indexed_weight_map or discovered_weight_map
+        self._checkpoint_files = files
         self.checkpoint_bytes = sum(file.nbytes for file in files)
         self.read_wall_s = time.perf_counter() - started
         self.version = version
@@ -297,6 +318,11 @@ class CanonicalCheckpoint:
 
     def begin_update(self, target_version: int) -> None:
         self._require_readable()
+        if self.storage != "memory":
+            raise RuntimeError(
+                "disk-backed canonical checkpoints must be advanced by the "
+                "disk checkpoint materializer"
+            )
         if target_version <= self.version:
             raise ValueError(
                 f"target version {target_version} must follow canonical "
@@ -353,16 +379,48 @@ class CanonicalCheckpoint:
     def stats(self) -> dict[str, int | float | str]:
         self._require_readable()
         return {
-            "storage": "host_shared_memory",
+            "storage": (
+                "host_shared_memory" if self._storage is not None else "host_local_disk"
+            ),
             "checkpoint_bytes": self.checkpoint_bytes,
-            "allocated_bytes": self._storage.nbytes,
+            "allocated_bytes": self._storage.nbytes if self._storage is not None else 0,
             "files": len(self._files),
             "tensors": len(self.weight_map),
-            "physical_host_copies": 1,
+            "physical_host_copies": 1 if self._storage is not None else 0,
             "read_wall_s": round(self.read_wall_s, 6),
             "version": self.version,
         }
 
+    def release_cached_pages(self) -> dict[str, int | float]:
+        """Release clean file-backed pages after compiling a disk checkpoint."""
+
+        started = time.perf_counter()
+        files = 0
+        if (
+            self.storage == "disk"
+            and self._host_rank == 0
+            and hasattr(os, "posix_fadvise")
+        ):
+            for checkpoint_file in self._checkpoint_files:
+                try:
+                    fd = os.open(checkpoint_file.path, os.O_RDONLY)
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    finally:
+                        os.close(fd)
+                    files += 1
+                except OSError:
+                    # Cache eviction is a memory-pressure hint, not a
+                    # checkpoint correctness requirement.
+                    pass
+        return {
+            "files": files,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+
     def close(self) -> None:
         self._files.clear()
-        self._storage.close()
+        self._checkpoint_files = []
+        if self._storage is not None:
+            self._storage.close()
+            self._storage = None

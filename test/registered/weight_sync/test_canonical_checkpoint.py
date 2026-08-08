@@ -73,6 +73,23 @@ def test_unindexed_checkpoint_discovers_tensor_locations(tmp_path):
         cached.close()
 
 
+def test_disk_checkpoint_uses_file_backed_views(tmp_path):
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    save_file({"a": expected}, tmp_path / "model.safetensors")
+
+    cached = CanonicalCheckpoint(tmp_path, host_group=None, storage="disk")
+    try:
+        torch.testing.assert_close(cached.get_tensor("a"), expected)
+        stats = cached.stats()
+        assert stats["storage"] == "host_local_disk"
+        assert stats["allocated_bytes"] == 0
+        assert stats["physical_host_copies"] == 0
+        with pytest.raises(RuntimeError, match="disk checkpoint materializer"):
+            cached.begin_update(1)
+    finally:
+        cached.close()
+
+
 def test_duplicate_unindexed_tensor_fails_loudly(tmp_path):
     save_file({"a": torch.arange(3)}, tmp_path / "a.safetensors")
     save_file({"a": torch.arange(3)}, tmp_path / "b.safetensors")

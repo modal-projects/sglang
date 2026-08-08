@@ -176,6 +176,9 @@ class SchedulerWeightUpdaterManager:
                 max_compile_group_bytes=int(
                     server_args.cpu_weight_cache_max_compile_group_gb * (1 << 30)
                 ),
+                canonical_checkpoint_dir=(
+                    server_args.cpu_weight_cache_canonical_checkpoint_dir
+                ),
             )
         except Exception:
             self._cpu_weight_cache_initialization_error = traceback.format_exc()

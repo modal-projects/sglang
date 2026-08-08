@@ -22,6 +22,7 @@ def _manager(*, cpu_cache=False):
     tp_worker.model_runner.cpu_weight_cache = None
     tp_worker.model_runner.server_args = SimpleNamespace(
         checkpoint_source_refresh_hook=None,
+        cpu_weight_cache_canonical_checkpoint_dir=None,
         cpu_weight_cache_max_compile_group_gb=8.0,
         enable_cpu_weight_cache=cpu_cache,
         weight_cache_mode="off",
@@ -91,6 +92,26 @@ def test_cpu_weight_cache_keeps_speculative_draft_weights_fixed():
     server_args.speculative_algorithm = "EAGLE"
 
     with mock.patch("sglang.srt.server_args.is_cuda", return_value=True):
+        server_args._handle_cpu_weight_cache()
+
+
+def test_disk_canonical_checkpoint_requires_cpu_weight_cache():
+    server_args = ServerArgs(model_path="dummy")
+    server_args.cpu_weight_cache_canonical_checkpoint_dir = "/local/checkpoint"
+
+    with pytest.raises(ValueError, match="requires --enable-cpu-weight-cache"):
+        server_args._handle_cpu_weight_cache()
+
+
+def test_disk_canonical_checkpoint_rejects_empty_path():
+    server_args = ServerArgs(model_path="dummy")
+    server_args.enable_cpu_weight_cache = True
+    server_args.cpu_weight_cache_canonical_checkpoint_dir = ""
+
+    with (
+        mock.patch("sglang.srt.server_args.is_cuda", return_value=True),
+        pytest.raises(ValueError, match="must not be empty"),
+    ):
         server_args._handle_cpu_weight_cache()
 
 
@@ -186,6 +207,7 @@ def test_cpu_stage_zero_initializes_rank_cache():
         checkpoint_dir="/base",
         host_group=manager.host_cpu_group,
         max_compile_group_bytes=8 << 30,
+        canonical_checkpoint_dir=None,
     )
     assert result.rank_stats[0]["stage"]["initialization"] == {"cache": "ready"}
 

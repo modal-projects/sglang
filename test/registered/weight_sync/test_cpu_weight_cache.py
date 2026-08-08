@@ -116,7 +116,13 @@ def _write_delta(
     )
 
 
-def _create_cache(tmp_path, monkeypatch, base_value):
+def _create_cache(
+    tmp_path,
+    monkeypatch,
+    base_value,
+    *,
+    canonical_checkpoint_dir=None,
+):
     base = tmp_path / "base"
     shared_memory = tmp_path / "shared-memory"
     base.mkdir()
@@ -128,6 +134,7 @@ def _create_cache(tmp_path, monkeypatch, base_value):
         torch.nn.Module(),
         max_compile_group_bytes=1024,
         host_group=None,
+        canonical_checkpoint_dir=canonical_checkpoint_dir,
     )
     with patch.object(host_memory, "_SHARED_MEMORY_ROOT", shared_memory):
         initialization = cache.initialize_from_checkpoint(base)
@@ -154,6 +161,36 @@ def test_cache_initializes_stages_and_commits(tmp_path, monkeypatch):
 
         cache.commit(1)
         assert cache.image.committed == [1]
+    finally:
+        cache.close()
+
+
+def test_disk_canonical_checkpoint_materializes_and_compiles(tmp_path, monkeypatch):
+    base = torch.arange(8, dtype=torch.uint8)
+    target = base.roll(1)
+    updates = tmp_path / "updates"
+    canonical = tmp_path / "canonical"
+    _write_delta(updates, base, target)
+    cache, initialization, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        canonical_checkpoint_dir=canonical,
+    )
+    try:
+        assert initialization["canonical_checkpoint"]["storage"] == "host_local_disk"
+        assert initialization["canonical_checkpoint"]["allocated_bytes"] == 0
+        assert initialization["canonical_materialization"]["target_version"] == 0
+
+        stats = cache.stage_delta_lineage(
+            checkpoint_source_dir=updates,
+            target_version=1,
+        )
+        assert stats["delta_setup"] is None
+        assert stats["delta_transform"] is None
+        assert stats["canonical_materialization"]["target_version"] == 1
+        assert cache.canonical_version == 1
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], target)
     finally:
         cache.close()
 

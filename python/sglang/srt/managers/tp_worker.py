@@ -141,11 +141,13 @@ class BaseTpWorker(ABC):
         checkpoint_dir: str,
         host_group: torch.distributed.ProcessGroup | None,
         max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
     ):
         return self.model_runner.weight_updater.initialize_cpu_weight_cache(
             checkpoint_dir=checkpoint_dir,
             host_group=host_group,
             max_compile_group_bytes=max_compile_group_bytes,
+            canonical_checkpoint_dir=canonical_checkpoint_dir,
         )
 
     def stage_cpu_weight_update_from_delta_lineage(

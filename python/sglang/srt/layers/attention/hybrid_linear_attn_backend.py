@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    uses_post_chunk_checkpoints: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -280,7 +282,12 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
-        if isinstance(self, Mamba2AttnBackend):
+        if self.uses_post_chunk_checkpoints:
+            # FlashInfer stores state *after* each complete chunk. Triton's `h`
+            # stores state *before* every chunk, including the first, so the two
+            # layouts need different per-request offsets and source indices.
+            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+        elif isinstance(self, Mamba2AttnBackend):
             num_h_states = extend_seq_lens // mamba_cache_chunk_size
         else:
             num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
@@ -305,6 +312,10 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_src = offset_masked[not_aligned] + (
             lens_masked[not_aligned] // mamba_cache_chunk_size
         )
+        if self.uses_post_chunk_checkpoints:
+            # The state at boundary N is checkpoint N / chunk_size - 1 in a
+            # post-chunk array. A tracked row always spans at least one chunk.
+            track_ssm_h_src -= 1
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (
@@ -361,9 +372,9 @@ class MambaAttnBackendBase(AttentionBackend):
         return mask.cpu()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
@@ -418,9 +429,9 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -675,16 +686,25 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
             if forward_metadata.track_ssm_h_src.numel() > 0:
+                assert h is not None, (
+                    "unaligned Mamba checkpoint tracking requires intermediate "
+                    "states from the prefill backend"
+                )
+                if h.ndim == ssm_states.ndim + 1:
+                    # Triton `h` is [1, checkpoints, heads, V, K].
+                    assert h.shape[0] == 1
+                    h = h.squeeze(0)
+                else:
+                    # FlashInfer checkpoints are [checkpoints, heads, V, K].
+                    assert h.ndim == ssm_states.ndim
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
@@ -709,12 +729,14 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if model_runner.server_args.enable_mamba_extra_buffer():
-            assert (
-                self.conv_states_shape[-1] < self.mamba_chunk_size
-            ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
+                f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            )
             assert (
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            ), (
+                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -778,11 +800,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if forward_batch.mamba_track_mask is not None:
-            if (
-                intermediate_states is not None
-                and forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
+            if forward_batch.mamba_track_mask.any():
                 self._track_mamba_state_extend(
                     forward_batch,
                     intermediate_states,
@@ -1043,9 +1061,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,

@@ -36,7 +36,12 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global \
+        _flashinfer_gdn_available, \
+        _flashinfer_chunk_gated_delta_rule, \
+        _flashinfer_gated_delta_rule_mtp, \
+        _flashinfer_gated_delta_rule_decode, \
+        _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -111,6 +116,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
+        # The SM100 prefill kernel can write recurrent state after every N
+        # tokens. SGLang uses those snapshots for extra-buffer radix caching.
+        self.supports_state_checkpoints = self.use_state_pool
         self.supports_target_verify = sm_major in (9, 10)
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -247,6 +255,50 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        return_intermediate_states = kwargs.get("return_intermediate_states", False)
+        checkpoint_every_n_tokens = (
+            kwargs.get("checkpoint_every_n_tokens", 0)
+            if return_intermediate_states
+            else 0
+        )
+        state_checkpoints = None
+        checkpoint_cu_starts = None
+        if return_intermediate_states:
+            if not self.supports_state_checkpoints:
+                raise RuntimeError(
+                    "FlashInfer GDN state checkpoints require the SM100 prefill kernel"
+                )
+            if checkpoint_every_n_tokens <= 0:
+                raise ValueError(
+                    "checkpoint_every_n_tokens must be positive when GDN state "
+                    "checkpoints are requested"
+                )
+
+            seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+            checkpoint_counts = torch.div(
+                seq_lens,
+                checkpoint_every_n_tokens,
+                rounding_mode="floor",
+            ).to(torch.int64)
+            checkpoint_cu_starts = torch.cat(
+                (
+                    torch.zeros(
+                        1,
+                        dtype=torch.int64,
+                        device=query_start_loc.device,
+                    ),
+                    checkpoint_counts.cumsum(dim=0),
+                )
+            )
+            # The exact count lives on the GPU. Allocate the small upper bound
+            # floor(total_tokens / interval), avoiding a host sync per GDN layer.
+            checkpoint_capacity = total_seq_len // checkpoint_every_n_tokens
+            state_checkpoints = torch.empty(
+                (checkpoint_capacity, *ssm_states.shape[1:]),
+                dtype=ssm_states.dtype,
+                device=ssm_states.device,
+            )
+
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
@@ -269,6 +321,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 cu_seqlens=query_start_loc,  # already int32
                 use_qk_l2norm_in_kernel=False,
                 output_state=output_state_fi,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
@@ -290,6 +345,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output_final_state=True,
                 cu_seqlens=query_start_loc.to(torch.int64),
                 use_qk_l2norm_in_kernel=False,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
 
         # Write back state to pool
@@ -302,9 +360,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
-        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
-        # h=None since FlashInfer doesn't provide intermediate states.
-        return core_attn_out, None, None
+        # State checkpoints use a compact post-chunk layout. The GDN attention
+        # backend advertises that layout so radix tracking applies its matching
+        # source-index formula instead of Triton's pre-chunk `h` formula.
+        return core_attn_out, None, state_checkpoints
 
     # ---- target_verify (MTP) ----
 

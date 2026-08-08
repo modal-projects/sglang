@@ -19,6 +19,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -68,7 +69,9 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
-    # Extra-buffer strategies need intermediate state checkpoints.
+    # Keep automatic selection conservative until checkpointed radix modes have
+    # dedicated end-to-end coverage. Explicit FlashInfer selection supports the
+    # state-checkpoint path below.
     if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
         return
 
@@ -328,13 +331,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
+                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            )
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.uses_post_chunk_checkpoints = getattr(
+            self.kernel_dispatcher.extend_kernel,
+            "supports_state_checkpoints",
+            False,
+        )
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -632,6 +640,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                return_intermediate_states=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
+                checkpoint_every_n_tokens=get_server_args().mamba_cache_chunk_size,
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -646,10 +659,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out
 

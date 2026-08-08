@@ -7,6 +7,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsFusedMoEMethod,
     CompressedTensorsLinearMethod,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+    CompressedTensorsW8A8Fp8MoE,
+)
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
@@ -46,6 +49,11 @@ class WeightStagingCapabilitiesTest(unittest.TestCase):
             CompressedTensorsFusedMoEMethod(None),
         ):
             self.assertEqual(method.weight_staging_postprocess_device(layer), "cpu")
+
+    def test_compressed_fp8_moe_supports_batched_expert_loading(self):
+        method = CompressedTensorsW8A8Fp8MoE.__new__(CompressedTensorsW8A8Fp8MoE)
+
+        self.assertTrue(method.supports_batched_weight_loading())
 
     def test_modelopt_fp4_uses_cuda_postprocessing(self):
         layer = torch.nn.Module()

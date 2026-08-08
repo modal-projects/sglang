@@ -190,6 +190,20 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _finalize_sampling_mask_output(result: GenerationBatchResult) -> None:
+        logits_output = result.logits_output
+        if logits_output is None:
+            return
+        pending = logits_output.next_token_sampling_mask_output
+        if pending is None:
+            return
+        (
+            logits_output.next_token_sampling_mask_idx,
+            logits_output.next_token_sampling_logprobs,
+        ) = pending.finalize()
+        logits_output.next_token_sampling_mask_output = None
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -206,6 +220,7 @@ class SchedulerBatchResultProcessor:
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
+            self._finalize_sampling_mask_output(result)
 
             (
                 logits_output,
@@ -826,6 +841,7 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        self._finalize_sampling_mask_output(result)
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,

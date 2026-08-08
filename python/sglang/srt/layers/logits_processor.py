@@ -184,6 +184,9 @@ class LogitsProcessorOutput:
     next_token_sampling_logprobs: Optional[
         List[Optional[Union[float, List[float]]]]
     ] = None
+    # DFlash keeps variable-length supports device-resident until the scheduler
+    # result stream performs its asynchronous D2H copy.
+    next_token_sampling_mask_output: Optional[Any] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

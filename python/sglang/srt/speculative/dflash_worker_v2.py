@@ -1867,15 +1867,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if needs_sampling_masks:
-            (
-                logits_output.next_token_sampling_mask_idx,
-                logits_output.next_token_sampling_logprobs,
-            ) = build_dflash_sampling_mask_output(
-                target_probs=target_probs,
-                output_token_ids=out_tokens,
-                output_lens=commit_lens,
-                return_sampling_masks=return_sampling_masks,
-                max_mask_tokens=get_exec().features.sampling_mask_max_tokens,
+            logits_output.next_token_sampling_mask_output = (
+                build_dflash_sampling_mask_output(
+                    target_probs=target_probs,
+                    output_token_ids=out_tokens,
+                    output_lens=commit_lens,
+                    return_sampling_masks=return_sampling_masks,
+                    max_mask_tokens=get_exec().features.sampling_mask_max_tokens,
+                )
             )
 
         if batch.return_logprob:

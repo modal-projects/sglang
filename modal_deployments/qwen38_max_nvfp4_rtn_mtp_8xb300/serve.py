@@ -1,57 +1,75 @@
-"""Qwen3.8-Max-FP8 (Qwen's official FP8 checkpoint) on 2 nodes x 8 B300, TP16.
+"""Qwen3.8-Max NVFP4-RTN + NEXTN MTP on one 8xB300 node, TP8.
 
-Validated 2026-08-07: healthy serving, GPQA-Diamond 178/198 (89.9%).
+Speculative (MTP) throughput config: NEXTN draft head (steps 3, eagle-topk 1,
+4 draft tokens) with linear-attention replay-SSM spec support, decode CUDA
+graphs and running requests capped at 32. Same quality recipe as the no-spec
+reference config. Baseline validated 2026-08-07 (GPQA-Diamond
+175/198 raw); with the official chat template below, the blessed recipe
+measures 91.9-92.9% strict (vs published 92.6) -- the template's
+reasoning_effort=xhigh default is worth ~3.5 points.
+
+CHECKPOINT: Qwen3.8-Max-NVFP4-RTN-v2 (round-to-nearest, static activation
+scales, input_scale=1.0). A controlled A/B against the calibrated RadixArk
+NVFP4 checkpoint showed a statistical tie (McNemar p=0.39-0.73), so RTN-v2
+is the standard checkpoint. Per-token activation quant stays OFF on the
+trtllm backend: the flashinfer trtllm-gen per-token path miscomputes at this
+model's shape (512 experts / topk 10 / hidden 8192), collapsing output to
+"!!!" -- hence SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=0 below.
+
+Perf stack (RadixArk drop, PRs #5-#8): Split-K BF16 GEMM, fused GDN
+decode, and the CuTeDSL fused finalize+AllReduce
+(SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1) -- RadixArk's validated
+launch pairing on 8xB300 TP8.
 
 To deploy: set APP_NAME below (it ships unset so a checked-in copy can never
 redeploy someone else's app), then run (runc is required for sane
-weight-load times):
+weight-load times; fastsafetensors + enable_gds:false is the only tractable
+loader on these FUSE volumes):
 
   MODAL_FUNCTION_RUNTIME=runc MODAL_PROFILE=modal-labs MODAL_ENVIRONMENT=qwen-bringup \
-    uv run modal deploy modal_deployments/qwen38_max_fp8_2x8b300/serve.py
+    uv run modal deploy modal_deployments/qwen38_max_nvfp4_rtn_mtp_8xb300/serve.py
 """
 
 from __future__ import annotations
 
-import os
-
 import modal
-import modal.experimental
 
 MINUTES = 60
 PORT = 8000
-DIST_PORT = 25000
 
-NUM_NODES = 2
-TP_SIZE = 16
+TP_SIZE = 8
 GPU = "B300:8"
 
-HF_CACHE_MOUNT = "/hf-cache"
-MODEL_PATH = (
-    f"{HF_CACHE_MOUNT}/hub/models--Qwen--Qwen3.8-Max-FP8/snapshots/"
-    "93507eee0cd80e390c22dafcb0dfe1aa41661f27"
-)
-SERVED_MODEL_NAME = "qwen3.8-max-fp8"
-STARTUP_TIMEOUT = 120 * MINUTES
+# NVFP4 routed experts (92 main layers), BF16 everything else incl. the
+# mtp.* head; needs 8xB300 (2.3 TB).
+MODEL_MOUNT = "/model"
+MODEL_PATH = f"{MODEL_MOUNT}/Qwen3.8-Max-NVFP4-RTN-v2"
+SERVED_MODEL_NAME = "qwen3.8-max-nvfp4-rtn-mtp"
+# 3h: volume throughput degrades under concurrent readers; a 1.5TB load has
+# been observed to decelerate past a 90-min budget mid-load.
+STARTUP_TIMEOUT = 180 * MINUTES
 
-# Set your own app name, e.g. "qwen38-max-fp8-2x8b300-<you>". Ships unset
-# so deploying this file as-is can never redeploy a live app.
+# Set your own app name, e.g. "qwen38-max-nvfp4-rtn-mtp-8xb300-<you>". Ships
+# unset so deploying this file as-is can never redeploy a live app.
 APP_NAME = None
 if not APP_NAME:
     raise SystemExit("Edit APP_NAME in this file before deploying.")
 
 # sglang tree checked out over the nightly image. Top of the RadixArk perf
-# stack (PRs #5-#8, includes the language_model_only and
-# multinode-fastsafetensors fixes); flip back to "qwen38-bringup" once the
-# stack merges.
+# stack (PRs #5-#8); flip back to "qwen38-bringup" once the stack merges.
 # Exact commit pin (branch jamesl/qwen38-cutedsl-ar-fusion): the image
 # fetch layer is cache-keyed on this string, so a moving branch name
 # would silently reuse a stale cached checkout. Bump the sha to ship
 # new code; flip to a qwen38-bringup pin once the stack merges.
 SGLANG_REF = "c7966966075fb628821dfcffb57d8da420474e78"
 
-# Carries the trtllm-gen MoE routing NaN fix (#3946, absent from every
-# stable release) and the PR #4266 kernel the Split-K BF16 GEMM path
-# imports; verified 2026-08-08 by tag ancestry.
+# One pin satisfies both requirements (verified 2026-08-08 by tag ancestry):
+# the trtllm-gen MoE routing NaN fix (#3946, absent from every stable
+# release) and the PR #4266 direct dense BF16 GEMM kernel the Split-K path
+# imports. cutlass-dsl[cu13] >= 4.7.0: the [cu13] extra supplies the
+# CUDA-13 NVVM bindings -- without it cute-to-nvvm ICEs at sm_103a; the
+# floor is because the CuTe DSL kernels call
+# PipelineTmaAsync.create(enable_multicast_signaling=...).
 FLASHINFER_PIN = "0.6.18.dev20260807"
 
 serving_image = (
@@ -76,8 +94,13 @@ serving_image = (
     )
     .env({
         "HF_HUB_OFFLINE": "1",
-        # sglang's mq broadcaster wedges across nodes
-        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
+        # static scales: the trtllm-gen per-token path is broken at this
+        # model's shape (see module docstring)
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        # RadixArk's validated launch pairing: deferred MoE finalize handed
+        # off to the CuTeDSL fused finalize+AllReduce kernel (PR #8)
+        "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE": "1",
+        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": "1",
         # bad workers can come up NaN-poisoned; sanitize + smoke every boot
         "SGLANG_SANITIZE_NAN_LOGITS": "1",
         # required for the nightly wheel pin above
@@ -263,166 +286,104 @@ OFFICIAL_CHAT_TEMPLATE = r"""{%- set image_count = namespace(value=0) %}
 
 SERVER_ARGS = {
     "--served-model-name": SERVED_MODEL_NAME,
-    "--quantization": "fp8",
+    "--quantization": "modelopt_fp4",
+    "--dtype": "bfloat16",
     "--attention-backend": "trtllm_mha",
     "--page-size": "64",
     "--linear-attn-prefill-backend": "flashinfer",
-    # the flashinfer GDN decode kernel misaligns (32B) at tp16
-    "--linear-attn-decode-backend": "triton",
-    "--mamba-radix-cache-strategy": "extra_buffer",
+    "--linear-attn-decode-backend": "flashinfer",
     "--mamba-ssm-dtype": "bfloat16",
+    "--mamba-radix-cache-strategy": "extra_buffer",
+    "--bf16-gemm-backend": "cutedsl",
     "--reasoning-parser": "qwen3",
     "--tool-call-parser": "qwen3_coder",
+    # 8192 keeps flashinfer GDN prefill inside its validated envelope
     "--chunked-prefill-size": "8192",
     "--max-prefill-tokens": "8192",
-    "--context-length": "131072",
-    "--cuda-graph-max-bs": "16",
+    # native window per config.json (no rope_scaling shipped anywhere)
+    "--context-length": "262144",
+    "--cuda-graph-backend-prefill": "breakable",
+    "--cuda-graph-max-bs-prefill": "8192",
+    "--cuda-graph-backend-decode": "full",
+    "--cuda-graph-max-bs-decode": "32",
     "--dist-timeout": "3600",
-    "--max-running-requests": "16",
-    "--mem-fraction-static": "0.80",
+    "--max-running-requests": "32",
+    "--mem-fraction-static": "0.85",
     "--moe-runner-backend": "flashinfer_trtllm",
-    "--moe-a2a-backend": "none",
+    # NEXTN MTP: mtp.* head ships in the checkpoint (BF16); replay-SSM spec
+    # lets the GDN/linear-attn layers participate in draft verification
+    "--speculative-algorithm": "NEXTN",
+    "--speculative-num-steps": "3",
+    "--speculative-eagle-topk": "1",
+    "--speculative-num-draft-tokens": "4",
+    "--enable-linear-replayssm-spec": "",
     # model sampling default; compact JSON -- the endpoint wrapper splits
     # arg values on whitespace
     "--preferred-sampling-params": '{"top_k":20}',
+    "--decode-log-interval": "1",
+    "--enable-cache-report": "",
     "--trust-remote-code": "",
     "--load-format": "fastsafetensors",
-    # GDS off: cuFile opens fail on FUSE volumes ("Error opening file");
-    # compact JSON -- the endpoint wrapper splits arg values on whitespace
+    # GDS off: cuFile opens fail on FUSE volumes ("Error opening file")
     "--model-loader-extra-config": '{"enable_gds":false}',
-    # the per-rank runtime fusion fallback is rank-asymmetric -> deadlock;
-    # disable symmetrically at launch (no NVL72 on B300)
-    "--enforce-disable-flashinfer-allreduce-fusion": "",
 }
 
 app = modal.App(name=APP_NAME)
 
 
-def _pin_sockets_to_cluster_iface(my_ip: str) -> None:
-    """Pin NCCL/GLOO/TP sockets to the interface carrying the cluster IP;
-    otherwise NCCL free-picks one that blackholes on Modal's cluster fabric."""
-    import fcntl
-    import ipaddress
-    import socket
-    import struct
-
-    def _iface_ipv4(name: str):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            return socket.inet_ntoa(fcntl.ioctl(
-                s.fileno(), 0x8915,  # SIOCGIFADDR
-                struct.pack("256s", name[:15].encode()))[20:24])
-        except OSError:
-            return None
-        finally:
-            s.close()
-
-    addrs = {name: _iface_ipv4(name) for _, name in socket.if_nameindex()}
-    iface = next((n for n, a in addrs.items() if a == my_ip), None)
-    # fall back to the 10.100.0.0/16 cluster subnet, then eth0
-    iface = iface or next(
-        (n for n, a in addrs.items() if a and a.startswith("10.100.")), "eth0"
-    )
-    os.environ["NCCL_SOCKET_IFNAME"] = iface
-    os.environ["GLOO_SOCKET_IFNAME"] = iface
-    os.environ["TP_SOCKET_IFNAME"] = iface
-    os.environ["NCCL_SOCKET_FAMILY"] = (
-        "AF_INET6" if ipaddress.ip_address(my_ip).version == 6 else "AF_INET"
-    )
-    os.environ["NCCL_IB_DISABLE"] = "0"
-    print(f"cluster networking: iface={iface} my_ip={my_ip}")
-
-
-@app.cls(
+@app.server(
     image=serving_image,
     gpu=GPU,
     cpu=32,
     memory=262144,
-    volumes={
-        HF_CACHE_MOUNT: modal.Volume.from_name("huggingface-cache").read_only(),
-    },
-    min_containers=NUM_NODES,
-    timeout=120 * MINUTES,
-    experimental_options={"override_eof_timeout": 30 * 60},
-)
-@modal.experimental.clustered(size=NUM_NODES, rdma=True)
-@modal.experimental.http_server(
+    min_containers=1,
+    max_containers=1,
+    scaledown_window=10 * MINUTES,
     port=PORT,
-    proxy_regions=["us-west"],
+    routing_region="us-west",
+    unauthenticated=True,
     exit_grace_period=25,
     startup_timeout=STARTUP_TIMEOUT,
+    target_concurrency=32,
+    volumes={
+        MODEL_MOUNT: modal.Volume.from_name("qwen38-max-nvfp4-rtn"),
+    },
 )
 class Server:
     @modal.enter()
     def startup(self):
-        import subprocess
-        import time
-
         from autoinference_utils.endpoint import (
             SGLangEndpoint,
             warmup_chat_completions,
         )
 
-        cluster_info = modal.experimental.get_cluster_info()
-        rank = cluster_info.rank
-        leader_ip = cluster_info.container_ipv4_ips[0]
-        _pin_sockets_to_cluster_iface(cluster_info.container_ipv4_ips[rank])
-
         with open("/tmp/chat_template.jinja", "w") as f:
             f.write(OFFICIAL_CHAT_TEMPLATE)
         SERVER_ARGS["--chat-template"] = "/tmp/chat_template.jinja"
-
-        dist_args = {
-            "--tp": str(TP_SIZE),
-            "--nnodes": str(NUM_NODES),
-            "--node-rank": str(rank),
-            "--dist-init-addr": f"{leader_ip}:{DIST_PORT}",
-        }
-
-        if rank == 0:
-            self.endpoint = SGLangEndpoint(
-                model_path=MODEL_PATH,
-                worker_port=PORT,
-                tp=TP_SIZE,
-                extra_server_args=SERVER_ARGS | dist_args,
-                health_timeout=STARTUP_TIMEOUT,
-                health_poll_interval=10.0,
-            )
-            self.endpoint.start()
-            warmup_chat_completions(
-                port=PORT,
-                payload={
-                    "model": SERVED_MODEL_NAME,
-                    "messages": [{"role": "user", "content": "Reply with exactly OK."}],
-                    "max_tokens": 8,
-                    "temperature": 0,
-                },
-                successful_requests=2,
-                request_timeout=600.0,
-            )
-            print(f"{SERVED_MODEL_NAME} (tp{TP_SIZE}, {NUM_NODES}x{GPU}) ready.")
-        else:
-            # non-leader ranks run the worker directly; only rank 0 serves
-            # HTTP, so rank 0's health gate covers tp-group readiness.
-            args = []
-            for k, v in (SERVER_ARGS | dist_args).items():
-                args.append(k)
-                if v != "":
-                    args.append(v)
-            self.worker = subprocess.Popen([
-                "python", "-m", "sglang.launch_server",
-                "--model-path", MODEL_PATH,
-                "--host", "0.0.0.0", "--port", str(PORT),
-            ] + args)
-            time.sleep(30)  # fail fast on bad args
-            if self.worker.poll() is not None:
-                raise RuntimeError(
-                    f"[rank {rank}] worker exited early: {self.worker.returncode}"
-                )
+        print(f"Starting SGLang with server args: {SERVER_ARGS}")
+        self.endpoint = SGLangEndpoint(
+            model_path=MODEL_PATH,
+            worker_port=PORT,
+            tp=TP_SIZE,
+            extra_server_args=SERVER_ARGS,
+            health_timeout=STARTUP_TIMEOUT,
+            health_poll_interval=10.0,
+        )
+        self.endpoint.start()
+        warmup_chat_completions(
+            port=PORT,
+            payload={
+                "model": SERVED_MODEL_NAME,
+                "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+                "max_tokens": 8,
+                "temperature": 0,
+            },
+            successful_requests=2,
+            request_timeout=180.0,
+        )
+        print(f"{SERVED_MODEL_NAME} ({GPU}) is ready.")
 
     @modal.exit()
     def stop(self):
         if hasattr(self, "endpoint"):
             self.endpoint.stop()
-        if hasattr(self, "worker") and self.worker.poll() is None:
-            self.worker.terminate()

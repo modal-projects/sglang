@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -24,6 +25,68 @@ _DIRECT_IO_FALLBACK_ERRORS = {
 class PositionalReadResult:
     wall_s: float
     direct_io: bool
+
+
+def read_exact(reader: Any, nbytes: int) -> bytearray:
+    """Read exactly ``nbytes`` from a binary stream."""
+
+    result = bytearray(nbytes)
+    view = memoryview(result)
+    position = 0
+    while position < nbytes:
+        nread = reader.readinto(view[position:])
+        if not nread:
+            raise EOFError(
+                "unexpected end of compressed payload: "
+                f"expected={nbytes} actual={position}"
+            )
+        position += nread
+    return result
+
+
+class PositionalFileRangeReader:
+    """Expose one immutable file range without advancing a shared descriptor."""
+
+    def __init__(
+        self,
+        fd: int,
+        offset: int,
+        nbytes: int,
+        path: str | Path,
+        *,
+        max_read_bytes: int,
+    ):
+        if offset < 0 or nbytes < 0 or max_read_bytes <= 0:
+            raise ValueError("positional file ranges must be non-negative and bounded")
+        self.fd = fd
+        self.offset = offset
+        self.nbytes = nbytes
+        self.path = Path(path)
+        self.max_read_bytes = max_read_bytes
+        self.position = 0
+        self.read_wall_s = 0.0
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        remaining = self.nbytes - self.position
+        if remaining == 0:
+            return b""
+        size = min(
+            remaining,
+            self.max_read_bytes if size < 0 else size,
+            self.max_read_bytes,
+        )
+        started = time.perf_counter()
+        data = os.pread(self.fd, size, self.offset + self.position)
+        self.read_wall_s += time.perf_counter() - started
+        if not data:
+            raise EOFError(
+                f"unexpected EOF reading {self.path}: offset={self.offset} "
+                f"expected={self.nbytes} actual={self.position}"
+            )
+        self.position += len(data)
+        return data
 
 
 def read_file_into_tensor(

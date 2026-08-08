@@ -49,6 +49,7 @@ def test_indexed_checkpoint_is_cached_once_with_zero_copy_views(tmp_path):
         assert stats["tensors"] == 2
         assert stats["physical_host_copies"] == 1
         assert stats["allocated_bytes"] >= stats["checkpoint_bytes"]
+        assert stats["version"] == 0
         assert list(shared_memory.iterdir()) == []
     finally:
         cached.close()
@@ -86,3 +87,26 @@ def test_index_must_match_shard_contents(tmp_path):
 
     with pytest.raises(ValueError, match="does not match checkpoint shards"):
         CanonicalCheckpoint(tmp_path, host_group=None)
+
+
+def test_update_lifecycle_hides_partial_checkpoint(tmp_path):
+    shared_memory = tmp_path / "shared-memory"
+    shared_memory.mkdir()
+    save_file({"a": torch.arange(3)}, tmp_path / "model.safetensors")
+
+    with patch.object(host_memory, "_SHARED_MEMORY_ROOT", shared_memory):
+        cached = CanonicalCheckpoint(tmp_path, host_group=None, version=4)
+    try:
+        cached.begin_update(5)
+        with pytest.raises(RuntimeError, match="invalid"):
+            cached.get_tensor("a")
+        cached.finish_update(5)
+        assert cached.version == 5
+        torch.testing.assert_close(cached.get_tensor("a"), torch.arange(3))
+
+        cached.begin_update(6)
+        cached.fail_update("checksum mismatch")
+        with pytest.raises(RuntimeError, match="checksum mismatch"):
+            cached.get_tensor("a")
+    finally:
+        cached.close()

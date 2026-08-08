@@ -119,7 +119,10 @@ class CanonicalCheckpoint:
         checkpoint_dir: str | Path,
         *,
         host_group: torch.distributed.ProcessGroup | None,
+        version: int = 0,
     ):
+        if version < 0:
+            raise ValueError("canonical checkpoint version must be non-negative")
         indexed_weight_map, files, capacity, signature = _checkpoint_manifest(
             checkpoint_dir
         )
@@ -235,20 +238,75 @@ class CanonicalCheckpoint:
         self.weight_map = indexed_weight_map or discovered_weight_map
         self.checkpoint_bytes = sum(file.nbytes for file in files)
         self.read_wall_s = time.perf_counter() - started
+        self.version = version
+        self.valid = True
+        self.updating = False
+        self.invalid_reason: str | None = None
+
+    def _require_readable(self) -> None:
+        if not self.valid:
+            reason = f": {self.invalid_reason}" if self.invalid_reason else ""
+            raise RuntimeError(f"canonical checkpoint is invalid{reason}")
+        if self.updating:
+            raise RuntimeError("canonical checkpoint update is in progress")
+
+    def begin_update(self, target_version: int) -> None:
+        self._require_readable()
+        if target_version <= self.version:
+            raise ValueError(
+                f"target version {target_version} must follow canonical "
+                f"version {self.version}"
+            )
+        self.valid = False
+        self.updating = True
+        self.invalid_reason = (
+            f"update from version {self.version} to {target_version} is incomplete"
+        )
+
+    def get_update_tensor_bytes(self, name: str) -> torch.Tensor:
+        if not self.updating:
+            raise RuntimeError("canonical checkpoint update is not in progress")
+        filename = self.weight_map.get(name)
+        if filename is None:
+            raise KeyError(f"canonical checkpoint has no tensor {name!r}")
+        return self._files[filename].get_tensor_bytes(name)
+
+    def finish_update(self, target_version: int) -> None:
+        if not self.updating:
+            raise RuntimeError("canonical checkpoint update is not in progress")
+        if target_version <= self.version:
+            raise ValueError(
+                f"target version {target_version} must follow canonical "
+                f"version {self.version}"
+            )
+        self.version = target_version
+        self.invalid_reason = None
+        self.updating = False
+        self.valid = True
+
+    def fail_update(self, reason: str) -> None:
+        if not self.updating:
+            raise RuntimeError("canonical checkpoint update is not in progress")
+        self.invalid_reason = reason
+        self.updating = False
+        self.valid = False
 
     def get_tensor(self, name: str) -> torch.Tensor:
+        self._require_readable()
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"canonical checkpoint has no tensor {name!r}")
         return self._files[filename].get_tensor(name)
 
     def get_tensor_bytes(self, name: str) -> torch.Tensor:
+        self._require_readable()
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"canonical checkpoint has no tensor {name!r}")
         return self._files[filename].get_tensor_bytes(name)
 
     def stats(self) -> dict[str, int | float | str]:
+        self._require_readable()
         return {
             "storage": "host_shared_memory",
             "checkpoint_bytes": self.checkpoint_bytes,
@@ -257,6 +315,7 @@ class CanonicalCheckpoint:
             "tensors": len(self.weight_map),
             "physical_host_copies": 1,
             "read_wall_s": round(self.read_wall_s, 6),
+            "version": self.version,
         }
 
     def close(self) -> None:

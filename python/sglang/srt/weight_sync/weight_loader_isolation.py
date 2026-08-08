@@ -88,7 +88,8 @@ def build_weight_module_groups(
             for name, child in module._modules.items()
             if child is not None and subtree_keys[f"{prefix}{name}"]
         ]
-        if nbytes <= max_group_bytes or not children:
+        indivisible = bool(getattr(module, "weight_staging_indivisible", False))
+        if indivisible or nbytes <= max_group_bytes or not children:
             if nbytes > max_group_bytes:
                 logger.warning(
                     "Indivisible weight module exceeds compilation budget: "

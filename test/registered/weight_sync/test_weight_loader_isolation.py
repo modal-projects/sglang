@@ -34,6 +34,15 @@ class _GroupedModel(torch.nn.Module):
         self.layers = torch.nn.ModuleList([_DerivedBlock(8), _DerivedBlock(12)])
 
 
+class _IndivisibleBlock(torch.nn.Module):
+    weight_staging_indivisible = True
+
+    def __init__(self):
+        super().__init__()
+        self.left = _DerivedBlock(8)
+        self.right = _DerivedBlock(12)
+
+
 class _WrappedModel(torch.nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={"hf_layers.": "language_model.layers."},
@@ -71,6 +80,20 @@ def test_groups_support_a_model_with_root_weights():
     proxy, shadow = build_weight_loader_proxy(model, "")
     assert proxy is shadow
     assert shadow.weight.data_ptr() != model.weight.data_ptr()
+
+
+def test_indivisible_group_may_exceed_the_byte_target():
+    model = torch.nn.Module()
+    model.block = _IndivisibleBlock()
+
+    groups = build_weight_module_groups(
+        model,
+        max_group_bytes=16,
+        device_type="cpu",
+    )
+
+    assert [group.path for group in groups] == ["block"]
+    assert groups[0].nbytes > 16
 
 
 def test_groups_exclude_non_persistent_runtime_buffers():

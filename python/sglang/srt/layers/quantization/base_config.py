@@ -103,6 +103,10 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
+    def supports_batched_weight_loading(self) -> bool:
+        """Return whether independent expert-loader writes may be deferred."""
+        return False
+
     def create_weights(
         self,
         layer: torch.nn.Module,

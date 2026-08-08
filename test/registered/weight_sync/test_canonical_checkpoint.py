@@ -8,6 +8,7 @@ import torch
 from safetensors.torch import save_file
 
 import sglang.srt.weight_sync.host_local_buffer as host_memory
+from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
 from sglang.srt.weight_sync.canonical_checkpoint import CanonicalCheckpoint
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -43,7 +44,9 @@ def test_indexed_checkpoint_is_cached_once_with_zero_copy_views(tmp_path):
         cached = CanonicalCheckpoint(checkpoint, host_group=None)
     try:
         for name, tensor in expected.items():
-            torch.testing.assert_close(cached.get_tensor(name), tensor)
+            cached_tensor = cached.get_tensor(name)
+            torch.testing.assert_close(cached_tensor, tensor)
+            assert getattr(cached_tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False)
         stats = cached.stats()
         assert stats["files"] == 2
         assert stats["tensors"] == 2
@@ -79,7 +82,9 @@ def test_disk_checkpoint_uses_file_backed_views(tmp_path):
 
     cached = CanonicalCheckpoint(tmp_path, host_group=None, storage="disk")
     try:
-        torch.testing.assert_close(cached.get_tensor("a"), expected)
+        cached_tensor = cached.get_tensor("a")
+        torch.testing.assert_close(cached_tensor, expected)
+        assert getattr(cached_tensor, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False)
         stats = cached.stats()
         assert stats["storage"] == "host_local_disk"
         assert stats["allocated_bytes"] == 0

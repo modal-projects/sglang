@@ -508,6 +508,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,

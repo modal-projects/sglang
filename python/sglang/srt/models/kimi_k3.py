@@ -10,6 +10,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -94,6 +95,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -2751,6 +2753,23 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        batched_weight_loads = defaultdict(list)
+
+        def load_weight(weight_loader, *args, **kwargs):
+            loaded_weight = args[1]
+            owner = getattr(weight_loader, "__self__", None)
+            batch_method = getattr(owner, "batched_weight_loader", None)
+            supports_batching = getattr(owner, "supports_batched_weight_loading", None)
+            if (
+                getattr(loaded_weight, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False)
+                and callable(batch_method)
+                and callable(supports_batching)
+                and supports_batching()
+                and weight_loader == getattr(owner, "weight_loader", None)
+            ):
+                batched_weight_loads[owner].append((args, kwargs))
+            else:
+                weight_loader(*args, **kwargs)
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
@@ -2822,7 +2841,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                load_weight(weight_loader, param, loaded_weight, shard_id)
                 break
             else:
                 expert_mapping_candidates = _expert_mapping_candidates(
@@ -2846,7 +2865,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                         break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(
+                    load_weight(
+                        weight_loader,
                         param,
                         loaded_weight,
                         name,
@@ -2870,9 +2890,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, loaded_weight, **kwargs)
+                    load_weight(weight_loader, param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        if batched_weight_loads:
+            with ThreadPoolExecutor() as executor:
+                for owner, calls in batched_weight_loads.items():
+                    owner.batched_weight_loader(calls, executor=executor)
         self.post_load_weights(weight_names=loaded_params)
 
     def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):

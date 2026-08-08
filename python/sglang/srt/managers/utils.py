@@ -147,6 +147,10 @@ class GenerationBatchResult:
         if self.cap_lens is not None:
             self.cap_lens = _async_d2h(self.cap_lens)
 
+        sampling_mask_output = self.logits_output.next_token_sampling_mask_output
+        if sampling_mask_output is not None:
+            sampling_mask_output.map_device_tensors(_async_d2h)
+
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
         # all device->host copying and lifetime safety lives in one place.

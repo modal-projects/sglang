@@ -17,6 +17,30 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDFlashSamplingMask(CustomTestCase):
+    def test_sampling_mask_stays_tensor_backed_until_result_processing(self):
+        target_probs = torch.tensor([[[0.25, 0.0, 0.75]]])
+        pending = build_dflash_sampling_mask_output(
+            target_probs=target_probs,
+            output_token_ids=torch.tensor([[2]]),
+            output_lens=torch.tensor([1]),
+            return_sampling_masks=[True],
+        )
+
+        copied = []
+
+        def record_copy(tensor):
+            copied.append(tensor)
+            return tensor.clone()
+
+        pending.map_device_tensors(record_copy)
+
+        self.assertEqual(len(copied), 4)
+        self.assertEqual(pending.support_mask.dtype, torch.bool)
+        self.assertEqual(pending.support_mask.shape, target_probs.shape)
+        masks, logprobs = pending.finalize()
+        self.assertEqual(masks, [[[0, 2]]])
+        self.assertAlmostEqual(logprobs[0][0], math.log(0.75))
+
     def test_sparse_top_k_then_top_p_matches_dense_reference(self):
         logits = torch.tensor(
             [
@@ -99,12 +123,13 @@ class TestDFlashSamplingMask(CustomTestCase):
         )
 
         output_token_ids = expected.argmax(dim=-1)
-        masks, logprobs = build_dflash_sampling_mask_output(
+        pending = build_dflash_sampling_mask_output(
             target_probs=actual,
             output_token_ids=output_token_ids,
             output_lens=torch.tensor([2, 2]),
             return_sampling_masks=[True, True],
         )
+        masks, logprobs = pending.finalize()
         for request_idx in range(2):
             for token_idx in range(2):
                 expected_support = (
@@ -128,12 +153,13 @@ class TestDFlashSamplingMask(CustomTestCase):
                 [[0.0, 0.0, 0.4, 0.6, 0.0], [0, 1, 0, 0, 0], [0, 0, 1, 0, 0]],
             ]
         )
-        masks, logprobs = build_dflash_sampling_mask_output(
+        pending = build_dflash_sampling_mask_output(
             target_probs=target_probs,
             output_token_ids=torch.tensor([[3, 4, 0], [3, 1, 2]]),
             output_lens=torch.tensor([2, 1]),
             return_sampling_masks=[True, False],
         )
+        masks, logprobs = pending.finalize()
 
         self.assertEqual(masks, [[[1, 3], [0, 2, 4]], None])
         self.assertAlmostEqual(logprobs[0][0], math.log(0.75))
@@ -141,12 +167,13 @@ class TestDFlashSamplingMask(CustomTestCase):
         self.assertIsNone(logprobs[1])
 
     def test_greedy_masks_are_singletons(self):
-        masks, logprobs = build_dflash_sampling_mask_output(
+        pending = build_dflash_sampling_mask_output(
             target_probs=None,
             output_token_ids=torch.tensor([[3, 4], [2, 1]]),
             output_lens=torch.tensor([2, 1]),
             return_sampling_masks=[True, True],
         )
+        masks, logprobs = pending.finalize()
 
         self.assertEqual(masks, [[[3], [4]], [[2]]])
         self.assertEqual(logprobs, [[0.0, 0.0], [0.0]])
@@ -170,12 +197,13 @@ class TestDFlashSamplingMask(CustomTestCase):
                 target_probs[request_idx, token_idx, selected_id] = selected_prob
                 target_probs[request_idx, token_idx, other_id] = 1 - selected_prob
 
-        masks, logprobs = build_dflash_sampling_mask_output(
+        pending = build_dflash_sampling_mask_output(
             target_probs=target_probs,
             output_token_ids=output_token_ids,
             output_lens=torch.tensor([4, 2, 1]),
             return_sampling_masks=[True, False, True],
         )
+        masks, logprobs = pending.finalize()
 
         self.assertEqual(len(masks[0]), 4)
         self.assertIsNone(masks[1])

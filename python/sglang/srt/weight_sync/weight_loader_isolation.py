@@ -24,31 +24,6 @@ class WeightModuleGroup:
     nbytes: int
 
 
-def batch_weight_module_groups(
-    groups: list[WeightModuleGroup],
-    *,
-    max_batch_bytes: int,
-) -> list[list[tuple[int, WeightModuleGroup]]]:
-    """Pack adjacent groups without exceeding the configured byte budget."""
-
-    if max_batch_bytes <= 0:
-        raise ValueError("weight compilation batch budget must be positive")
-
-    batches: list[list[tuple[int, WeightModuleGroup]]] = []
-    current: list[tuple[int, WeightModuleGroup]] = []
-    current_bytes = 0
-    for group_index, group in enumerate(groups, start=1):
-        if current and current_bytes + group.nbytes > max_batch_bytes:
-            batches.append(current)
-            current = []
-            current_bytes = 0
-        current.append((group_index, group))
-        current_bytes += group.nbytes
-    if current:
-        batches.append(current)
-    return batches
-
-
 def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     storage = tensor.untyped_storage()
     return tensor.device.index, storage.data_ptr(), storage.nbytes()

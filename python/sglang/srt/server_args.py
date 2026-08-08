@@ -3438,6 +3438,12 @@ class ServerArgs:
         "weight staging. An indivisible module may exceed the bound.",
         NS("model"),
     ] = 8.0
+    cpu_weight_cache_canonical_checkpoint_dir: A[
+        Optional[str],
+        "Host-local directory for the mutable canonical checkpoint used by "
+        "CPU weight staging. By default the canonical checkpoint stays in RAM.",
+        NS("model"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -7264,8 +7270,20 @@ class ServerArgs:
         )
 
     def _handle_cpu_weight_cache(self) -> None:
+        if (
+            self.cpu_weight_cache_canonical_checkpoint_dir is not None
+            and not self.enable_cpu_weight_cache
+        ):
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir requires "
+                "--enable-cpu-weight-cache"
+            )
         if not self.enable_cpu_weight_cache:
             return
+        if self.cpu_weight_cache_canonical_checkpoint_dir == "":
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir must not be empty"
+            )
         if not is_cuda():
             raise ValueError("--enable-cpu-weight-cache requires CUDA")
         if self.cpu_weight_cache_max_compile_group_gb <= 0:

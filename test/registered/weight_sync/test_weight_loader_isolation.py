@@ -6,7 +6,6 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.weight_loader_isolation import (
-    batch_weight_module_groups,
     build_weight_loader_proxy,
     build_weight_module_groups,
     clone_weight_module,
@@ -47,7 +46,7 @@ class _WrappedModel(torch.nn.Module):
         self.language_model = _GroupedModel()
 
 
-def test_groups_are_bounded_storage_complete_and_batchable():
+def test_groups_are_bounded_and_storage_complete():
     model = _GroupedModel()
     groups = build_weight_module_groups(
         model,
@@ -57,9 +56,6 @@ def test_groups_are_bounded_storage_complete_and_batchable():
 
     assert [group.path for group in groups] == ["layers.0", "layers.1"]
     assert all(group.nbytes <= 80 for group in groups)
-    assert [
-        len(batch) for batch in batch_weight_module_groups(groups, max_batch_bytes=80)
-    ] == [1, 1]
 
 
 def test_groups_support_a_model_with_root_weights():

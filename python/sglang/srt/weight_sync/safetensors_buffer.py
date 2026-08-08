@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -197,27 +196,6 @@ def parse_safetensors_layout(
         header_bytes=header_bytes,
         file_nbytes=file_nbytes,
     )[0]
-
-
-def read_safetensors_layout(path: str | Path) -> SafetensorsLayout:
-    path = Path(path)
-    file_nbytes = path.stat().st_size
-    with path.open("rb") as file:
-        prefix = file.read(8)
-        if len(prefix) != 8:
-            raise ValueError(f"safetensors source is shorter than its header: {path}")
-        header_nbytes = int.from_bytes(prefix, "little")
-        if header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
-            raise ValueError(
-                "safetensors header exceeds "
-                f"{MAX_SAFETENSORS_HEADER_BYTES} bytes: {path}"
-            )
-        header_bytes = file.read(header_nbytes)
-    return parse_safetensors_layout(
-        header_nbytes=header_nbytes,
-        header_bytes=header_bytes,
-        file_nbytes=file_nbytes,
-    )
 
 
 class SafetensorsBuffer:

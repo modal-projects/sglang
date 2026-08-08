@@ -883,6 +883,14 @@ class DefaultModelLoader(BaseModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
 
+    @staticmethod
+    def restore_weights_before_cpu_staging(model):
+        """Restore checkpoint-facing state for a complete CPU staging pass."""
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.restore_weights_before_cpu_staging(module)
+
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a

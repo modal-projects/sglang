@@ -69,6 +69,25 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+def _trim_dflash_prefill_hidden_states(
+    target_hidden: torch.Tensor,
+    *,
+    logical_num_tokens: int,
+) -> torch.Tensor:
+    """Drop trailing execution-padding rows before draft-KV materialization."""
+    hidden_tokens = int(target_hidden.shape[0])
+    if hidden_tokens == logical_num_tokens:
+        return target_hidden
+
+    if hidden_tokens < logical_num_tokens:
+        raise ValueError(
+            "DFLASH prefill hidden states have fewer rows than cache locations: "
+            f"target_hidden={hidden_tokens}, cache_loc={logical_num_tokens}."
+        )
+
+    return target_hidden[:logical_num_tokens]
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -1425,6 +1444,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
+            target_hidden = _trim_dflash_prefill_hidden_states(
+                logits_output.hidden_states,
+                logical_num_tokens=int(batch.out_cache_loc.numel()),
+            )
             positions, _ = compute_position(
                 self.model_runner.server_args.attention_backend,
                 draft_seq_lens,
@@ -1432,7 +1455,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
+                target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
             )

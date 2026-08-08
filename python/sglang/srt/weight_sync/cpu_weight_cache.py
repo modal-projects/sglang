@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,45 @@ class CPUWeightCache:
         checkpoint = self._canonical_checkpoint
         return checkpoint.version if checkpoint is not None else None
 
+    def _run_on_host_ranks(
+        self,
+        operation: str,
+        function: Callable[[], Any],
+    ) -> Any:
+        distributed = torch.distributed.is_initialized()
+        world_size = (
+            torch.distributed.get_world_size(group=self.host_group)
+            if distributed
+            else 1
+        )
+        rank = torch.distributed.get_rank(group=self.host_group) if distributed else 0
+        if world_size > 1 and self.host_group is None:
+            raise RuntimeError(f"{operation} requires a host-local process group")
+
+        result = None
+        local_error = None
+        local_exception = None
+        try:
+            result = function()
+        except Exception as exc:
+            local_exception = exc
+            local_error = f"rank {rank}: {type(exc).__name__}: {exc}"
+        if world_size > 1:
+            errors: list[str | None] = [None] * world_size
+            torch.distributed.all_gather_object(
+                errors,
+                local_error,
+                group=self.host_group,
+            )
+        else:
+            errors = [local_error]
+        errors = [error for error in errors if error is not None]
+        if errors:
+            if world_size == 1 and local_exception is not None:
+                raise local_exception
+            raise RuntimeError(f"{operation} failed: " + "; ".join(errors))
+        return result
+
     def _seed_canonical_checkpoint(
         self, *, reason: str | None = None
     ) -> CanonicalCheckpoint:
@@ -87,29 +127,53 @@ class CPUWeightCache:
     def initialize_from_checkpoint(
         self,
         checkpoint_dir: str | Path,
+        *,
+        seed_from_active_weights: bool,
     ) -> dict[str, Any]:
         """Build and validate the reusable CPU state from active version zero."""
 
         with self._exclusive("initialize"):
-            return self._initialize_from_checkpoint(checkpoint_dir)
+            return self._initialize_from_checkpoint(
+                checkpoint_dir,
+                seed_from_active_weights=seed_from_active_weights,
+            )
 
     def _initialize_from_checkpoint(
         self,
         checkpoint_dir: str | Path,
+        *,
+        seed_from_active_weights: bool,
     ) -> dict[str, Any]:
         if self._base_checkpoint_dir is not None:
             raise RuntimeError("CPU weight cache is already initialized")
         started = time.perf_counter()
         self._base_checkpoint_dir = os.path.realpath(checkpoint_dir)
         try:
-            image_initialization = self.compiler.initialize_from_active()
-            checkpoint = self._seed_canonical_checkpoint()
-            baseline_compile = self.compiler.compile(
-                checkpoint,
-                target_version=0,
+            image_initialization = self._run_on_host_ranks(
+                "CPU weight image initialization",
+                self.compiler.initialize_from_active,
             )
-            validation = self.image.validate_against_active()
-            self.image.accept_staged_baseline()
+            checkpoint = self._seed_canonical_checkpoint()
+            if seed_from_active_weights:
+                baseline_compile = None
+                validation = None
+                rank_image_source = "active_model"
+            else:
+
+                def compile_baseline():
+                    compile_stats = self.compiler.compile(
+                        checkpoint,
+                        target_version=0,
+                    )
+                    validation_stats = self.image.validate_against_active()
+                    self.image.accept_staged_baseline()
+                    return compile_stats, validation_stats
+
+                baseline_compile, validation = self._run_on_host_ranks(
+                    "CPU weight cache baseline validation",
+                    compile_baseline,
+                )
+                rank_image_source = "checkpoint"
         except Exception:
             self._discard_canonical_checkpoint("CPU weight cache initialization failed")
             self._base_checkpoint_dir = None
@@ -121,6 +185,7 @@ class CPUWeightCache:
             "canonical_checkpoint": canonical_stats,
             "rank_image_bytes": self.image.image_nbytes,
             "rank_weight_bytes": self.image.weight_nbytes,
+            "rank_image_source": rank_image_source,
             "image_initialization": image_initialization,
             "baseline_compile": baseline_compile,
             "validation": validation,
@@ -201,10 +266,19 @@ class CPUWeightCache:
                 host_group=self.host_group,
             )
             transform_stats = transform.apply()
-            compile_stats = self.compiler.compile(
-                checkpoint,
-                target_version=target_version,
-            )
+            try:
+                compile_stats = self._run_on_host_ranks(
+                    f"CPU weight image compilation for version {target_version}",
+                    lambda: self.compiler.compile(
+                        checkpoint,
+                        target_version=target_version,
+                    ),
+                )
+            except Exception:
+                self.image.invalidate(
+                    f"distributed compilation of version {target_version} failed"
+                )
+                raise
         except Exception:
             if not checkpoint.valid:
                 self._discard_canonical_checkpoint(

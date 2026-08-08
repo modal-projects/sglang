@@ -1792,10 +1792,25 @@ def _map_checkpoint_name(
     model: torch.nn.Module,
     name: str,
 ) -> str | None:
-    """Apply the same authoritative name mapper as the ordinary loader."""
+    """Map a checkpoint name, returning ``None`` for loader-ignored weights."""
 
-    mapper = getattr(model, "hf_to_sglang_mapper", None)
+    mapper = getattr(model, "weight_update_name_mapper", None)
+    if mapper is None:
+        mapper = getattr(model, "hf_to_sglang_mapper", None)
     return name if mapper is None else mapper._map_name(name)
+
+
+def _filter_ignored_checkpoint_weights(
+    model: torch.nn.Module,
+    weight_map: dict[str, str],
+) -> dict[str, str]:
+    """Remove weights that the model's authoritative mapper ignores."""
+
+    return {
+        name: filename
+        for name, filename in weight_map.items()
+        if _map_checkpoint_name(model, name) is not None
+    }
 
 
 def _longest_group_prefix(
@@ -1808,6 +1823,30 @@ def _longest_group_prefix(
         if candidate in paths:
             return candidate
     return None
+
+
+def _groups_after_eliding_model_wrapper(
+    name: str,
+    paths: set[str],
+) -> set[str]:
+    """Find runtime groups after removing one nested ``*_model`` wrapper.
+
+    A few authoritative model loaders flatten checkpoint names such as
+    ``model.language_model.*`` to ``model.*`` without exposing a
+    ``hf_to_sglang_mapper``. Limit this fallback to interior model-wrapper
+    segments so unrelated checkpoint names cannot match arbitrary roots.
+    """
+
+    parts = name.split(".")
+    matches = set()
+    for index, part in enumerate(parts[1:-1], start=1):
+        if part != "model" and not part.endswith("_model"):
+            continue
+        candidate = ".".join(parts[:index] + parts[index + 1 :])
+        match = _longest_group_prefix(candidate, paths)
+        if match is not None:
+            matches.add(match)
+    return matches
 
 
 def _map_checkpoint_names_to_groups(
@@ -1830,6 +1869,16 @@ def _map_checkpoint_names_to_groups(
             result[name] = direct
             continue
 
+        wrapper_matches = _groups_after_eliding_model_wrapper(mapped, paths)
+        if len(wrapper_matches) > 1:
+            raise ValueError(
+                f"ambiguous checkpoint group after model-wrapper normalization "
+                f"for {name!r}: {wrapper_matches}"
+            )
+        if wrapper_matches:
+            result[name] = next(iter(wrapper_matches))
+            continue
+
         # Some wrapper models delegate unprefixed checkpoint names into one
         # named runtime child. Only infer that wrapper prefix when the
         # authoritative mapped name has no direct runtime match.
@@ -1837,6 +1886,7 @@ def _map_checkpoint_names_to_groups(
             match
             for root in root_prefixes
             if (match := _longest_group_prefix(f"{root}.{mapped}", paths)) is not None
+            and (match != root or len(root_prefixes) == 1)
         }
         if len(matches) > 1:
             raise ValueError(f"ambiguous checkpoint group for {name!r}: {matches}")
@@ -3058,6 +3108,10 @@ class CPUWeightCache:
 
         def inspect_checkpoint():
             weight_map, root = _checkpoint_weight_map(checkpoint_dir)
+            # WeightsMapper uses a ``None`` destination for tensors the
+            # ordinary model loader intentionally ignores. Exclude those
+            # before enforcing that every loadable tensor has a runtime group.
+            weight_map = _filter_ignored_checkpoint_weights(self.model, weight_map)
             return (
                 weight_map,
                 root,

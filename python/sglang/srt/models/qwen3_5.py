@@ -88,6 +88,7 @@ from sglang.srt.models.qwen2_moe import (
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import (
+    WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
@@ -1650,9 +1651,24 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+_QWEN3_5_WEIGHT_UPDATE_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "attn.qkv.": "attn.qkv_proj.",
+    },
+    orig_to_new_prefix={
+        # The target model's ordinary loader skips checkpoint-only MTP
+        # weights. DFlash loads its draft model from a separate checkpoint.
+        "mtp.": None,
+        "model.language_model.": "model.",
+        "model.visual.": "visual.",
+    },
+)
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    weight_update_name_mapper = _QWEN3_5_WEIGHT_UPDATE_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -1811,6 +1827,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    weight_update_name_mapper = _QWEN3_5_WEIGHT_UPDATE_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 

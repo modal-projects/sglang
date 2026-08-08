@@ -6,11 +6,14 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.cpu_weight_cache import (
+    _WeightModuleGroup,
     _build_weight_loader_proxy,
     _build_weight_module_groups,
     _clone_weight_module,
+    _filter_ignored_checkpoint_weights,
     _map_checkpoint_names_to_groups,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -415,4 +418,61 @@ def test_checkpoint_mapping_prefers_authoritative_direct_runtime_root():
         "mm_projector.weight": "mm_projector",
         "vision_tower.weight": "vision_tower",
         "hf_layers.0.weight": "language_model.layers.0",
+    }
+
+
+def test_checkpoint_mapping_strips_nested_loader_wrapper_segment():
+    model = torch.nn.Module()
+    groups = [
+        _WeightModuleGroup(path="visual", nbytes=1),
+        _WeightModuleGroup(path="model.embed_tokens", nbytes=1),
+        _WeightModuleGroup(path="lm_head", nbytes=1),
+    ]
+
+    mapping = _map_checkpoint_names_to_groups(
+        model,
+        ["model.language_model.embed_tokens.weight"],
+        groups,
+    )
+
+    assert mapping == {
+        "model.language_model.embed_tokens.weight": "model.embed_tokens"
+    }
+
+
+def test_checkpoint_mapping_uses_qwen_weight_update_name_mapper():
+    model = torch.nn.Module()
+    model.weight_update_name_mapper = (
+        Qwen3_5MoeForConditionalGeneration.weight_update_name_mapper
+    )
+    groups = [
+        _WeightModuleGroup(path="visual.blocks.0.mlp", nbytes=1),
+        _WeightModuleGroup(path="visual.blocks.0.attn.qkv_proj", nbytes=1),
+        _WeightModuleGroup(path="model.layers.0", nbytes=1),
+    ]
+
+    mapping = _map_checkpoint_names_to_groups(
+        model,
+        [
+            "model.visual.blocks.0.mlp.linear_fc1.weight",
+            "model.visual.blocks.0.attn.qkv.weight",
+            "model.language_model.layers.0.input_layernorm.weight",
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+        ],
+        groups,
+    )
+
+    assert Qwen3_5MoeForConditionalGeneration.hf_to_sglang_mapper is None
+    assert mapping == {
+        "model.visual.blocks.0.mlp.linear_fc1.weight": "visual.blocks.0.mlp",
+        "model.visual.blocks.0.attn.qkv.weight": "visual.blocks.0.attn.qkv_proj",
+        "model.language_model.layers.0.input_layernorm.weight": "model.layers.0",
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight": None,
+    }
+
+    weight_map = {name: "model.safetensors" for name in mapping}
+    assert _filter_ignored_checkpoint_weights(model, weight_map) == {
+        name: filename
+        for name, filename in weight_map.items()
+        if not name.startswith("mtp.")
     }

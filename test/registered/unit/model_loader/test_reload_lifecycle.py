@@ -118,6 +118,7 @@ class TestReloadLifecycle(CustomTestCase):
         runner = SimpleNamespace(
             load_config=original_load_config,
             server_args=SimpleNamespace(weight_cache_mode="off"),
+            cpu_weight_cache=None,
         )
         model = nn.Module()
         model_config = SimpleNamespace(
@@ -162,6 +163,7 @@ class TestReloadLifecycle(CustomTestCase):
         runner = SimpleNamespace(
             load_config=original_load_config,
             server_args=SimpleNamespace(weight_cache_mode="off"),
+            cpu_weight_cache=None,
         )
         model = nn.Module()
         model_config = SimpleNamespace(
@@ -210,11 +212,56 @@ class TestReloadLifecycle(CustomTestCase):
         self.assertEqual(model_config.model_path, "/original")
         update_model_fields.assert_not_called()
 
+    def test_failed_update_and_rollback_terminate_the_engine(self):
+        events = []
+        original_load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
+        runner = SimpleNamespace(
+            load_config=original_load_config,
+            server_args=SimpleNamespace(weight_cache_mode="off"),
+            cpu_weight_cache=None,
+        )
+        model = nn.Module()
+        model_config = SimpleNamespace(
+            model_path="/original", dtype=torch.float32, quantization=None
+        )
+        updater = _make_weight_updater(model, model_config, runner, Mock())
+        target_loader = _RecordingLoader(
+            original_load_config, events, "target", fail=True
+        )
+        original_loader = _RecordingLoader(
+            original_load_config, events, "original", fail=True
+        )
+
+        def get_model_loader(load_config, active_model_config):
+            return (
+                target_loader
+                if active_model_config.model_path == "/target"
+                else original_loader
+            )
+
+        with (
+            patch.object(
+                updater_mod,
+                "_unsupported_derived_weight_cache_error",
+                return_value=None,
+            ),
+            patch.object(updater_mod, "get_available_gpu_memory", return_value=1.0),
+            patch.object(updater_mod, "get_model_loader", get_model_loader),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "terminating the engine to avoid serving a partially updated model",
+            ),
+        ):
+            updater.update_weights_from_disk("/target", LoadFormat.SAFETENSORS)
+
+        self.assertEqual(model_config.model_path, "/original")
+
     def test_partial_quantized_reload_is_rejected_before_mutation(self):
         original_load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
         runner = SimpleNamespace(
             load_config=original_load_config,
             server_args=SimpleNamespace(weight_cache_mode="off"),
+            cpu_weight_cache=None,
         )
         model = nn.Module()
         model_config = SimpleNamespace(

@@ -236,8 +236,11 @@ class WeightUpdater:
                     rollback()
                 except Exception as rollback_error:
                     logger.exception("Failed to roll back model weights")
-                    message += f" Rollback also failed: {rollback_error}."
-                    return False, message
+                    raise RuntimeError(
+                        "Weight reload and rollback both failed; terminating the "
+                        "engine to avoid serving a partially updated model. "
+                        f"Reload error: {e}. Rollback error: {rollback_error}."
+                    ) from rollback_error
                 message += " Rolled back to the original weights."
                 return False, message
 

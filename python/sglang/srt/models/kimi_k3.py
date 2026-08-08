@@ -7,6 +7,8 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import re
+from collections import defaultdict
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -117,8 +119,16 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+
+def _expert_mapping_candidates(name, mappings, mappings_by_expert):
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match is None:
+        return mappings
+    return mappings_by_expert.get(int(match.group(1)), mappings)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -2735,6 +2745,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         else:
             expert_params_mapping = []
+        expert_params_mapping_by_expert = defaultdict(list)
+        for mapping in expert_params_mapping:
+            expert_params_mapping_by_expert[mapping[2]].append(mapping)
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -2812,9 +2825,17 @@ class KimiK3LinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (param_name, weight_name, expert_id, shard_id) in enumerate(
-                    expert_params_mapping
-                ):
+                expert_mapping_candidates = _expert_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
+                )
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in expert_mapping_candidates:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
@@ -2852,16 +2873,34 @@ class KimiK3LinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
-        self.post_load_weights()
+        self.post_load_weights(weight_names=loaded_params)
 
-    def post_load_weights(self):
+    def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get w_kc/w_vc and
         # the fused buffers too. Same pattern as deepseek_v4.
+        if weight_names is None:
+            layer_ids = range(self.model.start_layer, self.model.end_layer)
+            process_output = True
+        else:
+            weight_names = set(weight_names)
+            layer_ids = sorted(
+                {
+                    layer_id
+                    for name in weight_names
+                    if (layer_id := get_layer_id(name)) is not None
+                }
+            )
+            process_output = any(
+                name.startswith("model.output_attn_res_") for name in weight_names
+            )
+
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
-        for layer_id in self.config.full_attention_layer_ids:
-            if layer_id >= len(self.model.layers):
+        for layer_id in layer_ids:
+            if layer_id not in self.config.full_attention_layer_ids or layer_id >= len(
+                self.model.layers
+            ):
                 continue  # truncated config (e.g. num_hidden_layers override)
             layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
@@ -2883,20 +2922,26 @@ class KimiK3LinearForCausalLM(nn.Module):
             get_cw(proj, norm, dtype=torch.bfloat16)
             get_cw(proj, norm)
 
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
                 continue
             if layer.use_attn_residuals:
                 _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
-        if hasattr(self.model, "output_attn_res_proj"):
+        if process_output and hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights. Module
         # weights are re-pointed to views of the merged buffers (net extra
         # memory ~0), so this must run after all weights are loaded and
         # before cuda graph capture.
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
@@ -2912,10 +2957,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
 
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer) or not isinstance(
                 layer.self_attn, KimiK3DeltaAttention
             ):
+                continue
+            if layer.self_attn.dt_bias.device.type != "cuda":
                 continue
             from sglang.kernels.ops.attention.fla.kda import (
                 precompile_k3_recompute_w_u_kernel,

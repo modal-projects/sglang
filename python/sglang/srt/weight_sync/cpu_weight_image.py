@@ -162,6 +162,15 @@ class CPUWeightImage:
                 )
             )
         ]
+        # Model hooks refresh non-parameter state while preserving any storage
+        # addresses captured by CUDA graphs.
+        self._model_post_commit_hooks = [
+            hook
+            for module in model.modules()
+            if callable(
+                hook := getattr(module, "process_weights_after_weight_commit", None)
+            )
+        ]
         self.registered = False
         self.registration_wall_s: float | None = None
         self.target_version: int | None = None
@@ -358,6 +367,8 @@ class CPUWeightImage:
             hook_started = time.perf_counter()
             for module, hook in self._post_commit_hooks:
                 hook(module)
+            for hook in self._model_post_commit_hooks:
+                hook()
             torch.cuda.synchronize(self.segments[0].device_bytes.device)
             post_commit_hook_wall_s = time.perf_counter() - hook_started
         except Exception as exc:

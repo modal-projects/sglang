@@ -104,6 +104,7 @@ def test_cpu_staging_keeps_runtime_weight_buffers(monkeypatch):
         lambda tensor, *_args, **_kwargs: torch.arange(tensor.shape[0]),
     )
     method = _make_method()
+    method.weight_staging_postprocess_device = lambda _: "cpu"
     layer = _make_layer(seed=1)
     target = _make_layer(seed=2)
     reference = _make_layer(seed=2)
@@ -129,7 +130,30 @@ def test_cpu_staging_keeps_runtime_weight_buffers(monkeypatch):
         assert not hasattr(actual, "_weight_staging_runtime_buffer")
 
 
-def test_cpu_staging_zeroes_padded_checkpoint_buffers(monkeypatch):
+def test_cuda_staging_reuses_host_image_for_checkpoint_input(monkeypatch):
+    monkeypatch.setattr(
+        mxfp4,
+        "_get_flashinfer_mxfp4_device_permute_indices",
+        lambda tensor, *_args, **_kwargs: torch.arange(tensor.shape[0]),
+    )
+    method = _make_method()
+    layer = _make_layer(seed=1)
+    method.process_weights_after_loading(layer)
+    runtime_pointers = {
+        name: parameter.data_ptr() for name, parameter in layer.named_parameters()
+    }
+
+    method.restore_weights_before_cpu_staging(layer)
+
+    for name, pointer in runtime_pointers.items():
+        parameter = getattr(layer, name)
+        assert parameter.data_ptr() == pointer
+        assert not hasattr(parameter, "_weight_staging_runtime_buffer")
+    assert layer.w13_weight_scale.dtype == torch.uint8
+    assert layer.w2_weight_scale.dtype == torch.uint8
+
+
+def test_cuda_staging_zeroes_padded_checkpoint_buffers(monkeypatch):
     monkeypatch.setattr(mxfp4, "_cpu_weight_transform_workers", lambda: 2)
     method = _make_method()
     layer = _make_layer(seed=1)
@@ -156,9 +180,9 @@ def test_parallel_cpu_zero_preserves_tensor_boundaries(monkeypatch):
     torch.testing.assert_close(storage[28:], torch.full((4,), 7, dtype=torch.uint8))
 
 
-def test_cpu_staging_capability_is_backend_specific():
+def test_cuda_staging_capability_is_backend_specific():
     method = _make_method()
-    assert method.weight_staging_postprocess_device(torch.nn.Module()) == "cpu"
+    assert method.weight_staging_postprocess_device(torch.nn.Module()) == "cuda"
 
     method._fi_kernel = "cutlass_sm90"
     assert method.weight_staging_postprocess_device(torch.nn.Module()) is None

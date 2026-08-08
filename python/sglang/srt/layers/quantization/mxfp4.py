@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -104,6 +105,42 @@ _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
     tuple[tuple[int, ...], int, int, str, int], torch.Tensor
 ] = {}
+
+
+def _block_scale_interleave(scale: torch.Tensor) -> torch.Tensor:
+    """Convert linear block scales to TRT-LLM's device-independent layout."""
+
+    if scale.ndim not in (2, 3):
+        raise ValueError(f"block scales must be 2D or 3D, got {scale.ndim}D")
+    batched = scale.unsqueeze(0) if scale.ndim == 2 else scale
+    batches, rows, cols = batched.shape
+    padded_rows = round_up(rows, 128)
+    padded_cols = round_up(cols, 4)
+    padded = batched.new_zeros((batches, padded_rows, padded_cols))
+    padded[:, :rows, :cols] = batched
+    return (
+        padded.reshape(batches, padded_rows // 128, 4, 32, padded_cols // 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
+def _compose_trtllm_gate_up_permutation(
+    indices: torch.Tensor,
+    *,
+    gate_up_interleaved: bool,
+) -> torch.Tensor:
+    if gate_up_interleaved:
+        return indices.bitwise_xor(1)
+    if indices.numel() % 2:
+        raise ValueError("gate/up permutation requires an even number of rows")
+
+    half = indices.numel() // 2
+    gate_up_indices = torch.empty_like(indices)
+    gate_up_indices[0::2] = torch.arange(half, device=indices.device) + half
+    gate_up_indices[1::2] = torch.arange(half, device=indices.device)
+    return gate_up_indices.index_select(0, indices)
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -542,6 +579,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
+    def restore_weights_before_loading(self, layer) -> None:
+        if self._fi_kernel != "trtllm_sm100":
+            return
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            parameter = getattr(layer, name)
+            if parameter.dtype != torch.uint8:
+                parameter.data = parameter.data.view(torch.uint8)
+        for name in (
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_bias",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_bias",
+        ):
+            getattr(layer, name).data.zero_()
+
+    def weight_staging_postprocess_device(self, layer) -> str | None:
+        if self._fi_kernel == "trtllm_sm100":
+            return "cpu"
+        return None
+
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
@@ -631,17 +690,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             E = layer.num_local_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
-            layer.gemm1_alpha = Parameter(
-                torch.tensor([_alpha] * E, dtype=torch.float32).cuda(),
-                requires_grad=False,
+            device = layer.w13_weight.device
+            copy_or_rebind_param(
+                layer,
+                "gemm1_alpha",
+                torch.full((E,), _alpha, dtype=torch.float32, device=device),
             )
-            layer.gemm1_beta = Parameter(
-                torch.tensor([1.0] * E, dtype=torch.float32).cuda(),
-                requires_grad=False,
+            copy_or_rebind_param(
+                layer,
+                "gemm1_beta",
+                torch.ones(E, dtype=torch.float32, device=device),
             )
-            layer.gemm1_clamp_limit = Parameter(
-                torch.tensor([_limit] * E, dtype=torch.float32).cuda(),
-                requires_grad=False,
+            copy_or_rebind_param(
+                layer,
+                "gemm1_clamp_limit",
+                torch.full((E,), _limit, dtype=torch.float32, device=device),
             )
             sf_block_size = 32  # mxfp4 block size
 
@@ -691,52 +754,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
 
-            # Swap w1 and w3 as the definition of
-            # swiglu is different in the trtllm-gen
-            def swap_every_two_rows(x, axis=-1):
-                shape = x.shape
-                if axis < 0:
-                    axis = len(shape) + axis
-
-                # Create a new shape with pairs swapped along specified axis
-                new_shape = list(shape)
-                new_shape[axis] = shape[axis] // 2
-                new_shape.insert(axis + 1, 2)
-
-                # Reshape to expose pairs, swap them, and reshape back
-                x = x.reshape(*new_shape)
-                x = x.flip(axis + 1)
-                new_shape = list(shape)
-                return x.reshape(*new_shape)
-
-            if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
-                w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
-                w13_weight = swap_every_two_rows(w13_weight, -2)
-                w13_bias = swap_every_two_rows(w13_bias, -1)
-            else:
-                # Non-interleaved layout (e.g. K3 Latent MoE): first half = gate
-                # (w1), second half = up (w3). The trtllm-gen fused gated-act
-                # epilogue wants rows interleaved as (up_i, gate_i) PAIRS -
-                # the layout get_reorder_rows_for_gated_act_gemm_row_indices
-                # produces from [linear; gate] halves, and what the
-                # interleaved branch above arrives at via swap_every_two_rows.
-                # A plain halves swap keeps rows blocked and pairs up_i with
-                # up_{i+1}, which scrambles the gated activation.
-                half = w13_weight.shape[-2] // 2
-                pair_idx = torch.empty(2 * half, dtype=torch.long)
-                pair_idx[0::2] = torch.arange(half) + half  # up (w3)
-                pair_idx[1::2] = torch.arange(half)  # gate (w1)
-                w13_weight = w13_weight[..., pair_idx, :].contiguous()
-                w13_weight_scale = w13_weight_scale[..., pair_idx, :].contiguous()
-                w13_bias = w13_bias[..., pair_idx].contiguous()
-
-            # Shuffle weights and scaling factors for transposed mma output
-            gemm1_weights_mxfp4_shuffled = []
-            gemm1_scales_mxfp4_shuffled = []
-            gemm2_weights_mxfp4_shuffled = []
-            gemm2_scales_mxfp4_shuffled = []
-            gemm1_bias_shuffled = []
-            gemm2_bias_shuffled = []
+            # Compose the checkpoint gate/up order with TRT-LLM's runtime
+            # permutation so each tensor is copied only once.
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             w13_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight[0].view(torch.uint8),
@@ -750,6 +769,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_bias[0].reshape(-1, 1),
                 epilogue_tile_m,
+            )
+            gate_up_interleaved = getattr(
+                layer.moe_runner_config,
+                "gate_up_interleaved",
+                True,
+            )
+            w13_weight_permute_indices = _compose_trtllm_gate_up_permutation(
+                w13_weight_permute_indices,
+                gate_up_interleaved=gate_up_interleaved,
+            )
+            w13_scale_permute_indices = _compose_trtllm_gate_up_permutation(
+                w13_scale_permute_indices,
+                gate_up_interleaved=gate_up_interleaved,
+            )
+            w13_bias_permute_indices = _compose_trtllm_gate_up_permutation(
+                w13_bias_permute_indices,
+                gate_up_interleaved=gate_up_interleaved,
             )
 
             w2_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
@@ -766,77 +802,79 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
 
-            for i in range(E):
-                gemm1_weights_mxfp4_shuffled.append(
-                    w13_weight[i]
-                    .view(torch.uint8)[w13_weight_permute_indices]
-                    .contiguous()
+            def shuffle_rows(
+                tensor: torch.Tensor,
+                indices: torch.Tensor,
+            ) -> torch.Tensor:
+                if device.type == "cpu":
+                    return tensor.index_select(1, indices).contiguous()
+                return torch.stack(
+                    [expert.index_select(0, indices).contiguous() for expert in tensor]
                 )
 
-                gemm1_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w13_weight_scale[i]
-                        .view(torch.uint8)[w13_scale_permute_indices]
-                        .contiguous()
-                    )
+            def shuffle_scales(
+                tensor: torch.Tensor,
+                indices: torch.Tensor,
+            ) -> torch.Tensor:
+                shuffled = shuffle_rows(tensor.view(torch.uint8), indices)
+                if device.type == "cpu":
+                    return _block_scale_interleave(shuffled)
+                return torch.stack(
+                    [nvfp4_block_scale_interleave(expert) for expert in shuffled]
                 )
 
-                gemm1_bias_shuffled.append(
-                    w13_bias[i].reshape(-1, 1)[w13_bias_permute_indices].contiguous()
-                )
-
-                gemm2_weights_mxfp4_shuffled.append(
-                    w2_weight[i]
-                    .view(torch.uint8)[w2_weight_permute_indices]
-                    .contiguous()
-                )
-
-                gemm2_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w2_weight_scale[i]
-                        .view(torch.uint8)[w2_scale_permute_indices]
-                        .contiguous()
-                    )
-                )
-
-                gemm2_bias_shuffled.append(
-                    w2_bias[i].reshape(-1, 1)[w2_bias_permute_indices].contiguous()
-                )
-
-            w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
-            w13_weight_scale = (
-                torch.stack(gemm1_scales_mxfp4_shuffled)
-                .reshape(
-                    E,
-                    2 * self.intermediate_size_per_partition,
-                    self.hidden_size // sf_block_size,
-                )
-                .view(torch.float8_e4m3fn)
+            w13_weight = shuffle_rows(
+                w13_weight.view(torch.uint8),
+                w13_weight_permute_indices,
+            )
+            w13_weight_scale = shuffle_scales(
+                w13_weight_scale,
+                w13_scale_permute_indices,
+            )
+            w13_bias = shuffle_rows(
+                w13_bias.unsqueeze(-1),
+                w13_bias_permute_indices,
+            )
+            w2_weight = shuffle_rows(
+                w2_weight.view(torch.uint8),
+                w2_weight_permute_indices,
+            )
+            w2_weight_scale = shuffle_scales(
+                w2_weight_scale,
+                w2_scale_permute_indices,
+            )
+            w2_bias = shuffle_rows(
+                w2_bias.unsqueeze(-1),
+                w2_bias_permute_indices,
             )
 
-            w2_weight = torch.stack(gemm2_weights_mxfp4_shuffled)
-            w2_weight_scale = (
-                torch.stack(gemm2_scales_mxfp4_shuffled)
-                .reshape(
-                    E,
-                    self.hidden_size,
-                    self.intermediate_size_per_partition // sf_block_size,
-                )
-                .view(torch.float8_e4m3fn)
-            )
+            w13_weight_scale = w13_weight_scale.reshape(
+                E,
+                2 * self.intermediate_size_per_partition,
+                self.hidden_size // sf_block_size,
+            ).view(torch.float8_e4m3fn)
+            w2_weight_scale = w2_weight_scale.reshape(
+                E,
+                self.hidden_size,
+                self.intermediate_size_per_partition // sf_block_size,
+            ).view(torch.float8_e4m3fn)
 
-            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-            layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
-            layer.w13_weight_bias = Parameter(
-                torch.stack(gemm1_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
-            )
-            layer.w2_weight_bias = Parameter(
-                torch.stack(gemm2_bias_shuffled).reshape(E, -1),
-                requires_grad=False,
-            )
+            copy_or_rebind_param(layer, "w13_weight", w13_weight)
+            copy_or_rebind_param(layer, "w2_weight", w2_weight)
+            for name, value in (
+                ("w13_weight_scale", w13_weight_scale),
+                ("w2_weight_scale", w2_weight_scale),
+            ):
+                parameter = getattr(layer, name)
+                if (
+                    parameter.shape == value.shape
+                    and parameter.element_size() == value.element_size()
+                    and parameter.dtype != value.dtype
+                ):
+                    parameter.data = parameter.data.view(value.dtype)
+                copy_or_rebind_param(layer, name, value)
+            copy_or_rebind_param(layer, "w13_weight_bias", w13_bias.reshape(E, -1))
+            copy_or_rebind_param(layer, "w2_weight_bias", w2_bias.reshape(E, -1))
             return
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:

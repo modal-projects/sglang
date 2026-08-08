@@ -180,6 +180,36 @@ def test_overwrite_delta_advances_canonical_checkpoint(tmp_path):
         cached.close()
 
 
+def test_caller_owned_transform_reports_only_dirty_blocks(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {"a": torch.arange(256, dtype=torch.uint8)}
+    v1 = {"a": v0["a"].clone()}
+    v1["a"][[0, 17, 128, 255]] = torch.tensor([9, 8, 7, 6], dtype=torch.uint8)
+    _write_delta(versions, 1, v0, v1, encoding="overwrite")
+    cached = _checkpoint(tmp_path, v0)
+    target_bytes = _bytes(v0["a"]).copy()
+    target = torch.from_numpy(target_bytes)
+    writes = []
+    try:
+        transform = DeltaCheckpointTransform(
+            cached,
+            checkpoint_source_dir=versions,
+            target_version=1,
+            host_group=None,
+        )
+        transform.transform_tensors(
+            {"a": target},
+            description="test",
+            write_tensor=lambda name, _tensor, ranges: writes.append((name, ranges)),
+            write_block_bytes=64,
+        )
+        torch.testing.assert_close(target, v1["a"])
+        assert writes == [("a", [(0, 64), (128, 256)])]
+        assert cached.version == 0
+    finally:
+        cached.close()
+
+
 def test_checksum_failure_invalidates_mutated_checkpoint(tmp_path):
     versions = tmp_path / "updates"
     v0 = {"a": torch.arange(16, dtype=torch.uint8)}

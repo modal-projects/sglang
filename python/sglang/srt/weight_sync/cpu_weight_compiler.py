@@ -351,22 +351,15 @@ class CPUWeightCompiler:
         gc.collect(0)
         return updated, group_bytes, stats
 
-    def compile(
+    def checkpoint_groups(
         self,
-        checkpoint: CanonicalCheckpoint,
-        *,
-        target_version: int,
-    ) -> dict[str, Any]:
-        """Compile every runtime storage without changing the live model."""
+        weight_map: dict[str, str],
+    ) -> dict[str, list[str]]:
+        """Map every canonical tensor to its bounded runtime compile group."""
 
-        if target_version < 0:
-            raise ValueError("target_version must be non-negative")
-        if self.image.staging:
-            raise RuntimeError("a CPU weight image stage is already running")
-        started = time.perf_counter()
         group_for_name = map_checkpoint_names_to_groups(
             self.model,
-            checkpoint.weight_map,
+            weight_map,
             self.groups,
         )
         names_by_group = {group.path: [] for group in self.groups}
@@ -381,29 +374,92 @@ class CPUWeightCompiler:
                 "CPU weight staging cannot map every checkpoint tensor to a "
                 f"runtime weight group; unmapped={unmapped[:20]}"
             )
+        return names_by_group
 
-        updated_segments = set()
-        copied_bytes = 0
+    def compile(
+        self,
+        checkpoint: CanonicalCheckpoint,
+        *,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Compile every runtime storage without changing the live model."""
+
+        if target_version < 0:
+            raise ValueError("target_version must be non-negative")
+        if self.image.staging:
+            raise RuntimeError("a CPU weight image stage is already running")
+        started = time.perf_counter()
+        names_by_group = self.checkpoint_groups(checkpoint.weight_map)
+
+        covered_segments = set()
+        staged_bytes = 0
+        preserved_segments = set()
+        preserved_bytes = 0
         group_stats = []
         try:
-            if not self.image.registered:
-                self.image.register_host_memory()
-            if not self.image.valid:
-                self.image.capture_active_weights()
-            self.image.begin_stage(target_version)
+
+            def begin_stage():
+                if not self.image.registered:
+                    self.image.register_host_memory()
+                if not self.image.valid:
+                    self.image.capture_active_weights()
+                self.image.begin_stage(target_version)
+
+            checkpoint.run_on_host_ranks(
+                "CPU weight image stage initialization",
+                begin_stage,
+            )
 
             progress_interval = max(1, math.ceil(len(self.groups) / 10))
             for index, group in enumerate(self.groups, start=1):
-                loaded = self._load_group(
-                    index=index,
-                    group=group,
-                    names=names_by_group[group.path],
-                    checkpoint=checkpoint,
-                )
-                updated, group_bytes, stats = self._finalize_group(loaded)
-                updated_segments.update(updated)
-                copied_bytes += group_bytes
-                group_stats.append(stats)
+                phase = "preserve"
+                try:
+                    names = names_by_group[group.path]
+                    if not names:
+                        prefix = f"{group.path}." if group.path else ""
+                        group_segments = {
+                            id(segment): segment
+                            for name, segment in self.image.segments_by_name.items()
+                            if not group.path
+                            or name == group.path
+                            or name.startswith(prefix)
+                        }
+                        if not group_segments:
+                            raise RuntimeError(
+                                "weight compilation group has no runtime storage: "
+                                f"path={group.path!r}"
+                            )
+                        covered_segments.update(group_segments)
+                        preserved_segments.update(group_segments)
+                        group_bytes = sum(
+                            segment.nbytes for segment in group_segments.values()
+                        )
+                        staged_bytes += group_bytes
+                        preserved_bytes += group_bytes
+                    else:
+                        with checkpoint.tensor_group(
+                            group.path, names
+                        ) as group_checkpoint:
+                            phase = "load"
+                            loaded = self._load_group(
+                                index=index,
+                                group=group,
+                                names=names,
+                                checkpoint=group_checkpoint,
+                            )
+                            phase = "finalize"
+                            updated, group_bytes, stats = self._finalize_group(loaded)
+                            del loaded
+                        covered_segments.update(updated)
+                        staged_bytes += group_bytes
+                        group_stats.append(stats)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "CPU weight image compilation failed for group "
+                        f"{index}/{len(self.groups)} at {group.path or '<root>'!r} "
+                        f"during {phase}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 if (
                     index == 1
                     or index % progress_interval == 0
@@ -415,12 +471,12 @@ class CPUWeightCompiler:
                         target_version,
                         index,
                         len(self.groups),
-                        copied_bytes,
+                        staged_bytes,
                         time.perf_counter() - started,
                     )
 
             expected_segments = {id(segment) for segment in self.image.segments}
-            missing = expected_segments - updated_segments
+            missing = expected_segments - covered_segments
             if missing:
                 missing_names = [
                     segment.name
@@ -473,8 +529,10 @@ class CPUWeightCompiler:
             "target_version": target_version,
             "groups": len(self.groups),
             "checkpoint_tensors": len(checkpoint.weight_map),
-            "runtime_storages": len(updated_segments),
-            "bytes": copied_bytes,
+            "runtime_storages": len(covered_segments),
+            "preserved_storages": len(preserved_segments),
+            "bytes": staged_bytes,
+            "preserved_bytes": preserved_bytes,
             "wall_s": round(wall_s, 6),
             "compile_wall_s": round(
                 sum(group["wall_s"] for group in group_stats),
@@ -487,7 +545,7 @@ class CPUWeightCompiler:
         logger.info(
             "Compiled CPU weight image v%d: bytes=%d wall_time=%.3fs phases=%s",
             target_version,
-            copied_bytes,
+            staged_bytes,
             wall_s,
             phases,
         )

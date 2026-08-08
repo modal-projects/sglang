@@ -281,6 +281,7 @@ class WeightUpdater:
         seed_from_active_weights: bool,
         host_group: torch.distributed.ProcessGroup | None,
         max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
     ) -> dict[str, Any]:
         """Construct and populate the target model's CPU weight cache."""
 
@@ -317,6 +318,7 @@ class WeightUpdater:
                     self.get_model(),
                     max_compile_group_bytes=max_compile_group_bytes,
                     host_group=host_group,
+                    canonical_checkpoint_dir=canonical_checkpoint_dir,
                 )
             except Exception as exc:
                 construction_error = f"rank {host_rank}: {type(exc).__name__}: {exc}"

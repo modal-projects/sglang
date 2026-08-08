@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -315,6 +317,12 @@ class DeltaCheckpointTransform:
         if any(value != signature for value in signatures):
             raise RuntimeError(f"delta plans differ across local workers: {signatures}")
 
+        self.operations_by_name = {
+            name: operations
+            for names in self.operations_by_file.values()
+            for name, operations in names.items()
+        }
+
         self.setup_stats = {
             "operation": "plan_delta_checkpoint",
             "canonical_version": checkpoint.version,
@@ -403,16 +411,55 @@ class DeltaCheckpointTransform:
             for name in operations_by_name
         }
         try:
-            return self._apply_tensors(filename, tensors, operations_by_name)
+            stats = self.transform_tensors(tensors, description=filename)
+            stats["filename"] = filename
+            return stats
         finally:
             tensors.clear()
 
-    def _apply_tensors(
+    def transform_tensors(
         self,
-        filename: str,
         tensors: dict[str, torch.Tensor],
-        operations_by_name: dict[str, list[_DeltaOperation]],
+        *,
+        description: str,
+        write_tensor: (
+            Callable[[str, torch.Tensor, list[tuple[int, int]]], None] | None
+        ) = None,
+        write_block_bytes: int | None = None,
     ) -> dict[str, Any]:
+        """Apply and verify deltas in caller-owned canonical byte tensors.
+
+        ``write_tensor`` receives each transformed tensor and the byte ranges
+        that differ from its on-disk source. This lets a disk-backed canonical
+        checkpoint compile and persist the same verified bounded buffer.
+        """
+
+        if write_tensor is not None and (
+            write_block_bytes is None or write_block_bytes <= 0
+        ):
+            raise ValueError("write_block_bytes must be positive when persisting")
+        if write_tensor is not None:
+            assert write_block_bytes is not None
+        operations_by_name = {
+            name: self.operations_by_name[name]
+            for name in tensors
+            if name in self.operations_by_name
+        }
+        if not operations_by_name:
+            return {
+                "operation": "canonical_delta_transform",
+                "description": description,
+                "delta_tensors": 0,
+                "delta_fragments": 0,
+                "source_files": 0,
+                "target_tensor_bytes": 0,
+                "compressed_bytes": 0,
+                "source_read_worker_s": 0.0,
+                "working_memory_budget_bytes": self.working_memory_budget_bytes,
+                "workers": 0,
+                "wall_s": 0.0,
+            }
+
         try:
             available_cpus = len(os.sched_getaffinity(0))
         except (AttributeError, OSError):
@@ -423,18 +470,56 @@ class DeltaCheckpointTransform:
                 if envs.SGLANG_SET_CPU_AFFINITY.get()
                 else max(1, available_cpus // self.world_size)
             ),
-            len(tensors),
+            len(operations_by_name),
         )
         budget = _ByteBudget(self.working_memory_budget_bytes)
         final_operations = {
             name: operations[-1] for name, operations in operations_by_name.items()
         }
+        dirty_blocks = (
+            {
+                name: np.zeros(
+                    math.ceil(tensors[name].numel() / write_block_bytes),
+                    dtype=np.bool_,
+                )
+                for name in operations_by_name
+            }
+            if write_tensor is not None
+            else {}
+        )
         operations_by_source = {}
         for name, operations in operations_by_name.items():
             for operation in operations:
                 operations_by_source.setdefault(
                     (operation.version, operation.source_path), []
                 ).append((name, operation))
+
+        def mark_xor_blocks(name: str, position: int, delta: np.ndarray) -> None:
+            assert write_block_bytes is not None
+            cursor = 0
+            block = position // write_block_bytes
+            leading = position % write_block_bytes
+            if leading:
+                count = min(write_block_bytes - leading, delta.size)
+                if np.any(delta[:count]):
+                    dirty_blocks[name][block] = True
+                cursor += count
+                block += 1
+            complete_bytes = (
+                (delta.size - cursor) // write_block_bytes * write_block_bytes
+            )
+            if complete_bytes:
+                changes = np.any(
+                    delta[cursor : cursor + complete_bytes].reshape(
+                        -1, write_block_bytes
+                    ),
+                    axis=1,
+                )
+                dirty_blocks[name][block : block + changes.size] |= changes
+                cursor += complete_bytes
+                block += changes.size
+            if cursor < delta.size and np.any(delta[cursor:]):
+                dirty_blocks[name][block] = True
 
         def apply_operation(
             item: tuple[str, _DeltaOperation],
@@ -464,6 +549,8 @@ class DeltaCheckpointTransform:
                                 break
                             delta = np.frombuffer(block, dtype=np.uint8)
                             region = target[position : position + delta.size]
+                            if write_tensor is not None:
+                                mark_xor_blocks(name, position, delta)
                             np.bitwise_xor(region, delta, out=region)
                             if hasher is not None:
                                 hasher.update(region)
@@ -495,9 +582,17 @@ class DeltaCheckpointTransform:
                             values = np.frombuffer(
                                 read_exact(reader, block_nbytes), dtype=np.uint8
                             )
-                            target[positions[position : position + block_nbytes]] = (
-                                values
-                            )
+                            position_slice = positions[
+                                position : position + block_nbytes
+                            ]
+                            target[position_slice] = values
+                            if write_tensor is not None and block_nbytes:
+                                blocks = position_slice // write_block_bytes
+                                dirty_blocks[name][blocks[0]] = True
+                                if blocks.size > 1:
+                                    dirty_blocks[name][
+                                        blocks[1:][blocks[1:] != blocks[:-1]]
+                                    ] = True
                             position += block_nbytes
                     if reader.read(1):
                         raise RuntimeError(
@@ -518,6 +613,29 @@ class DeltaCheckpointTransform:
                     raise RuntimeError(
                         f"checksum mismatch after reconstructing {name!r}: "
                         f"expected={operation.expected_checksum} actual={actual}"
+                    )
+                if write_tensor is not None:
+                    edges = np.flatnonzero(
+                        np.diff(
+                            np.concatenate(
+                                (
+                                    np.array([False]),
+                                    dirty_blocks[name],
+                                    np.array([False]),
+                                )
+                            )
+                        )
+                    )
+                    write_tensor(
+                        name,
+                        tensors[name],
+                        [
+                            (
+                                int(begin) * write_block_bytes,
+                                min(int(end) * write_block_bytes, target.size),
+                            )
+                            for begin, end in edges.reshape(-1, 2)
+                        ],
                     )
             return (
                 target.size if is_final else 0,
@@ -569,7 +687,8 @@ class DeltaCheckpointTransform:
                     os.close(source_fd)
 
         return {
-            "filename": filename,
+            "operation": "canonical_delta_transform",
+            "description": description,
             "delta_tensors": len(tensors),
             "delta_fragments": len(results),
             "source_files": len(operations_by_source),

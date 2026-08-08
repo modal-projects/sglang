@@ -28,10 +28,18 @@ class _FakeImage:
 
 
 class _FakeCache:
-    def __init__(self, model, *, max_compile_group_bytes, host_group):
+    def __init__(
+        self,
+        model,
+        *,
+        max_compile_group_bytes,
+        host_group,
+        canonical_checkpoint_dir=None,
+    ):
         self.model = model
         self.max_compile_group_bytes = max_compile_group_bytes
         self.host_group = host_group
+        self.canonical_checkpoint_dir = canonical_checkpoint_dir
         self.image = _FakeImage()
         self.staged = []
         self.committed = []
@@ -105,6 +113,7 @@ def test_cpu_weight_cache_worker_lifecycle():
             seed_from_active_weights=True,
             host_group=host_group,
             max_compile_group_bytes=1024,
+            canonical_checkpoint_dir=None,
         )
 
         cache = runner.cpu_weight_cache
@@ -145,6 +154,7 @@ def test_cpu_weight_cache_rejects_draft_models():
             seed_from_active_weights=True,
             host_group=None,
             max_compile_group_bytes=1024,
+            canonical_checkpoint_dir=None,
         )
 
 

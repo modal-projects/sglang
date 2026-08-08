@@ -134,6 +134,21 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # Qwen3.8-Max TP8 tactics measured on B300 SXM6 (2026-08-08), same
+    # protocol: CUDA-graph replay, PDL, 32-copy L2-defeating weight rotation,
+    # FP32-reference correctness gate, >=1.26x over the best of
+    # cuBLAS/direct. N=512 is the GDN ba-proj shard, N=1024 the 8192-total
+    # column-parallel shard. The TP8 QKV/qkvz shard (N=4608) never beat the
+    # existing dispatch (0.93-1.12x) -- large-N shapes keep TGV/cuBLAS.
+    (8, 512, 8192): (64, 8, 4, 8),  # 1.51x
+    (16, 512, 8192): (64, 8, 4, 8),  # 1.60x
+    (24, 512, 8192): (64, 8, 4, 8),  # 1.48x
+    (32, 512, 8192): (64, 16, 4, 8),  # 1.37x
+    (4, 1024, 8192): (64, 8, 4, 11),  # 1.47x
+    (8, 1024, 8192): (64, 8, 4, 11),  # 2.08x
+    (16, 1024, 8192): (64, 16, 4, 8),  # 1.85x
+    (24, 1024, 8192): (64, 16, 4, 6),  # 1.41x
+    (32, 1024, 8192): (64, 16, 4, 8),  # 1.38x
 }
 
 

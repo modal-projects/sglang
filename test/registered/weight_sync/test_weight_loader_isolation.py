@@ -6,9 +6,11 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.weight_loader_isolation import (
+    WeightModuleGroup,
     build_weight_loader_proxy,
     build_weight_module_groups,
     clone_weight_module,
+    filter_ignored_checkpoint_weights,
     map_checkpoint_names_to_groups,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -317,3 +319,55 @@ def test_unknown_checkpoint_name_has_no_group_without_a_wrapper_prefix():
     assert map_checkpoint_names_to_groups(model, ["unused.weight"], groups) == {
         "unused.weight": None
     }
+
+
+def test_checkpoint_names_use_weight_update_mapper_and_ignore_checkpoint_only_weights():
+    model = torch.nn.Module()
+    model.weight_update_name_mapper = WeightsMapper(
+        orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+        orig_to_new_prefix={
+            "mtp.": None,
+            "model.language_model.": "model.",
+            "model.visual.": "visual.",
+        },
+    )
+    groups = [
+        WeightModuleGroup(path="visual.blocks.0.attn.qkv_proj", nbytes=1),
+        WeightModuleGroup(path="model.layers.0", nbytes=1),
+    ]
+    names = [
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.language_model.layers.0.input_layernorm.weight",
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+    ]
+
+    assert map_checkpoint_names_to_groups(
+        model,
+        names,
+        groups,
+    ) == {
+        "model.visual.blocks.0.attn.qkv.weight": "visual.blocks.0.attn.qkv_proj",
+        "model.language_model.layers.0.input_layernorm.weight": "model.layers.0",
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight": None,
+    }
+    weight_map = {name: "model.safetensors" for name in names}
+    assert filter_ignored_checkpoint_weights(model, weight_map) == {
+        name: filename
+        for name, filename in weight_map.items()
+        if not name.startswith("mtp.")
+    }
+
+
+def test_checkpoint_mapping_strips_nested_model_wrapper_segment():
+    model = torch.nn.Module()
+    groups = [
+        WeightModuleGroup(path="visual", nbytes=1),
+        WeightModuleGroup(path="model.embed_tokens", nbytes=1),
+        WeightModuleGroup(path="lm_head", nbytes=1),
+    ]
+
+    assert map_checkpoint_names_to_groups(
+        model,
+        ["model.language_model.embed_tokens.weight"],
+        groups,
+    ) == {"model.language_model.embed_tokens.weight": "model.embed_tokens"}

@@ -22,6 +22,7 @@ from sglang.srt.weight_sync.weight_loader_isolation import (
     build_weight_loader_proxy,
     build_weight_module_groups,
     clone_weight_module,
+    filter_ignored_checkpoint_weights,
     map_checkpoint_names_to_groups,
 )
 
@@ -354,9 +355,13 @@ class CPUWeightCompiler:
     ) -> dict[str, list[str]]:
         """Map every canonical tensor to its bounded runtime compile group."""
 
-        group_for_name = map_checkpoint_names_to_groups(
+        loadable_weight_map = filter_ignored_checkpoint_weights(
             self.model,
             weight_map,
+        )
+        group_for_name = map_checkpoint_names_to_groups(
+            self.model,
+            loadable_weight_map,
             self.groups,
         )
         names_by_group = {group.path: [] for group in self.groups}
@@ -372,6 +377,11 @@ class CPUWeightCompiler:
                 f"runtime weight group; unmapped={unmapped[:20]}"
             )
         return names_by_group
+
+    def includes_checkpoint_weight(self, name: str) -> bool:
+        """Whether the model's ordinary loader consumes this checkpoint tensor."""
+
+        return bool(filter_ignored_checkpoint_weights(self.model, {name: ""}))
 
     def compile(
         self,

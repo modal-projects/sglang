@@ -187,6 +187,7 @@ class DeltaCheckpointTransform:
         target_version: int,
         host_group: torch.distributed.ProcessGroup | None,
         max_working_memory_bytes: int = _HOST_WORKING_MEMORY_BYTES,
+        weight_name_filter: Callable[[str], bool] | None = None,
     ):
         if target_version < checkpoint.version:
             raise ValueError(
@@ -256,6 +257,10 @@ class DeltaCheckpointTransform:
                             f"extra={sorted(checksum_names - expected_names)[:8]}"
                         )
                     for name in sorted(layout.tensors):
+                        if weight_name_filter is not None and not weight_name_filter(
+                            name
+                        ):
+                            continue
                         entry = layout.tensors[name]
                         canonical_filename = checkpoint.weight_map.get(name)
                         if canonical_filename is None:

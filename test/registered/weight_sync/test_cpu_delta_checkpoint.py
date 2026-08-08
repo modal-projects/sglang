@@ -161,6 +161,38 @@ def test_xor_lineage_advances_canonical_checkpoint(tmp_path):
         cached.close()
 
 
+def test_delta_lineage_skips_checkpoint_weights_ignored_by_the_model(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {
+        "model.weight": torch.arange(8, dtype=torch.uint8),
+        "mtp.weight": torch.arange(8, dtype=torch.uint8),
+    }
+    v1 = {
+        "model.weight": v0["model.weight"].roll(1),
+        "mtp.weight": v0["mtp.weight"].roll(2),
+    }
+    _write_delta(versions, 1, v0, v1, encoding="xor")
+    cached = _checkpoint(tmp_path, v0)
+    try:
+        transform = DeltaCheckpointTransform(
+            cached,
+            checkpoint_source_dir=versions,
+            target_version=1,
+            host_group=None,
+            weight_name_filter=lambda name: not name.startswith("mtp."),
+        )
+        assert transform.setup_stats["delta_tensors"] == 1
+        transform.apply()
+
+        torch.testing.assert_close(
+            cached.get_tensor("model.weight"),
+            v1["model.weight"],
+        )
+        torch.testing.assert_close(cached.get_tensor("mtp.weight"), v0["mtp.weight"])
+    finally:
+        cached.close()
+
+
 def test_overwrite_delta_advances_canonical_checkpoint(tmp_path):
     versions = tmp_path / "updates"
     v0 = {"a": torch.arange(256, dtype=torch.uint8)}

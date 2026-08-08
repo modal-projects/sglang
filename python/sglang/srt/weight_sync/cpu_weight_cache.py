@@ -301,6 +301,7 @@ class CPUWeightCache:
                     checkpoint_source_dir=checkpoint_source_dir,
                     target_version=target_version,
                     host_group=self.host_group,
+                    weight_name_filter=self.compiler.includes_checkpoint_weight,
                 )
                 setup_stats = transform.setup_stats
                 transform_stats = transform.apply()
@@ -347,6 +348,7 @@ class CPUWeightCache:
                     checkpoint_source_dir=checkpoint_source_dir,
                     target_version=target_version,
                     host_group=self.host_group,
+                    weight_name_filter=self.compiler.includes_checkpoint_weight,
                 )
                 setup_stats = transform.setup_stats
                 names_by_group = self.compiler.checkpoint_groups(checkpoint.weight_map)

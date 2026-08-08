@@ -320,6 +320,46 @@ def _materialization_lock(local_checkpoint_dir: str):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+class LocalCheckpointTransaction:
+    """Publish an in-place canonical mutation under the materialization lock."""
+
+    def __init__(self, local_checkpoint_dir: str):
+        self.local_checkpoint_dir = local_checkpoint_dir
+        self.initial_version: int | None = None
+        self._lock = None
+        self._mutation_started = False
+        self._committed = False
+
+    def __enter__(self):
+        self._lock = _materialization_lock(self.local_checkpoint_dir)
+        self._lock.__enter__()
+        self.initial_version = _read_applied_version(self.local_checkpoint_dir)
+        return self
+
+    def begin(self, expected_version: int) -> None:
+        if self.initial_version != expected_version:
+            raise RuntimeError(
+                "canonical checkpoint version changed before mutation: "
+                f"expected={expected_version} actual={self.initial_version}"
+            )
+        _clear_applied_version(self.local_checkpoint_dir)
+        self._mutation_started = True
+
+    def commit(self, target_version: int) -> None:
+        if not self._mutation_started:
+            raise RuntimeError("canonical checkpoint mutation has not started")
+        _write_applied_version(self.local_checkpoint_dir, target_version)
+        self._committed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self._mutation_started and not self._committed:
+                _clear_applied_version(self.local_checkpoint_dir)
+        finally:
+            assert self._lock is not None
+            self._lock.__exit__(exc_type, exc, traceback)
+
+
 def _read_applied_version(local_checkpoint_dir: str) -> int | None:
     try:
         with open(os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json")) as f:

@@ -348,22 +348,15 @@ class CPUWeightCompiler:
         gc.collect(0)
         return updated, group_bytes, stats
 
-    def compile(
+    def checkpoint_groups(
         self,
-        checkpoint: CanonicalCheckpoint,
-        *,
-        target_version: int,
-    ) -> dict[str, Any]:
-        """Compile every runtime storage without changing the live model."""
+        weight_map: dict[str, str],
+    ) -> dict[str, list[str]]:
+        """Map every canonical tensor to its bounded runtime compile group."""
 
-        if target_version < 0:
-            raise ValueError("target_version must be non-negative")
-        if self.image.staging:
-            raise RuntimeError("a CPU weight image stage is already running")
-        started = time.perf_counter()
         group_for_name = map_checkpoint_names_to_groups(
             self.model,
-            checkpoint.weight_map,
+            weight_map,
             self.groups,
         )
         names_by_group = {group.path: [] for group in self.groups}
@@ -378,26 +371,52 @@ class CPUWeightCompiler:
                 "CPU weight staging cannot map every checkpoint tensor to a "
                 f"runtime weight group; unmapped={unmapped[:20]}"
             )
+        return names_by_group
+
+    def compile(
+        self,
+        checkpoint: CanonicalCheckpoint,
+        *,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Compile every runtime storage without changing the live model."""
+
+        if target_version < 0:
+            raise ValueError("target_version must be non-negative")
+        if self.image.staging:
+            raise RuntimeError("a CPU weight image stage is already running")
+        started = time.perf_counter()
+        names_by_group = self.checkpoint_groups(checkpoint.weight_map)
 
         updated_segments = set()
         copied_bytes = 0
         group_stats = []
         try:
-            if not self.image.registered:
-                self.image.register_host_memory()
-            if not self.image.valid:
-                self.image.capture_active_weights()
-            self.image.begin_stage(target_version)
+
+            def begin_stage():
+                if not self.image.registered:
+                    self.image.register_host_memory()
+                if not self.image.valid:
+                    self.image.capture_active_weights()
+                self.image.begin_stage(target_version)
+
+            checkpoint.run_on_host_ranks(
+                "CPU weight image stage initialization",
+                begin_stage,
+            )
 
             progress_interval = max(1, math.ceil(len(self.groups) / 10))
             for index, group in enumerate(self.groups, start=1):
-                loaded = self._load_group(
-                    index=index,
-                    group=group,
-                    names=names_by_group[group.path],
-                    checkpoint=checkpoint,
-                )
-                updated, group_bytes, stats = self._finalize_group(loaded)
+                names = names_by_group[group.path]
+                with checkpoint.tensor_group(group.path, names) as group_checkpoint:
+                    loaded = self._load_group(
+                        index=index,
+                        group=group,
+                        names=names,
+                        checkpoint=group_checkpoint,
+                    )
+                    updated, group_bytes, stats = self._finalize_group(loaded)
+                    del loaded
                 updated_segments.update(updated)
                 copied_bytes += group_bytes
                 group_stats.append(stats)

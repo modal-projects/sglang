@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -137,7 +138,14 @@ def test_compile_loads_rank_image_without_mutating_live_weights():
     checkpoint = SimpleNamespace(
         weight_map={"layer.weight": "model.safetensors"},
         get_tensor=lambda _name: expected,
+        run_on_host_ranks=lambda _operation, function: function(),
     )
+
+    @contextmanager
+    def tensor_group(_path, _names):
+        yield checkpoint
+
+    checkpoint.tensor_group = tensor_group
     stats = compiler.compile(checkpoint, target_version=3)
 
     assert stats["target_version"] == 3

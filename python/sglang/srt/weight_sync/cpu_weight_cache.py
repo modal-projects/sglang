@@ -13,7 +13,10 @@ from typing import Any
 
 import torch
 
-from sglang.srt.weight_sync.canonical_checkpoint import CanonicalCheckpoint
+from sglang.srt.weight_sync.canonical_checkpoint import (
+    CanonicalCheckpoint,
+    DiskCanonicalCheckpointUpdate,
+)
 from sglang.srt.weight_sync.cpu_delta_checkpoint import DeltaCheckpointTransform
 from sglang.srt.weight_sync.cpu_weight_compiler import CPUWeightCompiler
 
@@ -275,6 +278,8 @@ class CPUWeightCache:
             checkpoint_source_dir=checkpoint_source_dir,
             target_version=target_version,
         )
+        disk_canonical_invalid = False
+        compile_started = False
         try:
             if self._canonical_checkpoint_dir is None:
                 transform = DeltaCheckpointTransform(
@@ -286,18 +291,8 @@ class CPUWeightCache:
                 setup_stats = transform.setup_stats
                 transform_stats = transform.apply()
                 materialization_stats = None
-            else:
-                setup_stats = None
-                transform_stats = None
-                materialization_stats = self._materialize_canonical_checkpoint(
-                    checkpoint_source_dir=checkpoint_source_dir,
-                    target_version=target_version,
-                )
-                checkpoint = self._canonical_checkpoint
-                if checkpoint is None:
-                    raise RuntimeError("canonical checkpoint is unavailable")
-            try:
                 try:
+                    compile_started = True
                     compile_stats = self._run_on_host_ranks(
                         f"CPU weight image compilation for version {target_version}",
                         lambda: self.compiler.compile(
@@ -310,13 +305,85 @@ class CPUWeightCache:
                         "canonical checkpoint page-cache release",
                         checkpoint.release_cached_pages,
                     )
-            except Exception:
-                self.image.invalidate(
-                    f"distributed compilation of version {target_version} failed"
+            elif checkpoint.version == target_version:
+                setup_stats = None
+                transform_stats = None
+                materialization_stats = {
+                    "operation": "noop",
+                    "target_version": target_version,
+                    "wall_s": 0.0,
+                }
+                try:
+                    compile_started = True
+                    compile_stats = self._run_on_host_ranks(
+                        f"CPU weight image compilation for version {target_version}",
+                        lambda: self.compiler.compile(
+                            checkpoint,
+                            target_version=target_version,
+                        ),
+                    )
+                finally:
+                    cache_release = self._run_on_host_ranks(
+                        "canonical checkpoint page-cache release",
+                        checkpoint.release_cached_pages,
+                    )
+            else:
+                transform = DeltaCheckpointTransform(
+                    checkpoint,
+                    checkpoint_source_dir=checkpoint_source_dir,
+                    target_version=target_version,
+                    host_group=self.host_group,
                 )
-                raise
+                setup_stats = transform.setup_stats
+                names_by_group = self.compiler.checkpoint_groups(checkpoint.weight_map)
+                update = self._run_on_host_ranks(
+                    "disk canonical update construction",
+                    lambda: DiskCanonicalCheckpointUpdate(
+                        checkpoint,
+                        names_by_group=names_by_group,
+                        transform=transform,
+                        target_version=target_version,
+                        host_group=self.host_group,
+                    ),
+                )
+                self._canonical_checkpoint = None
+                checkpoint.close()
+                disk_canonical_invalid = True
+                with update:
+                    compile_started = True
+                    compile_stats = self._run_on_host_ranks(
+                        f"CPU weight image compilation for version {target_version}",
+                        lambda: self.compiler.compile(
+                            update,
+                            target_version=target_version,
+                        ),
+                    )
+                    materialization_stats = update.finish()
+                    transform_stats = materialization_stats["delta_transform"]
+                checkpoint = CanonicalCheckpoint(
+                    self._canonical_checkpoint_dir,
+                    host_group=self.host_group,
+                    version=target_version,
+                    storage="disk",
+                )
+                self._canonical_checkpoint = checkpoint
+                self._canonical_materialization_stats = materialization_stats
+                disk_canonical_invalid = False
+                cache_release = self._run_on_host_ranks(
+                    "canonical checkpoint page-cache release",
+                    checkpoint.release_cached_pages,
+                )
         except Exception:
-            if not checkpoint.valid:
+            if compile_started:
+                self.image.invalidate(
+                    f"distributed staging of version {target_version} failed"
+                )
+            if disk_canonical_invalid:
+                self._discard_canonical_checkpoint(
+                    f"staging of version {target_version} invalidated the "
+                    "disk canonical checkpoint"
+                )
+            elif not checkpoint.valid:
                 self._discard_canonical_checkpoint(
                     f"staging of version {target_version} left it invalid"
                 )
@@ -340,45 +407,6 @@ class CPUWeightCache:
             canonical_reset,
             stats["wall_s"],
         )
-        return stats
-
-    def _materialize_canonical_checkpoint(
-        self,
-        *,
-        checkpoint_source_dir: str | Path,
-        target_version: int,
-    ) -> dict[str, Any]:
-        if self._base_checkpoint_dir is None:
-            raise RuntimeError("CPU weight cache is not initialized")
-        if self._canonical_checkpoint_dir is None:
-            raise RuntimeError("CPU weight cache canonical checkpoint is in memory")
-        checkpoint = self._canonical_checkpoint
-        if checkpoint is not None and checkpoint.version == target_version:
-            return {
-                "operation": "noop",
-                "target_version": target_version,
-                "wall_s": 0.0,
-            }
-
-        self._canonical_checkpoint = None
-        if checkpoint is not None:
-            checkpoint.close()
-
-        from sglang.srt.weight_sync.disk_checkpoint import materialize
-
-        stats = materialize(
-            local_checkpoint_dir=self._canonical_checkpoint_dir,
-            base_checkpoint_dir=self._base_checkpoint_dir,
-            checkpoint_source_dir=os.path.realpath(checkpoint_source_dir),
-            target_version=target_version,
-        )
-        self._canonical_checkpoint = CanonicalCheckpoint(
-            self._canonical_checkpoint_dir,
-            host_group=self.host_group,
-            version=target_version,
-            storage="disk",
-        )
-        self._canonical_materialization_stats = stats
         return stats
 
     def invalidate_stage(self, reason: str) -> None:

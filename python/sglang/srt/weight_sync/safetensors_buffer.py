@@ -6,10 +6,11 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
-_MAX_HEADER_BYTES = 100 << 20
+MAX_SAFETENSORS_HEADER_BYTES = 100 << 20
 
 
 def _safetensors_dtypes() -> dict[str, torch.dtype]:
@@ -63,16 +64,17 @@ class SafetensorsLayout:
     tensors: dict[str, SafetensorsEntry]
 
 
-def parse_safetensors_layout(
+def parse_safetensors_header(
     *,
     header_nbytes: int,
     header_bytes: bytes,
     file_nbytes: int,
-) -> SafetensorsLayout:
+) -> tuple[SafetensorsLayout, dict[str, str]]:
     data_offset = 8 + header_nbytes
-    if header_nbytes > _MAX_HEADER_BYTES:
+    if header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
         raise ValueError(
-            f"safetensors header exceeds {_MAX_HEADER_BYTES} bytes: {header_nbytes}"
+            "safetensors header exceeds "
+            f"{MAX_SAFETENSORS_HEADER_BYTES} bytes: {header_nbytes}"
         )
     if (
         header_nbytes <= 0
@@ -89,18 +91,23 @@ def parse_safetensors_layout(
         raise ValueError("invalid safetensors JSON header") from exc
     if not isinstance(header, dict):
         raise ValueError("safetensors header is not an object")
-    header.pop("__metadata__", None)
+    file_metadata: Any = header.pop("__metadata__", {})
+    if not isinstance(file_metadata, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in file_metadata.items()
+    ):
+        raise ValueError("invalid safetensors file metadata")
 
     tensors = {}
-    for name, metadata in header.items():
-        if not isinstance(name, str) or not isinstance(metadata, dict):
+    for name, tensor_metadata in header.items():
+        if not isinstance(name, str) or not isinstance(tensor_metadata, dict):
             raise ValueError("invalid safetensors tensor metadata")
-        dtype_code = metadata.get("dtype")
+        dtype_code = tensor_metadata.get("dtype")
         dtype = _SAFETENSORS_DTYPES.get(dtype_code)
         if dtype is None:
             raise TypeError(f"unsupported safetensors dtype {dtype_code!r}")
-        shape = metadata.get("shape")
-        offsets = metadata.get("data_offsets")
+        shape = tensor_metadata.get("shape")
+        offsets = tensor_metadata.get("data_offsets")
         if (
             not isinstance(shape, list)
             or not all(isinstance(value, int) and value >= 0 for value in shape)
@@ -169,11 +176,27 @@ def parse_safetensors_layout(
             "safetensors tensor ranges do not cover the data buffer: "
             f"covered={cursor} data={data_nbytes}"
         )
-    return SafetensorsLayout(
-        data_offset=data_offset,
-        file_nbytes=file_nbytes,
-        tensors=tensors,
+    return (
+        SafetensorsLayout(
+            data_offset=data_offset,
+            file_nbytes=file_nbytes,
+            tensors=tensors,
+        ),
+        file_metadata,
     )
+
+
+def parse_safetensors_layout(
+    *,
+    header_nbytes: int,
+    header_bytes: bytes,
+    file_nbytes: int,
+) -> SafetensorsLayout:
+    return parse_safetensors_header(
+        header_nbytes=header_nbytes,
+        header_bytes=header_bytes,
+        file_nbytes=file_nbytes,
+    )[0]
 
 
 def read_safetensors_layout(path: str | Path) -> SafetensorsLayout:
@@ -184,9 +207,10 @@ def read_safetensors_layout(path: str | Path) -> SafetensorsLayout:
         if len(prefix) != 8:
             raise ValueError(f"safetensors source is shorter than its header: {path}")
         header_nbytes = int.from_bytes(prefix, "little")
-        if header_nbytes > _MAX_HEADER_BYTES:
+        if header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
             raise ValueError(
-                f"safetensors header exceeds {_MAX_HEADER_BYTES} bytes: {path}"
+                "safetensors header exceeds "
+                f"{MAX_SAFETENSORS_HEADER_BYTES} bytes: {path}"
             )
         header_bytes = file.read(header_nbytes)
     return parse_safetensors_layout(
@@ -235,9 +259,10 @@ class SafetensorsBuffer:
             raise ValueError("safetensors source is shorter than its header prefix")
         prefix = buffer[:8].numpy().tobytes()
         header_nbytes = int.from_bytes(prefix, "little")
-        if header_nbytes > _MAX_HEADER_BYTES:
+        if header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
             raise ValueError(
-                f"safetensors header exceeds {_MAX_HEADER_BYTES} bytes: {header_nbytes}"
+                "safetensors header exceeds "
+                f"{MAX_SAFETENSORS_HEADER_BYTES} bytes: {header_nbytes}"
             )
         data_offset = 8 + header_nbytes
         return parse_safetensors_layout(

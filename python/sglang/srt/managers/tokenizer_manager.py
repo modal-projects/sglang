@@ -1575,6 +1575,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out["text"] = state.get_text()
 
             if finished:
+                # Batch outputs normally remove the registry entry before waking
+                # this waiter. A tokenizer-held abort cannot do that because the
+                # waiter has not captured its state yet, so finish that lifecycle
+                # here after the state is local.
+                self.rid_to_state.pop(obj.rid, None)
+
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -2876,7 +2882,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        # Tokenizer-held requests can be aborted synchronously from the dispatch
+        # path, before _wait_one_response has captured this state. The waiter
+        # removes the registry entry once it owns the state locally.
 
         state.out_list.append(out)
         state.event.set()

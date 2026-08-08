@@ -156,11 +156,12 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
 
         tm._send_one_request(SimpleNamespace(rid="job-1-seq-0"))
 
-        # Never dispatched; resolved as aborted so _wait_one_response returns.
+        # Never dispatched; the waiter still needs the retained state to consume
+        # the abort result.
         tm._dispatch_to_scheduler.assert_not_called()
         self.assertTrue(state.finished)
         self.assertTrue(state.event.is_set())
-        self.assertNotIn("job-1-seq-0", tm.rid_to_state)
+        self.assertIs(tm.rid_to_state["job-1-seq-0"], state)
         finish_reason = state.out_list[-1]["meta_info"]["finish_reason"]
         self.assertEqual(finish_reason["type"], "abort")
 
@@ -191,7 +192,12 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
         )
 
         tm._dispatch_to_scheduler.assert_not_called()
-        self.assertEqual(tm.rid_to_state, {})
+        self.assertEqual(
+            set(tm.rid_to_state), {"job-1-seq-0", "job-1-seq-1"}
+        )
+        for state in tm.rid_to_state.values():
+            self.assertTrue(state.finished)
+            self.assertTrue(state.event.is_set())
 
 
 class FakeReq:
@@ -363,9 +369,7 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
         bootstrapped.disagg_kv_sender.abort.assert_not_called()
 
     def test_abort_all_covers_prefill_queues(self):
-        sched = _make_prefill_scheduler(
-            bootstrap_rids=["A::1"], inflight_rids=["B::1"]
-        )
+        sched = _make_prefill_scheduler(bootstrap_rids=["A::1"], inflight_rids=["B::1"])
         Scheduler.abort_request(sched, AbortReq(abort_all=True))
 
         sched.disagg_prefill_bootstrap_queue.queue[

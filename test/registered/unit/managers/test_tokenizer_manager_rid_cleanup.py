@@ -6,7 +6,7 @@ completion or abort, allowing resubmission with the same rid without
 triggering "Duplicate request ID detected" errors.
 
 Covers:
-  - _handle_abort_req cleans up rid_to_state
+  - abort results remain available until the request waiter consumes them
   - _handle_batch_output cleans up rid_to_state on finished requests
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
@@ -197,22 +197,32 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
-    """Test that _handle_abort_req removes rid from rid_to_state."""
+    """Test ownership transfer from the abort handler to the request waiter."""
 
-    def test_abort_removes_rid_from_state(self):
-        """After _handle_abort_req, rid should be removed from rid_to_state."""
+    def test_waiter_removes_aborted_rid_from_state(self):
         tm = _make_tokenizer_manager()
         rid = "abort_test_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
+        tm.request_logger = MagicMock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
 
         abort_req = _make_abort_req(rid)
         tm._handle_abort_req(abort_req)
+        self.assertIs(tm.rid_to_state[rid], state)
+
+        async def consume_abort():
+            response = tm._wait_one_response(state.obj)
+            await response.__anext__()
+            await response.aclose()
+
+        asyncio.run(consume_abort())
 
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_abort_allows_resubmit_same_rid(self):
-        """After abort, _init_req_state should accept the same rid again."""
+        """After consuming an abort, the same rid can be submitted again."""
         tm = _make_tokenizer_manager()
         rid = "resubmit_after_abort_rid"
         state = _make_req_state(rid)
@@ -220,6 +230,16 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 
         abort_req = _make_abort_req(rid)
         tm._handle_abort_req(abort_req)
+        tm.request_logger = MagicMock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+
+        async def consume_abort():
+            response = tm._wait_one_response(state.obj)
+            await response.__anext__()
+            await response.aclose()
+
+        asyncio.run(consume_abort())
 
         # Resubmit with the same rid — should not raise
         obj = Mock(spec=GenerateReqInput)
@@ -367,7 +387,7 @@ class TestResubmitAfterCompletion(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
     def test_abort_then_resubmit_same_rid(self):
-        """An aborted request should allow resubmission with the same rid."""
+        """A consumed abort should allow resubmission with the same rid."""
         tm = _make_tokenizer_manager()
         rid = "abort_resubmit_rid"
 
@@ -377,6 +397,16 @@ class TestResubmitAfterCompletion(CustomTestCase):
 
         abort_req = _make_abort_req(rid)
         tm._handle_abort_req(abort_req)
+        tm.request_logger = MagicMock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+
+        async def consume_abort():
+            response = tm._wait_one_response(state.obj)
+            await response.__anext__()
+            await response.aclose()
+
+        asyncio.run(consume_abort())
 
         self.assertNotIn(rid, tm.rid_to_state)
 

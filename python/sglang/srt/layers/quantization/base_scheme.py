@@ -34,6 +34,9 @@ class BaseLinearScheme(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return None
+
     @abstractmethod
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
@@ -76,3 +79,6 @@ class BaseMoEScheme(ABC):
     def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
         """Restore checkpoint-facing state before reloading weights in place."""
         return
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return None

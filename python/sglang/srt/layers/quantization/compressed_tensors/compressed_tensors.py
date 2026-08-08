@@ -1024,6 +1024,9 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return layer.scheme.weight_staging_postprocess_device(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1080,6 +1083,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return layer.scheme.weight_staging_postprocess_device(layer)
 
     def create_weights(
         self,

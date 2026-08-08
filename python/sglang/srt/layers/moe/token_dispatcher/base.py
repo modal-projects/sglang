@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import weakref
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -294,6 +295,64 @@ class BaseDispatcher(ABC):
         self._post_combine_hooks: Optional[_PostCombineHooks] = None
         self._original_dispatch_func: Optional[Callable] = None
         self._original_combine_func: Optional[Callable] = None
+
+    def clone_for_weight_staging(self) -> BaseDispatcher:
+        """Return an isolated dispatcher for background weight transforms."""
+
+        reset_fields = {
+            "quant_config",
+            "overlap_args",
+            "meta_overlap_args",
+            "_pre_dispatch_hooks",
+            "_post_dispatch_hooks",
+            "_pre_combine_hooks",
+            "_post_combine_hooks",
+            "_deepep_dispatch_hooks",
+            "_original_dispatch_func",
+            "_original_combine_func",
+            "_stage",
+            "_dispatch_intermediate_state",
+            "_combine_intermediate_state",
+            "dispatch",
+            "combine",
+        }
+
+        def clone_value(value):
+            clone_for_staging = getattr(value, "clone_for_weight_staging", None)
+            if callable(clone_for_staging):
+                return clone_for_staging()
+            if isinstance(value, list):
+                return [clone_value(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_value(item) for item in value)
+            if isinstance(value, dict):
+                return {key: clone_value(item) for key, item in value.items()}
+            return value
+
+        cloned = copy.copy(self)
+        # Serving hooks replace dispatch/combine with instance-bound wrappers.
+        # Staging must use the class implementations and must not run those hooks.
+        cloned.__dict__.pop("dispatch", None)
+        cloned.__dict__.pop("combine", None)
+        cloned.__dict__.pop("_dispatch_intermediate_state", None)
+        cloned.__dict__.pop("_combine_intermediate_state", None)
+        BaseDispatcher.__init__(cloned)
+        if hasattr(cloned, "_deepep_dispatch_hooks"):
+            cloned._deepep_dispatch_hooks = None
+        stage = getattr(self, "_stage", None)
+        initial_stage = getattr(type(stage), "INITIAL", None)
+        if initial_stage is not None:
+            cloned._stage = initial_stage
+        if hasattr(self, "quant_config"):
+            quant_config = self.quant_config
+            cloned.quant_config = None if quant_config is None else quant_config.copy()
+        for name, value in vars(self).items():
+            if name in reset_fields:
+                continue
+            cloned_value = clone_value(value)
+            if cloned_value is not value:
+                setattr(cloned, name, cloned_value)
+        return cloned
 
     @abstractmethod
     def dispatch(

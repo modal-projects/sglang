@@ -80,6 +80,19 @@ def _make_weight_updater(model, model_config, runner, update_model_fields):
 
 
 class TestReloadLifecycle(CustomTestCase):
+    def test_dcp_replicated_q_weights_reject_online_updates(self):
+        runner = SimpleNamespace(
+            server_args=SimpleNamespace(dcp_replicate_q_proj=True),
+        )
+
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.gemm.hpc_bf16xfp32_gemm_enabled",
+            return_value=False,
+        ):
+            error = updater_mod._unsupported_derived_weight_cache_error(runner)
+
+        self.assertIn("--dcp-replicate-q-proj", error)
+
     def test_restore_load_postprocess_order(self):
         events = []
         model = _LifecycleModel(events)

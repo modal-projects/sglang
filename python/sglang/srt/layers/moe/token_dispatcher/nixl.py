@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from enum import Enum, auto
 
@@ -237,6 +238,15 @@ class _NixlEPDispatcherImplBase:
         self.quant_config = None
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def clone_for_weight_staging(self):
+        cloned = copy.copy(self)
+        cloned.quant_config = (
+            None if self.quant_config is None else self.quant_config.copy()
+        )
+        cloned.overlap_args = None
+        cloned.meta_overlap_args = None
+        return cloned
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config

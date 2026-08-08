@@ -32,13 +32,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_derived_weight_cache_error() -> Optional[str]:
+def _unsupported_derived_weight_cache_error(
+    model_runner: ModelRunner | None = None,
+) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    These caches are built from loaded weights outside the ordinary post-load
+    lifecycle. In-place writes are invisible to them and would silently keep
+    serving stale values. Each check is startup-determined and rank-uniform,
+    so an update never proceeds on only a subset of workers.
     """
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
@@ -47,6 +49,16 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
             "Online weight updates are not supported while the HPC-Ops "
             "bf16xfp32 GEMM optimization is enabled: the cached weight "
             "split would keep serving the old weights."
+        )
+    if model_runner is not None and getattr(
+        model_runner.server_args,
+        "dcp_replicate_q_proj",
+        False,
+    ):
+        return (
+            "Online weight updates are not supported with "
+            "--dcp-replicate-q-proj: its full-head MLA weights are derived "
+            "once before CUDA graph capture and would become stale."
         )
     return None
 
@@ -147,7 +159,7 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
@@ -274,7 +286,7 @@ class WeightUpdater:
             shape: the shape of the parameter to be updated.
         """
         self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
@@ -358,7 +370,7 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
@@ -424,7 +436,7 @@ class WeightUpdater:
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 

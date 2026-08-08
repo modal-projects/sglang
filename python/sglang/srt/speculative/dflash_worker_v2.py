@@ -49,7 +49,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    prepare_mamba_track_for_verify,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1263,6 +1266,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_layer_kv=_write_layer_kv,
         )
 
+    def _prepare_target_mamba_state_for_verify(
+        self,
+        batch: ScheduleBatch,
+    ) -> Optional[torch.Tensor]:
+        """Refresh checkpoint slots and snapshot committed sequence lengths."""
+        if not self._need_mamba_verify_commit:
+            return None
+        prepare_mamba_track_for_verify(batch)
+        return batch.seq_lens.clone()
+
     def _update_target_mamba_state_after_verify(
         self,
         *,
@@ -1285,12 +1298,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = self.server_args.mamba_track_interval
+            seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+                seq_lens_pre_verify.dtype
+            )
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -1678,9 +1694,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
-        )
+        seq_lens_pre_verify = self._prepare_target_mamba_state_for_verify(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:

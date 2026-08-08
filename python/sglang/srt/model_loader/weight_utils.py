@@ -1021,7 +1021,10 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # Use the process's own CUDA device, not the global rank: on multinode
+    # clusters global ranks exceed the per-node device count (cuda:8..15 on
+    # an 8-GPU node) and torch.device(f"cuda:{rank}") is invalid there.
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]

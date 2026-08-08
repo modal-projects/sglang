@@ -868,6 +868,15 @@ class DefaultModelLoader(BaseModelLoader):
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Restore checkpoint-facing quantization state before an in-place reload."""
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.restore_weights_before_loading(module)
+
 
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a

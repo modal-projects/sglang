@@ -388,8 +388,10 @@ class CPUWeightCompiler:
         started = time.perf_counter()
         names_by_group = self.checkpoint_groups(checkpoint.weight_map)
 
-        updated_segments = set()
-        copied_bytes = 0
+        covered_segments = set()
+        staged_bytes = 0
+        preserved_segments = set()
+        preserved_bytes = 0
         group_stats = []
         try:
 
@@ -408,18 +410,40 @@ class CPUWeightCompiler:
             progress_interval = max(1, math.ceil(len(self.groups) / 10))
             for index, group in enumerate(self.groups, start=1):
                 names = names_by_group[group.path]
-                with checkpoint.tensor_group(group.path, names) as group_checkpoint:
-                    loaded = self._load_group(
-                        index=index,
-                        group=group,
-                        names=names,
-                        checkpoint=group_checkpoint,
+                if not names:
+                    prefix = f"{group.path}." if group.path else ""
+                    group_segments = {
+                        id(segment): segment
+                        for name, segment in self.image.segments_by_name.items()
+                        if not group.path
+                        or name == group.path
+                        or name.startswith(prefix)
+                    }
+                    if not group_segments:
+                        raise RuntimeError(
+                            "weight compilation group has no runtime storage: "
+                            f"path={group.path!r}"
+                        )
+                    covered_segments.update(group_segments)
+                    preserved_segments.update(group_segments)
+                    group_bytes = sum(
+                        segment.nbytes for segment in group_segments.values()
                     )
-                    updated, group_bytes, stats = self._finalize_group(loaded)
-                    del loaded
-                updated_segments.update(updated)
-                copied_bytes += group_bytes
-                group_stats.append(stats)
+                    staged_bytes += group_bytes
+                    preserved_bytes += group_bytes
+                else:
+                    with checkpoint.tensor_group(group.path, names) as group_checkpoint:
+                        loaded = self._load_group(
+                            index=index,
+                            group=group,
+                            names=names,
+                            checkpoint=group_checkpoint,
+                        )
+                        updated, group_bytes, stats = self._finalize_group(loaded)
+                        del loaded
+                    covered_segments.update(updated)
+                    staged_bytes += group_bytes
+                    group_stats.append(stats)
                 if (
                     index == 1
                     or index % progress_interval == 0
@@ -431,12 +455,12 @@ class CPUWeightCompiler:
                         target_version,
                         index,
                         len(self.groups),
-                        copied_bytes,
+                        staged_bytes,
                         time.perf_counter() - started,
                     )
 
             expected_segments = {id(segment) for segment in self.image.segments}
-            missing = expected_segments - updated_segments
+            missing = expected_segments - covered_segments
             if missing:
                 missing_names = [
                     segment.name
@@ -489,8 +513,10 @@ class CPUWeightCompiler:
             "target_version": target_version,
             "groups": len(self.groups),
             "checkpoint_tensors": len(checkpoint.weight_map),
-            "runtime_storages": len(updated_segments),
-            "bytes": copied_bytes,
+            "runtime_storages": len(covered_segments),
+            "preserved_storages": len(preserved_segments),
+            "bytes": staged_bytes,
+            "preserved_bytes": preserved_bytes,
             "wall_s": round(wall_s, 6),
             "compile_wall_s": round(
                 sum(group["wall_s"] for group in group_stats),
@@ -503,7 +529,7 @@ class CPUWeightCompiler:
         logger.info(
             "Compiled CPU weight image v%d: bytes=%d wall_time=%.3fs phases=%s",
             target_version,
-            copied_bytes,
+            staged_bytes,
             wall_s,
             phases,
         )

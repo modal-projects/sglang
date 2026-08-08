@@ -30,6 +30,11 @@ class _QuantMethod:
         return self.device
 
 
+class _MutatingQuantMethod(_QuantMethod):
+    def process_weights_after_loading(self, module):
+        module.weight.data.add_(1)
+
+
 def test_postprocess_device_is_fail_closed_and_promotes_to_cuda():
     model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
     model[0].quant_method = _QuantMethod("cpu")
@@ -156,3 +161,59 @@ def test_compile_loads_rank_image_without_mutating_live_weights():
         segment.image_offset : segment.image_offset + segment.nbytes
     ].view(torch.float32)
     torch.testing.assert_close(actual, expected)
+
+
+def test_compile_preserves_groups_absent_from_canonical_checkpoint():
+    model = _LoadableModel()
+    model.loaded = model.layer
+    del model.layer
+    model.runtime_only = _LoadableBlock()
+    model.runtime_only.quant_method = _MutatingQuantMethod("cpu")
+    model.loaded.weight.data.fill_(3)
+    model.runtime_only.weight.data.fill_(7)
+    image = _CPUImage(model)
+    for name, tensor in iter_weight_tensors(model):
+        segment = image.segments_by_name[name]
+        target = image.image[
+            segment.image_offset : segment.image_offset + segment.nbytes
+        ]
+        target.copy_(tensor.detach().view(torch.uint8))
+
+    compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
+    compiler.model = model
+    compiler.groups = build_weight_module_groups(
+        model,
+        max_group_bytes=16,
+        device_type="cpu",
+    )
+    compiler.image = image
+
+    expected = torch.arange(8, dtype=torch.float32)
+    checkpoint = SimpleNamespace(
+        weight_map={"loaded.weight": "model.safetensors"},
+        get_tensor=lambda _name: expected,
+        run_on_host_ranks=lambda _operation, function: function(),
+    )
+
+    @contextmanager
+    def tensor_group(_path, _names):
+        yield checkpoint
+
+    checkpoint.tensor_group = tensor_group
+    stats = compiler.compile(checkpoint, target_version=1)
+
+    loaded_segment = image.segments_by_name["loaded.weight"]
+    loaded = image.image[
+        loaded_segment.image_offset : loaded_segment.image_offset
+        + loaded_segment.nbytes
+    ].view(torch.float32)
+    runtime_segment = image.segments_by_name["runtime_only.weight"]
+    runtime_only = image.image[
+        runtime_segment.image_offset : runtime_segment.image_offset
+        + runtime_segment.nbytes
+    ].view(torch.float32)
+
+    torch.testing.assert_close(loaded, expected)
+    torch.testing.assert_close(runtime_only, torch.full((8,), 7.0))
+    assert stats["preserved_storages"] == 1
+    assert stats["preserved_bytes"] == model.runtime_only.weight.nbytes

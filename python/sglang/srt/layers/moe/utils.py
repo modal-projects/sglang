@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    DEEPEP_V2 = "deepep_v2"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
@@ -53,6 +54,12 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_deepep_v2(self):
+        # DeepEP v2 (RadixArk drop) is not imported on this branch; the member
+        # exists so imported call sites resolve, but no server-args choice maps
+        # to it, so this is always False until the wide-EP follow-up lands.
+        return self == MoeA2ABackend.DEEPEP_V2
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE

@@ -136,14 +136,23 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
     (32, 2560, 8192): (64, 32, 2, 9),
     # Qwen3.8-Max TP8 tactics measured on B300 SXM6 (2026-08-08), same
     # protocol: CUDA-graph replay, PDL, 32-copy L2-defeating weight rotation,
-    # FP32-reference correctness gate, >=1.26x over the best of
-    # cuBLAS/direct. N=512 is the GDN ba-proj shard, N=1024 the 8192-total
-    # column-parallel shard. The TP8 QKV/qkvz shard (N=4608) never beat the
-    # existing dispatch (0.93-1.12x) -- large-N shapes keep TGV/cuBLAS.
+    # FP32-reference correctness gate, >=1.26x over the existing dispatch.
+    # use_cutedsl_bf16_gemm declines all these shapes, so the existing
+    # dispatch here is cuBLAS. N=512 is the GDN ba-proj shard, N=1024 the
+    # 8192-total column-parallel shard. At M<=4 the speedup is delivered by
+    # the prefer_direct branch (direct kernel: 1.6-2.0x); the splitk tactic
+    # recorded is the in-branch fallback (1.5-2.0x itself at N<=1024). The
+    # TP8 QKV/qkvz shard (N=4608) never cleared the bar (1.12-1.30x) and
+    # keeps cuBLAS.
+    (1, 512, 8192): (64, 8, 4, 11),  # direct 1.89x / splitk 1.52x
+    (2, 512, 8192): (64, 8, 4, 12),  # direct 1.82x / splitk 1.52x
+    (4, 512, 8192): (64, 8, 4, 8),  # direct 1.58x / splitk 1.51x
     (8, 512, 8192): (64, 8, 4, 8),  # 1.51x
     (16, 512, 8192): (64, 8, 4, 8),  # 1.60x
     (24, 512, 8192): (64, 8, 4, 8),  # 1.48x
     (32, 512, 8192): (64, 16, 4, 8),  # 1.37x
+    (1, 1024, 8192): (64, 8, 4, 11),  # direct 2.03x / splitk 1.94x
+    (2, 1024, 8192): (64, 8, 4, 11),  # direct 1.81x / splitk 1.97x
     (4, 1024, 8192): (64, 8, 4, 11),  # 1.47x
     (8, 1024, 8192): (64, 8, 4, 11),  # 2.08x
     (16, 1024, 8192): (64, 16, 4, 8),  # 1.85x

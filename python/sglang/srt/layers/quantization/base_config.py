@@ -46,6 +46,10 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
+    def restore_weights_before_cpu_staging(self, layer: nn.Module) -> None:
+        """Restore checkpoint-facing state before compiling weights on CPU."""
+        self.restore_weights_before_loading(layer)
+
     def weight_staging_postprocess_device(self, layer: nn.Module) -> str | None:
         """Return where staged weights may run their post-load transformation.
 

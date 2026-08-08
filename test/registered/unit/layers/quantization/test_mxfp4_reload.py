@@ -6,6 +6,7 @@ import sglang.srt.layers.quantization.mxfp4 as mxfp4
 from sglang.srt.layers.quantization.mxfp4 import (
     Mxfp4MoEMethod,
     _compose_trtllm_gate_up_permutation,
+    _parallel_cpu_zero_,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -94,6 +95,65 @@ def test_cpu_staging_rebuilds_runtime_layout_in_place(monkeypatch):
         else:
             torch.testing.assert_close(actual, expected)
         assert actual.data_ptr() == runtime_pointers[name]
+
+
+def test_cpu_staging_keeps_runtime_weight_buffers(monkeypatch):
+    monkeypatch.setattr(
+        mxfp4,
+        "_get_flashinfer_mxfp4_device_permute_indices",
+        lambda tensor, *_args, **_kwargs: torch.arange(tensor.shape[0]),
+    )
+    method = _make_method()
+    layer = _make_layer(seed=1)
+    target = _make_layer(seed=2)
+    reference = _make_layer(seed=2)
+    method.process_weights_after_loading(layer)
+    runtime_pointers = {
+        name: getattr(layer, name).data_ptr() for name in ("w13_weight", "w2_weight")
+    }
+
+    method.restore_weights_before_cpu_staging(layer)
+    for name, pointer in runtime_pointers.items():
+        parameter = getattr(layer, name)
+        assert parameter.data_ptr() != pointer
+        assert parameter._weight_staging_runtime_buffer.data_ptr() == pointer
+    for name, parameter in target.named_parameters():
+        getattr(layer, name).data.copy_(parameter)
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(reference)
+
+    for name, pointer in runtime_pointers.items():
+        actual = getattr(layer, name)
+        torch.testing.assert_close(actual, getattr(reference, name))
+        assert actual.data_ptr() == pointer
+        assert not hasattr(actual, "_weight_staging_runtime_buffer")
+
+
+def test_cpu_staging_zeroes_padded_checkpoint_buffers(monkeypatch):
+    monkeypatch.setattr(mxfp4, "_cpu_weight_transform_workers", lambda: 2)
+    method = _make_method()
+    layer = _make_layer(seed=1)
+    layer.intermediate_size_per_partition = 96
+
+    method.restore_weights_before_cpu_staging(layer)
+
+    for name, parameter in layer.named_parameters():
+        assert torch.count_nonzero(parameter) == 0, name
+
+
+def test_parallel_cpu_zero_preserves_tensor_boundaries(monkeypatch):
+    monkeypatch.setattr(mxfp4, "_cpu_weight_transform_workers", lambda: 2)
+    storage = torch.full((32,), 7, dtype=torch.uint8)
+    first = storage[4:12]
+    second = storage[16:28].view(torch.bfloat16)
+
+    _parallel_cpu_zero_((first, first, second))
+
+    torch.testing.assert_close(storage[:4], torch.full((4,), 7, dtype=torch.uint8))
+    torch.testing.assert_close(storage[4:12], torch.zeros(8, dtype=torch.uint8))
+    torch.testing.assert_close(storage[12:16], torch.full((4,), 7, dtype=torch.uint8))
+    torch.testing.assert_close(storage[16:28], torch.zeros(12, dtype=torch.uint8))
+    torch.testing.assert_close(storage[28:], torch.full((4,), 7, dtype=torch.uint8))
 
 
 def test_cpu_staging_capability_is_backend_specific():

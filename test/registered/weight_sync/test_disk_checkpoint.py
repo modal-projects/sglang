@@ -14,6 +14,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 import numpy as np
 import zstandard
@@ -39,6 +40,18 @@ class ChecksumTest(unittest.TestCase):
     def test_unsupported_algorithm_fails_loudly(self):
         with self.assertRaisesRegex(ValueError, "unsupported checksum algorithm"):
             create_checksum("unknown")
+
+    def test_checkpoint_source_refresh_hook_receives_target(self):
+        hook = mock.Mock()
+        with mock.patch.object(
+            disk_checkpoint,
+            "dynamic_import",
+            return_value=hook,
+        ) as dynamic_import:
+            disk_checkpoint.refresh_checkpoint_source("/updates", 3, "hooks.refresh")
+
+        dynamic_import.assert_called_once_with("hooks.refresh")
+        hook.assert_called_once_with("/updates", 3)
 
 
 def write_safetensors(path, tensors, metadata=None):

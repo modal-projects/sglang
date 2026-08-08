@@ -46,6 +46,16 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before reloading weights in place."""
         return
 
+    def weight_staging_postprocess_device(self, layer: nn.Module) -> str | None:
+        """Return where staged weights may run their post-load transformation.
+
+        Return ``"cpu"`` or ``"cuda"`` to support CPU weight staging. ``None``
+        means that CPU weight staging does not support this method. Methods with
+        non-tensor runtime state must also define
+        ``process_weights_after_weight_commit``.
+        """
+        return None
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""

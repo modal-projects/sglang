@@ -148,6 +148,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         if self.strategy == QuantizationStrategy.BLOCK:
             restore_ue8m0_scale_checkpoint_layout(layer.weight_scale)
 
+    def weight_staging_postprocess_device(self, layer) -> str | None:
+        if (
+            self.strategy == QuantizationStrategy.CHANNEL
+            and not self.is_static_input_scheme
+            and not is_fp8_fnuz()
+            and not _use_aiter
+        ):
+            return "cpu"
+        if self.strategy == QuantizationStrategy.BLOCK and not is_fp8_fnuz():
+            return "cuda"
+        return None
+
     def process_weights_after_loading(self, layer) -> None:
         if self.strategy == QuantizationStrategy.BLOCK:
             record_ue8m0_scale_checkpoint_layout(layer.weight_scale)

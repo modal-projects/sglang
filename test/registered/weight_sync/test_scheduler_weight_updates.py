@@ -194,6 +194,38 @@ def test_disk_stage_defaults_to_boot_checkpoint():
     )
 
 
+def test_stage_response_reports_only_the_local_scheduler_stats():
+    manager = _manager()
+    request = _stage_request(
+        destination="disk",
+        target_version=1,
+        checkpoint_source_dir="/updates",
+        local_checkpoint_dir="/local",
+    )
+
+    def gather_with_remote_success(value, group):
+        assert group is manager.weight_update_stage_cpu_group
+        return [value, (True, "Success.", {"rank": 1, "wall_s": 2.0})]
+
+    with (
+        mock.patch(
+            "sglang.srt.weight_sync.disk_checkpoint.materialize",
+            return_value={},
+        ),
+        mock.patch.object(
+            SchedulerWeightUpdaterManager,
+            "_all_gather",
+            autospec=True,
+            side_effect=gather_with_remote_success,
+        ),
+    ):
+        result = manager._stage_weight_update_sync(request)
+
+    assert result.success
+    assert len(result.rank_stats) == 1
+    assert result.rank_stats[0]["rank"] == 0
+
+
 def test_cpu_stage_zero_initializes_rank_cache():
     manager = _manager(cpu_cache=True)
     manager.tp_worker.initialize_cpu_weight_cache.return_value = {"cache": "ready"}
@@ -451,6 +483,42 @@ def test_cpu_commit_flushes_before_updating_only_the_target():
     assert result.success
     assert order == [("flush", False), ("commit", 2)]
     manager.draft_worker.update_weights_from_cpu.assert_not_called()
+
+
+def test_cpu_commit_response_reports_only_the_local_scheduler_stats():
+    manager = _manager(cpu_cache=True)
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.validate_staged_cpu_weight_update.return_value = (True, "ready")
+    manager.tp_worker.update_weights_from_cpu.return_value = (
+        True,
+        "committed",
+        {"wall_s": 1.0},
+    )
+
+    def gather_with_remote_success(value, group):
+        assert group is manager.tp_cpu_group
+        if isinstance(value, bool):
+            return [value, False]
+        if len(value) == 2:
+            return [value, (True, "ready")]
+        return [value, (True, "committed", {"rank": 1, "wall_s": 2.0})]
+
+    with mock.patch.object(
+        SchedulerWeightUpdaterManager,
+        "_all_gather",
+        autospec=True,
+        side_effect=gather_with_remote_success,
+    ):
+        result = manager.update_weights_from_cpu(
+            SimpleNamespace(
+                target_version=2,
+                flush_cache=False,
+                torch_empty_cache=False,
+            )
+        )
+
+    assert result.success
+    assert result.rank_stats == [{"rank": 0, "wall_s": 1.0}]
 
 
 def test_cpu_commit_rejects_failed_flush_before_mutating_weights():

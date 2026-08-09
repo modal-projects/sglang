@@ -440,8 +440,6 @@ class SchedulerWeightUpdaterManager:
                 dict.fromkeys(result[1] for result in results if not result[0])
             )
             message = "\n".join(messages)
-        rank_stats = [result[2] for result in results]
-
         if recv_req.destination == "cpu" and not success:
             if recv_req.target_version == 0:
                 self.tp_worker.discard_cpu_weight_cache(
@@ -457,7 +455,10 @@ class SchedulerWeightUpdaterManager:
         return StageWeightUpdateReqOutput(
             success=success,
             message=message,
-            rank_stats=rank_stats,
+            # The tokenizer manager already fans out to every scheduler. The
+            # all-gather above is only the fail-closed synchronization point;
+            # returning it from every scheduler would duplicate rank stats.
+            rank_stats=[local_stats],
         )
 
     def check_pending_weight_update_stage(self) -> None:
@@ -545,7 +546,10 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromCPUReqOutput(
                 success=True,
                 message=message,
-                rank_stats=[result[2] for result in rank_results],
+                # The tokenizer manager collects one response per scheduler.
+                # Keep the all-gather local to the commit protocol so response
+                # metadata remains linear in the number of workers.
+                rank_stats=[{"rank": rank, **(stats or {})}],
             )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):

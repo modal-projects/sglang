@@ -2972,10 +2972,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if (layer_id := get_layer_id(name)) is not None
                 }
             )
-            # Only the projection owns the derived cache. A norm-only staging
-            # group must not mutate the live projection through the proxy shell.
-            process_output = any(
-                name.startswith("model.output_attn_res_proj.") for name in weight_names
+            # The output cache depends on both source modules. Bounded staging
+            # groups may contain only one of them; refresh the cache after the
+            # complete rank image is committed instead.
+            process_output = all(
+                any(name.startswith(prefix) for name in weight_names)
+                for prefix in (
+                    "model.output_attn_res_proj.",
+                    "model.output_attn_res_norm.",
+                )
             )
 
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers

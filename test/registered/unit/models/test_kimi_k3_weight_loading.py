@@ -164,6 +164,29 @@ def test_post_load_hook_processes_full_model():
         assert layer.self_attn.prepare_calls == 1
 
 
+def test_output_attention_residual_cache_requires_both_source_modules():
+    model = _model()
+    model.model.output_attn_res_proj = SimpleNamespace()
+    model.model.output_attn_res_norm = SimpleNamespace()
+
+    with patch("sglang.srt.models.kimi_k3.get_cw") as get_cw_mock:
+        KimiK3LinearForCausalLM.post_load_weights(
+            model,
+            weight_names={"model.output_attn_res_proj.weight"},
+        )
+        assert get_cw_mock.call_count == 0
+
+        KimiK3LinearForCausalLM.post_load_weights(
+            model,
+            weight_names={
+                "model.output_attn_res_proj.weight",
+                "model.output_attn_res_norm.weight",
+            },
+        )
+
+    assert get_cw_mock.call_count == 2
+
+
 def test_decoder_layers_are_indivisible_weight_staging_units():
     from sglang.srt.models.kimi_k3 import KimiK3DecoderLayer
 

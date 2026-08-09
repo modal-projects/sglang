@@ -205,11 +205,34 @@ def test_cpu_stage_zero_initializes_rank_cache():
     assert result.success
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         checkpoint_dir="/base",
+        seed_from_active_weights=True,
         host_group=manager.host_cpu_group,
         max_compile_group_bytes=8 << 30,
         canonical_checkpoint_dir=None,
     )
     assert result.rank_stats[0]["stage"]["initialization"] == {"cache": "ready"}
+
+
+def test_cpu_stage_zero_compiles_a_non_boot_checkpoint():
+    manager = _manager(cpu_cache=True)
+    manager.tp_worker.initialize_cpu_weight_cache.return_value = {"cache": "ready"}
+
+    result = manager._stage_weight_update_sync(
+        _stage_request(
+            destination="cpu",
+            target_version=0,
+            base_checkpoint_dir="/other-base",
+        )
+    )
+
+    assert result.success
+    manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
+        checkpoint_dir="/other-base",
+        seed_from_active_weights=False,
+        host_group=manager.host_cpu_group,
+        max_compile_group_bytes=8 << 30,
+        canonical_checkpoint_dir=None,
+    )
 
 
 def test_cpu_delta_stage_requires_initialized_base():

@@ -46,8 +46,12 @@ class _FakeCache:
         self.invalidated = []
         self.closed = []
 
-    def initialize_from_checkpoint(self, checkpoint_dir):
-        return {"checkpoint_dir": checkpoint_dir, "wall_s": 2.0}
+    def initialize_from_checkpoint(self, checkpoint_dir, *, seed_from_active_weights):
+        return {
+            "checkpoint_dir": checkpoint_dir,
+            "seed_from_active_weights": seed_from_active_weights,
+            "wall_s": 2.0,
+        }
 
     def stage_delta_lineage(self, *, checkpoint_source_dir, target_version):
         self.staged.append((checkpoint_source_dir, target_version))
@@ -106,6 +110,7 @@ def test_cpu_weight_cache_worker_lifecycle():
     ):
         initialization = updater.initialize_cpu_weight_cache(
             checkpoint_dir="/checkpoint",
+            seed_from_active_weights=True,
             host_group=host_group,
             max_compile_group_bytes=1024,
             canonical_checkpoint_dir=None,
@@ -116,6 +121,7 @@ def test_cpu_weight_cache_worker_lifecycle():
         assert cache.host_group is host_group
         assert cache.max_compile_group_bytes == 1024
         assert initialization["cache_population_wall_s"] == 2.0
+        assert initialization["seed_from_active_weights"] is True
 
         success, _, stage = updater.stage_cpu_weight_update_from_delta_lineage(
             checkpoint_source_dir="/updates",
@@ -145,6 +151,7 @@ def test_cpu_weight_cache_rejects_draft_models():
     with pytest.raises(RuntimeError, match="only supported for target models"):
         updater.initialize_cpu_weight_cache(
             checkpoint_dir="/checkpoint",
+            seed_from_active_weights=True,
             host_group=None,
             max_compile_group_bytes=1024,
             canonical_checkpoint_dir=None,

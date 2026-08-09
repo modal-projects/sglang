@@ -153,15 +153,22 @@ class CPUWeightCache:
     def initialize_from_checkpoint(
         self,
         checkpoint_dir: str | Path,
+        *,
+        seed_from_active_weights: bool,
     ) -> dict[str, Any]:
         """Build and validate the reusable CPU state from active version zero."""
 
         with self._exclusive("initialize"):
-            return self._initialize_from_checkpoint(checkpoint_dir)
+            return self._initialize_from_checkpoint(
+                checkpoint_dir,
+                seed_from_active_weights=seed_from_active_weights,
+            )
 
     def _initialize_from_checkpoint(
         self,
         checkpoint_dir: str | Path,
+        *,
+        seed_from_active_weights: bool,
     ) -> dict[str, Any]:
         if self._base_checkpoint_dir is not None:
             raise RuntimeError("CPU weight cache is already initialized")
@@ -173,21 +180,27 @@ class CPUWeightCache:
                 self.compiler.initialize_from_active,
             )
             checkpoint = self._seed_canonical_checkpoint()
-
-            def compile_baseline():
-                compile_stats = self.compiler.compile(
-                    checkpoint,
-                    target_version=0,
-                )
-                validation_stats = self.image.validate_against_active()
-                self.image.accept_staged_baseline()
-                return compile_stats, validation_stats
-
             try:
-                baseline_compile, validation = self._run_on_host_ranks(
-                    "CPU weight cache baseline validation",
-                    compile_baseline,
-                )
+                if seed_from_active_weights:
+                    baseline_compile = None
+                    validation = None
+                    rank_image_source = "active_model"
+                else:
+
+                    def compile_baseline():
+                        compile_stats = self.compiler.compile(
+                            checkpoint,
+                            target_version=0,
+                        )
+                        validation_stats = self.image.validate_against_active()
+                        self.image.accept_staged_baseline()
+                        return compile_stats, validation_stats
+
+                    baseline_compile, validation = self._run_on_host_ranks(
+                        "CPU weight cache baseline validation",
+                        compile_baseline,
+                    )
+                    rank_image_source = "checkpoint"
             finally:
                 cache_release = self._run_on_host_ranks(
                     "canonical checkpoint page-cache release",
@@ -205,6 +218,7 @@ class CPUWeightCache:
             "canonical_materialization": self._canonical_materialization_stats,
             "rank_image_bytes": self.image.image_nbytes,
             "rank_weight_bytes": self.image.weight_nbytes,
+            "rank_image_source": rank_image_source,
             "image_initialization": image_initialization,
             "baseline_compile": baseline_compile,
             "validation": validation,

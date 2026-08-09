@@ -172,6 +172,7 @@ class SchedulerWeightUpdaterManager:
         try:
             stats = self.tp_worker.initialize_cpu_weight_cache(
                 checkpoint_dir=checkpoint_dir,
+                seed_from_active_weights=self._is_boot_checkpoint(checkpoint_dir),
                 host_group=self.host_cpu_group,
                 max_compile_group_bytes=int(
                     server_args.cpu_weight_cache_max_compile_group_gb * (1 << 30)
@@ -195,6 +196,11 @@ class SchedulerWeightUpdaterManager:
             "initialization": stats,
             "wall_s": round(time.perf_counter() - started, 6),
         }
+
+    def _is_boot_checkpoint(self, checkpoint_dir: str) -> bool:
+        return os.path.realpath(checkpoint_dir) == os.path.realpath(
+            self.boot_model_path
+        )
 
     def _pending_weight_update_stage_message(self) -> str | None:
         pending = self._pending_weight_update_stage is not None

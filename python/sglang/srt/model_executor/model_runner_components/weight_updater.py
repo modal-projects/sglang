@@ -269,6 +269,7 @@ class WeightUpdater:
         self,
         *,
         checkpoint_dir: str,
+        seed_from_active_weights: bool,
         host_group: torch.distributed.ProcessGroup | None,
         max_compile_group_bytes: int,
         canonical_checkpoint_dir: str | None,
@@ -336,7 +337,10 @@ class WeightUpdater:
 
             construction_wall_s = time.perf_counter() - started
             try:
-                stats = cache.initialize_from_checkpoint(checkpoint_dir)
+                stats = cache.initialize_from_checkpoint(
+                    checkpoint_dir,
+                    seed_from_active_weights=seed_from_active_weights,
+                )
             except Exception:
                 cache.close("CPU weight cache initialization failed")
                 raise

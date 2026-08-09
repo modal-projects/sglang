@@ -258,6 +258,17 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             response.text,
         )
 
+        # A rejected decode result must not strand its overlap-allocated KV
+        # slot or poison the scheduler for the next request.
+        healthy_response = self._post_generate(
+            {
+                "temperature": 0,
+                "max_new_tokens": 1,
+            },
+            return_sampling_mask=False,
+        )
+        self.assertEqual(healthy_response.status_code, 200, healthy_response.text)
+
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
     @classmethod

@@ -604,6 +604,8 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    # Return sglext input/output ids for requests not tagged `modal-log-exclude`.
+    SGLANG_RETURN_IDS_FROM_LOG_EXCLUDE = EnvBool(False)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)

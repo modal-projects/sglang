@@ -445,6 +445,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if envs.SGLANG_RETURN_IDS_FROM_LOG_EXCLUDE.get():
+    from sglang.srt.entrypoints.log_exclude_ids import LogExcludeIdsMiddleware
+
+    app.add_middleware(LogExcludeIdsMiddleware)
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 

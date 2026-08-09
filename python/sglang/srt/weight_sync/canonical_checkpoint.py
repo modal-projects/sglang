@@ -836,6 +836,7 @@ class DiskCanonicalCheckpointUpdate:
         self._physical_write_bytes = 0
         self._write_worker_s = 0.0
         self._write_wait_s = 0.0
+        self._fsync_worker_s = 0.0
         self._persistence_stats = None
         logger.info(
             "Prepared NVMe canonical update v%d to v%d: groups=%d "
@@ -1176,7 +1177,9 @@ class DiskCanonicalCheckpointUpdate:
                 )
             for filename in self._dirty_files:
                 fd = self._fds[filename]
+                started = time.perf_counter()
                 os.fsync(fd)
+                self._fsync_worker_s += time.perf_counter() - started
                 if hasattr(os, "posix_fadvise"):
                     try:
                         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -1190,6 +1193,7 @@ class DiskCanonicalCheckpointUpdate:
                 "physical_bytes": self._physical_write_bytes,
                 "worker_s": self._write_worker_s,
                 "wait_s": self._write_wait_s,
+                "fsync_worker_s": self._fsync_worker_s,
                 "files": len(self._dirty_files),
             }
         )
@@ -1198,6 +1202,12 @@ class DiskCanonicalCheckpointUpdate:
             "physical_bytes": sum(stats["physical_bytes"] for stats in rank_stats),
             "worker_s": round(sum(stats["worker_s"] for stats in rank_stats), 6),
             "wait_s": round(max(stats["wait_s"] for stats in rank_stats), 6),
+            "fsync_worker_s": round(
+                sum(stats["fsync_worker_s"] for stats in rank_stats), 6
+            ),
+            "fsync_wall_s": round(
+                max(stats["fsync_worker_s"] for stats in rank_stats), 6
+            ),
             "files": sum(stats["files"] for stats in rank_stats),
         }
 

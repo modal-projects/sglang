@@ -278,6 +278,8 @@ def test_disk_canonical_checkpoint_materializes_and_compiles(tmp_path, monkeypat
         )
         assert stats["canonical_materialization"]["canonical_read_bytes"] == 8
         assert stats["canonical_materialization"]["persistence"]["physical_bytes"] == 8
+        assert stats["canonical_materialization"]["persistence"]["fsync_worker_s"] >= 0
+        assert stats["canonical_materialization"]["persistence"]["fsync_wall_s"] >= 0
         assert stats["canonical_materialization"]["target_version"] == 1
         assert cache.canonical_version == 1
         torch.testing.assert_close(cache.compiler.compiled[-1][1], target)

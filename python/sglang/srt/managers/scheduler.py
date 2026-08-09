@@ -2929,8 +2929,15 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        finish_reason = (
+            req.to_finish if isinstance(req.to_finish, FINISH_ABORT) else FINISH_ABORT()
+        )
+        prepare_abort(
+            req,
+            finish_reason.message,
+            finished_reason=finish_reason.to_json(),
+        )
+        req.time_stats.trace_ctx.abort(abort_info=finish_reason.to_json())
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
@@ -2944,7 +2951,9 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid, finished_reason=finish_reason.to_json()), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4393,9 +4402,15 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        finish_reason = (
+            FINISH_ABORT.from_json(recv_req.finished_reason)
+            if recv_req.finished_reason is not None
+            else FINISH_ABORT()
+        )
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                chunked_req.to_finish = finish_reason
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -4413,7 +4428,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    rid=req.rid,
+                    finished_reason=recv_req.finished_reason,
+                ),
+                req,
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4446,7 +4467,11 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=recv_req.finished_reason,
+                    ),
+                    req,
                 )
                 if (
                     req.req_pool_idx is not None
@@ -4473,7 +4498,11 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
                     if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
+                        prepare_abort(
+                            req,
+                            "Aborted by AbortReq.",
+                            finished_reason=recv_req.finished_reason,
+                        )
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4489,7 +4518,11 @@ class Scheduler(
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                        prepare_abort(
+                            decode_req.req,
+                            "Aborted by AbortReq.",
+                            finished_reason=recv_req.finished_reason,
+                        )
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -4505,7 +4538,11 @@ class Scheduler(
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
+                            AbortReq(
+                                rid=decode_req.rid,
+                                finished_reason=recv_req.finished_reason,
+                            ),
+                            decode_req,
                         )
                     else:
                         remaining_retracted.append(decode_req)
@@ -4526,7 +4563,7 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = finish_reason
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

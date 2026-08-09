@@ -344,6 +344,29 @@ class TestAbortRequests(unittest.TestCase):
         future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
 
+    def test_abort_preserves_finished_reason(self):
+        mgr = self._make_mgr_with_queue()
+        req = _make_req(rid="req-123")
+        req.grammar = MagicMock(spec=Future)
+        mgr.grammar_queue.append(req)
+        finished_reason = {
+            "type": "abort",
+            "message": "client cancelled",
+            "status_code": 499,
+            "err_type": "client_cancel",
+        }
+        abort_req = MagicMock(
+            abort_all=False,
+            rid="req-123",
+            finished_reason=finished_reason,
+        )
+
+        mgr.abort_requests(abort_req)
+
+        req.set_finish_with_abort.assert_called_once_with(
+            "Aborted by AbortReq.", finished_reason
+        )
+
     def test_abort_non_matching_rid(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-999")

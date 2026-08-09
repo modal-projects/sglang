@@ -83,6 +83,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # ampere and up
         return 80
 
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
     def weight_staging_postprocess_device(self, layer) -> str | None:
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL

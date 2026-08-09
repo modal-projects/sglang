@@ -190,6 +190,8 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return the post-tokenization prompt token ids
+    return_prompt_token_ids: bool = False
     return_indexer_topk: bool = False
     # Absolute start position for returned routings; response covers
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
@@ -674,6 +676,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_prompt_token_ids=self.return_prompt_token_ids,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,

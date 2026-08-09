@@ -176,6 +176,10 @@ class ReqState:
             out["output_ids"] = self.output_ids.copy()
         return out
 
+    # For return_prompt_token_ids: prompt token ids captured after tokenization,
+    # so multimodal placeholder expansion is already reflected.
+    prompt_token_ids: Optional[List[int]] = None
+
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
@@ -1132,8 +1136,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state[obj.rid]
+        tokenized_obj.time_stats = state.time_stats
+        state.time_stats.set_tokenize_finish_time()
+        if getattr(obj, "return_prompt_token_ids", False):
+            state.prompt_token_ids = list(tokenized_obj.input_ids)
 
         return tokenized_obj
 
@@ -1986,6 +1993,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             if out_dict is not None:
+                if state.prompt_token_ids is not None:
+                    out_dict["prompt_token_ids"] = state.prompt_token_ids
                 state.out_list.append(out_dict)
                 pending_notify[rid] = state
 

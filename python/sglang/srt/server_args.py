@@ -515,6 +515,8 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    return_input_ids: bool = False
+    return_output_ids: bool = False
     reasoning_parser: Optional[str] = None
     strip_thinking_cache: bool = False
     enable_strict_thinking: bool = False
@@ -5312,6 +5314,18 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--return-input-ids",
+            action="store_true",
+            help="Return prompt (input) token ids on the response-level sglext extension "
+            "for every chat completion request, as if return_input_ids were set on the request.",
+        )
+        parser.add_argument(
+            "--return-output-ids",
+            action="store_true",
+            help="Return sampled output token ids on the response-level sglext extension "
+            "for every chat completion request, as if return_output_ids were set on the request.",
         )
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(

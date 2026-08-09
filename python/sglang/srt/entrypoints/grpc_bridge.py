@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from pydantic import ValidationError
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.managers.schedule_batch import client_cancel_finish_reason
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -107,11 +108,16 @@ class RuntimeHandle:
         return status is not None and status == type(status).Closed
 
     def _abort_request_id(self, rid) -> None:
+        finished_reason = client_cancel_finish_reason()
         if isinstance(rid, list):
             for single_rid in rid:
-                self.tokenizer_manager.abort_request(rid=single_rid)
+                self.tokenizer_manager.abort_request(
+                    rid=single_rid, finished_reason=finished_reason
+                )
         else:
-            self.tokenizer_manager.abort_request(rid=rid)
+            self.tokenizer_manager.abort_request(
+                rid=rid, finished_reason=finished_reason
+            )
 
     async def _send_with_backpressure(
         self,
@@ -371,7 +377,11 @@ class RuntimeHandle:
             running_loop = None
 
         if running_loop is loop:
-            self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+            self.tokenizer_manager.abort_request(
+                rid=rid,
+                abort_all=abort_all,
+                finished_reason=None if abort_all else client_cancel_finish_reason(),
+            )
             return
 
         future = asyncio.run_coroutine_threadsafe(
@@ -391,7 +401,11 @@ class RuntimeHandle:
             )
 
     async def _abort_async(self, rid: str, abort_all: bool) -> None:
-        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+        self.tokenizer_manager.abort_request(
+            rid=rid,
+            abort_all=abort_all,
+            finished_reason=None if abort_all else client_cancel_finish_reason(),
+        )
 
     def get_model_info(self) -> str:
         model_config = self.tokenizer_manager.model_config

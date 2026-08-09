@@ -409,41 +409,54 @@ class CPUWeightCompiler:
 
             progress_interval = max(1, math.ceil(len(self.groups) / 10))
             for index, group in enumerate(self.groups, start=1):
-                names = names_by_group[group.path]
-                if not names:
-                    prefix = f"{group.path}." if group.path else ""
-                    group_segments = {
-                        id(segment): segment
-                        for name, segment in self.image.segments_by_name.items()
-                        if not group.path
-                        or name == group.path
-                        or name.startswith(prefix)
-                    }
-                    if not group_segments:
-                        raise RuntimeError(
-                            "weight compilation group has no runtime storage: "
-                            f"path={group.path!r}"
+                phase = "preserve"
+                try:
+                    names = names_by_group[group.path]
+                    if not names:
+                        prefix = f"{group.path}." if group.path else ""
+                        group_segments = {
+                            id(segment): segment
+                            for name, segment in self.image.segments_by_name.items()
+                            if not group.path
+                            or name == group.path
+                            or name.startswith(prefix)
+                        }
+                        if not group_segments:
+                            raise RuntimeError(
+                                "weight compilation group has no runtime storage: "
+                                f"path={group.path!r}"
+                            )
+                        covered_segments.update(group_segments)
+                        preserved_segments.update(group_segments)
+                        group_bytes = sum(
+                            segment.nbytes for segment in group_segments.values()
                         )
-                    covered_segments.update(group_segments)
-                    preserved_segments.update(group_segments)
-                    group_bytes = sum(
-                        segment.nbytes for segment in group_segments.values()
-                    )
-                    staged_bytes += group_bytes
-                    preserved_bytes += group_bytes
-                else:
-                    with checkpoint.tensor_group(group.path, names) as group_checkpoint:
-                        loaded = self._load_group(
-                            index=index,
-                            group=group,
-                            names=names,
-                            checkpoint=group_checkpoint,
-                        )
-                        updated, group_bytes, stats = self._finalize_group(loaded)
-                        del loaded
-                    covered_segments.update(updated)
-                    staged_bytes += group_bytes
-                    group_stats.append(stats)
+                        staged_bytes += group_bytes
+                        preserved_bytes += group_bytes
+                    else:
+                        with checkpoint.tensor_group(
+                            group.path, names
+                        ) as group_checkpoint:
+                            phase = "load"
+                            loaded = self._load_group(
+                                index=index,
+                                group=group,
+                                names=names,
+                                checkpoint=group_checkpoint,
+                            )
+                            phase = "finalize"
+                            updated, group_bytes, stats = self._finalize_group(loaded)
+                            del loaded
+                        covered_segments.update(updated)
+                        staged_bytes += group_bytes
+                        group_stats.append(stats)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "CPU weight image compilation failed for group "
+                        f"{index}/{len(self.groups)} at {group.path or '<root>'!r} "
+                        f"during {phase}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 if (
                     index == 1
                     or index % progress_interval == 0

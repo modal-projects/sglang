@@ -217,3 +217,34 @@ def test_compile_preserves_groups_absent_from_canonical_checkpoint():
     torch.testing.assert_close(runtime_only, torch.full((8,), 7.0))
     assert stats["preserved_storages"] == 1
     assert stats["preserved_bytes"] == model.runtime_only.weight.nbytes
+
+
+def test_compile_failure_identifies_weight_group():
+    model = _LoadableModel()
+    compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
+    compiler.model = model
+    compiler.groups = build_weight_module_groups(
+        model,
+        max_group_bytes=16,
+        device_type="cpu",
+    )
+    compiler.image = _CPUImage(model)
+
+    checkpoint = SimpleNamespace(
+        weight_map={"layer.weight": "model.safetensors"},
+        get_tensor=lambda _name: (_ for _ in ()).throw(ValueError("bad tensor")),
+        run_on_host_ranks=lambda _operation, function: function(),
+    )
+
+    @contextmanager
+    def tensor_group(_path, _names):
+        yield checkpoint
+
+    checkpoint.tensor_group = tensor_group
+    with pytest.raises(
+        RuntimeError,
+        match=r"group 1/1 at 'layer' during load",
+    ) as error:
+        compiler.compile(checkpoint, target_version=1)
+
+    assert isinstance(error.value.__cause__, ValueError)

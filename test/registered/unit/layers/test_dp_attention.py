@@ -34,6 +34,15 @@ def test_dp_local_slice_uses_dense_prefill_graph_layout(_):
 
 
 @patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=2)
+def test_dp_local_slice_uses_dense_layout_for_idle_prefill_rank(_):
+    assert get_dp_local_slice_cpu(
+        _forward_batch(ForwardMode.IDLE),
+        can_run_graph=True,
+        cuda_graph_batch=None,
+    ) == (12, 11)
+
+
+@patch("sglang.srt.layers.dp_attention.get_attention_dp_rank", return_value=2)
 def test_dp_local_slice_ignores_stale_graph_stride_for_eager_forward(_):
     assert get_dp_local_slice_cpu(
         _forward_batch(ForwardMode.EXTEND),

@@ -256,6 +256,43 @@ class TestReloadLifecycle(CustomTestCase):
 
         self.assertEqual(model_config.model_path, "/original")
 
+    def test_failed_update_from_active_checkpoint_path_terminates_without_rollback(
+        self,
+    ):
+        events = []
+        original_load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
+        runner = SimpleNamespace(
+            load_config=original_load_config,
+            server_args=SimpleNamespace(weight_cache_mode="off"),
+            cpu_weight_cache=None,
+        )
+        model = nn.Module()
+        model_config = SimpleNamespace(
+            model_path="/mutable", dtype=torch.float32, quantization=None
+        )
+        updater = _make_weight_updater(model, model_config, runner, Mock())
+        loader = _RecordingLoader(original_load_config, events, "target", fail=True)
+
+        with (
+            patch.object(
+                updater_mod,
+                "_unsupported_derived_weight_cache_error",
+                return_value=None,
+            ),
+            patch.object(updater_mod, "get_available_gpu_memory", return_value=1.0),
+            patch.object(updater_mod, "get_model_loader", return_value=loader),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "previous weights are no longer available for rollback",
+            ),
+        ):
+            updater.update_weights_from_disk("/mutable", LoadFormat.SAFETENSORS)
+
+        self.assertEqual(
+            events,
+            ["target.restore", "target.weights:/mutable", "target.load"],
+        )
+
     def test_partial_quantized_reload_is_rejected_before_mutation(self):
         original_load_config = LoadConfig(load_format=LoadFormat.SAFETENSORS)
         runner = SimpleNamespace(

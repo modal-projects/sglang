@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
@@ -232,6 +233,14 @@ class WeightUpdater:
             except Exception as e:
                 message = f"Failed to update weights: {e}."
                 gc.collect()
+                if os.path.realpath(original_model_path) == os.path.realpath(
+                    model_path
+                ):
+                    raise RuntimeError(
+                        "Weight reload failed after mutating the active checkpoint "
+                        "path; terminating the engine because the previous weights "
+                        f"are no longer available for rollback. Reload error: {e}."
+                    ) from e
                 try:
                     rollback()
                 except Exception as rollback_error:

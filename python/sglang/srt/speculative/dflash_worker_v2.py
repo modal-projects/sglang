@@ -1866,16 +1866,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
 
+        dflash_sampling_mask_output = None
         if needs_sampling_masks:
-            (
-                logits_output.next_token_sampling_mask_idx,
-                logits_output.next_token_sampling_logprobs,
-            ) = build_dflash_sampling_mask_output(
+            dflash_sampling_mask_output = build_dflash_sampling_mask_output(
                 target_probs=target_probs,
                 output_token_ids=out_tokens,
                 output_lens=commit_lens,
                 return_sampling_masks=return_sampling_masks,
                 max_mask_tokens=get_exec().features.sampling_mask_max_tokens,
+                max_top_k=sampling_info.sampling_mask_max_top_k,
             )
 
         if batch.return_logprob:
@@ -1939,4 +1938,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+            dflash_sampling_mask_output=dflash_sampling_mask_output,
         )

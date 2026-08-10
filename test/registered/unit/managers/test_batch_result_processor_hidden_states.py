@@ -176,6 +176,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
                 copy_done=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
+                dflash_sampling_mask_output=None,
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
                 next_token_ids=None,
                 can_run_cuda_graph=False,

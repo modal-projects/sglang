@@ -1633,6 +1633,7 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
         _global_state.tokenizer_manager.abort_request(
             rid=obj.rid,
             abort_all=obj.abort_all,
+            prefix=obj.prefix,
             finished_reason=None if obj.abort_all else client_cancel_finish_reason(),
         )
         return Response(status_code=200)

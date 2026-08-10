@@ -2761,8 +2761,14 @@ class FlashAttentionForwardSm100:
                     staggered_bias_loads = (
                         dummy_first_bias_load or (bias_max_idx0 > bias_max_idx1)
                     ) and const_expr(self.q_stage == 2)
+                # CuTeDSL joins variables across the dynamic split-K guard below.
+                # Give loop-carried integer values a stable type on both paths.
+                n_block_first = Int32(0)
+                prologue_loads = Int32(0)
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
-                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
+                    n_block_first = (
+                        n_block_max - 1 if n_block_max > 0 else Int32(0)
+                    )
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
@@ -4046,6 +4052,13 @@ class FlashAttentionForwardSm100:
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
+                # Empty split-K tiles skip the body below. Keep the integer mask
+                # boundaries typed across that dynamic branch and the loop backedge.
+                n_block_min_causal_local_mask = Int32(0)
+                n_block_min_before_local_mask = Int32(0)
+                if const_expr(self.has_bias):
+                    n_block_min_bias_emu_off = Int32(0)
+                    n_block_left_bias_emu_off = Int32(0)
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
                     if const_expr(self.has_bias) and (
                         const_expr(not self.is_split_kv) or num_bias_loads > 0

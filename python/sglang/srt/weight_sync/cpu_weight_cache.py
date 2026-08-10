@@ -303,6 +303,7 @@ class CPUWeightCache:
                     host_group=self.host_group,
                 )
                 setup_stats = transform.setup_stats
+                self.compiler.validate_delta_names(transform.operations_by_name)
                 transform_stats = transform.apply()
                 materialization_stats = None
                 try:
@@ -349,6 +350,7 @@ class CPUWeightCache:
                     host_group=self.host_group,
                 )
                 setup_stats = transform.setup_stats
+                self.compiler.validate_delta_names(transform.operations_by_name)
                 names_by_group = self.compiler.checkpoint_groups(checkpoint.weight_map)
                 update = self._run_on_host_ranks(
                     "disk canonical update construction",

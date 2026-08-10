@@ -597,10 +597,21 @@ def build_weight_loader_proxy(
 
 
 def _map_checkpoint_name(model: torch.nn.Module, name: str) -> str | None:
-    """Apply the same authoritative name mapper as the ordinary loader."""
+    """Map one checkpoint name through the model's weight-loading contract."""
 
-    mapper = getattr(model, "hf_to_sglang_mapper", None)
+    mapper = getattr(model, "weight_staging_name_mapper", None)
+    if mapper is None:
+        mapper = getattr(model, "hf_to_sglang_mapper", None)
     return name if mapper is None else mapper._map_name(name)
+
+
+def ignored_checkpoint_weight_names(
+    model: torch.nn.Module,
+    names: Iterable[str],
+) -> set[str]:
+    """Return checkpoint tensors explicitly ignored by the model loader."""
+
+    return {name for name in names if _map_checkpoint_name(model, name) is None}
 
 
 def _longest_group_prefix(name: str, paths: set[str]) -> str | None:

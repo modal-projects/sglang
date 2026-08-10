@@ -73,6 +73,9 @@ class _FakeCompiler:
     def checkpoint_groups(self, weight_map):
         return {"model": list(weight_map)}
 
+    def validate_delta_names(self, _names):
+        pass
+
     def compile(self, checkpoint, *, target_version):
         if target_version in self.fail_versions:
             self.image.invalidate("injected compilation failure")

@@ -1961,18 +1961,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(self, rid: str = "", abort_all: bool = False, prefix: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
+        if prefix and not abort_all:
+            # The scheduler matches rids by prefix; admit the request when any
+            # live rid is in the namespace instead of requiring an exact rid.
+            if get_serving().tokenizer_worker_num == 1 and not any(
+                state_rid.startswith(rid) for state_rid in self.rid_to_state
+            ):
+                return
+        elif (
             not abort_all
             and get_serving().tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request

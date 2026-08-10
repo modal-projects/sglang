@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -488,6 +488,30 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+class TestPrefixAbortRouting(CustomTestCase):
+    """Prefix aborts must survive the tokenizer's exact-rid admission guard."""
+
+    def test_prefix_abort_is_dispatched_for_namespace_matches(self):
+        tm = _make_tokenizer_manager(self)
+        for rid in ("run-1::a", "run-1::b", "run-2::a"):
+            tm.rid_to_state[rid] = _make_req_state(rid)
+
+        with patch.object(tm, "_dispatch_to_scheduler") as dispatch:
+            tm.abort_request("run-1::", prefix=True)
+
+        request = dispatch.call_args.args[0]
+        self.assertEqual(request.rid, "run-1::")
+        self.assertTrue(request.prefix)
+
+    def test_prefix_abort_without_match_is_not_dispatched(self):
+        tm = _make_tokenizer_manager(self)
+        tm.rid_to_state["other"] = _make_req_state("other")
+
+        with patch.object(tm, "_dispatch_to_scheduler") as dispatch:
+            tm.abort_request("run-1::", prefix=True)
+
+        dispatch.assert_not_called()
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):

@@ -1675,6 +1675,7 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
 
 class StageWeightUpdateReqInput(BaseReq, kw_only=True):
     target_version: int
+    base_version: int = 0
     destination: Literal["disk", "cpu"] = "disk"
     local_checkpoint_dir: Optional[str] = None
     base_checkpoint_dir: Optional[str] = None

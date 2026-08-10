@@ -105,6 +105,10 @@ class SchedulerWeightUpdaterManager:
         default=None,
         init=False,
     )
+    _cpu_weight_cache_base_version: Optional[int] = field(
+        default=None,
+        init=False,
+    )
     _cpu_weight_cache_initialization_stats: Optional[Dict[str, Any]] = field(
         default=None,
         init=False,
@@ -147,15 +151,21 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.all_gather_object(values, value, group=group)
         return values
 
-    def _initialize_cpu_weight_cache(self, checkpoint_dir: str) -> Dict[str, Any]:
+    def _initialize_cpu_weight_cache(
+        self, checkpoint_dir: str, base_version: int
+    ) -> Dict[str, Any]:
         checkpoint_dir = os.path.realpath(checkpoint_dir)
         started = time.perf_counter()
         if self._cpu_weight_cache_initialization_stats is not None:
-            if self._cpu_weight_cache_checkpoint_dir != checkpoint_dir:
+            if (
+                self._cpu_weight_cache_checkpoint_dir != checkpoint_dir
+                or self._cpu_weight_cache_base_version != base_version
+            ):
                 raise RuntimeError(
-                    "CPU weight cache was initialized from a different checkpoint: "
-                    f"{self._cpu_weight_cache_checkpoint_dir!r} != "
-                    f"{checkpoint_dir!r}"
+                    "CPU weight cache was initialized from a different base: "
+                    f"({self._cpu_weight_cache_checkpoint_dir!r}, "
+                    f"v{self._cpu_weight_cache_base_version}) != "
+                    f"({checkpoint_dir!r}, v{base_version})"
                 )
             return {
                 "operation": "initialize_cpu_weight_cache",
@@ -168,11 +178,13 @@ class SchedulerWeightUpdaterManager:
             logger.warning("Retrying CPU weight cache initialization")
             self._cpu_weight_cache_initialization_error = None
         self._cpu_weight_cache_checkpoint_dir = checkpoint_dir
+        self._cpu_weight_cache_base_version = base_version
         server_args = self.tp_worker.model_runner.server_args
         try:
             stats = self.tp_worker.initialize_cpu_weight_cache(
                 checkpoint_dir=checkpoint_dir,
                 seed_from_active_weights=self._is_boot_checkpoint(checkpoint_dir),
+                base_version=base_version,
                 host_group=self.host_cpu_group,
                 max_compile_group_bytes=int(
                     server_args.cpu_weight_cache_max_compile_group_gb * (1 << 30)
@@ -228,8 +240,15 @@ class SchedulerWeightUpdaterManager:
         message = None
         if recv_req.target_version < 0:
             message = "target_version must be non-negative."
-        elif recv_req.target_version > 0 and recv_req.checkpoint_source_dir is None:
-            message = "checkpoint_source_dir is required after version 0."
+        elif recv_req.base_version < 0:
+            message = "base_version must be non-negative."
+        elif recv_req.target_version < recv_req.base_version:
+            message = "target_version must not precede base_version."
+        elif (
+            recv_req.target_version > recv_req.base_version
+            and recv_req.checkpoint_source_dir is None
+        ):
+            message = "checkpoint_source_dir is required after the base version."
         elif recv_req.destination == "disk":
             if recv_req.local_checkpoint_dir is None:
                 message = "local_checkpoint_dir is required for disk staging."
@@ -355,15 +374,17 @@ class SchedulerWeightUpdaterManager:
         )
         local_stats: Dict[str, Any] = {
             "rank": rank,
+            "base_version": recv_req.base_version,
             "target_version": recv_req.target_version,
             "destination": recv_req.destination,
         }
         try:
             checkpoint_dir = recv_req.base_checkpoint_dir or self.boot_model_path
             if recv_req.destination == "cpu":
-                if recv_req.target_version == 0:
+                if recv_req.target_version == recv_req.base_version:
                     local_stats["stage"] = self._initialize_cpu_weight_cache(
-                        checkpoint_dir
+                        checkpoint_dir,
+                        recv_req.base_version,
                     )
                 else:
                     if self._cpu_weight_cache_initialization_error is not None:
@@ -373,21 +394,24 @@ class SchedulerWeightUpdaterManager:
                         )
                     if self._cpu_weight_cache_initialization_stats is None:
                         raise RuntimeError(
-                            "CPU weight cache is not initialized. Stage version 0 "
-                            "to CPU before staging a delta target."
+                            "CPU weight cache is not initialized. Stage the base "
+                            "version to CPU before staging a delta target."
                         )
-                    if self._cpu_weight_cache_checkpoint_dir != os.path.realpath(
-                        checkpoint_dir
+                    if (
+                        self._cpu_weight_cache_checkpoint_dir
+                        != os.path.realpath(checkpoint_dir)
+                        or self._cpu_weight_cache_base_version != recv_req.base_version
                     ):
                         raise RuntimeError(
-                            "CPU weight cache base checkpoint does not match the "
-                            f"initialized cache: {checkpoint_dir!r} != "
-                            f"{self._cpu_weight_cache_checkpoint_dir!r}"
+                            "CPU weight cache base does not match the initialized "
+                            f"cache: ({checkpoint_dir!r}, v{recv_req.base_version}) "
+                            f"!= ({self._cpu_weight_cache_checkpoint_dir!r}, "
+                            f"v{self._cpu_weight_cache_base_version})"
                         )
                     checkpoint_source_dir = recv_req.checkpoint_source_dir
                     if checkpoint_source_dir is None:
                         raise ValueError(
-                            "checkpoint_source_dir is required after version 0"
+                            "checkpoint_source_dir is required after the base version"
                         )
                     source_refresh_wall_s = self._refresh_checkpoint_source(
                         checkpoint_source_dir,
@@ -420,6 +444,7 @@ class SchedulerWeightUpdaterManager:
                         recv_req.checkpoint_source_dir or checkpoint_dir
                     ),
                     target_version=recv_req.target_version,
+                    base_version=recv_req.base_version,
                     checkpoint_source_refresh_hook=(
                         self.tp_worker.model_runner.server_args.checkpoint_source_refresh_hook
                     ),
@@ -441,11 +466,12 @@ class SchedulerWeightUpdaterManager:
             )
             message = "\n".join(messages)
         if recv_req.destination == "cpu" and not success:
-            if recv_req.target_version == 0:
+            if recv_req.target_version == recv_req.base_version:
                 self.tp_worker.discard_cpu_weight_cache(
                     "distributed CPU weight cache initialization failed"
                 )
                 self._cpu_weight_cache_checkpoint_dir = None
+                self._cpu_weight_cache_base_version = None
                 self._cpu_weight_cache_initialization_stats = None
                 self._cpu_weight_cache_initialization_error = message
             else:

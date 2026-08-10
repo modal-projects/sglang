@@ -84,6 +84,7 @@ def materialize(
     checkpoint_source_dir: str,
     target_version: int,
     checkpoint_source_refresh_hook: str | None = None,
+    base_version: int = 0,
 ) -> dict:
     """Bring the host-local checkpoint up to ``target_version``.
 
@@ -94,8 +95,10 @@ def materialize(
     reseeding. A checksum mismatch on a complete source is treated as corrupt
     local state and gets one replay from a clean seed.
     """
-    if target_version < 0:
-        raise ValueError("target_version must be non-negative")
+    if base_version < 0:
+        raise ValueError("base_version must be non-negative")
+    if target_version < base_version:
+        raise ValueError("target_version must not precede base_version")
     if _paths_overlap(local_checkpoint_dir, base_checkpoint_dir):
         raise ValueError(
             "local_checkpoint_dir must not overlap the immutable "
@@ -116,25 +119,32 @@ def materialize(
             return {
                 "operation": "noop",
                 "initial_version": applied,
+                "base_version": base_version,
                 "target_version": target_version,
                 "lock_wait_s": round(lock_wait_s, 6),
                 "source_refresh_wall_s": 0.0,
                 "wall_s": round(time.perf_counter() - started, 6),
             }
-        refresh_started = time.perf_counter()
-        refresh_checkpoint_source(
-            checkpoint_source_dir,
-            target_version,
-            checkpoint_source_refresh_hook,
-        )
-        source_refresh_wall_s = time.perf_counter() - refresh_started
+        source_refresh_wall_s = 0.0
+        if target_version > base_version:
+            refresh_started = time.perf_counter()
+            refresh_checkpoint_source(
+                checkpoint_source_dir,
+                target_version,
+                checkpoint_source_refresh_hook,
+            )
+            source_refresh_wall_s = time.perf_counter() - refresh_started
         try:
             stats = _materialize_locked(
                 local_checkpoint_dir,
                 base_checkpoint_dir,
                 checkpoint_source_dir,
+                base_version,
                 target_version,
-                reseed=applied is not None and applied > target_version,
+                reseed=(
+                    applied is not None
+                    and not base_version <= applied <= target_version
+                ),
             )
         except FileNotFoundError:
             # A source version is missing or not fully materialized — a readiness
@@ -157,11 +167,13 @@ def materialize(
                 local_checkpoint_dir,
                 base_checkpoint_dir,
                 checkpoint_source_dir,
+                base_version,
                 target_version,
                 reseed=True,
             )
             stats["reseed_after_failed_apply"] = True
         stats["initial_version"] = applied
+        stats["base_version"] = base_version
         stats["target_version"] = target_version
         stats["lock_wait_s"] = round(lock_wait_s, 6)
         stats["source_refresh_wall_s"] = round(source_refresh_wall_s, 6)
@@ -187,6 +199,7 @@ def _materialize_locked(
     local_checkpoint_dir: str,
     base_checkpoint_dir: str,
     checkpoint_source_dir: str,
+    base_version: int,
     target_version: int,
     reseed: bool,
 ) -> dict:
@@ -196,7 +209,7 @@ def _materialize_locked(
     # Scan back from the target for the newest full version. Stop at the
     # local state — below it a reset can never be needed (or, on a fresh
     # host, at 0 = the engine's base).
-    floor = applied if applied is not None else 0
+    floor = applied if applied is not None else base_version
     start = target_version
     while start > floor and _is_delta(
         _version_dir(checkpoint_source_dir, start), start
@@ -205,11 +218,16 @@ def _materialize_locked(
     if applied is None or start > applied:
         seed_dir = (
             base_checkpoint_dir
-            if start == 0
+            if start == base_version
             else _version_dir(checkpoint_source_dir, start)
         )
         seed_started = time.perf_counter()
-        _reset_checkpoint(seed_dir, local_checkpoint_dir, start)
+        _reset_checkpoint(
+            seed_dir,
+            local_checkpoint_dir,
+            start,
+            is_base=start == base_version,
+        )
         seed_wall_s = time.perf_counter() - seed_started
     else:
         start = applied
@@ -411,7 +429,13 @@ def _drop_page_cache(path: str) -> None:
         pass
 
 
-def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
+def _reset_checkpoint(
+    src_dir: str,
+    local_checkpoint_dir: str,
+    version: int,
+    *,
+    is_base: bool = False,
+) -> None:
     """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
     (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
     are pruned). Later deltas chain on top of this state."""
@@ -419,7 +443,7 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
         raise ValueError(
             "a published full checkpoint cannot also be the mutable " "local checkpoint"
         )
-    _validate_full_checkpoint(src_dir, version=version)
+    _validate_full_checkpoint(src_dir, version=version, is_base=is_base)
     os.makedirs(local_checkpoint_dir, exist_ok=True)
     # A full seed replaces every checkpoint byte. Invalidate the old marker
     # before the first mutation so an interrupted copy cannot be mistaken for
@@ -538,7 +562,9 @@ def _read_safetensors_header(path: str) -> tuple[int, dict]:
     return header_len, header
 
 
-def _validate_full_checkpoint(src_dir: str, *, version: int) -> None:
+def _validate_full_checkpoint(
+    src_dir: str, *, version: int, is_base: bool = False
+) -> None:
     """Reject incomplete full checkpoints before copying or publishing a marker."""
 
     headers = {}
@@ -552,12 +578,12 @@ def _validate_full_checkpoint(src_dir: str, *, version: int) -> None:
         with open(index_path) as file:
             index = json.load(file)
     except FileNotFoundError as exc:
-        if version == 0:
+        if is_base:
             return
         raise FileNotFoundError(
             f"published full checkpoint has no manifest: {index_path}"
         ) from exc
-    if version > 0:
+    if not is_base:
         _validate_published_version(index.get("metadata"), version, index_path)
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:

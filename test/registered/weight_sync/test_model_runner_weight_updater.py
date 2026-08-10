@@ -46,10 +46,13 @@ class _FakeCache:
         self.invalidated = []
         self.closed = []
 
-    def initialize_from_checkpoint(self, checkpoint_dir, *, seed_from_active_weights):
+    def initialize_from_checkpoint(
+        self, checkpoint_dir, *, seed_from_active_weights, base_version=0
+    ):
         return {
             "checkpoint_dir": checkpoint_dir,
             "seed_from_active_weights": seed_from_active_weights,
+            "base_version": base_version,
             "wall_s": 2.0,
         }
 
@@ -111,6 +114,7 @@ def test_cpu_weight_cache_worker_lifecycle():
         initialization = updater.initialize_cpu_weight_cache(
             checkpoint_dir="/checkpoint",
             seed_from_active_weights=True,
+            base_version=119,
             host_group=host_group,
             max_compile_group_bytes=1024,
             canonical_checkpoint_dir=None,
@@ -122,6 +126,7 @@ def test_cpu_weight_cache_worker_lifecycle():
         assert cache.max_compile_group_bytes == 1024
         assert initialization["cache_population_wall_s"] == 2.0
         assert initialization["seed_from_active_weights"] is True
+        assert initialization["base_version"] == 119
 
         success, _, stage = updater.stage_cpu_weight_update_from_delta_lineage(
             checkpoint_source_dir="/updates",
@@ -152,6 +157,7 @@ def test_cpu_weight_cache_rejects_draft_models():
         updater.initialize_cpu_weight_cache(
             checkpoint_dir="/checkpoint",
             seed_from_active_weights=True,
+            base_version=0,
             host_group=None,
             max_compile_group_bytes=1024,
             canonical_checkpoint_dir=None,

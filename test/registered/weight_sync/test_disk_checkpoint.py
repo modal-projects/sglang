@@ -224,9 +224,13 @@ class MaterializeTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def materialize(self, target):
+    def materialize(self, target, *, base_version=0):
         return disk_checkpoint.materialize(
-            self.local, self.pub.base_dir, self.pub.source_dir, target
+            self.local,
+            self.pub.base_dir,
+            self.pub.source_dir,
+            target,
+            base_version=base_version,
         )
 
     def assert_at_version(self, version):
@@ -259,6 +263,26 @@ class MaterializeTest(unittest.TestCase):
     def test_seed_and_chain(self):
         self.materialize(2)
         self.assert_at_version(2)
+
+    def test_nonzero_base_applies_only_later_deltas(self):
+        self.pub.state = dict(self.pub.versions[0])
+        self.pub.versions[119] = dict(self.pub.state)
+        rng = np.random.default_rng(19)
+        self.pub.publish_delta(
+            120,
+            {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()},
+        )
+
+        with self.spy_materialize() as (seeds, applies):
+            stats = self.materialize(120, base_version=119)
+
+        self.assert_at_version(120)
+        self.assertEqual(stats["base_version"], 119)
+        self.assertEqual(seeds, [self.pub.base_dir])
+        self.assertEqual(
+            applies,
+            [os.path.join(self.pub.source_dir, "weight_v000120")],
+        )
 
     def test_incremental_materialization_is_idempotent(self):
         stats = self.materialize(1)

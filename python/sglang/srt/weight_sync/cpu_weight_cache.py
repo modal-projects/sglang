@@ -46,6 +46,7 @@ class CPUWeightCache:
             max_group_bytes=max_compile_group_bytes,
         )
         self._base_checkpoint_dir: str | None = None
+        self._base_version: int | None = None
         self._checkpoint_source_dir: str | None = None
         self._canonical_checkpoint_dir = (
             os.path.realpath(canonical_checkpoint_dir)
@@ -121,6 +122,8 @@ class CPUWeightCache:
     ) -> CanonicalCheckpoint:
         if self._base_checkpoint_dir is None:
             raise RuntimeError("CPU weight cache has no base checkpoint")
+        if self._base_version is None:
+            raise RuntimeError("CPU weight cache has no base version")
         previous = self._canonical_checkpoint
         self._canonical_checkpoint = None
         self._checkpoint_source_dir = None
@@ -135,7 +138,8 @@ class CPUWeightCache:
                 local_checkpoint_dir=self._canonical_checkpoint_dir,
                 base_checkpoint_dir=self._base_checkpoint_dir,
                 checkpoint_source_dir=self._base_checkpoint_dir,
-                target_version=0,
+                target_version=self._base_version,
+                base_version=self._base_version,
             )
             checkpoint_dir = self._canonical_checkpoint_dir
             storage = "disk"
@@ -144,6 +148,7 @@ class CPUWeightCache:
         self._canonical_checkpoint = CanonicalCheckpoint(
             checkpoint_dir,
             host_group=self.host_group,
+            version=self._base_version,
             storage=storage,
         )
         if reason is not None:
@@ -155,13 +160,15 @@ class CPUWeightCache:
         checkpoint_dir: str | Path,
         *,
         seed_from_active_weights: bool,
+        base_version: int = 0,
     ) -> dict[str, Any]:
-        """Build and validate the reusable CPU state from active version zero."""
+        """Build and validate reusable CPU state from the loaded checkpoint."""
 
         with self._exclusive("initialize"):
             return self._initialize_from_checkpoint(
                 checkpoint_dir,
                 seed_from_active_weights=seed_from_active_weights,
+                base_version=base_version,
             )
 
     def _initialize_from_checkpoint(
@@ -169,11 +176,15 @@ class CPUWeightCache:
         checkpoint_dir: str | Path,
         *,
         seed_from_active_weights: bool,
+        base_version: int,
     ) -> dict[str, Any]:
         if self._base_checkpoint_dir is not None:
             raise RuntimeError("CPU weight cache is already initialized")
+        if base_version < 0:
+            raise ValueError("base_version must be non-negative")
         started = time.perf_counter()
         self._base_checkpoint_dir = os.path.realpath(checkpoint_dir)
+        self._base_version = base_version
         try:
             image_initialization = self._run_on_host_ranks(
                 "CPU weight image initialization",
@@ -190,7 +201,7 @@ class CPUWeightCache:
                     def compile_baseline():
                         compile_stats = self.compiler.compile(
                             checkpoint,
-                            target_version=0,
+                            target_version=base_version,
                         )
                         validation_stats = self.image.validate_against_active()
                         self.image.accept_staged_baseline()
@@ -209,11 +220,13 @@ class CPUWeightCache:
         except Exception:
             self._discard_canonical_checkpoint("CPU weight cache initialization failed")
             self._base_checkpoint_dir = None
+            self._base_version = None
             raise
 
         canonical_stats = checkpoint.stats()
         stats = {
             "operation": "initialize_cpu_weight_cache",
+            "base_version": base_version,
             "canonical_checkpoint": canonical_stats,
             "canonical_materialization": self._canonical_materialization_stats,
             "rank_image_bytes": self.image.image_nbytes,
@@ -254,7 +267,8 @@ class CPUWeightCache:
         elif (
             self._checkpoint_source_dir is not None
             and self._checkpoint_source_dir != source
-            and checkpoint.version > 0
+            and self._base_version is not None
+            and checkpoint.version > self._base_version
         ):
             reset_reason = "checkpoint lineage changed"
 
@@ -285,8 +299,10 @@ class CPUWeightCache:
         checkpoint_source_dir: str | Path,
         target_version: int,
     ) -> dict[str, Any]:
-        if target_version <= 0:
-            raise ValueError("CPU delta staging requires a positive target version")
+        if self._base_version is None:
+            raise RuntimeError("CPU weight cache has no base version")
+        if target_version <= self._base_version:
+            raise ValueError("CPU delta staging target must follow the base version")
         started = time.perf_counter()
         checkpoint, canonical_reset = self._canonical_checkpoint_for_lineage(
             checkpoint_source_dir=checkpoint_source_dir,

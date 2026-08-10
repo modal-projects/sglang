@@ -97,9 +97,10 @@ def _write_delta(
     before: torch.Tensor,
     after: torch.Tensor,
     *,
+    version: int = 1,
     checksum: str | None = None,
 ) -> None:
-    version_dir = root / "weight_v000001"
+    version_dir = root / f"weight_v{version:06d}"
     version_dir.mkdir(parents=True)
     before_bytes = before.contiguous().view(torch.uint8).numpy()
     after_bytes = after.contiguous().view(torch.uint8).numpy()
@@ -117,8 +118,8 @@ def _write_delta(
         json.dumps(
             {
                 "metadata": {
-                    "version": "000001",
-                    "base_version": "000000",
+                    "version": f"{version:06d}",
+                    "base_version": f"{version - 1:06d}",
                     "delta_encoding": "xor",
                     "compression_format": "zstd",
                     "checksum_format": "xxh3-128",
@@ -136,6 +137,7 @@ def _create_cache(
     *,
     canonical_checkpoint_dir=None,
     seed_from_active_weights=False,
+    base_version=0,
 ):
     base = tmp_path / "base"
     shared_memory = tmp_path / "shared-memory"
@@ -154,6 +156,7 @@ def _create_cache(
         initialization = cache.initialize_from_checkpoint(
             base,
             seed_from_active_weights=seed_from_active_weights,
+            base_version=base_version,
         )
     return cache, initialization, shared_memory
 
@@ -229,6 +232,37 @@ def test_cache_initializes_stages_and_commits(tmp_path, monkeypatch):
 
         cache.commit(1)
         assert cache.image.committed == [1]
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("canonical_on_disk", [False, True])
+def test_cache_preserves_nonzero_base_version(tmp_path, monkeypatch, canonical_on_disk):
+    base = torch.arange(8, dtype=torch.uint8)
+    target = base.roll(1)
+    updates = tmp_path / "updates"
+    _write_delta(updates, base, target, version=120)
+    cache, initialization, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        canonical_checkpoint_dir=(
+            tmp_path / "canonical" if canonical_on_disk else None
+        ),
+        base_version=119,
+    )
+    try:
+        assert initialization["base_version"] == 119
+        assert initialization["canonical_checkpoint"]["version"] == 119
+
+        stats = cache.stage_delta_lineage(
+            checkpoint_source_dir=updates,
+            target_version=120,
+        )
+
+        assert stats["delta_setup"]["delta_versions"] == [120]
+        assert cache.canonical_version == 120
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], target)
     finally:
         cache.close()
 

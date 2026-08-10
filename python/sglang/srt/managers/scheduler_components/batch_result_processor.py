@@ -826,6 +826,13 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if result.dflash_sampling_mask_output is not None:
+            assert result.logits_output is not None
+            (
+                result.logits_output.next_token_sampling_mask_idx,
+                result.logits_output.next_token_sampling_logprobs,
+            ) = result.dflash_sampling_mask_output.finalize()
+            result.dflash_sampling_mask_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,

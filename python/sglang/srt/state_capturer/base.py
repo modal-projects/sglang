@@ -176,9 +176,11 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         if no_copy_to_cpu:
+            # The next overlap forward can overwrite both reusable buffers before
+            # the result-copy stream consumes them. Snapshot them on this stream.
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
-                topk=slice_gpu,
+                out_cache_loc=forward_batch.out_cache_loc.clone(),
+                topk=slice_gpu.clone(),
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()

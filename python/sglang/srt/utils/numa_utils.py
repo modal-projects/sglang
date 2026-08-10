@@ -143,18 +143,86 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     return None
 
 
+class _Bitmask(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
+
+
 def get_libnuma():
     libnuma = None
 
     for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
         try:
-            libnuma = ctypes.CDLL(libnuma_so)
+            libnuma = ctypes.CDLL(libnuma_so, use_errno=True)
         except OSError as e:
             logger.debug(f"{e}")
             libnuma = None
         if libnuma is not None:
             break
     return libnuma
+
+
+def numa_interleave_memory(address: int, nbytes: int) -> tuple[int, ...]:
+    """Interleave future faults for one mapped range across allowed NUMA nodes."""
+
+    if address <= 0 or nbytes <= 0:
+        raise ValueError("NUMA memory ranges must have a positive address and size")
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        return ()
+
+    libnuma.numa_get_mems_allowed.argtypes = []
+    libnuma.numa_get_mems_allowed.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_bitmask_isbitset.argtypes = [
+        ctypes.POINTER(_Bitmask),
+        ctypes.c_uint,
+    ]
+    libnuma.numa_bitmask_isbitset.restype = ctypes.c_int
+    libnuma.numa_bitmask_free.argtypes = [ctypes.POINTER(_Bitmask)]
+    allowed = libnuma.numa_get_mems_allowed()
+    if not allowed:
+        logger.warning("libnuma returned no allowed memory-node mask")
+        return ()
+    try:
+        nodes = tuple(
+            node
+            for node in range(allowed.contents.size)
+            if libnuma.numa_bitmask_isbitset(allowed, node)
+        )
+        if len(nodes) < 2:
+            return ()
+
+        libnuma.mbind.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_ulong,
+            ctypes.c_uint,
+        ]
+        libnuma.mbind.restype = ctypes.c_long
+        # MPOL_INTERLEAVE affects pages faulted after this call. The mapping is
+        # still empty here, so no migration or privileged move flag is needed.
+        if (
+            libnuma.mbind(
+                ctypes.c_void_p(address),
+                ctypes.c_ulong(nbytes),
+                ctypes.c_int(3),  # MPOL_INTERLEAVE
+                allowed.contents.maskp,
+                ctypes.c_ulong(allowed.contents.size),
+                ctypes.c_uint(0),
+            )
+            != 0
+        ):
+            error = ctypes.get_errno()
+            logger.warning(
+                "Failed to interleave mapped host memory across NUMA nodes %s: %s",
+                nodes,
+                os.strerror(error),
+            )
+            return ()
+        return nodes
+    finally:
+        libnuma.numa_bitmask_free(allowed)
 
 
 def numa_bind_to_node(node: int):
@@ -175,10 +243,6 @@ def numa_bind_to_node(node: int):
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_preferred(ctypes.c_int(node))
-
-
-class _Bitmask(ctypes.Structure):
-    _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
 
 
 def _node_cpus(node: int) -> set:

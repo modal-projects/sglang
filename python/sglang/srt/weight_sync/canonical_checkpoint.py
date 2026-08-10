@@ -210,6 +210,10 @@ class CanonicalCheckpoint:
                 nbytes=capacity,
                 host_group=host_group,
                 name="weight-checkpoint",
+                # Model workers are commonly memory-bound to the GPU NUMA node.
+                # Spread the host-shared canonical source across every allowed
+                # node while keeping rank-ready pinned images GPU-local.
+                numa_interleave=True,
             )
             try:
                 for index, checkpoint_file in enumerate(files):

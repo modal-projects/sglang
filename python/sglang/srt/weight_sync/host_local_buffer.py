@@ -9,6 +9,8 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.utils.numa_utils import numa_interleave_memory
+
 _SHARED_MEMORY_ROOT = Path("/dev/shm")
 _ALIGNMENT = 4096
 
@@ -22,6 +24,7 @@ class HostLocalSharedBuffer:
         nbytes: int,
         host_group: torch.distributed.ProcessGroup | None,
         name: str,
+        numa_interleave: bool = False,
     ):
         if nbytes <= 0:
             raise ValueError("host-shared buffer size must be positive")
@@ -106,6 +109,11 @@ class HostLocalSharedBuffer:
                 self.mapping,
                 dtype=torch.uint8,
                 count=self.nbytes,
+            )
+            self.interleaved_numa_nodes = (
+                numa_interleave_memory(self.tensor.data_ptr(), self.nbytes)
+                if numa_interleave
+                else ()
             )
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"

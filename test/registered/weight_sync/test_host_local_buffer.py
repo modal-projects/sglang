@@ -37,6 +37,29 @@ def test_host_local_buffer_is_aligned_unlinked_and_writable(tmp_path):
         buffer.close()
 
 
+def test_host_local_buffer_can_interleave_future_page_faults(tmp_path):
+    with (
+        patch.object(host_memory, "_SHARED_MEMORY_ROOT", tmp_path),
+        patch.object(
+            host_memory,
+            "numa_interleave_memory",
+            return_value=(0, 1),
+        ) as interleave,
+    ):
+        buffer = HostLocalSharedBuffer(
+            nbytes=17,
+            host_group=None,
+            name="test",
+            numa_interleave=True,
+        )
+
+    try:
+        interleave.assert_called_once_with(buffer.tensor.data_ptr(), 4096)
+        assert buffer.interleaved_numa_nodes == (0, 1)
+    finally:
+        buffer.close()
+
+
 def test_host_local_buffer_checks_available_capacity(tmp_path):
     filesystem = SimpleNamespace(f_bavail=0, f_frsize=4096)
     with (

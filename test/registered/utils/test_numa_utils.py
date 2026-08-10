@@ -5,6 +5,7 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _Bitmask,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -15,6 +16,7 @@ from sglang.srt.utils.numa_utils import (
     configure_subprocess,
     get_numa_node_if_available,
     numa_bind_to_node,
+    numa_interleave_memory,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -368,6 +370,37 @@ class TestNumaBindIntersection(unittest.TestCase):
     def test_handle_failure_warns_when_disabled(self):
         with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING"):
             _handle_numa_bind_failure(0, {72, 73})
+
+
+class TestNumaInterleaveMemory(unittest.TestCase):
+    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    def test_interleaves_across_allowed_nodes(self, mock_libnuma):
+        words = (ctypes.c_ulong * 1)(0b11)
+        allowed = ctypes.pointer(_Bitmask(size=2, maskp=words))
+        lib = MagicMock()
+        lib.numa_available.return_value = 0
+        lib.numa_get_mems_allowed.return_value = allowed
+        lib.numa_bitmask_isbitset.side_effect = lambda _mask, node: node in {0, 1}
+        lib.mbind.return_value = 0
+        mock_libnuma.return_value = lib
+
+        self.assertEqual(numa_interleave_memory(4096, 8192), (0, 1))
+        lib.mbind.assert_called_once()
+        lib.numa_bitmask_free.assert_called_once_with(allowed)
+
+    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    def test_preserves_single_node_policy(self, mock_libnuma):
+        words = (ctypes.c_ulong * 1)(0b10)
+        allowed = ctypes.pointer(_Bitmask(size=2, maskp=words))
+        lib = MagicMock()
+        lib.numa_available.return_value = 0
+        lib.numa_get_mems_allowed.return_value = allowed
+        lib.numa_bitmask_isbitset.side_effect = lambda _mask, node: node == 1
+        mock_libnuma.return_value = lib
+
+        self.assertEqual(numa_interleave_memory(4096, 8192), ())
+        lib.mbind.assert_not_called()
+        lib.numa_bitmask_free.assert_called_once_with(allowed)
 
 
 def _run_result(returncode, stderr=b""):

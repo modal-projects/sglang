@@ -21,6 +21,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dflash_utils import DFlashSamplingMaskOutput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -100,6 +101,7 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    dflash_sampling_mask_output: Optional[DFlashSamplingMaskOutput] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -166,6 +168,7 @@ class GenerationBatchResult:
             self.routed_experts_output,
             self.indexer_topk_output,
             self.expert_distribution_metrics,
+            self.dflash_sampling_mask_output,
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)

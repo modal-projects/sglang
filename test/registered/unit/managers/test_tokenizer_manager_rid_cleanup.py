@@ -559,6 +559,56 @@ class TestParallelAbortRouting(CustomTestCase):
         )
         self.assertTrue(all(not request.abort_all for request in requests))
 
+    def test_prefix_abort_marks_matching_logical_requests(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        for rid in ("run-1::a", "run-1::b", "run-2::a"):
+            tm.rid_to_state[rid] = _make_req_state(rid)
+
+        tm.abort_request("run-1::", prefix=True)
+
+        self.assertTrue(tm.rid_to_state["run-1::a"].abort_requested)
+        self.assertTrue(tm.rid_to_state["run-1::b"].abort_requested)
+        self.assertFalse(tm.rid_to_state["run-2::a"].abort_requested)
+        request = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(request.rid, "run-1::")
+        self.assertTrue(request.prefix)
+
+    def test_prefix_abort_without_match_is_not_dispatched(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        tm.rid_to_state["other"] = _make_req_state("other")
+
+        tm.abort_request("run-1::", prefix=True)
+
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    def test_prefix_abort_fans_out_non_namespaced_children(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 1
+        tm.rid_to_state["run-1"] = _make_req_state("run-1")
+        for child_rid in ("choice-a", "choice-b"):
+            tm.rid_to_state[child_rid] = _make_req_state(child_rid)
+            tm._register_child_rid("run-1", child_rid)
+
+        tm.abort_request("run-", prefix=True)
+
+        requests = [call.args[0] for call in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual(
+            {request.rid for request in requests}, {"run-", "choice-a", "choice-b"}
+        )
+        self.assertTrue(tm.rid_to_state["run-1"].abort_requested)
+
+    def test_prefix_abort_is_forwarded_with_multiple_tokenizer_workers(self):
+        tm = _make_tokenizer_manager()
+        tm.server_args.tokenizer_worker_num = 2
+
+        tm.abort_request("run-1::", prefix=True)
+
+        request = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(request.rid, "run-1::")
+        self.assertTrue(request.prefix)
+
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):

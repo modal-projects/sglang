@@ -1909,6 +1909,8 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # Treat rid as a namespace prefix at the tokenizer admission boundary.
+    prefix: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

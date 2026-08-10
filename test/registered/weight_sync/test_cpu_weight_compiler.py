@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import gc
 import os
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sglang.srt.weight_sync.cpu_weight_compiler as compiler_module
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.cpu_weight_compiler import (
@@ -64,6 +67,10 @@ class _LoadableBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(8), requires_grad=False)
+        self.weight.weight_loader = self.load_weight
+
+    def load_weight(self, parameter, value):
+        parameter.data.copy_(value)
 
 
 class _LoadableModel(torch.nn.Module):
@@ -128,7 +135,7 @@ def _storage_key(tensor):
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
 
 
-def test_compile_loads_rank_image_without_mutating_live_weights():
+def test_compile_does_not_mutate_live_weights_or_retain_staging_clones(monkeypatch):
     model = _LoadableModel()
     image = _CPUImage(model)
     compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
@@ -152,7 +159,24 @@ def test_compile_loads_rank_image_without_mutating_live_weights():
         yield checkpoint
 
     checkpoint.tensor_group = tensor_group
-    stats = compiler.compile(checkpoint, target_version=3)
+    shadow_refs = []
+    build_proxy = compiler_module.build_weight_loader_proxy
+
+    def track_shadow(*args, **kwargs):
+        proxy, shadow = build_proxy(*args, **kwargs)
+        shadow_refs.append(weakref.ref(shadow))
+        return proxy, shadow
+
+    monkeypatch.setattr(compiler_module, "build_weight_loader_proxy", track_shadow)
+    automatic_gc = gc.isenabled()
+    gc.disable()
+    try:
+        stats = compiler.compile(checkpoint, target_version=3)
+        assert all(reference() is None for reference in shadow_refs)
+        assert not gc.isenabled()
+    finally:
+        if automatic_gc:
+            gc.enable()
 
     assert stats["target_version"] == 3
     assert image.valid and image.staged

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.cpu_weight_compiler import (
     CPUWeightCompiler,
     _staging_postprocess_device,
@@ -271,3 +272,24 @@ def test_compile_failure_identifies_weight_group():
         compiler.compile(checkpoint, target_version=1)
 
     assert isinstance(error.value.__cause__, ValueError)
+
+
+def test_checkpoint_only_weights_are_not_compiled_or_delta_updated():
+    model = _LoadableModel()
+    model.weight_staging_name_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": None})
+    compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
+    compiler.model = model
+    compiler.groups = build_weight_module_groups(
+        model,
+        max_group_bytes=16,
+        device_type="cpu",
+    )
+
+    assert compiler.checkpoint_groups(
+        {
+            "layer.weight": "model.safetensors",
+            "mtp.weight": "model.safetensors",
+        }
+    ) == {"layer": ["layer.weight"]}
+    with pytest.raises(ValueError, match="mtp.weight"):
+        compiler.validate_delta_names(["layer.weight", "mtp.weight"])

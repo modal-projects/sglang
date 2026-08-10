@@ -6,6 +6,7 @@ import gc
 import logging
 import math
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ from sglang.srt.weight_sync.weight_loader_isolation import (
     build_weight_loader_proxy,
     build_weight_module_groups,
     clone_weight_module,
+    ignored_checkpoint_weight_names,
     map_checkpoint_names_to_groups,
 )
 
@@ -354,9 +356,15 @@ class CPUWeightCompiler:
     ) -> dict[str, list[str]]:
         """Map every canonical tensor to its bounded runtime compile group."""
 
+        ignored = ignored_checkpoint_weight_names(self.model, weight_map)
+        loadable_weight_map = {
+            name: filename
+            for name, filename in weight_map.items()
+            if name not in ignored
+        }
         group_for_name = map_checkpoint_names_to_groups(
             self.model,
-            weight_map,
+            loadable_weight_map,
             self.groups,
         )
         names_by_group = {group.path: [] for group in self.groups}
@@ -372,6 +380,14 @@ class CPUWeightCompiler:
                 f"runtime weight group; unmapped={unmapped[:20]}"
             )
         return names_by_group
+
+    def validate_delta_names(self, names: Iterable[str]) -> None:
+        ignored = ignored_checkpoint_weight_names(self.model, names)
+        if ignored:
+            raise ValueError(
+                "delta changes checkpoint tensors ignored by the runtime model "
+                f"loader: {sorted(ignored)[:20]}"
+            )
 
     def compile(
         self,

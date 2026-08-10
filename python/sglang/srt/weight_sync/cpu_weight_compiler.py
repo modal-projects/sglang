@@ -347,7 +347,6 @@ class CPUWeightCompiler:
             stats["wall_s"],
         )
         del cpu_shadow, gpu_shadow
-        gc.collect(0)
         return updated, group_bytes, stats
 
     def checkpoint_groups(
@@ -453,16 +452,31 @@ class CPUWeightCompiler:
                         with checkpoint.tensor_group(
                             group.path, names
                         ) as group_checkpoint:
-                            phase = "load"
-                            loaded = self._load_group(
-                                index=index,
-                                group=group,
-                                names=names,
-                                checkpoint=group_checkpoint,
-                            )
-                            phase = "finalize"
-                            updated, group_bytes, stats = self._finalize_group(loaded)
-                            del loaded
+                            automatic_gc = gc.isenabled()
+                            gc.disable()
+                            loaded = None
+                            try:
+                                phase = "load"
+                                loaded = self._load_group(
+                                    index=index,
+                                    group=group,
+                                    names=names,
+                                    checkpoint=group_checkpoint,
+                                )
+                                phase = "finalize"
+                                updated, group_bytes, stats = self._finalize_group(
+                                    loaded
+                                )
+                            finally:
+                                # Cloned loader callbacks form temporary reference
+                                # cycles. Keep the bounded group in generation zero,
+                                # then reclaim it after its last strong reference.
+                                loaded = None
+                                try:
+                                    gc.collect(0)
+                                finally:
+                                    if automatic_gc:
+                                        gc.enable()
                         covered_segments.update(updated)
                         staged_bytes += group_bytes
                         group_stats.append(stats)

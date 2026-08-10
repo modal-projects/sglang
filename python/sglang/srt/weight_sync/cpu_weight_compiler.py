@@ -347,7 +347,6 @@ class CPUWeightCompiler:
             stats["wall_s"],
         )
         del cpu_shadow, gpu_shadow
-        gc.collect(0)
         return updated, group_bytes, stats
 
     def checkpoint_groups(
@@ -463,6 +462,22 @@ class CPUWeightCompiler:
                             phase = "finalize"
                             updated, group_bytes, stats = self._finalize_group(loaded)
                             del loaded
+                            allocated_before_gc = torch.cuda.memory_allocated(
+                                self.target_device
+                            )
+                            collected = gc.collect()
+                            allocated_after_gc = torch.cuda.memory_allocated(
+                                self.target_device
+                            )
+                            reclaimed = allocated_before_gc - allocated_after_gc
+                            if reclaimed:
+                                logger.info(
+                                    "CPU weight image group cleanup: path=%s "
+                                    "objects=%d cuda_bytes=%d",
+                                    group.path,
+                                    collected,
+                                    reclaimed,
+                                )
                         covered_segments.update(updated)
                         staged_bytes += group_bytes
                         group_stats.append(stats)

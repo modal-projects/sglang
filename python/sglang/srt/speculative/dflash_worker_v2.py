@@ -58,6 +58,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -1289,12 +1290,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = get_exec().mamba.mamba_track_interval
+            seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+                seq_lens_pre_verify.dtype
+            )
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -1690,9 +1694,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
-        )
+        if self._need_mamba_verify_commit:
+            prepare_mamba_track_for_verify(batch)
+        seq_lens_pre_verify = prefix_lens if self._need_mamba_verify_commit else None
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:

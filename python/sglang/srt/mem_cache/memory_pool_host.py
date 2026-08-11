@@ -1755,7 +1755,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.dcp_size = anchor_host.dcp_size
         self.dcp_rank = anchor_host.dcp_rank
-        self.logical_page_size = anchor_host.logical_page_size
+        # logical_page_size is a read-only property derived from page_size.
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory

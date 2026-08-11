@@ -599,7 +599,9 @@ def build_hybrid_mamba_stack(
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, mamba_host_size = None, 0
-    if server_args.hicache_size > 0:
+    if server_args.hicache_size > 0 and not server_args.enable_mla_hicache_host_dedup:
+        # Under dedup the plan below sizes the target and Mamba pools
+        # directly; the proportional split does not apply.
         kv_host_size, mamba_host_size = _split_hicache_size(
             server_args.hicache_size, (kv_pool, mamba_pool)
         )

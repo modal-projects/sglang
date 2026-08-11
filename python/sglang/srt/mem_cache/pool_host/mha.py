@@ -191,7 +191,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.dcp_size = 1
         self.dcp_rank = 0
-        self.logical_page_size = page_size
+        # logical_page_size/logical_size are read-only properties derived
+        # from page_size/size (dcp_size == 1 here).
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -208,7 +209,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.size = int(device_pool.size * host_to_device_ratio)
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        self.logical_size = self.size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -335,6 +335,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        assert not self._is_dummy, "load on a dummy (non-src GQA) host pool"
         if self.device_pool is not None:
             if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
@@ -474,6 +475,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-src GQA) host pool"
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.

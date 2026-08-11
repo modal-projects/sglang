@@ -164,7 +164,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             "MLA HiCache host dedup requires dcp_size=1 because the target "
             "device KV must be replicated across attention-TP ranks."
         )
-        self.logical_page_size = page_size
+        # logical_page_size/logical_size are read-only properties derived
+        # from page_size/size (dcp_size == 1 here).
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -181,7 +182,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.size = int(device_pool.size * host_to_device_ratio)
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        self.logical_size = self.size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 

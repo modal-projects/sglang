@@ -97,7 +97,7 @@ class MHATokenToKVPoolHost(HostKVCache):
 
         if is_dummy:
             # GQA replica-group host dedup: non-src ranks run allocator-only
-            # pools (see mla_host_dedup) -- no host KV data is allocated.
+            # pools (see hicache_host_dedup) -- no host KV data is allocated.
             assert not self.mtp_draft_device_pools, (
                 "host-dedup dummy pools do not support packed MTP draft "
                 "layers; disable dedup or the packed draft cache."

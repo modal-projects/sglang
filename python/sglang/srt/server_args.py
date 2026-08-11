@@ -2627,7 +2627,7 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
-    enable_mla_hicache_host_dedup: A[
+    enable_hicache_host_dedup: A[
         bool,
         "Deduplicate replicated HiCache host KV across attention-TP ranks. "
         "MLA/DSA: KV is identical on every attn-TP rank, so one rank owns "
@@ -7237,26 +7237,26 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
-        if self.enable_mla_hicache_host_dedup and self.enable_dsa_cache_layer_split:
+        if self.enable_hicache_host_dedup and self.enable_dsa_cache_layer_split:
             raise ValueError(
-                "--enable-mla-hicache-host-dedup cannot be used with "
+                "--enable-hicache-host-dedup cannot be used with "
                 "--enable-dsa-cache-layer-split."
             )
-        if self.enable_mla_hicache_host_dedup:
+        if self.enable_hicache_host_dedup:
             if not self.enable_hierarchical_cache:
                 raise ValueError(
-                    "--enable-mla-hicache-host-dedup requires "
+                    "--enable-hicache-host-dedup requires "
                     "--enable-hierarchical-cache."
                 )
             if self.dcp_size > 1:
                 raise ValueError(
-                    "--enable-mla-hicache-host-dedup requires --dcp-size=1: "
+                    "--enable-hicache-host-dedup requires --dcp-size=1: "
                     "DCP shards target MLA KV across ranks, while host dedup "
                     "requires replicated target KV."
                 )
             if self.hicache_storage_backend not in (None, "", "file"):
                 raise ValueError(
-                    "--enable-mla-hicache-host-dedup only supports L2-only "
+                    "--enable-hicache-host-dedup only supports L2-only "
                     "HiCache or --hicache-storage-backend=file; got "
                     f"{self.hicache_storage_backend!r}."
                 )

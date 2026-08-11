@@ -34,8 +34,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.mla_host_dedup import (
-    MLAHostDedupPrebuild,
+from sglang.srt.mem_cache.hicache_host_dedup import (
+    HostDedupPrebuild,
     storage_supports_host_dedup,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -180,8 +180,8 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
-        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
-        enable_mla_hicache_host_dedup: bool = False,
+        host_dedup_prebuild: Optional[HostDedupPrebuild] = None,
+        enable_hicache_host_dedup: bool = False,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -201,22 +201,22 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
-            mla_dedup_prebuild=mla_dedup_prebuild,
-            enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
+            host_dedup_prebuild=host_dedup_prebuild,
+            enable_hicache_host_dedup=enable_hicache_host_dedup,
         )
         # The base gate ran with storage_backend=None; re-apply it with the
         # real startup backend so broadcast never runs against full
         # (non-dummy) pools.
-        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+        if self.host_dedup_broadcast_enabled and not storage_supports_host_dedup(
             startup_storage_backend
         ):
-            self._destroy_mla_broadcast_group()
+            self._destroy_host_dedup_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
-        if self.mla_broadcast_enabled:
+        if self.host_dedup_broadcast_enabled:
             mamba_entry = getattr(mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
             if mamba_entry is not None and getattr(
                 mamba_entry.host_pool, "_is_dummy", False
@@ -247,7 +247,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
-        if self.mla_broadcast_enabled and PoolName.MAMBA in getattr(
+        if self.host_dedup_broadcast_enabled and PoolName.MAMBA in getattr(
             self.mem_pool_host, "entry_map", {}
         ):
             raise RuntimeError(
@@ -451,7 +451,7 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in op.pool_transfers or []
         )
         if (
-            self._mla_skip_host_io
+            self._dedup_skip_host_io
             and not self.has_draft
             and not has_rank_local_transfers
         ):
@@ -502,7 +502,7 @@ class HybridCacheController(BaseHiCacheController):
             ack_start_event.record()
             # Only the source rank owns deduplicated target pools. Draft KV is
             # rank-local and must still be copied on every rank.
-            if not self._mla_skip_host_io:
+            if not self._dedup_skip_host_io:
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -629,7 +629,7 @@ class HybridCacheController(BaseHiCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
-        if self.mla_broadcast_enabled:
+        if self.host_dedup_broadcast_enabled:
             return self._start_loading_mla(producer_id, op)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
@@ -735,7 +735,7 @@ class HybridCacheController(BaseHiCacheController):
             resolved_pool_transfers,
         )
 
-    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+    def _dedup_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
         # Hybrid transfer ids are global model-layer ids. Only target MLA
         # layers have an anchor mapping; Mamba/KDA layers are rank-local and
         # deliberately do not participate in the target broadcast.
@@ -748,7 +748,7 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> Optional[list[PoolTransfer]]:
         # Source already loads all pools through _load_mla_source_layer().
-        if self.mla_broadcaster.is_src:
+        if self.host_dedup_broadcaster.is_src:
             return None
         resolved = []
         for transfer in op.pool_transfers or []:
@@ -905,7 +905,7 @@ class HybridCacheController(BaseHiCacheController):
         # precede super()._page_transfer and the sidecar batch_get below;
         # pool_transfers_done lets this rank pass the all-reduced termination
         # check.
-        if self._mla_skip_host_io:
+        if self._dedup_skip_host_io:
             operation.completed_tokens += len(operation.hash_value) * self.page_size
             operation.pool_transfers_done = True
             return

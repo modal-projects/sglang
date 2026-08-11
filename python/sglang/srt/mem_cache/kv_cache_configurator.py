@@ -1499,7 +1499,7 @@ class KVCacheConfigurator:
             # GQA KV-head replication factor across attn-TP (QKVParallelLinear:
             # shard_id = tp_rank // (attn_tp // total_kv_heads), consecutive
             # rank blocks share identical KV). Stamped for HiCache host dedup
-            # (mla_host_dedup.kv_replica_group_size); 1 = no replication.
+            # (hicache_host_dedup.kv_replica_group_size); 1 = no replication.
             total_kv_heads = self.model_config.get_total_num_kv_heads()
             attn_tp_size = get_parallel().attn_tp_size
             if 0 < total_kv_heads < attn_tp_size and attn_tp_size % total_kv_heads == 0:

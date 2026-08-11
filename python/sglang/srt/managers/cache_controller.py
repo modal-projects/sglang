@@ -41,9 +41,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.mla_host_dedup import (
-    MLAHostDedupPrebuild,
-    maybe_build_mla_broadcaster,
+from sglang.srt.mem_cache.hicache_host_dedup import (
+    HostDedupPrebuild,
+    maybe_build_host_dedup_broadcaster,
     storage_supports_host_dedup,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -253,8 +253,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
-        mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
-        enable_mla_hicache_host_dedup: bool = False,
+        host_dedup_prebuild: Optional[HostDedupPrebuild] = None,
+        enable_hicache_host_dedup: bool = False,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -314,21 +314,21 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        # MLA/DSA host-memory dedup (see mla_host_dedup): consume the groups
+        # MLA/DSA host-memory dedup (see hicache_host_dedup): consume the groups
         # the caller prebuilt before the slow host KV alloc, else build
         # inline with the same gating.
-        if mla_dedup_prebuild is not None:
-            self.mla_broadcaster = mla_dedup_prebuild.broadcaster
+        if host_dedup_prebuild is not None:
+            self.host_dedup_broadcaster = host_dedup_prebuild.broadcaster
             self._prebuilt_prefetch_sync_groups = (
-                mla_dedup_prebuild.prefetch_sync_groups
+                host_dedup_prebuild.prefetch_sync_groups
             )
         else:
-            self.mla_broadcaster = maybe_build_mla_broadcaster(
+            self.host_dedup_broadcaster = maybe_build_host_dedup_broadcaster(
                 self.mem_pool_device,
                 self.tp_group,
                 self.attn_tp_group,
                 storage_backend,
-                enable_mla_hicache_host_dedup,
+                enable_hicache_host_dedup,
             )
             self._prebuilt_prefetch_sync_groups = None
 
@@ -347,19 +347,19 @@ class HiCacheController:
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
     @property
-    def mla_broadcast_enabled(self) -> bool:
-        return self.mla_broadcaster is not None
+    def host_dedup_broadcast_enabled(self) -> bool:
+        return self.host_dedup_broadcaster is not None
 
     @property
-    def _mla_skip_host_io(self) -> bool:
+    def _dedup_skip_host_io(self) -> bool:
         """Non-src dedup ranks: dummy host pools, no D2H backup or L3 reads."""
-        broadcaster = getattr(self, "mla_broadcaster", None)
+        broadcaster = getattr(self, "host_dedup_broadcaster", None)
         return broadcaster is not None and not broadcaster.is_src
 
-    def _destroy_mla_broadcast_group(self) -> None:
-        if self.mla_broadcaster is not None:
-            self.mla_broadcaster.destroy()
-            self.mla_broadcaster = None
+    def _destroy_host_dedup_broadcast_group(self) -> None:
+        if self.host_dedup_broadcaster is not None:
+            self.host_dedup_broadcaster.destroy()
+            self.host_dedup_broadcaster = None
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -371,7 +371,7 @@ class HiCacheController:
         return 0, 1
 
     def _create_prefetch_sync_groups(self) -> None:
-        # Reuse caller-prebuilt gloo groups (see maybe_prebuild_mla_host_dedup);
+        # Reuse caller-prebuilt gloo groups (see maybe_prebuild_host_dedup);
         # clear the slot so a runtime detach→re-attach builds fresh.
         if self._prebuilt_prefetch_sync_groups is not None:
             self.prefetch_sync_groups = self._prebuilt_prefetch_sync_groups
@@ -498,7 +498,7 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        if self.mla_broadcast_enabled and self.has_draft:
+        if self.host_dedup_broadcast_enabled and self.has_draft:
             raise RuntimeError(
                 "Cannot attach HiCache L3 storage while MLA host-memory dedup "
                 "and a local draft L2 cache are both active. Draft L3 needs "
@@ -510,7 +510,7 @@ class HiCacheController:
         # EVERY rank: attach is fanned out with no rollback on partial
         # failure, so a rank-asymmetric reject would leave the server
         # half-attached.
-        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+        if self.host_dedup_broadcast_enabled and not storage_supports_host_dedup(
             storage_backend
         ):
             raise RuntimeError(
@@ -785,7 +785,7 @@ class HiCacheController:
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
-        if self._mla_skip_host_io and not self.has_draft:
+        if self._dedup_skip_host_io and not self.has_draft:
             # Dummy target host pool on this rank: skip D2H, just ack.
             # (num_tokens/num_bytes stay 0: nothing moves on this rank.)
             ack_start_event.record()
@@ -820,7 +820,7 @@ class HiCacheController:
             # dedup source owns target host pages. Draft KV is not necessarily
             # replicated (EAGLE commonly uses head-sharded MHA), and therefore
             # each rank keeps its own full draft host pool.
-            if not self._mla_skip_host_io:
+            if not self._dedup_skip_host_io:
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device,
                     target_host_indices,
@@ -936,7 +936,7 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
 
-        if self.mla_broadcast_enabled:
+        if self.host_dedup_broadcast_enabled:
             return self._start_loading_mla(producer_id, op)
 
         host_indices, device_indices = self.move_indices(
@@ -1001,12 +1001,12 @@ class HiCacheController:
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             trace = self._begin_mla_trace(op)
-            broadcast_plan = self.mla_broadcaster.prepare_broadcast(
+            broadcast_plan = self.host_dedup_broadcaster.prepare_broadcast(
                 op.device_indices, self.load_stream
             )
 
             source_state = None
-            if self.mla_broadcaster.is_src:
+            if self.host_dedup_broadcaster.is_src:
                 source_state = self._prepare_mla_source_load(op)
             rank_local_state = self._prepare_mla_rank_local_load(op)
             draft_state = self._prepare_draft_load(op)
@@ -1027,15 +1027,15 @@ class HiCacheController:
                 # all enqueued on load_stream.  Recording the layer event below
                 # therefore makes this layer visible to the forward stream while
                 # later layers continue loading.
-                broadcast_layer_id = self._mla_broadcast_layer_id(i)
+                broadcast_layer_id = self._dedup_broadcast_layer_id(i)
                 if broadcast_layer_id is not None:
                     broadcast_start = self._mla_trace_event(trace)
                     if trace is None:
-                        self.mla_broadcaster.broadcast_loaded_layer(
+                        self.host_dedup_broadcaster.broadcast_loaded_layer(
                             broadcast_layer_id, broadcast_plan
                         )
                     else:
-                        self.mla_broadcaster.broadcast_loaded_layer(
+                        self.host_dedup_broadcaster.broadcast_loaded_layer(
                             broadcast_layer_id, broadcast_plan, trace=trace
                         )
                     self._finish_mla_trace_phase(
@@ -1084,7 +1084,7 @@ class HiCacheController:
         )
         return producer_id
 
-    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+    def _dedup_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
         """Map a transfer-layer id to the target MLA layer to broadcast."""
         return transfer_layer_id
 
@@ -1163,7 +1163,7 @@ class HiCacheController:
             )
             total_ms = trace["start"].elapsed_time(finish)
             cpu_submit_ms = (trace["cpu_submit_end"] - trace["cpu_submit_start"]) * 1000
-            role = "src" if self.mla_broadcaster.is_src else "peer"
+            role = "src" if self.host_dedup_broadcaster.is_src else "peer"
             rank = (
                 torch.distributed.get_rank()
                 if torch.distributed.is_initialized()
@@ -1270,7 +1270,7 @@ class HiCacheController:
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
         """Register a full local draft KV pool for HiCache L2 transfers."""
-        if self.mla_broadcast_enabled and self.enable_storage:
+        if self.host_dedup_broadcast_enabled and self.enable_storage:
             raise NotImplementedError(
                 "Draft HiCache L3 storage is not supported together with MLA "
                 "host-memory dedup. Draft L2 host cache is supported, but L3 "
@@ -1401,7 +1401,7 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Dummy host pool: only the src rank reads L3; mark complete so the
         # MIN-synced cross-rank accounting stays consistent.
-        if self._mla_skip_host_io:
+        if self._dedup_skip_host_io:
             operation.completed_tokens += len(operation.hash_value) * self.page_size
             return
         # Transfer batch by batch

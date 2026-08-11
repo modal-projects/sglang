@@ -1,5 +1,7 @@
 import inspect
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -46,6 +48,47 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
                         "explicitly and return it via NextBatchPlan instead."
                     ),
                 )
+
+
+class TestFlashinferMtpPhaseSync(unittest.TestCase):
+    @staticmethod
+    def _batch(*, is_extend: bool, is_speculative: bool = True):
+        return SimpleNamespace(
+            is_extend_in_batch=is_extend,
+            forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
+            spec_algorithm=SimpleNamespace(is_none=lambda: not is_speculative),
+        )
+
+    def _scheduler(self, *, require_mlp_sync: bool):
+        scheduler = object.__new__(Scheduler)
+        scheduler.require_mlp_sync = require_mlp_sync
+        return scheduler
+
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_syncs_only_at_mtp_phase_crossing(self, get_backend):
+        get_backend.return_value.is_flashinfer.return_value = True
+        scheduler = self._scheduler(require_mlp_sync=True)
+        extend = self._batch(is_extend=True)
+        decode = self._batch(is_extend=False)
+
+        self.assertTrue(scheduler._needs_flashinfer_mtp_phase_sync(decode, extend))
+        self.assertTrue(scheduler._needs_flashinfer_mtp_phase_sync(extend, decode))
+        self.assertFalse(scheduler._needs_flashinfer_mtp_phase_sync(decode, decode))
+
+    @patch("sglang.srt.managers.scheduler.get_moe_a2a_backend")
+    def test_skips_non_mtp_and_non_flashinfer(self, get_backend):
+        scheduler = self._scheduler(require_mlp_sync=False)
+        extend = self._batch(is_extend=True)
+        decode = self._batch(is_extend=False)
+
+        get_backend.return_value.is_flashinfer.return_value = False
+        self.assertFalse(scheduler._needs_flashinfer_mtp_phase_sync(decode, extend))
+
+        get_backend.return_value.is_flashinfer.return_value = True
+        non_mtp_decode = self._batch(is_extend=False, is_speculative=False)
+        self.assertFalse(
+            scheduler._needs_flashinfer_mtp_phase_sync(non_mtp_decode, extend)
+        )
 
 
 if __name__ == "__main__":

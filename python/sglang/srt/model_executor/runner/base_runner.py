@@ -231,6 +231,14 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
 
+        # Model-owned communication resources may depend on the resolved
+        # request pool and must be compiled/allocated before graph capture.
+        prepare_model_resources = getattr(
+            mr.model, "prepare_before_cuda_graph_capture", None
+        )
+        if prepare_model_resources is not None:
+            prepare_model_resources(mr)
+
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
             assert (

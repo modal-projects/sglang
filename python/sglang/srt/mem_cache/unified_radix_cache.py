@@ -213,10 +213,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
-        logger.info(
-            f"Init Unified Radix Cache. Components: {self.tree_components}. "
-            f"Tree Core: {type(self.tree_core).__name__}"
-        )
+        logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -2194,4 +2191,4 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
-        return self.tree_core.root_node_handle(extra_key)
+        return self.tree_core.root_node.id

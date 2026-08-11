@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -50,17 +50,12 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
-if TYPE_CHECKING:
-    from torch.cuda import Stream as CudaStream
-
-try:
-    from sglang.kernels.ops.mamba.triton_ops import (
-        initialize_mamba_selective_state_update_backend,
-    )
-except ImportError:
-    initialize_mamba_selective_state_update_backend = None
+from sglang.kernels.ops.mamba.triton_ops import (
+    initialize_mamba_selective_state_update_backend,
+)
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -98,7 +93,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import get_moe_a2a_backend, initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
@@ -340,7 +335,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
-STEP_MAX_US = 2_000_000
+DECODE_STEP_MAX_US = 2_000_000
 
 
 def _accumulate_decode_moment(
@@ -856,8 +851,7 @@ class Scheduler(
                 )
 
     def init_mamba_backend(self) -> None:
-        if initialize_mamba_selective_state_update_backend is not None:
-            initialize_mamba_selective_state_update_backend(self.server_args)
+        initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
         # For the MM models, check the text_config for MoE settings
@@ -1711,7 +1705,6 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                self._sched_idled = True
                 self.on_idle()
 
             # Update last_batch
@@ -1748,6 +1741,9 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            need_flashinfer_mtp_phase_sync = self._needs_flashinfer_mtp_phase_sync(
+                batch, last_batch=self.last_batch
+            )
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -1755,6 +1751,15 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
+                if need_flashinfer_mtp_phase_sync:
+                    # ``process_batch_result`` can recycle buffers referenced by
+                    # the previous MTP target/draft graph.  Its copy event only
+                    # fences the D2H leaf stream, not the complete forward.  Drain
+                    # the forward stream before processing the result when the
+                    # transport switches between one-sided decode and AG+RS
+                    # extend.  This is a boundary-only host wait; steady decode
+                    # retains normal scheduler/GPU overlap.
+                    self.forward_stream.synchronize()
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1773,7 +1778,6 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
-                self._sched_idled = True
 
             # Process the last batch
             if self.last_batch:
@@ -1826,11 +1830,47 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
+        # FlashInfer's one-sided MoE transport is CUDA-Graph safe during
+        # steady decode, but an MTP target/draft graph must be drained before
+        # an eager extend starts (and vice versa). Otherwise the next eager
+        # kernel can observe an asynchronous illegal-memory access from the
+        # in-flight graph when a DP replica reaches its max local batch.
+        # Process the pending result only at the phase boundary; decode->decode
+        # and extend->extend retain normal scheduler/GPU overlap.
+        need_flashinfer_mtp_phase_sync = self._needs_flashinfer_mtp_phase_sync(
+            batch, last_batch
+        )
+
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch
+            or need_grammar_sync
+            or need_flashinfer_mtp_phase_sync
+        )
+
+    def _needs_flashinfer_mtp_phase_sync(
+        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> bool:
+        """Whether an MTP batch crosses the FlashInfer transport boundary."""
+
+        if (
+            batch is None
+            or last_batch is None
+            or batch.spec_algorithm.is_none()
+            or not get_moe_a2a_backend().is_flashinfer()
+        ):
+            return False
+
+        if self.require_mlp_sync:
+            batch_is_extend = batch.is_extend_in_batch
+            last_batch_is_extend = last_batch.is_extend_in_batch
+        else:
+            batch_is_extend = batch.forward_mode.is_extend()
+            last_batch_is_extend = last_batch.forward_mode.is_extend()
+        return batch_is_extend != last_batch_is_extend
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -2052,8 +2092,7 @@ class Scheduler(
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
-        self._prev_step: Optional[Tuple[int, float, bool]] = None
-        self._sched_idled = False
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -2448,11 +2487,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = (
-                "DSpark speculative decoding does not support return_logprob yet."
-                if self.spec_algorithm.is_dspark() and req.return_logprob
-                else validate_dflash_request(req, self.enable_overlap)
-            )
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3547,8 +3582,6 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
-        self._sched_idled = False
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3868,28 +3901,23 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
-        prev = self._prev_step
-        self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
-        # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
-        if prev is None or batch.after_idle_gap:
-            return
-        prev_iter, prev_ts, prev_is_prefill = prev
-        if prev_iter + 1 != batch.forward_iter or prev_is_prefill != is_prefill:
-            return
-        step_us = int((batch.launch_ts - prev_ts) * 1e6)
-        if not 0 < step_us < STEP_MAX_US:
-            return
         if is_prefill:
-            self.total_prefill_busy_us += step_us
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
             self.total_prefill_uncached_tokens += batch.extend_num_tokens
         else:
             batch_size = len(batch.reqs)
-            _accumulate_decode_moment(
-                self.decode_moment_totals,
-                batch_size,
-                step_us,
-                batch_size + result.num_correct_drafts,
-            )
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

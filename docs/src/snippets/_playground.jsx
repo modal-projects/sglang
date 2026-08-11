@@ -1061,21 +1061,12 @@ export const Playground = ({ config }) => {
     },
 
     // ---- Axis: Hierarchical KV Cache ----------------------------------------
-    // Enable + optional backend + write policy. `null` inherits the base cell,
-    // so a verified HiCache recipe remains byte-identical until it is changed.
+    // Enable + optional backend + write policy. Owns the `--hicache-*` family
+    // (unconditional strip).
     hicache: {
-      initState: () => ({ enable: null, backend: null, writePolicy: "auto" }),
+      initState: () => ({ enable: false, backend: null, writePolicy: "auto" }),
 
-      deriveFromBase: (cell, fc, h) => {
-        const flags = (cell && cell.flags) || [];
-        return {
-          enable: h.hasFlag(flags, "--enable-hierarchical-cache"),
-          backend: h.findFlagArg(flags, "--hicache-storage-backend"),
-          writePolicy: h.findFlagArg(flags, "--hicache-write-policy") || "auto",
-        };
-      },
-
-      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h }) => {
         if (fc.excludesHw && sel && fc.excludesHw.includes(sel.hw)) return { flags, env };
         // When the Deploy panel owns enablement (`showWhen`), the base already
         // carries a complete, verified hicache recipe. Rebuilding it from this
@@ -1092,34 +1083,12 @@ export const Playground = ({ config }) => {
           }
           return { flags, env };
         }
-
-        const hasOverride = value.enable !== null
-          || value.backend !== null
-          || (value.writePolicy && value.writePolicy !== "auto");
-        if (!hasOverride) return { flags, env };
-
-        const backendOptions = fc.backends || [];
-        const ownedHeads = [
+        flags = h.stripFlagsByFirstToken(flags, [
           "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
           "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
           "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
-          "--hicache-storage-backend-extra-config",
-          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
-          ...backendOptions.flatMap((o) => (o.flags || []).map((f) => f.split(/\s/)[0])),
-        ];
-        const ownedEnvKeys = [
-          ...(fc.requiredEnv || []),
-          ...backendOptions.flatMap((o) => o.env || []),
-        ].map((e) => e.split("=")[0]);
-        flags = h.stripFlagsByFirstToken(flags, ownedHeads);
-        if (ownedEnvKeys.length) env = h.stripEnvByPrefix(env, ownedEnvKeys);
-
-        const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
-        const backend = value.backend !== null
-          ? value.backend
-          : ((derived && derived.backend) || fc.defaultBackend || null);
-        if (enabled) {
+        ]);
+        if (value.enable) {
           const isAmd = sel && /^mi\d/.test(sel.hw);
           const pdMode = h.findFlagArg(flags, "--disaggregation-mode") || "off";
           const pdBackend = h.findFlagArg(flags, "--disaggregation-transfer-backend");
@@ -1144,7 +1113,7 @@ export const Playground = ({ config }) => {
           if (useAmdIo) {
             adds.push(`--hicache-mem-layout ${amdIo.memLayout}`,
                       `--hicache-io-backend ${amdIo.ioBackend}`);
-          } else if (backend) {
+          } else if (value.backend) {
             adds.push("--hicache-mem-layout page_first_direct",
                       "--hicache-io-backend direct");
           }
@@ -1152,58 +1121,43 @@ export const Playground = ({ config }) => {
             ? value.writePolicy : ((amdIo && amdIo.writePolicy) || "write_through");
           adds.push(`--hicache-write-policy ${writePolicy}`);
           // When amdStorageFileOnly is set, AMD emits storage flags only for "file".
-          if ((isAmd && fc.amdStorageFileOnly) ? backend === "file" : !!backend) {
-            adds.push(`--hicache-storage-backend ${backend}`,
+          if ((isAmd && fc.amdStorageFileOnly) ? value.backend === "file" : !!value.backend) {
+            adds.push(`--hicache-storage-backend ${value.backend}`,
                       `--hicache-storage-prefetch-policy ${(amdIo && amdIo.prefetchPolicy) || "wait_complete"}`);
           } else if (amdIo && amdIo.prefetchPolicy) {
             adds.push(`--hicache-storage-prefetch-policy ${amdIo.prefetchPolicy}`);
           }
-          const backendOption = backendOptions.find((o) => o.id === backend);
-          adds.push(...(backendOption?.flags || []), ...(fc.requiredFlags || []));
           flags = h.insertBeforeTail(flags, adds);
-          env = [
-            ...env,
-            ...(backendOption?.env || []),
-            ...(fc.requiredEnv || []),
-          ];
         }
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
+      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect }) => {
         if (fc.excludesHw && fc.excludesHw.includes(base.hw)) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         const hasBackends = (fc.backends || []).length > 0;
         const hasPolicies = (fc.writePolicies || []).length > 0;
-        const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
-        const hasAutoBackend = (fc.backends || []).some((o) => o.id === null);
-        const backend = value.backend !== null
-          ? value.backend
-          : (hasAutoBackend ? null : ((derived && derived.backend) || fc.defaultBackend || null));
-        const writePolicy = value.writePolicy !== "auto"
-          ? value.writePolicy : ((derived && derived.writePolicy) || "auto");
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>HiCache</span>
               {typeof fc.showWhen !== "function" && (
                 <span style={s.field}>
-                  {renderChip("Enable", enabled, true,
-                    () => setSlot("enable", !enabled))}
+                  {renderChip("Enable", value.enable, true,
+                    () => setSlot("enable", !value.enable))}
                 </span>
               )}
               {hasBackends && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>Storage</span>
-                  {renderSelect(backend, fc.backends,
+                  {renderSelect(value.backend, fc.backends,
                     (v) => setSlot("backend", v), base)}
                 </span>
               )}
               {hasPolicies && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>Write</span>
-                  {renderSelect(writePolicy, fc.writePolicies,
+                  {renderSelect(value.writePolicy, fc.writePolicies,
                     (v) => setSlot("writePolicy", v), base)}
                 </span>
               )}
@@ -1465,8 +1419,6 @@ export const Playground = ({ config }) => {
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
-      const hostNetwork = multinode || pdMode || (typeof config.dockerHostNetworkWhen === "function"
-        && config.dockerHostNetworkWhen(sel, { flags: f, env: cellEnv }));
       // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
       // (Mintlify strips module state, so the engines cannot share it).
       const HW_MULTINODE_DOCKER_FLAGS = {
@@ -1478,7 +1430,7 @@ export const Playground = ({ config }) => {
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
-        hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),

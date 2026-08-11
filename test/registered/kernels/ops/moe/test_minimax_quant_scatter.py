@@ -1,6 +1,7 @@
 import random
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -156,6 +157,30 @@ def test_compact_all_tokens_uses_tight_routing_independent_bound(
         deep_gemm_runner._get_compact_all_tokens(num_assignments, num_experts)
         == expected
     )
+
+
+def test_compact_eager_keeps_masked_layout_for_cuda_graph(monkeypatch):
+    config = MoeRunnerConfig(
+        num_experts=128,
+        num_local_experts=16,
+        hidden_size=2048,
+        intermediate_size_per_partition=4096,
+        top_k=4,
+        activation="silu",
+        is_gated=True,
+        inplace=False,
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner.envs.SGLANG_OPT_DG_COMPACT_EAGER, "get", lambda: True
+    )
+    capture = SimpleNamespace(disable_dispose_tensor=False)
+    monkeypatch.setattr(
+        deep_gemm_runner, "get_flags", lambda: SimpleNamespace(capture=capture)
+    )
+    assert not deep_gemm_runner._should_use_masked_standard_layout(config)
+
+    capture.disable_dispose_tensor = True
+    assert deep_gemm_runner._should_use_masked_standard_layout(config)
 
 
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])

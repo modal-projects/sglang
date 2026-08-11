@@ -100,6 +100,10 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        """Forward model-owned warmup to the text backbone."""
+        self.model.prepare_before_cuda_graph_capture(model_runner)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -147,21 +151,30 @@ class Qwen3_5ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
-        body_weights = []
-        for name, loaded_weight in weights:
-            if name.startswith(_MODEL_PREFIX):
-                body_weights.append((name[len(_MODEL_PREFIX) :], loaded_weight))
-            elif name == "lm_head.weight":
-                if self.config.tie_word_embeddings:
-                    continue
-                if "lm_head.weight" not in params_dict:
-                    continue
-                param = params_dict["lm_head.weight"]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add("lm_head.weight")
+        # Keep the upstream checkpoint iterator lazy.  Materializing all body
+        # tensors in a list retains every mmap-backed CPU tensor until the
+        # complete Oakhaven checkpoint has been scanned.  With four model
+        # processes per Grace node that transient host-RSS peak exceeds the
+        # Slurm memory allocation before the tensors can be copied to GPU.
+        # The body loader already consumes an Iterable one tensor at a time,
+        # so prefix stripping can remain a streaming generator.
+        def body_weights():
+            for name, loaded_weight in weights:
+                if name.startswith(_MODEL_PREFIX):
+                    yield name[len(_MODEL_PREFIX) :], loaded_weight
+                elif name == "lm_head.weight":
+                    if self.config.tie_word_embeddings:
+                        continue
+                    if "lm_head.weight" not in params_dict:
+                        continue
+                    param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add("lm_head.weight")
 
-        body_loaded = self.model.load_weights(body_weights)
+        body_loaded = self.model.load_weights(body_weights())
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
 
         if self.config.tie_word_embeddings and self.pp_group.is_last_rank:

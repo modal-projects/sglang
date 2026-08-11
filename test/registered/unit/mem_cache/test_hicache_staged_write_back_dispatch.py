@@ -932,6 +932,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeTargetHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
+            size_per_token = 2
 
             def backup_from_device_all_layer(self, *args):
                 target_writes.append(args)
@@ -939,6 +940,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeDraftHostPool:
             layout = "page_first"
             can_use_write_back_jit = True
+            size_per_token = 2
 
             def backup_from_device_all_layer(self, *args):
                 draft_writes.append(args)
@@ -1394,6 +1396,11 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeHostGroup:
             layout = "page_first"
             can_use_write_back_jit = False
+            # Ack accounting reads the group anchor even on dedup-peer ranks.
+            anchor_entry = SimpleNamespace(
+                name=PoolName.KV, host_pool=SimpleNamespace(size_per_token=2)
+            )
+            entry_map = {}
 
             def backup_from_device_all_layer(self, *args, **kwargs):
                 raise AssertionError("peer must not write target MLA")
@@ -1461,6 +1468,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
             req_to_token_pool=SimpleNamespace(mamba_allocator=object()),
+            mtp_draft_device_pools=(),
         )
         server_args = SimpleNamespace(
             enable_mla_hicache_host_dedup=True,

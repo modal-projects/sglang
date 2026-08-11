@@ -258,7 +258,7 @@ def enforce_dedup_draft_host_budget(
         host_tokens=target_tokens,
         page_size=page_size,
     )
-    _, tp_size = mla_dedup_rank_and_size()
+    _, tp_size = dedup_rank_and_size()
     target_device_pool = getattr(target, "device_pool", None)
     target_copies = (
         num_target_host_copies(target_device_pool)
@@ -288,7 +288,7 @@ def enforce_dedup_draft_host_budget(
     )
 
 
-def mla_dedup_rank_and_size() -> tuple[int, int]:
+def dedup_rank_and_size() -> tuple[int, int]:
     """Attn-TP rank/size when DP attention is enabled, model-TP otherwise."""
     if is_dp_attention_enabled():
         return (
@@ -331,7 +331,7 @@ def kv_replica_group_size(kv_cache) -> int:
     """
     inner = _unwrap_kv_pool(kv_cache)
     if isinstance(inner, MLATokenToKVPool):
-        return mla_dedup_rank_and_size()[1]
+        return dedup_rank_and_size()[1]
     return int(getattr(inner, "hicache_dedup_kv_replicas", 1) or 1)
 
 
@@ -342,7 +342,7 @@ def dedup_group_rank_and_size(kv_cache) -> tuple[int, int]:
     the position within the group is attn_tp_rank % R and the group src is
     the block's first rank.
     """
-    rank, size = mla_dedup_rank_and_size()
+    rank, size = dedup_rank_and_size()
     group = min(kv_replica_group_size(kv_cache), size)
     if group <= 1:
         return rank, 1
@@ -352,14 +352,14 @@ def dedup_group_rank_and_size(kv_cache) -> tuple[int, int]:
 def num_target_host_copies(kv_cache) -> int:
     """Physical copies of the target host pool across the attn-TP group
     (= number of replica groups; 1 for MLA)."""
-    _, size = mla_dedup_rank_and_size()
+    _, size = dedup_rank_and_size()
     group = min(kv_replica_group_size(kv_cache), size)
     if group <= 1:
         return size
     return size // group
 
 
-def mla_host_dedup_eligible(
+def host_dedup_eligible(
     kv_cache, storage_backend: Optional[str], enabled: bool = False
 ) -> bool:
     """Rank-independent gate. CUDA only; FP4/MXFP8 excluded (their per-rank
@@ -378,7 +378,7 @@ def mla_host_dedup_eligible(
     )
 
 
-def require_mla_host_dedup_supported(
+def require_host_dedup_supported(
     kv_cache, storage_backend: Optional[str], enabled: bool = False
 ) -> None:
     """Fail closed when the opt-in cannot preserve target-cache semantics."""
@@ -387,28 +387,28 @@ def require_mla_host_dedup_supported(
     inner = _unwrap_kv_pool(kv_cache)
     if not isinstance(inner, (MLATokenToKVPool, MHATokenToKVPool)):
         raise ValueError(
-            "--enable-mla-hicache-host-dedup requires an MLA or replicated "
+            "--enable-hicache-host-dedup requires an MLA or replicated "
             f"GQA/MHA target KV pool, got {type(inner).__name__}."
         )
     if isinstance(inner, MLATokenToKVPoolFP4):
         raise ValueError(
-            "--enable-mla-hicache-host-dedup does not support FP4 MLA KV: "
+            "--enable-hicache-host-dedup does not support FP4 MLA KV: "
             "the per-rank scale buffer is not broadcast."
         )
     if isinstance(inner, MHATokenToKVPool):
         if _mha_scale_sidecar(inner):
             raise ValueError(
-                "--enable-mla-hicache-host-dedup does not support MXFP8 MHA "
+                "--enable-hicache-host-dedup does not support MXFP8 MHA "
                 "KV: the per-token scale sidecar is not broadcast."
             )
         if kv_replica_group_size(kv_cache) <= 1:
             raise ValueError(
-                "--enable-mla-hicache-host-dedup on a GQA/MHA pool requires "
+                "--enable-hicache-host-dedup on a GQA/MHA pool requires "
                 "replicated KV heads (num_kv_heads < attn_tp_size, stamped as "
                 "hicache_dedup_kv_replicas at pool build). This pool has no "
                 "replication -- every rank holds distinct KV; nothing to dedup."
             )
-        _, size = mla_dedup_rank_and_size()
+        _, size = dedup_rank_and_size()
         if size % kv_replica_group_size(kv_cache) != 0:
             raise ValueError(
                 "KV replica group size must divide the attention-TP size; got "
@@ -416,38 +416,38 @@ def require_mla_host_dedup_supported(
             )
     if getattr(inner, "layer_shard_enabled", False):
         raise ValueError(
-            "--enable-mla-hicache-host-dedup requires every attention-TP "
+            "--enable-hicache-host-dedup requires every attention-TP "
             "rank to own every target attention layer."
         )
     if not is_cuda():
         raise ValueError(
-            "--enable-mla-hicache-host-dedup currently requires CUDA/NCCL."
+            "--enable-hicache-host-dedup currently requires CUDA/NCCL."
         )
     if not storage_supports_host_dedup(storage_backend):
         raise ValueError(
-            "--enable-mla-hicache-host-dedup does not support storage backend "
+            "--enable-hicache-host-dedup does not support storage backend "
             f"{storage_backend!r}; only L2-only mode or the file backend is "
             "supported."
         )
-    _, size = mla_dedup_rank_and_size()
+    _, size = dedup_rank_and_size()
     if size <= 1:
         raise ValueError(
-            "--enable-mla-hicache-host-dedup requires attention TP > 1."
+            "--enable-hicache-host-dedup requires attention TP > 1."
         )
 
 
-def is_mla_dedup_dummy_rank(
+def is_host_dedup_dummy_rank(
     kv_cache, storage_backend: Optional[str], enabled: bool = False
 ) -> bool:
     """Whether this rank must construct an allocator-only (dummy) host pool."""
-    require_mla_host_dedup_supported(kv_cache, storage_backend, enabled)
-    if not mla_host_dedup_eligible(kv_cache, storage_backend, enabled):
+    require_host_dedup_supported(kv_cache, storage_backend, enabled)
+    if not host_dedup_eligible(kv_cache, storage_backend, enabled):
         return False
     group_rank, group_size = dedup_group_rank_and_size(kv_cache)
     return group_size > 1 and group_rank != 0
 
 
-class MLAHostDedupBroadcaster:
+class HostDedupBroadcaster:
     """Broadcasts host-loaded MLA KV (and DSA indexer) device pages from the
     src rank to its attn-TP peers over a dedicated NCCL group.
 
@@ -510,7 +510,7 @@ class MLAHostDedupBroadcaster:
         device_pool,
         tp_group: torch.distributed.ProcessGroup,
         attn_tp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> MLAHostDedupBroadcaster:
+    ) -> HostDedupBroadcaster:
         """Build the NCCL group (a world collective — all dedup participants
         must call in lockstep) and the staging buffers."""
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -699,40 +699,40 @@ class MLAHostDedupBroadcaster:
         self.group = None
 
 
-def maybe_build_mla_broadcaster(
+def maybe_build_host_dedup_broadcaster(
     device_pool,
     tp_group: torch.distributed.ProcessGroup,
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
-) -> Optional[MLAHostDedupBroadcaster]:
+) -> Optional[HostDedupBroadcaster]:
     """None when dedup does not engage (gate fails or single attn-TP rank)."""
-    require_mla_host_dedup_supported(device_pool, storage_backend, enabled)
-    if not mla_host_dedup_eligible(device_pool, storage_backend, enabled):
+    require_host_dedup_supported(device_pool, storage_backend, enabled)
+    if not host_dedup_eligible(device_pool, storage_backend, enabled):
         return None
     if dedup_group_rank_and_size(device_pool)[1] <= 1:
         return None
-    return MLAHostDedupBroadcaster.build(device_pool, tp_group, attn_tp_group)
+    return HostDedupBroadcaster.build(device_pool, tp_group, attn_tp_group)
 
 
 @dataclass
-class MLAHostDedupPrebuild:
+class HostDedupPrebuild:
     """Groups/buffers rendezvoused ahead of the slow host KV allocation."""
 
-    broadcaster: MLAHostDedupBroadcaster
+    broadcaster: HostDedupBroadcaster
     # None without a storage backend, so a later runtime attach still builds
     # its gloo groups inline.
     prefetch_sync_groups: Optional[List[torch.distributed.ProcessGroup]]
 
 
-def maybe_prebuild_mla_host_dedup(
+def maybe_prebuild_host_dedup(
     kv_cache,
     tp_group: torch.distributed.ProcessGroup,
     attn_cp_group: Optional[torch.distributed.ProcessGroup],
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
-) -> Optional[MLAHostDedupPrebuild]:
+) -> Optional[HostDedupPrebuild]:
     """Issue the controller's init-time world collectives BEFORE the host KV
     pool is allocated.
 
@@ -743,12 +743,12 @@ def maybe_prebuild_mla_host_dedup(
     does not engage — same gating as the controller, so groups are never
     built on ranks that would ignore them.
     """
-    broadcaster = maybe_build_mla_broadcaster(
+    broadcaster = maybe_build_host_dedup_broadcaster(
         kv_cache, tp_group, attn_tp_group, storage_backend, enabled
     )
     if broadcaster is None:
         return None
-    rank, size = mla_dedup_rank_and_size()
+    rank, size = dedup_rank_and_size()
     group_rank, group_size = dedup_group_rank_and_size(kv_cache)
     logger.info(
         "HiCache host dedup active: attn_tp_rank=%d/%d, "
@@ -765,7 +765,7 @@ def maybe_prebuild_mla_host_dedup(
         prefetch_sync_groups = _prebuild_prefetch_sync_groups(
             tp_group, attn_cp_group, attn_tp_group
         )
-    return MLAHostDedupPrebuild(broadcaster, prefetch_sync_groups)
+    return HostDedupPrebuild(broadcaster, prefetch_sync_groups)
 
 
 def _prebuild_prefetch_sync_groups(

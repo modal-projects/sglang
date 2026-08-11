@@ -129,8 +129,8 @@ def maybe_register_hicache_draft(
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary = tree_cache.cache_controller.mem_pool_host
-    if tree_cache.cache_controller.mla_broadcast_enabled:
-        from sglang.srt.mem_cache.mla_host_dedup import (
+    if tree_cache.cache_controller.host_dedup_broadcast_enabled:
+        from sglang.srt.mem_cache.hicache_host_dedup import (
             enforce_dedup_draft_host_budget,
         )
 

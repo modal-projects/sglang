@@ -21,18 +21,18 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.mla_host_dedup import (
+from sglang.srt.mem_cache.hicache_host_dedup import (
     _unwrap_kv_pool,
     estimate_target_host_pool_bytes,
     kv_replica_group_size,
-    MLAHostDedupPrebuild,
+    HostDedupPrebuild,
     enforce_hicache_host_budget,
     estimate_draft_host_pool_bytes,
     estimate_mamba_host_pool_bytes,
     estimate_mla_host_pool_bytes,
-    is_mla_dedup_dummy_rank,
-    mla_dedup_rank_and_size,
-    maybe_prebuild_mla_host_dedup,
+    is_host_dedup_dummy_rank,
+    dedup_rank_and_size,
+    maybe_prebuild_host_dedup,
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import (
@@ -180,7 +180,7 @@ def build_kv_only_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
-    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+    host_dedup_prebuild: Optional[HostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -219,8 +219,8 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        mla_dedup_prebuild=mla_dedup_prebuild,
-        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
+        host_dedup_prebuild=host_dedup_prebuild,
+        enable_hicache_host_dedup=server_args.enable_hicache_host_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -600,16 +600,16 @@ def build_hybrid_mamba_stack(
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, mamba_host_size = None, 0
-    if server_args.hicache_size > 0 and not server_args.enable_mla_hicache_host_dedup:
+    if server_args.hicache_size > 0 and not server_args.enable_hicache_host_dedup:
         # Under dedup the plan below sizes the target and Mamba pools
         # directly; the proportional split does not apply.
         kv_host_size, mamba_host_size = _split_hicache_size(
             server_args.hicache_size, (kv_pool, mamba_pool)
         )
 
-    mla_is_dummy = False
-    mla_dedup_prebuild = None
-    if server_args.enable_mla_hicache_host_dedup:
+    dedup_is_dummy = False
+    host_dedup_prebuild = None
+    if server_args.enable_hicache_host_dedup:
         if storage_backend not in (None, ""):
             raise ValueError(
                 "Hybrid host dedup currently supports L2 only; "
@@ -633,7 +633,7 @@ def build_hybrid_mamba_stack(
             host_to_device_ratio=mamba_ratio,
             host_size_gb=0,
         )
-        _, attn_tp_size = mla_dedup_rank_and_size()
+        _, attn_tp_size = dedup_rank_and_size()
         rank_local_bytes = {"mamba": mamba_bytes}
         draft_tokens = 0
         if params.hicache_draft_kv_pool is not None:
@@ -675,7 +675,7 @@ def build_hybrid_mamba_stack(
         )
 
         # Rendezvous before rank 0 begins the much larger physical MLA alloc.
-        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+        host_dedup_prebuild = maybe_prebuild_host_dedup(
             kv_pool,
             params.tp_cache_group,
             params.attn_cp_cache_group,
@@ -683,7 +683,7 @@ def build_hybrid_mamba_stack(
             storage_backend,
             True,
         )
-        mla_is_dummy = is_mla_dedup_dummy_rank(kv_pool, storage_backend, True)
+        dedup_is_dummy = is_host_dedup_dummy_rank(kv_pool, storage_backend, True)
 
         # Dedup sizing semantics (K3): --hicache-size (if set) sizes the
         # deduplicated target pool directly; the rank-local Mamba pool is
@@ -698,7 +698,7 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
-        is_dummy=mla_is_dummy,
+        is_dummy=dedup_is_dummy,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
@@ -748,8 +748,8 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        mla_dedup_prebuild=mla_dedup_prebuild,
-        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
+        host_dedup_prebuild=host_dedup_prebuild,
+        enable_hicache_host_dedup=server_args.enable_hicache_host_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -886,7 +886,7 @@ def build_anchor_sidecar_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
     is_dummy: bool = False,
-    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+    host_dedup_prebuild: Optional[HostDedupPrebuild] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -933,8 +933,8 @@ def build_anchor_sidecar_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
-        mla_dedup_prebuild=mla_dedup_prebuild,
-        enable_mla_hicache_host_dedup=server_args.enable_mla_hicache_host_dedup,
+        host_dedup_prebuild=host_dedup_prebuild,
+        enable_hicache_host_dedup=server_args.enable_hicache_host_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -1286,17 +1286,17 @@ class _DsaStrategy(StackStrategy):
 
         # MLA/DSA host dedup: dummy pools on non-src ranks; prebuild the
         # process groups before the slow host KV alloc (NCCL-watchdog race,
-        # see maybe_prebuild_mla_host_dedup).
-        mla_is_dummy = is_mla_dedup_dummy_rank(
-            kvcache, storage_backend, server_args.enable_mla_hicache_host_dedup
+        # see maybe_prebuild_host_dedup).
+        dedup_is_dummy = is_host_dedup_dummy_rank(
+            kvcache, storage_backend, server_args.enable_hicache_host_dedup
         )
-        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+        host_dedup_prebuild = maybe_prebuild_host_dedup(
             kvcache,
             params.tp_cache_group,
             params.attn_cp_cache_group,
             params.attn_tp_cache_group,
             storage_backend,
-            server_args.enable_mla_hicache_host_dedup,
+            server_args.enable_hicache_host_dedup,
         )
 
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
@@ -1321,8 +1321,8 @@ class _DsaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
-            is_dummy=mla_is_dummy,
-            mla_dedup_prebuild=mla_dedup_prebuild,
+            is_dummy=dedup_is_dummy,
+            host_dedup_prebuild=host_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1442,16 +1442,16 @@ class _PlainKvStrategy(StackStrategy):
 
         # Same dedup gating + watchdog prebuild as the DSA path; MHA pools
         # gate to False/None.
-        mla_is_dummy = is_mla_dedup_dummy_rank(
-            kvcache, storage_backend, server_args.enable_mla_hicache_host_dedup
+        dedup_is_dummy = is_host_dedup_dummy_rank(
+            kvcache, storage_backend, server_args.enable_hicache_host_dedup
         )
-        mla_dedup_prebuild = maybe_prebuild_mla_host_dedup(
+        host_dedup_prebuild = maybe_prebuild_host_dedup(
             kvcache,
             params.tp_cache_group,
             params.attn_cp_cache_group,
             params.attn_tp_cache_group,
             storage_backend,
-            server_args.enable_mla_hicache_host_dedup,
+            server_args.enable_hicache_host_dedup,
         )
 
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
@@ -1467,8 +1467,8 @@ class _PlainKvStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
-            is_dummy=mla_is_dummy,
-            mla_dedup_prebuild=mla_dedup_prebuild,
+            is_dummy=dedup_is_dummy,
+            host_dedup_prebuild=host_dedup_prebuild,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1749,7 +1749,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
-    mla_dedup_prebuild: Optional[MLAHostDedupPrebuild] = None,
+    host_dedup_prebuild: Optional[HostDedupPrebuild] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -1760,10 +1760,10 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
 
         # MLA/DSA host dedup: dummy KV + indexer pools on non-src ranks.
-        mla_is_dummy = is_mla_dedup_dummy_rank(
+        dedup_is_dummy = is_host_dedup_dummy_rank(
             kv,
             server_args.hicache_storage_backend,
-            server_args.enable_mla_hicache_host_dedup,
+            server_args.enable_hicache_host_dedup,
         )
 
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
@@ -1787,8 +1787,8 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
-            is_dummy=mla_is_dummy,
-            mla_dedup_prebuild=mla_dedup_prebuild,
+            is_dummy=dedup_is_dummy,
+            host_dedup_prebuild=host_dedup_prebuild,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group

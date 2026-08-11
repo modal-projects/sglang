@@ -31,8 +31,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.mla_host_dedup import (
-    MLAHostDedupBroadcaster,
+from sglang.srt.mem_cache.hicache_host_dedup import (
+    HostDedupBroadcaster,
     enforce_hicache_host_budget,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -187,7 +187,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
         )
 
-    def test_mla_dedup_dummy_host_pools_are_allocator_only(self):
+    def test_host_dedup_dummy_host_pools_are_allocator_only(self):
         mla_device_pool = _device_pool_stub(
             layer_num=2,
             store_dtype=torch.float16,
@@ -925,7 +925,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
 
-    def test_mla_dedup_peer_still_writes_local_draft_pool(self):
+    def test_host_dedup_peer_still_writes_local_draft_pool(self):
         target_writes = []
         draft_writes = []
 
@@ -958,7 +958,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.mem_pool_host_draft = FakeDraftHostPool()
         controller.mem_pool_device_draft = object()
         controller.has_draft = True
-        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.host_dedup_broadcaster = SimpleNamespace(is_src=False)
         controller.write_stream = object()
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
@@ -974,7 +974,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(len(draft_writes), 1)
         self.assertEqual(draft_writes[0][1].device.type, "cpu")
 
-    def test_mla_dedup_load_restores_draft_on_every_rank(self):
+    def test_host_dedup_load_restores_draft_on_every_rank(self):
         draft_loads = []
         broadcasts = []
 
@@ -1010,7 +1010,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.layer_done_counter = SimpleNamespace(
             update_producer=lambda: 0, events=[producer_event]
         )
-        controller.mla_broadcaster = SimpleNamespace(
+        controller.host_dedup_broadcaster = SimpleNamespace(
             is_src=False,
             prepare_broadcast=lambda device_indices, stream: (
                 device_indices,
@@ -1040,7 +1040,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertIsNot(ack.start_event, producer_event.start_event)
         self.assertIsNot(ack.finish_event, producer_event.finish_event)
 
-    def test_mla_dedup_source_load_and_broadcast_are_layerwise(self):
+    def test_host_dedup_source_load_and_broadcast_are_layerwise(self):
         operations = []
 
         class FakeTargetHostPool:
@@ -1091,7 +1091,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.layer_done_counter = SimpleNamespace(
             update_producer=lambda: 0, events=[FakeProducerEvent()]
         )
-        controller.mla_broadcaster = SimpleNamespace(
+        controller.host_dedup_broadcaster = SimpleNamespace(
             is_src=True,
             prepare_broadcast=lambda device_indices, stream: operations.append(
                 ("prepare", None)
@@ -1131,7 +1131,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         )
 
     def test_mla_layer_broadcast_reuses_full_staging_capacity(self):
-        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster = HostDedupBroadcaster.__new__(HostDedupBroadcaster)
         broadcaster.is_src = True
         broadcaster.src_global_rank = 0
         broadcaster.group = object()
@@ -1159,7 +1159,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
         torch.testing.assert_close(received[1].index_select(0, target), expected)
 
-    def test_hybrid_mla_dedup_peer_still_writes_local_draft_pool(self):
+    def test_hybrid_host_dedup_peer_still_writes_local_draft_pool(self):
         target_writes = []
         draft_writes = []
 
@@ -1197,7 +1197,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.mem_pool_host_draft = FakeDraftHostPool()
         controller.mem_pool_device_draft = object()
         controller.has_draft = True
-        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.host_dedup_broadcaster = SimpleNamespace(is_src=False)
         controller.write_stream = object()
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
@@ -1214,7 +1214,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(len(draft_writes), 1)
         self.assertEqual(draft_writes[0][1].device.type, "cpu")
 
-    def test_hybrid_mla_dedup_loads_extra_pools_layerwise(self):
+    def test_hybrid_host_dedup_loads_extra_pools_layerwise(self):
         operations = []
         pool_transfers = [mock.sentinel.pool_transfer]
 
@@ -1252,7 +1252,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.layer_done_counter = SimpleNamespace(
             update_producer=lambda: 0, events=[FakeProducerEvent()]
         )
-        controller.mla_broadcaster = SimpleNamespace(
+        controller.host_dedup_broadcaster = SimpleNamespace(
             is_src=True,
             prepare_broadcast=lambda device_indices, stream: (
                 device_indices,
@@ -1297,7 +1297,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             pool_transfers,
         )
 
-    def test_hybrid_mla_dedup_peer_broadcasts_only_target_and_loads_mamba(self):
+    def test_hybrid_host_dedup_peer_broadcasts_only_target_and_loads_mamba(self):
         operations = []
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
@@ -1339,7 +1339,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.layer_done_counter = SimpleNamespace(
             update_producer=lambda: 0, events=[FakeProducerEvent()]
         )
-        controller.mla_broadcaster = SimpleNamespace(
+        controller.host_dedup_broadcaster = SimpleNamespace(
             is_src=False,
             prepare_broadcast=lambda device_indices, stream: (device_indices, None),
             broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
@@ -1379,7 +1379,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ],
         )
 
-    def test_hybrid_mla_dedup_peer_still_writes_rank_local_mamba(self):
+    def test_hybrid_host_dedup_peer_still_writes_rank_local_mamba(self):
         writes = []
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
@@ -1416,7 +1416,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         controller.mem_pool_host = FakeHostGroup()
         controller.mem_pool_device = object()
         controller.has_draft = False
-        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.host_dedup_broadcaster = SimpleNamespace(is_src=False)
         controller.write_stream = object()
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
@@ -1433,7 +1433,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(writes[0][1], [transfer])
         self.assertEqual(writes[0][2], {PoolName.MAMBA})
 
-    def test_mla_dedup_aggregate_host_budget_is_fail_closed(self):
+    def test_host_dedup_aggregate_host_budget_is_fail_closed(self):
         budget = mock.Mock(get=mock.Mock(return_value=1))
         with mock.patch(
             "sglang.srt.environ.envs.SGLANG_HICACHE_HOST_BUDGET_GIB", budget
@@ -1460,7 +1460,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 1_200_000_000,
             )
 
-    def test_hybrid_mla_dedup_preflight_includes_draft_before_host_alloc(self):
+    def test_hybrid_host_dedup_preflight_includes_draft_before_host_alloc(self):
         params = SimpleNamespace(
             page_size=64,
             hicache_draft_kv_pool=mock.sentinel.draft_pool,
@@ -1471,7 +1471,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             mtp_draft_device_pools=(),
         )
         server_args = SimpleNamespace(
-            enable_mla_hicache_host_dedup=True,
+            enable_hicache_host_dedup=True,
             hicache_ratio=3.0,
             hicache_size=230,
             hicache_mamba_ratio=6.75,
@@ -1495,7 +1495,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
             mock.patch.object(
                 hybrid_pool_assembler,
-                "mla_dedup_rank_and_size",
+                "dedup_rank_and_size",
                 return_value=(0, 8),
             ),
             mock.patch.object(
@@ -1503,7 +1503,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ) as enforce,
             mock.patch.object(
                 hybrid_pool_assembler,
-                "maybe_prebuild_mla_host_dedup",
+                "maybe_prebuild_host_dedup",
                 side_effect=RuntimeError("stop before allocation"),
             ),
             mock.patch.object(

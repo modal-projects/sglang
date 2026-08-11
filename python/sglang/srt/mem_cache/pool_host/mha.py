@@ -92,7 +92,7 @@ class MHATokenToKVPoolHost(HostKVCache):
 
         if is_dummy:
             # GQA replica-group host dedup: non-src ranks run allocator-only
-            # pools (see mla_host_dedup) -- no host KV data is allocated.
+            # pools (see hicache_host_dedup) -- no host KV data is allocated.
             self._init_dummy(
                 device_pool,
                 host_to_device_ratio,

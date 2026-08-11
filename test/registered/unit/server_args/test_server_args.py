@@ -1079,46 +1079,46 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
-    def test_mla_host_dedup_is_opt_in(self):
-        self.assertFalse(ServerArgs(model_path="dummy").enable_mla_hicache_host_dedup)
+    def test_hicache_host_dedup_is_opt_in(self):
+        self.assertFalse(ServerArgs(model_path="dummy").enable_hicache_host_dedup)
         self.assertTrue(
             ServerArgs(
-                model_path="dummy", enable_mla_hicache_host_dedup=True
-            ).enable_mla_hicache_host_dedup
+                model_path="dummy", enable_hicache_host_dedup=True
+            ).enable_hicache_host_dedup
         )
 
-    def test_mla_host_dedup_rejects_dsa_cache_layer_split(self):
+    def test_hicache_host_dedup_rejects_dsa_cache_layer_split(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
-            enable_mla_hicache_host_dedup=True,
+            enable_hicache_host_dedup=True,
             enable_dsa_cache_layer_split=True,
         )
 
         with self.assertRaisesRegex(
             ValueError,
-            "--enable-mla-hicache-host-dedup cannot be used with "
+            "--enable-hicache-host-dedup cannot be used with "
             "--enable-dsa-cache-layer-split",
         ):
             args._handle_hicache()
 
-    def test_mla_host_dedup_requires_hicache(self):
-        args = self._make_args(enable_mla_hicache_host_dedup=True)
+    def test_hicache_host_dedup_requires_hicache(self):
+        args = self._make_args(enable_hicache_host_dedup=True)
         with self.assertRaisesRegex(ValueError, "requires --enable-hierarchical-cache"):
             args._handle_hicache()
 
-    def test_mla_host_dedup_rejects_dcp(self):
+    def test_hicache_host_dedup_rejects_dcp(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
-            enable_mla_hicache_host_dedup=True,
+            enable_hicache_host_dedup=True,
             dcp_size=8,
         )
         with self.assertRaisesRegex(ValueError, "requires --dcp-size=1"):
             args._handle_hicache()
 
-    def test_mla_host_dedup_rejects_registered_storage(self):
+    def test_hicache_host_dedup_rejects_registered_storage(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
-            enable_mla_hicache_host_dedup=True,
+            enable_hicache_host_dedup=True,
             hicache_storage_backend="mooncake",
         )
         with self.assertRaisesRegex(ValueError, "only supports L2-only"):

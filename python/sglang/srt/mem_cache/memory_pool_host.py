@@ -1816,8 +1816,8 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
+        # logical_size is a read-only property derived from size.
         self.size = anchor_host.size
-        self.logical_size = anchor_host.logical_size
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (

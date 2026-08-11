@@ -1512,7 +1512,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         with (
             mock.patch.object(
                 hybrid_pool_assembler,
-                "estimate_mla_host_pool_bytes",
+                "estimate_target_host_pool_bytes",
                 return_value=(100, 10),
             ),
             mock.patch.object(

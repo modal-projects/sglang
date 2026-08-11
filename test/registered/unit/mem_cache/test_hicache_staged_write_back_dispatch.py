@@ -1563,8 +1563,9 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 "allocator_metadata": 218,
             },
             tp_size=8,
+            target_copies=1,
             context=(
-                "hybrid MLA+Mamba L2 "
+                "hybrid target+Mamba L2 "
                 "(target_tokens=10, mamba_slots=2, draft_tokens=10)"
             ),
         )

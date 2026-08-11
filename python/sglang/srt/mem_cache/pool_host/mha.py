@@ -71,6 +71,9 @@ logger = logging.getLogger(__name__)
 class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
+    # Class default so instances that bypass __init__ (subclass builders,
+    # tests using __new__) read as physical pools.
+    _is_dummy = False
 
     def __init__(
         self,

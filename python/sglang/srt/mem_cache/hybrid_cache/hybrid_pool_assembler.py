@@ -665,7 +665,9 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
-    if server_args.hicache_size > 0:
+    if server_args.hicache_size > 0 and not server_args.enable_mla_hicache_host_dedup:
+        # Under dedup the plan below sizes the target and Mamba pools
+        # directly; the proportional split does not apply.
         kv_host_size, mamba_host_size = _split_hicache_size(
             server_args.hicache_size, (kv_pool, mamba_pool)
         )

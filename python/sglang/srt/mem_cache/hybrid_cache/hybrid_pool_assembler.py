@@ -22,6 +22,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     PoolEntry,
 )
 from sglang.srt.mem_cache.mla_host_dedup import (
+    num_target_host_copies,
+    estimate_target_host_pool_bytes,
     MLAHostDedupPrebuild,
     enforce_hicache_host_budget,
     estimate_draft_host_pool_bytes,
@@ -34,6 +36,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -113,8 +116,14 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
-    if use_mla and is_dummy:
-        # Dedup dummy rank: allocator-only host pool (no buffer).
+    if is_dummy:
+        # Dedup dummy rank: allocator-only host pool (no buffer). Only the
+        # plain MLA/MHA host pools implement dummy mode.
+        if not use_mla and kv_host_pool_cls is not MHATokenToKVPoolHost:
+            raise ValueError(
+                "HiCache host dedup dummy pools are not implemented for "
+                f"{kv_host_pool_cls.__name__}."
+            )
         kwargs["is_dummy"] = True
     return kv_host_pool_cls(
         kv_pool,
@@ -664,21 +673,18 @@ def build_hybrid_mamba_stack(
     mla_is_dummy = False
     mla_dedup_prebuild = None
     if server_args.enable_mla_hicache_host_dedup:
-        if not use_mla:
-            raise ValueError(
-                "--enable-mla-hicache-host-dedup requires the hybrid target "
-                "attention pool to use MLA."
-            )
         if storage_backend not in (None, ""):
             raise ValueError(
-                "Hybrid MLA+Mamba host dedup currently supports L2 only; "
+                "Hybrid host dedup currently supports L2 only; "
                 "rank-local Mamba/KDA L3 keys are not implemented."
             )
 
         # Compute the whole TP-group physical plan before any rank starts a
-        # host allocation. Target MLA has one owner; Mamba/KDA and any
-        # mirrored speculative draft are rank-local.
-        target_bytes, target_tokens = estimate_mla_host_pool_bytes(
+        # host allocation. The target pool has one owner per replica group
+        # (MLA: one group spanning attn-TP; GQA: attn_tp // kv_replicas
+        # groups); Mamba/GDN state and any mirrored speculative draft are
+        # rank-local.
+        target_bytes, target_tokens = estimate_target_host_pool_bytes(
             kv_pool,
             host_to_device_ratio=server_args.hicache_ratio,
             host_size_gb=server_args.hicache_size,
@@ -712,8 +718,9 @@ def build_hybrid_mamba_stack(
             target_bytes=target_bytes,
             rank_local_bytes=rank_local_bytes,
             tp_size=attn_tp_size,
+            target_copies=num_target_host_copies(kv_pool),
             context=(
-                f"hybrid MLA+Mamba L2 "
+                f"hybrid target+Mamba L2 "
                 f"(target_tokens={target_tokens}, mamba_slots={mamba_tokens}, "
                 f"draft_tokens={draft_tokens})"
             ),

@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -79,9 +80,29 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
         *,
         pool_label: str = "kv",
     ):
+        self._is_dummy = is_dummy
+        self.pool_label = pool_label
+
+        if is_dummy:
+            # GQA replica-group host dedup: non-src ranks run allocator-only
+            # pools (see mla_host_dedup) -- no host KV data is allocated.
+            self._init_dummy(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+            )
+            return
+
+
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -123,6 +144,72 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
         self._init_write_back_staging_buffers()
+
+    def _init_dummy(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator_type: str,
+    ) -> None:
+        """Initialize allocator bookkeeping without allocating host KV data.
+
+        Mirrors MLATokenToKVPoolHost._init_dummy: allocator state stays in
+        lockstep with the physical pool on the group's src rank, so host
+        indices agree across ranks; the data buffers are never allocated.
+        """
+        self.device_pool = device_pool
+        self.dcp_size = 1
+        self.dcp_rank = 0
+        self.logical_page_size = page_size
+        self.page_size = page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+
+        self.dtype = device_pool.store_dtype
+        self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+        self.logical_size = self.size
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.element_dim = self.head_num * self.head_dim
+        self.token_stride_size = self.element_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.can_use_jit = False
+        self.can_use_write_back_jit = False
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_k_buffer = None
+        self.staging_v_buffer = None
+        self.kv_buffer = None
+        self.k_data_refs = None
+        self.v_data_refs = None
+        self.k_data_ptrs = None
+        self.v_data_ptrs = None
+
+        logger.info(
+            "MHATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+            "saving %.2f GB host memory",
+            self.size,
+            self.size * self.size_per_token / 1e9,
+        )
+
+        self.lock = threading.RLock()
+        self.clear()
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num

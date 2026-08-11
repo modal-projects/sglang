@@ -2623,7 +2623,11 @@ class ServerArgs:
     )
     enable_mla_hicache_host_dedup: A[
         bool,
-        "Deduplicate MLA/DSA HiCache host KV across attention-TP ranks. "
+        "Deduplicate replicated HiCache host KV across attention-TP ranks. "
+        "MLA/DSA: KV is identical on every attn-TP rank, so one rank owns "
+        "the host pool. GQA with num_kv_heads < attn_tp_size: each KV-head "
+        "replica group (attn_tp // num_kv_heads consecutive ranks) shares "
+        "one host pool. Loaded pages reach peer ranks via NCCL broadcast. "
         "Disabled by default.",
         NS("memory"),
     ] = False

@@ -1289,12 +1289,22 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
+        is_draft_worker = getattr(self, "is_draft_worker", False)
+        # --speculative-draft-kv-cache-dtype pins the draft pool's storage
+        # dtype independently of the target's (default: inherit).
+        requested_kv_cache_dtype = kv_cache_dtype.select_kv_cache_dtype(
+            target_kv_cache_dtype=get_model().kv_cache_dtype,
+            draft_kv_cache_dtype=getattr(
+                get_spec(), "speculative_draft_kv_cache_dtype", None
+            ),
+            is_draft_worker=is_draft_worker,
+        )
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+                server_args_kv_cache_dtype=requested_kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
-                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_draft_worker=is_draft_worker,
                 is_dflash=(
                     spec_algorithm.is_dflash_family()
                     if spec_algorithm is not None
@@ -1310,7 +1320,7 @@ class ModelRunner:
         self.kv_cache_dtype_str = (
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
-            else get_model().kv_cache_dtype
+            else requested_kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

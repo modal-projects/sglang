@@ -307,7 +307,7 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        # MLA/DSA host-memory dedup (see hicache_host_dedup): consume the groups
+        # Host-memory dedup (see hicache_host_dedup): consume the groups
         # the caller prebuilt before the slow host KV alloc, else build
         # inline with the same gating.
         if host_dedup_prebuild is not None:
@@ -494,7 +494,7 @@ class HiCacheController:
 
         if self.host_dedup_broadcast_enabled and self.has_draft:
             raise RuntimeError(
-                "Cannot attach HiCache L3 storage while MLA host-memory dedup "
+                "Cannot attach HiCache L3 storage while host-memory dedup "
                 "and a local draft L2 cache are both active. Draft L3 needs "
                 "per-rank storage keys and is not implemented."
             )
@@ -509,7 +509,7 @@ class HiCacheController:
         ):
             raise RuntimeError(
                 f"Cannot runtime-attach non-dedup-compatible storage backend "
-                f"{storage_backend!r} while MLA/NSA host-memory dedup is "
+                f"{storage_backend!r} while host-memory dedup is "
                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
                 f"(kv_buffer=None) and this backend would dereference them. "
                 f"Only None/''/'file' backends can attach later in dedup "
@@ -842,7 +842,7 @@ class HiCacheController:
         """Return index tensors in the form required by one host pool's D2H path."""
         # The staged page-first write-back kernel accepts CPU destination indices.
         # The regular kernel path instead requires them on CUDA. Target and draft
-        # may select different paths when MLA dedup makes the target pool dummy.
+        # may select different paths when host dedup makes the target pool dummy.
         if (
             self.io_backend == "kernel"
             and host_pool.layout == "page_first"
@@ -959,7 +959,7 @@ class HiCacheController:
 
     def _start_loading_mla(self, producer_id: int, op: CacheOperation) -> int:
         """Layerwise H2D on the dedup source followed by layerwise broadcast."""
-        self._log_ready_mla_traces()
+        self._log_ready_dedup_traces()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -968,7 +968,7 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
-            trace = self._begin_mla_trace(op)
+            trace = self._begin_dedup_trace(op)
             broadcast_plan = self.host_dedup_broadcaster.prepare_broadcast(
                 op.device_indices, self.load_stream
             )
@@ -981,13 +981,13 @@ class HiCacheController:
 
             for i in range(self.layer_num):
                 if source_state is not None:
-                    h2d_start = self._mla_trace_event(trace)
+                    h2d_start = self._dedup_trace_event(trace)
                     self._load_mla_source_layer(source_state, i)
-                    self._finish_mla_trace_phase(trace, "h2d", h2d_start)
+                    self._finish_dedup_trace_phase(trace, "h2d", h2d_start)
 
-                rank_local_start = self._mla_trace_event(trace)
+                rank_local_start = self._dedup_trace_event(trace)
                 self._load_mla_rank_local_layer(rank_local_state, i)
-                self._finish_mla_trace_phase(
+                self._finish_dedup_trace_phase(
                     trace, "rank_local_h2d", rank_local_start
                 )
 
@@ -997,7 +997,7 @@ class HiCacheController:
                 # later layers continue loading.
                 broadcast_layer_id = self._dedup_broadcast_layer_id(i)
                 if broadcast_layer_id is not None:
-                    broadcast_start = self._mla_trace_event(trace)
+                    broadcast_start = self._dedup_trace_event(trace)
                     if trace is None:
                         self.host_dedup_broadcaster.broadcast_loaded_layer(
                             broadcast_layer_id, broadcast_plan
@@ -1006,13 +1006,13 @@ class HiCacheController:
                         self.host_dedup_broadcaster.broadcast_loaded_layer(
                             broadcast_layer_id, broadcast_plan, trace=trace
                         )
-                    self._finish_mla_trace_phase(
+                    self._finish_dedup_trace_phase(
                         trace, "broadcast_total", broadcast_start
                     )
                 if draft_state is not None:
-                    draft_start = self._mla_trace_event(trace)
+                    draft_start = self._dedup_trace_event(trace)
                     self._load_draft_layer(draft_state, i)
-                    self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
+                    self._finish_dedup_trace_phase(trace, "draft_h2d", draft_start)
 
                 # A draft can theoretically contain more layers than the target.
                 # Preserve the previous dedup path's all-draft completion guarantee
@@ -1021,9 +1021,9 @@ class HiCacheController:
                     for draft_layer_id in range(
                         self.layer_num, self.mem_pool_host_draft.layer_num
                     ):
-                        draft_start = self._mla_trace_event(trace)
+                        draft_start = self._dedup_trace_event(trace)
                         self._load_draft_layer(draft_state, draft_layer_id)
-                        self._finish_mla_trace_phase(trace, "draft_h2d", draft_start)
+                        self._finish_dedup_trace_phase(trace, "draft_h2d", draft_start)
                 producer_event.complete(i)
                 if trace is not None:
                     layer_ready = device_module.Event(enable_timing=True)
@@ -1039,7 +1039,7 @@ class HiCacheController:
                 trace["finish"] = device_module.Event(enable_timing=True)
                 trace["finish"].record()
                 trace["cpu_submit_end"] = time.perf_counter()
-                self._mla_trace_pending.append(trace)
+                self._dedup_trace_pending.append(trace)
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1066,17 +1066,17 @@ class HiCacheController:
     def _record_mla_rank_local_load(self, state) -> None:
         pass
 
-    def _begin_mla_trace(self, op: CacheOperation):
-        """Create a bounded, asynchronous CUDA-event trace for MLA dedup."""
-        if os.environ.get("SGLANG_MLA_DEDUP_TRACE", "0") != "1":
+    def _begin_dedup_trace(self, op: CacheOperation):
+        """Create a bounded, asynchronous CUDA-event trace for host dedup."""
+        if os.environ.get("SGLANG_HICACHE_DEDUP_TRACE", "0") != "1":
             return None
-        issued = getattr(self, "_mla_trace_issued", 0)
-        limit = int(os.environ.get("SGLANG_MLA_DEDUP_TRACE_LIMIT", "20"))
+        issued = getattr(self, "_dedup_trace_issued", 0)
+        limit = int(os.environ.get("SGLANG_HICACHE_DEDUP_TRACE_LIMIT", "20"))
         if issued >= limit:
             return None
-        self._mla_trace_issued = issued + 1
-        if not hasattr(self, "_mla_trace_pending"):
-            self._mla_trace_pending = []
+        self._dedup_trace_issued = issued + 1
+        if not hasattr(self, "_dedup_trace_pending"):
+            self._dedup_trace_pending = []
         start = device_module.Event(enable_timing=True)
         start.record()
         return {
@@ -1090,7 +1090,7 @@ class HiCacheController:
         }
 
     @staticmethod
-    def _mla_trace_event(trace):
+    def _dedup_trace_event(trace):
         if trace is None:
             return None
         event = device_module.Event(enable_timing=True)
@@ -1098,15 +1098,15 @@ class HiCacheController:
         return event
 
     @staticmethod
-    def _finish_mla_trace_phase(trace, name: str, start, num_bytes: int = 0):
+    def _finish_dedup_trace_phase(trace, name: str, start, num_bytes: int = 0):
         if trace is None:
             return
         end = device_module.Event(enable_timing=True)
         end.record()
         trace["events"].append((name, start, end, num_bytes))
 
-    def _log_ready_mla_traces(self) -> None:
-        pending = getattr(self, "_mla_trace_pending", None)
+    def _log_ready_dedup_traces(self) -> None:
+        pending = getattr(self, "_dedup_trace_pending", None)
         if not pending:
             return
 
@@ -1143,7 +1143,7 @@ class HiCacheController:
                 for name in sorted(phase_ms)
             )
             logger.info(
-                "[MLA_DEDUP_TRACE] id=%d rank=%d role=%s tokens=%d "
+                "[HICACHE_DEDUP_TRACE] id=%d rank=%d role=%s tokens=%d "
                 "first_layer_ms=%.3f total_ms=%.3f cpu_submit_ms=%.3f phases=%s",
                 trace["id"],
                 rank,
@@ -1155,7 +1155,7 @@ class HiCacheController:
                 phases,
             )
 
-        self._mla_trace_pending = remaining
+        self._dedup_trace_pending = remaining
 
     def _prepare_mla_source_load(
         self, op: CacheOperation
@@ -1190,7 +1190,7 @@ class HiCacheController:
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Resolve locally owned draft indices once on every attention-TP rank.
 
-        MLA host dedup is valid only for the target pool. The draft pool remains
+        Host dedup is valid only for the target pool. The draft pool remains
         a complete, per-rank L2 cache because its KV layout may be TP-sharded.
         """
         if not self.has_draft:
@@ -1253,7 +1253,7 @@ class HiCacheController:
             draft_host_pool.size,
         )
 
-        # L3 is rejected above for MLA dedup because draft shards need a
+        # L3 is rejected above for host dedup because draft shards need a
         # rank-qualified storage key. The normal non-dedup path can still
         # register its existing draft L3 I/O here.
         self._maybe_register_draft_with_storage()

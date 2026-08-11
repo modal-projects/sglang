@@ -50,7 +50,7 @@ _DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
-    """Whether MLA/DSA host-memory dedup can engage with this storage backend."""
+    """Whether host-memory dedup can engage with this storage backend."""
     return storage_backend in _DEDUP_COMPATIBLE_STORAGE
 
 
@@ -282,7 +282,7 @@ def enforce_dedup_draft_host_budget(
         tp_size=tp_size,
         target_copies=target_copies,
         context=(
-            f"MLA dedup with draft L2 "
+            f"host dedup with draft L2 "
             f"(target_tokens={target_tokens}, draft_tokens={draft_tokens})"
         ),
     )

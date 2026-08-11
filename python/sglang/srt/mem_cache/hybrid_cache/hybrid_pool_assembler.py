@@ -22,8 +22,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     PoolEntry,
 )
 from sglang.srt.mem_cache.mla_host_dedup import (
-    num_target_host_copies,
+    _unwrap_kv_pool,
     estimate_target_host_pool_bytes,
+    kv_replica_group_size,
     MLAHostDedupPrebuild,
     enforce_hicache_host_budget,
     estimate_draft_host_pool_bytes,
@@ -650,11 +651,22 @@ def build_hybrid_mamba_stack(
             target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
         )
         rank_local_bytes["allocator_metadata"] = allocator_metadata_bytes
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        # MLA: one host copy across attn-TP. GQA replica groups: one copy
+        # per group. (Unstamped/ineligible pools fail in the prebuild
+        # rendezvous below; 1 keeps this log honest until then.)
+        if isinstance(_unwrap_kv_pool(kv_pool), MHATokenToKVPool):
+            target_copies = attn_tp_size // min(
+                kv_replica_group_size(kv_pool), attn_tp_size
+            )
+        else:
+            target_copies = 1
         enforce_hicache_host_budget(
             target_bytes=target_bytes,
             rank_local_bytes=rank_local_bytes,
             tp_size=attn_tp_size,
-            target_copies=num_target_host_copies(kv_pool),
+            target_copies=target_copies,
             context=(
                 f"hybrid target+Mamba L2 "
                 f"(target_tokens={target_tokens}, mamba_slots={mamba_tokens}, "

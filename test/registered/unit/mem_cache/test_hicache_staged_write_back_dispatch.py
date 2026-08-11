@@ -1196,6 +1196,12 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeTargetHostPool:
             layout = "page_first"
             can_use_write_back_jit = False
+            # The ack accounting (_num_tokens_by_pool/_transfer_num_bytes)
+            # reads the group's anchor entry even on dedup-peer ranks.
+            anchor_entry = SimpleNamespace(
+                name=PoolName.KV, host_pool=SimpleNamespace(size_per_token=2)
+            )
+            entry_map = {}
 
             def backup_from_device_all_layer(self, *args, **kwargs):
                 target_writes.append((args, kwargs))
@@ -1203,6 +1209,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         class FakeDraftHostPool:
             layout = "page_first"
             can_use_write_back_jit = True
+            size_per_token = 2
 
             def backup_from_device_all_layer(self, *args):
                 draft_writes.append(args)

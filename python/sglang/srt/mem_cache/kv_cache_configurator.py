@@ -775,18 +775,30 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        # DSPARK/DFLASH commit routes through the backend fold (KDA fold or GDN
+        # fold, see update_mamba_state_after_mtp_verify). GDN is still refused
+        # under a non-static ragged verify layout: the GDN ring-write kernels
+        # do not take the ragged layout, so the commit would fold a stale ring.
+        # The server_args ragged check cannot see the model arch, so the
+        # KDA-vs-GDN half of it lives here.
         _algo = (self.server_args.speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
             and kimi_linear_config(self.model_config) is None
         ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "--enable-linear-replayssm-spec with DSPARK/DFLASH on a "
+                    "non-KDA model requires SGLANG_RAGGED_VERIFY_MODE=static: "
+                    "the GDN ring-write kernels do not take the ragged verify "
+                    "layout, so a non-static commit would fold a stale ring."
+                )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,

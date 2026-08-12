@@ -6248,7 +6248,9 @@ class ServerArgs:
                 # back to it for ragged layouts). The GDN ring-write kernels do
                 # not take the ragged layout and the flashinfer verify kernel
                 # never writes the ring -> a stale ring would be folded; keep
-                # refusing those combinations.
+                # refusing those combinations. The KDA-vs-GDN half of this
+                # check needs the model arch and lives in kv_cache_configurator
+                # (_build_hybrid_req_pool).
                 _algo = (self.speculative_algorithm or "").upper()
                 verify = self.linear_attn_verify_backend
                 if _algo not in ("DSPARK", "DFLASH") or verify not in (

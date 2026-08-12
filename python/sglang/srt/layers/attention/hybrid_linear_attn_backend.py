@@ -1206,12 +1206,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
+        # ReplaySSM: the accepted drafts live in the per-slot ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit
-        # handles replayssm before reaching here (returns early), so this branch is
-        # only hit by the direct callers. Chain layout only (topk <= 1), so
+        # handles replayssm before reaching here (returns early), so these branches
+        # are only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
         if getattr(mamba_pool, "replayssm_is_kda", False):
@@ -1220,6 +1220,26 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
             commit_kda_replayssm_after_verify(
+                spec_state=mamba_caches,
+                state_batch_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
+
+        # ReplaySSM-GDN (fold-every-commit): same protocol via the GDN fold --
+        # the verify forward ring-writes the raw inputs, the fold replays the
+        # accepted window into `temporal` and does the conv accept-rollback
+        # (+ track-slot scatter) internally.
+        if getattr(mamba_pool, "replayssm_spec_fold", False):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_gdn_replayssm_fold_after_verify,
+            )
+
+            commit_gdn_replayssm_fold_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,

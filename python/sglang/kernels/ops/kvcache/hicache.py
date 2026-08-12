@@ -276,6 +276,7 @@ def transfer_hicache_all_layer_staged_lf_pf(
     unroll: int | None = None,
     block_quota: int | None = None,
 ) -> None:
+    dst_indices = dst_indices.contiguous()
     element_dim = staging_k[0, 0].numel()
     element_size = element_size or (element_dim * staging_k.element_size())
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
@@ -322,6 +323,7 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     unroll: int | None = None,
     block_quota: int | None = None,
 ) -> None:
+    dst_indices = dst_indices.contiguous()
     element_dim = staging[0, 0].numel()
     element_size = element_size or (element_dim * staging.element_size())
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA

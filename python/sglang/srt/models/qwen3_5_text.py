@@ -104,6 +104,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         """Forward model-owned warmup to the text backbone."""
         self.model.prepare_before_cuda_graph_capture(model_runner)
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        """Forward DFLASH aux-hidden-state capture to the text backbone."""
+        self.model.set_dflash_layers_to_capture(layers_to_capture)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 

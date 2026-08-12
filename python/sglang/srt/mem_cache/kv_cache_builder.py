@@ -78,9 +78,14 @@ def get_hicache_draft_kv_pool(
     enable_hierarchical_cache: bool,
 ):
     """Return the concrete draft pool that will receive a mirrored L2 cache."""
+    # A windowed/ring draft cache holds no full-length KV, so there is
+    # nothing to mirror: DFlashWorkerV2 exposes this as
+    # use_compact_draft_cache (--speculative-draft-window-size), older
+    # workers as use_draft_ring.
     if (
         not enable_hierarchical_cache
         or getattr(draft_worker, "use_draft_ring", False)
+        or getattr(draft_worker, "use_compact_draft_cache", False)
     ):
         return None
 

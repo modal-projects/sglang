@@ -318,6 +318,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_speculative_decoding(server_args)
 
+    # Validate the CPU weight-cache surface once speculative_algorithm is final.
+    server_args._handle_cpu_weight_cache()
+
     # After the speculative hook so speculative_algorithm is final.
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
 

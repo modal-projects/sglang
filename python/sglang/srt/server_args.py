@@ -78,6 +78,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     human_readable_int,
+    is_cuda,
     json_list_type,
     nullable_str,
 )
@@ -3648,6 +3649,24 @@ class ServerArgs:
         ),
         NS("model"),
     ] = 1800
+    checkpoint_source_refresh_hook: A[
+        Optional[str],
+        "Import path of a hook(checkpoint_source_dir, target_version) that "
+        "runs once per host before staged checkpoint data is read.",
+        NS("model"),
+    ] = None
+    enable_cpu_weight_cache: A[
+        bool,
+        "Enable background compilation of verified checkpoints into "
+        "rank-ready CPU weight images. Only target-model weights are updated.",
+        NS("model"),
+    ] = False
+    cpu_weight_cache_max_compile_group_gb: A[
+        float,
+        "Target upper bound in GiB for a module group compiled during CPU "
+        "weight staging. An indivisible module may exceed the bound.",
+        NS("model"),
+    ] = 8.0
     cpu_weight_cache_canonical_checkpoint_dir: A[
         Optional[str],
         "Host-local directory for the mutable canonical checkpoint used by "
@@ -3781,6 +3800,63 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+
+    def _handle_cpu_weight_cache(self) -> None:
+        """Validate the CPU weight-cache surface against the resolved config."""
+        cfg = resolving_view(self)
+        if (
+            cfg.cpu_weight_cache_canonical_checkpoint_dir is not None
+            and not cfg.enable_cpu_weight_cache
+        ):
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir requires "
+                "--enable-cpu-weight-cache"
+            )
+        if not cfg.enable_cpu_weight_cache:
+            return
+        if cfg.cpu_weight_cache_canonical_checkpoint_dir == "":
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir must not be empty"
+            )
+        if not is_cuda():
+            raise ValueError("--enable-cpu-weight-cache requires CUDA")
+        if cfg.cpu_weight_cache_max_compile_group_gb <= 0:
+            raise ValueError("--cpu-weight-cache-max-compile-group-gb must be positive")
+        if cfg.weight_cache_mode != "off":
+            raise ValueError(
+                "--enable-cpu-weight-cache cannot be combined with "
+                "--weight-cache-mode"
+            )
+        if cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0:
+            raise ValueError(
+                "--enable-cpu-weight-cache requires model weights to remain "
+                "resident on the GPU"
+            )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support pipeline parallelism"
+            )
+        if cfg.dcp_replicate_q_proj:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support --dcp-replicate-q-proj"
+            )
+        if cfg.enable_eplb:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support automatic EPLB"
+            )
+        if cfg.enable_lora or cfg.lora_paths:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support dynamic LoRA weights"
+            )
+        if cfg.elastic_ep_backend is not None or cfg.enable_elastic_expert_backup:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support elastic expert weights"
+            )
+        if cfg.speculative_algorithm is not None:
+            logger.info(
+                "CPU weight cache updates target-model weights only; "
+                "speculative draft-model weights remain unchanged."
+            )
 
     # ===== END TO BE REFACTORED ====
 

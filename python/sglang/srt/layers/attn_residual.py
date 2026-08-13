@@ -60,6 +60,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -70,9 +72,13 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        updated = updated.to(dtype)
+        if cw is None:
+            cw = cache[dtype] = updated
+        else:
+            cw.copy_(updated)
     return cw
 
 

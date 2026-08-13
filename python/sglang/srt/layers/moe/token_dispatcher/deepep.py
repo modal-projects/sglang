@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import logging
 import os
@@ -405,6 +406,15 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    def clone_for_weight_staging(self):
+        cloned = copy.copy(self)
+        cloned.quant_config = (
+            None if self.quant_config is None else self.quant_config.copy()
+        )
+        cloned.overlap_args = None
+        cloned.meta_overlap_args = None
+        return cloned
 
     def dispatch_a(
         self,

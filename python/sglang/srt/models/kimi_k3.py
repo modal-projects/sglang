@@ -7,7 +7,10 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import re
+from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -92,6 +95,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_loader.utils import DEFERRED_WEIGHT_COPY_SAFE_ATTR
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -117,8 +121,16 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+
+def _expert_mapping_candidates(name, mappings, mappings_by_expert):
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match is None:
+        return mappings
+    return mappings_by_expert.get(int(match.group(1)), mappings)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -174,10 +186,14 @@ def _k3_bf16_gemm(
 
 
 def _merge_weights_as_views(
-    mods: list, pad_rows_to: int = 1
+    mods: list,
+    pad_rows_to: int = 1,
+    merged: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, list[int]]:
-    """Cat module weights along dim 0; re-point each module's weight to a view
-    of the merged buffer so the original storage is freed (net extra memory ~0).
+    """Merge module weights or reuse an existing merged runtime buffer.
+
+    Each module weight becomes a view of the merged buffer so the original
+    storage is freed (net extra memory ~0).
 
     With pad_rows_to > 1 the merged buffer gets zero rows appended up to the
     next multiple, so every row of the fused GEMM output stays 16-byte aligned
@@ -185,6 +201,24 @@ def _merge_weights_as_views(
     ws = [m.weight.data for m in mods]
     sizes = [w.shape[0] for w in ws]
     pad = (-sum(sizes)) % pad_rows_to
+    if merged is not None and merged.shape == (
+        sum(sizes) + pad,
+        ws[0].shape[1],
+    ):
+        offset = 0
+        views_match = True
+        for weight, size in zip(ws, sizes):
+            expected = merged[offset : offset + size]
+            if (
+                weight.shape != expected.shape
+                or weight.stride() != expected.stride()
+                or weight.data_ptr() != expected.data_ptr()
+            ):
+                views_match = False
+                break
+            offset += size
+        if views_match:
+            return merged, sizes
     if pad:
         ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
     merged = torch.cat(ws, dim=0).contiguous()
@@ -598,9 +632,9 @@ class KimiK3MoE(nn.Module):
         [H, gu+E+latent] GEMM reads the input once and drops 2 GEMM launches
         plus their splitK-reduce tails per MoE layer.
 
-        Called once from load_weights (after all weights are loaded, before
-        cuda graph capture); only plain bf16/fp16 dense weights are merged —
-        quantized or mixed-dtype checkpoints keep the unfused path.
+        Called after weights are loaded; reloads reuse the existing buffer so
+        captured graphs keep valid addresses. Only plain bf16/fp16 dense weights
+        are merged; quantized or mixed-dtype checkpoints keep the unfused path.
         """
         if not self.use_latent_moe:
             return
@@ -623,7 +657,10 @@ class KimiK3MoE(nn.Module):
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
             return
-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
+        self._front_w, self._front_sizes = _merge_weights_as_views(
+            mods,
+            merged=self._front_w,
+        )
         self._front_is_ep_pair = len(mods) == 2
         # Invalidate the cached properties.
         for prop in (
@@ -1531,12 +1568,14 @@ class KimiK3DeltaAttention(nn.Module):
         and the width is padded to a multiple of 8 so every fused-output row
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
-        Called once from load_weights (after all weights are loaded, before
-        cuda graph capture)."""
+        Called after weights are loaded. Reloads update the existing buffer so
+        captured graphs keep valid addresses."""
         if not self.use_full_rank_gate:
             return
         self._bfa_w, sizes = _merge_weights_as_views(
-            [self.f_a_proj, self.b_proj], pad_rows_to=8
+            [self.f_a_proj, self.b_proj],
+            pad_rows_to=8,
+            merged=self._bfa_w,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes
 
@@ -1546,8 +1585,7 @@ class KimiK3DeltaAttention(nn.Module):
         weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
         attention layer for the KDA backend; when the shapes do not match
         the compiled kernel the stash stays unset and decode keeps the
-        unfused chain. Called once from load_weights (after all weights are
-        loaded, before cuda graph capture)."""
+        unfused chain. Reloads update existing derived tensors in place."""
         if _is_hip:
             # The fused KDA decode kernel is NVIDIA-only
             return
@@ -1582,7 +1620,7 @@ class KimiK3DeltaAttention(nn.Module):
             if bias is not None
             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
         )
-        layer._k3_fused_decode_args = (
+        updated_args = (
             wt[:, :seg].contiguous(),
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
@@ -1591,7 +1629,33 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        current_args = getattr(layer, "_k3_fused_decode_args", None)
+        if (
+            isinstance(current_args, tuple)
+            and len(current_args) == len(updated_args)
+            and all(
+                isinstance(current, torch.Tensor)
+                and current.shape == updated.shape
+                and current.dtype == updated.dtype
+                and current.device == updated.device
+                for current, updated in zip(current_args[:-1], updated_args[:-1])
+            )
+        ):
+            for current, updated in zip(current_args[:-1], updated_args[:-1]):
+                current.copy_(updated)
+            layer._k3_fused_decode_args = (*current_args[:-1], updated_args[-1])
+        else:
+            layer._k3_fused_decode_args = updated_args
         self._kda_fused_decode_ready = True
+
+    def get_additional_weight_tensors(self):
+        """Expose fused KDA decode weights that are not registered state."""
+
+        args = getattr(self.attn, "_k3_fused_decode_args", None)
+        if args is None:
+            return
+        for index, tensor in enumerate(args[:-1]):
+            yield f"k3_fused_decode_arg_{index}", tensor
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
@@ -1875,6 +1939,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
+
+    # Model post-load processing derives several runtime weights across sibling
+    # modules. Staging must therefore clone and load a complete layer.
+    weight_staging_indivisible = True
 
     def __init__(
         self,
@@ -2735,9 +2803,29 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         else:
             expert_params_mapping = []
+        expert_params_mapping_by_expert = defaultdict(list)
+        for mapping in expert_params_mapping:
+            expert_params_mapping_by_expert[mapping[2]].append(mapping)
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        batched_weight_loads = defaultdict(list)
+
+        def load_weight(weight_loader, *args, **kwargs):
+            loaded_weight = args[1]
+            owner = getattr(weight_loader, "__self__", None)
+            batch_method = getattr(owner, "batched_weight_loader", None)
+            supports_batching = getattr(owner, "supports_batched_weight_loading", None)
+            if (
+                getattr(loaded_weight, DEFERRED_WEIGHT_COPY_SAFE_ATTR, False)
+                and callable(batch_method)
+                and callable(supports_batching)
+                and supports_batching()
+                and weight_loader == getattr(owner, "weight_loader", None)
+            ):
+                batched_weight_loads[owner].append((args, kwargs))
+            else:
+                weight_loader(*args, **kwargs)
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
@@ -2809,12 +2897,20 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                load_weight(weight_loader, param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (param_name, weight_name, expert_id, shard_id) in enumerate(
-                    expert_params_mapping
-                ):
+                expert_mapping_candidates = _expert_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
+                )
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in expert_mapping_candidates:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
@@ -2825,7 +2921,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                         break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(
+                    load_weight(
+                        weight_loader,
                         param,
                         loaded_weight,
                         name,
@@ -2849,19 +2946,48 @@ class KimiK3LinearForCausalLM(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, loaded_weight, **kwargs)
+                    load_weight(weight_loader, param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
-        self.post_load_weights()
+        if batched_weight_loads:
+            with ThreadPoolExecutor() as executor:
+                for owner, calls in batched_weight_loads.items():
+                    owner.batched_weight_loader(calls, executor=executor)
+        self.post_load_weights(weight_names=loaded_params)
 
-    def post_load_weights(self):
+    def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get w_kc/w_vc and
         # the fused buffers too. Same pattern as deepseek_v4.
+        if weight_names is None:
+            layer_ids = range(self.model.start_layer, self.model.end_layer)
+            process_output = True
+        else:
+            weight_names = set(weight_names)
+            layer_ids = sorted(
+                {
+                    layer_id
+                    for name in weight_names
+                    if (layer_id := get_layer_id(name)) is not None
+                }
+            )
+            # The output cache depends on both source modules. Bounded staging
+            # groups may contain only one of them; refresh the cache after the
+            # complete rank image is committed instead.
+            process_output = all(
+                any(name.startswith(prefix) for name in weight_names)
+                for prefix in (
+                    "model.output_attn_res_proj.",
+                    "model.output_attn_res_norm.",
+                )
+            )
+
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
-        for layer_id in self.config.full_attention_layer_ids:
-            if layer_id >= len(self.model.layers):
+        for layer_id in layer_ids:
+            if layer_id not in self.config.full_attention_layer_ids or layer_id >= len(
+                self.model.layers
+            ):
                 continue  # truncated config (e.g. num_hidden_layers override)
             layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
@@ -2870,33 +2996,49 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            for name, value in (
+                ("w_kc", w_kc.transpose(1, 2).contiguous().transpose(1, 2)),
+                ("w_vc", w_vc.contiguous().transpose(1, 2)),
+            ):
+                current = getattr(self_attn, name, None)
+                if (
+                    isinstance(current, torch.Tensor)
+                    and current.shape == value.shape
+                    and current.dtype == value.dtype
+                    and current.device == value.device
+                ):
+                    current.copy_(value)
+                else:
+                    setattr(self_attn, name, value)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
-        # Post-load: precompute the attn-res combined score weights BEFORE
-        # cuda graph capture (a lazy first call inside get_cw would bake the
-        # multiply into every captured graph replay otherwise). Warm both
-        # dtypes: the fast kernel consumes bf16, the triton fallback fp32.
+        # Precompute before initial graph capture, then refresh the same storage
+        # after reloads. The fast kernel consumes bf16; the fallback uses fp32.
         def _warm_cw(proj, norm):
-            get_cw(proj, norm, dtype=torch.bfloat16)
-            get_cw(proj, norm)
+            get_cw(proj, norm, dtype=torch.bfloat16, refresh=True)
+            get_cw(proj, norm, refresh=True)
 
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
                 continue
             if layer.use_attn_residuals:
                 _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
-        if hasattr(self.model, "output_attn_res_proj"):
+        if process_output and hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights. Module
         # weights are re-pointed to views of the merged buffers (net extra
         # memory ~0), so this must run after all weights are loaded and
         # before cuda graph capture.
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
@@ -2912,10 +3054,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
 
-        for layer in self.model.layers:
+        for layer_id in layer_ids:
+            if layer_id >= len(self.model.layers):
+                continue
+            layer = self.model.layers[layer_id]
             if isinstance(layer, PPMissingLayer) or not isinstance(
                 layer.self_attn, KimiK3DeltaAttention
             ):
+                continue
+            if layer.self_attn.dt_bias.device.type != "cuda":
                 continue
             from sglang.kernels.ops.attention.fla.kda import (
                 precompile_k3_recompute_w_u_kernel,
@@ -2928,6 +3075,21 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+    def process_weights_after_weight_commit(self) -> None:
+        """Refresh non-parameter caches after a rank-image commit."""
+
+        def refresh(proj, norm):
+            get_cw(proj, norm, dtype=torch.bfloat16, refresh=True)
+            get_cw(proj, norm, refresh=True)
+
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer) or not layer.use_attn_residuals:
+                continue
+            refresh(layer.self_attention_res_proj, layer.self_attention_res_norm)
+            refresh(layer.mlp_res_proj, layer.mlp_res_norm)
+        if hasattr(self.model, "output_attn_res_proj"):
+            refresh(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

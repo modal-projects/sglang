@@ -249,6 +249,10 @@ class FINISH_LENGTH(BaseFinishReason):
         }
 
 
+# Non-standard status used by nginx for a client-closed request.
+CLIENT_CLOSED_REQUEST = 499
+
+
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__()
@@ -263,6 +267,24 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+    @classmethod
+    def from_json(cls, reason: dict) -> FINISH_ABORT:
+        return cls(
+            message=reason.get("message"),
+            status_code=reason.get("status_code"),
+            err_type=reason.get("err_type"),
+        )
+
+
+def client_cancel_finish_reason(
+    message: str = "The client cancelled or disconnected the request.",
+) -> dict:
+    return FINISH_ABORT(
+        message=message,
+        status_code=CLIENT_CLOSED_REQUEST,
+        err_type="client_cancel",
+    ).to_json()
 
 
 class Modality(Enum):
@@ -1734,7 +1756,9 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_finish_with_abort(self, error_msg: str):
+    def set_finish_with_abort(
+        self, error_msg: str, finished_reason: Optional[dict] = None
+    ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
@@ -1744,8 +1768,10 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        self.to_finish = (
+            FINISH_ABORT.from_json(finished_reason)
+            if finished_reason is not None
+            else FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
         )
 
     def update_reasoning_tokens(self, token_id, think_end_ids):

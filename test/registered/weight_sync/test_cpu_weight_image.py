@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.weight_sync.cpu_weight_image import (
     CPUWeightImage,
+    CPUWeightSegment,
     build_cpu_weight_image_plan,
     iter_weight_tensors,
 )
@@ -72,6 +73,27 @@ def test_additional_weight_contract_rejects_invalid_entries():
 
     with pytest.raises(TypeError, match="must yield"):
         list(iter_weight_tensors(model))
+
+
+def test_empty_storage_has_an_empty_shadow_outside_the_image():
+    tensor = torch.empty(0)
+    storage = tensor.untyped_storage()
+    key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
+    image = CPUWeightImage.__new__(CPUWeightImage)
+    image._segments_by_device_storage = {
+        key: CPUWeightSegment(
+            name="empty",
+            image_offset=0,
+            nbytes=0,
+            device_bytes=torch.empty(0, dtype=torch.uint8),
+        )
+    }
+    image._image_buffer = memoryview(bytearray())
+
+    shadow = image.storage_image_bytes(tensor)
+
+    assert shadow.dtype == torch.uint8
+    assert shadow.numel() == 0
 
 
 def test_staging_state_fails_closed_until_a_complete_image_is_ready():

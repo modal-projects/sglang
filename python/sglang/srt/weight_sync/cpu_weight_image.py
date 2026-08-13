@@ -193,6 +193,11 @@ class CPUWeightImage:
         segment = self._segments_by_device_storage.get(key)
         if segment is None:
             raise KeyError("tensor storage is not part of the CPU weight image")
+        if segment.nbytes == 0:
+            # Empty parameters carry shape and stride metadata but have no bytes
+            # to place in the rank-ready image. ``torch.frombuffer`` rejects an
+            # empty buffer, so give the shadow tensor an ordinary empty storage.
+            return torch.empty(0, dtype=torch.uint8)
         begin = segment.image_offset
         end = begin + segment.nbytes
         return torch.frombuffer(

@@ -45,6 +45,7 @@ def _stage_request(
     *,
     destination,
     target_version,
+    base_version=0,
     base_checkpoint_dir=None,
     checkpoint_source_dir=None,
     local_checkpoint_dir=None,
@@ -52,6 +53,7 @@ def _stage_request(
     return SimpleNamespace(
         destination=destination,
         target_version=target_version,
+        base_version=base_version,
         base_checkpoint_dir=base_checkpoint_dir,
         checkpoint_source_dir=checkpoint_source_dir,
         local_checkpoint_dir=local_checkpoint_dir,
@@ -190,6 +192,7 @@ def test_disk_stage_defaults_to_boot_checkpoint():
         base_checkpoint_dir="/base",
         checkpoint_source_dir="/updates",
         target_version=1,
+        base_version=0,
         checkpoint_source_refresh_hook=None,
     )
 
@@ -238,6 +241,7 @@ def test_cpu_stage_zero_initializes_rank_cache():
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         checkpoint_dir="/base",
         seed_from_active_weights=True,
+        base_version=0,
         host_group=manager.host_cpu_group,
         max_compile_group_bytes=8 << 30,
         canonical_checkpoint_dir=None,
@@ -261,10 +265,68 @@ def test_cpu_stage_zero_compiles_a_non_boot_checkpoint():
     manager.tp_worker.initialize_cpu_weight_cache.assert_called_once_with(
         checkpoint_dir="/other-base",
         seed_from_active_weights=False,
+        base_version=0,
         host_group=manager.host_cpu_group,
         max_compile_group_bytes=8 << 30,
         canonical_checkpoint_dir=None,
     )
+
+
+def test_cpu_stage_replaces_an_initialized_base_checkpoint():
+    manager = _manager(cpu_cache=True)
+    manager._cpu_weight_cache_checkpoint_dir = "/base"
+    manager._cpu_weight_cache_base_version = 0
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.return_value = (
+        True,
+        "staged",
+        {"wall_s": 2.0},
+    )
+
+    result = manager._stage_weight_update_sync(
+        _stage_request(
+            destination="cpu",
+            target_version=119,
+            base_version=119,
+            base_checkpoint_dir="/saved/weight_v000119",
+        )
+    )
+
+    assert result.success
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.assert_called_once_with(
+        checkpoint_dir="/saved/weight_v000119",
+        target_version=119,
+        host_group=manager.host_cpu_group,
+    )
+    assert manager._cpu_weight_cache_checkpoint_dir == "/saved/weight_v000119"
+    assert manager._cpu_weight_cache_base_version == 119
+
+
+def test_failed_base_replacement_invalidates_stage_without_discarding_cache():
+    manager = _manager(cpu_cache=True)
+    manager._cpu_weight_cache_checkpoint_dir = "/base"
+    manager._cpu_weight_cache_base_version = 0
+    manager._cpu_weight_cache_initialization_stats = {}
+    manager.tp_worker.stage_cpu_weight_update_from_checkpoint.return_value = (
+        False,
+        "broken",
+        None,
+    )
+
+    result = manager._stage_weight_update_sync(
+        _stage_request(
+            destination="cpu",
+            target_version=119,
+            base_version=119,
+            base_checkpoint_dir="/saved/weight_v000119",
+        )
+    )
+
+    assert not result.success
+    assert manager._cpu_weight_cache_checkpoint_dir == "/base"
+    assert manager._cpu_weight_cache_base_version == 0
+    manager.tp_worker.invalidate_staged_cpu_weight_update.assert_called_once()
+    manager.tp_worker.discard_cpu_weight_cache.assert_not_called()
 
 
 def test_cpu_delta_stage_requires_initialized_base():
@@ -287,6 +349,7 @@ def test_cpu_delta_stage_requires_initialized_base():
 def test_cpu_delta_stage_refreshes_then_compiles():
     manager = _manager(cpu_cache=True)
     manager._cpu_weight_cache_checkpoint_dir = "/base"
+    manager._cpu_weight_cache_base_version = 0
     manager._cpu_weight_cache_initialization_stats = {}
     manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.return_value = (
         True,
@@ -343,6 +406,7 @@ def test_distributed_cpu_initialization_failure_discards_every_rank_and_retries(
 def test_distributed_cpu_delta_failure_invalidates_every_rank():
     manager = _manager(cpu_cache=True)
     manager._cpu_weight_cache_checkpoint_dir = "/base"
+    manager._cpu_weight_cache_base_version = 0
     manager._cpu_weight_cache_initialization_stats = {}
     manager.tp_worker.stage_cpu_weight_update_from_delta_lineage.return_value = (
         True,

@@ -293,6 +293,64 @@ class CPUWeightCache:
                 target_version=target_version,
             )
 
+    def stage_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        target_version: int,
+    ) -> dict[str, Any]:
+        """Replace the canonical base and stage its rank-ready image."""
+
+        with self._exclusive("stage checkpoint"):
+            started = time.perf_counter()
+            previous_base_checkpoint_dir = self._base_checkpoint_dir
+            previous_base_version = self._base_version
+            self._base_checkpoint_dir = os.path.realpath(checkpoint_dir)
+            self._base_version = target_version
+            try:
+                checkpoint = self._seed_canonical_checkpoint(
+                    reason=f"staging complete checkpoint v{target_version}"
+                )
+                try:
+                    compile_stats = self._run_on_host_ranks(
+                        f"CPU weight image compilation for version {target_version}",
+                        lambda: self.compiler.compile(
+                            checkpoint,
+                            target_version=target_version,
+                        ),
+                    )
+                finally:
+                    cache_release = self._run_on_host_ranks(
+                        "canonical checkpoint page-cache release",
+                        checkpoint.release_cached_pages,
+                    )
+            except Exception:
+                self.image.invalidate(
+                    f"checkpoint staging of version {target_version} failed"
+                )
+                self._discard_canonical_checkpoint(
+                    f"checkpoint staging of version {target_version} failed"
+                )
+                self._base_checkpoint_dir = previous_base_checkpoint_dir
+                self._base_version = previous_base_version
+                raise
+
+            stats = {
+                "operation": "stage_cpu_weight_checkpoint",
+                "target_version": target_version,
+                "canonical_materialization": self._canonical_materialization_stats,
+                "compile": compile_stats,
+                "canonical_cache_release": cache_release,
+                "canonical_checkpoint": checkpoint.stats(),
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
+            logger.info(
+                "Staged CPU weight checkpoint v%d: wall_time=%.3fs",
+                target_version,
+                stats["wall_s"],
+            )
+            return stats
+
     def _stage_delta_lineage(
         self,
         *,

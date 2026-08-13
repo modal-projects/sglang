@@ -286,6 +286,115 @@ def test_boot_checkpoint_uses_captured_active_image(tmp_path, monkeypatch):
         cache.close()
 
 
+@pytest.mark.parametrize("canonical_on_disk", [False, True])
+def test_cache_stages_a_complete_checkpoint_as_a_new_base(
+    tmp_path, monkeypatch, canonical_on_disk
+):
+    base = torch.arange(8, dtype=torch.uint8)
+    saved = base.roll(1)
+    target = saved.roll(1)
+    saved_dir = tmp_path / "saved"
+    updates = tmp_path / "updates"
+    saved_dir.mkdir()
+    save_file({"a": saved}, saved_dir / "model.safetensors")
+    _write_delta(updates, saved, target, version=120)
+    cache, _, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        canonical_checkpoint_dir=(
+            tmp_path / "canonical" if canonical_on_disk else None
+        ),
+    )
+    try:
+        stats = cache.stage_checkpoint(saved_dir, target_version=119)
+
+        assert stats["operation"] == "stage_cpu_weight_checkpoint"
+        assert cache.canonical_version == 119
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], saved)
+        cache.commit(119)
+        assert cache.image.committed == [119]
+
+        delta_stats = cache.stage_delta_lineage(
+            checkpoint_source_dir=updates,
+            target_version=120,
+        )
+        assert delta_stats["delta_setup"]["delta_versions"] == [120]
+        assert cache.canonical_version == 120
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], target)
+        cache.commit(120)
+        assert cache.image.committed == [119, 120]
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("canonical_on_disk", [False, True])
+def test_failed_checkpoint_stage_restores_the_previous_base(
+    tmp_path, monkeypatch, canonical_on_disk
+):
+    base = torch.arange(8, dtype=torch.uint8)
+    target = base.roll(1)
+    saved_dir = tmp_path / "saved"
+    updates = tmp_path / "updates"
+    saved_dir.mkdir()
+    save_file({"a": target}, saved_dir / "model.safetensors")
+    _write_delta(updates, base, target)
+    cache, _, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        canonical_checkpoint_dir=(
+            tmp_path / "canonical" if canonical_on_disk else None
+        ),
+    )
+    try:
+        _FakeCompiler.fail_versions = {5}
+        with pytest.raises(RuntimeError, match="injected compilation failure"):
+            cache.stage_checkpoint(saved_dir, target_version=5)
+
+        _FakeCompiler.fail_versions = set()
+        stats = cache.stage_delta_lineage(
+            checkpoint_source_dir=updates,
+            target_version=1,
+        )
+        assert stats["canonical_reset"] is True
+        assert cache.canonical_version == 1
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], target)
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("canonical_on_disk", [False, True])
+def test_unreadable_checkpoint_stage_restores_the_previous_base(
+    tmp_path, monkeypatch, canonical_on_disk
+):
+    base = torch.arange(8, dtype=torch.uint8)
+    target = base.roll(1)
+    updates = tmp_path / "updates"
+    _write_delta(updates, base, target)
+    cache, _, _ = _create_cache(
+        tmp_path,
+        monkeypatch,
+        base,
+        canonical_checkpoint_dir=(
+            tmp_path / "canonical" if canonical_on_disk else None
+        ),
+    )
+    try:
+        with pytest.raises(FileNotFoundError):
+            cache.stage_checkpoint(tmp_path / "missing", target_version=5)
+
+        stats = cache.stage_delta_lineage(
+            checkpoint_source_dir=updates,
+            target_version=1,
+        )
+        assert stats["canonical_reset"] is True
+        assert cache.canonical_version == 1
+        torch.testing.assert_close(cache.compiler.compiled[-1][1], target)
+    finally:
+        cache.close()
+
+
 def test_disk_canonical_checkpoint_materializes_and_compiles(tmp_path, monkeypatch):
     base = torch.arange(8, dtype=torch.uint8)
     target = base.roll(1)

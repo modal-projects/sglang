@@ -42,6 +42,7 @@ class _FakeCache:
         self.canonical_checkpoint_dir = canonical_checkpoint_dir
         self.image = _FakeImage()
         self.staged = []
+        self.staged_checkpoints = []
         self.committed = []
         self.invalidated = []
         self.closed = []
@@ -62,6 +63,10 @@ class _FakeCache:
             "compile": {"bytes": 32, "groups": 2},
             "wall_s": 3.0,
         }
+
+    def stage_checkpoint(self, checkpoint_dir, *, target_version):
+        self.staged_checkpoints.append((checkpoint_dir, target_version))
+        return {"wall_s": 4.0}
 
     def commit(self, target_version):
         self.committed.append(target_version)
@@ -137,6 +142,15 @@ def test_cpu_weight_cache_worker_lifecycle():
         assert stage is not None
         assert cache.staged == [("/updates", 1)]
         assert updater.validate_staged_cpu_weight_update(1)[0]
+
+        success, _, stage = updater.stage_cpu_weight_update_from_checkpoint(
+            checkpoint_dir="/saved",
+            target_version=119,
+            host_group=host_group,
+        )
+        assert success
+        assert stage is not None
+        assert cache.staged_checkpoints == [("/saved", 119)]
 
         success, _, commit = updater.update_weights_from_cpu(1)
         assert success

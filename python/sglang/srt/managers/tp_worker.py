@@ -169,6 +169,19 @@ class BaseTpWorker(ABC):
             )
         )
 
+    def stage_cpu_weight_update_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+    ):
+        return self.model_runner.weight_updater.stage_cpu_weight_update_from_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            target_version=target_version,
+            host_group=host_group,
+        )
+
     def validate_staged_cpu_weight_update(self, target_version: int):
         return self.model_runner.weight_updater.validate_staged_cpu_weight_update(
             target_version

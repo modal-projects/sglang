@@ -209,6 +209,26 @@ class SchedulerWeightUpdaterManager:
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
+    def _stage_cpu_weight_checkpoint(
+        self, checkpoint_dir: str, target_version: int
+    ) -> Dict[str, Any]:
+        started = time.perf_counter()
+        success, message, stats = (
+            self.tp_worker.stage_cpu_weight_update_from_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                target_version=target_version,
+                host_group=self.host_cpu_group,
+            )
+        )
+        if not success or stats is None:
+            raise RuntimeError(message)
+        return {
+            "operation": "stage_cpu_weight_checkpoint",
+            "checkpoint_dir": checkpoint_dir,
+            "checkpoint": stats,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+
     def _is_boot_checkpoint(self, checkpoint_dir: str) -> bool:
         return os.path.realpath(checkpoint_dir) == os.path.realpath(
             self.boot_model_path
@@ -378,14 +398,32 @@ class SchedulerWeightUpdaterManager:
             "target_version": recv_req.target_version,
             "destination": recv_req.destination,
         }
+        cpu_cache_was_initialized = (
+            self._cpu_weight_cache_initialization_stats is not None
+        )
         try:
             checkpoint_dir = recv_req.base_checkpoint_dir or self.boot_model_path
             if recv_req.destination == "cpu":
                 if recv_req.target_version == recv_req.base_version:
-                    local_stats["stage"] = self._initialize_cpu_weight_cache(
-                        checkpoint_dir,
-                        recv_req.base_version,
-                    )
+                    if self._cpu_weight_cache_initialization_stats is None:
+                        local_stats["stage"] = self._initialize_cpu_weight_cache(
+                            checkpoint_dir,
+                            recv_req.base_version,
+                        )
+                    elif (
+                        self._cpu_weight_cache_checkpoint_dir
+                        == os.path.realpath(checkpoint_dir)
+                        and self._cpu_weight_cache_base_version == recv_req.base_version
+                    ):
+                        local_stats["stage"] = self._initialize_cpu_weight_cache(
+                            checkpoint_dir,
+                            recv_req.base_version,
+                        )
+                    else:
+                        local_stats["stage"] = self._stage_cpu_weight_checkpoint(
+                            checkpoint_dir,
+                            recv_req.target_version,
+                        )
                 else:
                     if self._cpu_weight_cache_initialization_error is not None:
                         raise RuntimeError(
@@ -465,15 +503,27 @@ class SchedulerWeightUpdaterManager:
                 dict.fromkeys(result[1] for result in results if not result[0])
             )
             message = "\n".join(messages)
+        if (
+            recv_req.destination == "cpu"
+            and recv_req.target_version == recv_req.base_version
+            and success
+        ):
+            self._cpu_weight_cache_checkpoint_dir = os.path.realpath(checkpoint_dir)
+            self._cpu_weight_cache_base_version = recv_req.base_version
         if recv_req.destination == "cpu" and not success:
             if recv_req.target_version == recv_req.base_version:
-                self.tp_worker.discard_cpu_weight_cache(
-                    "distributed CPU weight cache initialization failed"
-                )
-                self._cpu_weight_cache_checkpoint_dir = None
-                self._cpu_weight_cache_base_version = None
-                self._cpu_weight_cache_initialization_stats = None
-                self._cpu_weight_cache_initialization_error = message
+                if not cpu_cache_was_initialized:
+                    self.tp_worker.discard_cpu_weight_cache(
+                        "distributed CPU weight cache initialization failed"
+                    )
+                    self._cpu_weight_cache_checkpoint_dir = None
+                    self._cpu_weight_cache_base_version = None
+                    self._cpu_weight_cache_initialization_stats = None
+                    self._cpu_weight_cache_initialization_error = message
+                else:
+                    self.tp_worker.invalidate_staged_cpu_weight_update(
+                        "distributed CPU checkpoint staging failed"
+                    )
             else:
                 self.tp_worker.invalidate_staged_cpu_weight_update(
                     "distributed CPU weight update staging failed"

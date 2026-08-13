@@ -406,6 +406,42 @@ class WeightUpdater:
                 None,
             )
 
+    @torch.no_grad()
+    def stage_cpu_weight_update_from_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        target_version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Compile a complete checkpoint without changing live weights."""
+
+        try:
+            runner = self.get_model_runner()
+            cache = runner.cpu_weight_cache
+            if cache is None:
+                raise RuntimeError("CPU weight cache is not initialized")
+            if cache.host_group is not host_group:
+                raise ValueError(
+                    "host-local process group cannot change after cache initialization"
+                )
+            with torch.cuda.device(self.gpu_id):
+                stats = cache.stage_checkpoint(
+                    checkpoint_dir,
+                    target_version=target_version,
+                )
+            return True, "Staged checkpoint in CPU memory.", stats
+        except Exception as exc:
+            logger.exception(
+                "Failed to stage CPU checkpoint for version %s",
+                target_version,
+            )
+            return (
+                False,
+                f"Failed to stage CPU checkpoint: {type(exc).__name__}: {exc}",
+                None,
+            )
+
     def validate_staged_cpu_weight_update(
         self,
         target_version: int,

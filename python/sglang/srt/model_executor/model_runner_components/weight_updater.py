@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import gc
 import logging
-from dataclasses import dataclass, field
+import os
+import time
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -32,13 +33,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_derived_weight_cache_error() -> Optional[str]:
+def _unsupported_derived_weight_cache_error(
+    model_runner: ModelRunner | None = None,
+) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    These caches are built from loaded weights outside the ordinary post-load
+    lifecycle. In-place writes are invisible to them and would silently keep
+    serving stale values. Each check is startup-determined and rank-uniform,
+    so an update never proceeds on only a subset of workers.
     """
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
@@ -47,6 +50,16 @@ def _unsupported_derived_weight_cache_error() -> Optional[str]:
             "Online weight updates are not supported while the HPC-Ops "
             "bf16xfp32 GEMM optimization is enabled: the cached weight "
             "split would keep serving the old weights."
+        )
+    if model_runner is not None and getattr(
+        model_runner.server_args,
+        "dcp_replicate_q_proj",
+        False,
+    ):
+        return (
+            "Online weight updates are not supported with "
+            "--dcp-replicate-q-proj: its full-head MLA weights are derived "
+            "once before CUDA graph capture and would become stale."
         )
     return None
 
@@ -123,12 +136,10 @@ class WeightUpdater:
             logger.error(message)
             return False, message
 
-    def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
-        """Reject weight mutations while the CUDA IPC weight cache is active:
-        param.data is the daemon's master copy shared with every co-attached
-        engine, so an in-place update would silently corrupt them all.
-        """
-        mode = self.get_model_runner().server_args.weight_cache_mode
+    def _assert_in_place_update_allowed(self: WeightUpdater, op: str) -> None:
+        """Reject mutations that would invalidate an active weight cache."""
+        runner = self.get_model_runner()
+        mode = runner.server_args.weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} is not supported while the weight cache is "
@@ -136,6 +147,12 @@ class WeightUpdater:
                 f"with the daemon via CUDA IPC, so mutating them in place would "
                 f"corrupt the daemon's master copy and every co-attached engine. "
                 f"Restart with --weight-cache-mode off to use this operation."
+            )
+        if runner.cpu_weight_cache is not None:
+            raise RuntimeError(
+                f"{op} is not supported while the CPU weight cache is active: "
+                "an out-of-band update would make its canonical checkpoint and "
+                "rank-ready image stale. Discard the CPU weight cache first."
             )
 
     def update_weights_from_disk(
@@ -146,8 +163,8 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error()
+        self._assert_in_place_update_allowed("update_weights_from_disk")
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
@@ -157,46 +174,83 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        model = self.get_model()
+        runner = self.get_model_runner()
+        original_model_path = self.model_config.model_path
+        original_load_config = runner.load_config
 
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
+        if (
+            weight_name_filter is not None
+            and self.model_config.quantization is not None
+        ):
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "post-load processing requires every checkpoint-facing weight."
+            )
+
+        self.model_config.model_path = model_path
+        load_config = replace(original_load_config, load_format=load_format)
+
+        try:
+            loader = get_model_loader(load_config, self.model_config)
+        except Exception as e:
+            self.model_config.model_path = original_model_path
+            return False, f"Failed to get model loader: {e}."
         if not isinstance(loader, DefaultModelLoader):
+            self.model_config.model_path = original_model_path
             message = f"Failed to get model loader: {loader}."
             return False, message
 
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.get_model())
-            )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
+        def load_weights(
+            active_loader: DefaultModelLoader,
+            *,
+            weight_filter: Optional[Callable[[str], bool]],
+        ) -> None:
+            active_loader.restore_weights_before_loading(model, target_device)
+            weights = active_loader._get_all_weights(self.model_config, model)
+            if weight_filter is not None:
+                weights = (
+                    (name, weight) for name, weight in weights if weight_filter(name)
                 )
+            active_loader.load_weights_and_postprocess(model, weights, target_device)
 
-            return iter
-
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
+        def rollback() -> None:
+            self.model_config.model_path = original_model_path
+            original_loader = get_model_loader(
+                original_load_config,
+                self.model_config,
+            )
+            if not isinstance(original_loader, DefaultModelLoader):
+                raise TypeError(
+                    "original model loader does not support in-place rollback: "
+                    f"{original_loader}"
+                )
+            load_weights(original_loader, weight_filter=None)
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                load_weights(loader, weight_filter=weight_name_filter)
             except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.get_model(), iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
+                message = f"Failed to update weights: {e}."
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                if os.path.realpath(original_model_path) == os.path.realpath(
+                    model_path
+                ):
+                    raise RuntimeError(
+                        "Weight reload failed after mutating the active checkpoint "
+                        "path; terminating the engine because the previous weights "
+                        f"are no longer available for rollback. Reload error: {e}."
+                    ) from e
+                try:
+                    rollback()
+                except Exception as rollback_error:
+                    logger.exception("Failed to roll back model weights")
+                    raise RuntimeError(
+                        "Weight reload and rollback both failed; terminating the "
+                        "engine to avoid serving a partially updated model. "
+                        f"Reload error: {e}. Rollback error: {rollback_error}."
+                    ) from rollback_error
+                message += " Rolled back to the original weights."
                 return False, message
 
         self.update_model_fields(
@@ -219,6 +273,200 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    @torch.no_grad()
+    def initialize_cpu_weight_cache(
+        self,
+        *,
+        checkpoint_dir: str,
+        seed_from_active_weights: bool,
+        base_version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+        max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
+    ) -> dict[str, Any]:
+        """Construct and populate the target model's CPU weight cache."""
+
+        runner = self.get_model_runner()
+        if self.device != "cuda":
+            raise RuntimeError("CPU weight caching requires a CUDA model runner")
+        if runner.is_draft_worker:
+            raise RuntimeError("CPU weight caching is only supported for target models")
+        if max_compile_group_bytes <= 0:
+            raise ValueError("max_compile_group_bytes must be positive")
+        if runner.cpu_weight_cache is not None:
+            raise RuntimeError("CPU weight cache is already initialized")
+        self._assert_in_place_update_allowed("initialize_cpu_weight_cache")
+        error = _unsupported_derived_weight_cache_error(runner)
+        if error is not None:
+            raise RuntimeError(error)
+
+        from sglang.srt.weight_sync.cpu_weight_cache import CPUWeightCache
+
+        distributed = torch.distributed.is_initialized()
+        host_world_size = (
+            torch.distributed.get_world_size(group=host_group) if distributed else 1
+        )
+        host_rank = torch.distributed.get_rank(group=host_group) if distributed else 0
+        if host_world_size > 1 and host_group is None:
+            raise RuntimeError("CPU weight caching requires a host-local process group")
+
+        started = time.perf_counter()
+        cache = None
+        construction_error = None
+        with torch.cuda.device(self.gpu_id):
+            try:
+                cache = CPUWeightCache(
+                    self.get_model(),
+                    max_compile_group_bytes=max_compile_group_bytes,
+                    host_group=host_group,
+                    canonical_checkpoint_dir=canonical_checkpoint_dir,
+                )
+            except Exception as exc:
+                construction_error = f"rank {host_rank}: {type(exc).__name__}: {exc}"
+
+            if host_world_size > 1:
+                construction_errors: list[str | None] = [None] * host_world_size
+                torch.distributed.all_gather_object(
+                    construction_errors,
+                    construction_error,
+                    group=host_group,
+                )
+            else:
+                construction_errors = [construction_error]
+            errors = [error for error in construction_errors if error is not None]
+            if errors:
+                if cache is not None:
+                    cache.close("distributed CPU weight cache construction failed")
+                raise RuntimeError(
+                    "CPU weight cache construction failed: " + "; ".join(errors)
+                )
+            if cache is None:
+                raise RuntimeError(
+                    "CPU weight cache construction completed without a cache"
+                )
+
+            construction_wall_s = time.perf_counter() - started
+            try:
+                stats = cache.initialize_from_checkpoint(
+                    checkpoint_dir,
+                    seed_from_active_weights=seed_from_active_weights,
+                    base_version=base_version,
+                )
+            except Exception:
+                cache.close("CPU weight cache initialization failed")
+                raise
+
+        runner.cpu_weight_cache = cache
+        stats["cache_population_wall_s"] = stats["wall_s"]
+        stats["cache_construction_wall_s"] = round(construction_wall_s, 6)
+        stats["wall_s"] = round(time.perf_counter() - started, 6)
+        return stats
+
+    @torch.no_grad()
+    def stage_cpu_weight_update_from_delta_lineage(
+        self,
+        *,
+        checkpoint_source_dir: str,
+        target_version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Compile a complete target image without changing live weights."""
+
+        try:
+            runner = self.get_model_runner()
+            cache = runner.cpu_weight_cache
+            if cache is None:
+                raise RuntimeError("CPU weight cache is not initialized")
+            if cache.host_group is not host_group:
+                raise ValueError(
+                    "host-local process group cannot change after cache initialization"
+                )
+            with torch.cuda.device(self.gpu_id):
+                stats = cache.stage_delta_lineage(
+                    checkpoint_source_dir=checkpoint_source_dir,
+                    target_version=target_version,
+                )
+            logger.info(
+                "Staged CPU weights for version %d: bytes=%d groups=%d "
+                "wall_time=%.3fs",
+                target_version,
+                stats["compile"]["bytes"],
+                stats["compile"]["groups"],
+                stats["wall_s"],
+            )
+            return True, "Staged weights in CPU memory.", stats
+        except Exception as exc:
+            logger.exception(
+                "Failed to stage CPU weights for version %s",
+                target_version,
+            )
+            return (
+                False,
+                f"Failed to stage CPU weights: {type(exc).__name__}: {exc}",
+                None,
+            )
+
+    def validate_staged_cpu_weight_update(
+        self,
+        target_version: int,
+    ) -> tuple[bool, str]:
+        cache = self.get_model_runner().cpu_weight_cache
+        if cache is None:
+            return False, "CPU weight cache is not initialized."
+        try:
+            cache.image.validate_commit(target_version)
+            return True, "CPU weights are ready."
+        except Exception as exc:
+            return (
+                False,
+                f"CPU weights are not ready: {type(exc).__name__}: {exc}",
+            )
+
+    @torch.no_grad()
+    def update_weights_from_cpu(
+        self,
+        target_version: int,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Copy a prepared rank image into the existing CUDA storages."""
+
+        cache = self.get_model_runner().cpu_weight_cache
+        if cache is None:
+            return False, "CPU weight cache is not initialized.", None
+        try:
+            with torch.cuda.device(self.gpu_id):
+                torch.cuda.synchronize(self.gpu_id)
+                stats = cache.commit(target_version)
+            logger.info(
+                "Updated weights from CPU for version %d: bytes=%d "
+                "wall_time=%.3fs bandwidth=%.3fGB/s",
+                target_version,
+                stats["bytes"],
+                stats["wall_s"],
+                stats["gbps"],
+            )
+            return True, "Updated weights from CPU memory.", stats
+        except Exception:
+            # A failed commit may have overwritten only part of the live model;
+            # recovery requires restarting or fully reloading the worker.
+            logger.critical(
+                "CPU weight update failed for version %s",
+                target_version,
+                exc_info=True,
+            )
+            raise
+
+    def invalidate_staged_cpu_weight_update(self, reason: str) -> None:
+        cache = self.get_model_runner().cpu_weight_cache
+        if cache is not None:
+            cache.invalidate_stage(reason)
+
+    def discard_cpu_weight_cache(self, reason: str) -> None:
+        runner = self.get_model_runner()
+        cache = runner.cpu_weight_cache
+        runner.cpu_weight_cache = None
+        if cache is not None:
+            cache.close(reason)
+
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -236,8 +484,8 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error()
+        self._assert_in_place_update_allowed("update_weights_from_distributed")
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
@@ -321,12 +569,12 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error()
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 
         monkey_patch_torch_reductions()
-        self._assert_weight_cache_inactive("update_weights_from_tensor")
+        self._assert_in_place_update_allowed("update_weights_from_tensor")
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -386,8 +634,8 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
-        self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error()
+        self._assert_in_place_update_allowed("update_weights_from_ipc")
+        error = _unsupported_derived_weight_cache_error(self.get_model_runner())
         if error is not None:
             return False, error
 

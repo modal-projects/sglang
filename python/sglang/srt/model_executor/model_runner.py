@@ -318,6 +318,7 @@ class ModelRunner:
         self.init_startup_observability()
 
         self.init_remote_instance_weight_transporter()
+        self.cpu_weight_cache = None
 
         self.init_msprobe()
 

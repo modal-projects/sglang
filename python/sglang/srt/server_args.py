@@ -3420,6 +3420,24 @@ class ServerArgs:
         ),
         NS("model"),
     ] = 1800
+    checkpoint_source_refresh_hook: A[
+        Optional[str],
+        "Import path of a hook(checkpoint_source_dir, target_version) that "
+        "runs once per host before staged checkpoint data is read.",
+        NS("model"),
+    ] = None
+    enable_cpu_weight_cache: A[
+        bool,
+        "Enable background compilation of verified checkpoints into "
+        "rank-ready CPU weight images. Only target-model weights are updated.",
+        NS("model"),
+    ] = False
+    cpu_weight_cache_max_compile_group_gb: A[
+        float,
+        "Target upper bound in GiB for a module group compiled during CPU "
+        "weight staging. An indivisible module may exceed the bound.",
+        NS("model"),
+    ] = 8.0
     cpu_weight_cache_canonical_checkpoint_dir: A[
         Optional[str],
         "Host-local directory for the mutable canonical checkpoint used by "
@@ -3602,6 +3620,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._handle_cpu_weight_cache()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -7249,6 +7268,61 @@ class ServerArgs:
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
+
+    def _handle_cpu_weight_cache(self) -> None:
+        if (
+            self.cpu_weight_cache_canonical_checkpoint_dir is not None
+            and not self.enable_cpu_weight_cache
+        ):
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir requires "
+                "--enable-cpu-weight-cache"
+            )
+        if not self.enable_cpu_weight_cache:
+            return
+        if self.cpu_weight_cache_canonical_checkpoint_dir == "":
+            raise ValueError(
+                "--cpu-weight-cache-canonical-checkpoint-dir must not be empty"
+            )
+        if not is_cuda():
+            raise ValueError("--enable-cpu-weight-cache requires CUDA")
+        if self.cpu_weight_cache_max_compile_group_gb <= 0:
+            raise ValueError("--cpu-weight-cache-max-compile-group-gb must be positive")
+        if self.weight_cache_mode != "off":
+            raise ValueError(
+                "--enable-cpu-weight-cache cannot be combined with "
+                "--weight-cache-mode"
+            )
+        if self.cpu_offload_gb > 0 or self.offload_group_size > 0:
+            raise ValueError(
+                "--enable-cpu-weight-cache requires model weights to remain "
+                "resident on the GPU"
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support pipeline parallelism"
+            )
+        if self.dcp_replicate_q_proj:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support --dcp-replicate-q-proj"
+            )
+        if self.enable_eplb:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support automatic EPLB"
+            )
+        if self.enable_lora or self.lora_paths:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support dynamic LoRA weights"
+            )
+        if self.elastic_ep_backend is not None or self.enable_elastic_expert_backup:
+            raise ValueError(
+                "--enable-cpu-weight-cache does not support elastic expert weights"
+            )
+        if self.speculative_algorithm is not None:
+            logger.info(
+                "CPU weight cache updates target-model weights only; "
+                "speculative draft-model weights remain unchanged."
+            )
 
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline

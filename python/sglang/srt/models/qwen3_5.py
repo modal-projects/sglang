@@ -1768,9 +1768,22 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+_QWEN3_5_WEIGHT_STAGING_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "attn.qkv.": "attn.qkv_proj.",
+    },
+    orig_to_new_prefix={
+        "mtp.": None,
+        "model.language_model.": "model.",
+        "model.visual.": "visual.",
+    },
+)
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    weight_staging_name_mapper = _QWEN3_5_WEIGHT_STAGING_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -1930,6 +1943,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    weight_staging_name_mapper = _QWEN3_5_WEIGHT_STAGING_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 

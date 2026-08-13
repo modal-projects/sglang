@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -46,9 +46,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import get_device
 
 # Test constants
@@ -538,6 +540,69 @@ class TestRadixCache(unittest.TestCase):
         torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
+        )
+
+    def test_release_frees_overlap_committed_token_without_output_id(self):
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+            def free(self, req):
+                req.kv.req_pool_idx = None
+
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        request_indices = allocator.alloc(4)
+        assert request_indices is not None
+        cache.req_to_token_pool = ReqToTokenPool(request_indices)
+
+        req = Req(
+            rid="overlap-abort",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=2),
+        )
+        req.output_ids = array("q", [3])
+        # Overlap scheduling committed one decode slot past the token sequence.
+        req.kv = ReqKvInfo(
+            req_pool_idx=0,
+            kv_committed_len=4,
+            kv_allocated_len=4,
+        )
+        req.last_node = None
+        req.extra_key = None
+
+        available_before = allocator.available_size()
+        serving = unittest.mock.Mock(strip_thinking_cache=False)
+        with (
+            unittest.mock.patch(
+                "sglang.srt.managers.schedule_batch.get_serving",
+                return_value=serving,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.common.get_serving", return_value=serving
+            ),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.common.get_spec",
+                return_value=unittest.mock.Mock(speculative_algorithm=None),
+            ),
+        ):
+            allocator.free_group_begin()
+            release_kv_cache(req, cache)
+            allocator.free_group_end()
+
+        # The three named tokens remain cache-owned; the overlap-committed
+        # fourth slot has no token id and returns to the allocator.
+        self.assertEqual(cache.total_size(), 3)
+        self.assertEqual(allocator.available_size(), available_before + 1)
+        self.assertEqual(
+            allocator.available_size() + cache.evictable_size(), allocator.size
         )
 
     def test_kv_cache_events(self):

@@ -390,3 +390,8 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    cpu_weight_cache_canonical_checkpoint_dir: A[
+        Optional[str],
+        "Host-local directory for the mutable canonical checkpoint used by "
+        "CPU weight staging. By default the canonical checkpoint stays in RAM.",
+    ] = None

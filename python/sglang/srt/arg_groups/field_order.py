@@ -502,6 +502,7 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_mode",
     "weight_cache_socket",
     "weight_cache_timeout",
+    "cpu_weight_cache_canonical_checkpoint_dir",
     "forward_hooks",
     "msprobe_dump_config",
 )

@@ -960,6 +960,31 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
     @staticmethod
+    @contextmanager
+    def weight_loading_context(model):
+        """Apply load-time settings required by the model's quantization."""
+        quant_config = getattr(model, "quant_config", None)
+        is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_modelopt_fp4_online = (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        )
+        if is_nvfp4_online or is_modelopt_fp4_online:
+            # Scope exact FP4 quantization math to load-time conversion only;
+            # restore the original environment before serving starts.
+            with temp_set_env(
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_NVFP4_4OVER6="1",
+                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
+            ):
+                yield
+        else:
+            yield
+
+    @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -989,22 +1014,11 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
-                model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
+        with DefaultModelLoader.weight_loading_context(model):
             model.load_weights(weights)
+        if (is_nvfp4_online or is_modelopt_fp4_online) and target_device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():

@@ -63,6 +63,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.to_finish = None
 
     def finished(self):
         return False
@@ -82,6 +83,7 @@ class _DecodeReq:
         self.return_sampling_mask = False
         self.grammar = None
         self.beam_group = None
+        self.to_finish = None
         self.time_stats = Mock()
 
     def finished(self):
@@ -183,6 +185,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
                 auxiliary_host_output=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
+                dflash_sampling_mask_output=None,
                 logits_output=SimpleNamespace(hidden_states=hidden_states),
                 next_token_ids=None,
                 can_run_cuda_graph=False,

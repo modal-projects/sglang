@@ -46,6 +46,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_dflash_sampling_mask_output,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -70,6 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -79,6 +81,25 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+def _trim_dflash_prefill_hidden_states(
+    target_hidden: torch.Tensor,
+    *,
+    logical_num_tokens: int,
+) -> torch.Tensor:
+    """Drop trailing execution-padding rows before draft-KV materialization."""
+    hidden_tokens = int(target_hidden.shape[0])
+    if hidden_tokens == logical_num_tokens:
+        return target_hidden
+
+    if hidden_tokens < logical_num_tokens:
+        raise ValueError(
+            "DFLASH prefill hidden states have fewer rows than cache locations: "
+            f"target_hidden={hidden_tokens}, cache_loc={logical_num_tokens}."
+        )
+
+    return target_hidden[:logical_num_tokens]
 
 
 def _get_fused_kv_materialize_helper():
@@ -530,9 +551,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
-        if not is_dense_head_weight(lm_head.weight):
-            # Quantized lm_head (FP8/INT) would break the static matmul.
+        if should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        ):
             return _eager("quantized lm_head")
+        if not torch.is_floating_point(lm_head.weight):
+            return _eager("non-floating lm_head")
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -1104,19 +1128,26 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
+        quant_method = getattr(lm_head, "quant_method", None)
+        use_quant_method = should_apply_lm_head_quant_method(lm_head, quant_method)
+        bias = getattr(lm_head, "bias", None)
         num_tokens = int(hidden_states.shape[0])
         out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+        def _compute_local_logits(x: torch.Tensor) -> torch.Tensor:
+            if use_quant_method:
+                return quant_method.apply(lm_head, x, bias)
+            if x.dtype != weight_dtype:
+                x = x.to(weight_dtype)
+            return torch.matmul(x, weight.T)
 
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
-                hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                hs = hidden_states[start:end]
+                logits = _compute_local_logits(hs)
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -1169,9 +1200,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             fast_chunk_size = max(int(chunk_size), 1024)
             for start in range(0, num_tokens, fast_chunk_size):
                 end = min(num_tokens, start + fast_chunk_size)
-                hs = _cast_hs(hidden_states[start:end])
+                hs = hidden_states[start:end]
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = _compute_local_logits(hs)[:, :num_org]
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -1184,12 +1215,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
-            hs = _cast_hs(hidden_states[start:end])
+            hs = hidden_states[start:end]
             chunk_len = int(hs.shape[0])
+            local_logits = _compute_local_logits(hs)
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = local_logits[:, :num_org]
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1197,8 +1229,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 local_max = torch.full(
                     (chunk_len,),
-                    torch.finfo(weight_dtype).min,
-                    dtype=weight_dtype,
+                    torch.finfo(local_logits.dtype).min,
+                    dtype=local_logits.dtype,
                     device=hs.device,
                 )
                 local_arg = torch.zeros(
@@ -1209,9 +1241,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
-                )
+                added_logits = local_logits[:, added_slice_start:added_slice_end]
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
@@ -1549,12 +1579,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+            seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+                seq_lens_pre_verify.dtype
+            )
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -1635,9 +1668,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        return_sampling_masks: Optional[list] = None,
     ):
         new_seq_lens = None
         target_predict = None
+        target_probs = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -1654,12 +1689,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            (
+                accept_len,
+                bonus,
+                target_probs,
+            ) = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                return_target_probs=any(return_sampling_masks or []),
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
@@ -1707,7 +1747,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            target_probs,
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -1798,6 +1846,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
+            target_hidden = _trim_dflash_prefill_hidden_states(
+                logits_output.hidden_states,
+                logical_num_tokens=int(batch.out_cache_loc.numel()),
+            )
             positions, _ = compute_position(
                 self.model_runner.prefill_attention_backend_str,
                 draft_seq_lens,
@@ -1805,7 +1857,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
+                target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
             )
@@ -2070,9 +2122,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
-        )
+        if self._need_mamba_verify_commit:
+            prepare_mamba_track_for_verify(batch)
+        seq_lens_pre_verify = prefix_lens if self._need_mamba_verify_commit else None
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
@@ -2121,6 +2173,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
+        return_sampling_masks = (
+            sampling_info.return_sampling_masks if sampling_info is not None else []
+        )
+        needs_sampling_masks = any(return_sampling_masks or [])
         (
             accept_len,
             commit_lens,
@@ -2128,6 +2184,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
+            target_probs,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2135,6 +2192,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            return_sampling_masks=return_sampling_masks,
         )
 
         if SIMULATE_ACC_LEN > 0:
@@ -2164,6 +2222,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        dflash_sampling_mask_output = None
+        if needs_sampling_masks:
+            dflash_sampling_mask_output = build_dflash_sampling_mask_output(
+                target_probs=target_probs,
+                output_token_ids=out_tokens,
+                output_lens=commit_lens,
+                return_sampling_masks=return_sampling_masks,
+                max_mask_tokens=get_exec().features.sampling_mask_max_tokens,
+                max_top_k=sampling_info.sampling_mask_max_top_k,
+            )
 
         if batch.return_logprob:
             compute_spec_logprobs(
@@ -2222,4 +2291,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+            dflash_sampling_mask_output=dflash_sampling_mask_output,
         )

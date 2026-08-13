@@ -478,6 +478,60 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+def validate_cpu_weight_cache(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cpu_weight_cache_canonical_checkpoint_dir is not None
+        and not cfg.enable_cpu_weight_cache
+    ):
+        raise ValueError(
+            "--cpu-weight-cache-canonical-checkpoint-dir requires "
+            "--enable-cpu-weight-cache"
+        )
+    if not cfg.enable_cpu_weight_cache:
+        return
+    if cfg.cpu_weight_cache_canonical_checkpoint_dir == "":
+        raise ValueError(
+            "--cpu-weight-cache-canonical-checkpoint-dir must not be empty"
+        )
+    if not get_platform().is_cuda:
+        raise ValueError("--enable-cpu-weight-cache requires CUDA")
+    if cfg.cpu_weight_cache_max_compile_group_gb <= 0:
+        raise ValueError("--cpu-weight-cache-max-compile-group-gb must be positive")
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--enable-cpu-weight-cache cannot be combined with --weight-cache-mode"
+        )
+    if cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0:
+        raise ValueError(
+            "--enable-cpu-weight-cache requires model weights to remain resident "
+            "on the GPU"
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-cpu-weight-cache does not support pipeline parallelism"
+        )
+    if cfg.dcp_replicate_q_proj:
+        raise ValueError(
+            "--enable-cpu-weight-cache does not support --dcp-replicate-q-proj"
+        )
+    if cfg.enable_eplb:
+        raise ValueError("--enable-cpu-weight-cache does not support automatic EPLB")
+    if cfg.enable_lora or cfg.lora_paths:
+        raise ValueError(
+            "--enable-cpu-weight-cache does not support dynamic LoRA weights"
+        )
+    if cfg.elastic_ep_backend is not None or cfg.enable_elastic_expert_backup:
+        raise ValueError(
+            "--enable-cpu-weight-cache does not support elastic expert weights"
+        )
+    if cfg.speculative_algorithm is not None:
+        logger.info(
+            "CPU weight cache updates target-model weights only; speculative "
+            "draft-model weights remain unchanged."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

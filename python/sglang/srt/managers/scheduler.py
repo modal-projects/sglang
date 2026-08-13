@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import signal
+import socket
 import sys
 import time
 from array import array
@@ -100,6 +101,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    create_custom_parallel_group,
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -174,10 +176,12 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
+    StageWeightUpdateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightFromCPUReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1745,6 +1749,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_disk,
                 ),
                 (
+                    UpdateWeightFromCPUReqInput,
+                    self.weight_updater.update_weights_from_cpu,
+                ),
+                (
                     InitWeightsUpdateGroupReqInput,
                     self.weight_updater.init_weights_update_group,
                 ),
@@ -1791,6 +1799,10 @@ class Scheduler(
                 (
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
+                ),
+                (
+                    StageWeightUpdateReqInput,
+                    self.weight_updater.stage_weight_update,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
@@ -2063,6 +2075,15 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
+    def send_control_output(self, recv_req, output) -> None:
+        if self.rust_server is not None:
+            self.rust_server.push_control_output(recv_req, output)
+        elif isinstance(output, RpcReqOutput):
+            if self.ipc_channels.recv_from_rpc is not None:
+                sock_send(self.ipc_channels.recv_from_rpc, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
     def ingest_requests(self) -> List:
         """Receive, broadcast and dispatch this iteration's external input.
 
@@ -2107,18 +2128,10 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                self.send_control_output(recv_req, output)
 
         self.flush_wrapper.check_pending()
+        self.weight_updater.check_pending_weight_update_stage()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2213,13 +2226,42 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        weight_update_stage_cpu_group = self.tp_cpu_group
+        host_cpu_group = self.tp_cpu_group
+        if tp_size > 1:
+            # Background staging must not share a collective sequence with
+            # scheduler request broadcasts.
+            weight_update_stage_cpu_group = create_custom_parallel_group(
+                group_ranks=self.tp_group.ranks,
+            )
+            host_cpu_group = weight_update_stage_cpu_group
+            if self.server_args.enable_cpu_weight_cache:
+                hosts = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    hosts,
+                    socket.gethostname(),
+                    group=self.tp_cpu_group,
+                )
+                hostname = socket.gethostname()
+                host_cpu_group = create_custom_parallel_group(
+                    group_ranks=[
+                        rank
+                        for rank, host in zip(self.tp_group.ranks, hosts)
+                        if host == hostname
+                    ],
+                )
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
             tp_cpu_group=self.tp_cpu_group,
+            weight_update_stage_cpu_group=weight_update_stage_cpu_group,
+            host_cpu_group=host_cpu_group,
+            boot_model_path=self.server_args.model_path,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
+            send_control_output=self.send_control_output,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )

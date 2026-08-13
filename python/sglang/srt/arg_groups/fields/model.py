@@ -390,8 +390,31 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    checkpoint_source_refresh_hook: A[
+        Optional[str],
+        (
+            "Import path of a hook(checkpoint_source_dir, target_version) that runs "
+            "once per host before staged checkpoint data is read."
+        ),
+    ] = None
+    enable_cpu_weight_cache: A[
+        bool,
+        (
+            "Enable background compilation of verified checkpoints into rank-ready "
+            "CPU weight images. Only target-model weights are updated."
+        ),
+    ] = False
+    cpu_weight_cache_max_compile_group_gb: A[
+        float,
+        (
+            "Target upper bound in GiB for a module group compiled during CPU weight "
+            "staging. An indivisible module may exceed the bound."
+        ),
+    ] = 8.0
     cpu_weight_cache_canonical_checkpoint_dir: A[
         Optional[str],
-        "Host-local directory for the mutable canonical checkpoint used by "
-        "CPU weight staging. By default the canonical checkpoint stays in RAM.",
+        (
+            "Host-local directory for the mutable canonical checkpoint used by "
+            "CPU weight staging. By default the canonical checkpoint stays in RAM."
+        ),
     ] = None

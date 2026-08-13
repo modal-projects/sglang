@@ -826,6 +826,13 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if result.dflash_sampling_mask_output is not None:
+            assert result.logits_output is not None
+            (
+                result.logits_output.next_token_sampling_mask_idx,
+                result.logits_output.next_token_sampling_logprobs,
+            ) = result.dflash_sampling_mask_output.finalize()
+            result.dflash_sampling_mask_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -903,9 +910,20 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # return_sampling_mask + speculative decoding is rejected at
-                # request entry, so this remains one support mask per token.
-                self.add_sampling_mask_return_values(i, req, logits_output)
+                mask_token_count = new_accept_len
+                if req.finished_len is not None:
+                    previous_output_len = len(req.output_ids) - new_accept_len
+                    mask_token_count = min(
+                        mask_token_count,
+                        max(0, req.finished_len - previous_output_len),
+                    )
+                self.add_sampling_mask_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    token_count=mask_token_count,
+                    speculative=is_spec,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -1023,14 +1041,25 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
+        *,
+        token_count: int = 1,
+        speculative: bool = False,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
-        req.output_token_sampling_logprobs.append(
-            None if logprobs is None else logprobs[i]
-        )
+        if speculative:
+            req.output_token_sampling_mask.extend(
+                [None] * token_count if mask is None else mask[i][:token_count]
+            )
+            req.output_token_sampling_logprobs.extend(
+                [None] * token_count if logprobs is None else logprobs[i][:token_count]
+            )
+        else:
+            req.output_token_sampling_mask.append(None if mask is None else mask[i])
+            req.output_token_sampling_logprobs.append(
+                None if logprobs is None else logprobs[i]
+            )
 
     def get_sampling_mask_overflow_error(
         self,

@@ -644,7 +644,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -767,7 +768,126 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus
+    return correct_len, bonus, target_probs if return_target_probs else None
+
+
+@dataclass
+class DFlashSamplingMaskOutput:
+    """Bounded DFlash sampling support awaiting result-stream copy."""
+
+    request_indices: List[int]
+    batch_size: int
+    support_ids: Optional[torch.Tensor]
+    support_lens: Optional[torch.Tensor]
+    output_token_ids: torch.Tensor
+    output_lens: torch.Tensor
+    selected_logprobs: Optional[torch.Tensor]
+    max_mask_tokens: int
+
+    def map_device_tensors(self, copy_fn: Any) -> None:
+        if self.support_ids is not None:
+            self.support_ids = copy_fn(self.support_ids)
+        if self.support_lens is not None:
+            self.support_lens = copy_fn(self.support_lens)
+        self.output_token_ids = copy_fn(self.output_token_ids)
+        self.output_lens = copy_fn(self.output_lens)
+        if self.selected_logprobs is not None:
+            self.selected_logprobs = copy_fn(self.selected_logprobs)
+
+    def finalize(
+        self,
+    ) -> tuple[List[Optional[List[List[int]]]], List[Optional[List[float]]]]:
+        output_lens = self.output_lens.tolist()
+        output_token_ids = self.output_token_ids.tolist()
+        selected_logprobs = (
+            None if self.selected_logprobs is None else self.selected_logprobs.tolist()
+        )
+        support_ids = None if self.support_ids is None else self.support_ids.tolist()
+        support_lens = None if self.support_lens is None else self.support_lens.tolist()
+
+        masks: List[Optional[List[List[int]]]] = [None] * self.batch_size
+        logprobs: List[Optional[List[float]]] = [None] * self.batch_size
+        for row, request_idx in enumerate(self.request_indices):
+            output_len = output_lens[row]
+            if support_lens is not None and any(
+                support_lens[row][token_idx] > self.max_mask_tokens
+                for token_idx in range(output_len)
+            ):
+                continue
+
+            masks[request_idx], logprobs[request_idx] = [], []
+            for token_idx in range(output_len):
+                if support_lens is None:
+                    token_support = [int(output_token_ids[row][token_idx])]
+                    selected_logprob = 0.0
+                else:
+                    support_len = support_lens[row][token_idx]
+                    token_support = support_ids[row][token_idx][:support_len]
+                    selected_logprob = float(selected_logprobs[row][token_idx])
+                masks[request_idx].append(token_support)
+                logprobs[request_idx].append(selected_logprob)
+        return masks, logprobs
+
+
+def build_dflash_sampling_mask_output(
+    *,
+    target_probs: Optional[torch.Tensor],
+    output_token_ids: torch.Tensor,
+    output_lens: torch.Tensor,
+    return_sampling_masks: List[bool],
+    max_mask_tokens: int,
+    max_top_k: int,
+) -> DFlashSamplingMaskOutput:
+    if max_mask_tokens <= 0:
+        raise ValueError("max_mask_tokens must be positive")
+    if max_top_k <= 0:
+        raise ValueError("max_top_k must be positive")
+    request_indices = [
+        i for i, should_return in enumerate(return_sampling_masks) if should_return
+    ]
+    request_indices_device = torch.tensor(
+        request_indices, dtype=torch.long, device=output_token_ids.device
+    )
+    requested_output_token_ids = output_token_ids.index_select(
+        0, request_indices_device
+    ).to(torch.int32)
+    requested_output_lens = output_lens.index_select(0, request_indices_device)
+
+    if target_probs is None:
+        support_ids = None
+        support_lens = None
+        selected_logprobs = None
+    else:
+        requested_probs = target_probs.index_select(0, request_indices_device)
+        candidate_count = min(
+            max_top_k,
+            max_mask_tokens + 1,
+            target_probs.shape[-1],
+        )
+        candidate_probs, support_ids = torch.topk(
+            requested_probs,
+            k=candidate_count,
+            dim=-1,
+            sorted=True,
+        )
+        support_ids = support_ids.to(torch.int32)
+        support_lens = (candidate_probs > 0).sum(dim=-1, dtype=torch.int32)
+        selected_logprobs = torch.log(
+            requested_probs.gather(
+                -1, requested_output_token_ids.to(torch.int64).unsqueeze(-1)
+            ).squeeze(-1)
+        )
+
+    return DFlashSamplingMaskOutput(
+        request_indices=request_indices,
+        batch_size=len(return_sampling_masks),
+        support_ids=support_ids,
+        support_lens=support_lens,
+        output_token_ids=requested_output_token_ids,
+        output_lens=requested_output_lens,
+        selected_logprobs=selected_logprobs,
+        max_mask_tokens=max_mask_tokens,
+    )
 
 
 def build_dflash_verify_target_probs(

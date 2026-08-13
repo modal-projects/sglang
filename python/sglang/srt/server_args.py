@@ -5603,8 +5603,8 @@ class ServerArgs:
                 "--mamba-radix-cache-strategy extra_buffer."
             )
             algo = (view.speculative_algorithm or "").upper()
-            # dspark verifies through prepare_mamba_track_for_verify (lazy plan
-            # wired); dflash bypasses that hook, so it stays unsupported.
+            # DSpark wires the scheduler-side lazy track plan. DFlash does not,
+            # so it remains unsupported even though verify refreshes track slots.
             assert algo != "DFLASH", (
                 f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
                 "use --mamba-radix-cache-strategy extra_buffer."

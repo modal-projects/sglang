@@ -42,6 +42,24 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def restore_weights_before_loading(self, layer: nn.Module) -> None:
+        """Restore checkpoint-facing state before reloading weights in place."""
+        return
+
+    def restore_weights_before_cpu_staging(self, layer: nn.Module) -> None:
+        """Restore checkpoint-facing state before compiling weights on CPU."""
+        self.restore_weights_before_loading(layer)
+
+    def weight_staging_postprocess_device(self, layer: nn.Module) -> str | None:
+        """Return where staged weights may run their post-load transformation.
+
+        Return ``"cpu"`` or ``"cuda"`` to support CPU weight staging. ``None``
+        means that CPU weight staging does not support this method. Methods with
+        non-tensor runtime state must also define
+        ``process_weights_after_weight_commit``.
+        """
+        return None
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
@@ -84,6 +102,10 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+
+    def supports_batched_weight_loading(self) -> bool:
+        """Return whether independent expert-loader writes may be deferred."""
+        return False
 
     def create_weights(
         self,

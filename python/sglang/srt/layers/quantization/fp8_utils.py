@@ -1531,8 +1531,63 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
-    offloader.update_param(weight, new_weight)
-    weight_scale_inv.data = new_weight_scale_inv
+    # Preserve runtime buffers across reloads so existing CUDA graphs keep
+    # referring to the same storage.
+    if (
+        weight.shape == new_weight.shape
+        and weight.dtype == new_weight.dtype
+        and weight.device == new_weight.device
+    ):
+        weight.data.copy_(new_weight)
+    else:
+        offloader.update_param(weight, new_weight)
+
+    runtime_buffer = getattr(weight_scale_inv, "_reload_runtime_buffer", None)
+    if runtime_buffer is not None:
+        if (
+            runtime_buffer.shape != new_weight_scale_inv.shape
+            or runtime_buffer.dtype != new_weight_scale_inv.dtype
+        ):
+            raise RuntimeError(
+                "reloaded FP8 scale layout does not match its runtime buffer: "
+                f"runtime={tuple(runtime_buffer.shape)}/{runtime_buffer.dtype}, "
+                f"new={tuple(new_weight_scale_inv.shape)}/"
+                f"{new_weight_scale_inv.dtype}"
+            )
+        runtime_buffer.copy_(new_weight_scale_inv)
+        weight_scale_inv.data = runtime_buffer
+        del weight_scale_inv._reload_runtime_buffer
+    else:
+        weight_scale_inv.data = new_weight_scale_inv
+
+
+def record_ue8m0_scale_checkpoint_layout(scale: torch.nn.Parameter | None) -> None:
+    """Record a scale parameter's checkpoint-facing layout once."""
+    if scale is None or hasattr(scale, "_reload_checkpoint_format_ue8m0"):
+        return
+    scale._reload_checkpoint_format_ue8m0 = getattr(scale, "format_ue8m0", False)
+    scale._reload_checkpoint_shape = tuple(scale.shape)
+    scale._reload_checkpoint_dtype = scale.dtype
+
+
+def restore_ue8m0_scale_checkpoint_layout(scale: torch.nn.Parameter | None) -> None:
+    """Expose a scale parameter's checkpoint-facing layout for reloading."""
+    if scale is None or not hasattr(scale, "_reload_checkpoint_format_ue8m0"):
+        return
+
+    scale.format_ue8m0 = scale._reload_checkpoint_format_ue8m0
+    if (
+        tuple(scale.shape) == scale._reload_checkpoint_shape
+        and scale.dtype == scale._reload_checkpoint_dtype
+    ):
+        return
+
+    scale._reload_runtime_buffer = scale.data
+    scale.data = torch.empty(
+        scale._reload_checkpoint_shape,
+        dtype=scale._reload_checkpoint_dtype,
+        device=scale.device,
+    )
 
 
 def requant_block_scale_ue8m0_for_deepgemm(

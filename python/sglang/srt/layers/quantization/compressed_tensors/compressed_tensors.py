@@ -1018,8 +1018,14 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.restore_weights_before_loading(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return layer.scheme.weight_staging_postprocess_device(layer)
 
     def create_weights(
         self,
@@ -1072,8 +1078,14 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.restore_weights_before_loading(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        return layer.scheme.weight_staging_postprocess_device(layer)
 
     def create_weights(
         self,

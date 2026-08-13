@@ -1700,6 +1700,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             else "w4a4"
         )
 
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str:
+        return "cuda"
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2267,6 +2270,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
+
+    def supports_batched_weight_loading(self) -> bool:
+        return True
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str | None:
+        if getattr(layer, "inference_moe_w13_interleaved", False):
+            return None
+        return "cuda"
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:

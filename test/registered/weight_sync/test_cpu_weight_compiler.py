@@ -158,7 +158,7 @@ def test_copy_shadow_to_image_supports_root_group():
     torch.testing.assert_close(actual, expected)
 
 
-def test_compile_does_not_mutate_live_weights_or_retain_staging_clones(monkeypatch):
+def test_compile_reuses_loader_views_without_mutating_live_weights(monkeypatch):
     model = _LoadableModel()
     image = _CPUImage(model)
     compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
@@ -169,11 +169,14 @@ def test_compile_does_not_mutate_live_weights_or_retain_staging_clones(monkeypat
         device_type="cpu",
     )
     compiler.image = image
+    compiler._prepared_groups = None
+    compiler._checkpoint_names = None
+    compiler._names_by_group = None
 
-    expected = torch.arange(8, dtype=torch.float32)
+    checkpoint_value = torch.arange(8, dtype=torch.float32)
     checkpoint = SimpleNamespace(
         weight_map={"layer.weight": "model.safetensors"},
-        get_tensor=lambda _name: expected,
+        get_tensor=lambda _name: checkpoint_value,
         run_on_host_ranks=lambda _operation, function: function(),
     )
 
@@ -191,24 +194,92 @@ def test_compile_does_not_mutate_live_weights_or_retain_staging_clones(monkeypat
         return proxy, shadow
 
     monkeypatch.setattr(compiler_module, "build_weight_loader_proxy", track_shadow)
+    restore_calls = 0
+    restore_weights = DefaultModelLoader.restore_weights_before_cpu_staging
+
+    def track_restore(shadow):
+        nonlocal restore_calls
+        restore_calls += 1
+        restore_weights(shadow)
+
+    monkeypatch.setattr(
+        DefaultModelLoader,
+        "restore_weights_before_cpu_staging",
+        track_restore,
+    )
+    checkpoint_group_calls = 0
+    checkpoint_groups = compiler.checkpoint_groups
+
+    def track_checkpoint_groups(weight_map):
+        nonlocal checkpoint_group_calls
+        checkpoint_group_calls += 1
+        return checkpoint_groups(weight_map)
+
+    monkeypatch.setattr(compiler, "checkpoint_groups", track_checkpoint_groups)
     automatic_gc = gc.isenabled()
     gc.disable()
     try:
         stats = compiler.compile(checkpoint, target_version=3)
-        assert all(reference() is None for reference in shadow_refs)
+        assert len(shadow_refs) == 1
+        assert shadow_refs[0]() is not None
+        checkpoint_value = checkpoint_value + 10
+        second_stats = compiler.compile(checkpoint, target_version=4)
+        assert len(shadow_refs) == 1
+        assert checkpoint_group_calls == 1
+        assert restore_calls == 2
         assert not gc.isenabled()
     finally:
         if automatic_gc:
             gc.enable()
 
     assert stats["target_version"] == 3
+    assert not stats["loader_view_preparation"]["reused"]
+    assert second_stats["target_version"] == 4
+    assert second_stats["loader_view_preparation"]["reused"]
     assert image.valid and image.staged
     assert torch.all(model.layer.weight == 0)
     segment = image.segments_by_name["layer.weight"]
     actual = image.image[
         segment.image_offset : segment.image_offset + segment.nbytes
     ].view(torch.float32)
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, checkpoint_value)
+
+
+def test_prepare_loader_views_does_not_mutate_rank_image(monkeypatch):
+    model = _LoadableModel()
+    image = _CPUImage(model)
+    image.image.copy_(torch.arange(image.image_nbytes, dtype=torch.uint8))
+    expected = image.image.clone()
+    compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
+    compiler.model = model
+    compiler.groups = build_weight_module_groups(
+        model,
+        max_group_bytes=16,
+        device_type="cpu",
+    )
+    compiler.image = image
+    compiler._prepared_groups = None
+    compiler._checkpoint_names = None
+    compiler._names_by_group = None
+
+    restore_calls = 0
+
+    def mutating_restore(shadow):
+        nonlocal restore_calls
+        restore_calls += 1
+        shadow.layer.weight.data.add_(1)
+
+    monkeypatch.setattr(
+        DefaultModelLoader,
+        "restore_weights_before_cpu_staging",
+        mutating_restore,
+    )
+
+    stats = compiler.prepare_loader_views({"layer.weight": "model.safetensors"})
+
+    assert stats["groups"] == 1
+    assert restore_calls == 0
+    torch.testing.assert_close(image.image, expected)
 
 
 def test_compile_preserves_groups_absent_from_canonical_checkpoint():
@@ -235,6 +306,9 @@ def test_compile_preserves_groups_absent_from_canonical_checkpoint():
         device_type="cpu",
     )
     compiler.image = image
+    compiler._prepared_groups = None
+    compiler._checkpoint_names = None
+    compiler._names_by_group = None
 
     expected = torch.arange(8, dtype=torch.float32)
     checkpoint = SimpleNamespace(
@@ -277,6 +351,9 @@ def test_compile_failure_identifies_weight_group():
         device_type="cpu",
     )
     compiler.image = _CPUImage(model)
+    compiler._prepared_groups = None
+    compiler._checkpoint_names = None
+    compiler._names_by_group = None
 
     checkpoint = SimpleNamespace(
         weight_map={"layer.weight": "model.safetensors"},

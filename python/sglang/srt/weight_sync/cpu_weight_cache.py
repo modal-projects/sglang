@@ -192,6 +192,10 @@ class CPUWeightCache:
             )
             checkpoint = self._seed_canonical_checkpoint()
             try:
+                loader_view_preparation = self._run_on_host_ranks(
+                    "CPU weight loader view preparation",
+                    lambda: self.compiler.prepare_loader_views(checkpoint.weight_map),
+                )
                 if seed_from_active_weights:
                     baseline_compile = None
                     validation = None
@@ -233,6 +237,7 @@ class CPUWeightCache:
             "rank_weight_bytes": self.image.weight_nbytes,
             "rank_image_source": rank_image_source,
             "image_initialization": image_initialization,
+            "loader_view_preparation": loader_view_preparation,
             "baseline_compile": baseline_compile,
             "validation": validation,
             "canonical_cache_release": cache_release,

@@ -70,6 +70,16 @@ class _FakeCompiler:
         self.image.valid = True
         return {"operation": "initialize", "wall_s": 0.0}
 
+    def prepare_loader_views(self, weight_map):
+        return {
+            "operation": "prepare",
+            "groups": 1,
+            "loader_state_bytes": 0,
+            "reused": False,
+            "tensors": len(weight_map),
+            "wall_s": 0.0,
+        }
+
     def checkpoint_groups(self, weight_map):
         return {"model": list(weight_map)}
 

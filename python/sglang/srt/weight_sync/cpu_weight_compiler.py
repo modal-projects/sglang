@@ -72,6 +72,17 @@ class _LoadedWeightGroup:
     cpu_load_s: float
 
 
+@dataclass
+class _PreparedWeightGroup:
+    index: int
+    group: WeightModuleGroup
+    names: tuple[str, ...]
+    proxy: torch.nn.Module
+    cpu_shadow: torch.nn.Module
+    image_storage_keys: set[tuple[int, int]]
+    loader_state_bytes: int
+
+
 class CPUWeightCompiler:
     """Use SGLang's native loader to build a complete rank-ready host image."""
 
@@ -95,6 +106,9 @@ class CPUWeightCompiler:
         self.image = CPUWeightImage(model)
         self.target_device = self.image.device
         self._compile_stream = torch.cuda.Stream(device=self.target_device)
+        self._prepared_groups: list[_PreparedWeightGroup] | None = None
+        self._checkpoint_names: frozenset[str] | None = None
+        self._names_by_group: dict[str, list[str]] | None = None
         logger.info(
             "CPU weight compiler layout: groups=%d storages=%d bytes=%d "
             "max_group_bytes=%d",
@@ -117,61 +131,130 @@ class CPUWeightCompiler:
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
+    def prepare_loader_views(self, weight_map: dict[str, str]) -> dict[str, Any]:
+        """Build reusable native-loader views backed by the rank image."""
+
+        started = time.perf_counter()
+        checkpoint_names = frozenset(weight_map)
+        if self._checkpoint_names is not None:
+            if checkpoint_names != self._checkpoint_names:
+                raise RuntimeError(
+                    "canonical checkpoint tensor names changed after CPU weight "
+                    "loader view preparation"
+                )
+            if self._prepared_groups is None or self._names_by_group is None:
+                raise RuntimeError("CPU weight loader view preparation is incomplete")
+            return {
+                "operation": "prepare_cpu_weight_loader_views",
+                "groups": len(self._prepared_groups),
+                "loader_state_bytes": sum(
+                    prepared.loader_state_bytes for prepared in self._prepared_groups
+                ),
+                "reused": True,
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
+
+        names_by_group = self.checkpoint_groups(weight_map)
+        loadable = [
+            (index, group, tuple(names_by_group[group.path]))
+            for index, group in enumerate(self.groups, start=1)
+            if names_by_group[group.path]
+        ]
+        prepared_groups = []
+        try:
+            for index, group, names in loadable:
+                image_storage_keys: set[tuple[int, int]] = set()
+                loader_state_bytes = 0
+
+                def storage_factory(
+                    tensor: torch.Tensor,
+                    source_bytes: torch.Tensor,
+                ) -> torch.Tensor:
+                    nonlocal loader_state_bytes
+                    try:
+                        storage_bytes = self.image.storage_image_bytes(tensor)
+                    except KeyError:
+                        # Loader-only tensor state is retained once with the
+                        # reusable view. It is not another copy of image storage.
+                        storage_bytes = source_bytes.to("cpu").clone()
+                        loader_state_bytes += storage_bytes.numel()
+                    if tensor.device.type == "cuda":
+                        storage = storage_bytes.untyped_storage()
+                        image_storage_keys.add((storage.data_ptr(), storage.nbytes()))
+                    return storage_bytes
+
+                proxy, cpu_shadow = build_weight_loader_proxy(
+                    self.model,
+                    group.path,
+                    target_device=torch.device("cpu"),
+                    copy_data=False,
+                    storage_factory=storage_factory,
+                )
+                prepared_groups.append(
+                    _PreparedWeightGroup(
+                        index=index,
+                        group=group,
+                        names=names,
+                        proxy=proxy,
+                        cpu_shadow=cpu_shadow,
+                        image_storage_keys=image_storage_keys,
+                        loader_state_bytes=loader_state_bytes,
+                    )
+                )
+        except Exception:
+            prepared_groups.clear()
+            gc.collect()
+            raise
+
+        self._prepared_groups = prepared_groups
+        self._checkpoint_names = checkpoint_names
+        self._names_by_group = names_by_group
+        stats = {
+            "operation": "prepare_cpu_weight_loader_views",
+            "groups": len(prepared_groups),
+            "loader_state_bytes": sum(
+                prepared.loader_state_bytes for prepared in prepared_groups
+            ),
+            "reused": False,
+            "wall_s": round(time.perf_counter() - started, 6),
+        }
+        logger.info(
+            "Prepared reusable CPU weight loader views: groups=%d "
+            "loader_state_bytes=%d "
+            "wall_time=%.3fs",
+            stats["groups"],
+            stats["loader_state_bytes"],
+            stats["wall_s"],
+        )
+        return stats
+
     def _load_group(
         self,
         *,
-        index: int,
-        group: WeightModuleGroup,
-        names: list[str],
+        prepared: _PreparedWeightGroup,
         checkpoint: CanonicalCheckpoint,
     ) -> _LoadedWeightGroup:
         started = time.perf_counter()
-        image_storage_keys: set[tuple[int, int]] = set()
-
-        def storage_factory(
-            tensor: torch.Tensor,
-            source_bytes: torch.Tensor,
-        ) -> torch.Tensor:
-            try:
-                storage_bytes = self.image.storage_image_bytes(tensor)
-            except KeyError:
-                # Loader metadata outside the image contract stays in bounded
-                # group scratch rather than retaining live model storage.
-                storage_bytes = source_bytes.to("cpu").clone()
-            if tensor.device.type == "cuda":
-                storage = storage_bytes.untyped_storage()
-                image_storage_keys.add((storage.data_ptr(), storage.nbytes()))
-            return storage_bytes
 
         phase_started = time.perf_counter()
-        proxy, cpu_shadow = build_weight_loader_proxy(
-            self.model,
-            group.path,
-            target_device=torch.device("cpu"),
-            copy_data=False,
-            storage_factory=storage_factory,
-        )
-        cpu_clone_s = time.perf_counter() - phase_started
-
-        phase_started = time.perf_counter()
-        DefaultModelLoader.restore_weights_before_cpu_staging(cpu_shadow)
+        DefaultModelLoader.restore_weights_before_cpu_staging(prepared.cpu_shadow)
         restore_s = time.perf_counter() - phase_started
 
-        weights = ((name, checkpoint.get_tensor(name)) for name in names)
+        weights = ((name, checkpoint.get_tensor(name)) for name in prepared.names)
         phase_started = time.perf_counter()
-        with DefaultModelLoader.weight_loading_context(proxy):
-            proxy.load_weights(weights)
+        with DefaultModelLoader.weight_loading_context(prepared.proxy):
+            prepared.proxy.load_weights(weights)
         cpu_load_s = time.perf_counter() - phase_started
-        del proxy, weights
+        del weights
 
         return _LoadedWeightGroup(
-            index=index,
-            group=group,
-            checkpoint_tensors=len(names),
-            cpu_shadow=cpu_shadow,
-            image_storage_keys=image_storage_keys,
+            index=prepared.index,
+            group=prepared.group,
+            checkpoint_tensors=len(prepared.names),
+            cpu_shadow=prepared.cpu_shadow,
+            image_storage_keys=prepared.image_storage_keys,
             started=started,
-            cpu_clone_s=cpu_clone_s,
+            cpu_clone_s=0.0,
             restore_s=restore_s,
             cpu_load_s=cpu_load_s,
         )
@@ -401,7 +484,13 @@ class CPUWeightCompiler:
         if self.image.staging:
             raise RuntimeError("a CPU weight image stage is already running")
         started = time.perf_counter()
-        names_by_group = self.checkpoint_groups(checkpoint.weight_map)
+        loader_view_preparation = self.prepare_loader_views(checkpoint.weight_map)
+        if self._prepared_groups is None or self._names_by_group is None:
+            raise RuntimeError("CPU weight loader view preparation returned no groups")
+        names_by_group = self._names_by_group
+        prepared_by_path = {
+            prepared.group.path: prepared for prepared in self._prepared_groups
+        }
 
         covered_segments = set()
         staged_bytes = 0
@@ -458,9 +547,7 @@ class CPUWeightCompiler:
                             try:
                                 phase = "load"
                                 loaded = self._load_group(
-                                    index=index,
-                                    group=group,
-                                    names=names,
+                                    prepared=prepared_by_path[group.path],
                                     checkpoint=group_checkpoint,
                                 )
                                 phase = "finalize"
@@ -555,6 +642,7 @@ class CPUWeightCompiler:
             "operation": "compile_cpu_weight_image",
             "target_version": target_version,
             "groups": len(self.groups),
+            "loader_view_preparation": loader_view_preparation,
             "checkpoint_tensors": len(checkpoint.weight_map),
             "runtime_storages": len(covered_segments),
             "preserved_storages": len(preserved_segments),
@@ -579,4 +667,10 @@ class CPUWeightCompiler:
         return stats
 
     def close(self) -> None:
+        if self._prepared_groups is not None:
+            self._prepared_groups.clear()
+            self._prepared_groups = None
+            self._checkpoint_names = None
+            self._names_by_group = None
+            gc.collect()
         self.image.close()

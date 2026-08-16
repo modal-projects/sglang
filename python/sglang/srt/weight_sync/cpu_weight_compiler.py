@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +58,20 @@ def _staging_postprocess_device(model: torch.nn.Module) -> str:
         if method_device == "cuda":
             device = "cuda"
     return device
+
+
+@dataclass
+class _PreparedWeightGroup:
+    index: int
+    group: WeightModuleGroup
+    names: list[str]
+    checkpoint_tensors: int
+    proxy: torch.nn.Module
+    cpu_shadow: torch.nn.Module
+    image_storage_keys: set[tuple[int, int]]
+    started: float
+    cpu_clone_s: float
+    restore_s: float
 
 
 @dataclass
@@ -117,14 +132,13 @@ class CPUWeightCompiler:
             "wall_s": round(time.perf_counter() - started, 6),
         }
 
-    def _load_group(
+    def _prepare_group(
         self,
         *,
         index: int,
         group: WeightModuleGroup,
         names: list[str],
-        checkpoint: CanonicalCheckpoint,
-    ) -> _LoadedWeightGroup:
+    ) -> _PreparedWeightGroup:
         started = time.perf_counter()
         image_storage_keys: set[tuple[int, int]] = set()
 
@@ -157,24 +171,60 @@ class CPUWeightCompiler:
         DefaultModelLoader.restore_weights_before_cpu_staging(cpu_shadow)
         restore_s = time.perf_counter() - phase_started
 
-        weights = ((name, checkpoint.get_tensor(name)) for name in names)
-        phase_started = time.perf_counter()
-        with DefaultModelLoader.weight_loading_context(proxy):
-            proxy.load_weights(weights)
-        cpu_load_s = time.perf_counter() - phase_started
-        del proxy, weights
-
-        return _LoadedWeightGroup(
+        return _PreparedWeightGroup(
             index=index,
             group=group,
+            names=names,
             checkpoint_tensors=len(names),
+            proxy=proxy,
             cpu_shadow=cpu_shadow,
             image_storage_keys=image_storage_keys,
             started=started,
             cpu_clone_s=cpu_clone_s,
             restore_s=restore_s,
+        )
+
+    @staticmethod
+    def _load_group(
+        prepared: _PreparedWeightGroup,
+        checkpoint: CanonicalCheckpoint,
+    ) -> _LoadedWeightGroup:
+        weights = ((name, checkpoint.get_tensor(name)) for name in prepared.names)
+        phase_started = time.perf_counter()
+        with DefaultModelLoader.weight_loading_context(prepared.proxy):
+            prepared.proxy.load_weights(weights)
+        cpu_load_s = time.perf_counter() - phase_started
+        del weights
+
+        return _LoadedWeightGroup(
+            index=prepared.index,
+            group=prepared.group,
+            checkpoint_tensors=prepared.checkpoint_tensors,
+            cpu_shadow=prepared.cpu_shadow,
+            image_storage_keys=prepared.image_storage_keys,
+            started=prepared.started,
+            cpu_clone_s=prepared.cpu_clone_s,
+            restore_s=prepared.restore_s,
             cpu_load_s=cpu_load_s,
         )
+
+    def _load_checkpoint_group(
+        self,
+        checkpoint: CanonicalCheckpoint,
+        prepared: _PreparedWeightGroup,
+    ) -> _LoadedWeightGroup:
+        try:
+            with checkpoint.tensor_group(
+                prepared.group.path, prepared.names
+            ) as group_checkpoint:
+                return self._load_group(prepared, group_checkpoint)
+        except Exception as exc:
+            raise RuntimeError(
+                "CPU weight image compilation failed for group "
+                f"{prepared.index}/{len(self.groups)} at "
+                f"{prepared.group.path or '<root>'!r} "
+                f"during load: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def _copy_shadow_to_image(
         self,
@@ -422,85 +472,126 @@ class CPUWeightCompiler:
                 begin_stage,
             )
 
-            progress_interval = max(1, math.ceil(len(self.groups) / 10))
+            loadable_groups = []
             for index, group in enumerate(self.groups, start=1):
-                phase = "preserve"
-                try:
-                    names = names_by_group[group.path]
-                    if not names:
-                        prefix = f"{group.path}." if group.path else ""
-                        group_segments = {
-                            id(segment): segment
-                            for name, segment in self.image.segments_by_name.items()
-                            if not group.path
-                            or name == group.path
-                            or name.startswith(prefix)
-                        }
-                        if not group_segments:
-                            raise RuntimeError(
-                                "weight compilation group has no runtime storage: "
-                                f"path={group.path!r}"
-                            )
-                        covered_segments.update(group_segments)
-                        preserved_segments.update(group_segments)
-                        group_bytes = sum(
-                            segment.nbytes for segment in group_segments.values()
-                        )
-                        staged_bytes += group_bytes
-                        preserved_bytes += group_bytes
-                    else:
-                        with checkpoint.tensor_group(
-                            group.path, names
-                        ) as group_checkpoint:
-                            automatic_gc = gc.isenabled()
-                            gc.disable()
-                            loaded = None
-                            try:
-                                phase = "load"
-                                loaded = self._load_group(
-                                    index=index,
-                                    group=group,
-                                    names=names,
-                                    checkpoint=group_checkpoint,
-                                )
-                                phase = "finalize"
-                                updated, group_bytes, stats = self._finalize_group(
-                                    loaded
-                                )
-                            finally:
-                                # Cloned loader callbacks form temporary reference
-                                # cycles. Keep the bounded group in generation zero,
-                                # then reclaim it after its last strong reference.
-                                loaded = None
-                                try:
-                                    gc.collect(0)
-                                finally:
-                                    if automatic_gc:
-                                        gc.enable()
-                        covered_segments.update(updated)
-                        staged_bytes += group_bytes
-                        group_stats.append(stats)
-                except Exception as exc:
+                names = names_by_group[group.path]
+                if names:
+                    loadable_groups.append((index, group, names))
+                    continue
+
+                prefix = f"{group.path}." if group.path else ""
+                group_segments = {
+                    id(segment): segment
+                    for name, segment in self.image.segments_by_name.items()
+                    if not group.path or name == group.path or name.startswith(prefix)
+                }
+                if not group_segments:
                     raise RuntimeError(
-                        "CPU weight image compilation failed for group "
-                        f"{index}/{len(self.groups)} at {group.path or '<root>'!r} "
-                        f"during {phase}: "
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
-                if (
-                    index == 1
-                    or index % progress_interval == 0
-                    or index == len(self.groups)
-                ):
-                    logger.info(
-                        "CPU weight image v%d progress: groups=%d/%d "
-                        "bytes=%d elapsed=%.3fs",
-                        target_version,
-                        index,
-                        len(self.groups),
-                        staged_bytes,
-                        time.perf_counter() - started,
+                        "weight compilation group has no runtime storage: "
+                        f"path={group.path!r}"
                     )
+                covered_segments.update(group_segments)
+                preserved_segments.update(group_segments)
+                group_bytes = sum(segment.nbytes for segment in group_segments.values())
+                staged_bytes += group_bytes
+                preserved_bytes += group_bytes
+
+            progress_interval = max(1, math.ceil(len(self.groups) / 10))
+            automatic_gc = gc.isenabled()
+            gc.disable()
+            pool = None
+            try:
+                pipeline_preparation = (
+                    len(loadable_groups) > 1
+                    and _staging_postprocess_device(self.model) == "cuda"
+                )
+                if pipeline_preparation:
+                    # Construct the next loader graph while the current group
+                    # moves model bytes. Checkpoint loading itself stays serial
+                    # with CUDA staging because both consume host-memory bandwidth.
+                    pool = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="weight-group-prepare",
+                    )
+                    index, group, names = loadable_groups[0]
+                    pending = pool.submit(
+                        self._prepare_group,
+                        index=index,
+                        group=group,
+                        names=names,
+                    )
+
+                for position, entry in enumerate(loadable_groups):
+                    if pool is None:
+                        index, group, names = entry
+                        prepared = checkpoint.run_on_host_ranks(
+                            "CPU weight loader preparation",
+                            lambda: self._prepare_group(
+                                index=index,
+                                group=group,
+                                names=names,
+                            ),
+                        )
+                    else:
+                        completed = pending
+                        prepared = checkpoint.run_on_host_ranks(
+                            "CPU weight loader preparation",
+                            completed.result,
+                        )
+                        completed = None
+                    # Keep checkpoint reads serial with device traffic. Only
+                    # loader-graph construction runs ahead of CUDA finalization.
+                    loaded = self._load_checkpoint_group(checkpoint, prepared)
+                    prepared = None
+                    if pool is not None:
+                        if position + 1 < len(loadable_groups):
+                            index, group, names = loadable_groups[position + 1]
+                            pending = pool.submit(
+                                self._prepare_group,
+                                index=index,
+                                group=group,
+                                names=names,
+                            )
+                        else:
+                            pending = None
+                    index = loaded.index
+                    group = loaded.group
+                    try:
+                        updated, group_bytes, stats = self._finalize_group(loaded)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "CPU weight image compilation failed for group "
+                            f"{index}/{len(self.groups)} at "
+                            f"{group.path or '<root>'!r} during finalize: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    finally:
+                        # Cloned loader callbacks form temporary reference cycles.
+                        # Reclaim each bounded group after its final strong reference.
+                        loaded = None
+                        gc.collect(0)
+                    covered_segments.update(updated)
+                    staged_bytes += group_bytes
+                    group_stats.append(stats)
+                    if (
+                        index == 1
+                        or index % progress_interval == 0
+                        or index == len(self.groups)
+                    ):
+                        logger.info(
+                            "CPU weight image v%d progress: groups=%d/%d "
+                            "bytes=%d elapsed=%.3fs",
+                            target_version,
+                            index,
+                            len(self.groups),
+                            staged_bytes,
+                            time.perf_counter() - started,
+                        )
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                if automatic_gc:
+                    gc.enable()
 
             expected_segments = {id(segment) for segment in self.image.segments}
             missing = expected_segments - covered_segments
@@ -561,10 +652,7 @@ class CPUWeightCompiler:
             "bytes": staged_bytes,
             "preserved_bytes": preserved_bytes,
             "wall_s": round(wall_s, 6),
-            "compile_wall_s": round(
-                sum(group["wall_s"] for group in group_stats),
-                6,
-            ),
+            "compile_wall_s": round(wall_s, 6),
             "phases": phases,
             "postprocess_bytes": postprocess_bytes,
             "traffic": traffic,

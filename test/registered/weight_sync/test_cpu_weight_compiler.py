@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -61,6 +62,99 @@ def test_native_weight_loading_context_scopes_online_nvfp4_math(monkeypatch):
     with DefaultModelLoader.weight_loading_context(model):
         assert os.environ[variable] == "1"
     assert variable not in os.environ
+
+
+def test_cuda_postprocess_prepares_one_bounded_group_ahead(monkeypatch):
+    compiler = CPUWeightCompiler.__new__(CPUWeightCompiler)
+    compiler.model = SimpleNamespace()
+    compiler.groups = [
+        SimpleNamespace(path="first"),
+        SimpleNamespace(path="second"),
+    ]
+    compiler.image = SimpleNamespace(
+        staging=False,
+        registered=True,
+        valid=True,
+        segments=[],
+        begin_stage=lambda _version: None,
+        finish_stage=lambda _version: None,
+        invalidate=lambda _reason: None,
+    )
+    second_started = threading.Event()
+    release_second = threading.Event()
+    prepare_order = []
+    load_order = []
+    finalize_order = []
+    last_finalized = 0
+
+    def prepare_group(*, index, group, names):
+        prepare_order.append(index)
+        if index == 2:
+            second_started.set()
+            assert release_second.wait(timeout=1)
+        return SimpleNamespace(index=index, group=group, names=names, started=0.0)
+
+    def load_checkpoint_group(_checkpoint, prepared):
+        load_order.append(prepared.index)
+        assert last_finalized == prepared.index - 1
+        if prepared.index == 1:
+            assert not second_started.is_set()
+        return prepared
+
+    def finalize_group(loaded):
+        nonlocal last_finalized
+        finalize_order.append(loaded.index)
+        if loaded.index == 1:
+            assert second_started.wait(timeout=1)
+            release_second.set()
+        last_finalized = loaded.index
+        return (
+            set(),
+            0,
+            {
+                "bytes": 0,
+                "postprocess_device": "cuda",
+                "background_h2d_bytes": 0,
+                "background_d2h_bytes": 0,
+                "cpu_image_copy_bytes": 0,
+                "wall_s": 0.0,
+            },
+        )
+
+    @contextmanager
+    def tensor_group(_path, _names):
+        yield checkpoint
+
+    checkpoint = SimpleNamespace(
+        weight_map={
+            "first.weight": "model.safetensors",
+            "second.weight": "model.safetensors",
+        },
+        run_on_host_ranks=lambda _operation, function: function(),
+        tensor_group=tensor_group,
+    )
+
+    monkeypatch.setattr(
+        compiler_module, "_staging_postprocess_device", lambda _: "cuda"
+    )
+    monkeypatch.setattr(
+        compiler,
+        "checkpoint_groups",
+        lambda _weight_map: {
+            "first": ["first.weight"],
+            "second": ["second.weight"],
+        },
+    )
+    monkeypatch.setattr(compiler, "_prepare_group", prepare_group)
+    monkeypatch.setattr(compiler, "_load_checkpoint_group", load_checkpoint_group)
+    monkeypatch.setattr(compiler, "_finalize_group", finalize_group)
+
+    stats = compiler.compile(checkpoint, target_version=1)
+
+    assert stats["groups"] == 2
+    assert prepare_order == [1, 2]
+    assert load_order == [1, 2]
+    assert finalize_order == [1, 2]
 
 
 class _LoadableBlock(torch.nn.Module):

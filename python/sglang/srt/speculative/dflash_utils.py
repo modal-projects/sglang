@@ -698,6 +698,9 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_samples = torch.rand(
             (bs, draft_token_num), dtype=torch.float32, device=device
         )
+        # The target-only kernel uses an inclusive CDF comparison, so its
+        # uniform variates must use the equivalent float32 grid in (0, 1].
+        uniform_samples.add_(torch.finfo(torch.float32).eps / 2)
     else:
         if uniform_samples.shape != (bs, draft_token_num):
             raise ValueError(

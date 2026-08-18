@@ -36,6 +36,32 @@ class TestLogExcludeIdsMiddleware(CustomTestCase):
             {header: b"1" for header in ID_HEADERS},
         )
 
+    def test_allow_log_request_opts_in(self):
+        headers = self._call([(b"modal-allow-log", b"true")])
+
+        self.assertEqual(
+            self._id_header_values(headers),
+            {header: b"1" for header in ID_HEADERS},
+        )
+
+    def test_allow_log_overrides_log_exclude(self):
+        headers = self._call(
+            [
+                (b"modal-log-exclude", b"true"),
+                (b"modal-allow-log", b"true"),
+            ]
+        )
+
+        self.assertEqual(
+            self._id_header_values(headers),
+            {header: b"1" for header in ID_HEADERS},
+        )
+
+    def test_false_allow_log_does_not_opt_in(self):
+        headers = self._call([(b"modal-allow-log", b"false")])
+
+        self.assertEqual(self._id_header_values(headers), {})
+
     def test_excluded_request_gets_no_ids(self):
         headers = self._call([(b"modal-log-exclude", b"true")])
 

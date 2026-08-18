@@ -83,6 +83,20 @@ def maybe_register_hicache_draft(
     if not enable_hierarchical_cache:
         return
 
+    # A compact/windowed draft cache holds only a rolling window of draft KV,
+    # not full-length sequences, so there is nothing to mirror into L2: skip
+    # draft host-pool registration entirely (no host pool, no draft transfers).
+    # DFlashWorkerV2 exposes this as use_compact_draft_cache
+    # (--speculative-draft-window-size); older workers as use_draft_ring.
+    if getattr(draft_worker, "use_compact_draft_cache", False) or getattr(
+        draft_worker, "use_draft_ring", False
+    ):
+        logger.info(
+            "Skipping HiCache draft KV registration: draft worker uses a "
+            "compact (windowed) draft KV cache."
+        )
+        return
+
     draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,

@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 
 logger = logging.getLogger(__name__)
@@ -58,17 +59,49 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
-def _cuda_host_register(buffer: torch.Tensor) -> None:
+def _cuda_host_register(
+    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+) -> None:
+    # Register in chunks of SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB (default 256GB).
+    # Some driver/silicon combinations fail and corrupt the CUDA context when a
+    # single cudaHostRegister call exceeds roughly 500-600GB.
     cudart = torch.cuda.cudart()
-    n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
-    if int(rc) != 0:
-        raise RuntimeError(
-            f"cudaHostRegister failed (rc={int(rc)}, "
-            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
-            f"may silently return stale data."
-        )
+    base = buffer.data_ptr()
+    total = buffer.numel() * buffer.element_size()
+    chunk_limit_bytes = (
+        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+    )
+    chunk_bytes = chunk_limit_bytes
+    if registration_granularity_bytes is not None:
+        if registration_granularity_bytes <= 0:
+            raise ValueError(
+                "registration_granularity_bytes must be positive, got "
+                f"{registration_granularity_bytes}"
+            )
+        if registration_granularity_bytes > chunk_limit_bytes:
+            raise ValueError(
+                "Host registration granularity exceeds the configured chunk limit: "
+                f"granularity={registration_granularity_bytes}, "
+                f"chunk_limit={chunk_limit_bytes}"
+            )
+        # cudaMemcpyAsync validates a host range against a single registered
+        # allocation.  Keep registration boundaries aligned to the largest D2H
+        # copy unit so a page copy never straddles two cudaHostRegister calls.
+        chunk_bytes = (
+            chunk_limit_bytes // registration_granularity_bytes
+        ) * registration_granularity_bytes
+    offset = 0
+    while offset < total:
+        size = min(chunk_bytes, total - offset)
+        rc = int(cudart.cudaHostRegister(base + offset, size, 0))
+        if rc != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={rc}, "
+                f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
+                f"pinned and device transfers may silently return stale data."
+            )
+        offset += size
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
@@ -90,6 +123,7 @@ def alloc_with_host_register(
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
+    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
@@ -97,7 +131,7 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        _cuda_host_register(buffer)
+        _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer
 
 
@@ -107,6 +141,7 @@ def alloc_with_pin_memory(
     device: str,
     pin_memory: bool,
     allocator: None,
+    registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.

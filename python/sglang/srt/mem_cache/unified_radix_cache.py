@@ -65,6 +65,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -2378,6 +2379,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
+                    self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -2401,7 +2403,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
+            self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
+        if self.metrics_collector is None:
+            return
+        for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_backup_num_tokens(
+                    num_tokens=num_tokens, pool=pool
+                )
+        if ack.num_bytes > 0:
+            self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
+        if ack.timing_enabled:
+            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -2429,7 +2447,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(

@@ -170,6 +170,11 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
     num_tokens: int = 0
     timing_enabled: bool = False
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
+    num_bytes: int = 0
 
 
 class StorageOperation:
@@ -793,15 +798,18 @@ class HiCacheController:
         self.write_queue.clear()
 
         start_event = device_module.Event()
-        finish_event = device_module.Event()
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
         if self._mla_skip_host_io and not self.has_draft:
-            # Dummy target host pool on this rank: skip D2H, just ack.
+            # Dummy target host pool on this rank: skip D2H, just ack. No real
+            # bytes move, so leave the observability fields at their defaults
+            # (num_tokens_by_pool=None, num_bytes=0) so this rank does not count
+            # backup work it did not perform.
             start_event.record()
-            finish_event.record()
-            self.last_write_finish_event = finish_event
+            ack_finish_event.record()
+            self.last_write_finish_event = ack_finish_event
             self.ack_write_queue.append(
-                HiCacheAck(start_event, finish_event, op.node_ids)
+                HiCacheAck(start_event, ack_finish_event, op.node_ids)
             )
             return
 
@@ -826,6 +834,7 @@ class HiCacheController:
             producer_stream = getattr(self, "producer_stream", None)
             if producer_stream is not None:
                 self.write_stream.wait_stream(producer_stream)
+            ack_start_event.record()
             # MLA target KV is replicated across attention-TP ranks, so only the
             # dedup source owns target host pages. Draft KV is not necessarily
             # replicated (EAGLE commonly uses head-sharded MHA), and therefore
@@ -844,7 +853,7 @@ class HiCacheController:
                     draft_device_indices,
                     self.io_backend,
                 )
-            finish_event.record()
+            ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
@@ -858,8 +867,38 @@ class HiCacheController:
 
         # The next model forward must not reuse/write these slots until D2H is
         # done. Scheduler inserts this event into forward_stream.
-        self.last_write_finish_event = finish_event
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.last_write_finish_event = ack_finish_event
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
+                # Non-src dedup ranks skip the KV target D2H (dummy host pool),
+                # so no KV backup tokens are attributed to this rank.
+                num_tokens_by_pool=(
+                    None
+                    if self._mla_skip_host_io
+                    else {PoolName.KV.value: len(op.device_indices)}
+                ),
+                num_bytes=self._transfer_num_bytes(op),
+            )
+        )
+
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        """Total bytes moved by a merged transfer op (draft piggyback included).
+
+        Non-src dedup ranks skip the KV target D2H (dummy host pool), so their
+        KV bytes are excluded; the rank-local draft copy still runs and counts.
+        """
+        num_tokens = len(op.device_indices)
+        num_bytes = 0
+        if not self._mla_skip_host_io:
+            num_bytes += num_tokens * self.mem_pool_host.size_per_token
+        if self.has_draft:
+            num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
+        return num_bytes
 
     def _resolve_write_indices(
         self, op: CacheOperation, host_pool
@@ -978,6 +1017,8 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=timing_enabled,
+                num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id
@@ -1065,6 +1106,12 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=timing_enabled,
+                # Every rank places these tokens on its device via the dedup
+                # broadcast, so count load-back tokens on all ranks (matching
+                # the pre-observability behavior). _transfer_num_bytes still
+                # excludes KV bytes on peers, which read no local host DRAM.
+                num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id

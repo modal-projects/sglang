@@ -6,11 +6,14 @@ and ``ContentBlockDelta`` are discriminated unions over the ``type`` field,
 so each variant carries only the fields it actually uses.
 """
 
+import re
 import uuid
 from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
+    ConfigDict,
     Discriminator,
     Field,
     NonNegativeInt,
@@ -28,10 +31,27 @@ class AnthropicError(BaseModel):
 
 
 class AnthropicErrorResponse(BaseModel):
-    """Error response structure for Anthropic API."""
+    """Error response structure for Anthropic API.
+
+    ``request_id`` mirrors Anthropic's top-level envelope field (spec
+    §5.1) — a globally unique ``req_...`` id the client can quote back
+    for support/log correlation.
+    """
 
     type: Literal["error"] = "error"
     error: AnthropicError
+    request_id: Optional[str] = None
+
+
+class AnthropicOutputTokensDetails(BaseModel):
+    """Read-only decomposition of ``output_tokens`` (spec §3.3).
+
+    ``thinking_tokens`` counts output tokens that were internal reasoning
+    (raw, before summarization); it is at most ``output_tokens``. Omitted
+    entirely (``exclude_none``) for non-reasoning requests.
+    """
+
+    thinking_tokens: Optional[NonNegativeInt] = None
 
 
 class AnthropicUsage(BaseModel):
@@ -46,41 +66,90 @@ class AnthropicUsage(BaseModel):
     output_tokens: Optional[NonNegativeInt] = None
     cache_creation_input_tokens: Optional[NonNegativeInt] = None
     cache_read_input_tokens: Optional[NonNegativeInt] = None
+    output_tokens_details: Optional[AnthropicOutputTokensDetails] = None
+    # Spec §3.3: which service tier served the request. The adapter always
+    # emits "standard" — the only tier a local server has (audit G-10).
+    service_tier: Optional[str] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
 
 
-class TextBlock(BaseModel):
+class AnthropicCacheControl(BaseModel):
+    """Anthropic prompt-caching breakpoint marker (spec §9).
+
+    ``{"type": "ephemeral", "ttl": "5m"|"1h"}`` may attach to most
+    top-level blocks and tools. sglang has no explicit-cache API — the
+    prefix cache (radix) is automatic and always on — so this layer is a
+    deliberate **accept-and-ignore** (audit G-26): declaring it keeps SDK
+    payloads parseable and round-trippable without pretending to honor
+    TTL semantics.
+    """
+
+    type: Literal["ephemeral"] = "ephemeral"
+    ttl: Optional[Literal["5m", "1h"]] = None
+
+
+class AnthropicCacheableBlock(BaseModel):
+    """Spec §9 cache-marker carrier for content blocks and tool definitions.
+
+    Single declaration site: every Anthropic content/task object that may
+    carry ``cache_control`` inherits it here instead of re-declaring the
+    field (20 sites). The serving layer accepts and
+    ignores it (sglang's radix cache already caches prefix boundaries
+    automatically — audit G-26) while SDK round-trip fidelity is kept:
+    ``AnthropicCacheControl`` models the standard ephemeral 5m/1h marker.
+    """
+
+    cache_control: Optional[AnthropicCacheControl] = None
+
+
+
+class TextBlock(AnthropicCacheableBlock):
     type: Literal["text"] = "text"
     text: str
 
 
-class ImageBlock(BaseModel):
+class ImageBlock(AnthropicCacheableBlock):
     type: Literal["image"] = "image"
     # Kept loosely typed for compat with both base64 and URL sources; the
     # serving layer normalises to OpenAI ``image_url`` parts.
     source: Optional[Union[dict[str, Any], str]] = None
 
 
-class ToolUseBlock(BaseModel):
+class DocumentBlock(AnthropicCacheableBlock):
+    """``document`` content block (spec §2.3/§8.3; audit G-12).
+
+    returns a ``document`` block inside ``tool_result.content`` — absent
+    from the union, the whole request would 400 and the tool loop dies.
+    ``source`` stays loosely typed (base64 pdf / text / url / file-id /
+    nested-``content`` shapes); the serving layer converts text/content
+    sources and DEGRADES PDF sources to an explicit placeholder instead
+    of rejecting.
+    """
+    type: Literal["document"] = "document"
+    source: Optional[Union[dict[str, Any], str]] = None
+    title: Optional[str] = None
+    context: Optional[str] = None
+    citations: Optional[dict[str, Any]] = None
+
+
+class ToolUseBlock(AnthropicCacheableBlock):
     type: Literal["tool_use"] = "tool_use"
     id: str
     name: str
     input: dict[str, Any] = Field(default_factory=dict)
 
 
-class ToolResultBlock(BaseModel):
+class ToolResultBlock(AnthropicCacheableBlock):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: Optional[str] = None
-    # Some legacy payloads use ``id`` instead of ``tool_use_id``.
     id: Optional[str] = None
     content: Optional[Union[str, list["AnthropicContentBlock"]]] = None
     is_error: Optional[bool] = None
 
 
-class ToolReferenceBlock(BaseModel):
-    """sglang extension: references a deferred-loaded tool by name."""
+class ToolReferenceBlock(AnthropicCacheableBlock):
 
     type: Literal["tool_reference"] = "tool_reference"
     name: Optional[str] = None
@@ -89,7 +158,9 @@ class ToolReferenceBlock(BaseModel):
     id: Optional[str] = None
 
 
-class SearchResultBlock(BaseModel):
+class SearchResultBlock(AnthropicCacheableBlock):
+    """Search result fed back into context (spec §2.3)."""
+
     type: Literal["search_result"] = "search_result"
     # ``source`` here is a URL/identifier string (unlike ImageBlock.source).
     source: Optional[Union[str, dict[str, Any]]] = None
@@ -97,29 +168,125 @@ class SearchResultBlock(BaseModel):
     content: Optional[list[dict[str, Any]]] = None
 
 
-class ThinkingBlock(BaseModel):
+class ThinkingBlock(AnthropicCacheableBlock):
     type: Literal["thinking"] = "thinking"
     thinking: str
     signature: Optional[str] = None
 
 
-class RedactedThinkingBlock(BaseModel):
+class RedactedThinkingBlock(AnthropicCacheableBlock):
     type: Literal["redacted_thinking"] = "redacted_thinking"
     data: Optional[str] = None
+
+class ServerToolUseBlock(AnthropicCacheableBlock):
+    """Round-tripped history of an Anthropic server-side tool call
+    (``web_search``/``web_fetch``/``code_execution``/…, spec §2.3).
+
+    sglang never executes server tools, but cross-backend conversation
+    fields (``caller`` etc.) are preserved via ``extra="allow"`` so the
+    model is round-trippable.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: Optional[str] = None
+    name: Optional[str] = None
+    input: Optional[dict[str, Any]] = None
+
+
+class WebSearchToolResultBlock(AnthropicCacheableBlock):
+    """Server-side web_search result in history (opaque; audit G-14)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: Optional[str] = None
+    # Result payload is server-encrypted per spec §3.2 — keep it verbatim.
+    content: Optional[Any] = None
+
+class WebFetchToolResultBlock(AnthropicCacheableBlock):
+    """Server-side web_fetch result in history (opaque; audit G-14)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["web_fetch_tool_result"] = "web_fetch_tool_result"
+    tool_use_id: Optional[str] = None
+    content: Optional[Any] = None
+
+
+class CodeExecutionToolResultBlock(AnthropicCacheableBlock):
+    """Server-side code_execution result in history (opaque; audit G-14)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["code_execution_tool_result"] = "code_execution_tool_result"
+    tool_use_id: Optional[str] = None
+    content: Optional[Any] = None
+
+
+class GenericContentBlock(AnthropicCacheableBlock):
+    """Catch-all for content-block types this protocol doesn't model yet
+    (audit G-15, spec §1.6 versioning policy).
+
+    Anthropic's API contract is strictly additive — tomorrow's clients
+    may send newer block types — so unknown ``type`` values must parse
+    (and round-trip via ``extra="allow"``) instead of 400-ing the whole
+    request. The serving layer degrades them to an explicit text
+    placeholder rather than dropping them silently.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # NOT a Literal: any string is accepted. The discriminator routes
+    # unmatched types here.
+    type: str
+
+
+_KNOWN_BLOCK_TYPES = {
+    "text",
+    "image",
+    "document",
+    "tool_use",
+    "tool_result",
+    "tool_reference",
+    "search_result",
+    "thinking",
+    "redacted_thinking",
+    "server_tool_use",
+    "web_fetch_tool_result",
+    "code_execution_tool_result",
+}
+
+
+def _block_discriminator(v) -> str:
+    """Route a content block to its union variant.
+
+    Every known ``type`` maps 1:1; anything else falls through to
+    ``GenericContentBlock`` (audit G-15) so strictly-additive wire
+    evolution never 400s.
+    """
+    t = v.get("type") if isinstance(v, dict) else getattr(v, "type", None)
+    return t if t in _KNOWN_BLOCK_TYPES else "generic"
 
 
 AnthropicContentBlock = Annotated[
     Union[
-        TextBlock,
-        ImageBlock,
-        ToolUseBlock,
-        ToolResultBlock,
-        ToolReferenceBlock,
-        SearchResultBlock,
-        ThinkingBlock,
-        RedactedThinkingBlock,
+        Annotated[TextBlock, Tag("text")],
+        Annotated[ImageBlock, Tag("image")],
+        Annotated[DocumentBlock, Tag("document")],
+        Annotated[ToolUseBlock, Tag("tool_use")],
+        Annotated[ToolResultBlock, Tag("tool_result")],
+        Annotated[ToolReferenceBlock, Tag("tool_reference")],
+        Annotated[SearchResultBlock, Tag("search_result")],
+        Annotated[ThinkingBlock, Tag("thinking")],
+        Annotated[RedactedThinkingBlock, Tag("redacted_thinking")],
+        Annotated[ServerToolUseBlock, Tag("server_tool_use")],
+        Annotated[WebSearchToolResultBlock, Tag("web_search_tool_result")],
+        Annotated[WebFetchToolResultBlock, Tag("web_fetch_tool_result")],
+        Annotated[CodeExecutionToolResultBlock, Tag("code_execution_tool_result")],
+        Annotated[GenericContentBlock, Tag("generic")],
     ],
-    Field(discriminator="type"),
+    Discriminator(_block_discriminator),
 ]
 
 
@@ -131,7 +298,7 @@ class AnthropicMessage(BaseModel):
 # ---------- Tools (discriminated by ``type`` family) ----------
 
 
-class AnthropicCustomTool(BaseModel):
+class AnthropicCustomTool(AnthropicCacheableBlock):
     """Custom tool defined by the API user — requires ``input_schema``."""
 
     type: Optional[Literal["custom"]] = None  # absent or explicit "custom"
@@ -150,9 +317,8 @@ class AnthropicCustomTool(BaseModel):
         return v
 
 
-class AnthropicWebSearchTool(BaseModel):
+class AnthropicWebSearchTool(AnthropicCacheableBlock):
     """Anthropic ``web_search_*`` server tool family.
-
     No client-side ``input_schema`` — Anthropic provides the backing
     search implementation. Tag format is ``web_search_YYYYMMDD``.
     """
@@ -166,19 +332,18 @@ class AnthropicWebSearchTool(BaseModel):
     blocked_domains: Optional[list[str]] = None
 
 
-class AnthropicComputerTool(BaseModel):
+class AnthropicComputerTool(AnthropicCacheableBlock):
     """Anthropic ``computer_*`` server tool family."""
 
     type: str = Field(pattern=r"^computer_\d{8}$")
     name: Literal["computer"] = "computer"
     description: Optional[str] = None
     defer_loading: Optional[bool] = None
-    display_width_px: Optional[int] = None
     display_height_px: Optional[int] = None
     display_number: Optional[int] = None
 
 
-class AnthropicBashTool(BaseModel):
+class AnthropicBashTool(AnthropicCacheableBlock):
     """Anthropic ``bash_*`` server tool family."""
 
     type: str = Field(pattern=r"^bash_\d{8}$")
@@ -186,12 +351,31 @@ class AnthropicBashTool(BaseModel):
     description: Optional[str] = None
     defer_loading: Optional[bool] = None
 
-
-class AnthropicTextEditorTool(BaseModel):
+class AnthropicTextEditorTool(AnthropicCacheableBlock):
     """Anthropic ``text_editor_*`` server tool family."""
 
     type: str = Field(pattern=r"^text_editor_\d{8}$")
     name: Literal["str_replace_editor", "str_replace_based_edit_tool"]
+    description: Optional[str] = None
+    defer_loading: Optional[bool] = None
+
+
+class AnthropicGenericServerTool(AnthropicCacheableBlock):
+    """Families of dated server tools that lack a dedicated model here
+    (``web_fetch_*``, ``code_execution_*``, ``memory_*``,
+    ``tool_search_tool_*``, ``*_toolset_*``, …).
+
+    Like the dedicated families, these are skipped-with-log at
+    conversion — Anthropic executes them server-side, no local
+    ``input_schema`` exists (spec §2.5.2; audit G-14: previously these
+    fell through to ``custom`` and 400'd on the missing schema).
+    ``extra="allow"`` keeps family-specific params round-trippable.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    # ``<family>_YYYYMMDD`` per spec §2.5.2's tag convention.
+    type: str = Field(pattern=r"^[a-z][a-z0-9_]*_\d{8}$")
+    name: Optional[str] = None
     description: Optional[str] = None
     defer_loading: Optional[bool] = None
 
@@ -201,7 +385,9 @@ def _tool_discriminator(v) -> str:
 
     Pydantic discriminators don't accept ``None`` as a tag, and custom
     tools allow ``type`` to be absent. Map missing/``custom`` to
-    ``"custom"`` and prefix-match server-tool families.
+    ``"custom"``, prefix-match the dedicated server-tool families, and
+    route any other dated ``<family>_YYYYMMDD`` tag to the generic
+    server-tool model (spec §2.5.2; audit G-14).
     """
     if isinstance(v, dict):
         t = v.get("type")
@@ -217,6 +403,8 @@ def _tool_discriminator(v) -> str:
         return "bash"
     if t.startswith("text_editor_"):
         return "text_editor"
+    if re.fullmatch(r"[a-z][a-z0-9_]*_\d{8}", t):
+        return "server_tool"
     return "custom"
 
 
@@ -227,6 +415,7 @@ AnthropicTool = Annotated[
         Annotated[AnthropicComputerTool, Tag("computer")],
         Annotated[AnthropicBashTool, Tag("bash")],
         Annotated[AnthropicTextEditorTool, Tag("text_editor")],
+        Annotated[AnthropicGenericServerTool, Tag("server_tool")],
     ],
     Discriminator(_tool_discriminator),
 ]
@@ -241,15 +430,24 @@ def is_server_tool(tool) -> bool:
             AnthropicComputerTool,
             AnthropicBashTool,
             AnthropicTextEditorTool,
+            AnthropicGenericServerTool,
         ),
     )
 
 
 class AnthropicToolChoice(BaseModel):
-    """Tool choice strategy."""
+    """Tool choice strategy.
+
+    ``disable_parallel_tool_use`` is accepted on ``auto``/``any``/``tool``
+    (spec §2.6): when true the model may produce **at most one**
+    ``tool_use`` block. It maps exactly onto OpenAI's
+    ``parallel_tool_calls=False`` semantics ("the model calls at most one
+    tool"), which the serving layer applies whenever the flag is set.
+    """
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: Optional[bool] = None
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -326,16 +524,55 @@ class AnthropicTaskBudget(BaseModel):
     remaining: Optional[int] = Field(default=None, ge=0)
 
 
+class AnthropicOutputFormat(BaseModel):
+    """Anthropic structured-output format (spec §2.1 ``output_config.format``).
+
+    Mirrors Anthropic's wire shape ``{"type": "json_schema", "schema":
+    {...}}``. The field is stored as ``schema_`` (matching the OpenAI
+    protocol's ``JsonSchemaResponseFormat``, where the trailing underscore
+    works around a Pydantic ``BaseModel.schema`` name clash) and accepts
+    both the Anthropic SDK key ``schema`` and the OpenAI-flavoured key
+    ``json_schema`` via ``validation_alias`` so payloads from either
+    ecosystem parse.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal["json_schema"] = "json_schema"
+    schema_: Optional[dict[str, Any]] = Field(
+        default=None,
+        validation_alias=AliasChoices("schema", "json_schema"),
+    )
+
+
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
     ``effort`` maps to the OpenAI ``reasoning_effort`` knob (``xhigh`` →
     ``max`` because the OpenAI Literal does not include ``xhigh``).
-    ``task_budget`` is propagated as a custom-param hint.
+    ``task_budget`` is propagated as a custom-param hint. ``format``
+    selects Anthropic **structured outputs** (spec §2.1): a JSON schema
+    the response must conform to — bridged to an OpenAI
+    ``response_format`` of type ``json_schema`` by the serving layer.
     """
 
     effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
+    format: Optional[AnthropicOutputFormat] = None
+
+
+# Spec §2.1 hard cap on the messages array. Enforced here (request-shape
+# layer) so it surfaces as a 400 ``invalid_request_error``.
+ANTHROPIC_MAX_MESSAGES = 100_000
+
+
+def _check_messages_cap(v):
+    if len(v) > ANTHROPIC_MAX_MESSAGES:
+        raise ValueError(
+            f"messages: too many entries"
+            f" ({len(v)} > {ANTHROPIC_MAX_MESSAGES}, spec §2.1 cap)"
+        )
+    return v
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -350,6 +587,14 @@ class AnthropicCountTokensRequest(BaseModel):
     # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # Accepted for envelope parity with the Messages request (audit G-10);
+    # the count response has no usage block to echo a tier into.
+    service_tier: Optional[Literal["auto", "standard_only"]] = None
+
+    @field_validator("messages")
+    @classmethod
+    def _validate_messages_cap(cls, v):
+        return _check_messages_cap(v)
 
 
 class AnthropicCountTokensResponse(BaseModel):
@@ -358,7 +603,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(AnthropicCacheableBlock):
     """Anthropic Messages API request."""
 
     model: str
@@ -378,6 +623,20 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # Spec §2.1 requests: both exist in the wire contract and are accepted
+    # here for SDK round-trip fidelity. ``cache_control`` (spec §9
+    # top-level automatic caching marker) is a no-op — sglang's radix
+    # cache already caches the longest shared prefix automatically
+    # (audit G-26); the FIELD itself is inherited from
+    # ``AnthropicCacheableBlock`` — same type, same default, wire schema
+    # identical. ``service_tier`` (spec §2.1/§3.3) is
+    # accepted and the response echoes ``"standard"`` — the only tier a
+    # local server has (audit G-10).
+    service_tier: Optional[Literal["auto", "standard_only"]] = None
+    # Claude Code >= 2.x attaches ``context_management`` edit strategies.
+    # No engine support exists; explicit accept-and-ignore (logged once at
+    # the serving layer) beats a silent drop or a 400 (audit B20/G-06).
+    context_management: Optional[dict[str, Any]] = None
 
     @field_validator("model")
     @classmethod
@@ -386,17 +645,95 @@ class AnthropicMessagesRequest(BaseModel):
             raise ValueError("Model is required")
         return v
 
+    @field_validator("messages")
+    @classmethod
+    def _validate_messages_cap(cls, v):
+        return _check_messages_cap(v)
+
     @field_validator("max_tokens")
     @classmethod
     def _validate_max_tokens(cls, v):
-        if v <= 0:
-            raise ValueError("max_tokens must be positive")
+        # Anthropic allows ``max_tokens=0``: it is a cache pre-warm
+        # request — "0 is legal and means 'cache pre-warm, don't
+        # generate'" (spec §2.1). The serving layer clamps it to 1 for
+        # the OpenAI-compatible backend, which cannot express a
+        # zero-token generation. Negative values stay invalid.
+        if v < 0:
+            raise ValueError("max_tokens must be non-negative")
         return v
+
+    @model_validator(mode="after")
+    def _validate_thinking_cross_fields(self):
+        """Spec §7 cross-field rules that previously leaked into confusing
+        engine-side failures (audit G-11, tier-1 manual thinking)."""
+        th = self.thinking
+        if th is not None and th.type == "enabled":
+            # §7.2: budget_tokens must be strictly less than max_tokens —
+            # except under the interleaved-thinking beta, which
+            # deliberately allows budget >= max_tokens.
+            interleaved = bool(self.betas) and any(
+                b.startswith("interleaved-thinking") for b in self.betas
+            )
+            budget = getattr(th, "budget_tokens", None)
+            if (
+                budget is not None
+                and not interleaved
+                and budget >= self.max_tokens
+            ):
+                raise ValueError(
+                    "thinking.budget_tokens must be less than max_tokens "
+                    "(spec §7.2; allowed to exceed only under the "
+                    "interleaved-thinking beta)"
+                )
+            # §2.6/§7.4: manual (non-interleaved) thinking forbids forced
+            # tool_choice — the model would be unable to emit a tool_use
+            # after producing thinking blocks.
+            if self.tool_choice is not None and self.tool_choice.type in (
+                "any",
+                "tool",
+            ):
+                raise ValueError(
+                    "tool_choice 'any'/'tool' is incompatible with "
+                    "thinking.type='enabled' under manual thinking "
+                    "(spec §2.6/§7.4)"
+                )
+            # §7.4: an assistant prefill must not start with a thinking
+            # block, so prefilling is incompatible with enabled thinking.
+            if self.messages and self.messages[-1].role == "assistant":
+                raise ValueError(
+                    "assistant prefill (trailing assistant message) is "
+                    "incompatible with thinking.type='enabled' (spec §7.4)"
+                )
+        return self
 
 
 # ---------- Stream deltas ----------
 # Content-block deltas (discriminated by ``type``) vs message-end delta
 # (separate model; the wire format does not put ``type`` inside its payload).
+
+# Anthropic ``stop_reason`` wire enum (spec §3.1). ``end_turn`` /
+# ``max_tokens`` / ``stop_sequence`` / ``tool_use`` are the reasons a
+# sglang backend produces today. ``refusal`` is SHAPE-CONTRACT ONLY — no
+# sglang code path ever produces ``content_filter`` (producer census: it
+# exists only in openai/protocol.py Literal declarations), so the
+# finish_reason map in ``respond.py`` deliberately omits it (audit G-17;
+# re-expand the map ONLY when a real producer lands).
+# ``model_context_window_exceeded`` (context-window exhaustion —
+# SGLang's scheduler currently reports that as a plain ``length`` finish,
+# indistinguishable from a request ``max_tokens`` cap) and ``pause_turn``
+# (Anthropic's server-side tool-loop iteration cap — this server never
+# runs server-side tool loops) are NOT emitted, but stay in the enum so
+# the response model remains spec-complete for SDK round-trips and future
+# backend support.
+AnthropicStopReason = Literal[
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "refusal",
+    "model_context_window_exceeded",
+    "pause_turn",
+]
 
 
 class TextDelta(BaseModel):
@@ -433,9 +770,7 @@ class AnthropicMessageEndDelta(BaseModel):
     Stop reason and stop sequence are the only fields.
     """
 
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
+    stop_reason: Optional[AnthropicStopReason] = None
     stop_sequence: Optional[str] = None
 
 
@@ -506,9 +841,7 @@ class AnthropicMessagesResponse(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: list[AnthropicContentBlock]
     model: str
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
+    stop_reason: Optional[AnthropicStopReason] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
 

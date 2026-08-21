@@ -3257,13 +3257,15 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         swa = self.components.get(ComponentType.SWA)
-        if swa is None or not swa.sliding_window_size:
-            return 0
-        if not is_unified_kv_triton():
-            return 0
-        if self.tree_core.has_swa_host_pool:
-            return 0
-        return swa.sliding_window_size
+        layout_tail = 0
+        if (
+            swa is not None
+            and swa.sliding_window_size
+            and is_unified_kv_triton()
+            and not self.tree_core.has_swa_host_pool
+        ):
+            layout_tail = swa.sliding_window_size
+        return max(layout_tail, super().swa_reprefill_tail_tokens())
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

@@ -79,18 +79,15 @@ REQUIRE_AUTHENTICATION = True
 ROUTING_REGION = "us-west"
 
 HF_CACHE_MOUNT_PATH = "/cache/huggingface"
-JIT_CACHE_MOUNT_PATH = "/root/kimi-k3-jit-cache-volume"
-JIT_CACHE_PATH = f"{JIT_CACHE_MOUNT_PATH}/kimi-k3-cu13-sm103-rc5-native-kepoch2-4153db87"
+# Only the huggingface-cache volume exists on this account: every JIT/
+# kernel cache dir lives INSIDE it under its own subtree instead of a
+# second volume.
+JIT_CACHE_PATH = f"{HF_CACHE_MOUNT_PATH}/kimi-k3-cu13-sm103-rc5-native-kepoch2-4153db87"
 
 HF_CACHE_VOLUME_NAME = "huggingface-cache"
-JIT_CACHE_VOLUME_NAME = "kimi-k3-b300-jit-cache"
 
 hf_cache = modal.Volume.from_name(
     HF_CACHE_VOLUME_NAME,
-    create_if_missing=True,
-)
-jit_cache = modal.Volume.from_name(
-    JIT_CACHE_VOLUME_NAME,
     create_if_missing=True,
 )
 
@@ -260,7 +257,6 @@ app = modal.App(name="ep-kimi-k3-anthropic-claude-code")
     volumes={
         "/flash-endpoint-model": modal.Volume.from_name("endpoint-ep-OAimsKXm6F5j7B5HHffvN3"),
         HF_CACHE_MOUNT_PATH: hf_cache,
-        JIT_CACHE_MOUNT_PATH: jit_cache,
     },
     min_containers=0,
     target_concurrency=TARGET_CONCURRENCY,

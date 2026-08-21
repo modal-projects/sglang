@@ -276,12 +276,67 @@ defeats radix prefix-cache reuse; see the section above.
 beta. Verify `ANTHROPIC_DEFAULT_*_MODEL` uses the `[1m]` suffix, and that the loaded model's native context
 is 1M (GLM-5.2 is 1048576; pass `--context-length` only to cap it, not to extend).
 
-## Parameters
+## Parameter coverage
 
-The `/v1/messages` endpoint accepts the standard Anthropic Messages API parameters. Refer to the
-[Anthropic Messages API reference](https://docs.anthropic.com/en/api/messages) for the full list.
+The endpoint accepts the standard Anthropic Messages API surface; refer to the
+[Anthropic Messages API reference](https://docs.anthropic.com/en/api/messages) for the full schema.
+Entries below mark where SGLang's behavior is *defined* beyond "passes through":
+
+| Area | Behavior |
+|---|---|
+| `stop_sequences` | Stop-string matches surface as `stop_reason: "stop_sequence"` with the matched string echoed in `stop_sequence`; stop token ids (e.g. EOS) stay `end_turn`. |
+| `max_tokens: 0` | Prewarm mode: clamped to 1 token (one engine pass warms the radix cache), returned with `stop_reason: "max_tokens"`. Negative values return 400. |
+| `output_config.format` | `{"type": "json_schema", "schema": {...}}` maps to the backend JSON-schema response format (structured output). |
+| `tool_choice.disable_parallel_tool_use` | Sets `parallel_tool_calls: false` on the backend request. `any`/`tool` modes force the parallel flag off the same way. |
+| `temperature` | Values above `1.0` clamp to `1.0` with a WARNING; negative values return 400. |
+| `thinking` | `enabled` / `adaptive` / `display` are accepted; `reasoning_content` streams as `thinking` content blocks; `usage.output_tokens_details.thinking_tokens` reports the backend's reasoning token count. `budget_tokens` is accepted (advisory WARNING; see limits). |
+| `system` / consecutive same-role turns | List or string `system` accepted; adjacent same-role turns are merged before conversion; the `tool_use` → `tool_result` boundary is never collapsed. |
+| Trailing assistant message | Converted to a "continue final message" prefill (string coerced to a text block); trailing whitespace or `tool_use`/`thinking` blocks in the trailing turn return 400. |
+| `tool_use` / `tool_result` pairing | Unmatched `tool_use` (no immediately following `tool_result` with the same id) returns 400; string-form `tool_result.content` is accepted; `is_error: true` prefixes `[Tool execution failed] `. |
+| `document` content blocks | Text sources and nested `content` convert normally; PDF (base64/URL) degrades to a visible `[PDF document ...]` text placeholder with a WARNING (no PDF renderer); `file` sources return 400. |
+| `cache_control` | Accepted on every block and tool definition (ephemeral, 5m/1h TTL shape) and silently no-ops — SGLang's radix cache manages prefix reuse automatically. `usage` always reports `cache_read_input_tokens` / `cache_creation_input_tokens`. |
+| `service_tier` | `auto` / `standard_only` accepted; usage responses echo `service_tier: "standard"`. |
+| `context_management`, `metadata`, unknown fields | Accepted and ignored (forward-compatible). Unknown top-level content-block types degrade to a visible placeholder text block with a WARNING. |
+
+Wire guarantees on every `/v1/messages*` response (including streams and errors):
+
+- `request-id: req_<hex>` response header, mirrored by the `request_id` field inside JSON bodies so
+  client logs always correlate.
+- HTTP `429` rate-limit bodies use Anthropic's `rate_limit_error` type; upstream overload surfaces as
+  HTTP `529` with an `overloaded_error` envelope (the status Anthropic SDKs retry on).
+- Request bodies are capped at 32 MiB (over → HTTP `413`, `request_too_large`); `messages` arrays over
+  100,000 entries return 400.
+- Errors use the Anthropic `{"type": "error", "error": {"type", "message"}}` envelope throughout,
+  with 5xx details scrubbed.
+- Streaming responses always emit the canonical `message_start → … → message_delta(usage) →
+  message_stop` sequence (with `service_tier` echoed), keepalive `ping` events during pending tool work
+  and idle upstream windows, and validation errors (`400`) are returned before the stream is opened
+  when the failure is detectable upfront.
+- `GET /v1/models` and `GET /v1/models/{id}` return Anthropic-shaped entries (`type: "model"`,
+  `display_name`, `created_at`, `max_input_tokens`) when the request carries an `anthropic-version`
+  header; otherwise the OpenAI-shaped list is returned unchanged.
+- Servers started with `--api-key` accept it via `x-api-key` as well as `Authorization: Bearer` on
+  the `/v1/messages*` routes (constant-time compare).
 
 Reasoning models are supported through the same `--reasoning-parser` mechanism as the OpenAI-compatible
 endpoint; pass the model's reasoning kwarg via the request (e.g. `thinking` for DeepSeek-V3-style models,
 `enable_thinking` for Qwen3-style models). See [OpenAI APIs - Completions](./openai_api_completions) for
 the reasoning-parser / chat-template mapping.
+
+## Deliberate limits
+
+These are the edge of the surface today — none of them silently corrupt; each either degrades visibly
+or returns a clear error:
+
+- **Server-side tools** (`web_search`, `web_fetch`, `code_execution`, `tool_search`, `memory`) are not
+  executable by a self-hosted server; their tool definitions are skipped during conversion with a log
+  line, and any `server_tool_use` / `*_tool_result` blocks in history are tolerated and degrade to
+  visible placeholder text rather than failing the request.
+- **`thinking.display: "omitted"` and `budget_tokens`** are advisory-only (no backend knob restricts or
+  hides reasoning output); both log a one-time informational notice.
+- **Thinking signatures / `redacted_thinking`**: SGLang cannot verify or emit cryptographic thinking
+  signatures, so they are never fabricated. Echoed thinking history with an empty or absent signature is
+  accepted; `redacted_thinking` blocks return 400 rather than silently dropping context.
+- **Structured tool definitions (`tool.strict`)**, the Files API, MCP connectors, and billing-header
+  accounting are not supported; requests using them degrade with a WARNING rather than a failure.
+- The `anthropic-version` request header value itself is not validated.

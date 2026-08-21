@@ -466,6 +466,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Anthropic HTTP-contract middlewares for the /v1/messages* surface (G-02
+# request-id header, G-03 32 MB body cap, G-24 503→529; see
+# sglang.srt.utils.anthropic_http). Always on — independent of --api-key — and
+# pure-ASGI pass-through for all other routes.
+from sglang.srt.utils.anthropic_http import (
+    ANTHROPIC_REQUEST_ID_SCOPE_KEY,
+    add_anthropic_http_contract_middlewares,
+    anthropic_error_body,
+    anthropic_error_spec,
+    anthropic_model_entry,
+    anthropic_model_list,
+    is_anthropic_messages_path,
+)
+
+add_anthropic_http_contract_middlewares(app)
+
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
         RequestDecompressionMiddleware,
@@ -518,14 +534,21 @@ def _anthropic_validation_message(raw_errors) -> str:
     return text
 
 
-def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
-    """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
+def _anthropic_error_response(
+    *, status_code: int, error_type: str, message: str, request_id: str | None = None
+):
+    """Anthropic-format error envelope: {"type":"error","error":{...}[,"request_id":...]}.
+
+    Built via sglang.srt.utils.anthropic_http.anthropic_error_body (single envelope
+    owner). When request_id is given it MUST equal the response's ``request-id``
+    header (spec §5.1) — callers source it from ANTHROPIC_REQUEST_ID_SCOPE_KEY,
+    which AnthropicRequestIdMiddleware stamps before handlers run.
+    """
     return ORJSONResponse(
         status_code=status_code,
-        content={
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        },
+        content=anthropic_error_body(
+            error_type=error_type, message=message, request_id=request_id
+        ),
     )
 
 
@@ -537,31 +560,23 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
-    if request.url.path.startswith("/v1/messages"):
-        # Map HTTP status to Anthropic error.type; fall back to api_error.
-        anthropic_type = {
-            400: "invalid_request_error",
-            401: "authentication_error",
-            403: "permission_error",
-            404: "not_found_error",
-            413: "request_too_large",
-            422: "invalid_request_error",
-            429: "rate_limit_error",
-            500: "api_error",
-            502: "api_error",
-            503: "overloaded_error",
-            504: "api_error",
-        }.get(exc.status_code, "api_error")
-        # 5xx must never echo upstream detail (may contain stack/PII).
-        message = (
-            "Internal server error"
-            if exc.status_code >= 500
-            else (str(exc.detail) if exc.detail else "Request failed")
+    if is_anthropic_messages_path(request.url.path):
+        # Body shape (type mapping, 5xx detail scrub, canonical "Overloaded"
+        # message) is owned by anthropic_error_spec (spec §5.2; G-04/G-24).
+        # The WIRE status stays exc.status_code here: 503 → 529 translation is
+        # owned solely by AnthropicOverloadedStatusMiddleware so raw-Response
+        # 503s that bypass this handler get identical treatment.
+        spec = anthropic_error_spec(
+            status_code=exc.status_code,
+            detail=str(exc.detail) if exc.detail else None,
         )
         return _anthropic_error_response(
             status_code=exc.status_code,
-            error_type=anthropic_type,
-            message=message,
+            error_type=spec["error_type"],
+            message=spec["message"],
+            # Spec §5.1: body request_id mirrors the request-id header stamped by
+            # AnthropicRequestIdMiddleware (it writes the scope key first).
+            request_id=request.scope.get(ANTHROPIC_REQUEST_ID_SCOPE_KEY),
         )
 
     # adjust fmt for responses api
@@ -595,11 +610,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
     use the legacy ErrorResponse shape.
     """
-    if request.url.path.startswith("/v1/messages"):
+    if is_anthropic_messages_path(request.url.path):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
+            # Spec §5.1: keep body request_id == request-id header (scope key is
+            # stamped by AnthropicRequestIdMiddleware before parsing even runs).
+            request_id=request.scope.get(ANTHROPIC_REQUEST_ID_SCOPE_KEY),
         )
 
     exc_str = str(exc)
@@ -1841,8 +1859,16 @@ async def openai_v1_realtime_transcription(ws: WebSocket):
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
-async def available_models():
-    """Show available models. OpenAI-compatible endpoint."""
+async def available_models(raw_request: Request):
+    """Show available models. OpenAI-compatible endpoint.
+
+    G-27 content-negotiation (spec §12.2): when the request carries an
+    `anthropic-version` header (exact header-presence check — Anthropic SDKs
+    send it on every call, spec §1.2; we do NOT sniff User-Agent), answer with
+    the Anthropic Models shape {data, first_id, last_id, has_more}. Without the
+    header the OpenAI ModelList payload stays byte-identical — both dialects
+    share this route, so the default must not move.
+    """
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
 
@@ -1869,15 +1895,43 @@ async def available_models():
                 )
             )
 
+    if "anthropic-version" in raw_request.headers:
+        return anthropic_model_list(
+            [
+                anthropic_model_entry(
+                    model_id=card.id,
+                    created=card.created,
+                    max_model_len=card.max_model_len,
+                )
+                for card in model_cards
+            ]
+        )
+
     return ModelList(data=model_cards)
 
 
 @app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
-async def retrieve_model(model: str):
-    """Retrieves a model instance, providing basic information about the model."""
+async def retrieve_model(model: str, raw_request: Request):
+    """Retrieves a model instance, providing basic information about the model.
+
+    G-27: with an `anthropic-version` header the response is the single
+    Anthropic model object and misses get the Anthropic-envelope 404
+    (``not_found_error``); without it the legacy OpenAI shapes are unchanged.
+    """
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
 
     if model not in served_model_names:
+        if "anthropic-version" in raw_request.headers:
+            return ORJSONResponse(
+                status_code=404,
+                content=anthropic_error_body(
+                    error_type="not_found_error",
+                    message=f"The model '{model}' does not exist",
+                    # Present only when a request-id middleware stamped the scope
+                    # (today: /v1/messages* only) — spec §5.1 header/body mirror.
+                    request_id=raw_request.scope.get(ANTHROPIC_REQUEST_ID_SCOPE_KEY),
+                ),
+            )
         return ORJSONResponse(
             status_code=404,
             content={
@@ -1890,11 +1944,16 @@ async def retrieve_model(model: str):
             },
         )
 
-    return ModelCard(
+    card = ModelCard(
         id=model,
         root=model,
         max_model_len=_global_state.tokenizer_manager.model_config.context_len,
     )
+    if "anthropic-version" in raw_request.headers:
+        return anthropic_model_entry(
+            model_id=card.id, created=card.created, max_model_len=card.max_model_len
+        )
+    return card
 
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
@@ -1997,6 +2056,12 @@ async def ollama_show(request: OllamaShowRequest, raw_request: Request):
 
 
 ##### Anthropic-compatible API endpoints #####
+
+# NB (G-03): spec §2.1's 100k-message cap is enforced by a pydantic validator on
+# the request models (protocol.py) — a FastAPI dependency here would be dead
+# code, because body parsing/validation already failed the request first.
+# The 32 MB body cap lives in AnthropicBodySizeLimitMiddleware (works at the
+# byte level, before parsing).
 
 
 @app.post("/v1/messages", dependencies=[Depends(validate_json_request)])

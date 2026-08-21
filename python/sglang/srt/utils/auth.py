@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
+from sglang.srt.utils.anthropic_http import (
+    ANTHROPIC_REQUEST_ID_SCOPE_KEY,
+    anthropic_error_body,
+    is_anthropic_messages_path,
+    new_anthropic_request_id,
+)
+
 
 @dataclass(frozen=True)
 class AuthDecision:
@@ -79,6 +86,7 @@ def decide_request_auth(
     api_key: Optional[str],
     admin_api_key: Optional[str],
     auth_level: AuthLevel,
+    x_api_key_header: Optional[str] = None,
 ) -> AuthDecision:
     """Pure auth decision function (easy to unit test).
 
@@ -93,6 +101,11 @@ def decide_request_auth(
     - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
       to support k8s/liveness/readiness and Prometheus scraping without embedding secrets.
     - We match them by prefix to cover common variants like /health_generate.
+    - x_api_key_header is the Anthropic-style credential (spec §1.2; audit G-01):
+      Anthropic SDKs (and Claude Code via ANTHROPIC_API_KEY) authenticate with
+      `x-api-key: <key>` instead of `Authorization: Bearer <key>`. It is honored
+      ONLY on /v1/messages* paths and ONLY against the regular api_key — never
+      admin_api_key — so every other path keeps byte-identical legacy behavior.
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
@@ -110,6 +123,23 @@ def decide_request_auth(
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return False
         return secrets.compare_digest(parts[1], expected_token)
+
+    def _check_x_api_key_header(
+        x_api_key_header: Optional[str], expected_token: str
+    ) -> bool:
+        """Check the Anthropic `x-api-key` credential with constant-time comparison."""
+        return bool(x_api_key_header) and secrets.compare_digest(
+            x_api_key_header, expected_token
+        )
+
+    # G-01: `x-api-key` is Bearer-equivalent on the Anthropic Messages API surface only.
+    allow_x_api_key = is_anthropic_messages_path(path)
+
+    def _check_api_key_credential(expected_token: str) -> bool:
+        return _check_bearer_token(authorization_header, expected_token) or (
+            allow_x_api_key
+            and _check_x_api_key_header(x_api_key_header, expected_token)
+        )
 
     # Force-auth endpoints: only admin_api_key can unlock them; if admin_api_key is unset,
     # reject them unconditionally (explicitly "not allowed").
@@ -131,9 +161,7 @@ def decide_request_auth(
                 allowed=_check_bearer_token(authorization_header, admin_api_key)
             )
         elif api_key:
-            return AuthDecision(
-                allowed=_check_bearer_token(authorization_header, api_key)
-            )
+            return AuthDecision(allowed=_check_api_key_credential(api_key))
         else:
             return AuthDecision(allowed=True)
 
@@ -141,7 +169,7 @@ def decide_request_auth(
     # - if api_key is configured, require api_key (even if admin_api_key is also configured)
     # - otherwise allow (including the "admin_api_key only" case)
     if api_key:
-        return AuthDecision(allowed=_check_bearer_token(authorization_header, api_key))
+        return AuthDecision(allowed=_check_api_key_credential(api_key))
 
     return AuthDecision(allowed=True)
 
@@ -174,6 +202,8 @@ def add_api_key_middleware(
             request = Request(scope, receive=receive)
             path = request.url.path
             authz = request.headers.get("Authorization")
+            # G-01: Anthropic SDKs authenticate with `x-api-key` (spec §1.2).
+            x_api_key = request.headers.get("x-api-key")
             level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
             decision = decide_request_auth(
                 method=request.method,
@@ -182,9 +212,38 @@ def add_api_key_middleware(
                 api_key=self.api_key,
                 admin_api_key=self.admin_api_key,
                 auth_level=level,
+                x_api_key_header=x_api_key,
             )
 
             if not decision.allowed:
+                if is_anthropic_messages_path(path):
+                    # G-01 (spec §5.1/§5.2): Anthropic envelope for the Messages API —
+                    # never the legacy {"error": "Unauthorized"} shape. 401 ⇒
+                    # authentication_error, 403 ⇒ permission_error. This middleware
+                    # runs OUTSIDE AnthropicRequestIdMiddleware (the request-id for
+                    # all other /v1/messages* responses), so stamp the id itself.
+                    request_id = scope.get(
+                        ANTHROPIC_REQUEST_ID_SCOPE_KEY
+                    ) or new_anthropic_request_id()
+                    response = ORJSONResponse(
+                        content=anthropic_error_body(
+                            error_type=(
+                                "authentication_error"
+                                if decision.error_status_code == 401
+                                else "permission_error"
+                            ),
+                            message=(
+                                "Invalid or missing API key"
+                                if decision.error_status_code == 401
+                                else "The API key does not have permission to access this resource"
+                            ),
+                            request_id=request_id,
+                        ),
+                        status_code=decision.error_status_code,
+                        headers={"request-id": request_id},
+                    )
+                    await response(scope, receive, send)
+                    return
                 response = ORJSONResponse(
                     content={
                         "error": (

@@ -866,6 +866,12 @@ class ChatCompletionRequest(BaseModel):
     return_token_ids: bool = False
     return_meta_info: bool = False
     return_sampling_mask: bool = False
+    # sglang-internal extension: opt a single request into cache-hit
+    # reporting (prompt_tokens_details.cached_tokens) WITHOUT the global
+    # --enable-cache-report flag. Set by the Anthropic adapter, which owes
+    # clients cache_read_input_tokens unconditionally (audit G-25); the
+    # OpenAI surface keeps the flag's historical behavior otherwise.
+    report_cached_tokens: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

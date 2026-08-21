@@ -665,9 +665,13 @@ class OpenAIServingChat(OpenAIServingBase):
         return reasoning_text, tool_calls
 
     def _continuous_usage_cached_details(
-        self, content: Dict[str, Any]
+        self, content: Dict[str, Any], request: Optional[ChatCompletionRequest] = None
     ) -> Optional[PromptTokensDetails]:
-        if not self.tokenizer_manager.server_args.enable_cache_report:
+        if not (
+            self.tokenizer_manager.server_args.enable_cache_report
+            # Anthropic adapter requests opt in per-request (audit G-25).
+            or (request is not None and request.report_cached_tokens)
+        ):
             return None
         return UsageProcessor._details_if_cached(
             content["meta_info"].get("cached_tokens", 0)
@@ -727,7 +731,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
+                        cached_tokens=self._continuous_usage_cached_details(content, request),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -774,7 +778,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
+                        cached_tokens=self._continuous_usage_cached_details(content, request),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -802,7 +806,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens.get(index, 0),
                     reasoning_tokens=reasoning_tokens.get(index, 0),
                     completion_tokens=completion_tokens.get(index, 0),
-                    cached_tokens=self._continuous_usage_cached_details(content),
+                    cached_tokens=self._continuous_usage_cached_details(content, request),
                 ).model_dump()
 
             yield build_sse_content(
@@ -1747,7 +1751,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=(
+                        self.tokenizer_manager.server_args.enable_cache_report
+                        # Anthropic adapter requests opt in per-request (G-25).
+                        or request.report_cached_tokens
+                    ),
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
@@ -1957,7 +1965,11 @@ class OpenAIServingChat(OpenAIServingBase):
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
-            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            enable_cache_report=(
+                self.tokenizer_manager.server_args.enable_cache_report
+                # Anthropic adapter requests opt in per-request (G-25).
+                or request.report_cached_tokens
+            ),
             image_tokens=image_tokens,
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
@@ -2546,7 +2558,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
+                    cached_tokens=self._continuous_usage_cached_details(content, request),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -2599,7 +2611,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
+                    cached_tokens=self._continuous_usage_cached_details(content, request),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

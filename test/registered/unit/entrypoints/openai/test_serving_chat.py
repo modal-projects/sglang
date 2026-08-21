@@ -3608,5 +3608,47 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class ContinuousUsageCacheGateTestCase(unittest.TestCase):
+    """G-25: ``report_cached_tokens`` opts ONE request into cache-hit
+    reporting without the global --enable-cache-report (Anthropic
+    adapter surface), while the OpenAI surface keeps its old behavior."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.content = {"meta_info": {"cached_tokens": 7}}
+
+    def test_global_off_request_off_no_details(self):
+        self.assertIsNone(self.chat._continuous_usage_cached_details(self.content))
+
+    def test_global_off_request_on_yields_details(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            report_cached_tokens=True,
+        )
+        details = self.chat._continuous_usage_cached_details(self.content, req)
+        self.assertIsNotNone(details)
+        self.assertEqual(details.cached_tokens, 7)
+
+    def test_request_reporting_does_not_change_openai_default(self):
+        # OpenAI surface guard-rail: default request → cached_tokens stay
+        # hidden unless --enable-cache-report is set globally.
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertFalse(req.report_cached_tokens)
+        self.assertIsNone(
+            self.chat._continuous_usage_cached_details(self.content, req)
+        )
+
+    def test_global_on_works_without_request_flag(self):
+        self.tm.server_args.enable_cache_report = True
+        details = self.chat._continuous_usage_cached_details(self.content)
+        self.assertIsNotNone(details)
+        self.assertEqual(details.cached_tokens, 7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

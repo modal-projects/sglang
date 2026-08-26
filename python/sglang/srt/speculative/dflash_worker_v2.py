@@ -196,6 +196,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self._tp_group = get_tp_group()
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
@@ -359,7 +360,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            available_mem = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=self._tp_group.world_size > 1,
+                cpu_group=(
+                    self._tp_group.cpu_group if self._tp_group.world_size > 1 else None
+                ),
+            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -1454,6 +1462,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
+            self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1797,6 +1806,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
+            self._tp_group.broadcast_capture_safe(accept_len, src=0)
+            self._tp_group.broadcast_capture_safe(bonus, src=0)
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
                 (bs, int(self.block_size)), dtype=torch.int64, device=device
@@ -1809,6 +1820,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
+            self._tp_group.broadcast_capture_safe(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -1895,6 +1907,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+            # Keep the forced outcome identical across TP ranks: the simulate
+            # sampler draws unseeded per-rank values (fractional acc lens),
+            # which would re-introduce the PR #33614 divergence after the
+            # synced real decisions get overwritten.
+            self._tp_group.broadcast_capture_safe(accept_len, src=0)
+            self._tp_group.broadcast_capture_safe(commit_lens, src=0)
+            self._tp_group.broadcast_capture_safe(bonus, src=0)
+            self._tp_group.broadcast_capture_safe(out_tokens, src=0)
 
         if batch.return_logprob:
             compute_spec_logprobs(

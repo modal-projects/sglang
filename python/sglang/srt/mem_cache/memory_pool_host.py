@@ -1083,6 +1083,47 @@ class HostPoolGroup:
     def set_from_flat_data_page(self, index: int, data_page) -> None:
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
 
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+    ) -> None:
+        # Restored for the MLA-dedup hybrid load path
+        # (HybridCacheController._load_mla_source_layer calls this on the
+        # group; v0.5.18 moved the non-dedup path to L2TransferEngine and
+        # dropped the method). Anchor KV first, then sidecar pools.
+        # 1. Anchor (KV) transfer
+        anchor = self.anchor_entry
+        local_layer_id = anchor.layer_mapper(layer_id)
+        if local_layer_id is not None and host_indices.numel() > 0:
+            anchor.host_pool.load_to_device_per_layer(
+                anchor.device_pool,
+                host_indices,
+                device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+        # 2. Extra pool transfers
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            local_layer_id = entry.layer_mapper(layer_id)
+            if local_layer_id is None:
+                continue
+            entry.host_pool.load_to_device_per_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
 
 class DSAIndexerPoolHost(HostKVCache):
     """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""

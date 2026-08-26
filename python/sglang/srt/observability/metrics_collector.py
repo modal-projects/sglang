@@ -2057,6 +2057,75 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
+        # --- HiCache restore-path diagnostic counters ---
+        # Scheduler-side decision counters (match / load-back gating). Unlike
+        # the ack-based transfer counters above, these are emitted only by the
+        # stats-logging rank (attn-TP rank 0) because every rank executes the
+        # same mirrored scheduler decisions; see HiRadixCache.
+
+        self.match_host_hit_tokens = Counter(
+            name="sglang:hicache_match_host_hit_tokens_total",
+            documentation="Tokens matched in the radix tree that were "
+            "host-resident (device-evicted, host-backed) at match time.",
+            labelnames=labels.keys(),
+        )
+
+        self.match_stopped_reason = Counter(
+            name="sglang:hicache_match_stopped_reason_total",
+            documentation="Classification of each match_prefix outcome: "
+            "no_node (nothing matched), host_present (match saw host-backed "
+            "pages), device_evicted_no_host (deepest matched node evicted "
+            "with no host copy), node_not_backed (deepest matched node never "
+            "backed up to host), device_hit (fully device-resident match).",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
+        self.load_back_attempt = Counter(
+            name="sglang:hicache_load_back_attempt_total",
+            documentation="Number of load_back calls (host->device restore "
+            "attempts entering the gating checks).",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_declined = Counter(
+            name="sglang:hicache_load_back_declined_total",
+            documentation="Load-back restores that transferred nothing, by "
+            "reason: below_threshold, quota, insufficient_device_space, "
+            "other.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
+        self.load_back_failed = Counter(
+            name="sglang:hicache_load_back_failed_total",
+            documentation="Load-back restores aborted by a resource/IO "
+            "failure (device allocation failure after an eviction retry).",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_requested_tokens = Counter(
+            name="sglang:hicache_load_back_requested_tokens_total",
+            documentation="Tokens presented to load_back for restore "
+            "(wanted), as opposed to sglang:load_back_tokens_total which "
+            "counts tokens actually restored.",
+            labelnames=labels.keys(),
+        )
+
+        self.host_evict_tokens = Counter(
+            name="sglang:hicache_host_evict_tokens_total",
+            documentation="Host (L2) KV tokens evicted from the host pool; "
+            "host eviction deletes radix nodes, making their prefix "
+            "unreachable to later matches.",
+            labelnames=labels.keys(),
+        )
+
+        self.backup_write_failed_tokens = Counter(
+            name="sglang:hicache_backup_write_failed_tokens_total",
+            documentation="Tokens whose D->H write-through backup was "
+            "dropped because host allocation failed even after a host "
+            "eviction retry (silent write drop).",
+            labelnames=labels.keys(),
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -2085,6 +2154,30 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def increment_match_host_hit_tokens(self, num_tokens: int) -> None:
+        self.match_host_hit_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_match_stopped_reason(self, reason: str) -> None:
+        self.match_stopped_reason.labels(**self.labels, reason=reason).inc()
+
+    def increment_load_back_attempt(self) -> None:
+        self.load_back_attempt.labels(**self.labels).inc()
+
+    def increment_load_back_declined(self, reason: str) -> None:
+        self.load_back_declined.labels(**self.labels, reason=reason).inc()
+
+    def increment_load_back_failed(self) -> None:
+        self.load_back_failed.labels(**self.labels).inc()
+
+    def increment_load_back_requested_tokens(self, num_tokens: int) -> None:
+        self.load_back_requested_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_host_evict_tokens(self, num_tokens: int) -> None:
+        self.host_evict_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_backup_write_failed_tokens(self, num_tokens: int) -> None:
+        self.backup_write_failed_tokens.labels(**self.labels).inc(num_tokens)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

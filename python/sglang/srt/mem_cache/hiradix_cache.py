@@ -231,6 +231,25 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        # Restore-path diagnostics: every attn-TP rank executes the same
+        # mirrored match/load-back decisions, so scheduler-side counters must
+        # be emitted by one rank only to avoid multiplying under prometheus
+        # multiprocess aggregation. Rank within the attn-TP group (DP
+        # attention) or the TP group matches is_stats_logging_rank
+        # (attn_tp_rank == 0) in SchedulerMetricsCollector.init_new. Uses the
+        # params-provided groups (not parallel_state getters) so this also
+        # works where only torch.distributed is initialized (unit tests).
+        _stats_group = (
+            self.attn_tp_group if self.attn_tp_group is not None else self.tp_group
+        )
+        self._is_stats_logging_rank = (
+            torch.distributed.get_rank(group=_stats_group) == 0
+            if torch.distributed.is_initialized()
+            else True
+        )
+        # Rate limiter for declined-restore log lines (seconds, monotonic).
+        self._last_load_back_decline_log_ts = 0.0
+
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -889,6 +908,10 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            # Host allocation failed even after an eviction retry: this
+            # write-through backup is silently dropped (the node stays
+            # non-backuped and a later device eviction will destroy it).
+            self._inc_backup_write_failed_tokens(len(node.value))
             return 0
 
         return len(host_indices)
@@ -1351,6 +1374,73 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+        self._inc_host_evict_tokens(num_evicted)
+
+    # --- Restore-path diagnostic helpers (stats-logging rank only) ---
+
+    def _inc_match_host_hit_tokens(self, num_tokens: int) -> None:
+        if (
+            self.metrics_collector is not None
+            and self._is_stats_logging_rank
+            and num_tokens > 0
+        ):
+            self.metrics_collector.increment_match_host_hit_tokens(num_tokens)
+
+    def _inc_match_stopped_reason(self, reason: str) -> None:
+        if self.metrics_collector is not None and self._is_stats_logging_rank:
+            self.metrics_collector.increment_match_stopped_reason(reason)
+
+    def _inc_load_back_attempt(self, requested_tokens: int) -> None:
+        if self.metrics_collector is not None and self._is_stats_logging_rank:
+            self.metrics_collector.increment_load_back_attempt()
+            self.metrics_collector.increment_load_back_requested_tokens(
+                requested_tokens
+            )
+
+    def _inc_load_back_declined(self, reason: str) -> None:
+        if self.metrics_collector is not None and self._is_stats_logging_rank:
+            self.metrics_collector.increment_load_back_declined(reason)
+
+    def _inc_load_back_failed(self) -> None:
+        if self.metrics_collector is not None and self._is_stats_logging_rank:
+            self.metrics_collector.increment_load_back_failed()
+
+    def _inc_host_evict_tokens(self, num_tokens: int) -> None:
+        if (
+            self.metrics_collector is not None
+            and self._is_stats_logging_rank
+            and num_tokens > 0
+        ):
+            self.metrics_collector.increment_host_evict_tokens(num_tokens)
+
+    def _inc_backup_write_failed_tokens(self, num_tokens: int) -> None:
+        if (
+            self.metrics_collector is not None
+            and self._is_stats_logging_rank
+            and num_tokens > 0
+        ):
+            self.metrics_collector.increment_backup_write_failed_tokens(num_tokens)
+
+    def _log_load_back_decline(
+        self, reason: str, requested_tokens: int, mem_quota: Optional[int]
+    ) -> None:
+        """Rate-limited (1/10s/rank) one-line log for declined restores."""
+        now = time.monotonic()
+        if now - self._last_load_back_decline_log_ts < 10.0:
+            return
+        self._last_load_back_decline_log_ts = now
+        logger.info(
+            "hicache load_back declined: reason=%s requested_tokens=%d "
+            "device_free_tokens=%d load_back_threshold=%d mem_quota=%s "
+            "evictable_size=%d",
+            reason,
+            requested_tokens,
+            self.token_to_kv_pool_allocator.available_size(),
+            self.load_back_threshold,
+            mem_quota,
+            self.evictable_size_,
+        )
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
@@ -1372,10 +1462,18 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
+        self._inc_load_back_attempt(len(host_indices))
+        below_threshold = len(host_indices) < self.load_back_threshold
+        over_quota = (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
-        ):
+        )
+        if below_threshold or over_quota:
             # skip loading back if the total size is too small or exceeding the memory quota
+            decline_reason = "below_threshold" if below_threshold else "quota"
+            self._inc_load_back_declined(decline_reason)
+            self._log_load_back_decline(
+                decline_reason, len(host_indices), mem_quota
+            )
             self.dec_lock_ref(ancester_node)
             return None
 
@@ -1400,6 +1498,11 @@ class HiRadixCache(RadixCache):
             # no sufficient GPU memory to load back KV caches
             for n in nodes_to_load:
                 n.release_host()
+            self._inc_load_back_declined("insufficient_device_space")
+            self._inc_load_back_failed()
+            self._log_load_back_decline(
+                "insufficient_device_space", len(host_indices), mem_quota
+            )
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -1688,11 +1791,32 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
+        matched_last_node = last_node
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+
+        if self.metrics_collector is not None and self._is_stats_logging_rank:
+            self._inc_match_host_hit_tokens(host_hit_length)
+            matched_len = len(value) + host_hit_length
+            if matched_len == 0:
+                # No radix node for this prefix at all (never inserted, or
+                # removed by host eviction -- see hicache_host_evict_tokens).
+                stop_reason = "no_node"
+            elif host_hit_length > 0:
+                # Match found host-backed (device-evicted) pages.
+                stop_reason = "host_present"
+            elif matched_last_node.evicted:
+                # Deepest matched node is device-evicted with no host copy.
+                stop_reason = "device_evicted_no_host"
+            elif not matched_last_node.backuped:
+                # Deepest matched node was never backed up to host.
+                stop_reason = "node_not_backed"
+            else:
+                stop_reason = "device_hit"
+            self._inc_match_stopped_reason(stop_reason)
 
         return MatchResult(
             device_indices=value,

@@ -297,7 +297,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout == "page_first"
+                if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
         )

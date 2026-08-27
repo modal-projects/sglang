@@ -1759,6 +1759,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        # Verify runs with batch=None, so tp_worker never refreshes the HiCache
+        # consumer index for this forward — a stale producer index would make an
+        # eager get_key_buffer wait on a slot the producer ring may have reused.
+        self.target_worker.set_hicache_consumer(-1)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

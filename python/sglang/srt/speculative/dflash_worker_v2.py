@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import List, Optional
 
@@ -62,6 +63,117 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 _DFLASH_GRAMMAR_MASK_RING_SIZE = 3
+
+
+# ---------------------------------------------------------------------------
+# SGLANG_DFLASH_TP_DETECT: LOG-ONLY TP divergence detector.
+#
+# Suspected entry event for the production scheduler wedge (upstream
+# sgl-project PR #33614 / issue #33549): DFLASH commits DIFFERENT
+# accept_len/bonus on different TP ranks. This detector MEASURES that
+# divergence; it never corrects it. It all_gathers a COPY of accept_len/bonus
+# into a separate buffer and compares; the live accept_len / bonus /
+# target_predict tensors are never aliased, gathered-into, or written back.
+# (Broadcasting rank 0's values into the live tensors would silently APPLY
+# the #33614 fix and make this measurement meaningless.) Gated by
+# SGLANG_DFLASH_TP_DETECT (default OFF: no collective, no counters, no logs).
+# ---------------------------------------------------------------------------
+
+_DFLASH_TP_DETECT_LOG_INTERVAL_S = 10.0
+
+_dflash_tp_detect_state = {
+    "enabled": None,  # lazily cached env read (env is fixed at server start)
+    "counters": None,  # (mismatch_counter, verify_counter), lazily registered
+    "last_log_ts": 0.0,
+}
+
+
+def _dflash_tp_detect_counters():
+    counters = _dflash_tp_detect_state["counters"]
+    if counters is not None:
+        return counters
+    from prometheus_client import REGISTRY, Counter
+
+    def _get_or_create(name, documentation):
+        existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+        if existing is not None:
+            return existing
+        return Counter(name=name, documentation=documentation)
+
+    counters = (
+        _get_or_create(
+            "sglang:dflash_tp_accept_len_mismatch_total",
+            "DFLASH verify calls where TP ranks committed different "
+            "accept_len/bonus (SGLANG_DFLASH_TP_DETECT).",
+        ),
+        _get_or_create(
+            "sglang:dflash_tp_verify_total",
+            "DFLASH verify calls checked for TP divergence "
+            "(SGLANG_DFLASH_TP_DETECT).",
+        ),
+    )
+    _dflash_tp_detect_state["counters"] = counters
+    return counters
+
+
+def _dflash_tp_detect_verify(
+    *,
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    batch: "ScheduleBatch",
+    bs: int,
+    device,
+    context: str,
+) -> None:
+    """LOG-ONLY: all_gather a COPY of accept_len/bonus and compare ranks."""
+    state = _dflash_tp_detect_state
+    if state["enabled"] is None:
+        state["enabled"] = envs.SGLANG_DFLASH_TP_DETECT.get()
+    if not state["enabled"]:
+        return
+    tp_group = get_tp_group()
+    tp_size = int(tp_group.world_size)
+    if tp_size <= 1:
+        return
+    # A collective issued inside CUDA-graph capture could deadlock: skip the
+    # check while capturing rather than risk a hang.
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return
+    mismatch_counter, verify_counter = _dflash_tp_detect_counters()
+    verify_counter.inc()
+    # Fixed per-call shapes: local [2*bs] gathered into [tp_size*2*bs]. bs is
+    # identical on all TP ranks for the same batch step, so the collective
+    # itself can never hang on a size mismatch. torch.stack always copies
+    # into a fresh contiguous buffer, so the live accept_len/bonus tensors
+    # are never aliased or modified, and `gathered` is never written back.
+    local = torch.stack([accept_len.to(torch.int32), bonus.to(torch.int32)]).reshape(
+        -1
+    )
+    gathered = torch.empty(tp_size * 2 * bs, dtype=torch.int32, device=device)
+    tp_group.all_gather_into_tensor(gathered, local)
+    per_rank = gathered.view(tp_size, 2, bs)
+    ref = per_rank[0]
+    if not bool((per_rank[1:] != ref).any()):
+        return
+    mismatch_counter.inc()
+    now = time.monotonic()
+    if now - state["last_log_ts"] < _DFLASH_TP_DETECT_LOG_INTERVAL_S:
+        return
+    state["last_log_ts"] = now
+    try:
+        rids = [req.rid for req in batch.reqs]
+    except Exception:  # never let diagnostics break the engine
+        rids = None
+    logger.warning(
+        "DFLASH TP DIVERGENCE (%s): ranks committed different accept_len/bonus; "
+        "tp_rank=%d bs=%d rids=%s accept_len_per_rank=%s bonus_per_rank=%s",
+        context,
+        tp_group.rank_in_group,
+        bs,
+        rids,
+        per_rank[:, 0, :].tolist(),
+        per_rank[:, 1, :].tolist(),
+    )
 
 
 @dataclass
@@ -2000,6 +2112,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
+            _dflash_tp_detect_verify(
+                accept_len=accept_len,
+                bonus=bonus,
+                batch=batch,
+                bs=bs,
+                device=device,
+                context="sampling",
+            )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
                 (bs, int(self.block_size)), dtype=torch.int64, device=device
@@ -2070,6 +2190,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        # LOG-ONLY TP divergence check on the committed greedy accept_len/bonus
+        # (placed after the argmax-derived accept_len/bonus are final in every
+        # greedy sub-branch: triton, triton-fallback, and eager).
+        _dflash_tp_detect_verify(
+            accept_len=accept_len,
+            bonus=bonus,
+            batch=batch,
+            bs=bs,
+            device=device,
+            context="greedy",
+        )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

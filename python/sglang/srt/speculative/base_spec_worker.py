@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import os
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -243,6 +245,12 @@ class BaseSpecWorker(ABC):
 
         draft_runners = self._draft_model_runners()
         if not draft_runners:
+            return HiCacheDraftPlan()
+
+        if os.environ.get("SGLANG_DISABLE_DRAFT_HICACHE", "0") == "1":
+            # Escape hatch: keep target HiCache but never offload/restore
+            # draft-side KV. The draft-side restore path is the prime
+            # suspect in the DFLASH+HiCache TP deadlock (2026-08-27).
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         if (

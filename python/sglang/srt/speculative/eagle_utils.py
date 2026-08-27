@@ -887,6 +887,13 @@ def eagle_sample(
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
+        # The simulate sampler draws unseeded per-rank values for fractional
+        # acc lens, which would re-diverge ranks right after the synced real
+        # decisions above (PR #33614 class). Broadcast the forced outcome.
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
+            tp_group.broadcast(accept_index, src=0)
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the

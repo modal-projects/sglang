@@ -1317,6 +1317,24 @@ class GroupCoordinator:
         )
         return input_
 
+    def broadcast_capture_safe(self, input_: torch.Tensor, src: int = 0):
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.world_size == 1:
+            return input_
+        if input_.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            return self.broadcast(input_, src=src)
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not pynccl_comm.available:
+            raise RuntimeError(
+                f"CUDA graph broadcast on group {self.unique_name!r} requires "
+                "an available PyNCCL communicator."
+            )
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.broadcast(input_, src=src)
+        return input_
+
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.

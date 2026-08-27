@@ -199,6 +199,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
+        self._tp_group = get_tp_group()
+
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -1577,6 +1579,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
+            self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -2000,6 +2003,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
+            self._tp_group.broadcast_capture_safe(accept_len, src=0)
+            self._tp_group.broadcast_capture_safe(bonus, src=0)
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
                 (bs, int(self.block_size)), dtype=torch.int64, device=device
@@ -2012,6 +2017,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
+            self._tp_group.broadcast_capture_safe(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
                     (

@@ -4990,6 +4990,12 @@ def configure_scheduler_process(
     _fh_secs = int(os.environ.get("SGLANG_FH_DUMP_SECS", "0") or 0)
     if _fh_secs > 0:
         faulthandler.dump_traceback_later(_fh_secs, repeat=True)
+    if os.environ.get("SGLANG_FH_SIGUSR1", "0") == "1":
+        # Async-signal-level stack dump: works even when the main thread is
+        # wedged inside a C call holding the GIL (unlike dump_traceback_later).
+        import signal as _signal
+
+        faulthandler.register(_signal.SIGUSR1, chain=False)
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)

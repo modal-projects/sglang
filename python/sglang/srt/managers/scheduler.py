@@ -4984,6 +4984,12 @@ def configure_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
+    # Diagnostic: dump all Python stacks SGLANG_FH_DUMP_SECS seconds after
+    # scheduler start, repeating, so a mid-run deadlock's stack lands in
+    # stderr BEFORE the watchdog kill (which otherwise loses it).
+    _fh_secs = int(os.environ.get("SGLANG_FH_DUMP_SECS", "0") or 0)
+    if _fh_secs > 0:
+        faulthandler.dump_traceback_later(_fh_secs, repeat=True)
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)

@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional
 
@@ -2000,6 +2001,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
+            _maybe_skew_accept_len_for_debug(self, accept_len)
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(
                 (bs, int(self.block_size)), dtype=torch.int64, device=device
@@ -2119,3 +2121,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
         )
+
+
+# --- DEBUG-ONLY fault injection (env-gated, default OFF) -------------------
+# Reproduces the TP rank-divergence failure deterministically instead of
+# waiting ~1 container-day for FP nondeterminism to produce it naturally.
+# Deliberately makes ONE rank commit a different accept_len from the others,
+# which is exactly the state upstream PR #33614 prevents by broadcasting
+# accept_len/bonus from rank 0. Injection happens BEFORE that broadcast point,
+# so a patched engine must be immune and an unpatched one must not be.
+_SKEW_EVERY = int(os.environ.get("SGLANG_DEBUG_SKEW_ACCEPT_LEN_EVERY", "0"))
+_SKEW_RANK = int(os.environ.get("SGLANG_DEBUG_SKEW_ACCEPT_LEN_RANK", "1"))
+_skew_counter = [0]
+
+
+def _maybe_skew_accept_len_for_debug(worker, accept_len):
+    """If enabled, subtract 1 from accept_len on ONE rank, every Nth verify."""
+    if _SKEW_EVERY <= 0:
+        return
+    _skew_counter[0] += 1
+    if _skew_counter[0] % _SKEW_EVERY != 0:
+        return
+    try:
+        rank = get_tp_group().rank_in_group
+    except Exception:
+        return
+    if rank != _SKEW_RANK:
+        return
+    accept_len.sub_(1).clamp_(min=0)
+    logger.warning(
+        "DEBUG SKEW: rank %d perturbed accept_len at verify #%d "
+        "(fault injection; never enable in production)",
+        rank,
+        _skew_counter[0],
+    )

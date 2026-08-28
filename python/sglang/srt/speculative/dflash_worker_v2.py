@@ -125,7 +125,12 @@ def _dflash_tp_fold_w(device) -> torch.Tensor:
 
 
 def _dflash_tp_hash_tensor64(t: torch.Tensor) -> int:
-    u = t.detach().contiguous().view(torch.uint8).reshape(-1)
+    # clone(memory_format=contiguous_format) ALWAYS materializes stride-1
+    # output; .contiguous() does NOT for size-1 dims (a [1] slice like
+    # candidates[:, 0] keeps stride 8) and .view(torch.uint8) strictly
+    # requires stride(-1)==1.
+    u = t.detach().clone(memory_format=torch.contiguous_format)
+    u = u.view(torch.uint8).reshape(-1)
     n = u.numel()
     pad = (-n) % 512
     if pad:

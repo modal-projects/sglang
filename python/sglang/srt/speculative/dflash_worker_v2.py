@@ -296,6 +296,11 @@ def _dflash_tp_detect_verify(
     tp_size = int(tp_group.world_size)
     if tp_size <= 1:
         return
+    # Callers pass self.device, which is server_args.device: an Optional[str]
+    # (e.g. "cuda"), NOT a torch.device. Normalize before any .type access
+    # (torch.tensor/torch.empty accept either, .type does not).
+    if isinstance(device, str):
+        device = torch.device(device)
     # A collective issued inside CUDA-graph capture could deadlock: skip the
     # check while capturing rather than risk a hang.
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():

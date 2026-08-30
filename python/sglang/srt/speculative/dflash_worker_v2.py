@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from dataclasses import dataclass, replace
 from typing import List, Optional
 
@@ -62,6 +64,390 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 _DFLASH_GRAMMAR_MASK_RING_SIZE = 3
+
+
+# ---------------------------------------------------------------------------
+# SGLANG_DFLASH_TP_DETECT: LOG-ONLY TP divergence detector.
+#
+# Suspected entry event for the production scheduler wedge (upstream
+# sgl-project PR #33614 / issue #33549): DFLASH commits DIFFERENT
+# accept_len/bonus on different TP ranks. This detector MEASURES that
+# divergence; it never corrects it. It all_gathers a COPY of accept_len/bonus
+# into a separate buffer and compares; the live accept_len / bonus /
+# target_predict tensors are never aliased, gathered-into, or written back.
+# (Broadcasting rank 0's values into the live tensors would silently APPLY
+# the #33614 fix and make this measurement meaningless.) Gated by
+# SGLANG_DFLASH_TP_DETECT (default OFF: no collective, no counters, no logs).
+#
+# INPUT-CAPTURE EXTENSION (_dflash_tp_input_capture): per call, every rank
+# additionally hashes each verify INPUT (candidates incl. slot 0,
+# next_token_logits, sampling_info temperatures/top_ks/top_ps, the pre-drawn
+# coins, the CUDA RNG state, and greedy target_predict) with a deterministic
+# full-tensor integer hash and all_gathers the fixed-shape hash vector. The
+# FIRST mismatch per container is classified (which input diverged, or
+# outputs-differ-with-equal-inputs) and every rank dumps its LOCAL full
+# tensors to /tmp (no collectives in the dump path). Still strictly
+# LOG-ONLY: hashes are read-only folds and gathered hashes are never
+# written back into any live tensor.
+# ---------------------------------------------------------------------------
+
+_DFLASH_TP_DETECT_LOG_INTERVAL_S = 10.0
+
+_dflash_tp_detect_state = {
+    "enabled": None,  # lazily cached env read (env is fixed at server start)
+    "counters": None,  # {name: Counter}, lazily registered
+    "last_log_ts": 0.0,
+    "dumped": False,  # first-mismatch full-tensor dump happens once per process
+}
+
+
+# --- _dflash_tp_input_capture: deterministic portable 64-bit hash ----------
+# Copied from l1_tp4_harness.py: bytes viewed as int64 lanes, two-level
+# multiply-fold with fixed ODD weights. Integer mul/sum only (odd weights =>
+# per-lane multiply is invertible mod 2^64, so any lane diff changes the row
+# hash; the sum is wrap-around and order-independent) => bitwise
+# deterministic and device/portable (same bytes => same hash on any rank).
+_DFLASH_TP_HASH_SEED = 0x5EEDF01D
+_dflash_tp_fold_weights = {}
+
+
+def _dflash_tp_fold_w(device) -> torch.Tensor:
+    key = str(device)
+    w = _dflash_tp_fold_weights.get(key)
+    if w is None:
+        g = torch.Generator(device="cpu").manual_seed(_DFLASH_TP_HASH_SEED)
+        w = torch.randint(
+            -(1 << 63), (1 << 63) - 1, (64,), generator=g, dtype=torch.int64
+        ).to(device)
+        w |= 1  # force odd (see header)
+        _dflash_tp_fold_weights[key] = w
+    return w
+
+
+def _dflash_tp_hash_tensor64(t: torch.Tensor) -> int:
+    # clone(memory_format=contiguous_format) ALWAYS materializes stride-1
+    # output; .contiguous() does NOT for size-1 dims (a [1] slice like
+    # candidates[:, 0] keeps stride 8) and .view(torch.uint8) strictly
+    # requires stride(-1)==1.
+    u = t.detach().clone(memory_format=torch.contiguous_format)
+    u = u.view(torch.uint8).reshape(-1)
+    n = u.numel()
+    pad = (-n) % 512
+    if pad:
+        u = torch.cat([u, u.new_zeros(pad)])
+    v = u.view(torch.int64).view(-1, 64)
+    w = _dflash_tp_fold_w(u.device)
+    rows = (v * w).sum(dim=1)
+    m = rows.numel()
+    pad2 = (-m) % 64
+    if pad2:
+        rows = torch.cat([rows, rows.new_zeros(pad2)])
+    h = (rows.view(-1, 64) * w).sum()
+    return int(h.item())
+
+
+# Fixed hash-slot layout for the per-call int64 gather. The slot count is a
+# compile-time constant and bs is identical on all TP ranks for the same
+# batch step, so every detector collective is fixed-shape and can never
+# shape-hang.
+_TP_SLOT_CANDIDATES = 2
+_TP_SLOT_CANDIDATE_SLOT0 = 3  # inherited prefill/sampler token (S1 surface)
+_TP_SLOT_LOGITS = 4
+_TP_SLOT_TEMPERATURES = 5
+_TP_SLOT_TOP_KS = 6
+_TP_SLOT_TOP_PS = 7
+_TP_SLOT_COINS_VERIFY = 8  # uniform_samples
+_TP_SLOT_COINS_FINAL = 9  # uniform_samples_for_final_sampling
+_TP_SLOT_RNG_STATE = 10
+_TP_SLOT_TARGET_PREDICT = 11  # greedy argmax (derived; absent in sampling mode)
+_TP_HASH_N = 12
+_TP_HASH_NONE = 0x4E4F4E5F534C4F54  # sentinel for "input absent in this mode"
+
+_TP_MISMATCH_CLASSES = (
+    "output_mismatch_equal_inputs",
+    "candidate_mismatch",
+    "logits_mismatch",
+    "sampling_info_mismatch",
+    "coin_mismatch",
+    "rng_mismatch",
+    "argmax_mismatch",
+)
+
+
+def _dflash_tp_detect_counters():
+    counters = _dflash_tp_detect_state["counters"]
+    if counters is not None:
+        return counters
+    from prometheus_client import REGISTRY, Counter
+
+    def _get_or_create(name, documentation):
+        existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+        if existing is not None:
+            return existing
+        return Counter(name=name, documentation=documentation)
+
+    counters = {
+        "mismatch": _get_or_create(
+            "sglang:dflash_tp_accept_len_mismatch_total",
+            "DFLASH verify calls where TP ranks committed different "
+            "accept_len/bonus (SGLANG_DFLASH_TP_DETECT).",
+        ),
+        "verify": _get_or_create(
+            "sglang:dflash_tp_verify_total",
+            "DFLASH verify calls checked for TP divergence "
+            "(SGLANG_DFLASH_TP_DETECT).",
+        ),
+    }
+    for cls in _TP_MISMATCH_CLASSES:
+        counters[cls] = _get_or_create(
+            f"sglang:dflash_tp_{cls}_total",
+            "DFLASH TP divergence events classified as "
+            f"{cls} (SGLANG_DFLASH_TP_DETECT input capture).",
+        )
+    _dflash_tp_detect_state["counters"] = counters
+    return counters
+
+
+def _dflash_tp_input_capture_dump(
+    *,
+    cls: str,
+    context: str,
+    tp_rank: int,
+    batch: "ScheduleBatch",
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    candidates: Optional[torch.Tensor],
+    next_token_logits: Optional[torch.Tensor],
+    sampling_info,
+    uniform_samples: Optional[torch.Tensor],
+    uniform_samples_for_final_sampling: Optional[torch.Tensor],
+    target_predict: Optional[torch.Tensor],
+    hash_matrix: torch.Tensor,
+) -> None:
+    """First-mismatch full-state dump to LOCAL disk.
+
+    Saves only this rank's LOCAL tensors and issues NO collectives: at this
+    point cross-rank state may already be inconsistent, so any collective
+    beyond the fixed-shape gathers already done could deadlock.
+    """
+    try:
+
+        def _cpu(t):
+            return None if t is None else t.detach().to("cpu")
+
+        try:
+            rids = [req.rid for req in batch.reqs]
+        except Exception:  # never let diagnostics break the engine
+            rids = None
+        si = sampling_info
+        payload = {
+            "class": cls,
+            "context": context,
+            "tp_rank": tp_rank,
+            "rids": rids,
+            "accept_len": _cpu(accept_len),
+            "bonus": _cpu(bonus),
+            "candidates": _cpu(candidates),
+            "next_token_logits": _cpu(next_token_logits),
+            "temperatures": _cpu(getattr(si, "temperatures", None)),
+            "top_ks": _cpu(getattr(si, "top_ks", None)),
+            "top_ps": _cpu(getattr(si, "top_ps", None)),
+            "uniform_samples": _cpu(uniform_samples),
+            "uniform_samples_for_final_sampling": _cpu(
+                uniform_samples_for_final_sampling
+            ),
+            "target_predict": _cpu(target_predict),
+            "rng_state": (
+                torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            ),
+            "hash_matrix_per_rank": _cpu(hash_matrix),
+        }
+        path = f"/tmp/dflash_tp_mismatch_{cls}_{os.getpid()}_rank{tp_rank}.pt"
+        torch.save(payload, path)
+        logger.warning(
+            "DFLASH TP MISMATCH DUMP: rank=%d class=%s context=%s wrote %s",
+            tp_rank,
+            cls,
+            context,
+            path,
+        )
+    except Exception:  # never let diagnostics break the engine
+        logger.exception("DFLASH TP mismatch dump failed")
+
+
+def _dflash_tp_detect_verify(
+    *,
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    batch: "ScheduleBatch",
+    bs: int,
+    device,
+    context: str,
+    candidates: Optional[torch.Tensor] = None,
+    next_token_logits: Optional[torch.Tensor] = None,
+    sampling_info=None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
+) -> None:
+    """LOG-ONLY: all_gather a COPY of accept_len/bonus plus per-input hashes
+    and compare ranks. Gathered data is never written into live tensors."""
+    state = _dflash_tp_detect_state
+    if state["enabled"] is None:
+        state["enabled"] = envs.SGLANG_DFLASH_TP_DETECT.get()
+    if not state["enabled"]:
+        return
+    tp_group = get_tp_group()
+    tp_size = int(tp_group.world_size)
+    if tp_size <= 1:
+        return
+    # Callers pass self.device, which is server_args.device: an Optional[str]
+    # (e.g. "cuda"), NOT a torch.device. Normalize before any .type access
+    # (torch.tensor/torch.empty accept either, .type does not).
+    if isinstance(device, str):
+        device = torch.device(device)
+    # A collective issued inside CUDA-graph capture could deadlock: skip the
+    # check while capturing rather than risk a hang.
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return
+    counters = _dflash_tp_detect_counters()
+    counters["verify"].inc()
+
+    def _h(t) -> int:
+        return _TP_HASH_NONE if t is None else _dflash_tp_hash_tensor64(t)
+
+    # Per-input hashes. The RNG state is read AFTER the (explicitly
+    # pre-drawn, see call site) coins, so it fingerprints the exact generator
+    # position the accept kernel consumed. torch.cuda.get_rng_state() is a
+    # local read, not a collective. Hashing is a read-only fold; live tensors
+    # are never modified.
+    si = sampling_info
+    local_hashes = torch.tensor(
+        [
+            _h(accept_len),
+            _h(bonus),
+            _h(candidates),
+            _h(candidates[:, 0] if candidates is not None else None),
+            _h(next_token_logits),
+            _h(getattr(si, "temperatures", None)),
+            _h(getattr(si, "top_ks", None)),
+            _h(getattr(si, "top_ps", None)),
+            _h(uniform_samples),
+            _h(uniform_samples_for_final_sampling),
+            _h(torch.cuda.get_rng_state() if device.type == "cuda" else None),
+            _h(target_predict),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    # Fixed per-call shapes: local [2*bs] gathered into [tp_size*2*bs]. bs is
+    # identical on all TP ranks for the same batch step, so the collective
+    # itself can never hang on a size mismatch. torch.stack always copies
+    # into a fresh contiguous buffer, so the live accept_len/bonus tensors
+    # are never aliased or modified, and `gathered` is never written back.
+    local = torch.stack([accept_len.to(torch.int32), bonus.to(torch.int32)]).reshape(
+        -1
+    )
+    gathered = torch.empty(tp_size * 2 * bs, dtype=torch.int32, device=device)
+    tp_group.all_gather_into_tensor(gathered, local)
+    gathered_hashes = torch.empty(
+        tp_size * _TP_HASH_N, dtype=torch.int64, device=device
+    )
+    tp_group.all_gather_into_tensor(gathered_hashes, local_hashes)
+    per_rank = gathered.view(tp_size, 2, bs)
+    hash_matrix = gathered_hashes.view(tp_size, _TP_HASH_N)
+    ref = per_rank[0]
+    outputs_differ = bool((per_rank[1:] != ref).any())
+    slot_diff = (hash_matrix[1:] != hash_matrix[0]).any(dim=0)  # [_TP_HASH_N]
+    if not outputs_differ and not bool(slot_diff[2:].any()):
+        return
+    if outputs_differ:
+        counters["mismatch"].inc()
+    # Classify the mismatch by its FIRST diverging input, in causal order:
+    # candidates (slot 0 = inherited prefill/sampler token) -> logits ->
+    # sampling params -> coins -> RNG state -> greedy argmax -> outputs-only.
+    # Reaching the argmax branch implies equal logits, so a greedy
+    # target_predict diff there is an argmax/kernel issue, not upstream.
+    if bool(slot_diff[_TP_SLOT_CANDIDATE_SLOT0]) or bool(
+        slot_diff[_TP_SLOT_CANDIDATES]
+    ):
+        cls = "candidate_mismatch"
+        verdict = (
+            "S1-prefill/inherited-token"
+            if bool(slot_diff[_TP_SLOT_CANDIDATE_SLOT0])
+            else "candidate-body-differs"
+        )
+    elif bool(slot_diff[_TP_SLOT_LOGITS]):
+        cls = "logits_mismatch"
+        verdict = "H4/upstream-model"
+    elif (
+        bool(slot_diff[_TP_SLOT_TEMPERATURES])
+        or bool(slot_diff[_TP_SLOT_TOP_KS])
+        or bool(slot_diff[_TP_SLOT_TOP_PS])
+    ):
+        cls = "sampling_info_mismatch"
+        verdict = "sampling-params-upstream"
+    elif bool(slot_diff[_TP_SLOT_COINS_VERIFY]) or bool(
+        slot_diff[_TP_SLOT_COINS_FINAL]
+    ):
+        cls = "coin_mismatch"
+        verdict = "coin-draw-desync"
+    elif bool(slot_diff[_TP_SLOT_RNG_STATE]):
+        cls = "rng_mismatch"
+        verdict = "rng-state-desync"
+    elif bool(slot_diff[_TP_SLOT_TARGET_PREDICT]):
+        cls = "argmax_mismatch"
+        verdict = "H1-kernel(greedy-argmax)"
+    elif outputs_differ:
+        cls = "output_mismatch_equal_inputs"
+        verdict = "H1-kernel"
+    else:
+        return  # nothing actionable
+    counters[cls].inc()
+    first = not state["dumped"]
+    now = time.monotonic()
+    if first or now - state["last_log_ts"] >= _DFLASH_TP_DETECT_LOG_INTERVAL_S:
+        state["last_log_ts"] = now
+        try:
+            rids = [req.rid for req in batch.reqs]
+        except Exception:  # never let diagnostics break the engine
+            rids = None
+        logger.warning(
+            "DFLASH TP DIVERGENCE (%s): class=%s tp_rank=%d bs=%d rids=%s "
+            "accept_len_per_rank=%s bonus_per_rank=%s hash_matrix_per_rank=%s",
+            context,
+            cls,
+            tp_group.rank_in_group,
+            bs,
+            rids,
+            per_rank[:, 0, :].tolist(),
+            per_rank[:, 1, :].tolist(),
+            hash_matrix.tolist(),
+        )
+    if first:
+        state["dumped"] = True
+        logger.warning(
+            "DFLASH TP MISMATCH VERDICT (%s): class=%s verdict=%s",
+            context,
+            cls,
+            verdict,
+        )
+        _dflash_tp_input_capture_dump(
+            cls=cls,
+            context=context,
+            tp_rank=tp_group.rank_in_group,
+            batch=batch,
+            accept_len=accept_len,
+            bonus=bonus,
+            candidates=candidates,
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_predict=target_predict,
+            hash_matrix=hash_matrix,
+        )
+
 
 
 @dataclass
@@ -200,6 +586,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         self._tp_group = get_tp_group()
+
+        # LOG-ONLY TP divergence detector gate (SGLANG_DFLASH_TP_DETECT, env
+        # fixed at server start). Read once: when False, every detector code
+        # path below is a no-op and the #33614 broadcast behavior is
+        # byte-identical to the uninstrumented fix branch.
+        self._dflash_tp_detect = envs.SGLANG_DFLASH_TP_DETECT.get()
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -1991,17 +2383,66 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        # Detector input-capture slots, filled in below per mode. None in
+        # modes that do not produce them (hashed to a sentinel by the
+        # detector; never an extra RNG draw).
+        target_predict = None
+        uniform_samples = None
+        uniform_samples_for_final_sampling = None
+        _tp_detect_raw_target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            if self._dflash_tp_detect:
+                # SGLANG_DFLASH_TP_DETECT input capture: the verify coins are
+                # drawn EXPLICITLY here instead of inside
+                # compute_dflash_sampling_correct_drafts_and_bonus.
+                # RNG-equivalence proof: that function's ONLY RNG consumers
+                # are, in order, torch.rand((bs, draft_token_num), float32)
+                # then torch.rand((bs,), float32) on next_token_logits.device
+                # from the default CUDA generator (dflash_utils.py), and
+                # nothing between this point and the call consumes RNG (shape
+                # checks and server-arg reads only). Identical generator,
+                # shape, dtype, device, and order => identical philox
+                # consumption and identical values; passing them in makes the
+                # internal draws a no-op, so the net RNG stream is
+                # byte-identical to the unmodified code.
+                uniform_samples = torch.rand(
+                    (bs, int(self.block_size)),
+                    dtype=torch.float32,
+                    device=logits_output.next_token_logits.device,
+                )
+                uniform_samples_for_final_sampling = torch.rand(
+                    (bs,),
+                    dtype=torch.float32,
+                    device=logits_output.next_token_logits.device,
+                )
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            )
+            # LOG-ONLY TP divergence detector, STRICTLY BEFORE the #33614
+            # broadcast: all_gathers COPIES of the raw rank-local
+            # accept_len/bonus (never writes back into the live tensors).
+            _dflash_tp_detect_verify(
+                accept_len=accept_len,
+                bonus=bonus,
+                batch=batch,
+                bs=bs,
+                device=device,
+                context="sampling",
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             )
             self._tp_group.broadcast_capture_safe(accept_len, src=0)
             self._tp_group.broadcast_capture_safe(bonus, src=0)
@@ -2017,6 +2458,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
+            if self._dflash_tp_detect:
+                # LOG-ONLY detector: snapshot the RAW rank-local argmax
+                # STRICTLY BEFORE the #33614 broadcast overwrites it, so the
+                # greedy-path check below hashes pre-sync values.
+                _tp_detect_raw_target_predict = target_predict.clone()
             self._tp_group.broadcast_capture_safe(target_predict, src=0)
             if self._use_triton_accept_bonus:
                 try:
@@ -2076,6 +2522,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+            # LOG-ONLY TP divergence check on the committed greedy
+            # accept_len/bonus (placed after the argmax-derived
+            # accept_len/bonus are final in every greedy sub-branch: triton,
+            # triton-fallback, and eager). target_predict is the RAW
+            # pre-broadcast clone snapshotted above, so this check sees
+            # pre-sync values even though the live tensor was already synced.
+            _dflash_tp_detect_verify(
+                accept_len=accept_len,
+                bonus=bonus,
+                batch=batch,
+                bs=bs,
+                device=device,
+                context="greedy",
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+                target_predict=_tp_detect_raw_target_predict,
+            )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

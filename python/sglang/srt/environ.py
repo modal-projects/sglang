@@ -766,6 +766,10 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Log-only diagnostic: measure (never correct) whether DFLASH commits
+    # different accept_len/bonus on different TP ranks. Default OFF = zero
+    # overhead, no collective at all.
+    SGLANG_DFLASH_TP_DETECT = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

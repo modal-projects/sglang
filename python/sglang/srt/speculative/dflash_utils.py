@@ -50,9 +50,34 @@ else:
     top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
+if top_p_renorm_prob is not None:
+    try:
+        from flashinfer.sampling import (
+            top_p_renorm_probs as _flashinfer_top_p_renorm_probs,
+        )
+    except Exception:
+        _flashinfer_top_p_renorm_probs = None
+else:
+    _flashinfer_top_p_renorm_probs = None
+
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _top_p_renorm_prob_deterministic(
+    probs: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """Top-p renormalization with a deterministic reduction.
+
+    ``is_deterministic=True`` selects flashinfer's deterministic reduction, so
+    repeated calls on bitwise-identical inputs return bitwise-identical outputs
+    (the default path does not fix its reduction order). Falls back to the
+    sgl_kernel wrapper where flashinfer is unavailable.
+    """
+    if _flashinfer_top_p_renorm_probs is not None and probs.device.type != "musa":
+        return _flashinfer_top_p_renorm_probs(probs, top_p, is_deterministic=True)
+    return top_p_renorm_prob(probs, top_p)
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -890,7 +915,9 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _top_p_renorm_prob_deterministic(
+                    topk_probs, repeated_top_ps
+                )
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -904,7 +931,7 @@ def build_dflash_verify_target_probs(
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _top_p_renorm_prob_deterministic(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )

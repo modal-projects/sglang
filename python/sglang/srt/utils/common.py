@@ -4738,6 +4738,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "ffn.shared_experts.w1",
     "ffn.shared_experts.w2",
     "ffn.shared_experts.w3",
+    # GDN (GatedDeltaNet) projections
+    "in_proj_qkvz",
+    "in_proj_ba",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

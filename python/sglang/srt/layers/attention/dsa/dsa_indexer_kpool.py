@@ -39,6 +39,9 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import get_device
 
 if TYPE_CHECKING:
@@ -1349,6 +1352,42 @@ class IndexerKPool(MultiPlatformOp):
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
     def forward_cuda(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        if (
+            is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
+                bcg_kpool_indexer_prefill_with_output,
+            )
+
+            # K-pool prefill plans contain request-specific tensors and launch
+            # counts. Like the ordinary DSA indexer, execute them eagerly and
+            # bridge the result into a stable buffer for captured attention.
+            output = torch.empty(
+                (
+                    x.shape[0] if return_indices else 0,
+                    self.index_topk + self.index_kpool - 1,
+                ),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            bcg_kpool_indexer_prefill_with_output(
+                self, x, q_lora, positions, output, layer_id
+            )
+            return output if return_indices else None
+        return self._forward_cuda_impl(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
+
+    def _forward_cuda_impl(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,

@@ -1411,6 +1411,12 @@ class IndexerKPool(MultiPlatformOp):
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            # The BCG eager break must finish its indexer work before starting
+            # the next capture segment; keep its projections on one stream.
+            and not (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
         )
 
         # Skip DSA if the attention backend chooses to skip this batch.

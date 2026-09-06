@@ -171,8 +171,8 @@ def _linear_attention_with_output_impl(
             layer=attention_layer,
             forward_batch=forward_batch,
             mixed_qkv=mixed_qkv[:real_num_tokens],
-            a=a[:real_num_tokens],
-            b=b[:real_num_tokens],
+            a=a.narrow(0 if a.ndim == 2 else 1, 0, real_num_tokens),
+            b=b.narrow(0 if b.ndim == 2 else 1, 0, real_num_tokens),
             linear_attn_output=logical_output,
         )
     finally:

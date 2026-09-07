@@ -229,6 +229,16 @@ def unified_linear_attention_with_output(
     )
 
 
-bcg_unified_linear_attention_with_output = eager_on_graph(True)(
-    unified_linear_attention_with_output
-)
+def _linear_attention_capture_stub(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    output.zero_()
+
+
+bcg_unified_linear_attention_with_output = eager_on_graph(
+    True, capture_stub=_linear_attention_capture_stub
+)(unified_linear_attention_with_output)

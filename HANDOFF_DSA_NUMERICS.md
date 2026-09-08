@@ -73,10 +73,18 @@ modified source files.
 | Valid-layout guard probe | `ap-U0KF0s7ZsLgGMwG1xz5J7L` | `fc-01M211KQ0YFGMP0ZRACSSYSCNH` |
 | Integrated matched smoke | `ap-BqufpvnK3UscFF1FvKoOCE` | `fc-01M211PDCRWEC2J55WGFB5GY2K` |
 
+The complete probe/harness archive is in `glm53-kda-benchmarks` at
+`dsa-numerics-handoff-20260908/harness.tar.gz`, with hashes in the adjacent
+`archive-manifest.json`.
+
 All runs use retries=0. Results are in `glm53-kda-benchmarks` under the run IDs
 from the corresponding `launch-*.json` files. The integrated smoke is detached
 and gated on the passed guard probe. It uses the unchanged serving recipe,
 Triton KDA, TRTLLM DSA, DFlash2 epoch-2 block-8, and seed 479309393.
+
+The GPU child call is `fc-01M211PJA27ZNY7QY5HH0VVHC7`; immutable image
+`im-lqx8gZaE2jbRIROnN0R4To`. It cleared its dependency and entered published
+startup.
 
 Candidate and control run on the same four B300s. **Control keeps KDA captured
 and DSA eager** to isolate the DSA change. Required numerical gate: all 535

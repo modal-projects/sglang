@@ -1231,7 +1231,7 @@ class DeepseekSparseAttnBackend(
             if sum(forward_batch.extend_seq_lens_cpu) <= config.max_bs:
                 if not hasattr(self, "_prefill_graph_buffers"):
                     self._prefill_graph_buffers = DSAPrefillGraphMetadata(
-                        config.max_bs, self.device
+                        config.max_bs, self.device, config.bs, self.num_q_heads
                     )
                 self._prefill_graph_buffers.update(forward_batch, metadata)
                 self.prefill_graph_metadata = self._prefill_graph_buffers

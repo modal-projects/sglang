@@ -709,6 +709,7 @@ class DeepseekMLAForwardMixin:
                 if (
                     is_in_breakable_cuda_graph()
                     and getattr(backend, "prefill_graph_metadata", None) is not None
+                    and backend.prefill_graph_metadata.can_capture(q_nope_out.shape[0])
                 ):
                     bmm_attention_fn = captured_mla_bmm_then_attention
                 else:

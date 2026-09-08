@@ -8,11 +8,21 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 
 
 class DSAPrefillGraphMetadata:
-    def __init__(self, max_tokens, device):
+    def __init__(self, max_tokens, device, capture_sizes, num_heads):
         self.max_tokens = max_tokens
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        previous = 0
+        self.capture_sizes = set()
+        for size in sorted(capture_sizes):
+            if num_heads in (8, 16, 32) and previous >= sm_count // 2:
+                self.capture_sizes.add(size)
+            previous = size
         self.seq_lens = torch.ones(max_tokens, dtype=torch.int32, device=device)
         self.cache_locs = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def can_capture(self, num_tokens):
+        return num_tokens in self.capture_sizes
 
     def update(self, forward_batch, metadata):
         tokens = sum(forward_batch.extend_seq_lens_cpu)

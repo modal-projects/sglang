@@ -16,11 +16,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import (
-    get_schema_properties,
-    infer_type_from_json_schema,
-    safe_literal_eval,
-)
+from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -50,42 +46,75 @@ class StreamState(str, Enum):
     IN_VALUE = "IN_VALUE"
 
 
+def _argument_types(
+    schema: Any,
+    root: Any,
+    key: Optional[str] = None,
+    seen: frozenset[int] = frozenset(),
+) -> Optional[set[str]]:
+    """Keep every possible type until the argument value disambiguates a union."""
+    if not isinstance(schema, dict) or id(schema) in seen:
+        return None
+    seen = seen | {id(schema)}
+    constraints = []
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and (ref == "#" or ref.startswith("#/")):
+        target = root
+        try:
+            for part in ref[2:].split("/") if ref != "#" else []:
+                part = part.replace("~1", "/").replace("~0", "~")
+                target = target[int(part)] if isinstance(target, list) else target[part]
+            types = _argument_types(target, root, key, seen)
+            if types is not None:
+                constraints.append(types)
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+    if key is not None:
+        field = schema.get("properties", {}).get(key)
+        types = _argument_types(field, root, seen=seen)
+        if types is not None:
+            constraints.append(types)
+    else:
+        types = schema.get("type")
+        if isinstance(types, str):
+            constraints.append({types})
+        elif isinstance(types, list):
+            constraints.append(set(types))
+        values = [schema["const"]] if "const" in schema else schema.get("enum")
+        if isinstance(values, list):
+            names = {
+                type(None): "null",
+                bool: "boolean",
+                int: "integer",
+                float: "number",
+                str: "string",
+                list: "array",
+                dict: "object",
+            }
+            constraints.append({names[type(value)] for value in values})
+    for keyword in ("anyOf", "oneOf"):
+        if isinstance(schema.get(keyword), list):
+            alternatives = [
+                _argument_types(branch, root, key, seen) for branch in schema[keyword]
+            ]
+            if alternatives and all(types is not None for types in alternatives):
+                constraints.append(set().union(*alternatives))
+    if isinstance(schema.get("allOf"), list):
+        for branch in schema["allOf"]:
+            types = _argument_types(branch, root, key, seen)
+            if types is not None:
+                constraints.append(types)
+    return set.intersection(*constraints) if constraints else None
+
+
 def get_argument_type(
     func_name: str, arg_key: str, defined_tools: List[Tool]
 ) -> Optional[str]:
-    """Get the expected type of a function argument from tool definitions.
-
-    Supports complex JSON Schema definitions including:
-    - Direct type field (including type arrays)
-    - anyOf/oneOf: parameter can be any of multiple types
-    - enum: parameter must be one of enum values
-    - allOf: parameter must satisfy all type definitions
-    - properties: inferred as object type
-    - items: inferred as array type
-
-    Args:
-        func_name: Name of the function/tool
-        arg_key: Name of the argument
-        defined_tools: List of available tools
-
-    Returns:
-        The type string (e.g., 'string', 'number', 'object') or None if not found
-    """
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-
-    # Check if function exists
-    tool = name2tool.get(func_name)
-    if not tool:
-        return None
-
-    # Get parameters safely using getattr
-    params = getattr(tool.function, "parameters", None)
-
-    arg_spec = get_schema_properties(params).get(arg_key)
-    if isinstance(arg_spec, dict):
-        # Use the new type inference function for complex JSON Schema support
-        return infer_type_from_json_schema(arg_spec)
-
+    for tool in defined_tools:
+        if tool.function.name == func_name:
+            schema = tool.function.parameters
+            types = _argument_types(schema, schema, arg_key)
+            return next(iter(types)) if types and len(types) == 1 else None
     return None
 
 
@@ -273,57 +302,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
-        """Get parameter type from tool definition, with fallback to auto-detection.
-
-        Args:
-            func_name: Name of the function
-            key: Parameter name
-            tools: List of available tools
-
-        Returns:
-            Type string: 'string', 'number', 'object', 'array', or 'boolean'
-        """
-        arg_type = get_argument_type(func_name, key, tools)
-        if arg_type:
-            return arg_type
-
-        # Improved auto-detection type from value (best effort)
-        value_content = self._current_value.strip() if self._current_value else ""
-
-        if not value_content:
-            return "string"
-
-        # Try to parse as valid JSON first
-        try:
-            parsed = json.loads(value_content)
-            if isinstance(parsed, dict):
-                return "object"
-            elif isinstance(parsed, list):
-                return "array"
-            elif isinstance(parsed, bool):
-                return "boolean"
-            elif isinstance(parsed, (int, float)):
-                return "number"
-            # For string values, check if they look like numbers
-            elif isinstance(parsed, str):
-                if parsed.isdigit() or (
-                    parsed.startswith("-") and parsed[1:].isdigit()
-                ):
-                    return "number"
-                return "string"
-        except json.JSONDecodeError:
-            # Not valid JSON, try heuristic detection
-            first_char = value_content[0] if value_content else ""
-
-            if first_char.isdigit() or first_char in ["-", "."]:
-                return "number"
-            elif first_char in ["{", "["]:
-                return "object"
-            elif first_char in ['"', "'"]:
-                return "string"
-
-        # Default to string (safest fallback)
-        return "string"
+        return get_argument_type(func_name, key, tools) or "auto"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
         """Format complete value based on type.
@@ -410,7 +389,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
 
-                    if self._value_started:
+                    if value_type == "auto":
+                        parsed = self._parse_argument_pairs(
+                            [(self._current_key, self._current_value)], func_name, tools
+                        )[self._current_key]
+                        json_output += json.dumps(parsed, ensure_ascii=False)
+                    elif self._value_started:
                         # Output any remaining content
                         if final_value:
                             if value_type == "string":
@@ -444,7 +428,10 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Use cached value type for consistency
                         value_type = self._cached_value_type or "string"
 
-                        if value_type == "string":
+                        if value_type == "auto":
+                            self._current_value += content
+                            self._xml_tag_buffer = ""
+                        elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -789,7 +776,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
-            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
+            parsed_value, is_good_json = parse_arguments(
+                arg_value, arg_type or "string"
+            )
 
             if arg_type == "string":
                 # Only convert to string if explicitly defined as string type
@@ -799,7 +788,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     # If parsed as dict/list but schema says string, convert to JSON string
                     arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
                 else:
-                    arguments[arg_key] = str(parsed_value)
+                    arguments[arg_key] = arg_value
             elif arg_type is None:
                 # If type is not defined, keep the parsed value as-is
                 arguments[arg_key] = parsed_value if is_good_json else arg_value

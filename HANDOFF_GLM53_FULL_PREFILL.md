@@ -25,7 +25,7 @@ The runner is still BCG; the generic `full` runner is not implemented here.
   original small-grid behavior. This is a candidate numerical fix, not yet
   validated on the integrated model.
 
-## Results as of 2026-09-08 15:48 UTC
+## Results as of 2026-09-08 15:57 UTC
 
 - 24 synthetic KDA replay cases passed on B300, reusing one 4096-token graph
   while changing sequence lengths, slot mappings, prefix flags and snapshots.
@@ -39,6 +39,10 @@ The runner is still BCG; the generic `full` runner is not implemented here.
   Includes 2049/3073/4095/4096 tokens and batch sizes 2/4/8/16/32.
   4097-token prefill correctly launches zero graphs.
 - Repository pre-commit hooks passed for all modified Python files.
+- Revised KDA (`e44be6b92d`) passed all **30 synthetic replays bitwise exactly**
+  for outputs, SSM states, and convolution states. This includes the added
+  31/32/64-token cases; output padding was zero in every case. Real-activation
+  and integrated same-GPU parity remain pending.
 - The first KDA model smoke completed 510 finite-output checks, the 33-case
   runtime stress suite (including long context and multimodal inputs), and
   all-rank multimodal replay profiles. **This does not establish parity.**
@@ -156,3 +160,5 @@ Independent revised synthetic probe (does not wait for collection):
 `ap-nVKvS8qYuuVstrRPKP2Y9c` / `fc-01M20VJ9QWQB975NNJ205C4CKQ`,
 run `20260908T155310.127061Z-kda-graph-probe`; record
 `launch-probe-synthetic-v2.json`.
+Completed: `passed`, all 30 cases exact. Local/archived result:
+`progress-probe-synthetic-v2.json`.

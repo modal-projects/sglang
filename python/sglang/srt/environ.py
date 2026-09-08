@@ -1252,6 +1252,7 @@ class Envs:
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     SGLANG_KDA_PREFILL_CUDA_GRAPH = EnvBool(False)
+    SGLANG_DSA_PREFILL_CUDA_GRAPH = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

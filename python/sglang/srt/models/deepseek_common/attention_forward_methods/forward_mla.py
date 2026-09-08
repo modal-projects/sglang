@@ -704,11 +704,19 @@ class DeepseekMLAForwardMixin:
                     llama_4_scaling=llama_4_scaling,
                 )
             if fusion_plan is not None:
-                bmm_attention_fn = (
-                    bcg_mla_bmm_then_unified_attention
-                    if is_in_breakable_cuda_graph()
-                    else mla_bmm_then_unified_attention
-                )
+                backend = get_attn_backend()
+                backend = getattr(backend, "full_attn_backend", backend)
+                if (
+                    is_in_breakable_cuda_graph()
+                    and getattr(backend, "prefill_graph_metadata", None) is not None
+                ):
+                    bmm_attention_fn = captured_mla_bmm_then_attention
+                else:
+                    bmm_attention_fn = (
+                        bcg_mla_bmm_then_unified_attention
+                        if is_in_breakable_cuda_graph()
+                        else mla_bmm_then_unified_attention
+                    )
                 bmm_attention_fn(
                     fusion_plan.q_nope_t,
                     self.w_kc,
@@ -1006,6 +1014,32 @@ def mla_bmm_then_unified_attention(
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
     )
+
+
+def captured_mla_bmm_then_attention(
+    q_nope_t,
+    w_kc,
+    q_nope_out_buf,
+    q_nope_out_view,
+    k_nope,
+    attn_output_buf,
+    save_kv_cache,
+    layer_id,
+    q_pe,
+    k_pe,
+    **kwargs,
+):
+    assert save_kv_cache
+    assert q_pe.shape[-1] == 0 and k_pe.shape[-1] == 0
+    context = get_tc_piecewise_forward_context()
+    layer = context.attention_layers[layer_id]
+    backend = get_attn_backend()
+    backend = getattr(backend, "full_attn_backend", backend)
+    torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+    result = backend.forward_prefill_graph(
+        layer, q_nope_out_view, k_nope, k_pe, kwargs["topk_indices"]
+    )
+    attn_output_buf.copy_(result.view(attn_output_buf.shape))
 
 
 bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(

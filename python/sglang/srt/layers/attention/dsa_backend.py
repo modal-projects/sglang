@@ -1205,6 +1205,45 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        self.prefill_graph_metadata = None
+        if (
+            envs.SGLANG_DSA_PREFILL_CUDA_GRAPH.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.layers.attention.dsa.trtllm_prefill_cuda_graph import (
+                DSAPrefillGraphMetadata,
+            )
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            config = get_exec().graph.cuda_graph_config.prefill
+            if (
+                config.backend != Backend.BREAKABLE
+                or self.dsa_prefill_impl != "trtllm"
+                or not self.use_fused_topk
+                or self.qk_rope_head_dim != 0
+                or self.kv_cache_dtype != torch.float8_e4m3fn
+                or self.dsa_index_kpool != 4
+                or get_parallel().attn_dcp_size != 1
+            ):
+                raise ValueError(
+                    "Captured DSA prefill requires GLM FP8 TRTLLM KPool with fused top-k"
+                )
+            if sum(forward_batch.extend_seq_lens_cpu) <= config.max_bs:
+                if not hasattr(self, "_prefill_graph_buffers"):
+                    self._prefill_graph_buffers = DSAPrefillGraphMetadata(
+                        config.max_bs, self.device
+                    )
+                self._prefill_graph_buffers.update(forward_batch, metadata)
+                self.prefill_graph_metadata = self._prefill_graph_buffers
+
+    def forward_prefill_graph(self, layer, q, k, k_rope, topk_indices):
+        from sglang.srt.layers.attention.dsa.trtllm_prefill_cuda_graph import (
+            dsa_prefill_graph_forward,
+        )
+
+        return dsa_prefill_graph_forward(
+            self, layer, q, k, k_rope, topk_indices, self.prefill_graph_metadata
+        )
 
     def _cal_indexer_k_start_end(
         self,

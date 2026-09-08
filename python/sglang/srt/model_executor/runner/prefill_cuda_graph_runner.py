@@ -309,13 +309,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        dsa_variants = envs.SGLANG_DSA_PREFILL_CUDA_GRAPH_VARIANTS.get()
+        if (
+            dsa_variants == "all"
+            and not model_runner.is_draft_worker
+            and 1 not in self.capture_num_tokens
+        ):
+            self.capture_num_tokens.insert(0, 1)
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
         self.dsa_prefill_graph_variants = None
         self.dsa_variant_capture_stats = []
-        dsa_variants = envs.SGLANG_DSA_PREFILL_CUDA_GRAPH_VARIANTS.get()
         if dsa_variants and not model_runner.is_draft_worker:
             from sglang.srt.layers.attention.dsa.prefill_graph_variants import (
                 DSAPrefillGraphVariants,
@@ -1496,6 +1502,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
         if self.dsa_prefill_graph_variants is not None:
+            self.device_module.synchronize()
+            variant_started = time.monotonic()
+            variant_free = torch.cuda.mem_get_info(self.device)[0]
+            logger.info(
+                "DSA_PREFILL_VARIANTS_BEGIN %s",
+                json.dumps(
+                    dict(
+                        rank=get_parallel().tp_rank,
+                        variants=len(self.dsa_prefill_graph_variants.variants),
+                        device_free_bytes=variant_free,
+                    )
+                ),
+            )
             for variant in self.dsa_prefill_graph_variants.variants:
                 bucket = self.dsa_prefill_graph_variants.bucket(variant[0])
                 self.device_module.synchronize()
@@ -1505,6 +1524,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_one_shape(bucket, dsa_variant=variant)
                 self.device_module.synchronize()
                 record = dict(
+                    rank=get_parallel().tp_rank,
                     tokens=variant[0],
                     context_bound=variant[1],
                     bucket=bucket,
@@ -1512,6 +1532,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     allocated_bytes=torch.cuda.memory_allocated(self.device)
                     - allocated,
                     reserved_bytes=torch.cuda.memory_reserved(self.device) - reserved,
+                    cumulative_device_bytes=variant_free
+                    - torch.cuda.mem_get_info(self.device)[0],
+                    cumulative_seconds=time.monotonic() - variant_started,
                     segments=len(
                         self.backend._graphs[
                             ShapeKey(
@@ -1525,6 +1548,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self.dsa_variant_capture_stats.append(record)
                 logger.info("DSA_PREFILL_VARIANT_CAPTURE %s", json.dumps(record))
+                if (
+                    record["cumulative_device_bytes"] > 8 * 1024**3
+                    or record["cumulative_seconds"] > 1800
+                ):
+                    raise RuntimeError(
+                        "DSA variant capture exceeded its 8 GiB/30 minute budget"
+                    )
 
     def capture_one_shape(
         self,

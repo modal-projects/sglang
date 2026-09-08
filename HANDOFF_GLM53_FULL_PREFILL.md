@@ -9,6 +9,30 @@ TP4/EP4, DeepGEMM MoE, and DFlash2 epoch-2 block8. Both new flags default off:
 `SGLANG_KDA_PREFILL_CUDA_GRAPH` and `SGLANG_DSA_PREFILL_CUDA_GRAPH`.
 The runner is still BCG; the generic `full` runner is not implemented here.
 
+## Latest update: 2026-09-08 17:10 UTC
+
+- Revised KDA real-activation replay: **126/126 bitwise-exact outputs, SSM
+  states and convolution states**, covering 42 fixtures replayed three times.
+- Revised KDA integrated same-GPU validation **passed**: **510/510 greedy
+  outputs equal**, max selected teacher log-probability difference **0.0214723**
+  against threshold 0.05. All 33 stress cases and multimodal replay passed.
+  Profiles confirm 23 segments versus 57 for the matched control.
+- Combined KDA+DSA integrated validation **failed numerical parity**:
+  **499/510 greedy outputs equal**, maximum difference **2.272848**. Profiles
+  did confirm 12 segments, and finite/stress checks passed; those do not
+  establish numerical equivalence. All 11 greedy failures are fresh 2–32-token
+  prefills; log-probability differences above threshold extend through 64.
+- The throughput curve driver **stopped at the correctness gate**. No
+  benchmark GPU job or points ran. Do not requeue it until DSA parity passes.
+- Pooled-indexer capture remains unimplemented. The next diagnostic isolates
+  the DSA short-context path, including the maximum-sequence-length scalar and
+  graph padding. See `launch-dsa-short-probe.json` in the harness for the run.
+
+Local/archived evidence: `progress-smoke.json`, `progress-dsa-smoke.json`,
+`latest-smoke-matched-comparison.json`,
+`latest-dsa-smoke-matched-comparison.json`, and `progress-curve.json`.
+The dated results below preserve the earlier experiment history.
+
 ## Implemented
 
 - `e21e303d9c`: capture KDA using stable ragged chunk maps, packed convolution

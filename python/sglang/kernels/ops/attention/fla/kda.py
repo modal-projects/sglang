@@ -538,9 +538,13 @@ def _recompute_w_u_fwd_kernel(
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    active_chunks=None,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    if active_chunks is not None:
+        if tl.load(active_chunks) * H <= 256:
+            return
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -708,6 +712,8 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    active_chunks: torch.Tensor | None = None,
+    output_buffers: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
@@ -716,9 +722,12 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
-    kg = torch.empty_like(k) if gk is not None else None
+    if output_buffers is None:
+        w = torch.empty_like(k)
+        u = torch.empty_like(v)
+        kg = torch.empty_like(k) if gk is not None else None
+    else:
+        w, u, kg = output_buffers
     static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
     kernel = (
         _recompute_w_u_fwd_kernel
@@ -744,6 +753,7 @@ def recompute_w_u_fwd(
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
         DOT_PRECISION="ieee",
+        active_chunks=active_chunks,
         **(static_config or {}),
     )
     return w, u, kg
@@ -1102,6 +1112,7 @@ def chunk_kda_fwd(
     output_intermediate_states: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    active_chunks: Optional[torch.Tensor] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1149,20 +1160,42 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
-    w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        safe_gate=lower_bound is not None,
-        fuse_diagonal=_small_grid,
-        fuse_recompute=_small_grid,
-    )
+    if active_chunks is not None:
+        assert _B == 1 and lower_bound is not None
+        w, u, kg = torch.empty_like(k), torch.empty_like(v), torch.empty_like(k)
+        Aqk = torch.zeros((*k.shape[:3], chunk_size), device=k.device, dtype=k.dtype)
+        for fused in (True, False):
+            chunk_kda_fwd_intra(
+                q=q,
+                k=k,
+                v=v,
+                gk=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices[: 256 // _H_pr] if fused else chunk_indices,
+                safe_gate=True,
+                fuse_diagonal=fused,
+                fuse_recompute=fused,
+                active_chunks=active_chunks,
+                output_buffers=(w, u, kg, Aqk),
+            )
+    else:
+        w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=lower_bound is not None,
+            fuse_diagonal=_small_grid,
+            fuse_recompute=_small_grid,
+        )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
@@ -1219,6 +1252,7 @@ def chunk_kda(
     beta_is_raw: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    active_chunks: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1248,4 +1282,5 @@ def chunk_kda(
         output_intermediate_states=output_intermediate_states,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        active_chunks=active_chunks,
     )

@@ -71,6 +71,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     USE_SAFE_GATE: tl.constexpr,
     FUSE_RECOMPUTE: tl.constexpr,
     FUSE_DIAGONAL: tl.constexpr,
+    active_chunks=None,
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
@@ -86,6 +87,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     """
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    if active_chunks is not None:
+        small_grid = tl.load(active_chunks) * H <= 256
+        if small_grid != FUSE_RECOMPUTE:
+            return
 
     if IS_VARLEN:
         i_n, i_t = (
@@ -816,9 +821,13 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    active_chunks=None,
 ):
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
+    if active_chunks is not None:
+        if tl.load(active_chunks) * H <= 256:
+            return
 
     if IS_VARLEN:
         i_n, i_t = (
@@ -924,6 +933,8 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
+    active_chunks: torch.Tensor | None = None,
+    output_buffers: tuple | None = None,
 ):
     B, T, H, K = k.shape
     V = v.shape[-1]
@@ -934,7 +945,9 @@ def chunk_kda_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
-    if fuse_diagonal:
+    if output_buffers is not None:
+        Aqk = output_buffers[3]
+    elif fuse_diagonal:
         Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     else:
         Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
@@ -963,6 +976,7 @@ def chunk_kda_fwd_intra(
                 BC=BC,
                 BK=BK,
                 USE_GATHER=is_gather_supported,
+                active_chunks=active_chunks,
             )
         else:
             Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
@@ -982,9 +996,12 @@ def chunk_kda_fwd_intra(
     grid = (NT, B * H)
 
     if fuse_recompute:
-        w = torch.empty_like(k)
-        u = torch.empty_like(v)
-        kg = torch.empty_like(k)
+        if output_buffers is None:
+            w = torch.empty_like(k)
+            u = torch.empty_like(v)
+            kg = torch.empty_like(k)
+        else:
+            w, u, kg = output_buffers[:3]
         chunk_kda_fwd_kernel_inter_solve_fused[grid](
             q=q,
             k=k,
@@ -1009,6 +1026,7 @@ def chunk_kda_fwd_intra(
             USE_SAFE_GATE=safe_gate,
             FUSE_RECOMPUTE=True,
             FUSE_DIAGONAL=fuse_diagonal,
+            active_chunks=active_chunks,
         )
         return w, u, None, kg, Aqk, None
 
@@ -1039,6 +1057,7 @@ def chunk_kda_fwd_intra(
         USE_SAFE_GATE=safe_gate,
         FUSE_RECOMPUTE=False,
         FUSE_DIAGONAL=fuse_diagonal,
+        active_chunks=active_chunks,
     )
 
     from sglang.kernels.ops.attention.fla.kda import (
@@ -1053,5 +1072,7 @@ def chunk_kda_fwd_intra(
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        active_chunks=active_chunks,
+        output_buffers=output_buffers[:3] if output_buffers is not None else None,
     )
     return w, u, None, kg, Aqk, Akk

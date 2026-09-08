@@ -133,3 +133,24 @@ Neither pilot serving profiles nor full model parity were complete.
 Full harness: `glm53-kda-benchmarks/dsa-variants-handoff-20260908/full-harness.tar.gz`.
 Each archive has its own SHA256 manifest. Final pass/fail lives in each run's
 `run.json`; numerical parity lives in `matched-comparison.json`.
+
+
+## Pilot passed; full validation started (2026-09-08 18:37 UTC)
+
+The pilot passed published startup, all16 fresh/prefix serving cases, all-rank
+12-launch profile assertions, and final health. Every one of64 startup variant
+records reports12segments. This is finite/profile validation, not a candidate
+versus control numerical comparison.
+
+Per-rank incremental capture seconds:26.9242,26.9239,26.9247,26.9249.
+Driver-inclusive peak device increase:160MiB on each GPU. Conservative360-plan
+projection:605.8seconds (~10.1minutes),3600MiB (~3.52GiB) per GPU. Cost gate passed.
+The raw pilot report is `<pilot-run>/run.json`, cost evidence is
+`dsa-variants-handoff-20260908/pilot-capture-cost.json`, and profiles are
+`glm53-torch-profiles/<pilot-run>/variants`.
+
+Full pipeline automatically cleared both gates and launched GPU worker
+`fc-01M214YQMXPGC6F431GNEJMHTX` under app `ap-oy2gzmIG6HBdeghbGiw8t4`.
+It is in published startup;2,208-case matched parity remains pending.
+The earlier startup delay was Triton KDA cache-file loading on the eager
+multimodal/health warmup paths and resolved without code changes.

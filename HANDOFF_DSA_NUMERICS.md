@@ -101,3 +101,27 @@ GLM53_CAPTURE_DSA=1 GLM53_MATCHED_CONTROL=1 MODAL_PROFILE=modal-labs \
   modal run --detach --env glm-bringup smoke_lane.py \
   --dependency-call fc-01M211KQ0YFGMP0ZRACSSYSCNH
 ```
+
+## Capturing the small shapes: kernel-level alternative passed
+
+A separate probe, without changing the guarded model smoke, captured **all
+90/90 valid layouts bitwise exactly**, including the small 1–80-token cases.
+It passes an exact-live-token query subview and uses
+`min(2052, ceil(actual_max_seq_len / 128) * 128)` as the captured context
+representative. Results: `variant-result.json`. All rows have
+`captured_attention=true`; every graph was replayed three times.
+
+Run `20260908T175038.897209Z-dsa-variant-probe`, app
+`ap-ul6ap0v1wcVL1gkAAaOhdS`, call `fc-01M2129D9YQVH22DWKVDPDEFHE`.
+The 90-case guarded probe above consists of 25 captured cases and 65 preserved
+eager cases; this alternative actually captures attention for all 90.
+
+This establishes a kernel-level route around the eager cutoff. It does **not**
+establish integrated-model parity for graph variants. Integration must select
+variants from CPU live-token/context metadata before replay, preserve fixed
+subview sizes per graph, and copy/zero unused padded output rows. The current
+prefill runner's `ShapeKey` already supports variant labels, but prefill capture
+and selection currently only use them for chunked-prefix variants. The public
+FlashInfer MLA wrapper has no explicit launch-plan override. Exact-live-count
+variants require more graphs; 17 representative context bounds reduce that
+dimension, and actual-plan deduplication could further limit captures.

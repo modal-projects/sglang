@@ -30,7 +30,9 @@ from transformers import (
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.image_prefill_attn_backend import (
+    is_image_prefill,
+)
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -334,14 +336,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
         tokens), not across items.
-        Currently only the TritonAttnBackend supports this.
-
-        TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
+        Requires an attention backend with per-request custom-mask support.
         """
-        if not isinstance(get_attn_backend(), TritonAttnBackend):
+        attn_backend = get_attn_backend()
+        if not attn_backend.supports_custom_mask:
             logger.warning_once(
-                "Bidirectional attention for image tokens requires TritonAttnBackend. "
-                "Falling back to causal attention, which may degrade image quality."
+                "Bidirectional attention for image tokens requires an attention "
+                "backend with custom-mask support (triton, or "
+                "--image-prefill-attention-backend triton). Falling back to causal "
+                "attention, which may degrade image quality."
             )
             return
         assert forward_batch.forward_mode == ForwardMode.EXTEND
@@ -412,10 +415,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
-                bidirectional_attn_mask_indptr
+            attn_backend.install_custom_mask(
+                custom_mask=bidirectional_attn_masks,
+                mask_indptr=bidirectional_attn_mask_indptr,
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -644,10 +647,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # Prepare bidirectional attention masks for image tokens during prefill.
         # mm_inputs is preserved on every PP rank up to the first-rank embed
         # routine, so each rank's attn_backend can install the mask locally.
-        if (
-            forward_batch.forward_mode == ForwardMode.EXTEND
-            and forward_batch.contains_image_inputs()
-        ):
+        if is_image_prefill(forward_batch):
             self.prepare_attn_masks(
                 forward_batch,
                 input_ids,

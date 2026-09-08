@@ -26,7 +26,9 @@ import torch
 from torch import nn
 from transformers import Gemma3Config, PreTrainedModel
 
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.image_prefill_attn_backend import (
+    is_image_prefill,
+)
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -221,7 +223,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(get_attn_backend(), TritonAttnBackend):
+        attn_backend = get_attn_backend()
+        if attn_backend.supports_custom_mask:
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -266,11 +269,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_masks = torch.cat(
                     bidirectional_attn_masks_list, dim=0
                 )
-                get_attn_backend().forward_metadata.mask_indptr = (
-                    bidirectional_attn_mask_indptr
-                )
-                get_attn_backend().forward_metadata.custom_mask = (
-                    bidirectional_attn_masks
+                attn_backend.install_custom_mask(
+                    custom_mask=bidirectional_attn_masks,
+                    mask_indptr=bidirectional_attn_mask_indptr,
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -397,12 +398,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             llm_input_ids = input_ids
 
-        # NOTE: As described in https://huggingface.co/blog/gemma3#multimodality, in the prefill stage of Gemma-3, image tokens use bidirectional attention. Currently, only the TritonAttnBackend supports bidirectional attention; other backends have not yet implemented this. Bidirectional attention is incompatible with CUDA Graph and chunked prefill.
-        if (
-            forward_batch.forward_mode
-            == ForwardMode.EXTEND  # only Extend mode is supported for now
-            and forward_batch.contains_image_inputs()  # Gemma-3 only supports image as mm inputs
-        ):
+        if is_image_prefill(forward_batch):
             self.prepare_attn_masks(
                 forward_batch,
                 llm_input_ids,

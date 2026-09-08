@@ -517,6 +517,18 @@ If you set only one of `--prefill-attention-backend` or `--decode-attention-back
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 </Tip>
 
+#### Image prefills on a custom-mask backend
+
+Gemma 3 and Gemma 4 attend bidirectionally within each image's tokens during prefill. That mask is only implemented by the `triton` backend; every other backend runs image tokens causally and logs a warning. `--image-prefill-attention-backend` routes only the prefill batches that contain image inputs to the given backend, while text prefill, decode, and speculative verification keep the backends above. For the implementation, see `python/sglang/srt/layers/attention/image_prefill_attn_backend.py`.
+
+```bash Command
+# Example: text on TRTLLM MHA, image prefills on Triton (Blackwell)
+python3 -m sglang.launch_server \
+  --model-path google/gemma-4-31B-it \
+  --attention-backend trtllm_mha \
+  --image-prefill-attention-backend triton
+```
+
 ## Attention Backend Selection Guide (CUDA)
 
 If the `--attention-backend` argument is not specified, SGLang automatically selects the best backend based on the hardware (CUDA) and model architecture.

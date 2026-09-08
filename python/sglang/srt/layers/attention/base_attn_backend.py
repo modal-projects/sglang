@@ -85,6 +85,16 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    supports_custom_mask: bool = False
+
+    def install_custom_mask(
+        self, *, custom_mask: torch.Tensor, mask_indptr: torch.Tensor
+    ) -> None:
+        """Install this forward's per-request extend masks; only backends with ``supports_custom_mask`` accept them."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support per-request custom masks"
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

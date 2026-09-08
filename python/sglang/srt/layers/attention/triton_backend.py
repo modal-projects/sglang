@@ -759,6 +759,14 @@ class TritonAttnBackend(AttentionBackend):
             width=self.cuda_graph_out_cache_loc_full_physical.numel(),
         )
 
+    supports_custom_mask = True
+
+    def install_custom_mask(
+        self, *, custom_mask: torch.Tensor, mask_indptr: torch.Tensor
+    ) -> None:
+        self.forward_metadata.custom_mask = custom_mask
+        self.forward_metadata.mask_indptr = mask_indptr
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 

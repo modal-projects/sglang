@@ -539,9 +539,9 @@ def handle_model_specific_adjustments(server_args: Any):
     ):
         # Default attention backend selection moved to the override registry
         # (arg_groups/overrides.py: _gemma4_overrides).
-        prefill_backend, decode_backend = attention_backends_of(
-            resolved_view(server_args)
-        )
+        view = resolved_view(server_args)
+        prefill_backend, decode_backend = attention_backends_of(view)
+        image_prefill_backend = view.image_prefill_attention_backend
         accepted_backends = (
             "trtllm_mha",
             "triton",
@@ -550,10 +550,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "intel_amx",
         )
         assert (
-            prefill_backend in accepted_backends and decode_backend in accepted_backends
+            prefill_backend in accepted_backends
+            and decode_backend in accepted_backends
+            and image_prefill_backend in (None, *accepted_backends)
         ), (
             "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
-            f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            f"attention backend, got prefill={prefill_backend}, "
+            f"decode={decode_backend}, image_prefill={image_prefill_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override

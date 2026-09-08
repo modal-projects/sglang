@@ -208,6 +208,7 @@ POSITIONAL_FIELD_ORDER = (
     "decode_attention_backend",
     "enable_lean_attention",
     "prefill_attention_backend",
+    "image_prefill_attention_backend",
     "sampling_backend",
     "grammar_backend",
     "radix_cache_backend",

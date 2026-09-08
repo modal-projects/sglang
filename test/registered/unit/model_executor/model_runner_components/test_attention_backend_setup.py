@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 import pytest
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.layers.attention.image_prefill_attn_backend import (
+    ImagePrefillAttnBackend,
+)
 from sglang.srt.model_executor.model_runner_components import (
     attention_backend_setup,
 )
@@ -120,3 +124,71 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _runner():
+    return SimpleNamespace(
+        server_args=SimpleNamespace(speculative_attention_mode="prefill"),
+        model_config=SimpleNamespace(context_len=2048),
+        kv_cache_dtype=None,
+        token_to_kv_pool=object(),
+        req_to_token_pool=object(),
+        kv_index_translator=None,
+        init_new_workspace=None,
+    )
+
+
+class _LeafBackend(AttentionBackend):
+    supports_custom_mask = False
+
+    def __init__(self, name):
+        self.name = name
+
+
+class _MaskLeafBackend(_LeafBackend):
+    supports_custom_mask = True
+
+
+def test_image_prefill_backend_wraps_the_resolved_backend_once():
+    runner = _runner()
+    wrapper_inputs = []
+
+    def wrap_once(model_runner, backend):
+        wrapper_inputs.append(backend)
+        return backend
+
+    constructors = {
+        "text-test": lambda model_runner: _LeafBackend("text"),
+        "image-test": lambda model_runner: _MaskLeafBackend("image"),
+    }
+    resolved = ResolvedAttentionBackendStr(
+        prefill="text-test", decode="text-test", image_prefill="image-test"
+    )
+    with (
+        patch.dict(attention_backend_setup.ATTENTION_BACKENDS, constructors),
+        patch.object(
+            attention_backend_setup, "attn_backend_wrapper", side_effect=wrap_once
+        ),
+    ):
+        result = attention_backend_setup._build_resolved_backend(
+            model_runner=runner, resolved=resolved, init_new_workspace=False
+        )
+
+    assert wrapper_inputs == [result]
+    assert isinstance(result, ImagePrefillAttnBackend)
+    assert result.text_backend.name == "text"
+    assert result.image_backend.name == "image"
+
+
+def test_image_prefill_backend_without_custom_mask_support_is_rejected():
+    constructors = {"plain-test": lambda model_runner: _LeafBackend("plain")}
+    resolved = ResolvedAttentionBackendStr(
+        prefill="plain-test", decode="plain-test", image_prefill="plain-test"
+    )
+    with (
+        patch.dict(attention_backend_setup.ATTENTION_BACKENDS, constructors),
+        pytest.raises(ValueError, match="custom masks"),
+    ):
+        attention_backend_setup._build_resolved_backend(
+            model_runner=_runner(), resolved=resolved, init_new_workspace=False
+        )

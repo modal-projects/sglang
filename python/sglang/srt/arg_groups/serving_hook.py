@@ -285,6 +285,7 @@ def handle_deprecated_args(server_args: Any):
         "attention_backend",
         "decode_attention_backend",
         "prefill_attention_backend",
+        "image_prefill_attention_backend",
         "speculative_draft_attention_backend",
     ):
         if getattr(server_args, attr, None) == "compressed":

@@ -142,6 +142,14 @@ class ExecKernel:
             resolvable=True,
         ),
     ] = None
+    image_prefill_attention_backend: A[
+        Optional[str],
+        Arg(
+            help="Choose the kernels for prefill attention layers on batches that contain image inputs (have priority over --attention-backend and --prefill-attention-backend for those batches). Models whose image tokens attend bidirectionally (Gemma 3 and 4) need a backend with per-request custom-mask support; only triton has it.",
+            choices=ATTENTION_BACKEND_CHOICES,
+            resolvable=True,
+        ),
+    ] = None
     sampling_backend: A[
         Optional[str],
         Arg(

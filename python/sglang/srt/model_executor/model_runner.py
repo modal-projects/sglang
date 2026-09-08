@@ -1025,6 +1025,7 @@ class ModelRunner:
         resolved = resolve_attention_backend_strs(model_runner=self)
         self.prefill_attention_backend_str = resolved.prefill
         self.decode_attention_backend_str = resolved.decode
+        self.image_prefill_attention_backend_str = resolved.image_prefill
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 class ResolvedAttentionBackendStr(msgspec.Struct, frozen=True, kw_only=True):
     prefill: str
     decode: str
+    image_prefill: Optional[str] = None
     is_draft_override: bool = False
 
 
@@ -77,6 +78,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     resolved = ResolvedAttentionBackendStr(
         prefill=model_runner.prefill_attention_backend_str,
         decode=model_runner.decode_attention_backend_str,
+        image_prefill=model_runner.image_prefill_attention_backend_str,
         is_draft_override=bool(
             model_runner.is_draft_worker and model_runner.draft_attention_backend
         ),
@@ -175,7 +177,14 @@ def resolve_attention_backend_strs(
             is_draft_override=True,
         )
     prefill, decode = attention_backends()
-    return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
+    image_prefill = (
+        None if is_draft_worker else get_exec().kernel.image_prefill_attention_backend
+    )
+    if image_prefill == prefill == decode:
+        image_prefill = None
+    return ResolvedAttentionBackendStr(
+        prefill=prefill, decode=decode, image_prefill=image_prefill
+    )
 
 
 def _build_resolved_backend(
@@ -185,54 +194,100 @@ def _build_resolved_backend(
     init_new_workspace: bool,
 ) -> AttentionBackend:
     if resolved.is_draft_override:
-        attn_backend = _build_backend_from_str(
+        return _build_backend_from_str(
             model_runner=model_runner,
             backend_str=resolved.prefill,
             init_new_workspace=init_new_workspace,
         )
-    elif resolved.decode != resolved.prefill:
-        from sglang.srt.layers.attention.hybrid_attn_backend import (
-            HybridAttnBackend,
+    attn_backend = _build_full_attention_core(
+        model_runner=model_runner,
+        resolved=resolved,
+        init_new_workspace=init_new_workspace,
+    )
+    if resolved.image_prefill is not None:
+        attn_backend = _wrap_image_prefill(
+            model_runner=model_runner,
+            text_backend=attn_backend,
+            backend_str=resolved.image_prefill,
+            init_new_workspace=init_new_workspace,
         )
+    return attn_backend_wrapper(model_runner, attn_backend)
 
-        # Compose the two full-attention backends first, then apply model-level
-        # wrappers once.  Wrapping each child independently duplicates the
-        # linear/sparse side backend for hybrid models (for example, two GDN
-        # dispatchers for Qwen3.5 when prefill and decode use different MHA
-        # backends), duplicating initialization and associated state while only
-        # one side backend can be active in a forward pass.
-        attn_backend = attn_backend_wrapper(
-            model_runner,
-            HybridAttnBackend(
-                model_runner=model_runner,
-                decode_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.decode,
-                    init_new_workspace=init_new_workspace,
-                ),
-                prefill_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.prefill,
-                    init_new_workspace=init_new_workspace,
-                ),
-            ),
-        )
-        logger.info(
-            f"Using hybrid attention backend for decode and prefill: "
-            f"decode_backend={resolved.decode}, "
-            f"prefill_backend={resolved.prefill}."
-        )
-        logger.warning(
-            "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-            "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
-        )
-    else:
-        attn_backend = _build_backend_from_str(
+
+def _build_full_attention_core(
+    *,
+    model_runner: ModelRunner,
+    resolved: ResolvedAttentionBackendStr,
+    init_new_workspace: bool,
+) -> AttentionBackend:
+    if resolved.decode == resolved.prefill:
+        return _build_full_attention_backend_from_str(
             model_runner=model_runner,
             backend_str=resolved.prefill,
             init_new_workspace=init_new_workspace,
         )
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+    # Compose the two full-attention backends first, then apply model-level
+    # wrappers once.  Wrapping each child independently duplicates the
+    # linear/sparse side backend for hybrid models (for example, two GDN
+    # dispatchers for Qwen3.5 when prefill and decode use different MHA
+    # backends), duplicating initialization and associated state while only
+    # one side backend can be active in a forward pass.
+    attn_backend = HybridAttnBackend(
+        model_runner=model_runner,
+        decode_backend=_build_full_attention_backend_from_str(
+            model_runner=model_runner,
+            backend_str=resolved.decode,
+            init_new_workspace=init_new_workspace,
+        ),
+        prefill_backend=_build_full_attention_backend_from_str(
+            model_runner=model_runner,
+            backend_str=resolved.prefill,
+            init_new_workspace=init_new_workspace,
+        ),
+    )
+    logger.info(
+        f"Using hybrid attention backend for decode and prefill: "
+        f"decode_backend={resolved.decode}, "
+        f"prefill_backend={resolved.prefill}."
+    )
+    logger.warning(
+        "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+        "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+    )
     return attn_backend
+
+
+def _wrap_image_prefill(
+    *,
+    model_runner: ModelRunner,
+    text_backend: AttentionBackend,
+    backend_str: str,
+    init_new_workspace: bool,
+) -> AttentionBackend:
+    from sglang.srt.layers.attention.image_prefill_attn_backend import (
+        ImagePrefillAttnBackend,
+    )
+
+    image_backend = _build_full_attention_backend_from_str(
+        model_runner=model_runner,
+        backend_str=backend_str,
+        init_new_workspace=init_new_workspace,
+    )
+    if not image_backend.supports_custom_mask:
+        raise ValueError(
+            f"--image-prefill-attention-backend {backend_str} does not support "
+            "per-request custom masks; use triton."
+        )
+    logger.info(
+        f"Using {backend_str} attention backend for prefill batches with image inputs."
+    )
+    return ImagePrefillAttnBackend(
+        model_runner=model_runner,
+        text_backend=text_backend,
+        image_backend=image_backend,
+    )
 
 
 def _build_backend_from_str(

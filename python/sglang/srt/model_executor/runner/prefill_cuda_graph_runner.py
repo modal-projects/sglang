@@ -333,6 +333,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "full_attn_backend",
                 model_runner.attn_backend,
             )
+            if any(
+                getattr(attn_backend, name, None) != expected
+                for name, expected in (
+                    ("dsa_index_topk", 2048),
+                    ("dsa_index_kpool", 4),
+                    ("kv_lora_rank", 512),
+                    ("kv_cache_dim", 512),
+                    ("qk_nope_head_dim", 256),
+                    ("qk_rope_head_dim", 0),
+                    ("real_page_size", 64),
+                )
+            ):
+                raise ValueError("DSA variants require the validated GLM dimensions")
             self.dsa_prefill_graph_variants = DSAPrefillGraphVariants(
                 dsa_variants,
                 self.capture_num_tokens,

@@ -14,14 +14,41 @@ class DSAPrefillGraphVariants:
                 bisect_left(self.capture_sizes, sm_count // 2),
             )
         ]
-        if num_heads != 16:
+        import flashinfer
+
+        if (sm_count, num_heads, flashinfer.__version__) != (148, 16, "0.6.17"):
             raise ValueError(
-                "DSA prefill graph variants currently require 16 query heads"
+                "DSA prefill graph variants require 148 SMs, 16 query heads, "
+                "and FlashInfer 0.6.17"
             )
         if specification == "all":
-            raise ValueError(
-                "Full DSA variant capture requires a validated launch-plan map"
+            from sglang.srt.layers.attention.dsa.trtllm_prefill_graph_plans import (
+                CONTEXT_BOUNDS,
+                REPRESENTATIVES,
             )
+
+            if self.max_tokens > len(REPRESENTATIVES):
+                raise ValueError("DSA variant map covers at most 80 live tokens")
+            if len(REPRESENTATIVES) != 80 or any(
+                len(row) != len(CONTEXT_BOUNDS)
+                or any(
+                    representative not in CONTEXT_BOUNDS
+                    or representative < bound
+                    or row[CONTEXT_BOUNDS.index(representative)] != representative
+                    for bound, representative in zip(CONTEXT_BOUNDS, row)
+                )
+                for row in REPRESENTATIVES
+            ):
+                raise ValueError("Invalid validated DSA variant map")
+            self.lookup = {
+                (tokens, bound): (tokens, representative)
+                for tokens, row in enumerate(
+                    REPRESENTATIVES[: self.max_tokens], start=1
+                )
+                for bound, representative in zip(CONTEXT_BOUNDS, row)
+            }
+            self.variants = sorted(set(self.lookup.values()))
+            return
         self.variants = set()
         for item in specification.split(","):
             tokens, bound = map(int, item.split(":"))

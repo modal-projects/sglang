@@ -86,6 +86,11 @@ class RadixLinearAttention(nn.Module):
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
+            if is_in_breakable_cuda_graph():
+                backend = get_attn_backend()
+                backend = getattr(backend, "linear_attn_backend", backend)
+                if getattr(backend, "prefill_graph_metadata", None) is not None:
+                    return backend.forward_prefill_graph(self, mixed_qkv, a, b)
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(

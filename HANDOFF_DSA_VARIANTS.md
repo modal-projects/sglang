@@ -83,3 +83,53 @@ Per-run source, settings, logs/results: `glm53-kda-benchmarks/<run-id>`.
 Profiles: `glm53-torch-profiles/<run-id>`.
 Local full harness: `/home/ec2-user/artifacts/glm53-dsa-variants-20260908`.
 A tar archive is uploaded under `dsa-variants-handoff-20260908` with SHA manifest.
+
+## Full finite-map pipeline (queued 2026-09-08 18:16 UTC)
+
+Candidate source is `b0363d743e`; finite map introduced in `0193aa7c62`.
+The table is finite data, not a runtime reimplementation of undocumented
+FlashInfer heuristics. All 1,360 entries equal the validated GPU artifact;
+164,400 host context resolutions and incompatible-configuration guards passed.
+`all` mode requires FlashInfer0.6.17,148SM,Q16,topk2048,KPool4,KV/V512,
+qk_nope256,RoPE0,page64; underlying captured-DSA checks require FP8 KV.
+
+Full mode adds a runner-local token bucket1 before buffer/capture setup because
+normal BCG starts at4 and rejects the4x padding for a single token. N>=2 keeps
+its original bucket. The same-GPU control retains its original wholly eager
+N=1 path, so final parity explicitly tests this difference.
+
+Current app: `ap-oy2gzmIG6HBdeghbGiw8t4`.
+Driver: `fc-01M213RPBS48W4XHH40908HRPC`.
+Run: `20260908T181628.271898Z-dsa-exact-variant-full-smoke`.
+Image: `im-8ohbrpsKyfZTWccCHxPWPn`.
+This waits on pilot driver `fc-01M213CKYMT5226Y0Q3BFFD8KQ`; it does not allocate
+GPUs until the pilot passes and measured cost passes the gate below.
+Superseded waiting app `ap-GKdfFYyr6OUsFvVcrkKPJZ` was stopped before any GPU launch.
+
+Gate: each rank's16 measured captures projected to360 must consume<=30minutes
+and<=8GiB extra total device memory. A200ms NVML observer includes CUDA driver
+and executable allocations; correlation uses conservative timestamp margins.
+The observer is in the pilot container and writes `device-memory.csv` alongside
+`server.log`. Dependency errors, missing memory evidence, or gate failures
+produce a durable stopped report. During full capture the runner independently
+checks actual CUDA mem_get_info growth and elapsed time against the same limits.
+
+After admission the detached job runs2,208 numerical cases on the same4B300s
+for candidate then control, with the same random seed and recipe/model/draft:
+
+- Original535 boundary/ragged/prefix cases,32greedy output tokens each.
+- Every exact1..80 live count at every17canonical context class:1,360cases,
+ 8greedy output tokens each, alternating context classes to change variants.
+- Small ragged totals2..80:313individual request comparisons,8outputs each.
+
+It requires2,208/2,208 equal greedy sequences and max selected teacher logprob
+absolute difference<=0.05. It also runs the original33stress cases, long context,
+multimodal validation and all-rank profiles; a separate profile requires12launches
+for every1..80 live count and actual bs4/total74,75,80 prefills. The control clears
+both DSA and variant environment flags but retains captured Triton KDA.
+
+At queue time the pilot was still in normal model startup/DeepGEMM warmup.
+Neither pilot serving profiles nor full model parity were complete.
+Full harness: `glm53-kda-benchmarks/dsa-variants-handoff-20260908/full-harness.tar.gz`.
+Each archive has its own SHA256 manifest. Final pass/fail lives in each run's
+`run.json`; numerical parity lives in `matched-comparison.json`.

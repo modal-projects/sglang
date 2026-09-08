@@ -46,7 +46,8 @@ boundaries, rather than assuming a fixed GPU or token threshold.
 
 For the current B300 bucket list:
 
-- **1–80 live tokens:** DSA+BMM stays eager; KDA remains captured (23 segments).
+- **2–80 live tokens:** DSA+BMM stays eager; KDA remains captured (23 segments).
+- **1 live token:** the current minimum bucket/padding rule keeps prefill eager.
 - **81–4096 live tokens:** DSA+BMM and KDA are captured (12 segments).
 - **Above 4096:** existing prefill graph fallback remains in effect.
 
@@ -83,15 +84,27 @@ and gated on the passed guard probe. It uses the unchanged serving recipe,
 Triton KDA, TRTLLM DSA, DFlash2 epoch-2 block-8, and seed 479309393.
 
 The GPU child call is `fc-01M211PJA27ZNY7QY5HH0VVHC7`; immutable image
-`im-lqx8gZaE2jbRIROnN0R4To`. It cleared its dependency and entered published
-startup.
+`im-lqx8gZaE2jbRIROnN0R4To`. The integrated run completed successfully:
+`20260908T174016.399255Z-captured-kda-dsa-smoke`.
 
 Candidate and control run on the same four B300s. **Control keeps KDA captured
 and DSA eager** to isolate the DSA change. Required numerical gate: all 535
 greedy outputs equal, selected teacher-forced log probabilities within 0.05.
 The original 510 cases are expanded with 25 targeted boundary/prefix cases.
-The lane also runs the 33-case stress suite, multimodal replay, and all-rank
-profiles. Integrated parity remains pending until its completed result is read.
+**Completed result:** all 535 greedy outputs matched. Maximum selected
+teacher-forced logprob difference was **0.0147776976**, below the 0.05 gate.
+All 33 stress cases passed, including images/video, 1,044,480-token context,
+prefix restoration, mixed concurrency, and cancellation/cache reuse. Additional
+2k–4k multimodal replay checks passed. Four-rank profiles confirmed 23 segments
+for the tested short prefills and 12 for eligible large prefills, with eager
+fallback at 4097 tokens; the control used 23 segments.
+
+The authoritative `run.json`, `matched-comparison.json`, `numerical-raw.json`,
+`control/numerical-raw.json`, and `stress/stress.json` are under that run ID in
+`glm53-kda-benchmarks`. Traces are under the same ID in `glm53-torch-profiles`.
+This validates the guarded implementation; it does not validate exact-count
+variants for short DSA. That separate work is on `willhu/glm53-dsa-variants`,
+documented in `HANDOFF_DSA_VARIANTS.md` on that branch.
 
 Launch:
 

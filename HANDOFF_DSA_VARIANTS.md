@@ -1,7 +1,15 @@
 # GLM 5.3 Flash exact-count DSA graph variants
 
-Experimental branch `willhu/glm53-dsa-variants`; no production deployment.
+Implementation branch `willhu/glm53-dsa-variants` has exactly eight code commits
+at `5f47465d441cd4b81a19140532132fc69a0fb34c`. Experiment history and this handoff
+live on `willhu/glm53-dsa-variants-experiments`; no production deployment.
 Workspace/environment: `modal-labs / glm-bringup`.
+
+Latest status (2026-09-08 19:04 UTC): all 360 variants captured and all-rank
+profiles passed. The first full run stopped on a harness scoring-window check
+before its control arm. A corrected, stricter harness is running on the identical
+model source/image. The 2,208-case same-GPU model parity verdict remains pending.
+Historical launch entries below are retained; see the final section for current IDs.
 
 ## Purpose and implementation
 
@@ -154,3 +162,53 @@ Full pipeline automatically cleared both gates and launched GPU worker
 It is in published startup;2,208-case matched parity remains pending.
 The earlier startup delay was Triton KDA cache-file loading on the eager
 multimodal/health warmup paths and resolved without code changes.
+
+## Full capture passed; corrected numerical harness rerun (2026-09-08 19:04 UTC)
+
+The first full run captured 360 variants on each of four ranks. All 1,440 capture
+records report 12 segments. Actual incremental capture took 274.60 seconds per
+rank and consumed 3,361,734,656 bytes (3.13 GiB) of device memory per GPU, including
+driver allocations measured with CUDA mem_get_info. Both actual limits passed.
+Cost evidence: `dsa-variants-handoff-20260908/full-actual-capture-cost.json`.
+
+All-rank 4K/fallback profiles passed. The additional profiles passed for every
+live count 1–80, plus actual four-request batches with totals 74, 75 and 80;
+every captured prefill used 12 graph launches. Pooled-indexer breaks remain, so
+this is merged breakable capture, not a single full CUDA graph.
+
+The numerical collection stopped at `exact-1-context-2048` with
+`Missing teacher-forced log probabilities`, before the control arm. SGLang's
+`LogprobResultProcessor._process_input_token_logprobs` prepends `None` and drops
+the last input score; a scoring window containing one uncached token therefore
+has no non-null teacher score. The generic harness required a teacher score from
+the total context length rather than the scoring-window length. This is an API
+contract error in the harness, not a measured candidate/control kernel mismatch.
+The original failed run, result and harness are retained unchanged.
+
+V2 allows this empty teacher-score window only for one uncached token. It also
+compares the first generated target token's log probability for all 1,673 added
+exact-context/ragged cases, which checks the logits produced by prefill directly.
+All available teacher scores remain compared. The criterion is unchanged:
+2,208/2,208 identical greedy sequences and maximum selected log-probability
+difference <=0.05, now including those 1,673 first-output scores. The harness
+requires exact cached-prefix lengths and saves raw API responses before checks.
+Six host API-contract checks passed; these are not GPU numerical validation.
+
+Current app: `ap-2B4OmPu0HmOJBpiBXCazvL`.
+Driver: `fc-01M216EKBSPP03YCAZ56EGNGW6`.
+GPU worker: `fc-01M216EVNSXK9W1FBYPHE6BAGB`.
+Run: `20260908T190323.246526Z-dsa-exact-variant-full-smoke-v2`.
+Image: `im-8ohbrpsKyfZTWccCHxPWPn`, identical to the first full run.
+The detached pipeline cleared the pilot/cost gates and entered published startup.
+Its source, recipes, seeds, model/draft pins and same-GPU control are unchanged.
+
+The cleaned implementation branch has an identical entire Python tree to the
+experimental candidate, and all 17 live source-overlay hashes match. Old source
+commit IDs above remain reachable through the experiments branch. The mapping is
+in the archived `implementation-history.json`; further documentation belongs on
+the experiments branch and must not add commits to the eight-commit code branch.
+
+V2 harness archive: `glm53-kda-benchmarks/dsa-variants-handoff-20260908/full-v2-harness.tar.gz`.
+Its separate SHA256 manifest preserves the first full harness/archive unchanged.
+The final verdict will be `<v2-run>/run.json` and
+`<v2-run>/matched-comparison.json`; until then this route is not model-validated.

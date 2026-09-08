@@ -20,14 +20,18 @@ class DSAPrefillGraphMetadata:
         self.seq_lens = torch.ones(max_tokens, dtype=torch.int32, device=device)
         self.cache_locs = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+        self.variant = None
 
     def can_capture(self, num_tokens):
-        return num_tokens in self.capture_sizes
+        return self.variant is not None or num_tokens in self.capture_sizes
 
     def update(self, forward_batch, metadata):
         tokens = sum(forward_batch.extend_seq_lens_cpu)
         if not 0 < tokens <= self.max_tokens:
             raise ValueError(f"Invalid captured DSA prefill size: {tokens}")
+        self.variant = forward_batch.dsa_prefill_graph_variant
+        if self.variant is not None and self.variant[0] != tokens:
+            raise ValueError("DSA capture variant does not match its live token count")
         self.num_tokens.fill_(tokens)
         self.seq_lens.fill_(1)
         self.seq_lens[:tokens].copy_(metadata.dsa_cache_seqlens_int32[:tokens])
@@ -93,12 +97,16 @@ def dsa_prefill_graph_forward(backend, layer, q, k, k_rope, topk_indices, metada
     )
 
     tokens = q.shape[0]
+    live_tokens, max_seq_len = metadata.variant or (
+        tokens,
+        backend.dsa_index_topk + backend.dsa_index_kpool,
+    )
     pool = backend.token_to_kv_pool
     pool.set_mla_kv_buffer(
         layer,
-        metadata.cache_locs[:tokens],
-        k.squeeze(1).to(torch.float8_e4m3fn),
-        k_rope.squeeze(1).to(torch.float8_e4m3fn),
+        metadata.cache_locs[:live_tokens],
+        k[:live_tokens].squeeze(1).to(torch.float8_e4m3fn),
+        k_rope[:live_tokens].squeeze(1).to(torch.float8_e4m3fn),
     )
     kv = pool.get_key_buffer(layer.layer_id).view(
         -1, 1, backend.real_page_size, backend.kv_cache_dim
@@ -110,15 +118,20 @@ def dsa_prefill_graph_forward(backend, layer, q, k, k_rope, topk_indices, metada
         tokens,
     )
     k_scale = getattr(layer, "k_scale_float", None)
-    return trtllm_prefill_graph_attention(
-        q.view(tokens, layer.tp_q_head_num, layer.v_head_dim),
+    result = trtllm_prefill_graph_attention(
+        q.view(tokens, layer.tp_q_head_num, layer.v_head_dim)[:live_tokens],
         kv,
-        topk_indices,
-        metadata.seq_lens[:tokens],
+        topk_indices[:live_tokens],
+        metadata.seq_lens[:live_tokens],
         metadata.num_tokens,
         backend.workspace_buffer,
         backend._multi_ctas_kv_counter_buffer,
         layer.scaling * (k_scale if k_scale is not None else 1.0),
         backend.qk_nope_head_dim,
-        backend.dsa_index_topk + backend.dsa_index_kpool,
+        max_seq_len,
     )
+    if live_tokens == tokens:
+        return result
+    output = result.new_zeros((tokens, *result.shape[1:]))
+    output[:live_tokens].copy_(result)
+    return output

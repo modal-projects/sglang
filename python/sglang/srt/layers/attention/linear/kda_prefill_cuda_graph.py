@@ -206,6 +206,7 @@ def kda_prefill_graph_forward(layer, mixed_qkv, a, b, conv_pool, ssm_states, met
         cu_seqlens=metadata.cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_offsets=metadata.chunk_offsets,
+        active_chunks=metadata.chunk_offsets[-1:],
         use_qk_l2norm_in_kernel=True,
         A_log=layer.A_log,
         dt_bias=layer.dt_bias,

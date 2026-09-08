@@ -553,6 +553,8 @@ def _recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    if i_t * BT >= T:
+        return
     p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
@@ -796,6 +798,8 @@ def chunk_gla_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
+    if i_t * BT >= T:
+        return
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
@@ -965,6 +969,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    if i_t * BT >= T:
+        return
     p_s = tl.make_block_ptr(
         s + (bos * H + i_h) * S,
         (T, S),
@@ -1094,15 +1100,14 @@ def chunk_kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
     # Without this, each of the 4 callees would recompute independently.
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if A_log is not None:
         # Fused: gate activation + chunk-local cumsum in one kernel.
@@ -1169,6 +1174,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        chunk_offsets=chunk_offsets,
     )
     del w, u, kg
 
@@ -1211,6 +1217,8 @@ def chunk_kda(
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
     beta_is_raw: bool = False,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1238,4 +1246,6 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
     )

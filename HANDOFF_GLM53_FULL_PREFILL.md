@@ -9,7 +9,46 @@ TP4/EP4, DeepGEMM MoE, and DFlash2 epoch-2 block8. Both new flags default off:
 `SGLANG_KDA_PREFILL_CUDA_GRAPH` and `SGLANG_DSA_PREFILL_CUDA_GRAPH`.
 The runner is still BCG; the generic `full` runner is not implemented here.
 
-## Latest update: 2026-09-08 17:10 UTC
+## Latest update: 2026-09-08 17:35 UTC
+
+The user requested a **KDA-only serving comparison**, independent of the failed
+combined DSA gate. It launched in `modal-labs/glm-bringup` and passed both its
+KDA real-activation and matched-model correctness prerequisites. Four B300 GPUs
+are allocated; the first captured-KDA server is starting. No points yet.
+
+- Run: `20260908T173426.361187Z-captured-kda-curve`.
+- App: `ap-78ndrelFJwyDkRDXdcKjlA`.
+- Driver: `fc-01M211BQJ2VFWC4NYTAD4FXDJM`.
+- GPU benchmark: `fc-01M211BWD810AK3B1Q8NH5CAYE`.
+- Launch record: `launch-curve-kda.json`; image `im-ItRRmFe8dZQ0g2MAXnnzID`.
+- KDA capture alone is toggled, with DSA capture explicitly **off in both
+  arms**. Profiles must confirm 23 versus 57 segments. Both arms use the same
+  validated image, recipe, source overlays, and seed; source/recipe hashes are
+  checked at runtime.
+- Same four GPU UUIDs, ABBA order, concurrency 1/2/4/8/16/32, two repetitions,
+  64 agentic-v2 requests per point, EOS enabled with a 4096-token output ceiling.
+  Timings exclude profiling and conditioning; prefix cache is flushed per point.
+- Results/progress/PNG/SVG/PDF/CSV: volume `glm53-kda-benchmarks`, under the run
+  directory. All-rank profiles: volume `glm53-torch-profiles`, under the same run.
+- `curve_lane.py` now defaults to KDA-only; set `GLM53_CURVE_CAPTURE_DSA=1`
+  explicitly for the combined lane, which remains blocked on DSA parity.
+
+Launch/poll from the archived harness:
+
+```sh
+GLM53_CURVE_CAPTURE_DSA=0 MODAL_PROFILE=modal-labs modal run --detach --env glm-bringup curve_lane.py
+MODAL_PROFILE=modal-labs python poll.py curve-kda
+```
+
+DSA numerical investigation is continuing separately, at the user's request,
+in `willhu/glm53-dsa-numerics` based on `333b53d48a`, with a separate harness.
+The focused diagnostic found that setting `max_seq_len=2052` changes short
+DSA outputs even eagerly; graph replay with the same bound matched. Query
+padding also affects some longer-prefix cases. This points to dispatch/partition
+arithmetic choices; it is not yet a validated fix. Pooled-indexer work remains
+unimplemented. Production is unchanged.
+
+## Validation update: 2026-09-08 17:10 UTC
 
 - Revised KDA real-activation replay: **126/126 bitwise-exact outputs, SSM
   states and convolution states**, covering 42 fixtures replayed three times.
@@ -22,8 +61,9 @@ The runner is still BCG; the generic `full` runner is not implemented here.
   did confirm 12 segments, and finite/stress checks passed; those do not
   establish numerical equivalence. All 11 greedy failures are fresh 2–32-token
   prefills; log-probability differences above threshold extend through 64.
-- The throughput curve driver **stopped at the correctness gate**. No
-  benchmark GPU job or points ran. Do not requeue it until DSA parity passes.
+- The combined KDA+DSA throughput curve driver **stopped at the correctness
+  gate**. No benchmark GPU job or points ran for that lane. Do not requeue the
+  combined lane until DSA parity passes; the newer KDA-only lane is independent.
 - Pooled-indexer capture remains unimplemented. The next diagnostic isolates
   the DSA short-context path, including the maximum-sequence-length scalar and
   graph padding. See `launch-dsa-short-probe.json` in the harness for the run.

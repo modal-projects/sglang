@@ -35,6 +35,7 @@ def gather_index_k_scale_prefix_into(
     seq_len: int,
     k_out: torch.Tensor,
     scale_out: torch.Tensor,
+    active_rows: Optional[torch.Tensor] = None,
 ) -> None:
     assert buf.dtype == torch.uint8
     assert page_indices.dtype in (torch.int32, torch.int64)
@@ -48,6 +49,11 @@ def gather_index_k_scale_prefix_into(
     assert page_indices.is_contiguous()
     assert k_out.is_contiguous()
     assert scale_out.is_contiguous()
+    assert page_indices.numel() >= triton.cdiv(seq_len, pool.page_size)
+    if active_rows is not None:
+        assert active_rows.shape == (1,)
+        assert active_rows.dtype in (torch.int32, torch.int64)
+        assert active_rows.device == buf.device
     if seq_len == 0:
         return
 
@@ -57,11 +63,13 @@ def gather_index_k_scale_prefix_into(
         page_indices,
         k_out,
         scale_out,
+        active_rows if active_rows is not None else page_indices,
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        HAS_ACTIVE_ROWS=active_rows is not None,
     )
 
 
@@ -72,22 +80,27 @@ def _gather_index_k_scale_prefix_into_kernel(
     page_indices_ptr,
     k_out_ptr,
     scale_out_ptr,
+    active_rows_ptr,
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HAS_ACTIVE_ROWS: tl.constexpr,
 ):
     token_id = tl.program_id(0)
+    active = True
+    if HAS_ACTIVE_ROWS:
+        active = token_id < tl.load(active_rows_ptr)
     page_idx = token_id // PAGE_SIZE
     token_offset_in_page = token_id % PAGE_SIZE
-    page = tl.load(page_indices_ptr + page_idx)
+    page = tl.load(page_indices_ptr + page_idx, mask=active, other=0)
 
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
     src_k_offsets = page * BUF_NUMEL_PER_PAGE + token_offset_in_page * HEAD_DIM + offs
     dst_k_offsets = token_id * HEAD_DIM + offs
-    k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask)
+    k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask & active, other=0)
     tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
 
     src_s_offset = (
@@ -95,7 +108,7 @@ def _gather_index_k_scale_prefix_into_kernel(
         + S_OFFSET_NBYTES_IN_PAGE // 4
         + token_offset_in_page
     )
-    scale = tl.load(buf_fp32_ptr + src_s_offset)
+    scale = tl.load(buf_fp32_ptr + src_s_offset, mask=active, other=0.0)
     tl.store(scale_out_ptr + token_id, scale)
 
 

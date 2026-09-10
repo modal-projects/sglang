@@ -42,7 +42,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -81,6 +81,19 @@ class IndexerKPool(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.compress_gate_stream = None
         self.skip_rope = skip_rope
+        self.prefill_stable_projection = (
+            envs.SGLANG_DSA_KPOOL_PREFILL_STABLE_PROJECTION.get()
+        )
+        self.prefill_projection_max_tokens = 0
+        self.prefill_projection_buckets = ()
+        if self.prefill_stable_projection:
+            prefill = get_exec().graph.cuda_graph_config.prefill
+            self.prefill_projection_buckets = tuple(
+                sorted(prefill.bs or [prefill.max_bs or 0])
+            )
+            self.prefill_projection_max_tokens = max(
+                self.prefill_projection_buckets
+            )
 
         self.index_kpool = config.index_kpool
         self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
@@ -154,11 +167,50 @@ class IndexerKPool(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+    def _get_logits_head_gate(
+        self, x: torch.Tensor, q_scale: torch.Tensor, stable_projection: bool = False
+    ):
+        if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
+            from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
+                kpool_prefill_head_projection,
+            )
+
+            weights = kpool_prefill_head_projection(
+                x, self.weights_proj.weight, self.prefill_projection_buckets
+            )
+        else:
+            weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    def _project_key(self, x: torch.Tensor, stable_projection: bool = False):
+        if getattr(self, "_native_prefill_projection_context", False):
+            from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import project
+
+            return project(self, "key", x, self.wk.weight)
+        if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
+            from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
+                kpool_prefill_linear,
+            )
+
+            return kpool_prefill_linear(x, self.wk.weight, split=1)
+        return self.wk(x)[0]
+
+    def _project_compress_gate(
+        self, x: torch.Tensor, stable_projection: bool = False
+    ):
+        if getattr(self, "_native_prefill_projection_context", False):
+            from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import project
+
+            return project(self, "gate", x, self.index_kpool_compress_gate)
+        if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
+            from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
+                kpool_prefill_linear,
+            )
+
+            return kpool_prefill_linear(x, self.index_kpool_compress_gate, split=1)
+        return F.linear(x, self.index_kpool_compress_gate)
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -492,7 +544,11 @@ class IndexerKPool(MultiPlatformOp):
             return None
 
         if gate_score is None:
-            gate_score = F.linear(x, self.index_kpool_compress_gate)
+            gate_score = self._project_compress_gate(
+                x,
+                self.prefill_stable_projection
+                and forward_batch.forward_mode.is_extend_without_speculative(),
+            )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._compress_write_decode(
@@ -537,6 +593,10 @@ class IndexerKPool(MultiPlatformOp):
         precompute_compress_gate: bool = False,
     ):
         gate_score = None
+        stable_projection = (
+            self.prefill_stable_projection
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -555,7 +615,7 @@ class IndexerKPool(MultiPlatformOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                key, _ = self.wk(x)
+                key = self._project_key(x, stable_projection)
                 key = self.k_norm(key)
 
                 k_rope, _ = torch.split(
@@ -575,7 +635,7 @@ class IndexerKPool(MultiPlatformOp):
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
-            key, _ = self.wk(x)
+            key = self._project_key(x, stable_projection)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -596,7 +656,7 @@ class IndexerKPool(MultiPlatformOp):
         x: torch.Tensor,
         positions: torch.Tensor,
     ):
-        key, _ = self.wk(x)
+        key = self._project_key(x, self.prefill_stable_projection)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -1360,6 +1420,28 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+            graph_plan = (
+                getattr(metadata.attn_metadata, "kpool_prefill_graph_plan", None)
+                if metadata is not None
+                else None
+            )
+            if graph_plan is not None:
+                from sglang.srt.layers.attention.dsa.kpool_captured_forward import (
+                    forward_captured_kpool,
+                )
+
+                return forward_captured_kpool(
+                    self,
+                    x,
+                    q_lora,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    return_indices,
+                    graph_plan,
+                )
         if (
             is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1531,7 +1613,12 @@ class IndexerKPool(MultiPlatformOp):
                 return None
 
         if weights is None:
-            weights = self._get_logits_head_gate(x, q_scale)
+            weights = self._get_logits_head_gate(
+                x,
+                q_scale,
+                stable_projection=self.prefill_stable_projection
+                and forward_batch.forward_mode.is_extend_without_speculative(),
+            )
 
         if is_cuda():
             if (

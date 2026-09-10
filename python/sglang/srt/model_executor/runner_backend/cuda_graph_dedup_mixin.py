@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 def dedup_update(graph_exec: int, raw_graph: int) -> tuple[bool, str]:
     assert cuda_rt is not None
     err, info = cuda_rt.cudaGraphExecUpdate(graph_exec, raw_graph)
+    if err not in (
+        cuda_rt.cudaError_t.cudaSuccess,
+        cuda_rt.cudaError_t.cudaErrorGraphExecUpdateFailure,
+    ):
+        checkCudaErrors((err,))
     if info is None:
         return False, f"err={int(err)}"
     result = info.result
@@ -117,9 +123,15 @@ def kernel_node_payload(node):
     )
 
 
-def graph_node_payload(node):
+def graph_node_payload(node, topology_only=False):
     assert cuda_drv is not None
     node_type = checkCudaErrors(cuda_drv.cuGraphNodeGetType(node))
+    if topology_only:
+        payload = ()
+        if node_type == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_GRAPH:
+            child = checkCudaErrors(cuda_drv.cuGraphChildGraphNodeGetGraph(node))
+            payload = graph_signature(child, topology_only=True)
+        return (node_type.name, payload)
     match node_type:
         case cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
             payload = kernel_node_payload(node)
@@ -139,7 +151,7 @@ def graph_node_payload(node):
     return (node_type.name, payload)
 
 
-def graph_signature(raw_graph: int):
+def graph_signature(raw_graph: int, topology_only=False):
     assert cuda_drv is not None
     _, num_nodes = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, 0))
     nodes, _ = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw_graph, num_nodes))
@@ -177,7 +189,10 @@ def graph_signature(raw_graph: int):
         sorted((topo_indices[src], topo_indices[dst]) for src, dst in edges)
     )
     return (
-        tuple(graph_node_payload(nodes[node_idx]) for node_idx in order),
+        tuple(
+            graph_node_payload(nodes[node_idx], topology_only=topology_only)
+            for node_idx in order
+        ),
         topo_edges,
     )
 
@@ -197,16 +212,22 @@ class DedupedCudaGraph:
     registry: DedupedCudaGraphRegistry
     group: GraphExecGroup | None = None
 
-    def replay(self, stream: int | None = None) -> None:
+    def replay(
+        self,
+        stream: int | None = None,
+        *,
+        before_launch: Callable[[int, int], None] | None = None,
+    ) -> None:
         if stream is None:
             stream = torch.cuda.current_stream().cuda_stream
-        self.registry.replay(self, stream)
+        self.registry.replay(self, stream, before_launch=before_launch)
 
 
 class DedupedCudaGraphRegistry:
-    def __init__(self):
+    def __init__(self, allow_kernel_updates=False):
         self.groups: dict[tuple, GraphExecGroup] = {}
         self.sealed = False
+        self.allow_kernel_updates = allow_kernel_updates
 
     def instantiate(self, raw_graph: int) -> int:
         assert cuda_rt is not None
@@ -222,17 +243,22 @@ class DedupedCudaGraphRegistry:
     def register(self, captured_graph) -> DedupedCudaGraph:
         assert not self.sealed
         raw_graph = captured_graph.raw_cuda_graph()
-        signature = graph_signature(raw_graph)
+        signature = graph_signature(raw_graph, topology_only=self.allow_kernel_updates)
         graph = DedupedCudaGraph(raw_graph, captured_graph, self)
 
-        group = self.groups.get(signature)
-        if group is not None:
+        group_index = 0
+        group_key = (signature, group_index) if self.allow_kernel_updates else signature
+        while (group := self.groups.get(group_key)) is not None:
             assert group.compat_exec is not None
             ok, detail = dedup_update(group.compat_exec, graph.raw_graph)
-            assert ok, f"CUDA graph dedup register update failed ({detail})"
-            graph.group = group
-            group.graphs.append(graph)
-            return graph
+            if ok:
+                graph.group = group
+                group.graphs.append(graph)
+                return graph
+            if not self.allow_kernel_updates:
+                raise AssertionError(f"CUDA graph dedup register update failed ({detail})")
+            group_index += 1
+            group_key = (signature, group_index)
 
         group = GraphExecGroup(
             graph_exec=self.instantiate(graph.raw_graph),
@@ -241,7 +267,7 @@ class DedupedCudaGraphRegistry:
             graphs=[graph],
         )
         graph.group = group
-        self.groups[signature] = group
+        self.groups[group_key] = group
         return graph
 
     def seal(self) -> None:
@@ -258,7 +284,13 @@ class DedupedCudaGraphRegistry:
             self.groups
         )
 
-    def replay(self, graph: DedupedCudaGraph, stream: int) -> None:
+    def replay(
+        self,
+        graph: DedupedCudaGraph,
+        stream: int,
+        *,
+        before_launch: Callable[[int, int], None] | None = None,
+    ) -> None:
         assert cuda_rt is not None
         group = graph.group
         assert group is not None, (
@@ -275,6 +307,8 @@ class DedupedCudaGraphRegistry:
             )
             group.current_raw_graph = raw_graph
 
+        if before_launch is not None:
+            before_launch(graph_exec, group.graphs[0].raw_graph)
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
 
     def close(self) -> None:
@@ -329,7 +363,9 @@ class DedupedCudaGraphMixin:
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             if not hasattr(graph, "raw_cuda_graph"):
                 return None
-            return DedupedCudaGraphRegistry()
+            return DedupedCudaGraphRegistry(
+                allow_kernel_updates=getattr(self, "_dedup_allow_kernel_updates", False)
+            )
         except TypeError:
             return None
         except Exception as e:

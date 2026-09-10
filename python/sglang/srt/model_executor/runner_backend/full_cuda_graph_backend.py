@@ -193,6 +193,7 @@ class FullCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         graph = (
             torch.cuda.CUDAGraph(keep_graph=True)
             if self.deduped_cuda_graph is not None
+            or get_bool_env_var("SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS")
             else torch.cuda.CUDAGraph()
         )
 
@@ -225,6 +226,11 @@ class FullCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if profiler is not None:
             profiler.step()
 
+        if self.deduped_cuda_graph is None and get_bool_env_var(
+            "SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS"
+        ):
+            graph.instantiate()
+
         self._graphs[shape_key] = (
             self.deduped_cuda_graph.register(graph)
             if self.deduped_cuda_graph is not None
@@ -247,12 +253,36 @@ class FullCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            graph = self._graphs[shape_key]
+            if get_bool_env_var("SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS"):
+                from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import replay_callback
+
+                raw = graph.raw_graph if isinstance(graph, DedupedCudaGraph) else graph.raw_cuda_graph()
+                lengths = static_forward_batch.extend_seq_lens_cpu
+                callback = replay_callback(raw, sum(lengths) if lengths is not None else 0)
+                if isinstance(graph, DedupedCudaGraph):
+                    graph.replay(before_launch=callback)
+                else:
+                    if callback is not None:
+                        callback(graph.raw_cuda_graph_exec(), raw)
+                    graph.replay()
+            else:
+                graph.replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        raw_graphs = []
+        if get_bool_env_var("SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS"):
+            raw_graphs = [
+                graph.raw_graph if isinstance(graph, DedupedCudaGraph) else graph.raw_cuda_graph()
+                for graph in self._graphs.values()
+            ]
         self.close()
         self._graphs.clear()
+        if raw_graphs:
+            from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import release_graphs
+
+            release_graphs(raw_graphs)
         self._outputs.clear()
         self._capture_inputs.clear()
         self._output_buffer = None

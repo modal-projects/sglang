@@ -2,7 +2,9 @@ import unittest
 from unittest import mock
 
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
+    DedupedCudaGraph,
     DedupedCudaGraphRegistry,
+    GraphExecGroup,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -10,6 +12,77 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDedupCompatibility(unittest.TestCase):
+    def test_before_launch_uses_executable_owner_after_update_and_on_repeat(self):
+        registry = DedupedCudaGraphRegistry(allow_kernel_updates=True)
+        original = DedupedCudaGraph(1, None, registry)
+        current = DedupedCudaGraph(2, None, registry)
+        group = GraphExecGroup(10, 1, None, [original, current])
+        original.group = current.group = group
+        events = []
+
+        def update(executable, raw):
+            events.append(("update", executable, raw))
+            return True, ""
+
+        def launch(executable, stream):
+            events.append(("launch", executable, stream))
+            return (0,)
+
+        def before_launch(executable, original_raw):
+            events.append(("hook", executable, original_raw))
+
+        module = "sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin"
+        with (
+            mock.patch(module + ".dedup_update", side_effect=update),
+            mock.patch(module + ".cuda_rt") as runtime,
+            mock.patch(module + ".checkCudaErrors"),
+        ):
+            runtime.cudaGraphLaunch.side_effect = launch
+            current.replay(7, before_launch=before_launch)
+            current.replay(7, before_launch=before_launch)
+            current.replay(7)
+        self.assertEqual(
+            events,
+            [
+                ("update", 10, 2),
+                ("hook", 10, 1),
+                ("launch", 10, 7),
+                ("hook", 10, 1),
+                ("launch", 10, 7),
+                ("launch", 10, 7),
+            ],
+        )
+
+    def test_before_launch_failure_prevents_launch(self):
+        registry = DedupedCudaGraphRegistry()
+        graph = DedupedCudaGraph(1, None, registry)
+        graph.group = GraphExecGroup(10, 1, None, [graph])
+        callback = mock.Mock(side_effect=RuntimeError("child update failed"))
+        module = "sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin"
+        with mock.patch(module + ".cuda_rt") as runtime:
+            with self.assertRaisesRegex(RuntimeError, "child update failed"):
+                graph.replay(7, before_launch=callback)
+            runtime.cudaGraphLaunch.assert_not_called()
+        callback.assert_called_once_with(10, 1)
+
+    def test_failed_graph_update_prevents_hook_and_launch(self):
+        registry = DedupedCudaGraphRegistry(allow_kernel_updates=True)
+        original = DedupedCudaGraph(1, None, registry)
+        current = DedupedCudaGraph(2, None, registry)
+        group = GraphExecGroup(10, 1, None, [original, current])
+        original.group = current.group = group
+        callback = mock.Mock()
+        module = "sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin"
+        with (
+            mock.patch(module + ".dedup_update", return_value=(False, "incompatible")),
+            mock.patch(module + ".cuda_rt") as runtime,
+        ):
+            with self.assertRaisesRegex(AssertionError, "incompatible"):
+                current.replay(7, before_launch=callback)
+            callback.assert_not_called()
+            runtime.cudaGraphLaunch.assert_not_called()
+        self.assertEqual(group.current_raw_graph, 1)
+
     def test_incompatible_update_keeps_separate_executable(self):
         registry = DedupedCudaGraphRegistry(allow_kernel_updates=True)
         captures = [mock.Mock() for _ in range(3)]

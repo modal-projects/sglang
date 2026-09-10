@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 
@@ -211,10 +212,15 @@ class DedupedCudaGraph:
     registry: DedupedCudaGraphRegistry
     group: GraphExecGroup | None = None
 
-    def replay(self, stream: int | None = None) -> None:
+    def replay(
+        self,
+        stream: int | None = None,
+        *,
+        before_launch: Callable[[int, int], None] | None = None,
+    ) -> None:
         if stream is None:
             stream = torch.cuda.current_stream().cuda_stream
-        self.registry.replay(self, stream)
+        self.registry.replay(self, stream, before_launch=before_launch)
 
 
 class DedupedCudaGraphRegistry:
@@ -278,7 +284,13 @@ class DedupedCudaGraphRegistry:
             self.groups
         )
 
-    def replay(self, graph: DedupedCudaGraph, stream: int) -> None:
+    def replay(
+        self,
+        graph: DedupedCudaGraph,
+        stream: int,
+        *,
+        before_launch: Callable[[int, int], None] | None = None,
+    ) -> None:
         assert cuda_rt is not None
         group = graph.group
         assert group is not None, (
@@ -295,6 +307,8 @@ class DedupedCudaGraphRegistry:
             )
             group.current_raw_graph = raw_graph
 
+        if before_launch is not None:
+            before_launch(graph_exec, group.graphs[0].raw_graph)
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
 
     def close(self) -> None:

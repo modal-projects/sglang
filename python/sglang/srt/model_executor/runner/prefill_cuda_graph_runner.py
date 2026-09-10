@@ -359,6 +359,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 attn_backend.num_q_heads,
             )
 
+        self.kpool_prefill_graph_variants = None
+        kpool_variants = envs.SGLANG_DSA_KPOOL_PREFILL_CUDA_GRAPH_VARIANTS.get()
+        if kpool_variants and not model_runner.is_draft_worker:
+            from sglang.srt.layers.attention.dsa.kpool_prefill_graph_variants import (
+                KPoolPrefillGraphVariants,
+            )
+
+            if (self.dsa_prefill_graph_variants is None
+                or not envs.SGLANG_KDA_PREFILL_CUDA_GRAPH.get()
+                or self.dp_size != 1 or get_parallel().attn_cp_size != 1
+                or get_parallel().attn_dcp_size != 1
+                or get_parallel().enable_dsa_cache_layer_split
+                or not attn_backend.dsa_topk_backend.is_sgl_kernel()
+                or not attn_backend.use_fused_topk
+                or getattr(model_runner.model_config.hf_config, "index_head_dim", None) != 128
+                or getattr(model_runner.model_config.hf_config, "index_n_heads", None) != 32):
+                raise ValueError("KPool capture requires validated TP-only KDA/DSA graphs and SGL fused top-k")
+            self.kpool_prefill_graph_variants = KPoolPrefillGraphVariants(
+                kpool_variants, self.capture_num_tokens, self.dsa_prefill_graph_variants,
+            )
+            attn_backend.kpool_prefill_graph_variants = self.kpool_prefill_graph_variants
+
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
         # Hidden-state capture mode cases:
@@ -980,6 +1002,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 len(forward_batch.input_ids), int(forward_batch.seq_lens_cpu.max())
             )
             dsa_variant = self.dsa_prefill_graph_variants.label(dsa_variant)
+        if self.kpool_prefill_graph_variants is not None:
+            kpool_variant = self.kpool_prefill_graph_variants.resolve(forward_batch)
+            if kpool_variant is not None:
+                variant = self.kpool_prefill_graph_variants.label(kpool_variant)
         return ShapeKey(size=num_tokens, variant_label=variant, dsa_variant=dsa_variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
@@ -1555,6 +1581,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raise RuntimeError(
                         "DSA variant capture exceeded its 8 GiB/30 minute budget"
                     )
+        if self.kpool_prefill_graph_variants is not None:
+            variants = self.kpool_prefill_graph_variants
+            started = time.monotonic()
+            free = torch.cuda.mem_get_info(self.device)[0]
+            for variant in variants.variants:
+                bucket = variants.bucket(variant)
+                self.capture_one_shape(
+                    bucket, dsa_variant=variants.dsa_variant(variant), kpool_variant=variant,
+                )
+                key = ShapeKey(size=bucket, variant_label=variants.label(variant),
+                    dsa_variant=self.dsa_prefill_graph_variants.label(variants.dsa_variant(variant)))
+                segments = len(self.backend._graphs[key]._segments)
+                logger.info("KPOOL_PREFILL_VARIANT_CAPTURE %s", json.dumps(dict(
+                    rank=torch.distributed.get_rank(), variant=variant, bucket=bucket,
+                    segments=segments, cumulative_seconds=time.monotonic()-started,
+                    cumulative_device_bytes=free-torch.cuda.mem_get_info(self.device)[0],
+                )))
+                if segments != 1:
+                    raise RuntimeError(f"KPool capture retained {segments} graph segments")
+                if free-torch.cuda.mem_get_info(self.device)[0] > 8 * 1024**3 or time.monotonic()-started > 1800:
+                    raise RuntimeError("KPool capture exceeded its 8 GiB/30 minute budget")
 
     def capture_one_shape(
         self,
@@ -1562,14 +1609,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         *,
         prefix_num_chunks: int = 0,
         dsa_variant: Optional[tuple[int, int]] = None,
+        kpool_variant: Optional[tuple[int, int, int]] = None,
     ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if dsa_variant is not None:
-            live_tokens = dsa_variant[0]
+        if dsa_variant is not None or kpool_variant is not None:
+            live_tokens = kpool_variant[0] if kpool_variant is not None else dsa_variant[0]
             assert forward_batch.batch_size == 1 and not prefix_num_chunks
             forward_batch.dsa_prefill_graph_variant = dsa_variant
             forward_batch.extend_num_tokens = live_tokens
@@ -1583,6 +1631,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.global_num_token_non_padded_cpu = live_tokens
             if forward_batch.num_token_non_padded is not None:
                 forward_batch.num_token_non_padded.fill_(live_tokens)
+        forward_batch.kpool_prefill_graph_variant = kpool_variant
+        forward_batch.kpool_prefill_graph_capture = kpool_variant is not None
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1604,7 +1654,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         shape_key = ShapeKey(
             size=num_tokens,
             variant_label=(
-                _chunked_prefix_variant(prefix_num_chunks)
+                self.kpool_prefill_graph_variants.label(kpool_variant)
+                if kpool_variant is not None else _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
                 else None
             ),
@@ -1700,6 +1751,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens, int(forward_batch.seq_lens_cpu.max())
             )
         forward_batch.dsa_prefill_graph_variant = dsa_variant
+        kpool_variant = (
+            self.kpool_prefill_graph_variants.resolve(forward_batch)
+            if self.kpool_prefill_graph_variants is not None else None
+        )
+        forward_batch.kpool_prefill_graph_variant = kpool_variant
+        forward_batch.kpool_prefill_graph_capture = False
 
         bs = forward_batch.batch_size
         self.raw_bs = bs
@@ -1810,6 +1867,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
             dsa_prefill_graph_variant=dsa_variant,
+            kpool_prefill_graph_variant=kpool_variant,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
@@ -2058,7 +2116,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            if self._capture_chunked_prefix and shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.

@@ -513,6 +513,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For extend
     extend_num_tokens: Optional[int] = None
     dsa_prefill_graph_variant: Optional[tuple[int, int]] = None
+    kpool_prefill_graph_variant: Optional[tuple[int, int, int]] = None
+    kpool_prefill_graph_capture: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None

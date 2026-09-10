@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.moe.topk import (
+    _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
@@ -32,7 +33,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             input_ids=input_ids,
             bias_alt_token_id=moe.config.image_token_id,
             renormalize=config.renormalize and config.top_k > 1,
-            renormalize_epsilon=1e-20,
+            renormalize_epsilon=_RENORMALIZE_SUM_EPSILON,
             routed_scaling_factor=config.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=config.apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
@@ -47,10 +48,12 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             moe.gate.e_score_correction_bias_vl,
             moe.gate.e_score_correction_bias,
         )
-    num_routed_topk = config.top_k - num_fused_shared_experts
-    indices = (scores + bias).topk(num_routed_topk, dim=-1).indices
+    # topk for routed experts only; the shared expert slots are appended below
+    # with the same layout as biased_grouped_topk_gpu.
+    topk_routed = config.top_k - num_fused_shared_experts
+    indices = (scores + bias).topk(topk_routed, dim=-1).indices
     weights = scores.gather(-1, indices)
-    routed_sum = weights.sum(-1, keepdim=True)
+    routed_sum = weights.sum(-1, keepdim=True, dtype=torch.float32)
     if num_fused_shared_experts:
         shared_ids = logits.shape[-1] + torch.arange(
             num_fused_shared_experts, device=indices.device, dtype=indices.dtype
@@ -59,17 +62,10 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             [indices, shared_ids.expand(indices.shape[0], -1)],
             dim=-1,
         )
-        weights = torch.cat(
-            [
-                weights,
-                (routed_sum / config.routed_scaling_factor).expand(
-                    -1, num_fused_shared_experts
-                ),
-            ],
-            dim=-1,
-        )
+        weights = F.pad(weights, (0, num_fused_shared_experts))
+        weights[:, topk_routed:] = routed_sum / config.routed_scaling_factor
     if config.renormalize and config.top_k > 1:
-        weights = weights / (routed_sum + 1e-20)
+        weights = weights / (routed_sum + _RENORMALIZE_SUM_EPSILON)
     if config.apply_routed_scaling_factor_on_output:
         weights = weights * config.routed_scaling_factor
     weights, indices = weights.float(), indices.int()

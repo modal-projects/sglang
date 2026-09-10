@@ -1232,7 +1232,7 @@ class DeepseekSparseAttnBackend(
 
             config = get_exec().graph.cuda_graph_config.prefill
             if (
-                config.backend != Backend.BREAKABLE
+                config.backend not in (Backend.BREAKABLE, Backend.FULL)
                 or self.dsa_prefill_impl != "trtllm"
                 or not self.use_fused_topk
                 or self.qk_rope_head_dim != 0

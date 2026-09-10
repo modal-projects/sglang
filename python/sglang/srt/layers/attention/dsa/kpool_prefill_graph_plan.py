@@ -1,6 +1,7 @@
 """Bounded persistent metadata prototype for pooled-indexer prefill capture."""
 
 import dataclasses
+import math
 
 import torch
 
@@ -19,8 +20,17 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 
 
 class KPoolPrefillGraphPlan:
-    def __init__(self, max_tokens, max_requests, max_history_rows, device, pool_size=4,
-                 max_context=None, mapping_mode=None):
+    def __init__(
+        self,
+        max_tokens,
+        max_requests,
+        max_history_rows,
+        device,
+        pool_size=4,
+        max_context=None,
+        mapping_mode=None,
+        storage=None,
+    ):
         if min(max_tokens, max_requests, max_history_rows, pool_size) <= 0:
             raise ValueError("Capture capacities must be positive")
         if max_history_rows % BLOCK_SIZE_K:
@@ -34,42 +44,71 @@ class KPoolPrefillGraphPlan:
         self.ragged_paged_page_table = None
         self.live_tokens = self.token_capacity = max_tokens
         self.max_context = max_context
-        self.max_logits_rows = max(1, (max_context or max_history_rows * pool_size) // pool_size)
+        self.max_logits_rows = max(
+            1, (max_context or max_history_rows * pool_size) // pool_size
+        )
         self.skip_logits = max_context is not None and max_context <= 2048
         self.mapping_mode = mapping_mode
         self._owns_page_table = max_context is not None and mapping_mode == "paged"
+        self._storage = {} if storage is None else storage
 
-        def zeros(n, dtype=torch.int32):
-            return torch.zeros(n, dtype=dtype, device=device)
+        def zeros(name, shape, dtype=torch.int32):
+            shape = (shape,) if isinstance(shape, int) else shape
+            if storage is None:
+                value = torch.zeros(shape, dtype=dtype, device=device)
+                self._storage[name] = value.reshape(-1)
+                return value
+            owner = storage[name]
+            requested_device = torch.device(device)
+            if (
+                owner.dtype != dtype
+                or owner.ndim != 1
+                or owner.numel() < math.prod(shape)
+                or owner.device.type != requested_device.type
+                or (
+                    requested_device.index is not None
+                    and owner.device.index != requested_device.index
+                )
+            ):
+                raise ValueError("Shared KPool storage does not fit the capture plan")
+            return owner[: math.prod(shape)].view(shape)
 
         self.writes = PoolWriteRows(
-            req=zeros(self.max_writes, torch.int64),
-            pool_id=zeros(self.max_writes, torch.int64),
-            n_from_tail=zeros(self.max_writes),
-            chunk_src=zeros(self.max_writes, torch.int64),
-            tail_logical_base=zeros(self.max_writes),
-            write_loc=zeros(self.max_writes, torch.int64),
+            req=zeros("writes.req", self.max_writes, torch.int64),
+            pool_id=zeros("writes.pool_id", self.max_writes, torch.int64),
+            n_from_tail=zeros("writes.n_from_tail", self.max_writes),
+            chunk_src=zeros("writes.chunk_src", self.max_writes, torch.int64),
+            tail_logical_base=zeros("writes.tail_logical_base", self.max_writes),
+            write_loc=zeros("writes.write_loc", self.max_writes, torch.int64),
         )
         self.tails = TailWriteRows(
-            req=zeros(max_requests, torch.int64),
-            dst_logical_start=zeros(max_requests),
-            chunk_src=zeros(max_requests, torch.int64),
-            n_write=zeros(max_requests),
+            req=zeros("tails.req", max_requests, torch.int64),
+            dst_logical_start=zeros("tails.dst_logical_start", max_requests),
+            chunk_src=zeros("tails.chunk_src", max_requests, torch.int64),
+            n_write=zeros("tails.n_write", max_requests),
         )
-        self.write_mask = zeros(self.max_writes, torch.bool)
-        self.num_history_rows = zeros(1)
-        self.num_tokens = zeros(1)
-        self.seq_lens_expanded = zeros(max_tokens)
-        self.pooled_seq_lens_expanded = zeros(max_tokens)
-        self.ragged_q_ks = zeros(max_tokens)
-        self.ragged_q_ke = zeros(max_tokens)
-        self.ragged_concat_page_table = zeros(max_history_rows // BLOCK_SIZE_K)
-        self.ragged_paged_page_table_row_index = zeros(max_tokens)
-        self.topk_offsets = zeros(max_tokens)
-        self.ragged_k_u8 = zeros((max_history_rows, INDEX_HEAD_DIM), torch.uint8)
-        self.ragged_k_scale = zeros(max_history_rows, torch.float32)
+        self.write_mask = zeros("write_mask", self.max_writes, torch.bool)
+        self.num_history_rows = zeros("num_history_rows", 1)
+        self.num_tokens = zeros("num_tokens", 1)
+        self.seq_lens_expanded = zeros("seq_lens_expanded", max_tokens)
+        self.pooled_seq_lens_expanded = zeros("pooled_seq_lens_expanded", max_tokens)
+        self.ragged_q_ks = zeros("ragged_q_ks", max_tokens)
+        self.ragged_q_ke = zeros("ragged_q_ke", max_tokens)
+        self.ragged_concat_page_table = zeros(
+            "ragged_concat_page_table", max_history_rows // BLOCK_SIZE_K
+        )
+        self.ragged_paged_page_table_row_index = zeros(
+            "ragged_paged_page_table_row_index", max_tokens
+        )
+        self.topk_offsets = zeros("topk_offsets", max_tokens)
+        self.ragged_k_u8 = zeros(
+            "ragged_k_u8", (max_history_rows, INDEX_HEAD_DIM), torch.uint8
+        )
+        self.ragged_k_scale = zeros("ragged_k_scale", max_history_rows, torch.float32)
         if self._owns_page_table:
-            self.ragged_paged_page_table = zeros((max_requests, max_context))
+            self.ragged_paged_page_table = zeros(
+                "ragged_paged_page_table", (max_requests, max_context)
+            )
             self.layout = "paged"
 
     def clear(self):

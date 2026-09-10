@@ -85,10 +85,14 @@ class IndexerKPool(MultiPlatformOp):
             envs.SGLANG_DSA_KPOOL_PREFILL_STABLE_PROJECTION.get()
         )
         self.prefill_projection_max_tokens = 0
+        self.prefill_projection_buckets = ()
         if self.prefill_stable_projection:
             prefill = get_exec().graph.cuda_graph_config.prefill
+            self.prefill_projection_buckets = tuple(
+                sorted(prefill.bs or [prefill.max_bs or 0])
+            )
             self.prefill_projection_max_tokens = max(
-                prefill.bs or [prefill.max_bs or 0]
+                self.prefill_projection_buckets
             )
 
         self.index_kpool = config.index_kpool
@@ -168,11 +172,11 @@ class IndexerKPool(MultiPlatformOp):
     ):
         if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
             from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
-                kpool_prefill_linear,
+                kpool_prefill_head_projection,
             )
 
-            weights = kpool_prefill_linear(
-                x, self.weights_proj.weight, dtype=torch.float32
+            weights = kpool_prefill_head_projection(
+                x, self.weights_proj.weight, self.prefill_projection_buckets
             )
         else:
             weights, _ = self.weights_proj(x.float())

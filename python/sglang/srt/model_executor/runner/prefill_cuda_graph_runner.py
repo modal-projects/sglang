@@ -328,11 +328,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             if (
-                self.prefill_backend_name != Backend.BREAKABLE
+                self.prefill_backend_name not in (Backend.BREAKABLE, Backend.FULL)
                 or not envs.SGLANG_DSA_PREFILL_CUDA_GRAPH.get()
+                or (
+                    self.prefill_backend_name == Backend.FULL
+                    and not envs.SGLANG_DSA_KPOOL_PREFILL_CUDA_GRAPH_VARIANTS.get()
+                )
             ):
                 raise ValueError(
-                    "DSA variants require captured DSA with breakable graphs"
+                    "DSA variants require breakable graphs, or full graphs with pooled-indexer plans"
                 )
             attn_backend = getattr(
                 model_runner.attn_backend,
@@ -380,6 +384,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 kpool_variants, self.capture_num_tokens, self.dsa_prefill_graph_variants,
             )
             attn_backend.kpool_prefill_graph_variants = self.kpool_prefill_graph_variants
+
+        self._sparse_prefill_full_graph = (
+            self.prefill_backend_name == Backend.FULL
+            and self.kpool_prefill_graph_variants is not None
+        )
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -504,6 +513,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
+            if self._sparse_prefill_full_graph:
+                self._capture_req_slots = min(
+                    max_req, self.kpool_prefill_graph_variants.max_requests
+                )
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
@@ -534,7 +547,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
+            self._is_full_backend
+            and not self._sparse_prefill_full_graph
+            and not get_schedule().disable_chunked_prefix_cache
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -1175,7 +1190,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
         attn_backend = self.model_runner.attn_backend
-        if self._is_full_backend:
+        if self._is_full_backend and not self._sparse_prefill_full_graph:
             # Slot-padded shallow view: plan() must see exactly req_slots
             # entries (real values in [:bs], sentinels in [bs:req_slots]
             # already populated by replay_prepare).
@@ -1280,6 +1295,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            self._sparse_prefill_full_graph
+            and self.kpool_prefill_graph_variants.resolve(forward_batch) is None
+        ):
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1359,7 +1379,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             min(context_length, num_tokens - start)
             for start in range(0, num_tokens, context_length)
         ]
-        if self.prefill_backend_name == Backend.FULL:
+        if self._is_full_backend and not self._sparse_prefill_full_graph:
             # Full captures a fixed request-axis shape; unused slots are
             # zero-length sentinels after the context-bounded real requests.
             capture_seq_lens += [0] * (self._capture_req_slots - len(capture_seq_lens))
@@ -1509,7 +1529,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+            ()
+            if self._sparse_prefill_full_graph
+            else tqdm.tqdm(list(reversed(self.capture_num_tokens)))
             if get_parallel().tp_rank == 0
             else reversed(self.capture_num_tokens)
         )
@@ -1527,7 +1549,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
-        if self.dsa_prefill_graph_variants is not None:
+        if (
+            self.dsa_prefill_graph_variants is not None
+            and not self._sparse_prefill_full_graph
+        ):
             self.device_module.synchronize()
             variant_started = time.monotonic()
             variant_free = torch.cuda.mem_get_info(self.device)[0]
@@ -1585,14 +1610,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             variants = self.kpool_prefill_graph_variants
             started = time.monotonic()
             free = torch.cuda.mem_get_info(self.device)[0]
-            for variant in variants.variants:
+            capture_variants = (
+                reversed(variants.variants)
+                if self._sparse_prefill_full_graph
+                else variants.variants
+            )
+            for variant in capture_variants:
                 bucket = variants.bucket(variant)
                 self.capture_one_shape(
                     bucket, dsa_variant=variants.dsa_variant(variant), kpool_variant=variant,
                 )
                 key = ShapeKey(size=bucket, variant_label=variants.label(variant),
                     dsa_variant=self.dsa_prefill_graph_variants.label(variants.dsa_variant(variant)))
-                segments = len(self.backend._graphs[key]._segments)
+                segments = (
+                    1
+                    if self._is_full_backend
+                    else len(self.backend._graphs[key]._segments)
+                )
                 logger.info("KPOOL_PREFILL_VARIANT_CAPTURE %s", json.dumps(dict(
                     rank=torch.distributed.get_rank(), variant=variant, bucket=bucket,
                     segments=segments, cumulative_seconds=time.monotonic()-started,
@@ -1669,7 +1703,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._prepare_chunked_prefix_capture(
                 forward_batch, shape_key, prefix_num_chunks
             )
-        if self._is_full_backend:
+        if self._is_full_backend and not self._sparse_prefill_full_graph:
             if not prefix_num_chunks:
                 attn_backend.init_forward_metadata_out_graph(
                     forward_batch, in_capture=True
@@ -1694,7 +1728,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4's hook (which restores forward_metadata to a stale
         # _current_capture_raw left over from decode CG capture) doesn't
         # corrupt warmup iter 2's metadata read.
-        if isinstance(self.backend, BreakableCudaGraphBackend):
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            or self._sparse_prefill_full_graph
+        ):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
             mamba_pool = getattr(req_pool, "mamba_pool", None)
@@ -1716,7 +1753,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # BCG retains it so their recorded addresses remain valid.
             capture_inputs=(
                 forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
+                if self._is_full_backend
+                or forward_batch.global_num_tokens_gpu is not None
                 else None
             ),
             post_warmup_hook=post_warmup_hook,

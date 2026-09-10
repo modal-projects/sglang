@@ -434,9 +434,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
             graph_config = get_exec().graph.cuda_graph_config.prefill
-            if graph_config.backend != Backend.BREAKABLE:
+            if graph_config.backend not in (Backend.BREAKABLE, Backend.FULL):
                 raise ValueError(
-                    "KDA prefill capture currently requires breakable graphs"
+                    "KDA prefill capture requires breakable or full graphs"
+                )
+            if graph_config.backend == Backend.FULL and not (
+                envs.SGLANG_DSA_PREFILL_CUDA_GRAPH.get()
+                and envs.SGLANG_DSA_KPOOL_PREFILL_CUDA_GRAPH_VARIANTS.get()
+            ):
+                raise ValueError(
+                    "Full KDA prefill requires captured DSA and pooled-indexer plans"
                 )
             self._prefill_graph_buffers = KDAPrefillGraphMetadata(
                 graph_config.max_bs, model_runner.max_running_requests, self.device

@@ -1,8 +1,23 @@
 """Fixed reduction order for opt-in pooled-indexer prefill projections."""
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+
+def kpool_prefill_head_projection(x, weight, capture_sizes):
+    rows = x.shape[0]
+    padded_rows = rows
+    if rows > 80:
+        for size in capture_sizes:
+            if rows <= size:
+                padded_rows = size
+                break
+    x = x.float()
+    if padded_rows != rows:
+        x = F.pad(x, (0, 0, 0, padded_rows - rows))
+    return F.linear(x, weight)[:rows]
 
 
 @triton.jit(do_not_specialize=["M"])

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -317,6 +317,7 @@ class DSAMetadata:
     pooled_real_page_table: Optional[torch.Tensor] = None
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
+    kpool_prefill_graph_plan: Optional[object] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
 
 
@@ -576,6 +577,11 @@ class DeepseekSparseAttnBackend(
             prefill_impl=self.dsa_prefill_impl,
             decode_impl=self.dsa_decode_impl,
         )
+
+        # Captured TRT-LLM graphs retain the address of their counter buffer.
+        # Eager prefills may need a larger buffer later; keep previous buffers
+        # alive for this backend's lifetime so those graphs can still replay.
+        self._retired_multi_ctas_kv_counter_buffers: list[torch.Tensor] = []
 
         if uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
@@ -1204,6 +1210,15 @@ class DeepseekSparseAttnBackend(
             topk_transform_method=topk_transform_method,
             kpool_inputs=kpool_inputs,
         )
+        if forward_batch.kpool_prefill_graph_variant is not None:
+            variants = getattr(self, "kpool_prefill_graph_variants", None)
+            if (variants is None or not self.use_fused_topk
+                or self.dsa_prefill_impl != "trtllm" or self.use_mha):
+                raise ValueError("KPool graph selected without compatible metadata")
+            metadata = replace(metadata, kpool_prefill_graph_plan=variants.prepare(
+                forward_batch.kpool_prefill_graph_variant, forward_batch, metadata, self.device,
+                "paged" if topk_transform_method == TopkTransformMethod.PAGED else "ragged",
+            ))
         self.forward_metadata = metadata
         self.prefill_graph_metadata = None
         if (
@@ -3637,14 +3652,7 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
-        )
+        self._ensure_multi_ctas_kv_counter_buffer(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
@@ -3670,6 +3678,15 @@ class DeepseekSparseAttnBackend(
         )
 
         return out
+
+    def _ensure_multi_ctas_kv_counter_buffer(self, batch_size: int) -> None:
+        previous = self._multi_ctas_kv_counter_buffer
+        current = grow_multi_ctas_kv_counter_buffer_if_needed(
+            previous, torch.device(self.device), self.num_q_heads, batch_size
+        )
+        if current is not previous:
+            self._retired_multi_ctas_kv_counter_buffers.append(previous)
+            self._multi_ctas_kv_counter_buffer = current
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int

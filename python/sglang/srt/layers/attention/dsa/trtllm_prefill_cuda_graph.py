@@ -92,10 +92,6 @@ def trtllm_prefill_graph_attention(
 
 
 def dsa_prefill_graph_forward(backend, layer, q, k, k_rope, topk_indices, metadata):
-    from sglang.srt.layers.attention.trtllm_mla_backend import (
-        grow_multi_ctas_kv_counter_buffer_if_needed,
-    )
-
     tokens = q.shape[0]
     live_tokens, max_seq_len = metadata.variant or (
         tokens,
@@ -111,12 +107,7 @@ def dsa_prefill_graph_forward(backend, layer, q, k, k_rope, topk_indices, metada
     kv = pool.get_key_buffer(layer.layer_id).view(
         -1, 1, backend.real_page_size, backend.kv_cache_dim
     )
-    backend._multi_ctas_kv_counter_buffer = grow_multi_ctas_kv_counter_buffer_if_needed(
-        backend._multi_ctas_kv_counter_buffer,
-        torch.device(backend.device),
-        backend.num_q_heads,
-        tokens,
-    )
+    backend._ensure_multi_ctas_kv_counter_buffer(tokens)
     k_scale = getattr(layer, "k_scale_float", None)
     result = trtllm_prefill_graph_attention(
         q.view(tokens, layer.tp_q_head_num, layer.v_head_dim)[:live_tokens],

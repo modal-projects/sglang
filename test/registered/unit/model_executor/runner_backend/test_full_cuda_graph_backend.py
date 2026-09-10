@@ -285,5 +285,89 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         self.assertEqual(rf_names, [])
 
 
+class TestNativeProjectionReplay(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        self.key = ShapeKey(size=128)
+        self.backend._outputs[self.key] = "OUTPUT"
+        self.batch = SimpleNamespace(extend_seq_lens_cpu=[40, 64])
+        self.native = "sglang.srt.layers.attention.dsa.kpool_native_projection_graph"
+        patch = mock.patch(
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.get_bool_env_var",
+            side_effect=lambda name: name == "SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS",
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_dedup_replay_uses_live_lengths(self):
+        from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import DedupedCudaGraph
+
+        graph = mock.Mock(spec=DedupedCudaGraph)
+        graph.raw_graph = 170
+        self.backend._graphs[self.key] = graph
+        with mock.patch(self.native + ".replay_callback") as callback:
+            self.assertEqual(self.backend.replay(self.key, self.batch), "OUTPUT")
+        callback.assert_called_once_with(170, 104)
+        graph.replay.assert_called_once_with(before_launch=callback.return_value)
+
+    def test_non_dedup_updates_before_launch(self):
+        graph = mock.Mock()
+        graph.raw_cuda_graph.return_value = 170
+        graph.raw_cuda_graph_exec.return_value = 990
+        self.backend._graphs[self.key] = graph
+        order = mock.Mock()
+        order.attach_mock(graph.replay, "launch")
+        with mock.patch(self.native + ".replay_callback") as callback:
+            order.attach_mock(callback.return_value, "update")
+            self.backend.replay(self.key, self.batch)
+        callback.assert_called_once_with(170, 104)
+        self.assertEqual(order.mock_calls, [mock.call.update(990, 170), mock.call.launch()])
+
+    def test_decode_without_native_children_replays_normally(self):
+        graph = mock.Mock()
+        graph.raw_cuda_graph.return_value = 170
+        self.backend._graphs[self.key] = graph
+        with mock.patch(self.native + ".replay_callback", return_value=None) as callback:
+            self.backend.replay(self.key, SimpleNamespace(extend_seq_lens_cpu=None))
+        callback.assert_called_once_with(170, 0)
+        graph.raw_cuda_graph_exec.assert_not_called()
+        graph.replay.assert_called_once_with()
+
+    def test_failed_update_prevents_launch(self):
+        graph = mock.Mock()
+        self.backend._graphs[self.key] = graph
+        with mock.patch(self.native + ".replay_callback") as callback:
+            callback.return_value.side_effect = ValueError("wrong owner")
+            with self.assertRaisesRegex(ValueError, "wrong owner"):
+                self.backend.replay(self.key, self.batch)
+        graph.replay.assert_not_called()
+
+    def test_non_dedup_capture_instantiates_retained_graph(self):
+        graph = mock.Mock()
+        with mock.patch("torch.cuda.CUDAGraph", return_value=graph) as create:
+            self.backend.capture_one(self.key, lambda: torch.ones(128))
+        create.assert_called_once_with(keep_graph=True)
+        graph.instantiate.assert_called_once_with()
+
+    def test_cleanup_releases_native_templates_after_executables(self):
+        from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import DedupedCudaGraph
+
+        graph = mock.Mock(spec=DedupedCudaGraph)
+        graph.raw_graph = 170
+        registry = mock.Mock()
+        self.backend.deduped_cuda_graph = registry
+        self.backend._deduped_cuda_graph_registries = [registry]
+        self.backend._graphs[self.key] = graph
+        order = mock.Mock()
+        order.attach_mock(registry.close, "close")
+        with mock.patch(self.native + ".release_graphs") as release:
+            order.attach_mock(release, "release")
+            self.backend.cleanup()
+        self.assertEqual(order.mock_calls, [mock.call.close(), mock.call.release([170])])
+        self.assertFalse(self.backend._graphs)
+        self.assertFalse(self.backend._outputs)
+
+
 if __name__ == "__main__":
     unittest.main()

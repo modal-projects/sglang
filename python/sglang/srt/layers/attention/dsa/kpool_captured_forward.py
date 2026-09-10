@@ -102,6 +102,30 @@ def forward_captured_kpool(
     return_indices,
     plan,
 ):
+    from sglang.srt.utils import get_bool_env_var
+
+    if plan.live_tokens > 80 and get_bool_env_var("SGLANG_KPOOL_PREFILL_NATIVE_PROJECTION_GRAPHS"):
+        from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import native_projection_context
+
+        with native_projection_context(indexer):
+            return _forward_captured_kpool(
+                indexer, x, q_lora, positions, forward_batch, layer_id, return_indices, plan
+            )
+    return _forward_captured_kpool(
+        indexer, x, q_lora, positions, forward_batch, layer_id, return_indices, plan
+    )
+
+
+def _forward_captured_kpool(
+    indexer,
+    x,
+    q_lora,
+    positions,
+    forward_batch,
+    layer_id,
+    return_indices,
+    plan,
+):
     import deep_gemm
 
     from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant

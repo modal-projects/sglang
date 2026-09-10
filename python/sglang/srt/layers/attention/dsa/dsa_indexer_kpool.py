@@ -185,6 +185,10 @@ class IndexerKPool(MultiPlatformOp):
         return weights
 
     def _project_key(self, x: torch.Tensor, stable_projection: bool = False):
+        if getattr(self, "_native_prefill_projection_context", False):
+            from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import project
+
+            return project(self, "key", x, self.wk.weight)
         if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
             from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
                 kpool_prefill_linear,
@@ -196,6 +200,10 @@ class IndexerKPool(MultiPlatformOp):
     def _project_compress_gate(
         self, x: torch.Tensor, stable_projection: bool = False
     ):
+        if getattr(self, "_native_prefill_projection_context", False):
+            from sglang.srt.layers.attention.dsa.kpool_native_projection_graph import project
+
+            return project(self, "gate", x, self.index_kpool_compress_gate)
         if stable_projection and x.shape[0] <= self.prefill_projection_max_tokens:
             from sglang.srt.layers.attention.dsa.kpool_prefill_projection import (
                 kpool_prefill_linear,

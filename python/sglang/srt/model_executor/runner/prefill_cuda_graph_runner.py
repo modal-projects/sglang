@@ -40,7 +40,9 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
+import json
 import logging
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -53,6 +55,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -306,10 +309,55 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        dsa_variants = envs.SGLANG_DSA_PREFILL_CUDA_GRAPH_VARIANTS.get()
+        if (
+            dsa_variants == "all"
+            and not model_runner.is_draft_worker
+            and 1 not in self.capture_num_tokens
+        ):
+            self.capture_num_tokens.insert(0, 1)
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
+        self.dsa_prefill_graph_variants = None
+        self.dsa_variant_capture_stats = []
+        if dsa_variants and not model_runner.is_draft_worker:
+            from sglang.srt.layers.attention.dsa.prefill_graph_variants import (
+                DSAPrefillGraphVariants,
+            )
+
+            if (
+                self.prefill_backend_name != Backend.BREAKABLE
+                or not envs.SGLANG_DSA_PREFILL_CUDA_GRAPH.get()
+            ):
+                raise ValueError(
+                    "DSA variants require captured DSA with breakable graphs"
+                )
+            attn_backend = getattr(
+                model_runner.attn_backend,
+                "full_attn_backend",
+                model_runner.attn_backend,
+            )
+            if any(
+                getattr(attn_backend, name, None) != expected
+                for name, expected in (
+                    ("dsa_index_topk", 2048),
+                    ("dsa_index_kpool", 4),
+                    ("kv_lora_rank", 512),
+                    ("kv_cache_dim", 512),
+                    ("qk_nope_head_dim", 256),
+                    ("qk_rope_head_dim", 0),
+                    ("real_page_size", 64),
+                )
+            ):
+                raise ValueError("DSA variants require the validated GLM dimensions")
+            self.dsa_prefill_graph_variants = DSAPrefillGraphVariants(
+                dsa_variants,
+                self.capture_num_tokens,
+                torch.cuda.get_device_properties(self.device).multi_processor_count,
+                attn_backend.num_q_heads,
+            )
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -926,7 +974,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
-        return ShapeKey(size=num_tokens, variant_label=variant)
+        dsa_variant = None
+        if self.dsa_prefill_graph_variants is not None and len(forward_batch.input_ids):
+            dsa_variant = self.dsa_prefill_graph_variants.resolve(
+                len(forward_batch.input_ids), int(forward_batch.seq_lens_cpu.max())
+            )
+            dsa_variant = self.dsa_prefill_graph_variants.label(dsa_variant)
+        return ShapeKey(size=num_tokens, variant_label=variant, dsa_variant=dsa_variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
         """Allocate the stable chunk-metadata tensors shared by all variants."""
@@ -1447,13 +1501,88 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
+        if self.dsa_prefill_graph_variants is not None:
+            self.device_module.synchronize()
+            variant_started = time.monotonic()
+            variant_free = torch.cuda.mem_get_info(self.device)[0]
+            logger.info(
+                "DSA_PREFILL_VARIANTS_BEGIN %s",
+                json.dumps(
+                    dict(
+                        rank=get_parallel().tp_rank,
+                        variants=len(self.dsa_prefill_graph_variants.variants),
+                        device_free_bytes=variant_free,
+                    )
+                ),
+            )
+            for variant in self.dsa_prefill_graph_variants.variants:
+                bucket = self.dsa_prefill_graph_variants.bucket(variant[0])
+                self.device_module.synchronize()
+                allocated = torch.cuda.memory_allocated(self.device)
+                reserved = torch.cuda.memory_reserved(self.device)
+                started = time.monotonic()
+                self.capture_one_shape(bucket, dsa_variant=variant)
+                self.device_module.synchronize()
+                record = dict(
+                    rank=get_parallel().tp_rank,
+                    tokens=variant[0],
+                    context_bound=variant[1],
+                    bucket=bucket,
+                    seconds=time.monotonic() - started,
+                    allocated_bytes=torch.cuda.memory_allocated(self.device)
+                    - allocated,
+                    reserved_bytes=torch.cuda.memory_reserved(self.device) - reserved,
+                    cumulative_device_bytes=variant_free
+                    - torch.cuda.mem_get_info(self.device)[0],
+                    cumulative_seconds=time.monotonic() - variant_started,
+                    segments=len(
+                        self.backend._graphs[
+                            ShapeKey(
+                                size=bucket,
+                                dsa_variant=self.dsa_prefill_graph_variants.label(
+                                    variant
+                                ),
+                            )
+                        ]._segments
+                    ),
+                )
+                self.dsa_variant_capture_stats.append(record)
+                logger.info("DSA_PREFILL_VARIANT_CAPTURE %s", json.dumps(record))
+                if (
+                    record["cumulative_device_bytes"] > 8 * 1024**3
+                    or record["cumulative_seconds"] > 1800
+                ):
+                    raise RuntimeError(
+                        "DSA variant capture exceeded its 8 GiB/30 minute budget"
+                    )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        dsa_variant: Optional[tuple[int, int]] = None,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if dsa_variant is not None:
+            live_tokens = dsa_variant[0]
+            assert forward_batch.batch_size == 1 and not prefix_num_chunks
+            forward_batch.dsa_prefill_graph_variant = dsa_variant
+            forward_batch.extend_num_tokens = live_tokens
+            forward_batch.extend_seq_lens_cpu = [live_tokens]
+            forward_batch.extend_logprob_start_lens_cpu = [live_tokens]
+            forward_batch.seq_lens_cpu.fill_(live_tokens)
+            forward_batch.seq_lens.fill_(live_tokens)
+            forward_batch.orig_seq_lens.fill_(live_tokens)
+            forward_batch.extend_seq_lens.fill_(live_tokens)
+            forward_batch.seq_lens_sum = live_tokens
+            forward_batch.global_num_token_non_padded_cpu = live_tokens
+            if forward_batch.num_token_non_padded is not None:
+                forward_batch.num_token_non_padded.fill_(live_tokens)
         if self.enable_cp_v2_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1477,6 +1606,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
+                else None
+            ),
+            dsa_variant=(
+                self.dsa_prefill_graph_variants.label(dsa_variant)
+                if dsa_variant is not None
                 else None
             ),
         )
@@ -1560,6 +1694,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "Prefill CUDA graph replay was admitted without a fitting bucket"
                 )
         self.raw_num_tokens = num_tokens
+        dsa_variant = None
+        if self.dsa_prefill_graph_variants is not None and num_tokens:
+            dsa_variant = self.dsa_prefill_graph_variants.resolve(
+                num_tokens, int(forward_batch.seq_lens_cpu.max())
+            )
+        forward_batch.dsa_prefill_graph_variant = dsa_variant
 
         bs = forward_batch.batch_size
         self.raw_bs = bs
@@ -1669,6 +1809,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
+            dsa_prefill_graph_variant=dsa_variant,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,

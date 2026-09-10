@@ -423,6 +423,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        self.prefill_graph_metadata = None
+        self._prefill_graph_buffers = None
+        if envs.SGLANG_KDA_PREFILL_CUDA_GRAPH.get():
+            if not prefill_backend.is_triton():
+                raise ValueError("KDA prefill CUDA graphs require the Triton backend")
+            from sglang.srt.layers.attention.linear.kda_prefill_cuda_graph import (
+                KDAPrefillGraphMetadata,
+            )
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            graph_config = get_exec().graph.cuda_graph_config.prefill
+            if graph_config.backend != Backend.BREAKABLE:
+                raise ValueError(
+                    "KDA prefill capture currently requires breakable graphs"
+                )
+            self._prefill_graph_buffers = KDAPrefillGraphMetadata(
+                graph_config.max_bs, model_runner.max_running_requests, self.device
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -536,6 +554,39 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+        self.prefill_graph_metadata = None
+        buffers = self._prefill_graph_buffers
+        if (
+            buffers is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and sum(forward_batch.extend_seq_lens_cpu) <= buffers.max_tokens
+            and forward_batch.batch_size <= buffers.max_requests
+        ):
+            buffers.update(
+                forward_batch.extend_seq_lens_cpu,
+                self.forward_metadata.mamba_cache_indices,
+                forward_batch.extend_prefix_lens,
+                self.forward_metadata,
+            )
+            self.prefill_graph_metadata = buffers
+
+    def forward_prefill_graph(self, layer, mixed_qkv, a, b):
+        from sglang.srt.layers.attention.linear.kda_prefill_cuda_graph import (
+            kda_prefill_graph_forward,
+        )
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        assert cache.conv[0].shape[1] == 3
+        assert self.accept_lens_pool is None
+        return kda_prefill_graph_forward(
+            layer,
+            mixed_qkv,
+            a,
+            b,
+            cache.conv[0],
+            cache.temporal,
+            self.prefill_graph_metadata,
+        )
 
     def forward_decode(
         self,

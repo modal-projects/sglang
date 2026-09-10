@@ -11,6 +11,15 @@ from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.utils import is_cuda
 
 
+def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
+    # Standard EP replicates the fused shared expert on every rank and
+    # all-reduces the outputs, so the shared columns carry a 1/ep_size factor
+    # (applied by _post_process_topk_ids on the paths that go through it).
+    if num_fused_shared_experts and scaling_factor is not None:
+        weights[:, -num_fused_shared_experts:] *= scaling_factor
+    return weights
+
+
 def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
     config = moe.topk.topk_config
     num_fused_shared_experts = config.num_fused_shared_experts
@@ -37,6 +46,11 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             routed_scaling_factor=config.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=config.apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
+        )
+        weights = _scale_fused_shared_weights(
+            weights,
+            num_fused_shared_experts,
+            config.fused_shared_experts_scaling_factor,
         )
         return StandardTopKOutput(weights, indices, logits)
     scores = F.softplus(logits.float()).sqrt()
@@ -68,6 +82,9 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         weights = weights / (routed_sum + _RENORMALIZE_SUM_EPSILON)
     if config.apply_routed_scaling_factor_on_output:
         weights = weights * config.routed_scaling_factor
+    weights = _scale_fused_shared_weights(
+        weights, num_fused_shared_experts, config.fused_shared_experts_scaling_factor
+    )
     weights, indices = weights.float(), indices.int()
     if num_token_non_padded is not None:
         _mask_topk_ids_padded_region(indices, num_token_non_padded)

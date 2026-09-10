@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -18,7 +19,10 @@ NUM_ROUTED_TOPK = 4
 ROUTED_SCALING_FACTOR = 1.5
 
 
-def _make_moe(num_fused_shared_experts: int):
+def _make_moe(
+    num_fused_shared_experts: int,
+    fused_shared_experts_scaling_factor: Optional[float] = None,
+):
     return SimpleNamespace(
         gate=SimpleNamespace(
             e_score_correction_bias=torch.zeros(NUM_EXPERTS),
@@ -33,6 +37,7 @@ def _make_moe(num_fused_shared_experts: int):
                 routed_scaling_factor=ROUTED_SCALING_FACTOR,
                 apply_routed_scaling_factor_on_output=True,
                 scoring_func="sqrtsoftplus",
+                fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             )
         ),
     )
@@ -58,6 +63,25 @@ class TestDsv41VisionTopK(CustomTestCase):
         # Routing of the non-shared slots is unchanged by fusion.
         torch.testing.assert_close(fused.topk_ids[:, :-1], unfused.topk_ids)
         torch.testing.assert_close(fused.topk_weights[:, :-1], unfused.topk_weights)
+
+    @patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False)
+    def test_fused_shared_expert_ep_scaling(self, _mock_is_cuda):
+        torch.manual_seed(0)
+        logits = torch.randn(8, NUM_EXPERTS)
+        ep_size = 8
+
+        fused = vision_topk(_make_moe(1), logits, None)
+        scaled = vision_topk(_make_moe(1, 1 / ep_size), logits, None)
+
+        # Standard EP replicates the shared expert per rank, so its weight is
+        # divided by ep_size while the routed slots are untouched.
+        torch.testing.assert_close(scaled.topk_ids, fused.topk_ids)
+        torch.testing.assert_close(
+            scaled.topk_weights[:, -1], fused.topk_weights[:, -1] / ep_size
+        )
+        torch.testing.assert_close(
+            scaled.topk_weights[:, :-1], fused.topk_weights[:, :-1]
+        )
 
 
 if __name__ == "__main__":

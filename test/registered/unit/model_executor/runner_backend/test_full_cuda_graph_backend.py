@@ -20,6 +20,8 @@ profiler stepping) is pure-Python and runs on CPU.
 """
 
 import contextlib
+import gc
+import weakref
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -29,6 +31,7 @@ import torch
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
+    _copy_output_to_buffer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,6 +59,7 @@ def _make_backend(runner):
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
     backend._outputs = {}
+    backend._capture_inputs = {}
     backend._pool = None
     backend._capture_stream = None
     backend._precarve = SimpleNamespace(
@@ -89,6 +93,93 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
 
 
 class TestCaptureOneNoProfiling(CustomTestCase):
+    def test_dedup_registers_raw_graph_and_releases_registry_on_cleanup(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        registry = mock.Mock()
+        backend.deduped_cuda_graph = registry
+        backend._deduped_cuda_graph_registries = [registry]
+        shape_key = ShapeKey(size=4)
+        with mock.patch("torch.cuda.CUDAGraph", return_value="RAW_GRAPH") as create:
+            backend.capture_one(shape_key, lambda: torch.ones(4))
+        create.assert_called_once_with(keep_graph=True)
+        registry.register.assert_called_once_with("RAW_GRAPH")
+        self.assertIs(backend._graphs[shape_key], registry.register.return_value)
+        backend.replay(shape_key, None)
+        registry.register.return_value.replay.assert_called_once_with()
+        backend.cleanup()
+        registry.close.assert_called_once_with()
+        self.assertFalse(backend._graphs)
+        self.assertFalse(backend._capture_inputs)
+        self.assertIsNone(backend.deduped_cuda_graph)
+
+    def test_capture_session_seals_dedup_after_capture_failure(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        backend._pool = (0, 1)
+        module = "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend"
+        with (
+            mock.patch(module + ".set_graph_pool_id"),
+            mock.patch.object(backend, "begin_cuda_graph_capture") as begin,
+            mock.patch.object(backend, "end_cuda_graph_capture") as end,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                with backend.capture_session("STREAM"):
+                    self.assertEqual(backend._capture_stream, "STREAM")
+                    raise RuntimeError("capture failed")
+        begin.assert_called_once_with()
+        end.assert_called_once_with()
+        self.assertIsNone(backend._capture_stream)
+
+    def test_nested_draft_outputs_share_storage_across_shapes(self):
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        backend._reuse_output_buffer = True
+
+        def output(rows, value):
+            return (
+                torch.full((rows, 2), value),
+                [torch.full((rows, 3), value + 1), None],
+            )
+
+        with mock.patch("torch.cuda.CUDAGraph", side_effect=["GRAPH4", "GRAPH2"]):
+            backend.capture_one(ShapeKey(size=4), lambda: output(4, 1.0))
+            backend.capture_one(ShapeKey(size=2), lambda: output(2, 7.0))
+        large = backend._outputs[ShapeKey(size=4)]
+        small = backend._outputs[ShapeKey(size=2)]
+        self.assertIsInstance(small, tuple)
+        self.assertIsInstance(small[1], list)
+        self.assertIsNone(small[1][1])
+        for a, b in [(large[0], small[0]), (large[1][0], small[1][0])]:
+            self.assertEqual(a.data_ptr(), b.data_ptr())
+            self.assertEqual(b.shape[0], 2)
+            self.assertTrue(torch.equal(a[:2], b))
+        self.assertTrue(torch.equal(small[0], torch.full((2, 2), 7.0)))
+        self.assertTrue(torch.equal(small[1][0], torch.full((2, 3), 8.0)))
+        self.assertTrue(backend._reuse_output_buffer)
+
+    def test_nested_structure_mismatch_does_not_partially_copy(self):
+        buffer = (torch.zeros(4, 2), [torch.zeros(4, 3)])
+        output = (torch.ones(2, 2), [torch.ones(2, 3), torch.ones(2, 3)])
+        self.assertIsNone(_copy_output_to_buffer(output, buffer))
+        self.assertEqual(buffer[0].count_nonzero(), 0)
+        self.assertEqual(buffer[1][0].count_nonzero(), 0)
+
+    def test_capture_inputs_remain_owned_until_cleanup(self):
+        class Inputs:
+            pass
+
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        inputs = Inputs()
+        reference = weakref.ref(inputs)
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(
+                ShapeKey(size=4), lambda: torch.ones(4), capture_inputs=inputs
+            )
+        del inputs
+        gc.collect()
+        self.assertIsNotNone(reference())
+        backend.cleanup()
+        gc.collect()
+        self.assertIsNone(reference())
+
     def test_runs_two_warmups_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)

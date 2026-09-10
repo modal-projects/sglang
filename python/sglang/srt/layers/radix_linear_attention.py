@@ -86,7 +86,10 @@ class RadixLinearAttention(nn.Module):
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
-            if is_in_breakable_cuda_graph():
+            if (
+                is_in_breakable_cuda_graph()
+                or get_tc_piecewise_forward_context().full_graph
+            ):
                 backend = get_attn_backend()
                 backend = getattr(backend, "linear_attn_backend", backend)
                 if getattr(backend, "prefill_graph_metadata", None) is not None:

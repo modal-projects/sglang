@@ -164,7 +164,16 @@ class DeepseekMLAForwardMixin:
         # Shared activation surface with the DSA indexer graph dispatch
         # (in piecewise/breakable graph + non-speculative extend). Like the indexer
         # dispatch, this fusion is on by default on that surface.
-        if not is_graph_dsa_split_op_surface(forward_batch):
+        context = get_tc_piecewise_forward_context()
+        captured_sparse_prefill = (
+            context is not None
+            and context.full_graph
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.kpool_prefill_graph_variant is not None
+        )
+        if not (
+            is_graph_dsa_split_op_surface(forward_batch) or captured_sparse_prefill
+        ):
             return False
         if not self.use_dsa:
             return False
@@ -707,7 +716,13 @@ class DeepseekMLAForwardMixin:
                 backend = get_attn_backend()
                 backend = getattr(backend, "full_attn_backend", backend)
                 if (
-                    is_in_breakable_cuda_graph()
+                    (
+                        is_in_breakable_cuda_graph()
+                        or (
+                            get_tc_piecewise_forward_context() is not None
+                            and get_tc_piecewise_forward_context().full_graph
+                        )
+                    )
                     and getattr(backend, "prefill_graph_metadata", None) is not None
                     and backend.prefill_graph_metadata.can_capture(q_nope_out.shape[0])
                 ):

@@ -30,6 +30,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
+    DedupedCudaGraph,
+    DedupedCudaGraphMixin,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -47,15 +51,30 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
+def _allocate_output_buffer(output: Any) -> Any:
+    if type(output) in (list, tuple):
+        return type(output)(_allocate_output_buffer(item) for item in output)
     if not torch.is_tensor(output) or output.ndim == 0:
         return None
     return torch.empty_like(output)
 
 
-def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
+def _output_fits_buffer(output: Any, output_buffer: Any) -> bool:
+    if output is None or output_buffer is None:
+        return output is None and output_buffer is None
+    if type(output) in (list, tuple):
+        return (
+            type(output_buffer) is type(output)
+            and len(output) == len(output_buffer)
+            and all(
+                _output_fits_buffer(item, buffer)
+                for item, buffer in zip(output, output_buffer)
+            )
+        )
     return (
         torch.is_tensor(output)
+        and torch.is_tensor(output_buffer)
+        and output.ndim > 0
         and output.ndim == output_buffer.ndim
         and output.shape[1:] == output_buffer.shape[1:]
         and output.shape[0] <= output_buffer.shape[0]
@@ -64,17 +83,22 @@ def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
     )
 
 
-def _copy_output_to_buffer(
-    output: Any, output_buffer: torch.Tensor
-) -> Optional[torch.Tensor]:
+def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Any:
     if not _output_fits_buffer(output, output_buffer):
         return None
+    if output is None:
+        return None
+    if type(output) in (list, tuple):
+        return type(output)(
+            _copy_output_to_buffer(item, buffer)
+            for item, buffer in zip(output, output_buffer)
+        )
     shared_output = output_buffer[: output.shape[0]]
     shared_output.copy_(output)
     return shared_output
 
 
-class FullCudaGraphBackend(BaseCudaGraphBackend):
+class FullCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
     """
@@ -86,8 +110,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         reuse_output_buffer: bool = False,
     ) -> None:
-        self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
+        self._graphs: Dict[Any, torch.cuda.CUDAGraph | DedupedCudaGraph] = {}
+        self._dedup_allow_kernel_updates = True
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -95,7 +121,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
-        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Any = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -107,10 +133,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        self.begin_cuda_graph_capture()
         try:
             yield
         finally:
-            self._capture_stream = None
+            try:
+                self.end_cuda_graph_capture()
+            finally:
+                self._capture_stream = None
 
     def capture_one(
         self,
@@ -154,10 +184,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             # Prefill captures the largest shape first and replays one shape at
             # a time, so all graphs can share this eager-tail input buffer.
             self._output_buffer = _allocate_output_buffer(warmup_output)
-            self._reuse_output_buffer = self._output_buffer is not None
+            self._reuse_output_buffer = (
+                self._output_buffer is not None
+                and _output_fits_buffer(warmup_output, self._output_buffer)
+            )
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        graph = (
+            torch.cuda.CUDAGraph(keep_graph=True)
+            if self.deduped_cuda_graph is not None
+            else torch.cuda.CUDAGraph()
+        )
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -188,8 +225,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         if profiler is not None:
             profiler.step()
 
-        self._graphs[shape_key] = graph
+        self._graphs[shape_key] = (
+            self.deduped_cuda_graph.register(graph)
+            if self.deduped_cuda_graph is not None
+            else graph
+        )
         self._outputs[shape_key] = out
+        self._capture_inputs[shape_key] = capture_inputs
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -209,7 +251,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self.close()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None

@@ -211,6 +211,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         ):
             # Two capture-only transients become disjoint free graph-pool runs.
             transient_a = torch.empty(48 << 20, dtype=torch.uint8, device="cuda")
+            separator = torch.empty(2 << 20, dtype=torch.uint8, device="cuda")
             transient_b = torch.empty(24 << 20, dtype=torch.uint8, device="cuda")
             y = x + 1
             del transient_a, transient_b
@@ -258,7 +259,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             pool._teardown_borrow_pool()
 
         self.assertEqual(torch.cuda.memory_reserved(device_id), reserved_before)
-        del graph, y
+        del graph, y, separator
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_static_borrow_runs_serve_without_a_pool_snapshot(self):

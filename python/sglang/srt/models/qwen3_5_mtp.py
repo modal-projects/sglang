@@ -61,12 +61,24 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
+        # NVFP4 checkpoints ship the MTP head either BF16 (Qwen3.8 A95B,
+        # Qwen3-Next) or with NVFP4 routed experts (Qwen3.8-Max-VL-0902:
+        # U8 packed weights + F8 block scales + F32 input scales on
+        # mtp.layers.0.mlp.experts.*). Only drop quantization when the exclude
+        # list actually covers the MTP experts; otherwise the MoE layer gets a
+        # BF16 buffer at logical width and the packed FP4 copy fails with a
+        # 2x shape mismatch in _load_w13.
         if quant_config and quant_config.get_name() in (
             "modelopt_fp4",
             "modelopt_mixed",
         ):
-            quant_config = None
+            exclude = getattr(quant_config, "exclude_modules", None) or []
+            mtp_experts_excluded = any(
+                isinstance(p, str) and p.startswith("mtp.") and "experts" in p
+                for p in exclude
+            )
+            if mtp_experts_excluded:
+                quant_config = None
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
 

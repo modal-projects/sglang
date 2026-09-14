@@ -472,6 +472,31 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
         self.assertNotIsInstance(result, InvalidGrammarObject)
 
 
+class TestXGrammarCompileDiagnostics(unittest.TestCase):
+    def test_structural_tag_compile_error_redacts_payload(self):
+        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+        backend.grammar_compiler.compile_structural_tag.side_effect = RuntimeError(
+            "Lookahead is not supported yet: synthetic-private-value"
+        )
+        payload = json.dumps(
+            {"format": {"type": "regex", "pattern": "synthetic-private-value"}}
+        )
+
+        with self.assertLogs(
+            "sglang.srt.constrained.xgrammar_backend", level="ERROR"
+        ) as captured:
+            result = backend.dispatch_structural_tag(payload)
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        output = "\n".join(captured.output)
+        self.assertIn("category=unsupported_lookahead", output)
+        self.assertIn("payload_hash=", output)
+        self.assertNotIn("synthetic-private-value", output)
+
+
 class TestNulByteGrammarRejection(unittest.TestCase):
     def setUp(self):
         self.backend = BaseGrammarBackend()

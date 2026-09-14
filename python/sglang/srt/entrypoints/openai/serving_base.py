@@ -13,9 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.environ import envs
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.entrypoints.openai.tool_call_diagnostics import (
-    log_request_value_error,
-)
+from sglang.srt.entrypoints.openai.request_diagnostics import log_request_value_error
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability

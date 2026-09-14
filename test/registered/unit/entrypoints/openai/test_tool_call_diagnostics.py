@@ -1,7 +1,7 @@
 import logging
 
+from sglang.srt.entrypoints.openai.request_diagnostics import log_request_value_error
 from sglang.srt.entrypoints.openai.tool_call_diagnostics import (
-    log_request_value_error,
     log_tool_call_validation_errors,
 )
 

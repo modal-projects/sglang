@@ -42,7 +42,10 @@ def test_logs_value_error_origin_without_message_contents(caplog):
 
     output = caplog.text
     assert "request_value_error" in output
-    assert "origin_function=test_logs_value_error_origin_without_message_contents" in output
+    assert (
+        "origin_function=test_logs_value_error_origin_without_message_contents"
+        in output
+    )
     assert "stream=True" in output
     assert "tool_count=1" in output
     assert "response_format=json_schema" in output
@@ -115,6 +118,49 @@ def test_valid_tool_call_is_not_logged(caplog):
                     "function": {
                         "name": "update_private_record",
                         "arguments": '{"count":3,"note":"customer secret"}',
+                    }
+                }
+            ],
+            request_id="request-id",
+            choice_index=0,
+        )
+
+    assert "tool_call_validation_error" not in caplog.text
+
+
+def test_uses_schema_dialect_for_validation(caplog):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_pair",
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "pair": {
+                            "type": "array",
+                            "prefixItems": [
+                                {"type": "string"},
+                                {"type": "integer"},
+                            ],
+                            "items": False,
+                        }
+                    },
+                    "required": ["pair"],
+                },
+            },
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        log_tool_call_validation_errors(
+            tools=tools,
+            tool_calls=[
+                {
+                    "function": {
+                        "name": "submit_pair",
+                        "arguments": '{"pair":["value",1]}',
                     }
                 }
             ],

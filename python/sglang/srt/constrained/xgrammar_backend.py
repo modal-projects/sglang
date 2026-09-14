@@ -14,6 +14,7 @@
 """Constrained decoding with xgrammar backend."""
 
 import dataclasses
+import hashlib
 import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
@@ -59,6 +60,33 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _grammar_payload_hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def _grammar_compile_error_category(error: Exception) -> str:
+    message = str(error)
+    if "Lookahead is not supported" in message:
+        return "unsupported_lookahead"
+    if "Cannot find field" in message:
+        return "unresolved_reference"
+    if "Schema 'false' cannot accept any value" in message:
+        return "false_schema"
+    return type(error).__name__
+
+
+def _log_grammar_compile_failure(kind: str, payload: str, error: Exception) -> None:
+    logger.error(
+        "grammar_compile_error kind=%s payload_hash=%s category=%s error_type=%s",
+        kind,
+        _grammar_payload_hash(payload),
+        _grammar_compile_error_category(error),
+        type(error).__name__,
+    )
+
+
 MAX_ROLLBACK_TOKENS = 200
 
 
@@ -357,7 +385,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             json.decoder.JSONDecodeError,
             UnicodeDecodeError,
         ) as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            _log_grammar_compile_failure("json_schema", key_string, e)
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
@@ -365,7 +393,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            _log_grammar_compile_failure("ebnf", key_string, e)
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
@@ -373,7 +401,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logger.error(f"Hit invalid regex: {key_string=}, {e=}")
+            _log_grammar_compile_failure("regex", key_string, e)
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
@@ -404,7 +432,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            _log_grammar_compile_failure("structural_tag", key_string, e)
             return InvalidGrammarObject(str(e))
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")

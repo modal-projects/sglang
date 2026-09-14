@@ -1,6 +1,7 @@
 import logging
 
 from sglang.srt.entrypoints.openai.tool_call_diagnostics import (
+    log_request_value_error,
     log_tool_call_validation_errors,
 )
 
@@ -22,6 +23,31 @@ TOOLS = [
         },
     }
 ]
+
+
+def test_logs_value_error_origin_without_message_contents(caplog):
+    try:
+        raise ValueError("customer secret")
+    except ValueError as error:
+        with caplog.at_level(logging.WARNING):
+            log_request_value_error(
+                error=error,
+                request={
+                    "stream": True,
+                    "tools": TOOLS,
+                    "response_format": {"type": "json_schema"},
+                },
+                request_id="customer-request-id",
+            )
+
+    output = caplog.text
+    assert "request_value_error" in output
+    assert "origin_function=test_logs_value_error_origin_without_message_contents" in output
+    assert "stream=True" in output
+    assert "tool_count=1" in output
+    assert "response_format=json_schema" in output
+    assert "customer secret" not in output
+    assert "customer-request-id" not in output
 
 
 def test_logs_schema_paths_without_payload_contents(caplog):

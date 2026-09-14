@@ -69,6 +69,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
+from sglang.srt.entrypoints.openai.tool_call_diagnostics import (
+    log_tool_call_validation_errors,
+)
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -817,6 +820,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        streamed_tool_calls: Optional[Dict[int, Dict[int, Dict[str, str]]]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -873,6 +877,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                streamed_tool_calls=streamed_tool_calls,
             ):
                 if chunk:
                     yield chunk
@@ -881,7 +886,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
+                    parser,
+                    content,
+                    request,
+                    index,
+                    streamed_tool_calls=streamed_tool_calls,
                 )
                 if remaining_chunk:
                     yield remaining_chunk
@@ -1780,6 +1789,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         reasoning_tokens = {}
         completion_tokens = {}
+        streamed_tool_calls: Dict[int, Dict[int, Dict[str, str]]] = {}
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
@@ -1924,8 +1934,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    streamed_tool_calls=streamed_tool_calls,
                 ):
                     yield chunk
+
+            if envs.SGLANG_LOG_TOOL_CALL_VALIDATION_ERRORS.get():
+                effective_tools = self._effective_tools(request)
+                for index, calls_by_index in streamed_tool_calls.items():
+                    log_tool_call_validation_errors(
+                        tools=effective_tools,
+                        tool_calls=[
+                            calls_by_index[tool_index]
+                            for tool_index in sorted(calls_by_index)
+                        ],
+                        request_id=content["meta_info"]["id"],
+                        choice_index=index,
+                    )
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -2251,6 +2275,13 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
             )
+            if tool_calls and envs.SGLANG_LOG_TOOL_CALL_VALIDATION_ERRORS.get():
+                log_tool_call_validation_errors(
+                    tools=effective_tools,
+                    tool_calls=tool_calls,
+                    request_id=ret_item["meta_info"]["id"],
+                    choice_index=idx,
+                )
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -2821,6 +2852,7 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        streamed_tool_calls: Optional[Dict[int, Dict[int, Dict[str, str]]]] = None,
     ):
         """Process tool calls in streaming response.
 
@@ -2928,6 +2960,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
 
+            if streamed_tool_calls is not None:
+                choice_calls = streamed_tool_calls.setdefault(index, {})
+                accumulated = choice_calls.setdefault(
+                    call_item.tool_index,
+                    {"name": "", "arguments": ""},
+                )
+                if call_item.name is not None:
+                    accumulated["name"] = call_item.name
+                accumulated["arguments"] += call_item.parameters
+
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
@@ -2960,6 +3002,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
+        streamed_tool_calls: Optional[Dict[int, Dict[int, Dict[str, str]]]] = None,
     ) -> Optional[str]:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -3003,6 +3046,14 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if remaining_call:
+            if streamed_tool_calls is not None:
+                choice_calls = streamed_tool_calls.setdefault(index, {})
+                accumulated = choice_calls.setdefault(
+                    tool_index,
+                    {"name": "", "arguments": ""},
+                )
+                accumulated["arguments"] += remaining_call
+
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
                 id=None,  # No ID for argument deltas

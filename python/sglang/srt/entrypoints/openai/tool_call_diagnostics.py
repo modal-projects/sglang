@@ -1,28 +1,15 @@
-import hashlib
 import json
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from jsonschema import Draft7Validator
 
+from sglang.srt.entrypoints.openai.request_diagnostics import field, short_hash
+
 logger = logging.getLogger(__name__)
 
 _MAX_SCHEMA_ERRORS_PER_CALL = 8
-
-
-def _field(value: Any, name: str) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name)
-    return getattr(value, name, None)
-
-
-def _short_hash(value: Any) -> str:
-    if not isinstance(value, str):
-        value = json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
 def _json_pointer(path: Iterable[Any]) -> str:
@@ -36,49 +23,11 @@ def _json_pointer(path: Iterable[Any]) -> str:
 def _tool_definitions(tools: Sequence[Any]) -> dict[str, Any]:
     definitions = {}
     for tool in tools:
-        function = _field(tool, "function")
-        name = _field(function, "name")
+        function = field(tool, "function")
+        name = field(function, "name")
         if isinstance(name, str):
             definitions[name] = function
     return definitions
-
-
-def log_request_value_error(
-    *, error: ValueError, request: Any, request_id: str | None
-) -> None:
-    traceback = error.__traceback__
-    while traceback is not None and traceback.tb_next is not None:
-        traceback = traceback.tb_next
-
-    if traceback is None:
-        origin_file = "unknown"
-        origin_function = "unknown"
-        origin_line = 0
-    else:
-        code = traceback.tb_frame.f_code
-        origin_file = code.co_filename.rsplit("/", 1)[-1]
-        origin_function = code.co_name
-        origin_line = traceback.tb_lineno
-
-    tools = _field(request, "tools")
-    response_format = _field(request, "response_format")
-    response_format_type = _field(response_format, "type")
-    if response_format_type not in {"json_object", "json_schema", "text"}:
-        response_format_type = "other" if response_format is not None else "none"
-
-    logger.warning(
-        "request_value_error request_id_hash=%s message_hash=%s "
-        "origin_file=%s origin_function=%s origin_line=%d stream=%s "
-        "tool_count=%d response_format=%s",
-        _short_hash(request_id) if request_id else "missing",
-        _short_hash(str(error)),
-        origin_file,
-        origin_function,
-        origin_line,
-        bool(_field(request, "stream")),
-        len(tools) if isinstance(tools, Sequence) else 0,
-        response_format_type,
-    )
 
 
 def log_tool_call_validation_errors(
@@ -90,15 +39,15 @@ def log_tool_call_validation_errors(
 ) -> None:
     """Log OpenRouter-style tool validation failures without payload contents."""
     definitions = _tool_definitions(tools)
-    request_id_hash = _short_hash(request_id)
+    request_id_hash = short_hash(request_id)
 
     for tool_index, tool_call in enumerate(tool_calls):
-        function = _field(tool_call, "function")
+        function = field(tool_call, "function")
         if function is None:
             function = tool_call
-        name = _field(function, "name")
-        arguments = _field(function, "arguments")
-        name_hash = _short_hash(name) if isinstance(name, str) else "missing"
+        name = field(function, "name")
+        arguments = field(function, "arguments")
+        name_hash = short_hash(name) if isinstance(name, str) else "missing"
 
         if not isinstance(name, str) or name not in definitions:
             logger.warning(
@@ -128,8 +77,8 @@ def log_tool_call_validation_errors(
         else:
             instance = arguments
 
-        schema = _field(definitions[name], "parameters") or {}
-        schema_hash = _short_hash(schema)
+        schema = field(definitions[name], "parameters") or {}
+        schema_hash = short_hash(schema)
         try:
             errors = Draft7Validator(schema).iter_errors(instance)
             for error_index, error in enumerate(errors):

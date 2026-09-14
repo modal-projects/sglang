@@ -75,6 +75,7 @@ class BaseReasoningFormatDetector:
         thinks_internally: bool = False,
         reasoning_default: str = "always",
         force_nonempty_content: bool = False,
+        defer_tool_start_after_reasoning: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -85,6 +86,9 @@ class BaseReasoningFormatDetector:
         self.stream_reasoning = stream_reasoning
         self.thinks_internally = thinks_internally
         self.reasoning_default = reasoning_default
+        self.defer_tool_start_after_reasoning = defer_tool_start_after_reasoning
+        self._reasoning_content_seen = False
+        self._deferred_tool_start = False
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -230,6 +234,18 @@ class BaseReasoningFormatDetector:
             # think_end_token that has not arrived yet; see the chunk_dependent test.
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
+                if self.defer_tool_start_after_reasoning and (
+                    self._deferred_tool_start
+                    or self._reasoning_content_seen
+                    or bool(current_text[:tool_idx].strip())
+                ):
+                    self._deferred_tool_start = True
+                    if self.stream_reasoning:
+                        reasoning_text = current_text[:tool_idx]
+                        self._reasoning_content_seen |= bool(reasoning_text.strip())
+                        self._buffer = current_text[tool_idx:]
+                        return StreamingParseResult(reasoning_text=reasoning_text)
+                    return StreamingParseResult()
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
@@ -251,8 +267,10 @@ class BaseReasoningFormatDetector:
                     for token in holdback_tokens
                 )
                 self._buffer = current_text[len(current_text) - holdback :]
+                reasoning_text = current_text[: len(current_text) - holdback]
+                self._reasoning_content_seen |= bool(reasoning_text.strip())
                 return StreamingParseResult(
-                    reasoning_text=current_text[: len(current_text) - holdback]
+                    reasoning_text=reasoning_text
                 )
             else:
                 return StreamingParseResult()
@@ -291,6 +309,17 @@ class BaseReasoningFormatDetector:
             leftover = self._buffer
             self._buffer = ""
             return StreamingParseResult(normal_text=leftover)
+
+        if self._deferred_tool_start and self.tool_start_token in self._buffer:
+            tool_idx = self._buffer.find(self.tool_start_token)
+            reasoning_text = self._buffer[:tool_idx]
+            normal_text = self._buffer[tool_idx:]
+            self._buffer = ""
+            self._in_reasoning = False
+            self._deferred_tool_start = False
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
 
         # Defensive: subclasses that fill _buffer themselves may not have stripped
         # the opening think token that _parse_streaming_increment_impl removes.
@@ -843,6 +872,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         reasoning_default: str = "enable_thinking",
+        tool_call_parser_active: bool = False,
     ):
         think_excluded_tokens = [
             "<tool_call>",
@@ -863,6 +893,7 @@ class Glm45Detector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            defer_tool_start_after_reasoning=tool_call_parser_active,
         )
 
 

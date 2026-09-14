@@ -450,6 +450,63 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result2.reasoning_text, "")
         self.assertEqual(result2.normal_text, "<tool_call>tool call")
 
+    def test_streaming_quoted_tool_marker_waits_for_explicit_close(self):
+        raw = (
+            "I should use the <tool_call>bash command:</think>"
+            "<tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>pwd</arg_value></tool_call>"
+        )
+        expected_reasoning = "I should use the <tool_call>bash command:"
+        expected_normal = raw.split("</think>", 1)[1]
+
+        for split in range(1, len(raw)):
+            detector = Glm45Detector(
+                force_reasoning=True, tool_call_parser_active=True
+            )
+            results = [
+                detector.parse_streaming_increment(raw[:split]),
+                detector.parse_streaming_increment(raw[split:]),
+                detector.finish(),
+            ]
+            self.assertEqual(
+                "".join(result.reasoning_text for result in results),
+                expected_reasoning,
+                split,
+            )
+            self.assertEqual(
+                "".join(result.normal_text for result in results),
+                expected_normal,
+                split,
+            )
+
+    def test_streaming_implicit_tool_handoff_flushes_at_end(self):
+        tool_call = (
+            "<tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>pwd</arg_value></tool_call>"
+        )
+        detector = Glm45Detector(
+            force_reasoning=True, tool_call_parser_active=True
+        )
+
+        reasoning = detector.parse_streaming_increment("Reasoning.")
+        pending = detector.parse_streaming_increment(tool_call)
+        finished = detector.finish()
+
+        self.assertEqual(reasoning.reasoning_text, "Reasoning.")
+        self.assertEqual(pending.normal_text, "")
+        self.assertEqual(finished.normal_text, tool_call)
+
+    def test_streaming_direct_tool_handoff_is_not_deferred(self):
+        detector = Glm45Detector(
+            force_reasoning=True, tool_call_parser_active=True
+        )
+        tool_call = "<tool_call>bash<arg_key>command</arg_key>"
+
+        result = detector.parse_streaming_increment(tool_call)
+
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, tool_call)
+
     def test_forced_reasoning_mode(self):
         """Test GLM45 with force_reasoning=True."""
         detector = Glm45Detector(force_reasoning=True)

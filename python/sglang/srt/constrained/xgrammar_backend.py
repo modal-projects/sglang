@@ -70,6 +70,8 @@ def _grammar_compile_error_category(error: Exception) -> str:
         return "unresolved_reference"
     if "Schema 'false' cannot accept any value" in message:
         return "false_schema"
+    if "unsatisfiable" in message:
+        return "unsatisfiable_schema"
     return type(error).__name__
 
 

@@ -3,7 +3,7 @@ import logging
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from jsonschema import Draft7Validator
+from jsonschema.validators import validator_for
 
 from sglang.srt.entrypoints.openai.request_diagnostics import field, short_hash
 
@@ -80,7 +80,9 @@ def log_tool_call_validation_errors(
         schema = field(definitions[name], "parameters") or {}
         schema_hash = short_hash(schema)
         try:
-            errors = Draft7Validator(schema).iter_errors(instance)
+            validator_cls = validator_for(schema)
+            validator_cls.check_schema(schema)
+            errors = validator_cls(schema).iter_errors(instance)
             for error_index, error in enumerate(errors):
                 if error_index >= _MAX_SCHEMA_ERRORS_PER_CALL:
                     logger.warning(

@@ -180,6 +180,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         end_layer: Optional[int] = None,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         global_page_size: Optional[int] = None,
+        *,
+        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -190,6 +192,7 @@ class DeepSeekV4SingleKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            dcp_sharded=dcp_sharded,
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -382,6 +385,8 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         end_layer: int | None = None,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         global_page_size: int | None = None,
+        *,
+        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -396,6 +401,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             end_layer,
             global_page_size=global_page_size,
             kv_layout=kv_layout,
+            dcp_sharded=dcp_sharded,
         )
         # The HiSparse transfer kernels hardcode the V4 token layout.
         assert self.kv_layout is KVLayout.V4, (
@@ -886,6 +892,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        *,
+        dcp_sharded: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -896,6 +904,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            dcp_sharded=dcp_sharded,
         )
         # Layout of the SWA (main) cache; compressed caches follow
         # resolve_compressed_kv_layout, so valid (main, extra) pairs form only here.
@@ -1503,6 +1512,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
             global_page_size=global_page_size,
             kv_layout=kv_layout,
+            dcp_sharded=self.dcp_sharded,
         )
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:

@@ -12,7 +12,6 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
-    kimi_linear_config,
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
@@ -308,6 +307,14 @@ class KVCacheConfigurator:
                 else capacity
             )
         return full_capacity or swa_capacity
+
+    def _is_kda_model(self) -> bool:
+        return self.mambaish_config is not None and bool(
+            self.mambaish_config.mamba2_cache_params.is_kda
+        )
+
+    def _supports_replayssm_spec(self) -> bool:
+        return self.hybrid_gdn_config is not None or self._is_kda_model()
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -1079,10 +1086,7 @@ class KVCacheConfigurator:
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
-                )
+                and self._supports_replayssm_spec()
             ),
         )
         return req_to_token_pool
@@ -1122,11 +1126,11 @@ class KVCacheConfigurator:
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
-            and kimi_linear_config(self.model_config) is None
+            and not self._is_kda_model()
         ):
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+                "model; got a non-KDA model."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -1160,10 +1164,7 @@ class KVCacheConfigurator:
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
                 get_exec().mamba.enable_linear_replayssm_spec
-                and (
-                    self.hybrid_gdn_config is not None
-                    or kimi_linear_config(self.model_config) is not None
-                )
+                and self._supports_replayssm_spec()
             ),
         )
         return req_to_token_pool
@@ -2442,8 +2443,7 @@ class KVCacheConfigurator:
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
         # request scratch; KDA replay remains attached to each mamba slot.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+            self._supports_replayssm_spec()
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
@@ -2455,7 +2455,7 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and kimi_linear_config(self.model_config) is None:
+        if replayssm_active and not self._is_kda_model():
             replay_req_slots = (
                 get_schedule().max_running_requests // self.ps.attn_dp_size + 1
             )

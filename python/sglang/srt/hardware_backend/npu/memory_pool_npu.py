@@ -589,8 +589,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -605,7 +603,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver=enable_memory_saver,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         self.kv_lora_rank = kv_lora_rank

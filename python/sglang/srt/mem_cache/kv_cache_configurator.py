@@ -291,10 +291,8 @@ class KVCacheConfigurator:
     # {cap_source}. A declared field: this is a slots dataclass, so an undeclared
     # attribute assignment would raise at startup.
     max_running_requests_cap_source: Optional[str] = None
-    dcp_sharded: bool = field(init=False)
 
     def __post_init__(self) -> None:
-        self.dcp_sharded = get_parallel().dcp_enabled and not self.is_draft_worker
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.is_hybrid_swa_mtp_draft = (
@@ -749,7 +747,6 @@ class KVCacheConfigurator:
             # Draft workers keep the token-count byte sum (spec is asserted
             # off under unified; belt only).
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
-            dcp_sharded=self.dcp_sharded,
         )
         return bundle
 
@@ -871,7 +868,6 @@ class KVCacheConfigurator:
                 if get_disagg().disaggregation_mode == "decode"
                 else 0
             ),
-            dcp_sharded=self.dcp_sharded,
         )
 
     def _init_unified_swa_pools(
@@ -967,7 +963,6 @@ class KVCacheConfigurator:
             # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
-            dcp_sharded=self.dcp_sharded,
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
@@ -1427,7 +1422,6 @@ class KVCacheConfigurator:
             full_size=full_max_total_num_tokens,
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
-            dcp_sharded=self.dcp_sharded,
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
             # The draft pool has no C4 layers and shares this req pool, so only
@@ -1455,7 +1449,6 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1475,7 +1468,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1494,7 +1486,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1534,7 +1525,6 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.model_config.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
-            dcp_sharded=self.dcp_sharded,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1567,7 +1557,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1618,7 +1607,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1640,7 +1628,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1707,9 +1694,9 @@ class KVCacheConfigurator:
             ),
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
-            dcp_sharded=self.dcp_sharded,
             **pool_kwargs,
         )
+        token_to_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(
@@ -1763,7 +1750,6 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.swa_kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.swa_qk_rope_head_dim,
             },
-            dcp_sharded=self.dcp_sharded,
         )
 
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1778,7 +1764,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1794,7 +1779,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -1853,7 +1837,6 @@ class KVCacheConfigurator:
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
-            dcp_sharded=self.dcp_sharded,
             **kwargs,
         )
         return token_to_kv_pool
@@ -1892,7 +1875,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -2000,9 +1982,10 @@ class KVCacheConfigurator:
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
-            dcp_sharded=self.dcp_sharded,
             **extra_args,
         )
+        if extra_args.get("use_dsa"):
+            token_to_kv_pool.full_kv_pool.dcp_replicated = self.loc_space_scale > 1
         return token_to_kv_pool
 
     def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -2022,7 +2005,6 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_alt_stream=not get_disagg().enable_pdmux,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            dcp_sharded=self.dcp_sharded,
         )
         return token_to_kv_pool
 
@@ -2058,7 +2040,6 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_alt_stream=not get_disagg().enable_pdmux,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            dcp_sharded=self.dcp_sharded,
             **pool_kwargs,
         )
         return token_to_kv_pool

@@ -255,33 +255,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             param=param,
         )
 
-    def _known_model_names(self) -> set[str]:
-        """Model ids a caller may address, mirroring what ``/v1/models`` lists."""
-        names = {self.tokenizer_manager.served_model_name}
-        registry = getattr(self.tokenizer_manager, "lora_registry", None)
-        if registry is not None:
-            names.update(registry.get_all_adapters().keys())
-        return names
-
-    def _validate_model(self, model: Optional[str]) -> Optional[ORJSONResponse]:
-        """Reject an unknown ``model``, as the Responses API does.
-
-        ``None`` means "whatever is loaded". A LoRA adapter may be addressed
-        either by name or through the ``base-model:adapter`` form.
-        """
-        if model is None:
-            return None
-        base_model, _ = self._parse_model_parameter(model)
-        known = self._known_model_names()
-        if model in known or base_model in known:
-            return None
-        return self.create_error_response(
-            message=f"The model '{model}' does not exist",
-            err_type="invalid_request_error",
-            status_code=HTTPStatus.NOT_FOUND,
-            param="model",
-        )
-
     async def create_responses(
         self,
         request: ResponsesRequest,
@@ -299,10 +272,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 "background=true requires store=true.", param="store"
             )
-
-        model_error = self._validate_model(request.model)
-        if model_error is not None:
-            return model_error
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case

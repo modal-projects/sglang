@@ -535,6 +535,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def set_speculative_reprefill_tail_tokens(self, num_tokens: int) -> None:
         self._speculative_reprefill_tail_tokens = max(0, int(num_tokens))
 
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[Tuple[int, int]]:
+        """Prefix lengths a match of `key` would reuse without and with a cap.
+
+        Returns (uncapped_len, capped_len), where capped_len is the reusable
+        length when the match is limited to the first `cap` tokens, or None
+        if this cache cannot answer without mutating the tree. Used to decide
+        whether holding back a draft re-prefill tail is worth its extra
+        prefill. Must not modify the tree or any LRU state.
+        """
+        return None
+
     def supports_mamba(self) -> bool:
         return False
 

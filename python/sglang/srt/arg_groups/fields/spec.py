@@ -160,6 +160,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
     ] = None
+    speculative_draft_soft_holdback_threshold: A[
+        Optional[int],
+        "Only with the bounded all-SWA DFLASH draft pool. A prefix hit normally holds back one draft window so the target re-prefills it and rewrites the draft's ring (hard hold-back). With this set, the hold-back is applied only when it costs at most this many extra prefill tokens over the point the cache could otherwise resume from; above that the match is not capped and the draft attends only to the part of its ring written since the resume point until generation fills the window (soft hold-back). Requires --page-size 1 and a cache that reports resume points (Mamba radix cache); otherwise the hold-back stays hard. Default: always hard.",
+    ] = None
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

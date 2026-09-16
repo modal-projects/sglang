@@ -566,6 +566,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[tuple[int, int]]:
+        if self.disable:
+            return (0, 0)
+        return self.tree_core.peek_reprefill_resume(key, cap)
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 

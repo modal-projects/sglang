@@ -70,6 +70,7 @@ from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
     validate_domino_runtime,
 )
+from sglang.srt.speculative.draft_holdback import soft_holdback_threshold
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -392,6 +393,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.bounded_swa_capacity_per_request: Optional[int] = None
         self.bounded_swa_pool_tokens: Optional[int] = None
         self.device = target_worker.device
+        # Soft hold-back: a prefix hit may resume without re-prefilling a full
+        # draft window, so the ring is unwritten below the reused prefix length.
+        # The scheduler records that length per request; this table (indexed by
+        # req_pool_idx) lets the decode path bound the visible window without a
+        # host sync.
+        self.use_soft_holdback = (
+            self.use_bounded_swa_draft_cache and soft_holdback_threshold() is not None
+        )
+        self._draft_valid_from_table: Optional[torch.Tensor] = None
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
@@ -1149,15 +1159,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             context="DFLASH req_to_token segment gather",
         )
 
-    def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+    def _compute_compact_draft_seq_lens(
+        self, seq_lens: torch.Tensor, valid_from: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         window_tokens = (
             getattr(self, "bounded_swa_window_tokens", None) or self.draft_window_size
         )
         assert window_tokens is not None
-        visible_lens = torch.clamp(
-            seq_lens.to(dtype=torch.int32, device=self.device),
-            max=int(window_tokens),
-        )
+        lens = seq_lens.to(dtype=torch.int32, device=self.device)
+        if valid_from is not None:
+            # Ring positions below the reused prefix were never written for this
+            # request; the draft may only see what was written since then. At
+            # least one token has always been extended past the reused prefix.
+            lens = torch.clamp(lens - valid_from.to(torch.int32), min=1)
+        visible_lens = torch.clamp(lens, max=int(window_tokens))
         if self.page_size <= 1:
             return visible_lens
 
@@ -1371,6 +1386,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             positions.to(torch.int64), self.bounded_swa_capacity_per_request
         )
         return torch.where(req_pool_indices > 0, slots, torch.zeros_like(slots))
+
+    def _draft_valid_from(self) -> torch.Tensor:
+        if self._draft_valid_from_table is None:
+            num_rows = int(self.model_runner.req_to_token_pool.req_to_token.shape[0])
+            self._draft_valid_from_table = torch.zeros(
+                (num_rows,), dtype=torch.int32, device=self.device
+            )
+        return self._draft_valid_from_table
+
+    def _record_draft_valid_from(self, batch: ScheduleBatch) -> None:
+        """Store each request's reused prefix length, keyed by req_pool_idx.
+
+        Called on every extend of the request (chunks repeat the same value);
+        the decode path gathers it to bound the draft's visible window.
+        """
+        table = self._draft_valid_from()
+        values = torch.tensor(
+            [int(getattr(req, "draft_reused_prefix_len", 0)) for req in batch.reqs],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        table[batch.req_pool_indices.to(torch.int64)] = values
 
     def _select_bounded_swa_prefill_tail(
         self,
@@ -2457,6 +2494,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     req_pool_indices=materialize_req_indices,
                     positions=positions,
                 )
+                if self.use_soft_holdback:
+                    self._record_draft_valid_from(batch)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
@@ -2656,7 +2695,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Rebuild the draft-local sliding-window view. The native bounded
             # path generates physical ring slots; the legacy compact path
             # gathers content-stable target-indexed draft slots.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            valid_from = None
+            if self.use_soft_holdback:
+                valid_from = self._draft_valid_from()[
+                    batch.req_pool_indices.to(torch.int64)
+                ]
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(
+                prefix_lens, valid_from=valid_from
+            )
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,

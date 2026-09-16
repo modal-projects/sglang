@@ -139,6 +139,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.draft_holdback import resolve_reprefill_key_limit
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1111,6 +1112,10 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Prefix length reused from the cache by the last match. A request-owned
+        # draft KV ring is unwritten below this position; the draft worker limits
+        # its visible window accordingly when the hold-back was not applied.
+        self.draft_reused_prefix_len: int = 0
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1532,16 +1537,6 @@ class Req(ReqDllmMixin):
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
-        # SWA lives in a per-request ring that's not content-stable and is never
-        # stored in the radix tree, so a reused prefix carries stale SWA. Cap the
-        # match by the trailing sliding window so it gets re-prefilled, rewriting
-        # this request's SWA ring. No-op for other layouts.
-        if tree_cache is not None:
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
-
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
@@ -1551,22 +1546,22 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # unified_kv SWA lives in a per-request ring that is not content-stable
-            # and never cached in the radix tree, so a reused prefix carries stale
-            # SWA. Cap the match by the trailing sliding window so it is re-prefilled
-            # into this request's ring. No-op for other layouts (returns 0).
-            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
+            # SWA in a per-request ring (unified_kv layout, or a request-owned
+            # draft cache) is not content-stable and never cached in the radix
+            # tree, so a reused prefix carries stale SWA. Cap the match by the
+            # trailing window so it is re-prefilled into this request's ring,
+            # unless the soft hold-back policy decides the cap costs too much.
+            # No-op for other layouts (tail is 0).
+            key = RadixKey(
+                token_ids=token_ids_to_match,
+                extra_key=self.extra_key,
+                limit=key_limit,
+                cache_salt=self.cache_salt,
+            )
+            key.limit = resolve_reprefill_key_limit(tree_cache, key, input_len)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                        cache_salt=self.cache_salt,
-                    ),
+                    key=key,
                     req=self,
                     cow_mamba=cow_mamba,
                 )
@@ -1600,6 +1595,7 @@ class Req(ReqDllmMixin):
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
                 self.kv.cache_protected_len = len(self.prefix_indices)
+            self.draft_reused_prefix_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1904,6 +1900,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.draft_reused_prefix_len = 0
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0

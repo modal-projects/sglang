@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.speculative.draft_holdback import resolve_reprefill_key_limit
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -164,21 +165,21 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    # unified_kv SWA lives in a per-request ring that's not content-stable and is
-    # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
-    # the match by the trailing sliding window so it gets re-prefilled, rewriting
-    # this request's SWA ring. No-op for other layouts.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    # SWA in a per-request ring (unified_kv layout, or a request-owned draft
+    # cache) is not content-stable and never stored in the radix tree, so a
+    # reused prefix carries stale SWA. Cap the match by the trailing window so
+    # it gets re-prefilled into this request's ring, unless the soft hold-back
+    # policy decides the cap costs too much. No-op for other layouts.
+    key = RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        cache_salt=req.cache_salt,
+    )
+    key.limit = resolve_reprefill_key_limit(tree_cache, key, len(token_ids))
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
+            key=key,
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
@@ -208,6 +209,7 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.draft_reused_prefix_len = len(req.prefix_indices)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen

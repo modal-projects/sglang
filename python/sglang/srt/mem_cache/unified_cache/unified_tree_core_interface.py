@@ -395,6 +395,16 @@ class UnifiedTreeCoreInterface(ABC):
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False
 
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[tuple[int, int]]:
+        """Prefix lengths a match of `key` would reuse without and with a cap.
+
+        Returns (uncapped_len, capped_len) or None if the core cannot answer
+        without mutating the tree. Must not modify the tree or LRU state.
+        """
+        return None
+
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:

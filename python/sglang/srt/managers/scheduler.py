@@ -616,6 +616,10 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        if self.draft_worker is not None:
+            self.tree_cache.set_speculative_reprefill_tail_tokens(
+                self.draft_worker.prefix_reprefill_tail_tokens
+            )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 

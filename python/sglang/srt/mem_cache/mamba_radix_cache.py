@@ -1144,6 +1144,39 @@ class MambaRadixCache(BasePrefixCache):
 
         return value, best_last_node, best_value_len
 
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[Tuple[int, int]]:
+        """Resume points for `key` without and with a cap; no tree mutation.
+
+        A prefix can only be resumed at a node whose end carries a linear
+        attention state (mamba_value). Walk the fully matched nodes and record
+        the deepest such end overall and the deepest one within `cap` tokens
+        (a node ending past the cap would be split by a capped match, so its
+        state is not reachable).
+        """
+        if self.disable or len(key) == 0:
+            return (0, 0)
+        node = self.root_node
+        matched = 0
+        uncapped = capped = 0
+        child_key = key.child_key(self.page_size)
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                break
+            matched += prefix_len
+            if child.mamba_value is not None:
+                uncapped = matched
+                if matched <= cap:
+                    capped = matched
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+        return (uncapped, capped)
+
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key

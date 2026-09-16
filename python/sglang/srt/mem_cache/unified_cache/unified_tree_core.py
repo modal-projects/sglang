@@ -782,6 +782,60 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[tuple[int, int]]:
+        """Resume points for `key` without and with a cap; no tree mutation.
+
+        Mirrors _match_prefix_helper's device-only validation: a node is a
+        resume point when every component holds device data for it. Nodes are
+        never split here. A component that cannot be split (the Mamba state
+        lives only at a node's end) makes a partially matched node unusable,
+        and a node ending past `cap` unusable for the capped match; otherwise
+        the match is token-granular and the cap simply truncates it.
+        """
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return (0, 0)
+        cap = max(0, cap) // self.page_size * self.page_size
+        validators = tuple(
+            comp.create_match_validator(match_device_only=True)
+            for comp in self.components
+        )
+        partial_resumable = all(
+            comp.component_type != ComponentType.MAMBA for comp in self.components
+        )
+
+        node = self.root_node
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
+        matched = 0
+        uncapped = capped = 0
+        while key_offset < len(key) and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted:
+                break
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                if partial_resumable and all(v(child) for v in validators):
+                    matched += prefix_len
+                    uncapped = matched
+                    capped = min(matched, cap)
+                break
+            matched += prefix_len
+            node = child
+            if all(v(node) for v in validators):
+                uncapped = matched
+                if matched <= cap:
+                    capped = matched
+                elif partial_resumable:
+                    capped = cap
+            key_offset += prefix_len
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
+        return (uncapped, capped)
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> tuple[

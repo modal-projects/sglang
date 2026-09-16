@@ -315,6 +315,7 @@ def _dfs_weight_order(
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
+    _speculative_reprefill_tail_tokens = 0
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
@@ -526,8 +527,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a
         # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
-        return 0
+        # content-stable and overrides this where relevant. A speculative
+        # worker may additionally register a request-owned draft sidecar whose
+        # tail must be rebuilt on every prefix hit.
+        return self._speculative_reprefill_tail_tokens
+
+    def set_speculative_reprefill_tail_tokens(self, num_tokens: int) -> None:
+        self._speculative_reprefill_tail_tokens = max(0, int(num_tokens))
+
+    def peek_reprefill_resume(
+        self, key: RadixKey, cap: int
+    ) -> Optional[Tuple[int, int]]:
+        """Prefix lengths a match of `key` would reuse without and with a cap.
+
+        Returns (uncapped_len, capped_len), where capped_len is the reusable
+        length when the match is limited to the first `cap` tokens, or None
+        if this cache cannot answer without mutating the tree. Used to decide
+        whether holding back a draft re-prefill tail is worth its extra
+        prefill. Must not modify the tree or any LRU state.
+        """
+        return None
 
     def supports_mamba(self) -> bool:
         return False

@@ -148,19 +148,21 @@ class Spec(msgspec.Struct):
     speculative_draft_kv_cache_dtype: A[
         Optional[str],
         Arg(
-            help="KV cache dtype for the speculative draft model only. The draft pool is "
-            "allocated with one slot per target token (draft and target share a slot index "
-            "space), so for a small draft it can still rival the target pool: a 5-layer "
-            "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
-            "pool; the saving shows up as free device memory, so raise "
-            "--mem-fraction-static to convert it into KV capacity. Default follows "
-            "--kv-cache-dtype.",
+            help="KV cache dtype for the speculative draft model only. The draft pool "
+            "normally shares the target slot index space, so a small draft can still rival "
+            "the target pool. All-SWA DFLASH drafts use an automatically bounded, "
+            "request-owned pool instead. Setting fp8_e4m3 halves either draft pool's KV "
+            "storage. Default follows --kv-cache-dtype.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
     ] = None
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
+    ] = None
+    speculative_draft_soft_holdback_threshold: A[
+        Optional[int],
+        "Only with the bounded all-SWA DFLASH draft pool. A prefix hit normally holds back one draft window so the target re-prefills it and rewrites the draft's ring (hard hold-back). With this set, the hold-back is applied only when it costs at most this many extra prefill tokens over the point the cache could otherwise resume from; above that the match is not capped and the draft attends only to the part of its ring written since the resume point until generation fills the window (soft hold-back). Needs a cache that reports resume points (the unified FULL+MAMBA radix cache or the Mamba radix cache); other caches keep the hard hold-back. Default: always hard.",
     ] = None
     speculative_moe_runner_backend: A[
         Optional[str],

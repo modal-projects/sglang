@@ -162,7 +162,7 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_draft_soft_holdback_threshold: A[
         Optional[int],
-        "Only with the bounded all-SWA DFLASH draft pool. A prefix hit normally holds back one draft window so the target re-prefills it and rewrites the draft's ring (hard hold-back). With this set, the hold-back is applied only when it costs at most this many extra prefill tokens over the point the cache could otherwise resume from; above that the match is not capped and the draft attends only to the part of its ring written since the resume point until generation fills the window (soft hold-back). Requires --page-size 1 and a cache that reports resume points (Mamba radix cache); otherwise the hold-back stays hard. Default: always hard.",
+        "Only with the bounded all-SWA DFLASH draft pool. A prefix hit normally holds back one draft window so the target re-prefills it and rewrites the draft's ring (hard hold-back). With this set, the hold-back is applied only when it costs at most this many extra prefill tokens over the point the cache could otherwise resume from; above that the match is not capped and the draft attends only to the part of its ring written since the resume point until generation fills the window (soft hold-back). Needs a cache that reports resume points (the unified FULL+MAMBA radix cache or the Mamba radix cache); other caches keep the hard hold-back. Default: always hard.",
     ] = None
     speculative_moe_runner_backend: A[
         Optional[str],

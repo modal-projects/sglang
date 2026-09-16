@@ -1402,8 +1402,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         the decode path gathers it to bound the draft's visible window.
         """
         table = self._draft_valid_from()
+        # Round down to a page: the compact row's left edge is page-aligned, so
+        # an unaligned value could expose up to page_size - 1 unwritten slots.
+        page = int(self.page_size)
         values = torch.tensor(
-            [int(getattr(req, "draft_reused_prefix_len", 0)) for req in batch.reqs],
+            [
+                int(getattr(req, "draft_reused_prefix_len", 0)) // page * page
+                for req in batch.reqs
+            ],
             dtype=torch.int32,
             device=self.device,
         )

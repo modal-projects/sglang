@@ -66,7 +66,9 @@ _ESSAY_QUESTION = (
 class TestDFlashBoundedSwa(CustomTestCase, GSM8KMixin):
     model = TARGET_MODEL
     draft_model = DRAFT_MODEL
-    page_size = 1
+    # Page size 1 by default; the K3 deployment runs page size 64 (trtllm_mla),
+    # so the same tests can be run at that geometry via the environment.
+    page_size = int(os.environ.get("DFLASH_BOUNDED_SWA_PAGE_SIZE", "1"))
     max_running_requests = 32
     other_launch_args: list = []
     gsm8k_accuracy_thres = 0.80

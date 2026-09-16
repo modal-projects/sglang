@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -27,13 +27,12 @@ def soft_holdback_threshold() -> Optional[int]:
     """Extra prefill tokens the hard hold-back may cost before going soft.
 
     None means the hold-back is always hard. Soft hold-back reads only the
-    ring positions written since the resume point, which needs page size 1
-    (the compact draft row is not page-aligned to the left otherwise).
+    ring positions written since the resume point; the draft's compact row
+    may extend left to a page boundary, so the recorded resume point must be
+    page-aligned (radix matches are, and the worker rounds down as a guard).
     """
     threshold = get_spec().speculative_draft_soft_holdback_threshold
     if threshold is None or int(threshold) < 0:
-        return None
-    if get_schedule().page_size != 1:
         return None
     return int(threshold)
 

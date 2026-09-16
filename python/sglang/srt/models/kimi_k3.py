@@ -3516,6 +3516,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
+    # DFLASH drafts consume the same per-layer hidden-state capture as DSPARK.
+    set_dflash_layers_to_capture = set_dspark_layers_to_capture
+
     def preprocess_mm_for_encoder(
         self,
         mm_data,

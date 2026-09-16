@@ -509,14 +509,15 @@ def run_eagle_verify(
     if plan_stream:
         torch.get_device_module(device).current_stream().wait_stream(plan_stream)
         if (
-            _is_npu
-            and target_worker.model_runner.model_config.model_is_mrope
+            target_worker.model_runner.model_config.model_is_mrope
             and batch.spec_info is not None
             and getattr(batch.spec_info, "positions", None) is not None
             and not batch.forward_mode.is_idle()
         ):
             # mrope_position depends on draft output in default stream and is computed in plan stream,
-            # causing errors. Compute it here for correct values.
+            # causing errors. Compute it here for correct values. This is not NPU-specific:
+            # on CUDA the same cross-stream read yields stale positions that index the
+            # rope table out of range (XID 13 on the first verify step).
             verify_forward_batch.compute_spec_mrope_positions(
                 target_worker.model_runner, batch
             )

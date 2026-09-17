@@ -274,6 +274,7 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    max_running_requests_cap_source: Optional[str] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)

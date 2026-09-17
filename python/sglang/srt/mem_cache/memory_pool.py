@@ -3877,6 +3877,7 @@ class HybridLinearKVPool(KVCache):
         index_buf_size: Optional[int] = None,
         index_page_size: Optional[int] = None,
         index_kernel_page_size: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -3965,6 +3966,7 @@ class HybridLinearKVPool(KVCache):
                 index_buf_size=index_buf_size,
                 index_page_size=index_page_size,
                 index_kernel_page_size=index_kernel_page_size,
+                dcp_replicated=dcp_replicated,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -4919,7 +4921,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         index_page_size: Optional[int] = None,
         index_kernel_page_size: Optional[int] = None,
+        dcp_replicated: bool = False,
     ):
+        self.dcp_replicated = dcp_replicated
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )

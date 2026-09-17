@@ -1056,7 +1056,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
-            # In speculative decoding, these two fields are still needed.
+            # In speculative decoding, these fields depend on the draft output
+            # and must be re-copied after the draft finishes.
             graph_size_key = (
                 self._ragged_graph_size
                 if is_ragged
@@ -1072,6 +1073,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if forward_batch.mrope_positions is not None:
+                # mrope models: the plan-stream copy may predate the draft; the
+                # verify path recomputes mrope_positions after the stream join,
+                # so refresh the static buffer or the graph replays stale
+                # positions (out-of-range rope index, XID 13).
+                self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
+                    forward_batch.mrope_positions
+                )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()

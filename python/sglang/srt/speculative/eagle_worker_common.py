@@ -494,12 +494,18 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
+    from sglang.srt.speculative.spec_utils import plan_wait
+    main_stream = (
+        torch.get_device_module(device).current_stream() if plan_stream else None
+    )
     with plan_stream_ctx:
+        plan_wait("verify_entry", main_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
             batch,
             target_worker,
+            main_stream=main_stream,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.

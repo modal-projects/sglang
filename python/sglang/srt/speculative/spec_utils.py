@@ -1042,24 +1042,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         eagle_prepare_for_decode(batch)
 
 
-_SPEC_PLAN_WAIT_POINTS = frozenset(
-    x for x in os.environ.get("SGLANG_SPEC_PLAN_WAIT_POINTS", "").split(",") if x
-)
-
-
-def plan_wait_enabled(point: str) -> bool:
-    return point in _SPEC_PLAN_WAIT_POINTS or "all" in _SPEC_PLAN_WAIT_POINTS
-
-
-def plan_wait(point: str, main_stream) -> None:
-    """Debug bisection: order the plan stream after main_stream at a named
-    point when SGLANG_SPEC_PLAN_WAIT_POINTS lists it (or 'all')."""
-    if main_stream is None:
-        return
-    if point in _SPEC_PLAN_WAIT_POINTS or "all" in _SPEC_PLAN_WAIT_POINTS:
-        torch.get_device_module(main_stream.device).current_stream().wait_stream(main_stream)
-
-
 def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:

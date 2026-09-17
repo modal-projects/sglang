@@ -1173,15 +1173,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            # Mark the main stream before the draft is enqueued. Verify prep on the
-            # plan stream depends on work enqueued before this point (previous
-            # iteration's seq_lens / req_to_token writes) but not on the draft
-            # itself; waiting on this event keeps the draft/prep overlap.
-            if self.plan_stream is not None:
-                self._pre_draft_event = torch.get_device_module(self.device).Event()
-                self._pre_draft_event.record(
-                    torch.get_device_module(self.device).current_stream()
-                )
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
@@ -1523,7 +1514,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
-            pre_draft_event=getattr(self, "_pre_draft_event", None),
             topk=self.topk,
             num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,

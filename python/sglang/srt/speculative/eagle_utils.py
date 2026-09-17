@@ -492,9 +492,7 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
-    main_stream=None,
 ):
-    from sglang.srt.speculative.spec_utils import plan_wait
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
     )
@@ -519,7 +517,6 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        plan_wait("before_cache_locs", main_stream)
         batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=req_to_token_pool.req_to_token,
@@ -533,7 +530,6 @@ def eagle_prepare_for_verify(
             batch, verify_input.draft_token_num
         )
 
-        plan_wait("before_mamba_track", main_stream)
         prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
@@ -551,7 +547,6 @@ def eagle_prepare_for_verify(
         if target_worker.model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.FULL
     )
-    plan_wait("before_init_new", main_stream)
     verify_forward_batch = ForwardBatch.init_new(
         batch,
         target_worker.model_runner,
@@ -566,7 +561,6 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    plan_wait("before_load_batch", main_stream)
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch

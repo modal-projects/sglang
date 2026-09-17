@@ -1047,6 +1047,10 @@ _SPEC_PLAN_WAIT_POINTS = frozenset(
 )
 
 
+def plan_wait_enabled(point: str) -> bool:
+    return point in _SPEC_PLAN_WAIT_POINTS or "all" in _SPEC_PLAN_WAIT_POINTS
+
+
 def plan_wait(point: str, main_stream) -> None:
     """Debug bisection: order the plan stream after main_stream at a named
     point when SGLANG_SPEC_PLAN_WAIT_POINTS lists it (or 'all')."""

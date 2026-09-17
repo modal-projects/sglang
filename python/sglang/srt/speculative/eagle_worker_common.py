@@ -466,6 +466,7 @@ def run_eagle_verify(
     token_to_kv_pool_allocator: Any,
     plan_stream: Any,
     plan_stream_ctx: Any,
+    pre_draft_event: Any = None,
     topk: int,
     num_steps: int,
     num_draft_tokens: int,
@@ -494,12 +495,14 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
-    from sglang.srt.speculative.spec_utils import plan_wait
+    from sglang.srt.speculative.spec_utils import plan_wait, plan_wait_enabled
     main_stream = (
         torch.get_device_module(device).current_stream() if plan_stream else None
     )
     with plan_stream_ctx:
         plan_wait("verify_entry", main_stream)
+        if pre_draft_event is not None and plan_wait_enabled("verify_entry_event"):
+            torch.get_device_module(device).current_stream().wait_event(pre_draft_event)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,

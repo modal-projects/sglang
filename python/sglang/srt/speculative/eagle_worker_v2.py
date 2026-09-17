@@ -880,6 +880,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
+        if (
+            self.plan_stream
+            and self.target_worker.model_runner.model_config.model_is_mrope
+        ):
+            # Draft-extend prep consumes verify outputs (accept_lens, hidden_states,
+            # updated seq_lens) and, for mrope models, derives multimodal positions
+            # from them inside ForwardBatch.init_new. The plan stream deliberately
+            # does not wait on the default stream (verify prep overlaps the draft),
+            # but here there is nothing left to overlap: verify is already
+            # enqueued. Order the plan stream after it instead of racing it.
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(

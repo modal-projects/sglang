@@ -103,6 +103,9 @@ _KPOOL_FINITE_PROBE = os.getenv("SGLANG_GLM53_KPOOL_FINITE_PROBE", "0") == "1"
 def _drain_kpool_finite_probes(context: str) -> None:
     if not _KPOOL_FINITE_PROBE:
         return
+    from sglang.srt.models.glm5_next import drain_glm5_layer_finite_probes
+
+    drain_glm5_layer_finite_probes(context)
     from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
         drain_kpool_finite_probes,
     )

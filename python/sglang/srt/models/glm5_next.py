@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -99,7 +101,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_device,
+    get_forward,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -116,6 +124,129 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+
+_GLM5_LAYER_FINITE_PROBE = os.getenv("SGLANG_GLM53_KPOOL_FINITE_PROBE", "0") == "1"
+_GLM5_LAYER_FINITE_PROBE_STAGES = (
+    "forward.input.hidden",
+    "forward.input.residual",
+    "prepare_attn.hidden",
+    "prepare_attn.residual",
+    "self_attn.output",
+    "prepare_mlp.hidden",
+    "prepare_mlp.residual",
+    "mlp.output",
+    "postprocess.hidden",
+    "postprocess.residual",
+)
+_GLM5_LAYER_FINITE_PROBE_STAGE_INDEX = {
+    stage: index for index, stage in enumerate(_GLM5_LAYER_FINITE_PROBE_STAGES)
+}
+_GLM5_LAYER_GRAPH_PROBES: List[Tuple[str, int, torch.Tensor]] = []
+
+
+def _probe_glm5_layer_finite(
+    stage: str,
+    tensor: Optional[torch.Tensor],
+    layer_id: int,
+    graph_counts: Optional[torch.Tensor],
+) -> None:
+    if (
+        not _GLM5_LAYER_FINITE_PROBE
+        or tensor is None
+        or not isinstance(tensor, torch.Tensor)
+        or not tensor.is_floating_point()
+    ):
+        return
+
+    value = tensor.detach()
+    probe_value = value.float() if value.element_size() == 1 else value
+    bad = ~torch.isfinite(probe_value)
+    stage_index = _GLM5_LAYER_FINITE_PROBE_STAGE_INDEX[stage]
+    if torch.cuda.is_current_stream_capturing():
+        assert graph_counts is not None
+        graph_counts[stage_index].copy_(bad.sum(dtype=torch.int32))
+        return
+
+    if graph_counts is not None:
+        graph_counts[stage_index].zero_()
+    if not bool(bad.any().item()):
+        return
+
+    from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+        _write_probe_record,
+    )
+
+    flat = probe_value.reshape(-1)
+    flat_bad = bad.reshape(-1)
+    first_bad = int(torch.nonzero(flat_bad, as_tuple=False)[0].item())
+    finite_values = flat[~flat_bad].float()
+    record = {
+        "event": "glm53_layer_first_nonfinite",
+        "time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "rank": os.getenv("RANK"),
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "layer_id": layer_id,
+        "stage": stage,
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "numel": value.numel(),
+        "nan_count": int(torch.isnan(probe_value).sum().item()),
+        "posinf_count": int(torch.isposinf(probe_value).sum().item()),
+        "neginf_count": int(torch.isneginf(probe_value).sum().item()),
+        "first_bad_flat_index": first_bad,
+        "first_bad_value": str(flat[first_bad].item()),
+        "finite_min": (
+            float(finite_values.min().item()) if finite_values.numel() else None
+        ),
+        "finite_max": (
+            float(finite_values.max().item()) if finite_values.numel() else None
+        ),
+    }
+    payload = _write_probe_record(record)
+    raise RuntimeError(f"GLM53_LAYER_NONFINITE {payload}")
+
+
+def drain_glm5_layer_finite_probes(context: str) -> None:
+    if not _GLM5_LAYER_FINITE_PROBE or not _GLM5_LAYER_GRAPH_PROBES:
+        return
+
+    snapshots = [counts.detach().cpu() for _, _, counts in _GLM5_LAYER_GRAPH_PROBES]
+    for _, _, counts in _GLM5_LAYER_GRAPH_PROBES:
+        counts.zero_()
+
+    failures = []
+    for (module_name, layer_id, _), counts in zip(
+        _GLM5_LAYER_GRAPH_PROBES, snapshots, strict=True
+    ):
+        bad_stages = torch.nonzero(counts, as_tuple=False).flatten().tolist()
+        if bad_stages:
+            failures.append((layer_id, int(bad_stages[0]), module_name, counts))
+    if not failures:
+        return
+
+    layer_id, stage_index, module_name, counts = min(
+        failures, key=lambda failure: (failure[0], failure[1])
+    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+        _write_probe_record,
+    )
+
+    record = {
+        "event": "glm53_layer_graph_nonfinite",
+        "time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "rank": os.getenv("RANK"),
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "context": context,
+        "module": module_name,
+        "layer_id": layer_id,
+        "stage": _GLM5_LAYER_FINITE_PROBE_STAGES[stage_index],
+        "nonfinite_count": int(counts[stage_index].item()),
+    }
+    payload = _write_probe_record(record)
+    raise RuntimeError(f"GLM53_LAYER_GRAPH_NONFINITE {payload}")
 
 
 @torch.compile
@@ -706,6 +837,29 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
+        self._finite_probe_counts = None
+        if _GLM5_LAYER_FINITE_PROBE:
+            self._finite_probe_counts = torch.zeros(
+                len(_GLM5_LAYER_FINITE_PROBE_STAGES),
+                dtype=torch.int32,
+                device=get_device().device,
+            )
+            _GLM5_LAYER_GRAPH_PROBES.append(
+                (
+                    prefix or self.__class__.__name__,
+                    self.layer_id,
+                    self._finite_probe_counts,
+                )
+            )
+
+    def _probe_finite(self, stage: str, tensor: Optional[torch.Tensor]) -> None:
+        _probe_glm5_layer_finite(
+            stage,
+            tensor,
+            self.layer_id,
+            self._finite_probe_counts,
+        )
+
     def _hc_pre(
         self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
     ):
@@ -772,12 +926,16 @@ class Glm5NextDecoderLayer(nn.Module):
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         hidden_states_orig = hidden_states
+        self._probe_finite("forward.input.hidden", hidden_states)
+        self._probe_finite("forward.input.residual", residual)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
         )
+        self._probe_finite("prepare_attn.hidden", hidden_states)
+        self._probe_finite("prepare_attn.residual", residual)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -791,6 +949,7 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        self._probe_finite("self_attn.output", hidden_states)
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -798,6 +957,8 @@ class Glm5NextDecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
+        self._probe_finite("prepare_mlp.hidden", hidden_states)
+        self._probe_finite("prepare_mlp.residual", residual)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -833,6 +994,7 @@ class Glm5NextDecoderLayer(nn.Module):
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
+        self._probe_finite("mlp.output", hidden_states)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -843,6 +1005,8 @@ class Glm5NextDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
             )
+        self._probe_finite("postprocess.hidden", hidden_states)
+        self._probe_finite("postprocess.residual", residual)
 
         return hidden_states, residual, topk_indices
 

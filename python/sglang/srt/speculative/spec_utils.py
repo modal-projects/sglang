@@ -491,8 +491,8 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            current_token = draft_tokens[curr]
-            if vocab_size and current_token >= vocab_size:
+            current_token = int(draft_tokens[curr])
+            if vocab_size and not 0 <= current_token < vocab_size:
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
@@ -503,7 +503,7 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
+                grammar.accept_token(current_token)
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
@@ -632,7 +632,7 @@ class GrammarTree:
         next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
         next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
         next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+        return cls.from_host(next_token, next_sibling, verify_ids_2d.to("cpu"))
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:

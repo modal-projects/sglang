@@ -38,6 +38,11 @@ struct FastTopKParams {
 };
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
+  const auto raw = __float_as_uint(x);
+  // Keep every NaN payload on one radix path and rank it below numeric values.
+  if ((raw & 0x7f800000u) == 0x7f800000u && (raw & 0x007fffffu) != 0) {
+    return 0;
+  }
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
@@ -46,6 +51,9 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
+  if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0) {
+    return 0;
+  }
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 

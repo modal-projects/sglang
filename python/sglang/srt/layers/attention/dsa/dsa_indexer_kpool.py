@@ -112,21 +112,26 @@ def _probe_finite(
     value = tensor.detach()
     probe_value = value.float() if value.element_size() == 1 else value
     finite = torch.isfinite(probe_value)
+    bad = (
+        torch.isnan(probe_value) | torch.isposinf(probe_value)
+        if stage == "topk.input_logits"
+        else ~finite
+    )
     stage_index = _KPOOL_FINITE_PROBE_STAGE_INDEX[stage]
     if torch.cuda.is_current_stream_capturing():
         assert graph_counts is not None
-        graph_counts[stage_index].copy_((~finite).sum(dtype=torch.int32))
+        graph_counts[stage_index].copy_(bad.sum(dtype=torch.int32))
         return
 
     if graph_counts is not None:
         graph_counts[stage_index].zero_()
-    if bool(finite.all().item()):
+    if not bool(bad.any().item()):
         return
 
     flat = probe_value.reshape(-1)
-    flat_finite = finite.reshape(-1)
-    first_bad = int(torch.nonzero(~flat_finite, as_tuple=False)[0].item())
-    finite_values = flat[flat_finite].float()
+    flat_bad = bad.reshape(-1)
+    first_bad = int(torch.nonzero(flat_bad, as_tuple=False)[0].item())
+    finite_values = flat[finite.reshape(-1)].float()
     record = {
         "event": "glm53_kpool_first_nonfinite",
         "time_ns": time.time_ns(),

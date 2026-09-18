@@ -58,20 +58,67 @@ _KPOOL_FINITE_PROBE = os.getenv("SGLANG_GLM53_KPOOL_FINITE_PROBE", "0") == "1"
 _KPOOL_FINITE_PROBE_DIR = os.getenv(
     "SGLANG_GLM53_KPOOL_FINITE_PROBE_DIR", "/coredumps/kpool-producer-probe"
 )
+_KPOOL_FINITE_PROBE_STAGES = (
+    "forward.input_x",
+    "forward.input_q_lora",
+    "qk.query",
+    "qk.key",
+    "qk.gate_score",
+    "quant.q_fp8",
+    "quant.q_scale",
+    "head_gate.input_x",
+    "head_gate.input_q_scale",
+    "head_gate.weights_proj",
+    "head_gate.head_scaled",
+    "head_gate.output",
+    "topk.input_logits",
+    "verify.qk.query",
+    "verify.qk.key",
+    "verify.qk.gate_score",
+    "verify.quant.q_fp8",
+    "verify.quant.q_scale",
+)
+_KPOOL_FINITE_PROBE_STAGE_INDEX = {
+    stage: index for index, stage in enumerate(_KPOOL_FINITE_PROBE_STAGES)
+}
+_KPOOL_GRAPH_PROBES: List[Tuple[str, int, torch.Tensor]] = []
 
 
-def _probe_finite(stage: str, tensor: Optional[torch.Tensor], layer_id: int) -> None:
+def _write_probe_record(record: Dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True)
+    os.makedirs(_KPOOL_FINITE_PROBE_DIR, exist_ok=True)
+    path = os.path.join(
+        _KPOOL_FINITE_PROBE_DIR,
+        f"rank-{record['rank']}-local-{record['local_rank']}-pid-{record['pid']}-"
+        f"{record['time_ns']}.json",
+    )
+    with open(path, "w") as output:
+        output.write(payload + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    return payload
+
+
+def _probe_finite(
+    stage: str,
+    tensor: Optional[torch.Tensor],
+    layer_id: int,
+    graph_counts: Optional[torch.Tensor],
+) -> None:
     """Fail before KPool sees a non-finite tensor and persist its first producer."""
-    if (
-        not _KPOOL_FINITE_PROBE
-        or tensor is None
-        or not tensor.is_floating_point()
-        or torch.cuda.is_current_stream_capturing()
-    ):
+    if not _KPOOL_FINITE_PROBE or tensor is None or not tensor.is_floating_point():
         return
 
     value = tensor.detach()
     finite = torch.isfinite(value)
+    stage_index = _KPOOL_FINITE_PROBE_STAGE_INDEX[stage]
+    if torch.cuda.is_current_stream_capturing():
+        assert graph_counts is not None
+        graph_counts[stage_index].copy_((~finite).sum(dtype=torch.int32))
+        return
+
+    if graph_counts is not None:
+        graph_counts[stage_index].zero_()
     if bool(finite.all().item()):
         return
 
@@ -102,18 +149,40 @@ def _probe_finite(stage: str, tensor: Optional[torch.Tensor], layer_id: int) -> 
             float(finite_values.max().item()) if finite_values.numel() else None
         ),
     }
-    payload = json.dumps(record, sort_keys=True)
-    os.makedirs(_KPOOL_FINITE_PROBE_DIR, exist_ok=True)
-    path = os.path.join(
-        _KPOOL_FINITE_PROBE_DIR,
-        f"rank-{record['rank']}-local-{record['local_rank']}-pid-{record['pid']}-"
-        f"{record['time_ns']}.json",
-    )
-    with open(path, "w") as output:
-        output.write(payload + "\n")
-        output.flush()
-        os.fsync(output.fileno())
+    payload = _write_probe_record(record)
     raise RuntimeError(f"GLM53_KPOOL_NONFINITE {payload}")
+
+
+def drain_kpool_finite_probes(context: str) -> None:
+    """Read stage counters written by CUDA graph replays before their outputs are used."""
+    if not _KPOOL_FINITE_PROBE or not _KPOOL_GRAPH_PROBES:
+        return
+
+    snapshots = [counts.detach().cpu() for _, _, counts in _KPOOL_GRAPH_PROBES]
+    for _, _, counts in _KPOOL_GRAPH_PROBES:
+        counts.zero_()
+
+    for (module_name, layer_id, _), counts in zip(
+        _KPOOL_GRAPH_PROBES, snapshots, strict=True
+    ):
+        bad_stages = torch.nonzero(counts, as_tuple=False).flatten().tolist()
+        if not bad_stages:
+            continue
+        stage_index = int(bad_stages[0])
+        record = {
+            "event": "glm53_kpool_graph_nonfinite",
+            "time_ns": time.time_ns(),
+            "pid": os.getpid(),
+            "rank": os.getenv("RANK"),
+            "local_rank": os.getenv("LOCAL_RANK"),
+            "context": context,
+            "module": module_name,
+            "layer_id": layer_id,
+            "stage": _KPOOL_FINITE_PROBE_STAGES[stage_index],
+            "nonfinite_count": int(counts[stage_index].item()),
+        }
+        payload = _write_probe_record(record)
+        raise RuntimeError(f"GLM53_KPOOL_GRAPH_NONFINITE {payload}")
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -221,15 +290,33 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+        self._finite_probe_counts = None
+        if _KPOOL_FINITE_PROBE:
+            self._finite_probe_counts = torch.zeros(
+                len(_KPOOL_FINITE_PROBE_STAGES),
+                dtype=torch.int32,
+                device=get_device().device,
+            )
+            _KPOOL_GRAPH_PROBES.append(
+                (
+                    prefix or self.__class__.__name__,
+                    self.layer_id,
+                    self._finite_probe_counts,
+                )
+            )
+
+    def _probe_finite(self, stage: str, tensor: Optional[torch.Tensor]) -> None:
+        _probe_finite(stage, tensor, self.layer_id, self._finite_probe_counts)
+
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        _probe_finite("head_gate.input_x", x, self.layer_id)
-        _probe_finite("head_gate.input_q_scale", q_scale, self.layer_id)
+        self._probe_finite("head_gate.input_x", x)
+        self._probe_finite("head_gate.input_q_scale", q_scale)
         weights, _ = self.weights_proj(x.float())
-        _probe_finite("head_gate.weights_proj", weights, self.layer_id)
+        self._probe_finite("head_gate.weights_proj", weights)
         weights = weights * self.n_heads**-0.5
-        _probe_finite("head_gate.head_scaled", weights, self.layer_id)
+        self._probe_finite("head_gate.head_scaled", weights)
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-        _probe_finite("head_gate.output", weights, self.layer_id)
+        self._probe_finite("head_gate.output", weights)
         return weights
 
     @staticmethod
@@ -711,7 +798,7 @@ class IndexerKPool(MultiPlatformOp):
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _probe_finite("topk.input_logits", logits, self.layer_id)
+        self._probe_finite("topk.input_logits", logits)
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
         )
@@ -1373,9 +1460,9 @@ class IndexerKPool(MultiPlatformOp):
                 enable_dual_stream and self.compress_gate_stream is not None
             ),
         )
-        _probe_finite("verify.qk.query", query, layer_id)
-        _probe_finite("verify.qk.key", key, layer_id)
-        _probe_finite("verify.qk.gate_score", gate_score_maybe, layer_id)
+        self._probe_finite("verify.qk.query", query)
+        self._probe_finite("verify.qk.key", key)
+        self._probe_finite("verify.qk.gate_score", gate_score_maybe)
 
         pool = get_token_to_kv_pool()
         tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
@@ -1413,8 +1500,8 @@ class IndexerKPool(MultiPlatformOp):
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                _probe_finite("verify.quant.q_fp8", q_fp8, layer_id)
-                _probe_finite("verify.quant.q_scale", q_scale, layer_id)
+                self._probe_finite("verify.quant.q_fp8", q_fp8)
+                self._probe_finite("verify.quant.q_scale", q_scale)
                 weights = self._get_logits_head_gate(x, q_scale)
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
@@ -1423,8 +1510,8 @@ class IndexerKPool(MultiPlatformOp):
             _compress_write()
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                _probe_finite("verify.quant.q_fp8", q_fp8, layer_id)
-                _probe_finite("verify.quant.q_scale", q_scale, layer_id)
+                self._probe_finite("verify.quant.q_fp8", q_fp8)
+                self._probe_finite("verify.quant.q_scale", q_scale)
                 weights = self._get_logits_head_gate(x, q_scale)
 
         if not return_indices:
@@ -1476,8 +1563,8 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        _probe_finite("forward.input_x", x, layer_id)
-        _probe_finite("forward.input_q_lora", q_lora, layer_id)
+        self._probe_finite("forward.input_x", x)
+        self._probe_finite("forward.input_q_lora", q_lora)
         if is_hip():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not is_npu():
@@ -1563,9 +1650,9 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
         )
-        _probe_finite("qk.query", query, layer_id)
-        _probe_finite("qk.key", key, layer_id)
-        _probe_finite("qk.gate_score", gate_score, layer_id)
+        self._probe_finite("qk.query", query)
+        self._probe_finite("qk.key", key)
+        self._probe_finite("qk.gate_score", gate_score)
 
         weights = None
         kpool_extend_cache = None
@@ -1585,14 +1672,14 @@ class IndexerKPool(MultiPlatformOp):
                     gate_score=gate_score,
                 )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            _probe_finite("quant.q_fp8", q_fp8, layer_id)
-            _probe_finite("quant.q_scale", q_scale, layer_id)
+            self._probe_finite("quant.q_fp8", q_fp8)
+            self._probe_finite("quant.q_scale", q_scale)
             weights = self._get_logits_head_gate(x, q_scale)
             current_stream.wait_stream(self.alt_stream)
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            _probe_finite("quant.q_fp8", q_fp8, layer_id)
-            _probe_finite("quant.q_scale", q_scale, layer_id)
+            self._probe_finite("quant.q_fp8", q_fp8)
+            self._probe_finite("quant.q_scale", q_scale)
             has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
             defer_kpool_cache_write = (
                 forward_batch.forward_mode.is_extend_without_speculative()

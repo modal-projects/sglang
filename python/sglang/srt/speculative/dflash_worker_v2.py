@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -96,6 +97,52 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+_KPOOL_FINITE_PROBE = os.getenv("SGLANG_GLM53_KPOOL_FINITE_PROBE", "0") == "1"
+
+
+def _drain_kpool_finite_probes(context: str) -> None:
+    if not _KPOOL_FINITE_PROBE:
+        return
+    from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+        drain_kpool_finite_probes,
+    )
+
+    drain_kpool_finite_probes(context)
+
+
+def _validate_dflash_draft_tokens(
+    context: str, draft_tokens: torch.Tensor, vocab_size: int
+) -> None:
+    if not _KPOOL_FINITE_PROBE or draft_tokens.numel() == 0:
+        return
+    valid = (draft_tokens >= 0) & (draft_tokens < vocab_size)
+    invalid_count = int((~valid).sum().item())
+    if invalid_count == 0:
+        return
+
+    from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+        _write_probe_record,
+    )
+
+    flat = draft_tokens.reshape(-1)
+    first_bad = int(torch.nonzero(~valid.reshape(-1), as_tuple=False)[0].item())
+    record = {
+        "event": "dflash_invalid_draft_token",
+        "time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "rank": os.getenv("RANK"),
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "context": context,
+        "shape": list(draft_tokens.shape),
+        "vocab_size": vocab_size,
+        "invalid_count": invalid_count,
+        "token_min": int(flat.min().item()),
+        "token_max": int(flat.max().item()),
+        "first_bad_flat_index": first_bad,
+        "first_bad_token": int(flat[first_bad].item()),
+    }
+    payload = _write_probe_record(record)
+    raise RuntimeError(f"DFLASH_INVALID_DRAFT_TOKEN {payload}")
 
 
 def _get_fused_kv_materialize_helper():
@@ -2197,6 +2244,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
+            _drain_kpool_finite_probes("target_prefill")
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2299,6 +2347,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     is_verify=True,
                     skip_attn_backend_init=True,
                 )
+                _drain_kpool_finite_probes("idle_target_verify")
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -2498,6 +2547,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_tp_context(self.draft_model_runner.tp_group),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
+        _drain_kpool_finite_probes("draft_forward")
         draft_logits_output = draft_out.logits_output
 
         if (
@@ -2578,6 +2628,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        _validate_dflash_draft_tokens(
+            "before_target_verify",
+            draft_tokens,
+            int(self.model_runner.model_config.vocab_size),
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2642,6 +2697,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
+        )
+        _drain_kpool_finite_probes("target_verify")
+        _validate_dflash_draft_tokens(
+            "after_target_verify",
+            draft_tokens,
+            int(self.model_runner.model_config.vocab_size),
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph

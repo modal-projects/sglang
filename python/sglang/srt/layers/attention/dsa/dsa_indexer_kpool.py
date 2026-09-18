@@ -104,6 +104,8 @@ def _probe_finite(
     tensor: Optional[torch.Tensor],
     layer_id: int,
     graph_counts: Optional[torch.Tensor],
+    valid_lengths: Optional[torch.Tensor] = None,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> None:
     """Fail before KPool sees a non-finite tensor and persist its first producer."""
     if not _KPOOL_FINITE_PROBE or tensor is None or not tensor.is_floating_point():
@@ -112,11 +114,29 @@ def _probe_finite(
     value = tensor.detach()
     probe_value = value.float() if value.element_size() == 1 else value
     finite = torch.isfinite(probe_value)
+    valid = None
+    if valid_lengths is not None:
+        assert probe_value.ndim == 2
+        assert valid_lengths.shape[0] == probe_value.shape[0]
+        starts = (
+            row_starts.to(torch.int64)
+            if row_starts is not None
+            else torch.zeros_like(valid_lengths, dtype=torch.int64)
+        )
+        lengths = valid_lengths.to(torch.int64)
+        cols = torch.arange(
+            probe_value.shape[1], device=probe_value.device, dtype=torch.int64
+        )
+        valid = (cols.unsqueeze(0) >= starts.unsqueeze(1)) & (
+            cols.unsqueeze(0) < (starts + lengths).unsqueeze(1)
+        )
     bad = (
         torch.isnan(probe_value) | torch.isposinf(probe_value)
         if stage == "topk.input_logits"
         else ~finite
     )
+    if valid is not None:
+        bad &= valid
     stage_index = _KPOOL_FINITE_PROBE_STAGE_INDEX[stage]
     if torch.cuda.is_current_stream_capturing():
         assert graph_counts is not None
@@ -131,7 +151,15 @@ def _probe_finite(
     flat = probe_value.reshape(-1)
     flat_bad = bad.reshape(-1)
     first_bad = int(torch.nonzero(flat_bad, as_tuple=False)[0].item())
-    finite_values = flat[finite.reshape(-1)].float()
+    finite_for_stats = finite if valid is None else finite & valid
+    finite_values = flat[finite_for_stats.reshape(-1)].float()
+    nan = torch.isnan(probe_value)
+    posinf = torch.isposinf(probe_value)
+    neginf = torch.isneginf(probe_value)
+    if valid is not None:
+        nan &= valid
+        posinf &= valid
+        neginf &= valid
     record = {
         "event": "glm53_kpool_first_nonfinite",
         "time_ns": time.time_ns(),
@@ -143,9 +171,10 @@ def _probe_finite(
         "shape": list(value.shape),
         "dtype": str(value.dtype),
         "numel": value.numel(),
-        "nan_count": int(torch.isnan(probe_value).sum().item()),
-        "posinf_count": int(torch.isposinf(probe_value).sum().item()),
-        "neginf_count": int(torch.isneginf(probe_value).sum().item()),
+        "valid_numel": int(valid.sum().item()) if valid is not None else value.numel(),
+        "nan_count": int(nan.sum().item()),
+        "posinf_count": int(posinf.sum().item()),
+        "neginf_count": int(neginf.sum().item()),
         "first_bad_flat_index": first_bad,
         "first_bad_value": str(flat[first_bad].item()),
         "finite_min": (
@@ -311,8 +340,21 @@ class IndexerKPool(MultiPlatformOp):
                 )
             )
 
-    def _probe_finite(self, stage: str, tensor: Optional[torch.Tensor]) -> None:
-        _probe_finite(stage, tensor, self.layer_id, self._finite_probe_counts)
+    def _probe_finite(
+        self,
+        stage: str,
+        tensor: Optional[torch.Tensor],
+        valid_lengths: Optional[torch.Tensor] = None,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> None:
+        _probe_finite(
+            stage,
+            tensor,
+            self.layer_id,
+            self._finite_probe_counts,
+            valid_lengths,
+            row_starts,
+        )
 
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         self._probe_finite("head_gate.input_x", x)
@@ -804,7 +846,12 @@ class IndexerKPool(MultiPlatformOp):
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        self._probe_finite("topk.input_logits", logits)
+        self._probe_finite(
+            "topk.input_logits",
+            logits,
+            valid_lengths=pool_lens,
+            row_starts=row_starts,
+        )
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
         )

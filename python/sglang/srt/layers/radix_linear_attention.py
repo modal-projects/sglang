@@ -29,6 +29,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -240,5 +241,10 @@ def _linear_attention_capture_stub(
 
 
 bcg_unified_linear_attention_with_output = eager_on_graph(
-    True, capture_stub=_linear_attention_capture_stub
+    True,
+    capture_stub=(
+        None
+        if get_bool_env_var("SGLANG_GLM53_BCG_DISABLE_LINEAR_CAPTURE_STUB")
+        else _linear_attention_capture_stub
+    ),
 )(unified_linear_attention_with_output)

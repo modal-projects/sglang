@@ -135,6 +135,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     is_npu,
     require_attn_tp_gather,
@@ -156,6 +157,7 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+_DISABLE_BCG_MAMBA_RESET = get_bool_env_var("SGLANG_GLM53_BCG_DISABLE_MAMBA_RESET")
 
 
 def _chunked_prefix_variant(num_chunks: int) -> str:
@@ -1628,7 +1630,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
             mamba_pool = getattr(req_pool, "mamba_pool", None)
-            if mamba_pool is not None and not prefix_num_chunks:
+            if (
+                mamba_pool is not None
+                and not prefix_num_chunks
+                and not _DISABLE_BCG_MAMBA_RESET
+            ):
                 capture_state_indices = req_pool.translate_mamba_indices(
                     req_pool.get_mamba_indices(forward_batch.req_pool_indices)
                 ).unique()

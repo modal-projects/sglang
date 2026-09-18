@@ -427,5 +427,16 @@ class DeveloperMessageTestCase(CustomTestCase):
         self.assertEqual(messages[1]["role"], "user")
 
 
+class ModelValidationTestCase(CustomTestCase):
+    def test_model_validation(self):
+        serving = make_serving()
+        error = serving._validate_model("__no_such_model__")
+        self.assertIsNotNone(error)
+        self.assertEqual(error.status_code, 404)
+        self.assertIsNone(serving._validate_model(None))
+        self.assertIsNone(serving._validate_model("x"))
+        self.assertIsNone(serving._validate_model("x:my-adapter"))
+
+
 if __name__ == "__main__":
     unittest.main()

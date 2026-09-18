@@ -1,5 +1,8 @@
 import importlib.util
-from typing import Optional, Tuple, Union
+import json
+import os
+import time
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -42,6 +45,81 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
+
+
+_KDA_FINITE_PROBE = os.getenv("SGLANG_GLM53_KPOOL_FINITE_PROBE", "0") == "1"
+_KDA_FINITE_PROBE_DIR = os.getenv(
+    "SGLANG_GLM53_KPOOL_FINITE_PROBE_DIR", "/coredumps/kpool-producer-probe"
+)
+_KDA_FINITE_PROBE_LAYERS = {
+    int(layer_id)
+    for layer_id in os.getenv("SGLANG_GLM53_KDA_FINITE_PROBE_LAYERS", "").split(",")
+    if layer_id.strip()
+}
+
+
+def _probe_kda_finite(
+    stage: str,
+    tensor: Optional[torch.Tensor],
+    layer_id: int,
+    context: Dict[str, Any],
+) -> None:
+    """Persist and stop at the first non-finite KDA input, state, or output."""
+    if (
+        not _KDA_FINITE_PROBE
+        or tensor is None
+        or not tensor.is_floating_point()
+        or (_KDA_FINITE_PROBE_LAYERS and layer_id not in _KDA_FINITE_PROBE_LAYERS)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+
+    value = tensor.detach()
+    probe_value = value.float() if value.element_size() == 1 else value
+    finite = torch.isfinite(probe_value)
+    if bool(finite.all().item()):
+        return
+
+    flat = probe_value.reshape(-1)
+    flat_finite = finite.reshape(-1)
+    first_bad = int(torch.nonzero(~flat_finite, as_tuple=False)[0].item())
+    finite_values = flat[flat_finite].float()
+    record = {
+        "event": "glm53_kda_first_nonfinite",
+        "time_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "rank": os.getenv("RANK"),
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "layer_id": layer_id,
+        "stage": stage,
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "numel": value.numel(),
+        "nan_count": int(torch.isnan(probe_value).sum().item()),
+        "posinf_count": int(torch.isposinf(probe_value).sum().item()),
+        "neginf_count": int(torch.isneginf(probe_value).sum().item()),
+        "first_bad_flat_index": first_bad,
+        "first_bad_value": str(flat[first_bad].item()),
+        "finite_min": (
+            float(finite_values.min().item()) if finite_values.numel() else None
+        ),
+        "finite_max": (
+            float(finite_values.max().item()) if finite_values.numel() else None
+        ),
+        **context,
+    }
+    payload = json.dumps(record, sort_keys=True)
+    os.makedirs(_KDA_FINITE_PROBE_DIR, exist_ok=True)
+    path = os.path.join(
+        _KDA_FINITE_PROBE_DIR,
+        f"rank-{record['rank']}-local-{record['local_rank']}-pid-{record['pid']}-"
+        f"{record['time_ns']}.json",
+    )
+    with open(path, "w") as output:
+        output.write(payload + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    raise RuntimeError(f"GLM53_KDA_NONFINITE {payload}")
 
 
 class KDAKernelDispatcher:
@@ -809,10 +887,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        probe_context = {
+            "forward_mode": str(forward_batch.forward_mode),
+            "physical_num_tokens": mixed_qkv.shape[0],
+            "logical_num_tokens": int(query_start_loc[-1]),
+            "num_sequences": query_start_loc.shape[0] - 1,
+        }
+        _probe_kda_finite(
+            "extend.input.mixed_qkv",
+            mixed_qkv,
+            layer.layer_id,
+            probe_context,
+        )
+        _probe_kda_finite("extend.input.a", a, layer.layer_id, probe_context)
+        _probe_kda_finite("extend.input.b", b, layer.layer_id, probe_context)
+
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
+        probe_slots = cache_indices.to(torch.int64)
+        _probe_kda_finite(
+            "extend.state.conv.before",
+            conv_states.index_select(0, probe_slots),
+            layer.layer_id,
+            probe_context,
+        )
+        _probe_kda_finite(
+            "extend.state.ssm.before",
+            ssm_states.index_select(0, probe_slots),
+            layer.layer_id,
+            probe_context,
+        )
 
         # Normal extend path
         if forward_batch.extend_prefix_lens is None:
@@ -851,6 +957,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
+        _probe_kda_finite("extend.conv.output", qkv, layer.layer_id, probe_context)
+        _probe_kda_finite(
+            "extend.state.conv.after",
+            conv_states.index_select(0, probe_slots),
+            layer.layer_id,
+            probe_context,
+        )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -922,6 +1035,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
             core_attn_out, h = core_attn_out
+            _probe_kda_finite(
+                "extend.kernel.track_state", h, layer.layer_id, probe_context
+            )
             self._track_mamba_state_extend(
                 forward_batch,
                 h,
@@ -929,6 +1045,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata,
                 h_track_buf=h_track_buf,
             )
+
+        _probe_kda_finite(
+            "extend.kernel.output", core_attn_out, layer.layer_id, probe_context
+        )
+        _probe_kda_finite(
+            "extend.state.ssm.after",
+            ssm_states.index_select(0, probe_slots),
+            layer.layer_id,
+            probe_context,
+        )
 
         if logical_num_tokens < physical_num_tokens:
             pad = core_attn_out.new_zeros(

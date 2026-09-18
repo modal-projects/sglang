@@ -62,11 +62,12 @@ def _probe_kda_finite(
     stage: str,
     tensor: Optional[torch.Tensor],
     layer_id: int,
-    context: Dict[str, Any],
+    context: Optional[Dict[str, Any]],
 ) -> None:
     """Persist and stop at the first non-finite KDA input, state, or output."""
     if (
-        not _KDA_FINITE_PROBE
+        context is None
+        or not _KDA_FINITE_PROBE
         or tensor is None
         or not tensor.is_floating_point()
         or (_KDA_FINITE_PROBE_LAYERS and layer_id not in _KDA_FINITE_PROBE_LAYERS)
@@ -887,12 +888,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        probe_context = {
-            "forward_mode": str(forward_batch.forward_mode),
-            "physical_num_tokens": mixed_qkv.shape[0],
-            "logical_num_tokens": int(query_start_loc[-1]),
-            "num_sequences": query_start_loc.shape[0] - 1,
-        }
+        probe_context = None
+        if (
+            _KDA_FINITE_PROBE
+            and (
+                not _KDA_FINITE_PROBE_LAYERS
+                or layer.layer_id in _KDA_FINITE_PROBE_LAYERS
+            )
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            probe_context = {
+                "forward_mode": str(forward_batch.forward_mode),
+                "physical_num_tokens": mixed_qkv.shape[0],
+                "logical_num_tokens": int(query_start_loc[-1]),
+                "num_sequences": query_start_loc.shape[0] - 1,
+            }
         _probe_kda_finite(
             "extend.input.mixed_qkv",
             mixed_qkv,
@@ -906,19 +916,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
-        probe_slots = cache_indices.to(torch.int64)
-        _probe_kda_finite(
-            "extend.state.conv.before",
-            conv_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
-        _probe_kda_finite(
-            "extend.state.ssm.before",
-            ssm_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        probe_slots = None
+        if probe_context is not None:
+            probe_slots = cache_indices.to(torch.int64)
+            _probe_kda_finite(
+                "extend.state.conv.before",
+                conv_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
+            _probe_kda_finite(
+                "extend.state.ssm.before",
+                ssm_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
 
         # Normal extend path
         if forward_batch.extend_prefix_lens is None:
@@ -958,12 +970,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
         _probe_kda_finite("extend.conv.output", qkv, layer.layer_id, probe_context)
-        _probe_kda_finite(
-            "extend.state.conv.after",
-            conv_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        if probe_slots is not None:
+            _probe_kda_finite(
+                "extend.state.conv.after",
+                conv_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1049,12 +1062,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         _probe_kda_finite(
             "extend.kernel.output", core_attn_out, layer.layer_id, probe_context
         )
-        _probe_kda_finite(
-            "extend.state.ssm.after",
-            ssm_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        if probe_slots is not None:
+            _probe_kda_finite(
+                "extend.state.ssm.after",
+                ssm_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
 
         if logical_num_tokens < physical_num_tokens:
             pad = core_attn_out.new_zeros(
@@ -1101,13 +1115,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = fm.retrieve_next_sibling
         retrieve_parent_token = fm.retrieve_parent_token
         draft_token_num = forward_batch.spec_info.draft_token_num
-        probe_context = {
-            "forward_mode": str(forward_batch.forward_mode),
-            "physical_num_tokens": seq_len,
-            "logical_num_tokens": int(query_start_loc[-1]),
-            "num_sequences": query_start_loc.shape[0] - 1,
-            "draft_token_num": draft_token_num,
-        }
+        probe_context = None
+        if (
+            _KDA_FINITE_PROBE
+            and (
+                not _KDA_FINITE_PROBE_LAYERS
+                or layer.layer_id in _KDA_FINITE_PROBE_LAYERS
+            )
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            probe_context = {
+                "forward_mode": str(forward_batch.forward_mode),
+                "physical_num_tokens": seq_len,
+                "logical_num_tokens": int(query_start_loc[-1]),
+                "num_sequences": query_start_loc.shape[0] - 1,
+                "draft_token_num": draft_token_num,
+            }
         _probe_kda_finite(
             "verify.input.mixed_qkv",
             mixed_qkv,
@@ -1120,19 +1143,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        probe_slots = cache_indices.to(torch.int64).unique()
-        _probe_kda_finite(
-            "verify.state.conv.before",
-            conv_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
-        _probe_kda_finite(
-            "verify.state.ssm.before",
-            ssm_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        probe_slots = None
+        if probe_context is not None:
+            probe_slots = cache_indices.to(torch.int64).unique()
+            _probe_kda_finite(
+                "verify.state.conv.before",
+                conv_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
+            _probe_kda_finite(
+                "verify.state.ssm.before",
+                ssm_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
         # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
@@ -1264,18 +1289,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     layer.layer_id,
                     probe_context,
                 )
-                _probe_kda_finite(
-                    "verify.state.conv.after",
-                    conv_states.index_select(0, probe_slots),
-                    layer.layer_id,
-                    probe_context,
-                )
-                _probe_kda_finite(
-                    "verify.state.ssm.after",
-                    ssm_states.index_select(0, probe_slots),
-                    layer.layer_id,
-                    probe_context,
-                )
+                if probe_slots is not None:
+                    _probe_kda_finite(
+                        "verify.state.conv.after",
+                        conv_states.index_select(0, probe_slots),
+                        layer.layer_id,
+                        probe_context,
+                    )
+                    _probe_kda_finite(
+                        "verify.state.ssm.after",
+                        ssm_states.index_select(0, probe_slots),
+                        layer.layer_id,
+                        probe_context,
+                    )
                 return core_attn_out
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -1325,12 +1351,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.layer_id,
             probe_context,
         )
-        _probe_kda_finite(
-            "verify.state.conv.after",
-            conv_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        if probe_slots is not None:
+            _probe_kda_finite(
+                "verify.state.conv.after",
+                conv_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
         if dense_token_indices is None:
             mixed_qkv = mixed_qkv_flat
         else:
@@ -1382,12 +1409,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         _probe_kda_finite(
             "verify.kernel.output", core_attn_out, layer.layer_id, probe_context
         )
-        _probe_kda_finite(
-            "verify.state.ssm.after",
-            ssm_states.index_select(0, probe_slots),
-            layer.layer_id,
-            probe_context,
-        )
+        if probe_slots is not None:
+            _probe_kda_finite(
+                "verify.state.ssm.after",
+                ssm_states.index_select(0, probe_slots),
+                layer.layer_id,
+                probe_context,
+            )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
             # uncovered tail rows; zero them so discarded pad hidden states

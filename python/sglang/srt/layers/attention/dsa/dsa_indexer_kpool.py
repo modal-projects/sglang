@@ -110,7 +110,8 @@ def _probe_finite(
         return
 
     value = tensor.detach()
-    finite = torch.isfinite(value)
+    probe_value = value.float() if value.element_size() == 1 else value
+    finite = torch.isfinite(probe_value)
     stage_index = _KPOOL_FINITE_PROBE_STAGE_INDEX[stage]
     if torch.cuda.is_current_stream_capturing():
         assert graph_counts is not None
@@ -122,7 +123,7 @@ def _probe_finite(
     if bool(finite.all().item()):
         return
 
-    flat = value.reshape(-1)
+    flat = probe_value.reshape(-1)
     flat_finite = finite.reshape(-1)
     first_bad = int(torch.nonzero(~flat_finite, as_tuple=False)[0].item())
     finite_values = flat[flat_finite].float()
@@ -137,9 +138,9 @@ def _probe_finite(
         "shape": list(value.shape),
         "dtype": str(value.dtype),
         "numel": value.numel(),
-        "nan_count": int(torch.isnan(value).sum().item()),
-        "posinf_count": int(torch.isposinf(value).sum().item()),
-        "neginf_count": int(torch.isneginf(value).sum().item()),
+        "nan_count": int(torch.isnan(probe_value).sum().item()),
+        "posinf_count": int(torch.isposinf(probe_value).sum().item()),
+        "neginf_count": int(torch.isneginf(probe_value).sum().item()),
         "first_bad_flat_index": first_bad,
         "first_bad_value": str(flat[first_bad].item()),
         "finite_min": (

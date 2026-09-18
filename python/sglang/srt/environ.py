@@ -678,6 +678,11 @@ class Envs:
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # KV ghost list (capacity-miss metrics, mem_cache/kv_ghost_list.py); only
+    # built under --enable-metrics. Entries: -1 = the KV pool's page count
+    # (capped at 1M), 0 = off. TTL: entries older than this are forgotten.
+    SGLANG_KV_GHOST_LIST_PAGES = EnvInt(-1)
+    SGLANG_KV_GHOST_LIST_TTL_S = EnvFloat(7200.0)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================

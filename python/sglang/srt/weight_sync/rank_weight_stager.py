@@ -240,10 +240,15 @@ class RankWeightStager:
                     "reused": True,
                     "wall_s": 0.0,
                 }
-            raise RuntimeError(
-                f"version {image.target_version} is already prepared; commit or "
-                "discard it before preparing another target"
-            )
+            if (
+                image.target_version is not None
+                and target_version < image.target_version
+            ):
+                raise RuntimeError(
+                    f"target version {target_version} must not precede prepared "
+                    f"version {image.target_version}"
+                )
+            image.invalidate(f"superseded by version {target_version}")
 
         started = time.perf_counter()
         checkpoint, canonical_reset, seed_stats = self._canonical_for_target(

@@ -1625,6 +1625,38 @@ class FusedMoE(torch.nn.Module):
             ]
         ]
 
+    @staticmethod
+    def index_expert_params_mapping(
+        mappings: List[Tuple[str, str, int, str]],
+    ) -> Dict[int, List[Tuple[str, str, int, str]]]:
+        """Index checkpoint mappings so one expert does not scan every expert."""
+
+        result: Dict[int, List[Tuple[str, str, int, str]]] = {}
+        for mapping in mappings:
+            result.setdefault(mapping[2], []).append(mapping)
+        return result
+
+    @staticmethod
+    def get_expert_params_mapping_candidates(
+        name: str,
+        mappings: List[Tuple[str, str, int, str]],
+        mappings_by_expert: Dict[int, List[Tuple[str, str, int, str]]],
+    ) -> List[Tuple[str, str, int, str]]:
+        """Return only mappings for the explicit expert in a checkpoint name."""
+
+        marker = ".experts."
+        marker_start = name.find(marker)
+        if marker_start >= 0:
+            expert_start = marker_start + len(marker)
+        elif name.startswith("experts."):
+            expert_start = len("experts.")
+        else:
+            return mappings
+        expert = name[expert_start:].partition(".")[0]
+        if not expert.isdigit():
+            return mappings
+        return mappings_by_expert.get(int(expert), [])
+
     @classmethod
     def make_expert_params_mapping_fused(
         cls,

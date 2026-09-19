@@ -1415,6 +1415,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1519,7 +1522,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 break
             else:
                 is_expert_weight = False
-                for mapping in expert_params_mapping:
+                for mapping in FusedMoE.get_expert_params_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
+                ):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

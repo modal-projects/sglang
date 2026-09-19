@@ -4,11 +4,34 @@ import torch
 
 from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    _expert_mapping_candidates,
     _normalize_modelopt_fp4_expert_weight,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestExpertMappingCandidates(unittest.TestCase):
+    def test_uses_encoded_expert_id(self):
+        mappings = [
+            ("w13", "w1", 0, "w1"),
+            ("w2", "w2", 0, "w2"),
+            ("w13", "w1", 1, "w1"),
+            ("w2", "w2", 1, "w2"),
+        ]
+        by_expert = {
+            expert_id: [mapping for mapping in mappings if mapping[2] == expert_id]
+            for expert_id in range(2)
+        }
+
+        candidates = _expert_mapping_candidates(
+            "model.layers.3.mlp.experts.1.w2.weight",
+            mappings,
+            by_expert,
+        )
+
+        self.assertEqual(candidates, by_expert[1])
 
 
 class TestModelOptFp4ExpertWeightNormalization(unittest.TestCase):

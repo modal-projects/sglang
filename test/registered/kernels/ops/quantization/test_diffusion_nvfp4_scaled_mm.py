@@ -389,6 +389,7 @@ def test_flux2_fused_nvfp4_swiglu_quant_matches_unfused() -> None:
     previous_interleaved_weight = layer_in.weight_swiglu_interleaved.clone()
     reloaded_weight = _swap_fp4_nibbles(weight_in_fp4).clone()
     reloaded_weight.view(torch.uint8).flatten()[0] ^= 0x11
+    method_in.restore_weights_before_loading(layer_in)
     layer_in.weight.data.copy_(reloaded_weight)
     layer_in.weight_scale.data.copy_(weight_in_scale)
     method_in.process_weights_after_loading(layer_in)

@@ -113,6 +113,73 @@ After training completes each step, rollout engines must be refit with new weigh
 - **From tensor** is best for co-located training/rollout when you can pass in-memory tensors.
 - **From distributed** is best for disaggregated training/rollout with dedicated communication groups (NCCL/IB).
 
+### Prepared Checkpoint Updates
+
+Large checkpoint updates can prepare their inactive state while inference continues,
+then commit it while new requests are blocked. Enable one startup-time backend:
+
+```text
+--weight-update-staging disk
+--weight-update-local-checkpoint-dir /local/checkpoint
+```
+
+or:
+
+```text
+--weight-update-staging cpu
+```
+
+`disk` materializes the target as a host-local checkpoint and performs a native
+checkpoint reload during commit. `cpu` compiles a rank-local pinned host image, so
+commit only copies the prepared bytes to the existing CUDA storages. With `cpu`,
+setting `--weight-update-local-checkpoint-dir` keeps the canonical checkpoint on
+host-local storage; omitting it keeps one canonical copy per host in shared memory.
+`--weight-update-max-compile-group-gb` bounds temporary native-loader state during
+CPU image compilation, except when one indivisible model unit is larger.
+
+The startup checkpoint and `--weight-version` define the initial served version.
+Initialization completes before the server reports readiness. Speculative draft
+weights are not modified.
+
+Prepare a strictly newer version with:
+
+```http
+POST /prepare_weight_update
+{
+  "checkpoint_source_dir": "/published/checkpoints",
+  "target_version": 12
+}
+```
+
+The request completes after every model rank has prepared the target, but inference
+continues during that work. The source directory contains published version
+directories. SGLang verifies the complete lineage and folds all required deltas
+before producing the inactive target. Repeating the same target is idempotent. A
+strictly newer preparation replaces the inactive target, so a controller may skip
+an obsolete target without exposing it; older targets are rejected.
+
+Commit that exact version with:
+
+```http
+POST /commit_weight_update
+{
+  "target_version": 12,
+  "abort_all_requests": false,
+  "flush_cache": false,
+  "torch_empty_cache": false
+}
+```
+
+Commit serializes live-weight mutation against inference and updates the externally
+visible version only after every rank succeeds. `flush_cache` defaults to `true` and
+requires an idle scheduler. A controller that namespaces cache entries by weight
+version may set it to `false` when preserving requests across an in-place pause.
+A preparation failure leaves live model storage unchanged. A failure after commit
+starts is fatal because some live storage may already contain the new version.
+Direct disk, tensor, distributed, and IPC mutations are rejected while prepared
+checkpoint updates are enabled, because they would invalidate the canonical and
+rank-local state.
+
 ### Update Weights from Disk
 
 **When to use:**

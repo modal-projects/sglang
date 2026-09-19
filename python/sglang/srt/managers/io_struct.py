@@ -1815,6 +1815,30 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class PrepareWeightUpdateReqInput(BaseReq, kw_only=True):
+    checkpoint_source_dir: str
+    target_version: int
+
+
+class PrepareWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
+class CommitWeightUpdateReqInput(BaseReq, kw_only=True):
+    target_version: int
+    abort_all_requests: bool = False
+    flush_cache: bool = True
+    torch_empty_cache: bool = False
+
+
+class CommitWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    rank_stats: Optional[List[Dict[str, Any]]] = None
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]
@@ -1974,7 +1998,8 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
 
 
 class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):

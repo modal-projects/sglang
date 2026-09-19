@@ -1535,8 +1535,69 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
-    offloader.update_param(weight, new_weight)
-    weight_scale_inv.data = new_weight_scale_inv
+    if (
+        weight.shape == new_weight.shape
+        and weight.dtype == new_weight.dtype
+        and weight.device == new_weight.device
+    ):
+        weight.data.copy_(new_weight)
+    else:
+        offloader.update_param(weight, new_weight)
+
+    runtime_scale = getattr(weight_scale_inv, "_reload_runtime_scale", None)
+    if runtime_scale is None:
+        weight_scale_inv.data = new_weight_scale_inv
+        return
+
+    if (
+        runtime_scale.shape != new_weight_scale_inv.shape
+        or runtime_scale.dtype != new_weight_scale_inv.dtype
+    ):
+        raise RuntimeError(
+            "Reloaded FP8 scale layout does not match the existing runtime "
+            f"buffer: runtime={tuple(runtime_scale.shape)}/{runtime_scale.dtype}, "
+            f"new={tuple(new_weight_scale_inv.shape)}/{new_weight_scale_inv.dtype}."
+        )
+    runtime_scale.copy_(new_weight_scale_inv)
+    weight_scale_inv.data = runtime_scale
+    del weight_scale_inv._reload_runtime_scale
+
+
+def record_ue8m0_scale_checkpoint_layout(
+    scale: torch.nn.Parameter | None,
+) -> None:
+    """Record the checkpoint representation before UE8M0 postprocessing."""
+    if scale is None or hasattr(scale, "_checkpoint_scale_layout"):
+        return
+    scale._checkpoint_scale_layout = (
+        tuple(scale.shape),
+        scale.dtype,
+        getattr(scale, "format_ue8m0", False),
+    )
+
+
+def restore_ue8m0_scale_checkpoint_layout(
+    scale: torch.nn.Parameter | None,
+) -> None:
+    """Expose a scale parameter's checkpoint representation for reloading."""
+    if scale is None or not hasattr(scale, "_checkpoint_scale_layout"):
+        return
+
+    checkpoint_shape, checkpoint_dtype, checkpoint_format = (
+        scale._checkpoint_scale_layout
+    )
+    scale.format_ue8m0 = checkpoint_format
+    if tuple(scale.shape) == checkpoint_shape and scale.dtype == checkpoint_dtype:
+        return
+
+    if hasattr(scale, "_reload_runtime_scale"):
+        raise RuntimeError("FP8 scale restoration is already in progress.")
+    scale._reload_runtime_scale = scale.data
+    scale.data = torch.empty(
+        checkpoint_shape,
+        dtype=checkpoint_dtype,
+        device=scale.device,
+    )
 
 
 def requant_block_scale_ue8m0_for_deepgemm(

@@ -938,13 +938,20 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        self.materialize_sampling_mask_output(batch.reqs, logits_output)
-
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
             logits_output=logits_output,
             next_token_ids=next_token_ids,
+        )
+        self.materialize_sampling_mask_output(
+            batch.reqs,
+            logits_output,
+            output_lengths=(
+                [len(token_ids) for token_ids in next_token_ids]
+                if not batch.spec_algorithm.is_none()
+                else None
+            ),
         )
 
         batch_size = batch.batch_size()
@@ -1033,9 +1040,20 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_sampling_mask:
-                # return_sampling_mask + speculative decoding is rejected at
-                # request entry, so this remains one support mask per token.
-                self.add_sampling_mask_return_values(i, req, logits_output)
+                mask_token_count = new_accept_len
+                if req.finished_len is not None:
+                    previous_output_len = len(req.output_ids) - new_accept_len
+                    mask_token_count = min(
+                        mask_token_count,
+                        max(0, req.finished_len - previous_output_len),
+                    )
+                self.add_sampling_mask_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    token_count=mask_token_count,
+                    speculative=is_spec,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -1160,19 +1178,31 @@ class SchedulerBatchResultProcessor:
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
+        *,
+        token_count: int = 1,
+        speculative: bool = False,
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
-        req.output_token_sampling_logprobs.append(
-            None if logprobs is None else logprobs[i]
-        )
+        if speculative:
+            req.output_token_sampling_mask.extend(
+                [None] * token_count if mask is None else mask[i][:token_count]
+            )
+            req.output_token_sampling_logprobs.extend(
+                [None] * token_count if logprobs is None else logprobs[i][:token_count]
+            )
+        else:
+            req.output_token_sampling_mask.append(None if mask is None else mask[i])
+            req.output_token_sampling_logprobs.append(
+                None if logprobs is None else logprobs[i]
+            )
 
     @staticmethod
     def materialize_sampling_mask_output(
         reqs: List[Req],
         output: Optional[LogitsProcessorOutput],
+        output_lengths: Optional[List[int]] = None,
     ) -> None:
         """Convert opted-in tensor rows to batch-aligned Python results."""
         if output is None or output.sampling_mask_output is None:
@@ -1190,16 +1220,44 @@ class SchedulerBatchResultProcessor:
         logprobs = [None] * batch_size
         status_by_batch = [None] * batch_size
         token_ids = sampling_output.token_ids.cpu()
-        packed_width = token_ids.shape[1]
+        packed_width = token_ids.shape[-1]
         for row, batch_index in enumerate(batch_indices):
-            status = int(statuses[row])
-            length = int(lengths[row])
-            if status == SamplingMaskStatus.OK and not (0 <= length <= packed_width):
-                status = SamplingMaskStatus.INVALID
-            status_by_batch[batch_index] = status
-            if status == SamplingMaskStatus.OK:
-                masks[batch_index] = token_ids[row, :length].tolist()
-                logprobs[batch_index] = float(selected_logprobs[row])
+            if output_lengths is None:
+                status = int(statuses[row])
+                length = int(lengths[row])
+                if status == SamplingMaskStatus.OK and not (
+                    0 <= length <= packed_width
+                ):
+                    status = SamplingMaskStatus.INVALID
+                status_by_batch[batch_index] = status
+                if status == SamplingMaskStatus.OK:
+                    masks[batch_index] = token_ids[row, :length].tolist()
+                    logprobs[batch_index] = float(selected_logprobs[row])
+                continue
+
+            output_length = int(output_lengths[batch_index])
+            if not (0 <= output_length <= token_ids.shape[1]):
+                status_by_batch[batch_index] = SamplingMaskStatus.INVALID
+                continue
+
+            request_masks = []
+            request_logprobs = []
+            request_status = SamplingMaskStatus.OK
+            for token_index in range(output_length):
+                status = int(statuses[row][token_index])
+                length = int(lengths[row][token_index])
+                if status == SamplingMaskStatus.OK and not (
+                    0 <= length <= packed_width
+                ):
+                    status = SamplingMaskStatus.INVALID
+                request_status = max(request_status, status)
+                if status == SamplingMaskStatus.OK:
+                    request_masks.append(token_ids[row, token_index, :length].tolist())
+                    request_logprobs.append(float(selected_logprobs[row][token_index]))
+            status_by_batch[batch_index] = request_status
+            if request_status == SamplingMaskStatus.OK:
+                masks[batch_index] = request_masks
+                logprobs[batch_index] = request_logprobs
 
         output.next_token_sampling_mask_idx = masks
         output.next_token_sampling_logprobs = logprobs

@@ -563,6 +563,23 @@ class Sampler(nn.Module):
             statuses=statuses,
         )
 
+    def build_sampling_mask_output_from_probs(
+        self,
+        filtered_probs: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> SamplingMaskOutput:
+        """Pack sampling support from an already-filtered distribution."""
+        rows = torch.arange(filtered_probs.shape[0], device=filtered_probs.device)
+        return self._build_sampling_mask_output(
+            sampled_token_ids,
+            _SamplingMaskCapture(
+                weights=filtered_probs,
+                token_ids=None,
+                selected_weight=None,
+                batch_rows=rows,
+            ),
+        )
+
     def _sample_from_logprobs(
         self,
         logprobs: torch.Tensor,

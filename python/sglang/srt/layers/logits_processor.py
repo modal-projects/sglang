@@ -224,8 +224,12 @@ class LogitsProcessorOutput:
     # Post-filter support IDs, bounded by server capacity, and selected-token
     # logprob over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[List[int], List[List[int]]]]]
+    ] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[float, List[float]]]]
+    ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor

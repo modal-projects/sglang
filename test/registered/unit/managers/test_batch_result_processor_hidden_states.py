@@ -75,6 +75,74 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertEqual(output.next_token_sampling_logprobs, [-0.5, None, -0.25])
         self.assertIsNone(output.sampling_mask_output)
 
+    def test_speculative_rows_materialize_per_emitted_token(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SimpleNamespace(
+                token_ids=torch.tensor(
+                    [
+                        [[7, 8, 0], [9, 0, 0], [10, 11, 0]],
+                        [[12, 13, 0], [14, 0, 0], [0, 0, 0]],
+                    ]
+                ),
+                lengths=torch.tensor([[2, 1, 2], [2, 1, 0]]),
+                selected_logprobs=torch.tensor(
+                    [[-0.5, -0.25, -0.75], [-0.1, -0.2, 0.0]]
+                ),
+                statuses=torch.full((2, 3), SamplingMaskStatus.OK),
+            ),
+        )
+
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[SimpleNamespace(return_sampling_mask=x) for x in (True, False, True)],
+            output=output,
+            output_lengths=[3, 0, 2],
+        )
+
+        self.assertEqual(
+            output.next_token_sampling_mask_idx,
+            [[[7, 8], [9], [10, 11]], None, [[12, 13], [14]]],
+        )
+        self.assertEqual(
+            output.next_token_sampling_logprobs[:2], [[-0.5, -0.25, -0.75], None]
+        )
+        self.assertAlmostEqual(output.next_token_sampling_logprobs[2][0], -0.1)
+        self.assertAlmostEqual(output.next_token_sampling_logprobs[2][1], -0.2)
+        self.assertEqual(
+            output.next_token_sampling_mask_status,
+            [SamplingMaskStatus.OK, None, SamplingMaskStatus.OK],
+        )
+
+    def test_speculative_rows_ignore_uncommitted_suffix_status(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SimpleNamespace(
+                token_ids=torch.tensor([[[7, 0], [8, 0], [9, 0]]]),
+                lengths=torch.tensor([[1, 1, 1]]),
+                selected_logprobs=torch.tensor([[-0.5, -0.25, -0.75]]),
+                statuses=torch.tensor(
+                    [
+                        [
+                            SamplingMaskStatus.OK,
+                            SamplingMaskStatus.OK,
+                            SamplingMaskStatus.INVALID,
+                        ]
+                    ]
+                ),
+            ),
+        )
+
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[SimpleNamespace(return_sampling_mask=True)],
+            output=output,
+            output_lengths=[2],
+        )
+
+        self.assertEqual(output.next_token_sampling_mask_idx, [[[7], [8]]])
+        self.assertEqual(
+            output.next_token_sampling_mask_status, [SamplingMaskStatus.OK]
+        )
+
 
 class _PrefillReq:
     def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_states):

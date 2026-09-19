@@ -567,7 +567,7 @@ class ModelRunner:
             custom_weight_loaders=get_model().custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
-            recapture_cuda_graph=self.init_decode_cuda_graph,
+            recapture_cuda_graph=self.recapture_cuda_graphs,
             get_model_runner=lambda: self,
         )
 
@@ -1105,6 +1105,12 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+
+    def recapture_cuda_graphs(self):
+        """Release captured graphs before replacing them with new captures."""
+        self.prefill_cuda_graph_runner = None
+        self.decode_cuda_graph_runner = None
+        self.init_cuda_graphs()
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

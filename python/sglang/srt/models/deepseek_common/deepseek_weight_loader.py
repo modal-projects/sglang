@@ -268,6 +268,9 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -399,7 +402,11 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in FusedMoE.get_expert_params_mapping_candidates(
+                        name,
+                        expert_params_mapping,
+                        expert_params_mapping_by_expert,
+                    ):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue

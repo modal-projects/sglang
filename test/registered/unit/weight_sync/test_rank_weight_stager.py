@@ -159,11 +159,36 @@ def test_repeated_stage_is_idempotent(monkeypatch, tmp_path):
 
     assert stats["reused"] is True
     assert stager.compiler.compiles == [2]
-    with pytest.raises(RuntimeError, match="already prepared"):
+
+
+def test_newer_stage_supersedes_prepared_image(monkeypatch, tmp_path):
+    stager, _ = _new_stager(monkeypatch)
+    stager.initialize(tmp_path / "base", version=0)
+    stager.stage(checkpoint_source_dir=tmp_path / "updates", target_version=2)
+
+    stats = stager.stage(
+        checkpoint_source_dir=tmp_path / "updates",
+        target_version=5,
+    )
+
+    assert stats["canonical_transform"] == {"from": 2, "to": 5}
+    assert stager.compiler.compiles == [2, 5]
+    assert stager.prepared_version == 5
+
+
+def test_older_stage_does_not_replace_prepared_image(monkeypatch, tmp_path):
+    stager, _ = _new_stager(monkeypatch)
+    stager.initialize(tmp_path / "base", version=0)
+    stager.stage(checkpoint_source_dir=tmp_path / "updates", target_version=5)
+
+    with pytest.raises(RuntimeError, match="must not precede prepared version 5"):
         stager.stage(
             checkpoint_source_dir=tmp_path / "updates",
             target_version=3,
         )
+
+    assert stager.prepared_version == 5
+    assert stager.compiler.compiles == [5]
 
 
 def test_discard_allows_canonical_to_advance(monkeypatch, tmp_path):

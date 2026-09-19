@@ -10,8 +10,7 @@ from typing import Any
 
 from sglang.srt.weight_sync.checksum import create_checksum, validate_checksum
 from sglang.srt.weight_sync.safetensors_buffer import (
-    MAX_SAFETENSORS_HEADER_BYTES,
-    parse_safetensors_header,
+    read_safetensors_file_layout,
 )
 
 
@@ -33,6 +32,10 @@ class DeltaCheckpoint:
     tensors: tuple[DeltaTensor, ...]
     metadata_wall_s: float
     source_setup_wall_s: float
+
+
+def version_dir(checkpoint_source_dir: str | Path, version: int) -> Path:
+    return Path(checkpoint_source_dir) / f"weight_v{version:06d}"
 
 
 def read_delta_checkpoint(
@@ -169,59 +172,7 @@ def _resolve_source_path(root: Path, filename: str) -> Path:
 
 
 def _read_delta_header(path: Path):
-    file_nbytes = path.stat().st_size
-    with path.open("rb") as file:
-        prefix = file.read(8)
-        if len(prefix) != 8:
-            raise FileNotFoundError(f"delta source is shorter than its header: {path}")
-        header_nbytes = int.from_bytes(prefix, "little")
-        if header_nbytes <= 0 or header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
-            raise ValueError(
-                f"invalid delta header length in {path}: "
-                f"header={header_nbytes} file={file_nbytes}"
-            )
-        if 8 + header_nbytes > file_nbytes:
-            raise FileNotFoundError(
-                f"delta source is shorter than its declared header: {path}"
-            )
-        header_bytes = file.read(header_nbytes)
-        if len(header_bytes) != header_nbytes:
-            raise FileNotFoundError(
-                f"delta source is shorter than its declared header: {path}"
-            )
-
-    # A publisher can expose a complete header before the blob payload has
-    # finished materializing. Distinguish that readiness state from malformed
-    # safetensors metadata so callers retry instead of rebuilding local state.
-    try:
-        raw_header = json.loads(header_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid safetensors JSON header in {path}") from exc
-    if isinstance(raw_header, dict):
-        declared_data_nbytes = 0
-        offsets_are_valid = True
-        for name, entry in raw_header.items():
-            if name == "__metadata__":
-                continue
-            offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
-            if (
-                not isinstance(offsets, list)
-                or len(offsets) != 2
-                or not all(isinstance(value, int) for value in offsets)
-            ):
-                offsets_are_valid = False
-                break
-            declared_data_nbytes = max(declared_data_nbytes, offsets[1])
-        declared_file_nbytes = 8 + header_nbytes + declared_data_nbytes
-        if offsets_are_valid and file_nbytes < declared_file_nbytes:
-            raise FileNotFoundError(
-                f"delta source is shorter than its declared payload: {path}"
-            )
-    layout, metadata = parse_safetensors_header(
-        header_nbytes=header_nbytes,
-        header_bytes=header_bytes,
-        file_nbytes=file_nbytes,
-    )
+    layout, metadata = read_safetensors_file_layout(path)
     for name, entry in layout.tensors.items():
         if entry.dtype_code != "U8" or entry.shape != (
             entry.relative_end - entry.relative_begin,

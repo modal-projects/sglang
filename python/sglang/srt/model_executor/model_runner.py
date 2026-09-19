@@ -559,6 +559,7 @@ class ModelRunner:
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
 
     def init_weight_updater(self):
+        self.rank_weight_stager = None
         self.weight_updater = WeightUpdater(
             tp_rank=self.ps.tp_rank,
             device=self.device,

@@ -1,8 +1,10 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _expert_mapping_candidates,
     _normalize_modelopt_fp4_expert_weight,
@@ -32,6 +34,22 @@ class TestExpertMappingCandidates(unittest.TestCase):
         )
 
         self.assertEqual(candidates, by_expert[1])
+
+
+class TestDerivedMLAWeights(unittest.TestCase):
+    def test_declares_unregistered_weight_tensors(self):
+        attention = SimpleNamespace(
+            w_kc=torch.ones(1),
+            w_vc=torch.ones(2),
+            w_scale=None,
+            runtime_cache=torch.ones(3),
+        )
+
+        tensors = dict(DeepseekV2AttentionMLA.get_additional_weight_tensors(attention))
+
+        self.assertEqual(set(tensors), {"w_kc", "w_vc"})
+        self.assertIs(tensors["w_kc"], attention.w_kc)
+        self.assertIs(tensors["w_vc"], attention.w_vc)
 
 
 class TestModelOptFp4ExpertWeightNormalization(unittest.TestCase):

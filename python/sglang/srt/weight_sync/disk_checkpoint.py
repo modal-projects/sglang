@@ -1,0 +1,1105 @@
+"""Materialize versioned checkpoints on host-local storage.
+
+Each ``weight_v{N:06d}`` source is either a full Hugging Face checkpoint or a
+compressed per-tensor delta over version N-1. Materialization seeds the newest
+full checkpoint, applies and verifies the remaining deltas, then records the
+target version and immutable source lineage.
+
+A host-local file lock makes concurrent calls from model workers safe. Updated
+files are synchronized before the version marker, and a checksum mismatch
+triggers one clean reseed before failing loudly.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import glob
+import json
+import logging
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+import numpy as np
+import zstandard
+
+from sglang.srt.weight_sync.checksum import calculate_checksum
+from sglang.srt.weight_sync.delta_checkpoint import read_delta_checkpoint
+from sglang.srt.weight_sync.file_io import (
+    FileDescriptorCache,
+    PositionalFileRangeReader,
+    file_descriptor_cache_limit,
+    read_exact,
+)
+from sglang.srt.weight_sync.safetensors_buffer import (
+    SafetensorsLayout,
+    read_safetensors_file_layout,
+    validate_safetensors_weight_map,
+)
+
+logger = logging.getLogger(__name__)
+
+# XOR targets are read and written through ordinary positional I/O instead of
+# mmap. An XOR delta must read and checksum every target byte, and positional
+# I/O keeps that access sequential instead of making progress page-fault bound.
+# Bound target and sparse-overwrite work buffers across workers. Compressed XOR
+# bytes are decoded through a fixed-size stream buffer. A single tensor larger
+# than the budget is admitted alone.
+_DELTA_APPLY_MEMORY_BYTES = 8 << 30
+_POSITIONAL_IO_CHUNK_BYTES = 64 << 20
+_DELTA_STREAM_CHUNK_BYTES = 4 << 20
+
+_MAX_SEED_COPY_WORKERS = 8
+_MAX_DELTA_APPLY_WORKERS = 32
+_MAX_OPEN_FILES_PER_CACHE = 256
+_SEED_COPY_CHUNK_BYTES = 16 << 20
+_SEED_LOG_STEP_GB = 50
+
+# Per-checkpoint dir holding the applied-version marker and materialization lock.
+_SYNC_DIR = ".weight_sync"
+
+
+class _ChecksumMismatchError(RuntimeError):
+    """The reconstructed local tensor bytes do not match the published target."""
+
+
+@dataclass(frozen=True)
+class _AppliedCheckpointState:
+    """Identity of the published lineage represented by local checkpoint bytes."""
+
+    version: int
+    base_version: int
+    base_checkpoint_dir: str
+    checkpoint_source_dir: str | None
+
+
+def _requested_state(
+    *,
+    version: int,
+    base_version: int,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+) -> _AppliedCheckpointState:
+    return _AppliedCheckpointState(
+        version=version,
+        base_version=base_version,
+        base_checkpoint_dir=os.path.realpath(base_checkpoint_dir),
+        # The immutable base is independent of the directory that will publish
+        # later versions. Bind the source only after advancing beyond the base.
+        checkpoint_source_dir=(
+            os.path.realpath(checkpoint_source_dir) if version > base_version else None
+        ),
+    )
+
+
+def _state_matches_lineage(
+    state: _AppliedCheckpointState,
+    *,
+    base_version: int,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+) -> bool:
+    return (
+        state.base_version == base_version
+        and state.base_checkpoint_dir == os.path.realpath(base_checkpoint_dir)
+        and (
+            state.version == base_version
+            or state.checkpoint_source_dir == os.path.realpath(checkpoint_source_dir)
+        )
+    )
+
+
+def _available_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    left = os.path.realpath(left)
+    right = os.path.realpath(right)
+    common = os.path.commonpath((left, right))
+    return common == left or common == right
+
+
+def materialize(
+    local_checkpoint_dir: str,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+    target_version: int,
+    base_version: int = 0,
+) -> dict:
+    """Bring the host-local checkpoint up to ``target_version``.
+
+    Missing or incomplete source files raise ``FileNotFoundError`` without
+    reseeding. A checksum mismatch on a complete source is treated as corrupt
+    local state and gets one replay from a clean seed.
+    """
+    if base_version < 0:
+        raise ValueError("base_version must be non-negative")
+    if target_version < base_version:
+        raise ValueError("target_version must not precede base_version")
+    if _paths_overlap(local_checkpoint_dir, base_checkpoint_dir):
+        raise ValueError(
+            "local_checkpoint_dir must not overlap the immutable "
+            "base_checkpoint_dir tree"
+        )
+    if _paths_overlap(local_checkpoint_dir, checkpoint_source_dir):
+        raise ValueError(
+            "local_checkpoint_dir must not overlap the published "
+            "checkpoint_source_dir tree"
+        )
+    started = time.perf_counter()
+    lock_started = time.perf_counter()
+    with _materialization_lock(local_checkpoint_dir):
+        lock_wait_s = time.perf_counter() - lock_started
+        applied_state = _read_applied_state(local_checkpoint_dir)
+        applied = applied_state.version if applied_state is not None else None
+        lineage_matches = applied_state is not None and _state_matches_lineage(
+            applied_state,
+            base_version=base_version,
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+        )
+        if lineage_matches and applied == target_version:
+            # A co-located rank already brought this host up to the target.
+            return {
+                "operation": "noop",
+                "initial_version": applied,
+                "base_version": base_version,
+                "target_version": target_version,
+                "lock_wait_s": round(lock_wait_s, 6),
+                "wall_s": round(time.perf_counter() - started, 6),
+            }
+        try:
+            stats = _materialize_locked(
+                local_checkpoint_dir,
+                base_checkpoint_dir,
+                checkpoint_source_dir,
+                base_version,
+                target_version,
+                reseed=(
+                    applied is not None
+                    and (
+                        not lineage_matches
+                        or not base_version <= applied <= target_version
+                    )
+                ),
+            )
+        except FileNotFoundError:
+            # A source version is missing or not fully materialized — a readiness
+            # failure the caller owns, not local corruption. Reseeding cannot
+            # conjure absent bytes, so record what the mount shows and fail fast;
+            # the caller reloads and retries.
+            _log_missing_source(checkpoint_source_dir, target_version)
+            raise
+        except _ChecksumMismatchError:
+            # A checksum mismatch on staged, complete bytes == corrupt local
+            # state (incomplete sources are reclassified to FileNotFoundError
+            # above and never reach here). Reseed from the pristine base and
+            # replay once; a failure on that fresh state re-raises.
+            logger.exception(
+                "materialization of v%d failed on staged sources; "
+                "reseeding from base and replaying",
+                target_version,
+            )
+            stats = _materialize_locked(
+                local_checkpoint_dir,
+                base_checkpoint_dir,
+                checkpoint_source_dir,
+                base_version,
+                target_version,
+                reseed=True,
+            )
+            stats["reseed_after_failed_apply"] = True
+        stats["initial_version"] = applied
+        stats["base_version"] = base_version
+        stats["target_version"] = target_version
+        stats["lock_wait_s"] = round(lock_wait_s, 6)
+        stats["wall_s"] = round(time.perf_counter() - started, 6)
+        return stats
+
+
+def _materialize_locked(
+    local_checkpoint_dir: str,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+    base_version: int,
+    target_version: int,
+    reseed: bool,
+) -> dict:
+    # A torn local state (reseed=True) is treated like a fresh host: the
+    # applied-version marker can't be trusted over partially-mutated files.
+    applied_state = None if reseed else _read_applied_state(local_checkpoint_dir)
+    applied = applied_state.version if applied_state is not None else None
+    # Scan back from the target for the newest full version. Stop at the
+    # local state — below it a reset can never be needed (or, on a fresh
+    # host, at 0 = the engine's base).
+    floor = applied if applied is not None else base_version
+    start = target_version
+    while start > floor and _is_delta(
+        _version_dir(checkpoint_source_dir, start), start
+    ):
+        start -= 1
+    if applied is None or start > applied:
+        seed_dir = (
+            base_checkpoint_dir
+            if start == base_version
+            else _version_dir(checkpoint_source_dir, start)
+        )
+        seed_started = time.perf_counter()
+        _reset_checkpoint(
+            seed_dir,
+            local_checkpoint_dir,
+            _requested_state(
+                version=start,
+                base_version=base_version,
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+            ),
+            is_base=start == base_version,
+        )
+        seed_wall_s = time.perf_counter() - seed_started
+    else:
+        start = applied
+        seed_wall_s = 0.0
+    if start == target_version:
+        apply_stats = {
+            "operation": "seed_only" if seed_wall_s else "noop",
+            "wall_s": 0.0,
+        }
+    else:
+        versions = list(range(start + 1, target_version + 1))
+        target_state = _requested_state(
+            version=target_version,
+            base_version=base_version,
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+        )
+        if len(versions) == 1:
+            apply_stats = _apply_delta(
+                local_checkpoint_dir,
+                _version_dir(checkpoint_source_dir, target_version),
+                target_version,
+                target_state,
+            )
+        else:
+            apply_stats = _apply_delta_lineage(
+                local_checkpoint_dir,
+                [
+                    (_version_dir(checkpoint_source_dir, version), version)
+                    for version in versions
+                ],
+                target_state,
+            )
+    return {
+        "operation": "reseed_and_apply" if reseed else "materialize",
+        "seed_wall_s": round(seed_wall_s, 6),
+        "apply": apply_stats,
+    }
+
+
+def _log_missing_source(source_dir: str, target_version: int) -> None:
+    """Record the visible source state after an incomplete read."""
+    vdir = _version_dir(source_dir, target_version)
+    try:
+        versions = sorted(n for n in os.listdir(source_dir) if n.startswith("weight_v"))
+    except OSError as e:
+        versions = [f"<listdir {source_dir} failed: {e}>"]
+    target_contents = None
+    if os.path.isdir(vdir):
+        try:
+            target_contents = sorted(os.listdir(vdir))
+        except OSError as e:
+            target_contents = [f"<listdir failed: {e}>"]
+    logger.error(
+        "Checkpoint source v%d is incomplete: versions=%s isdir(%s)=%s contents=%s",
+        target_version,
+        versions,
+        vdir,
+        os.path.isdir(vdir),
+        target_contents,
+    )
+
+
+def _version_dir(source_dir: str, version: int) -> str:
+    return os.path.join(source_dir, f"weight_v{version:06d}")
+
+
+def _validate_published_version(
+    metadata: object,
+    expected_version: int,
+    index_path: str,
+) -> dict:
+    if not isinstance(metadata, dict):
+        raise ValueError(f"invalid checkpoint metadata: {index_path}")
+    try:
+        published_version = int(metadata["version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"checkpoint manifest has no valid version: {index_path}"
+        ) from exc
+    if published_version != expected_version:
+        raise ValueError(
+            f"checkpoint version mismatch: directory is v{expected_version}, "
+            f"manifest declares v{published_version}"
+        )
+    return metadata
+
+
+def _is_delta(version_dir: str, expected_version: int) -> bool:
+    """Read the published manifest and return whether this version is a delta."""
+    if not os.path.isdir(version_dir):
+        raise FileNotFoundError(f"published weight version missing: {version_dir}")
+    index_path = os.path.join(version_dir, "model.safetensors.index.json")
+    try:
+        with open(index_path) as file:
+            index = json.load(file)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"published weight version has no manifest: {index_path}"
+        ) from exc
+    if not isinstance(index, dict):
+        raise ValueError(f"invalid checkpoint manifest: {index_path}")
+    metadata = _validate_published_version(
+        index.get("metadata"), expected_version, index_path
+    )
+    return "delta_encoding" in metadata
+
+
+@contextmanager
+def _materialization_lock(local_checkpoint_dir: str):
+    sync = os.path.join(local_checkpoint_dir, _SYNC_DIR)
+    os.makedirs(sync, exist_ok=True)
+    with open(os.path.join(sync, "lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _read_applied_version(local_checkpoint_dir: str) -> int | None:
+    state = _read_applied_state(local_checkpoint_dir)
+    return state.version if state is not None else None
+
+
+def _read_applied_state(
+    local_checkpoint_dir: str,
+) -> _AppliedCheckpointState | None:
+    path = os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        logger.warning("Ignoring malformed checkpoint cache state: %s", path)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring invalid checkpoint cache state: %s", path)
+        return None
+    try:
+        base_checkpoint_dir = payload["base_checkpoint_dir"]
+        checkpoint_source_dir = payload.get("checkpoint_source_dir")
+        if not isinstance(base_checkpoint_dir, str) or not base_checkpoint_dir:
+            raise ValueError
+        if checkpoint_source_dir is not None and (
+            not isinstance(checkpoint_source_dir, str) or not checkpoint_source_dir
+        ):
+            raise ValueError
+        state = _AppliedCheckpointState(
+            version=int(payload["version"]),
+            base_version=int(payload["base_version"]),
+            base_checkpoint_dir=os.path.realpath(base_checkpoint_dir),
+            checkpoint_source_dir=(
+                os.path.realpath(checkpoint_source_dir)
+                if checkpoint_source_dir is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Ignoring checkpoint cache state without a complete lineage identity: %s",
+            path,
+        )
+        return None
+    if (
+        state.base_version < 0
+        or state.version < state.base_version
+        or not state.base_checkpoint_dir
+        or (state.version > state.base_version and not state.checkpoint_source_dir)
+    ):
+        logger.warning(
+            "Ignoring invalid checkpoint cache state: %s",
+            path,
+        )
+        return None
+    return state
+
+
+def _write_applied_state(
+    local_checkpoint_dir: str,
+    state: _AppliedCheckpointState,
+) -> None:
+    sync_dir = os.path.join(local_checkpoint_dir, _SYNC_DIR)
+    path = os.path.join(sync_dir, "state.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(
+            {
+                "version": f"{state.version:06d}",
+                "base_version": f"{state.base_version:06d}",
+                "base_checkpoint_dir": state.base_checkpoint_dir,
+                "checkpoint_source_dir": state.checkpoint_source_dir,
+            },
+            f,
+        )
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(sync_dir)
+
+
+def _clear_applied_version(local_checkpoint_dir: str) -> None:
+    sync_dir = os.path.join(local_checkpoint_dir, _SYNC_DIR)
+    try:
+        os.remove(os.path.join(sync_dir, "state.json"))
+    except FileNotFoundError:
+        return
+    _fsync_dir(sync_dir)
+
+
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _drop_page_cache(path: str) -> None:
+    """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
+    if not hasattr(os, "posix_fadvise"):  # POSIX-only (absent on macOS/Windows)
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _reset_checkpoint(
+    src_dir: str,
+    local_checkpoint_dir: str,
+    state: _AppliedCheckpointState,
+    *,
+    is_base: bool = False,
+) -> None:
+    """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
+    (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
+    are pruned). Later deltas chain on top of this state."""
+    if os.path.realpath(src_dir) == os.path.realpath(local_checkpoint_dir):
+        raise ValueError(
+            "a published full checkpoint cannot also be the mutable local checkpoint"
+        )
+    checkpoint_shards = _validate_full_checkpoint(
+        src_dir,
+        version=state.version,
+        is_base=is_base,
+    )
+    os.makedirs(local_checkpoint_dir, exist_ok=True)
+    # A full seed replaces every checkpoint byte. Invalidate the old marker
+    # before the first mutation so an interrupted copy cannot be mistaken for
+    # the previously committed version.
+    _clear_applied_version(local_checkpoint_dir)
+    src_files = [
+        entry
+        for entry in os.scandir(src_dir)
+        if entry.is_file()
+        and (not entry.name.endswith(".safetensors") or entry.name in checkpoint_shards)
+    ]
+    total_gb = sum(entry.stat().st_size for entry in src_files) / 1e9
+    workers = min(
+        _MAX_SEED_COPY_WORKERS,
+        _available_cpu_count(),
+        len(src_files) or 1,
+    )
+    logger.info(
+        "staging checkpoint v%d to local disk: %.0f GB in %d files, %d parallel streams (%s -> %s)",
+        state.version,
+        total_gb,
+        len(src_files),
+        workers,
+        src_dir,
+        local_checkpoint_dir,
+    )
+    start = time.monotonic()
+    progress = {"done_gb": 0.0, "next_log_gb": _SEED_LOG_STEP_GB}
+    progress_lock = threading.Lock()
+
+    def copy_one(entry) -> None:
+        dst = os.path.join(local_checkpoint_dir, entry.name)
+        with open(entry.path, "rb") as src, open(dst, "wb") as out:
+            while chunk := src.read(_SEED_COPY_CHUNK_BYTES):
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        # Don't let the source evict the local copy we keep resident.
+        _drop_page_cache(entry.path)
+        with progress_lock:
+            progress["done_gb"] += entry.stat().st_size / 1e9
+            done = progress["done_gb"]
+            if done >= progress["next_log_gb"] or done >= total_gb:
+                rate = done / max(time.monotonic() - start, 1e-3)
+                logger.info(
+                    "staging checkpoint v%d to local disk: %.0f/%.0f GB (%.0f%%), %.1f GB/s",
+                    state.version,
+                    done,
+                    total_gb,
+                    100 * done / max(total_gb, 1e-9),
+                    rate,
+                )
+                progress["next_log_gb"] += _SEED_LOG_STEP_GB
+
+    # The size check below fails loud if the mount served a short read on any shard.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(copy_one, src_files))
+    names = {entry.name for entry in src_files}
+    for entry in os.scandir(local_checkpoint_dir):
+        if entry.is_file() and entry.name not in names:
+            os.remove(entry.path)
+    # A truncated copy (for example, a mount surfacing metadata before bytes)
+    # must fail instead of serving corrupt weights.
+    for entry in src_files:
+        copied = os.path.getsize(os.path.join(local_checkpoint_dir, entry.name))
+        if copied != entry.stat().st_size:
+            raise RuntimeError(
+                f"size mismatch copying {entry.name}: src {entry.stat().st_size} != local {copied}"
+            )
+    _fsync_dir(local_checkpoint_dir)
+    _write_applied_state(local_checkpoint_dir, state)
+
+
+def _tensor_locations(ckpt_dir: str) -> dict:
+    """Map each tensor name to (file, byte offset, nbytes) by reading every safetensors header."""
+    locations = {}
+    for path in sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors"))):
+        layout, _ = read_safetensors_file_layout(path)
+        for name, entry in layout.tensors.items():
+            if name in locations:
+                raise ValueError(f"duplicate checkpoint tensor {name!r}")
+            locations[name] = (
+                path,
+                layout.data_offset + entry.relative_begin,
+                entry.relative_end - entry.relative_begin,
+            )
+    return locations
+
+
+def _validate_full_checkpoint(
+    src_dir: str, *, version: int, is_base: bool = False
+) -> set[str]:
+    """Reject incomplete full checkpoints before copying or publishing a marker."""
+
+    index_path = os.path.join(src_dir, "model.safetensors.index.json")
+    try:
+        with open(index_path) as file:
+            index = json.load(file)
+    except FileNotFoundError as exc:
+        if not is_base:
+            raise FileNotFoundError(
+                f"published full checkpoint has no manifest: {index_path}"
+            ) from exc
+        index = None
+
+    weight_map = None
+    if index is not None:
+        if not isinstance(index, dict):
+            raise ValueError(f"invalid checkpoint manifest: {index_path}")
+        if not is_base:
+            _validate_published_version(index.get("metadata"), version, index_path)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(
+                f"published full checkpoint has no weight map: {index_path}"
+            )
+        if not all(
+            isinstance(name, str)
+            and name
+            and isinstance(filename, str)
+            and filename
+            and os.path.basename(filename) == filename
+            for name, filename in weight_map.items()
+        ):
+            raise ValueError(f"invalid safetensors weight map: {index_path}")
+        filenames = sorted(set(weight_map.values()))
+    else:
+        filenames = [
+            os.path.basename(path)
+            for path in sorted(glob.glob(os.path.join(src_dir, "*.safetensors")))
+        ]
+
+    if not filenames:
+        raise FileNotFoundError(f"full checkpoint has no safetensors files: {src_dir}")
+    layouts: dict[str, SafetensorsLayout] = {}
+    for filename in filenames:
+        # Indexed filenames are validated as basenames above. Preserve the
+        # symlink itself here: Hugging Face snapshots commonly point from that
+        # basename into the cache's content-addressed blob store.
+        path = os.path.join(src_dir, filename)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"published full checkpoint is missing blob {filename!r}"
+            )
+        layout, _ = read_safetensors_file_layout(path)
+        layouts[filename] = layout
+    validate_safetensors_weight_map(layouts, weight_map)
+    return set(filenames)
+
+
+@dataclass(frozen=True)
+class _DiskDeltaItem:
+    encoding: str
+    name: str
+    source_path: str
+    source_offset: int
+    compressed_nbytes: int
+    target_path: str
+    target_offset: int
+    target_nbytes: int
+    checksum_algorithm: str
+    expected_checksum: str
+
+
+@dataclass(frozen=True)
+class _DiskDeltaPlan:
+    version: int
+    base_version: int
+    encoding: str
+    items: tuple[_DiskDeltaItem, ...]
+    metadata_wall_s: float
+    source_setup_wall_s: float
+
+
+class _ByteBudget:
+    """Bound concurrent full-tensor work buffers without rejecting large tensors."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.used = 0
+        self.condition = threading.Condition()
+
+    @contextmanager
+    def reserve(self, requested: int):
+        charge = min(requested, self.limit)
+        with self.condition:
+            self.condition.wait_for(lambda: self.used + charge <= self.limit)
+            self.used += charge
+        try:
+            yield
+        finally:
+            with self.condition:
+                self.used -= charge
+                self.condition.notify_all()
+
+
+def _pread_exact(
+    fd: int,
+    offset: int,
+    nbytes: int,
+    *,
+    source_path: str | None = None,
+) -> bytearray:
+    result = bytearray(nbytes)
+    view = memoryview(result)
+    position = 0
+    while position < nbytes:
+        count = min(_POSITIONAL_IO_CHUNK_BYTES, nbytes - position)
+        read = os.preadv(
+            fd,
+            [view[position : position + count]],
+            offset + position,
+        )
+        if read <= 0:
+            error_type = FileNotFoundError if source_path is not None else RuntimeError
+            raise error_type(
+                f"short positional read: offset={offset} expected={nbytes} "
+                f"actual={position}"
+                + (f" source={source_path}" if source_path is not None else "")
+            )
+        position += read
+    return result
+
+
+def _pwrite_all(fd: int, offset: int, data: bytearray) -> None:
+    view = memoryview(data)
+    position = 0
+    while position < len(view):
+        end = min(position + _POSITIONAL_IO_CHUNK_BYTES, len(view))
+        written = os.pwrite(fd, view[position:end], offset + position)
+        if written <= 0:
+            raise RuntimeError(
+                f"short positional write: offset={offset} expected={len(view)} "
+                f"actual={position}"
+            )
+        position += written
+
+
+def _build_delta_plan(
+    version_dir: str,
+    expected_version: int,
+    *,
+    expected_base_version: int,
+    locations: dict[str, tuple[str, int, int]],
+) -> _DiskDeltaPlan:
+    """Validate one published delta and resolve its source and target ranges."""
+    delta = read_delta_checkpoint(
+        version_dir,
+        expected_version=expected_version,
+        expected_base_version=expected_base_version,
+    )
+    items: list[_DiskDeltaItem] = []
+    for tensor in delta.tensors:
+        try:
+            path, offset, nbytes = locations[tensor.name]
+        except KeyError as exc:
+            raise ValueError(
+                f"delta tensor {tensor.name!r} is absent from the local checkpoint"
+            ) from exc
+        items.append(
+            _DiskDeltaItem(
+                encoding=delta.encoding,
+                name=tensor.name,
+                source_path=str(tensor.source_path),
+                source_offset=tensor.source_offset,
+                compressed_nbytes=tensor.compressed_nbytes,
+                target_path=path,
+                target_offset=offset,
+                target_nbytes=nbytes,
+                checksum_algorithm=tensor.checksum_algorithm,
+                expected_checksum=tensor.expected_checksum,
+            )
+        )
+    return _DiskDeltaPlan(
+        version=delta.version,
+        base_version=delta.base_version,
+        encoding=delta.encoding,
+        items=tuple(items),
+        metadata_wall_s=delta.metadata_wall_s,
+        source_setup_wall_s=delta.source_setup_wall_s,
+    )
+
+
+def _apply_delta(
+    local_checkpoint_dir: str,
+    version_dir: str,
+    expected_version: int,
+    target_state: _AppliedCheckpointState,
+) -> dict:
+    """Apply one version's delta in place and fail on checksum mismatch."""
+
+    applied = _read_applied_version(local_checkpoint_dir)
+    if applied == expected_version:
+        return {
+            "operation": "noop",
+            "version": expected_version,
+            "wall_s": 0.0,
+        }
+    return _apply_delta_lineage(
+        local_checkpoint_dir,
+        [(version_dir, expected_version)],
+        target_state,
+    )
+
+
+def _apply_delta_lineage(
+    local_checkpoint_dir: str,
+    versions: list[tuple[str, int]],
+    target_state: _AppliedCheckpointState,
+) -> dict:
+    """Apply an ordered lineage with one target read and write per tensor."""
+
+    if not versions:
+        raise ValueError("delta lineage must not be empty")
+    if target_state.version != versions[-1][1]:
+        raise ValueError("target state does not match the final delta version")
+    started = time.perf_counter()
+    applied = _read_applied_version(local_checkpoint_dir)
+    if applied is None:
+        raise RuntimeError("local checkpoint has no committed base version")
+    expected_base_version = applied
+    locations = _tensor_locations(local_checkpoint_dir)
+    plans = []
+    for version_dir, version in versions:
+        plan = _build_delta_plan(
+            version_dir,
+            version,
+            expected_base_version=expected_base_version,
+            locations=locations,
+        )
+        plans.append(plan)
+        expected_base_version = version
+
+    operations_by_name: dict[str, list[_DiskDeltaItem]] = {}
+    for plan in plans:
+        for item in plan.items:
+            operations = operations_by_name.setdefault(item.name, [])
+            if operations:
+                first = operations[0]
+                if (
+                    item.target_path,
+                    item.target_offset,
+                    item.target_nbytes,
+                ) != (
+                    first.target_path,
+                    first.target_offset,
+                    first.target_nbytes,
+                ):
+                    raise ValueError(
+                        f"target location changed across deltas for {item.name!r}"
+                    )
+            operations.append(item)
+
+    operations_by_target_path: dict[
+        str,
+        list[tuple[str, list[_DiskDeltaItem]]],
+    ] = {}
+    for name, operations in operations_by_name.items():
+        operations_by_target_path.setdefault(
+            operations[0].target_path,
+            [],
+        ).append((name, operations))
+    for tensor_operations in operations_by_target_path.values():
+        tensor_operations.sort(key=lambda value: value[1][0].target_offset)
+    target_batches = sorted(
+        operations_by_target_path.items(),
+        key=lambda value: sum(
+            operations[0].target_nbytes for _, operations in value[1]
+        ),
+        reverse=True,
+    )
+    all_items = [
+        item for operations in operations_by_name.values() for item in operations
+    ]
+
+    # Planning above validates the complete lineage before any local byte changes.
+    # An interruption after this point leaves no marker, forcing a clean seed.
+    _clear_applied_version(local_checkpoint_dir)
+    file_cache_limit = file_descriptor_cache_limit(
+        concurrent_caches=2,
+        max_cached_file_descriptors=_MAX_OPEN_FILES_PER_CACHE,
+    )
+    source_files = FileDescriptorCache(os.O_RDONLY, file_cache_limit)
+    target_files = FileDescriptorCache(os.O_RDWR, file_cache_limit)
+    memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
+    mismatches = []
+    mismatch_lock = threading.Lock()
+    close_wall_s = 0.0
+
+    def apply_tensor(
+        name: str,
+        operations: list[_DiskDeltaItem],
+        target_fd: int,
+        decompressor: zstandard.ZstdDecompressor,
+    ) -> None:
+        first = operations[0]
+        has_overwrite = any(item.encoding == "overwrite" for item in operations)
+        working_nbytes = first.target_nbytes + _DELTA_STREAM_CHUNK_BYTES
+        if has_overwrite:
+            working_nbytes += 4 * first.target_nbytes
+        with memory_budget.reserve(working_nbytes):
+            region = _pread_exact(
+                target_fd,
+                first.target_offset,
+                first.target_nbytes,
+            )
+            region_view = np.frombuffer(region, dtype=np.uint8)
+            for operation in operations:
+                with source_files.acquire(operation.source_path) as source_fd:
+                    source = PositionalFileRangeReader(
+                        source_fd,
+                        operation.source_offset,
+                        operation.compressed_nbytes,
+                        operation.source_path,
+                        max_read_bytes=_DELTA_STREAM_CHUNK_BYTES,
+                    )
+                    with decompressor.stream_reader(source, closefd=False) as reader:
+                        if operation.encoding == "xor":
+                            position = 0
+                            while position < operation.target_nbytes:
+                                block = reader.read(
+                                    min(
+                                        _DELTA_STREAM_CHUNK_BYTES,
+                                        operation.target_nbytes - position,
+                                    )
+                                )
+                                if not block:
+                                    break
+                                end = position + len(block)
+                                target = region_view[position:end]
+                                np.bitwise_xor(
+                                    target,
+                                    np.frombuffer(block, dtype=np.uint8),
+                                    out=target,
+                                )
+                                position = end
+                            if position != operation.target_nbytes or reader.read(1):
+                                raise RuntimeError(
+                                    f"decompressed XOR size mismatch for {name!r}: "
+                                    f"expected={operation.target_nbytes} "
+                                    f"actual={position}"
+                                )
+                        else:
+                            count = int.from_bytes(read_exact(reader, 4), "little")
+                            if count > operation.target_nbytes:
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            positions_buffer = read_exact(reader, 4 * count)
+                            positions = np.frombuffer(positions_buffer, dtype="<u4")
+                            if count and (
+                                int(positions[-1]) >= operation.target_nbytes
+                                or np.any(positions[1:] <= positions[:-1])
+                            ):
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            value_offset = 0
+                            while value_offset < count:
+                                values = reader.read(
+                                    min(
+                                        _DELTA_STREAM_CHUNK_BYTES,
+                                        count - value_offset,
+                                    )
+                                )
+                                if not values:
+                                    break
+                                value_end = value_offset + len(values)
+                                region_view[positions[value_offset:value_end]] = (
+                                    np.frombuffer(values, dtype=np.uint8)
+                                )
+                                value_offset = value_end
+                            if value_offset != count or reader.read(1):
+                                raise RuntimeError(
+                                    f"overwrite payload size mismatch for {name!r}: "
+                                    f"expected={count} actual={value_offset}"
+                                )
+                    if source.position != operation.compressed_nbytes:
+                        raise RuntimeError(
+                            f"compressed delta range was not fully consumed for "
+                            f"{name!r}: expected={operation.compressed_nbytes} "
+                            f"actual={source.position}"
+                        )
+
+            final = operations[-1]
+            if (
+                calculate_checksum(final.checksum_algorithm, region)
+                != final.expected_checksum
+            ):
+                with mismatch_lock:
+                    mismatches.append(name)
+            else:
+                _pwrite_all(target_fd, first.target_offset, region)
+
+    def apply_checkpoint_shard(
+        batch: tuple[str, list[tuple[str, list[_DiskDeltaItem]]]],
+    ) -> None:
+        target_path, tensor_operations = batch
+        decompressor = zstandard.ZstdDecompressor()
+        with target_files.acquire(target_path, write=True) as target_fd:
+            for name, operations in tensor_operations:
+                apply_tensor(name, operations, target_fd, decompressor)
+
+    try:
+        apply_started = time.perf_counter()
+        workers = min(
+            _MAX_DELTA_APPLY_WORKERS,
+            _available_cpu_count(),
+            len(target_batches) or 1,
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(apply_checkpoint_shard, target_batches))
+        apply_wall_s = time.perf_counter() - apply_started
+
+        flush_started = time.perf_counter()
+        target_files.flush()
+        flush_wall_s = time.perf_counter() - flush_started
+    finally:
+        close_started = time.perf_counter()
+        try:
+            target_files.close()
+        finally:
+            source_files.close()
+        close_wall_s = time.perf_counter() - close_started
+
+    if mismatches:
+        raise _ChecksumMismatchError(
+            f"checksum mismatch for {len(mismatches)} tensors after applying "
+            f"delta lineage v{plans[0].version}..v{plans[-1].version}: "
+            f"{sorted(mismatches)[:20]}"
+        )
+
+    marker_started = time.perf_counter()
+    _write_applied_state(local_checkpoint_dir, target_state)
+    marker_wall_s = time.perf_counter() - marker_started
+    encodings = {plan.encoding for plan in plans}
+    if len(plans) == 1:
+        operation = f"apply_{plans[0].encoding}"
+    elif encodings == {"xor"}:
+        operation = "apply_xor_chain"
+    else:
+        operation = "apply_delta_lineage"
+    stats = {
+        "operation": operation,
+        "base_version": plans[0].base_version,
+        "version": plans[-1].version,
+        "versions": len(plans),
+        "delta_tensors": len(operations_by_name),
+        "delta_fragments": len(all_items),
+        "checkpoint_shards": len(target_batches),
+        "delta_shards": len({item.source_path for item in all_items}),
+        "compressed_bytes": sum(item.compressed_nbytes for item in all_items),
+        "target_tensor_bytes": sum(
+            operations[0].target_nbytes for operations in operations_by_name.values()
+        ),
+        "apply_work_items": len(target_batches),
+        "scheduling": "checkpoint_shard_offset_order",
+        "workers": workers,
+        "io_backend": (
+            "pread_pwrite" if len(plans) == 1 else "pread_pwrite_delta_lineage"
+        ),
+        "working_memory_budget_bytes": _DELTA_APPLY_MEMORY_BYTES,
+        "file_descriptor_cache_limit": file_cache_limit,
+        "peak_source_file_descriptors": source_files.peak_open_files,
+        "peak_target_file_descriptors": target_files.peak_open_files,
+        "phases": {
+            "metadata_wall_s": round(sum(plan.metadata_wall_s for plan in plans), 6),
+            "source_setup_wall_s": round(
+                sum(plan.source_setup_wall_s for plan in plans), 6
+            ),
+            "apply_wall_s": round(apply_wall_s, 6),
+            "flush_wall_s": round(flush_wall_s, 6),
+            "close_wall_s": round(close_wall_s, 6),
+            "marker_wall_s": round(marker_wall_s, 6),
+        },
+        "wall_s": round(time.perf_counter() - started, 6),
+    }
+    logger.info(
+        "Applied checkpoint delta lineage v%d..v%d: versions=%d tensors=%d "
+        "target_bytes=%d wall_time=%.3fs",
+        plans[0].version,
+        plans[-1].version,
+        stats["versions"],
+        stats["delta_tensors"],
+        stats["target_tensor_bytes"],
+        stats["wall_s"],
+    )
+    return stats

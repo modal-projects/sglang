@@ -9,11 +9,35 @@ from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     KimiK3LinearForCausalLM,
     KimiK3MLAAttention,
+    _expert_mapping_candidates,
     _merge_weights_as_views,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def test_expert_mapping_uses_encoded_expert_id():
+    mappings = [
+        ("w13", "w1", 0, "w1"),
+        ("w13", "w3", 0, "w3"),
+        ("w2", "w2", 0, "w2"),
+        ("w13", "w1", 1, "w1"),
+        ("w13", "w3", 1, "w3"),
+        ("w2", "w2", 1, "w2"),
+    ]
+    by_expert = {
+        expert_id: [mapping for mapping in mappings if mapping[2] == expert_id]
+        for expert_id in range(2)
+    }
+
+    candidates = _expert_mapping_candidates(
+        "model.layers.3.mlp.experts.1.w2.weight",
+        mappings,
+        by_expert,
+    )
+
+    assert candidates == by_expert[1]
 
 
 class _FakeMoE:

@@ -8,6 +8,7 @@
 
 import logging
 import os
+import re
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -138,6 +139,17 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
+
+
+def _expert_mapping_candidates(name, mappings, mappings_by_expert):
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match is None:
+        return mappings
+    return mappings_by_expert.get(int(match.group(1)), ())
+
+
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -3257,6 +3269,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         else:
             expert_params_mapping = []
+        expert_params_mapping_by_expert = {}
+        for mapping in expert_params_mapping:
+            expert_params_mapping_by_expert.setdefault(mapping[2], []).append(mapping)
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -3344,8 +3359,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (param_name, weight_name, expert_id, shard_id) in enumerate(
-                    expert_params_mapping
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in _expert_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
                 ):
                     if weight_name not in name:
                         continue

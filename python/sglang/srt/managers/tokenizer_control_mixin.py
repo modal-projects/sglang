@@ -21,6 +21,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightUpdateReqInput,
+    CommitWeightUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -48,6 +50,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrepareWeightUpdateReqInput,
+    PrepareWeightUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -99,6 +103,8 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("prepare_weight_update", PrepareWeightUpdateReqOutput),
+    ("commit_weight_update", CommitWeightUpdateReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -810,6 +816,53 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
+    async def prepare_weight_update(
+        self: TokenizerManager,
+        obj: PrepareWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PrepareWeightUpdateReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.prepare_weight_update_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        return PrepareWeightUpdateReqOutput(
+            success=success,
+            message=message,
+            rank_stats=[
+                stats for result in results for stats in (result.rank_stats or [])
+            ],
+        )
+
+    async def commit_weight_update(
+        self: TokenizerManager,
+        obj: CommitWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> CommitWeightUpdateReqOutput:
+        self.auto_create_handle_loop()
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.commit_weight_update_communicator(obj)
+
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.commit_weight_update_communicator(obj)
+
+        success, message = FanOutCommunicator.merge_results(results)
+        if success and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        if success:
+            self._update_weight_version_if_provided(str(obj.target_version))
+        return CommitWeightUpdateReqOutput(
+            success=success,
+            message=message,
+            rank_stats=[
+                stats for result in results for stats in (result.rank_stats or [])
+            ],
+        )
+
     async def check_weights(
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
@@ -932,7 +985,10 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: UpdateWeightVersionReqInput
     ) -> None:
         self.auto_create_handle_loop()
-        await self.update_weight_version_communicator(obj)
+        results = await self.update_weight_version_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise RuntimeError(message)
         self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(

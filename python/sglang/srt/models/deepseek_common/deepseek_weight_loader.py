@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -70,6 +71,18 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
+
+
+def _expert_mapping_candidates(
+    name: str,
+    mappings: List[Tuple[str, str, int, str]],
+    mappings_by_expert: Dict[int, List[Tuple[str, str, int, str]]],
+) -> List[Tuple[str, str, int, str]]:
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match is None:
+        return mappings
+    return mappings_by_expert.get(int(match.group(1)), mappings)
 
 
 def _normalize_modelopt_fp4_expert_weight(
@@ -268,6 +281,9 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+        expert_params_mapping_by_expert = {}
+        for mapping in expert_params_mapping:
+            expert_params_mapping_by_expert.setdefault(mapping[2], []).append(mapping)
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -399,7 +415,11 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in _expert_mapping_candidates(
+                        name,
+                        expert_params_mapping,
+                        expert_params_mapping_by_expert,
+                    ):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue

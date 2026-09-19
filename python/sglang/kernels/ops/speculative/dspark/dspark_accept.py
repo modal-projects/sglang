@@ -87,7 +87,13 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     bs = candidates.shape[0]
     device = candidates.device
     if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
@@ -142,7 +148,7 @@ def _accept_sampling_core(
         )
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
-    return correct_len, cap_trim_lens, accept_index, predicts
+    return correct_len, cap_trim_lens, accept_index, predicts, target_probs
 
 
 def accept_sampling(
@@ -155,22 +161,30 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
     bs = candidates.shape[0]
     device = candidates.device
-    correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
+    correct_len, cap_trim_lens, accept_index, predicts, target_probs = (
+        _accept_sampling_core(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
+    if return_target_probs:
+        return correct_len, bonus, cap_trim_lens, target_probs
     return correct_len, bonus, cap_trim_lens
 
 
@@ -224,7 +238,7 @@ def accept_sampling_triton(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
+    correct_len, cap_trim_lens, accept_index, predicts, _ = _accept_sampling_core(
         candidates=candidates,
         target_logits=target_logits,
         draft_probs=draft_probs,

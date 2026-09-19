@@ -11,8 +11,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.logits_processor import SamplingMaskOutput, SamplingMaskStatus
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
+    Sampler,
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
 )
@@ -985,7 +987,11 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_target_probs: bool = False,
+) -> (
+    Tuple[torch.Tensor, torch.Tensor]
+    | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+):
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -1108,14 +1114,66 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             threshold_acc=threshold_acc,
             deterministic=True,
         )
-        del target_probs, draft_probs, candidates_i64
+        returned_target_probs = target_probs if return_target_probs else None
+        if not return_target_probs:
+            del target_probs
+        del draft_probs, candidates_i64
         del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
+    if return_target_probs:
+        return correct_len, bonus, returned_target_probs
     return correct_len, bonus
+
+
+def build_dflash_sampling_mask_output(
+    *,
+    sampler: Sampler,
+    target_probs: Optional[torch.Tensor],
+    output_token_ids: torch.Tensor,
+    batch_indices: torch.Tensor,
+    is_all_greedy: bool,
+) -> SamplingMaskOutput:
+    """Pack one bounded sampling support per DFlash verify position."""
+    all_requests = batch_indices.numel() == output_token_ids.shape[0]
+    if not all_requests:
+        output_token_ids = output_token_ids.index_select(0, batch_indices)
+    batch_size, block_size = output_token_ids.shape
+
+    if target_probs is None:
+        token_ids = output_token_ids.to(torch.int32).unsqueeze(-1)
+        shape = (batch_size, block_size)
+        status = SamplingMaskStatus.OK if is_all_greedy else SamplingMaskStatus.INVALID
+        output = SamplingMaskOutput(
+            token_ids=token_ids,
+            lengths=torch.ones(shape, dtype=torch.int32, device=token_ids.device),
+            selected_logprobs=torch.zeros(
+                shape, dtype=torch.float32, device=token_ids.device
+            ),
+            statuses=torch.full(
+                shape, status, dtype=torch.int32, device=token_ids.device
+            ),
+        )
+    else:
+        requested_probs = (
+            target_probs
+            if all_requests
+            else target_probs.index_select(0, batch_indices)
+        )
+        output = sampler.build_sampling_mask_output_from_probs(
+            requested_probs.flatten(0, 1),
+            output_token_ids.flatten(),
+        )
+        support_width = output.token_ids.shape[-1]
+        output.token_ids = output.token_ids.view(batch_size, block_size, support_width)
+        output.lengths = output.lengths.view(batch_size, block_size)
+        output.selected_logprobs = output.selected_logprobs.view(batch_size, block_size)
+        output.statuses = output.statuses.view(batch_size, block_size)
+
+    return output
 
 
 def build_dflash_verify_target_probs(

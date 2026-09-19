@@ -15,9 +15,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_accept import (
-    accept_sampling,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -57,6 +55,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_dflash_sampling_mask_output,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -1413,7 +1412,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_target_probs: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
@@ -1429,7 +1429,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            sampling_result = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
@@ -1438,13 +1438,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                return_target_probs=return_target_probs,
             )
+            if return_target_probs:
+                accept_len, bonus, _, target_probs = sampling_result
+            else:
+                accept_len, bonus, _ = sampling_result
+                target_probs = None
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
-        return accept_len.to(torch.int32), bonus.to(torch.int64)
+        return accept_len.to(torch.int32), bonus.to(torch.int64), target_probs
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -2062,18 +2068,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        return_target_probs: bool = False,
     ):
         new_seq_lens = None
         target_predict = None
+        target_probs = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accept_len, bonus, target_probs = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                return_target_probs=return_target_probs,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
@@ -2081,13 +2090,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+            sampling_result = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                return_target_probs=return_target_probs,
             )
+            if return_target_probs:
+                accept_len, bonus, target_probs = sampling_result
+            else:
+                accept_len, bonus = sampling_result
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
@@ -2134,7 +2148,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            target_probs,
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2599,6 +2621,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
+        sampling_mask_batch_indices = (
+            None if sampling_info is None else sampling_info.sampling_mask_batch_indices
+        )
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
@@ -2675,6 +2700,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
+            target_probs,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2682,6 +2708,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            return_target_probs=sampling_mask_batch_indices is not None,
         )
 
         if SIMULATE_ACC_LEN > 0:
@@ -2711,6 +2738,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        if sampling_mask_batch_indices is not None:
+            logits_output.sampling_mask_output = build_dflash_sampling_mask_output(
+                sampler=self.target_worker.model_runner.sampler,
+                target_probs=target_probs,
+                output_token_ids=out_tokens,
+                batch_indices=sampling_mask_batch_indices,
+                is_all_greedy=_is_all_greedy(sampling_info),
+            )
+        del target_probs
 
         if batch.return_logprob:
             compute_spec_logprobs(

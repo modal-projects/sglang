@@ -63,7 +63,11 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.layers.utils import (
+    alias_or_bind_derived_param,
+    copy_or_rebind_param,
+    update_derived_buffer,
+)
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
@@ -1819,6 +1823,37 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_interleave_for_swiglu_fusion", False):
+            return
+        layer.weight.data = torch.empty(
+            (
+                layer.output_size_per_partition,
+                layer.input_size_per_partition // 2,
+            ),
+            dtype=layer.weight.dtype,
+            device=layer.weight.device,
+        )
+        layer.weight_scale.data = torch.empty(
+            (
+                layer.output_size_per_partition,
+                layer.input_size_per_partition // self.quant_config.group_size,
+            ),
+            dtype=layer.weight_scale.dtype,
+            device=layer.weight_scale.device,
+        )
+
+    def get_derived_weight_tensors(self, layer: torch.nn.Module):
+        if not getattr(layer, "_interleave_for_swiglu_fusion", False):
+            return
+        for name in (
+            "weight_swiglu_interleaved",
+            "weight_scale_swiglu_interleaved",
+        ):
+            tensor = getattr(layer, name, None)
+            if isinstance(tensor, torch.Tensor):
+                yield name, tensor
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
@@ -1995,8 +2030,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 )
             )
 
-            layer.weight_swiglu_interleaved = w_swiglu
-            layer.weight_scale_swiglu_interleaved = w_scale_swiglu
+            update_derived_buffer(layer, "weight_swiglu_interleaved", w_swiglu)
+            update_derived_buffer(
+                layer,
+                "weight_scale_swiglu_interleaved",
+                w_scale_swiglu,
+            )
 
             # Keep the Parameter objects alive so weight reload can refill
             # them and re-run this hook; free their storage in the meantime.
@@ -2538,6 +2577,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "inference_moe_w13_interleaved", False):
+            layer._w13_deinterleaved = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""

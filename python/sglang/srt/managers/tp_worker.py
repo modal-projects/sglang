@@ -149,6 +149,48 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def initialize_rank_weight_stager(
+        self,
+        *,
+        checkpoint_dir: str,
+        version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+        max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
+    ):
+        return self.model_runner.weight_updater.initialize_rank_weight_stager(
+            checkpoint_dir=checkpoint_dir,
+            version=version,
+            host_group=host_group,
+            max_compile_group_bytes=max_compile_group_bytes,
+            canonical_checkpoint_dir=canonical_checkpoint_dir,
+        )
+
+    def stage_rank_weight_update(
+        self,
+        *,
+        checkpoint_source_dir: str,
+        target_version: int,
+    ):
+        return self.model_runner.weight_updater.stage_rank_weight_update(
+            checkpoint_source_dir=checkpoint_source_dir,
+            target_version=target_version,
+        )
+
+    def validate_rank_weight_commit(self, target_version: int) -> None:
+        self.model_runner.weight_updater.validate_rank_weight_commit(target_version)
+
+    def commit_rank_weight_update(self, target_version: int):
+        return self.model_runner.weight_updater.commit_rank_weight_update(
+            target_version
+        )
+
+    def discard_prepared_rank_weights(self, reason: str) -> None:
+        self.model_runner.weight_updater.discard_prepared_rank_weights(reason)
+
+    def close_rank_weight_stager(self) -> None:
+        self.model_runner.weight_updater.close_rank_weight_stager()
+
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,

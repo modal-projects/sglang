@@ -2586,8 +2586,47 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
+        grammar_producer_diagnostics = None
+        grammar_diagnostic_context = None
+        if batch.has_grammar and os.getenv("SGLANG_DFLASH_GRAMMAR_STAGE_DIAG") == "1":
+            vocab_size = int(self.model_runner.model_config.vocab_size)
+
+            def _token_summary(values: torch.Tensor) -> torch.Tensor:
+                return torch.stack(
+                    (
+                        values.min(),
+                        values.max(),
+                        (values < 0).sum(),
+                        (values >= vocab_size).sum(),
+                    )
+                ).to(torch.int64)
+
+            grammar_producer_diagnostics = torch.cat(
+                (
+                    _token_summary(block_ids[:, 0]),
+                    _token_summary(draft_next),
+                    _token_summary(draft_tokens),
+                    torch.stack(
+                        (
+                            (draft_tokens[:, 0] != block_ids[:, 0]).sum(),
+                            (draft_tokens[:, 1:] != draft_next).sum(),
+                        )
+                    ).to(torch.int64),
+                )
+            )
+            grammar_diagnostic_context = (
+                f"bs={bs},block={block_size},draft_graph={draft_out.can_run_graph},"
+                f"sampler={type(self._draft_sampler).__name__}"
+            )
         grammar_tree = (
-            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+            GrammarTree.from_linear_chain(
+                draft_tokens,
+                producer_diagnostics=grammar_producer_diagnostics,
+                diagnostic_context=grammar_diagnostic_context,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+            )
+            if batch.has_grammar
+            else None
         )
 
         # --- 2) Target verify.

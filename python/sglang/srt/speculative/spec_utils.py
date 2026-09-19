@@ -589,9 +589,20 @@ class GrammarTree:
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
     """
 
-    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+    def __init__(
+        self,
+        host: Tuple[torch.Tensor, ...],
+        done_event,
+        *,
+        producer_diagnostics: Optional[torch.Tensor] = None,
+        diagnostic_context: Optional[str] = None,
+        vocab_size: Optional[int] = None,
+    ):
         self._host = host
         self._done = done_event
+        self._producer_diagnostics = producer_diagnostics
+        self._diagnostic_context = diagnostic_context
+        self._vocab_size = vocab_size
 
     @classmethod
     def from_device(
@@ -621,7 +632,14 @@ class GrammarTree:
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
     @classmethod
-    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+    def from_linear_chain(
+        cls,
+        verify_ids_2d: torch.Tensor,
+        *,
+        producer_diagnostics: Optional[torch.Tensor] = None,
+        diagnostic_context: Optional[str] = None,
+        vocab_size: Optional[int] = None,
+    ) -> GrammarTree:
         """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
 
         ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
@@ -632,11 +650,62 @@ class GrammarTree:
         next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
         next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
         next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+        # Stage the producer-side summary before recording the completion event
+        # in from_device.  This lets the diagnostic distinguish a bad GPU source
+        # from a bad/incomplete D2H copy without synchronizing the hot path.
+        producer_diagnostics_host = (
+            _async_d2h(producer_diagnostics)
+            if producer_diagnostics is not None
+            else None
+        )
+        tree = cls.from_device(next_token, next_sibling, verify_ids_2d)
+        tree._producer_diagnostics = producer_diagnostics_host
+        tree._diagnostic_context = diagnostic_context
+        tree._vocab_size = vocab_size
+        return tree
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
             self._done.synchronize()
+        if self._producer_diagnostics is not None:
+            producer = [int(value) for value in self._producer_diagnostics.tolist()]
+            staged = self._host[2]
+            staged_summary = [
+                int(staged.min()),
+                int(staged.max()),
+                int((staged < 0).sum()),
+                int((staged >= self._vocab_size).sum())
+                if self._vocab_size is not None
+                else -1,
+            ]
+            # Layout is anchor, draft_next, and assembled draft_tokens summaries
+            # (min, max, negative count, too-high count), followed by the two
+            # assembly mismatch counts.
+            assembled = producer[8:12]
+            if (
+                producer[2]
+                or producer[3]
+                or producer[6]
+                or producer[7]
+                or producer[10]
+                or producer[11]
+                or producer[12]
+                or producer[13]
+                or staged_summary != assembled
+            ):
+                logger.error(
+                    "DFLASH_GRAMMAR_STAGE_DIAG context=%s "
+                    "anchor[min,max,negative,high]=%s "
+                    "draft_next[min,max,negative,high]=%s "
+                    "assembled[min,max,negative,high]=%s "
+                    "assembly_mismatch[anchor,next]=%s staged=%s",
+                    self._diagnostic_context,
+                    producer[0:4],
+                    producer[4:8],
+                    assembled,
+                    producer[12:14],
+                    staged_summary,
+                )
         return self._host
 
 

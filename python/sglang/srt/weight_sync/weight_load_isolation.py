@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from sglang.srt.weight_sync.rank_weight_image import iter_derived_weight_tensors
+
 logger = logging.getLogger(__name__)
 
 _COPY_IN_PROGRESS = object()
@@ -29,18 +31,6 @@ def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
 
 
-def _additional_weight_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
-    get_additional = getattr(module, "get_additional_weight_tensors", None)
-    if get_additional is None:
-        return
-    for name, tensor in get_additional():
-        if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                "get_additional_weight_tensors() must yield (str, torch.Tensor)"
-            )
-        yield tensor
-
-
 def _direct_weight_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
     yield from (value for value in module._parameters.values() if value is not None)
     yield from (
@@ -48,7 +38,7 @@ def _direct_weight_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
         for name, value in module._buffers.items()
         if value is not None and name not in module._non_persistent_buffers_set
     )
-    yield from _additional_weight_tensors(module)
+    yield from (tensor for _, tensor in iter_derived_weight_tensors(module))
 
 
 def _direct_module_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
@@ -83,6 +73,8 @@ def build_weight_load_groups(
             if tensor.device.type != device_type:
                 continue
             key = _storage_key(tensor)
+            if key[2] == 0:
+                continue
             direct_weights.add(key)
             storage_nbytes[key] = key[2]
         direct_weight_keys[path] = direct_weights
@@ -92,6 +84,8 @@ def build_weight_load_groups(
             if tensor.device.type != device_type:
                 continue
             key = _storage_key(tensor)
+            if key[2] == 0:
+                continue
             direct_clones.add(key)
             storage_nbytes[key] = key[2]
         direct_clone_keys[path] = direct_clones
@@ -122,7 +116,8 @@ def build_weight_load_groups(
             for name, child in module._modules.items()
             if child is not None and subtree_weight_keys[f"{prefix}{name}"]
         ]
-        if nbytes <= max_group_bytes or not children:
+        indivisible = bool(getattr(module, "weight_load_indivisible", False))
+        if indivisible or nbytes <= max_group_bytes or not children:
             if nbytes > max_group_bytes:
                 logger.warning(
                     "Indivisible weight load group exceeds its byte budget: "

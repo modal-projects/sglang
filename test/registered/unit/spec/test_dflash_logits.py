@@ -392,14 +392,16 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         draft_input=object(),
         prefix_lens=torch.tensor([3]),
         bs=1,
+        return_target_probs=False,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _, target_predict = result
+    accept_len, commit_lens, bonus, out_tokens, _, target_predict, target_probs = result
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]
     assert out_tokens.tolist() == [[7, 0]]
     assert target_predict.tolist() == [[1, 0]]
+    assert target_probs is None
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 

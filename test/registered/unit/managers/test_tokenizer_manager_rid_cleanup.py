@@ -17,6 +17,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import fastapi
 import msgspec
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,6 +29,11 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    CLIENT_CLOSED_REQUEST,
+    FINISH_ABORT,
+    client_cancel_finish_reason,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -626,6 +632,19 @@ class TestAbortRequestPrefix(CustomTestCase):
         self.assertEqual(sent[1].rid, rid)
         self.assertTrue(state.dispatched)
 
+    def test_abort_before_dispatch_preserves_reason(self):
+        rid = "job-1::0"
+        state = _make_req_state(rid)
+        self.tm.rid_to_state[rid] = state
+        finished_reason = client_cancel_finish_reason()
+
+        self.tm.abort_request(rid=rid, finished_reason=finished_reason)
+        self.tm._dispatch_to_scheduler.reset_mock()
+        self.tm._mark_state_dispatched(rid)
+
+        resent = self.tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(resent.finished_reason, finished_reason)
+
     def test_abort_all_marks_requests_pending_dispatch(self):
         for rid in ("a", "b"):
             self.tm.rid_to_state[rid] = _make_req_state(rid)
@@ -647,6 +666,45 @@ class TestAbortRequestPrefix(CustomTestCase):
             self.tm.abort_request(rid="job-1::", prefix=True)
 
         self.assertFalse(state.abort_sent)
+        self.assertIsNone(state.abort_finished_reason)
+
+    def test_client_cancel_reason_round_trips(self):
+        finished_reason = client_cancel_finish_reason("cancelled")
+
+        self.assertEqual(
+            FINISH_ABORT.from_json(finished_reason).to_json(), finished_reason
+        )
+        self.assertEqual(finished_reason["status_code"], CLIENT_CLOSED_REQUEST)
+
+    def test_client_cancel_becomes_http_499(self):
+        state = _make_req_state("request")
+        self.tm.rid_to_state["request"] = state
+        out = {"meta_info": {"finish_reason": client_cancel_finish_reason()}}
+
+        async def handle_abort():
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+
+        with self.assertRaises(fastapi.HTTPException) as exc:
+            asyncio.run(handle_abort())
+
+        self.assertEqual(exc.exception.status_code, CLIENT_CLOSED_REQUEST)
+
+    def test_client_cancel_is_not_counted_as_finished(self):
+        self.tm.metrics_collector = MagicMock(labels={})
+        self.tm.enable_priority_scheduling = False
+        state = _make_req_state("request")
+        state.finished = True
+        state.ttft_observed = True
+        state.last_completion_tokens = 0
+        state.obj.custom_labels = None
+        state.obj.sampling_params = {}
+        output = _make_batch_str_output(
+            "request", finished_reason=client_cancel_finish_reason()
+        )
+
+        self.tm.collect_metrics(state, output, 0)
+
+        self.tm.metrics_collector.observe_one_finished_request.assert_not_called()
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):

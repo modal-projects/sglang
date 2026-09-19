@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    FinishReasonDict,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -107,7 +108,9 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
+    CLIENT_CLOSED_REQUEST,
     MultimodalDataItem,
+    client_cancel_finish_reason,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -247,6 +250,7 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    abort_finished_reason: Optional[FinishReasonDict] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -1699,7 +1703,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # not reach it in the scheduler. The ordered channel guarantees
             # this exact abort follows the newly dispatched request.
             if state.abort_sent:
-                self._dispatch_to_scheduler(AbortReq(rid=rid))
+                self._dispatch_to_scheduler(
+                    AbortReq(rid=rid, finished_reason=state.abort_finished_reason)
+                )
 
     async def _send_batch_request(
         self,
@@ -1798,6 +1804,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ) in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
+            CLIENT_CLOSED_REQUEST,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
@@ -1846,7 +1853,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid, finished_reason=client_cancel_finish_reason()
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1934,7 +1943,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid, finished_reason=client_cancel_finish_reason()
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -2096,7 +2107,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def abort_request(
-        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        prefix: bool = False,
+        finished_reason: Optional[FinishReasonDict] = None,
     ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
@@ -2124,13 +2139,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         newly_marked = [state for state in states if not state.abort_sent]
         for state in newly_marked:
             state.abort_sent = True
+            state.abort_finished_reason = finished_reason
 
-        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            prefix=prefix,
+            finished_reason=finished_reason,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
             for state in newly_marked:
                 state.abort_sent = False
+                state.abort_finished_reason = None
             raise
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -2294,10 +2316,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            finished_reason = client_cancel_finish_reason()
             rids = [obj.rid] if obj.is_single else obj.rid
             for rid in rids:
                 if rid in self.rid_to_state:
-                    self.abort_request(rid)
+                    self.abort_request(rid, finished_reason=finished_reason)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -3068,6 +3091,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            finish_reason = recv_obj.finished_reasons[i]
+            if (
+                isinstance(finish_reason, dict)
+                and finish_reason.get("type") == "abort"
+                and finish_reason.get("status_code") == CLIENT_CLOSED_REQUEST
+            ):
+                return
+
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (

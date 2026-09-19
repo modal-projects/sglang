@@ -103,6 +103,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_weight_update_staging,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
@@ -323,6 +324,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_hook(validate_weight_update_staging, server_args)
 
     # After the speculative hook so speculative_algorithm is final.
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp

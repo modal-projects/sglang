@@ -86,6 +86,15 @@ def test_cp_decode_attention_sink_is_ready_before_first_forward(monkeypatch):
     )
 
 
+def test_local_attention_sink_is_checkpoint_derived_state():
+    attention = _make_attention()
+    attention.refresh_attn_sink_cache()
+
+    tensors = dict(attention.get_derived_weight_tensors())
+    assert tensors.keys() == {"attn_sink_local"}
+    assert tensors["attn_sink_local"] is attention._attn_sink_local
+
+
 def test_post_load_refreshes_attention_sink_cache(monkeypatch):
     monkeypatch.setattr(deepseek_v4, "_FP8_WO_A_GEMM", False)
     attention = SimpleNamespace(

@@ -854,6 +854,16 @@ def eagle_sample(
                 top_p_renorm_prob,
                 tree_speculative_sampling_target_only,
             )
+        elif _is_cuda:
+            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
+            from sglang.kernels.ops.speculative.sampling import (
+                tree_speculative_sampling_target_only,
+            )
         else:
             from sgl_kernel import (
                 top_k_renorm_prob,

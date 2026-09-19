@@ -896,6 +896,10 @@ class MqaAttentionBase(nn.Module):
             self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
         )
 
+    def get_derived_weight_tensors(self):
+        if self._attn_sink_local is not None:
+            yield "attn_sink_local", self._attn_sink_local
+
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Type
 
 import torch
 from torch import nn
@@ -49,6 +49,12 @@ class QuantizeMethodBase(ABC):
     def restore_weights_before_loading(self, layer: nn.Module) -> None:
         """Restore checkpoint-facing state before an in-place weight reload."""
         return
+
+    def get_derived_weight_tensors(
+        self, layer: nn.Module
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Return runtime tensors derived from checkpoint weights."""
+        return ()
 
 
 class LinearMethodBase(QuantizeMethodBase):

@@ -21,6 +21,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.rank_weight_stager import RankWeightStager
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -124,19 +125,23 @@ class WeightUpdater:
             logger.error(message)
             return False, message
 
-    def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
-        """Reject weight mutations while the CUDA IPC weight cache is active:
-        param.data is the daemon's master copy shared with every co-attached
-        engine, so an in-place update would silently corrupt them all.
-        """
+    def _assert_direct_update_allowed(self: WeightUpdater, operation: str) -> None:
+        """Reject mutations outside the active staged-update lifecycle."""
         mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
-                f"[weight_cache] {op} is not supported while the weight cache is "
+                f"[weight_cache] {operation} is not supported while the weight "
+                "cache is "
                 f"active (--weight-cache-mode {mode}): model weights are shared "
                 f"with the daemon via CUDA IPC, so mutating them in place would "
                 f"corrupt the daemon's master copy and every co-attached engine. "
                 f"Restart with --weight-cache-mode off to use this operation."
+            )
+        if getattr(self.get_model_runner(), "rank_weight_stager", None) is not None:
+            raise RuntimeError(
+                f"{operation} is unavailable while rank weight staging is active: "
+                "an out-of-band mutation would make its canonical checkpoint "
+                "and prepared image stale"
             )
 
     def update_weights_from_disk(
@@ -147,7 +152,7 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        self._assert_weight_cache_inactive("update_weights_from_disk")
+        self._assert_direct_update_allowed("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
@@ -254,6 +259,99 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    @torch.no_grad()
+    def initialize_rank_weight_stager(
+        self,
+        *,
+        checkpoint_dir: str,
+        version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+        max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
+    ) -> dict[str, Any]:
+        """Create the inactive host image from the currently served checkpoint."""
+
+        runner = self.get_model_runner()
+        if self.device != "cuda":
+            raise RuntimeError("rank weight staging requires a CUDA model runner")
+        if runner.is_draft_worker:
+            raise RuntimeError(
+                "rank weight staging must be initialized on the target model runner"
+            )
+        if runner.rank_weight_stager is not None:
+            raise RuntimeError("rank weight staging is already initialized")
+        if os.path.realpath(checkpoint_dir) != os.path.realpath(
+            self.model_config.model_path
+        ):
+            raise ValueError(
+                "the staging base must be the checkpoint that produced the "
+                "currently served model"
+            )
+        self._assert_direct_update_allowed("initialize_rank_weight_stager")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
+
+        stager = None
+        try:
+            with torch.cuda.device(self.gpu_id):
+                stager = RankWeightStager(
+                    self.get_model(),
+                    max_compile_group_bytes=max_compile_group_bytes,
+                    host_group=host_group,
+                    canonical_checkpoint_dir=canonical_checkpoint_dir,
+                )
+                stats = stager.initialize(checkpoint_dir, version=version)
+        except Exception:
+            if stager is not None:
+                stager.close()
+            raise
+        runner.rank_weight_stager = stager
+        return stats
+
+    @torch.no_grad()
+    def stage_rank_weight_update(
+        self,
+        *,
+        checkpoint_source_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        with torch.cuda.device(self.gpu_id):
+            return stager.stage(
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+            )
+
+    def validate_rank_weight_commit(self, target_version: int) -> None:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        stager.validate_commit(target_version)
+
+    @torch.no_grad()
+    def commit_rank_weight_update(self, target_version: int) -> dict[str, Any]:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        with torch.cuda.device(self.gpu_id):
+            torch.cuda.synchronize(self.gpu_id)
+            return stager.commit(target_version)
+
+    def discard_prepared_rank_weights(self, reason: str) -> None:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is not None:
+            stager.discard_prepared(reason)
+
+    def close_rank_weight_stager(self) -> None:
+        runner = self.get_model_runner()
+        stager = runner.rank_weight_stager
+        runner.rank_weight_stager = None
+        if stager is not None:
+            stager.close()
+
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -271,7 +369,7 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        self._assert_weight_cache_inactive("update_weights_from_distributed")
+        self._assert_direct_update_allowed("update_weights_from_distributed")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
@@ -306,7 +404,7 @@ class WeightUpdater:
                 handle.wait()
 
             self.get_model().load_weights(weights)
-            return True, "Succeeded to update parameter online."
+            return True, f"Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -341,7 +439,7 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -361,7 +459,7 @@ class WeightUpdater:
             return False, error
 
         monkey_patch_torch_reductions()
-        self._assert_weight_cache_inactive("update_weights_from_tensor")
+        self._assert_direct_update_allowed("update_weights_from_tensor")
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -421,7 +519,7 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
-        self._assert_weight_cache_inactive("update_weights_from_ipc")
+        self._assert_direct_update_allowed("update_weights_from_ipc")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error

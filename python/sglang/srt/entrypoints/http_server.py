@@ -119,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CommitWeightUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -133,6 +134,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrepareWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1283,6 +1285,40 @@ async def update_weights_from_disk(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/prepare_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_weight_update(
+    obj: Annotated[PrepareWeightUpdateReqInput, Body()], request: Request
+):
+    """Prepare a complete inactive weight version without pausing inference."""
+    output = await _global_state.tokenizer_manager.prepare_weight_update(obj, request)
+    return ORJSONResponse(
+        {
+            "success": output.success,
+            "message": output.message,
+            "rank_stats": output.rank_stats,
+        },
+        status_code=HTTPStatus.OK if output.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/commit_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def commit_weight_update(
+    obj: Annotated[CommitWeightUpdateReqInput, Body()], request: Request
+):
+    """Atomically expose one previously prepared weight version."""
+    output = await _global_state.tokenizer_manager.commit_weight_update(obj, request)
+    return ORJSONResponse(
+        {
+            "success": output.success,
+            "message": output.message,
+            "rank_stats": output.rank_stats,
+        },
+        status_code=HTTPStatus.OK if output.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.post("/init_weights_send_group_for_remote_instance")

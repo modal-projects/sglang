@@ -729,7 +729,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -967,7 +966,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             model = self._load_modelopt_base_model(model_config)
@@ -1066,6 +1064,15 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+    @staticmethod
+    def restore_weights_before_loading(model, target_device):
+        """Restore checkpoint-facing quantization state before an in-place reload."""
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.restore_weights_before_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1623,7 +1630,6 @@ class DummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
@@ -3241,7 +3247,6 @@ class GGUFModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         local_model_path = self._prepare_weights(model_config.model_path)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
@@ -3584,7 +3589,6 @@ class RemoteModelLoader(BaseModelLoader):
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
-
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             model.load_weights(self._get_weights_iterator_fs(client))
@@ -3689,7 +3693,6 @@ class IncModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         logger.info("IncModelLoader: Loading model...")
 
         # Check if model is already quantized
@@ -3955,7 +3958,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         logger.info("ModelOptModelLoader: Loading base model...")
 
         # Store the original model path for tokenizer export
@@ -4241,7 +4243,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-
         primary_weights = RunaiModelStreamerLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -4261,7 +4262,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             raise NotImplementedError(

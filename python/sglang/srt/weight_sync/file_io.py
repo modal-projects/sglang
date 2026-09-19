@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import errno
 import os
+import resource
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -87,6 +90,126 @@ class PositionalFileRangeReader:
             )
         self.position += len(data)
         return data
+
+
+@dataclass
+class _CachedFileDescriptor:
+    fd: int
+    users: int = 0
+    dirty: bool = False
+    last_used: int = 0
+
+
+class FileDescriptorCache:
+    """Share positional-I/O descriptors under a fixed process-local bound."""
+
+    def __init__(self, flags: int, limit: int):
+        if limit <= 0:
+            raise ValueError("file descriptor cache limit must be positive")
+        self.flags = flags
+        self.limit = limit
+        self.entries: dict[str, _CachedFileDescriptor] = {}
+        self.condition = threading.Condition()
+        self.clock = 0
+        self.peak_open_files = 0
+
+    @contextmanager
+    def acquire(self, path: str | Path, *, write: bool = False):
+        path = str(path)
+        with self.condition:
+            entry = self.entries.get(path)
+            while entry is None:
+                if len(self.entries) < self.limit:
+                    entry = _CachedFileDescriptor(fd=os.open(path, self.flags))
+                    self.entries[path] = entry
+                    self.peak_open_files = max(
+                        self.peak_open_files,
+                        len(self.entries),
+                    )
+                    break
+                idle_path, idle = min(
+                    (
+                        (candidate_path, candidate)
+                        for candidate_path, candidate in self.entries.items()
+                        if candidate.users == 0
+                    ),
+                    key=lambda item: item[1].last_used,
+                    default=(None, None),
+                )
+                if idle is None:
+                    self.condition.wait()
+                    entry = self.entries.get(path)
+                    continue
+                del self.entries[idle_path]
+                self._close(idle)
+            entry.users += 1
+            self.clock += 1
+            entry.last_used = self.clock
+            if write:
+                entry.dirty = True
+        try:
+            yield entry.fd
+        finally:
+            with self.condition:
+                entry.users -= 1
+                self.clock += 1
+                entry.last_used = self.clock
+                self.condition.notify()
+
+    def flush(self) -> None:
+        with self.condition:
+            for entry in self.entries.values():
+                if entry.dirty:
+                    os.fsync(entry.fd)
+                    entry.dirty = False
+
+    def close(self) -> None:
+        with self.condition:
+            entries = list(self.entries.values())
+            self.entries.clear()
+        error = None
+        for entry in entries:
+            try:
+                self._close(entry)
+            except OSError as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+
+    @staticmethod
+    def _close(entry: _CachedFileDescriptor) -> None:
+        try:
+            if entry.dirty:
+                os.fsync(entry.fd)
+        finally:
+            os.close(entry.fd)
+
+
+def file_descriptor_cache_limit(
+    *,
+    concurrent_caches: int = 1,
+    max_cached_file_descriptors: int = 256,
+) -> int:
+    """Return a per-cache limit while reserving descriptors for the server."""
+
+    if concurrent_caches <= 0:
+        raise ValueError("concurrent_caches must be positive")
+    if max_cached_file_descriptors <= 0:
+        raise ValueError("max_cached_file_descriptors must be positive")
+    reserve = 64
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        soft_limit = max_cached_file_descriptors * concurrent_caches + reserve
+    if soft_limit == resource.RLIM_INFINITY:
+        soft_limit = max_cached_file_descriptors * concurrent_caches + reserve
+    return max(
+        1,
+        min(
+            max_cached_file_descriptors,
+            max(concurrent_caches, soft_limit - reserve) // concurrent_caches,
+        ),
+    )
 
 
 def read_file_into_tensor(

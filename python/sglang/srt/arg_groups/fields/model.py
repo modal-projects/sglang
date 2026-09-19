@@ -390,3 +390,28 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_update_staging: A[
+        Optional[str],
+        Arg(
+            help="Prepare versioned weight updates on host-local disk or in a "
+            "rank-ready CPU image before committing them to the live target "
+            "model. Speculative draft-model weights remain unchanged.",
+            choices=["disk", "cpu"],
+        ),
+    ] = None
+    weight_update_local_checkpoint_dir: A[
+        Optional[str],
+        Arg(
+            help="Host-local directory for staged full checkpoints. Required for "
+            "disk staging; when set with CPU staging, the canonical checkpoint "
+            "remains on disk instead of in host memory."
+        ),
+    ] = None
+    weight_update_max_compile_group_gb: A[
+        float,
+        Arg(
+            help="Upper memory bound in GiB for one native weight-load group "
+            "during CPU image compilation. An indivisible model unit may exceed "
+            "it."
+        ),
+    ] = 8.0

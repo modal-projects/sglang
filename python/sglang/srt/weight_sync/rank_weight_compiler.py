@@ -95,7 +95,13 @@ class _PreparedLoadGroup:
 class RankWeightCompiler:
     """Use native model loaders to build a complete rank-local host image."""
 
-    def __init__(self, model: torch.nn.Module, *, max_group_bytes: int):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        max_group_bytes: int,
+        cuda_stream: torch.cuda.Stream,
+    ):
         if getattr(model, "secondary_weights", None):
             raise NotImplementedError(
                 "rank weight compilation does not support secondary checkpoints"
@@ -105,12 +111,8 @@ class RankWeightCompiler:
             model,
             max_group_bytes=max_group_bytes,
         )
-        self.image = RankWeightImage(model)
-        self._stream = (
-            torch.cuda.Stream(device=self.image.device)
-            if self.image.device.type == "cuda"
-            else None
-        )
+        self.image = RankWeightImage(model, cuda_stream=cuda_stream)
+        self._stream = cuda_stream if self.image.device.type == "cuda" else None
         self._prepared_groups: list[_PreparedLoadGroup] | None = None
         self._checkpoint_names: frozenset[str] | None = None
         self._ignored_checkpoint_names: frozenset[str] = frozenset()

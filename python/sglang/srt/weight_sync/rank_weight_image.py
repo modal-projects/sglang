@@ -151,7 +151,12 @@ def build_rank_weight_image_plan(
 class RankWeightImage:
     """Own one rank-local host image and commit it to live CUDA weights."""
 
-    def __init__(self, model: torch.nn.Module):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        cuda_stream: torch.cuda.Stream,
+    ):
         self.segments, self.image_nbytes = build_rank_weight_image_plan(model)
         self.weight_nbytes = sum(segment.nbytes for segment in self.segments)
         devices = {segment.device_bytes.device for segment in self.segments}
@@ -180,7 +185,7 @@ class RankWeightImage:
 
         self.image = torch.empty(self.image_nbytes, dtype=torch.uint8)
         self._image_buffer = memoryview(self.image.numpy()).cast("B")
-        self._stream = torch.cuda.Stream(device=self.device)
+        self._stream = cuda_stream
         self._post_commit_hooks = [
             (module, hook)
             for module in model.modules()

@@ -35,6 +35,7 @@ class RankWeightStager:
         *,
         max_compile_group_bytes: int,
         host_group: torch.distributed.ProcessGroup | None,
+        cuda_stream: torch.cuda.Stream,
         canonical_checkpoint_dir: str | Path | None = None,
     ):
         if max_compile_group_bytes <= 0:
@@ -43,6 +44,7 @@ class RankWeightStager:
         self.compiler = RankWeightCompiler(
             model,
             max_group_bytes=max_compile_group_bytes,
+            cuda_stream=cuda_stream,
         )
         self._canonical_checkpoint_dir = (
             os.path.realpath(canonical_checkpoint_dir)

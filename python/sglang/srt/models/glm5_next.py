@@ -1077,13 +1077,22 @@ class Glm5NextModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm5NextForConditionalGeneration(nn.Module):
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.language_model.": "model.",
-            "model.visual": "visual",
-        }
+_GLM5_NEXT_HF_TO_SGLANG_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "model.language_model.": "model.",
+        "model.visual": "visual",
+    }
+)
+
+
+def _glm5_next_weight_staging_name_mapper(num_hidden_layers: int) -> WeightsMapper:
+    return _GLM5_NEXT_HF_TO_SGLANG_MAPPER | WeightsMapper(
+        orig_to_new_prefix={f"model.layers.{num_hidden_layers}.": None}
     )
+
+
+class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = _GLM5_NEXT_HF_TO_SGLANG_MAPPER
 
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -1112,6 +1121,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
+        self.weight_staging_name_mapper = _glm5_next_weight_staging_name_mapper(
+            text_config.num_hidden_layers
+        )
         self.encoder_only = bool(getattr(config, "encoder_only", False))
         self.language_only = bool(getattr(config, "language_only", False))
 

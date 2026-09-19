@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -68,6 +69,34 @@ class _RecordingLoader(DefaultModelLoader):
         self.events.append(f"{self.name}.load")
         if self.fail:
             raise RuntimeError(f"{self.name} load failed")
+
+
+class _RecordingStager:
+    def __init__(self, model, **kwargs):
+        self.model = model
+        self.kwargs = kwargs
+        self.events = []
+
+    def initialize(self, checkpoint_dir, *, version):
+        self.events.append(("initialize", checkpoint_dir, version))
+        return {"operation": "initialize", "version": version}
+
+    def stage(self, *, checkpoint_source_dir, target_version):
+        self.events.append(("stage", checkpoint_source_dir, target_version))
+        return {"operation": "stage", "target_version": target_version}
+
+    def validate_commit(self, target_version):
+        self.events.append(("validate", target_version))
+
+    def commit(self, target_version):
+        self.events.append(("commit", target_version))
+        return {"operation": "commit", "target_version": target_version}
+
+    def discard_prepared(self, reason):
+        self.events.append(("discard", reason))
+
+    def close(self):
+        self.events.append(("close",))
 
 
 def _make_weight_updater(model, model_config, runner, update_model_fields=None):
@@ -325,6 +354,89 @@ class TestReloadLifecycle(CustomTestCase):
         self.assertIn("weight_name_filter is not supported", message)
         self.assertEqual(model_config.model_path, "/original")
         get_model_loader.assert_not_called()
+
+    def test_rank_weight_stager_owns_prepare_and_commit(self):
+        model = nn.Module()
+        runner = SimpleNamespace(
+            is_draft_worker=False,
+            rank_weight_stager=None,
+        )
+        model_config = SimpleNamespace(model_path="/checkpoint")
+        updater = WeightUpdater(
+            tp_rank=0,
+            device="cuda",
+            gpu_id=0,
+            model_config=model_config,
+            custom_weight_loaders={},
+            get_model=lambda: model,
+            update_model_fields=Mock(),
+            recapture_cuda_graph=Mock(),
+            get_model_runner=lambda: runner,
+        )
+
+        with (
+            patch.object(updater_mod, "RankWeightStager", _RecordingStager),
+            patch.object(
+                updater_mod,
+                "_unsupported_derived_weight_cache_error",
+                return_value=None,
+            ),
+            patch.object(torch.cuda, "device", return_value=nullcontext()),
+            patch.object(torch.cuda, "synchronize"),
+        ):
+            stats = updater.initialize_rank_weight_stager(
+                checkpoint_dir="/checkpoint",
+                version=3,
+                host_group=None,
+                max_compile_group_bytes=1024,
+                canonical_checkpoint_dir="/canonical",
+            )
+            self.assertEqual(stats["version"], 3)
+
+            stager = runner.rank_weight_stager
+            self.assertEqual(
+                stager.kwargs,
+                {
+                    "max_compile_group_bytes": 1024,
+                    "host_group": None,
+                    "canonical_checkpoint_dir": "/canonical",
+                },
+            )
+            self.assertEqual(
+                updater.stage_rank_weight_update(
+                    checkpoint_source_dir="/updates",
+                    target_version=5,
+                )["target_version"],
+                5,
+            )
+            updater.validate_rank_weight_commit(5)
+            self.assertEqual(updater.commit_rank_weight_update(5)["target_version"], 5)
+            updater.discard_prepared_rank_weights("distributed failure")
+            updater.close_rank_weight_stager()
+
+        self.assertIsNone(runner.rank_weight_stager)
+        self.assertEqual(
+            stager.events,
+            [
+                ("initialize", "/checkpoint", 3),
+                ("stage", "/updates", 5),
+                ("validate", 5),
+                ("commit", 5),
+                ("discard", "distributed failure"),
+                ("close",),
+            ],
+        )
+
+    def test_stager_rejects_out_of_band_weight_mutation(self):
+        runner = SimpleNamespace(rank_weight_stager=object())
+        updater = _make_weight_updater(
+            nn.Module(),
+            SimpleNamespace(model_path="/checkpoint"),
+            runner,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "out-of-band mutation"):
+            updater._assert_direct_update_allowed("update_weights_from_tensor")
 
 
 if __name__ == "__main__":

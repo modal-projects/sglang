@@ -71,6 +71,34 @@ def copy_or_rebind_param(
         setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
+def update_derived_buffer(
+    module: torch.nn.Module, name: str, new_value: torch.Tensor
+) -> None:
+    """Create a derived buffer once, then update it without rebinding storage."""
+    new_value = new_value.detach()
+    current = getattr(module, name, None)
+    if (
+        isinstance(current, torch.Tensor)
+        and current.shape == new_value.shape
+        and current.dtype == new_value.dtype
+        and current.device == new_value.device
+    ):
+        current.copy_(new_value)
+        return
+    if isinstance(current, torch.Tensor):
+        raise RuntimeError(
+            f"derived buffer layout changed for {name!r}: "
+            f"current={tuple(current.shape)}/{current.dtype}/{current.device} "
+            f"updated={tuple(new_value.shape)}/{new_value.dtype}/{new_value.device}"
+        )
+    if name in module._buffers:
+        module._buffers[name] = new_value
+        return
+    if hasattr(module, name):
+        delattr(module, name)
+    module.register_buffer(name, new_value, persistent=False)
+
+
 def alias_or_bind_derived_param(
     module: torch.nn.Module,
     source_name: str,

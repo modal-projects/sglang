@@ -35,6 +35,73 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+def validate_weight_update_staging(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    backend = cfg.weight_update_staging
+    local_dir = cfg.weight_update_local_checkpoint_dir
+    if backend not in (None, "disk", "cpu"):
+        raise ValueError("--weight-update-staging must be 'disk' or 'cpu'")
+    if backend is None:
+        if local_dir is not None:
+            raise ValueError(
+                "--weight-update-local-checkpoint-dir requires --weight-update-staging"
+            )
+        return
+
+    if local_dir == "":
+        raise ValueError("--weight-update-local-checkpoint-dir must not be empty")
+    if backend == "disk" and local_dir is None:
+        raise ValueError(
+            "--weight-update-staging disk requires --weight-update-local-checkpoint-dir"
+        )
+    try:
+        initial_version = int(cfg.weight_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "--weight-version must be a non-negative integer when staged weight "
+            "updates are enabled"
+        ) from exc
+    if initial_version < 0:
+        raise ValueError(
+            "--weight-version must be a non-negative integer when staged weight "
+            "updates are enabled"
+        )
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--weight-update-staging cannot be combined with --weight-cache-mode"
+        )
+    if cfg.delete_ckpt_after_loading:
+        raise ValueError(
+            "--weight-update-staging requires the startup checkpoint to remain "
+            "available"
+        )
+    if cfg.speculative_algorithm is not None:
+        logger.info(
+            "Staged weight updates modify target-model weights only; speculative "
+            "draft-model weights remain unchanged."
+        )
+    if backend != "cpu":
+        return
+    if cfg.weight_update_max_compile_group_gb <= 0:
+        raise ValueError("--weight-update-max-compile-group-gb must be positive")
+    if not get_platform().is_cuda:
+        raise ValueError("--weight-update-staging cpu requires CUDA")
+    if cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0:
+        raise ValueError(
+            "CPU weight staging requires model weights to remain resident on the GPU"
+        )
+    if cfg.pp_size > 1:
+        raise ValueError("CPU weight staging does not support pipeline parallelism")
+    if cfg.dcp_replicate_q_proj:
+        raise ValueError("CPU weight staging does not support --dcp-replicate-q-proj")
+    if cfg.enable_eplb:
+        raise ValueError("CPU weight staging does not support automatic EPLB")
+    if cfg.enable_lora or cfg.lora_paths:
+        raise ValueError("CPU weight staging does not support dynamic LoRA weights")
+    if cfg.elastic_ep_backend is not None or cfg.enable_elastic_expert_backup:
+        raise ValueError("CPU weight staging does not support elastic expert weights")
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 

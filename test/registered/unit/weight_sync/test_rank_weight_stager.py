@@ -38,6 +38,7 @@ class _Image:
 
 class _Compiler:
     def __init__(self, *_args, **_kwargs):
+        self.kwargs = _kwargs
         self.image = _Image()
         self.compiles = []
         self.validated_names = []
@@ -127,6 +128,7 @@ def _new_stager(monkeypatch, *, canonical_checkpoint_dir=None):
 
 def test_memory_canonical_stage_and_commit(monkeypatch, tmp_path):
     stager, materializations = _new_stager(monkeypatch)
+    assert stager.compiler.kwargs == {"max_group_bytes": 16}
     stats = stager.initialize(tmp_path / "base", version=4)
 
     assert stats["version"] == 4

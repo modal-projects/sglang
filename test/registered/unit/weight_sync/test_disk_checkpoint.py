@@ -287,6 +287,67 @@ class MaterializeTest(unittest.TestCase):
         self.materialize(2)
         self.assert_at_version(2)
 
+    def test_local_checkpoint_is_not_reused_across_source_lineages(self):
+        self.materialize(2)
+
+        alternate = Publisher(os.path.join(self._tmp.name, "alternate"))
+        alternate.base_dir = self.pub.base_dir
+        alternate.state = dict(self.pub.versions[0])
+        alternate.versions = {0: dict(alternate.state)}
+        rng = np.random.default_rng(29)
+        alternate.publish_delta(
+            1,
+            {"layer.a": rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()},
+        )
+        alternate.publish_delta(
+            2,
+            {"layer.b": rng.integers(0, 256, 2048, dtype=np.uint8).tobytes()},
+        )
+
+        seeds = []
+        reset = disk_checkpoint._reset_checkpoint
+
+        def reset_spy(src, *args, **kwargs):
+            seeds.append(src)
+            return reset(src, *args, **kwargs)
+
+        disk_checkpoint._reset_checkpoint = reset_spy
+        try:
+            stats = disk_checkpoint.materialize(
+                self.local,
+                alternate.base_dir,
+                alternate.source_dir,
+                2,
+            )
+        finally:
+            disk_checkpoint._reset_checkpoint = reset
+
+        self.assertEqual(seeds, [alternate.base_dir])
+        self.assertEqual(stats["operation"], "reseed_and_apply")
+        self.assertEqual(read_local(self.local), alternate.versions[2])
+
+    def test_legacy_version_marker_forces_a_clean_seed(self):
+        self.materialize(2)
+        state_path = os.path.join(self.local, ".weight_sync", "state.json")
+        with open(state_path, "w") as file:
+            json.dump({"version": "000002"}, file)
+
+        seeds = []
+        reset = disk_checkpoint._reset_checkpoint
+
+        def reset_spy(src, *args, **kwargs):
+            seeds.append(src)
+            return reset(src, *args, **kwargs)
+
+        disk_checkpoint._reset_checkpoint = reset_spy
+        try:
+            self.materialize(2)
+        finally:
+            disk_checkpoint._reset_checkpoint = reset
+
+        self.assertEqual(seeds, [self.pub.base_dir])
+        self.assert_at_version(2)
+
     def test_materialization_can_rollback_to_an_older_version(self):
         self.materialize(2)
         stats = self.materialize(1)
@@ -437,19 +498,19 @@ class MaterializeTest(unittest.TestCase):
         self.materialize(2)
         self.assert_at_version(2)
         self.pub.publish_full(3)
-        write_version = disk_checkpoint._write_applied_version
+        write_state = disk_checkpoint._write_applied_state
 
-        def fail_version_marker(local_checkpoint_dir, version):
-            if version == 3:
+        def fail_version_marker(local_checkpoint_dir, state):
+            if state.version == 3:
                 raise OSError("simulated crash before version marker")
-            return write_version(local_checkpoint_dir, version)
+            return write_state(local_checkpoint_dir, state)
 
-        disk_checkpoint._write_applied_version = fail_version_marker
+        disk_checkpoint._write_applied_state = fail_version_marker
         try:
             with self.assertRaisesRegex(OSError, "simulated crash"):
                 self.materialize(3)
         finally:
-            disk_checkpoint._write_applied_version = write_version
+            disk_checkpoint._write_applied_state = write_state
 
         self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
         self.materialize(2)
@@ -458,19 +519,19 @@ class MaterializeTest(unittest.TestCase):
     def test_interrupted_delta_invalidates_its_base_version(self):
         self.materialize(0)
         self.assert_at_version(0)
-        write_version = disk_checkpoint._write_applied_version
+        write_state = disk_checkpoint._write_applied_state
 
-        def fail_version_marker(local_checkpoint_dir, version):
-            if version == 1:
+        def fail_version_marker(local_checkpoint_dir, state):
+            if state.version == 1:
                 raise OSError("simulated crash before delta version marker")
-            return write_version(local_checkpoint_dir, version)
+            return write_state(local_checkpoint_dir, state)
 
-        disk_checkpoint._write_applied_version = fail_version_marker
+        disk_checkpoint._write_applied_state = fail_version_marker
         try:
             with self.assertRaisesRegex(OSError, "simulated crash"):
                 self.materialize(1)
         finally:
-            disk_checkpoint._write_applied_version = write_version
+            disk_checkpoint._write_applied_state = write_state
 
         self.assertIsNone(disk_checkpoint._read_applied_version(self.local))
         self.materialize(0)

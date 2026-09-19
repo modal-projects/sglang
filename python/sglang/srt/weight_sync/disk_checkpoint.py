@@ -59,6 +59,52 @@ class _ChecksumMismatchError(RuntimeError):
     """The reconstructed local tensor bytes do not match the published target."""
 
 
+@dataclass(frozen=True)
+class _AppliedCheckpointState:
+    """Identity of the published lineage represented by local checkpoint bytes."""
+
+    version: int
+    base_version: int
+    base_checkpoint_dir: str
+    checkpoint_source_dir: str | None
+
+
+def _requested_state(
+    *,
+    version: int,
+    base_version: int,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+) -> _AppliedCheckpointState:
+    return _AppliedCheckpointState(
+        version=version,
+        base_version=base_version,
+        base_checkpoint_dir=os.path.realpath(base_checkpoint_dir),
+        # The immutable base is independent of the directory that will publish
+        # later versions. Bind the source only after advancing beyond the base.
+        checkpoint_source_dir=(
+            os.path.realpath(checkpoint_source_dir) if version > base_version else None
+        ),
+    )
+
+
+def _state_matches_lineage(
+    state: _AppliedCheckpointState,
+    *,
+    base_version: int,
+    base_checkpoint_dir: str,
+    checkpoint_source_dir: str,
+) -> bool:
+    return (
+        state.base_version == base_version
+        and state.base_checkpoint_dir == os.path.realpath(base_checkpoint_dir)
+        and (
+            state.version == base_version
+            or state.checkpoint_source_dir == os.path.realpath(checkpoint_source_dir)
+        )
+    )
+
+
 def _available_cpu_count() -> int:
     try:
         return len(os.sched_getaffinity(0))
@@ -104,8 +150,15 @@ def materialize(
     lock_started = time.perf_counter()
     with _materialization_lock(local_checkpoint_dir):
         lock_wait_s = time.perf_counter() - lock_started
-        applied = _read_applied_version(local_checkpoint_dir)
-        if applied == target_version:
+        applied_state = _read_applied_state(local_checkpoint_dir)
+        applied = applied_state.version if applied_state is not None else None
+        lineage_matches = applied_state is not None and _state_matches_lineage(
+            applied_state,
+            base_version=base_version,
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+        )
+        if lineage_matches and applied == target_version:
             # A co-located rank already brought this host up to the target.
             return {
                 "operation": "noop",
@@ -124,7 +177,10 @@ def materialize(
                 target_version,
                 reseed=(
                     applied is not None
-                    and not base_version <= applied <= target_version
+                    and (
+                        not lineage_matches
+                        or not base_version <= applied <= target_version
+                    )
                 ),
             )
         except FileNotFoundError:
@@ -171,7 +227,8 @@ def _materialize_locked(
 ) -> dict:
     # A torn local state (reseed=True) is treated like a fresh host: the
     # applied-version marker can't be trusted over partially-mutated files.
-    applied = None if reseed else _read_applied_version(local_checkpoint_dir)
+    applied_state = None if reseed else _read_applied_state(local_checkpoint_dir)
+    applied = applied_state.version if applied_state is not None else None
     # Scan back from the target for the newest full version. Stop at the
     # local state — below it a reset can never be needed (or, on a fresh
     # host, at 0 = the engine's base).
@@ -191,7 +248,12 @@ def _materialize_locked(
         _reset_checkpoint(
             seed_dir,
             local_checkpoint_dir,
-            start,
+            _requested_state(
+                version=start,
+                base_version=base_version,
+                base_checkpoint_dir=base_checkpoint_dir,
+                checkpoint_source_dir=checkpoint_source_dir,
+            ),
             is_base=start == base_version,
         )
         seed_wall_s = time.perf_counter() - seed_started
@@ -205,11 +267,18 @@ def _materialize_locked(
         }
     else:
         versions = list(range(start + 1, target_version + 1))
+        target_state = _requested_state(
+            version=target_version,
+            base_version=base_version,
+            base_checkpoint_dir=base_checkpoint_dir,
+            checkpoint_source_dir=checkpoint_source_dir,
+        )
         if len(versions) == 1:
             apply_stats = _apply_delta(
                 local_checkpoint_dir,
                 _version_dir(checkpoint_source_dir, target_version),
                 target_version,
+                target_state,
             )
         else:
             apply_stats = _apply_delta_lineage(
@@ -218,6 +287,7 @@ def _materialize_locked(
                     (_version_dir(checkpoint_source_dir, version), version)
                     for version in versions
                 ],
+                target_state,
             )
     return {
         "operation": "reseed_and_apply" if reseed else "materialize",
@@ -307,19 +377,66 @@ def _materialization_lock(local_checkpoint_dir: str):
 
 
 def _read_applied_version(local_checkpoint_dir: str) -> int | None:
+    state = _read_applied_state(local_checkpoint_dir)
+    return state.version if state is not None else None
+
+
+def _read_applied_state(
+    local_checkpoint_dir: str,
+) -> _AppliedCheckpointState | None:
     try:
         with open(os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json")) as f:
-            return int(json.load(f)["version"])
+            payload = json.load(f)
     except FileNotFoundError:
         return None
+    try:
+        state = _AppliedCheckpointState(
+            version=int(payload["version"]),
+            base_version=int(payload["base_version"]),
+            base_checkpoint_dir=os.path.realpath(payload["base_checkpoint_dir"]),
+            checkpoint_source_dir=(
+                os.path.realpath(payload["checkpoint_source_dir"])
+                if payload.get("checkpoint_source_dir") is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Ignoring checkpoint cache state without a complete lineage identity: %s",
+            os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json"),
+        )
+        return None
+    if (
+        state.base_version < 0
+        or state.version < state.base_version
+        or not state.base_checkpoint_dir
+        or (state.version > state.base_version and not state.checkpoint_source_dir)
+    ):
+        logger.warning(
+            "Ignoring invalid checkpoint cache state: %s",
+            os.path.join(local_checkpoint_dir, _SYNC_DIR, "state.json"),
+        )
+        return None
+    return state
 
 
-def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
+def _write_applied_state(
+    local_checkpoint_dir: str,
+    state: _AppliedCheckpointState,
+) -> None:
     sync_dir = os.path.join(local_checkpoint_dir, _SYNC_DIR)
     path = os.path.join(sync_dir, "state.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"version": f"{version:06d}"}, f)
+        json.dump(
+            {
+                "version": f"{state.version:06d}",
+                "base_version": f"{state.base_version:06d}",
+                "base_checkpoint_dir": state.base_checkpoint_dir,
+                "checkpoint_source_dir": state.checkpoint_source_dir,
+            },
+            f,
+        )
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -360,7 +477,7 @@ def _drop_page_cache(path: str) -> None:
 def _reset_checkpoint(
     src_dir: str,
     local_checkpoint_dir: str,
-    version: int,
+    state: _AppliedCheckpointState,
     *,
     is_base: bool = False,
 ) -> None:
@@ -371,7 +488,7 @@ def _reset_checkpoint(
         raise ValueError(
             "a published full checkpoint cannot also be the mutable local checkpoint"
         )
-    _validate_full_checkpoint(src_dir, version=version, is_base=is_base)
+    _validate_full_checkpoint(src_dir, version=state.version, is_base=is_base)
     os.makedirs(local_checkpoint_dir, exist_ok=True)
     # A full seed replaces every checkpoint byte. Invalidate the old marker
     # before the first mutation so an interrupted copy cannot be mistaken for
@@ -386,7 +503,7 @@ def _reset_checkpoint(
     )
     logger.info(
         "staging checkpoint v%d to local disk: %.0f GB in %d files, %d parallel streams (%s -> %s)",
-        version,
+        state.version,
         total_gb,
         len(src_files),
         workers,
@@ -413,7 +530,7 @@ def _reset_checkpoint(
                 rate = done / max(time.monotonic() - start, 1e-3)
                 logger.info(
                     "staging checkpoint v%d to local disk: %.0f/%.0f GB (%.0f%%), %.1f GB/s",
-                    version,
+                    state.version,
                     done,
                     total_gb,
                     100 * done / max(total_gb, 1e-9),
@@ -437,7 +554,7 @@ def _reset_checkpoint(
                 f"size mismatch copying {entry.name}: src {entry.stat().st_size} != local {copied}"
             )
     _fsync_dir(local_checkpoint_dir)
-    _write_applied_version(local_checkpoint_dir, version)
+    _write_applied_state(local_checkpoint_dir, state)
 
 
 def _tensor_locations(ckpt_dir: str) -> dict:
@@ -776,6 +893,7 @@ def _apply_delta(
     local_checkpoint_dir: str,
     version_dir: str,
     expected_version: int,
+    target_state: _AppliedCheckpointState,
 ) -> dict:
     """Apply one version's delta in place and fail on checksum mismatch."""
 
@@ -789,17 +907,21 @@ def _apply_delta(
     return _apply_delta_lineage(
         local_checkpoint_dir,
         [(version_dir, expected_version)],
+        target_state,
     )
 
 
 def _apply_delta_lineage(
     local_checkpoint_dir: str,
     versions: list[tuple[str, int]],
+    target_state: _AppliedCheckpointState,
 ) -> dict:
     """Apply an ordered lineage with one target read and write per tensor."""
 
     if not versions:
         raise ValueError("delta lineage must not be empty")
+    if target_state.version != versions[-1][1]:
+        raise ValueError("target state does not match the final delta version")
     started = time.perf_counter()
     applied = _read_applied_version(local_checkpoint_dir)
     if applied is None:
@@ -1014,7 +1136,7 @@ def _apply_delta_lineage(
         )
 
     marker_started = time.perf_counter()
-    _write_applied_version(local_checkpoint_dir, plans[-1].version)
+    _write_applied_state(local_checkpoint_dir, target_state)
     marker_wall_s = time.perf_counter() - marker_started
     encodings = {plan.encoding for plan in plans}
     if len(plans) == 1:

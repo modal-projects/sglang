@@ -35,6 +35,10 @@ class DeltaCheckpoint:
     source_setup_wall_s: float
 
 
+def version_dir(checkpoint_source_dir: str | Path, version: int) -> Path:
+    return Path(checkpoint_source_dir) / f"weight_v{version:06d}"
+
+
 def read_delta_checkpoint(
     root: str | Path,
     *,

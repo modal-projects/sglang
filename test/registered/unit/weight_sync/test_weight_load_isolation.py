@@ -44,6 +44,23 @@ def test_groups_are_bounded_and_storage_complete():
     assert all(group.nbytes <= 80 for group in groups)
 
 
+def test_declared_indivisible_subtree_is_one_group():
+    model = torch.nn.Module()
+    model.block = torch.nn.Module()
+    model.block.weight_load_indivisible = True
+    model.block.left = torch.nn.Linear(8, 8)
+    model.block.right = torch.nn.Linear(8, 8)
+
+    groups = build_weight_load_groups(
+        model,
+        max_group_bytes=300,
+        device_type="cpu",
+    )
+
+    assert [group.path for group in groups] == ["block"]
+    assert groups[0].nbytes > 300
+
+
 def test_group_budget_includes_nonpersistent_loader_state():
     model = _Model()
     before = build_weight_load_groups(

@@ -1442,8 +1442,27 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
+def _glm_moe_dsa_checkpoint_name_mapper(config) -> WeightsMapper:
+    """Describe checkpoint tensors intentionally omitted by the target model."""
+
+    num_nextn_layers = getattr(config, "num_nextn_predict_layers", 0)
+    return WeightsMapper(
+        orig_to_new_prefix={
+            f"model.layers.{layer_id}.": None
+            for layer_id in range(
+                config.num_hidden_layers,
+                config.num_hidden_layers + num_nextn_layers,
+            )
+        }
+    )
+
+
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+
+    @property
+    def checkpoint_name_mapper(self) -> WeightsMapper:
+        return _glm_moe_dsa_checkpoint_name_mapper(self.config)
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):

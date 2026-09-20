@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from sglang.srt.weight_sync.weight_load_isolation import (
     build_weight_load_groups,
     build_weight_loader_view,
@@ -61,7 +60,7 @@ def test_declared_indivisible_subtree_is_one_group():
     assert groups[0].nbytes > 300
 
 
-def test_group_budget_includes_nonpersistent_loader_state():
+def test_group_budget_excludes_unowned_runtime_cache():
     model = _Model()
     before = build_weight_load_groups(
         model,
@@ -82,10 +81,30 @@ def test_group_budget_includes_nonpersistent_loader_state():
     )
 
     first = next(group for group in groups if group.path == "layers.0")
-    assert first.nbytes == before_bytes + 32
+    assert first.nbytes == before_bytes
 
 
-def test_runtime_cache_without_weights_does_not_create_a_load_group():
+def test_shared_runtime_cache_does_not_couple_load_groups():
+    model = _Model()
+    shared_cache = torch.nn.Module()
+    shared_cache.register_buffer(
+        "cos_sin_cache",
+        torch.zeros(32, dtype=torch.uint8),
+        persistent=False,
+    )
+    model.layers[0].rotary_emb = shared_cache
+    model.layers[1].rotary_emb = shared_cache
+
+    groups = build_weight_load_groups(
+        model,
+        max_group_bytes=80,
+        device_type="cpu",
+    )
+
+    assert [group.path for group in groups] == ["layers.0", "layers.1"]
+
+
+def test_runtime_cache_without_weights_does_not_affect_load_group():
     model = torch.nn.Module()
     model.weight = torch.nn.Linear(2, 2)
     model.cache = torch.nn.Module()
@@ -101,7 +120,10 @@ def test_runtime_cache_without_weights_does_not_create_a_load_group():
         device_type="cpu",
     )
 
-    assert [group.path for group in groups] == ["weight"]
+    assert [group.path for group in groups] == [""]
+    assert groups[0].nbytes == sum(
+        tensor.untyped_storage().nbytes() for tensor in model.weight.parameters()
+    )
 
 
 def test_zero_byte_parameters_do_not_alias_across_load_groups():
@@ -150,6 +172,40 @@ def test_clone_preserves_storage_aliases_and_values():
     )
     torch.testing.assert_close(copied.weight, source.weight)
     torch.testing.assert_close(copied.derived, source.derived)
+
+
+def test_clone_preserves_unowned_runtime_cache():
+    source = _Block(16)
+    source.register_buffer(
+        "runtime_cache",
+        torch.arange(8, dtype=torch.uint8),
+        persistent=False,
+    )
+
+    copied = clone_module_for_weight_loading(source)
+
+    assert copied.runtime_cache is source.runtime_cache
+
+
+def test_clone_isolates_declared_nonpersistent_derived_weight():
+    class DerivedBufferBlock(_Block):
+        def __init__(self):
+            super().__init__(16)
+            self.register_buffer(
+                "packed_weight",
+                torch.arange(8, dtype=torch.uint8),
+                persistent=False,
+            )
+
+        def get_derived_weight_tensors(self):
+            yield from super().get_derived_weight_tensors()
+            yield "packed_weight", self.packed_weight
+
+    source = DerivedBufferBlock()
+    copied = clone_module_for_weight_loading(source)
+
+    assert copied.packed_weight is not source.packed_weight
+    torch.testing.assert_close(copied.packed_weight, source.packed_weight)
 
 
 def test_clone_rebinds_parameter_loaders_to_copied_modules():

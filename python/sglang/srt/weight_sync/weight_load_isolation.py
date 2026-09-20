@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from sglang.srt.weight_sync.rank_weight_image import iter_derived_weight_tensors
 
 logger = logging.getLogger(__name__)
@@ -41,15 +40,6 @@ def _direct_weight_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
     yield from (tensor for _, tensor in iter_derived_weight_tensors(module))
 
 
-def _direct_module_tensors(module: torch.nn.Module) -> Iterable[torch.Tensor]:
-    yield from _direct_weight_tensors(module)
-    yield from (
-        value
-        for name, value in module._buffers.items()
-        if value is not None and name in module._non_persistent_buffers_set
-    )
-
-
 def build_weight_load_groups(
     model: torch.nn.Module,
     *,
@@ -62,9 +52,7 @@ def build_weight_load_groups(
         raise ValueError("weight load group budget must be positive")
 
     direct_weight_keys: dict[str, set[tuple[int | None, int, int]]] = {}
-    direct_clone_keys: dict[str, set[tuple[int | None, int, int]]] = {}
     subtree_weight_keys: dict[str, set[tuple[int | None, int, int]]] = {}
-    subtree_clone_keys: dict[str, set[tuple[int | None, int, int]]] = {}
     storage_nbytes: dict[tuple[int | None, int, int], int] = {}
 
     def collect(path: str, module: torch.nn.Module):
@@ -79,28 +67,14 @@ def build_weight_load_groups(
             storage_nbytes[key] = key[2]
         direct_weight_keys[path] = direct_weights
 
-        direct_clones = set()
-        for tensor in _direct_module_tensors(module):
-            if tensor.device.type != device_type:
-                continue
-            key = _storage_key(tensor)
-            if key[2] == 0:
-                continue
-            direct_clones.add(key)
-            storage_nbytes[key] = key[2]
-        direct_clone_keys[path] = direct_clones
-
         subtree_weights = set(direct_weights)
-        subtree_clones = set(direct_clones)
         prefix = f"{path}." if path else ""
         for child_name, child in module._modules.items():
             if child is not None:
-                child_weights, child_clones = collect(f"{prefix}{child_name}", child)
+                child_weights = collect(f"{prefix}{child_name}", child)
                 subtree_weights.update(child_weights)
-                subtree_clones.update(child_clones)
         subtree_weight_keys[path] = subtree_weights
-        subtree_clone_keys[path] = subtree_clones
-        return subtree_weights, subtree_clones
+        return subtree_weights
 
     collect("", model)
     groups: list[WeightLoadGroup] = []
@@ -109,7 +83,7 @@ def build_weight_load_groups(
         weight_keys = subtree_weight_keys[path]
         if not weight_keys:
             return
-        nbytes = sum(storage_nbytes[key] for key in subtree_clone_keys[path])
+        nbytes = sum(storage_nbytes[key] for key in weight_keys)
         prefix = f"{path}." if path else ""
         children = [
             (f"{prefix}{name}", child)
@@ -128,7 +102,7 @@ def build_weight_load_groups(
                 )
             groups.append(WeightLoadGroup(path=path, nbytes=nbytes))
             return
-        if direct_clone_keys[path]:
+        if direct_weight_keys[path]:
             raise ValueError(
                 "cannot split a module that owns tensor state and child weight "
                 f"subtrees: path={path or '<root>'!r} bytes={nbytes} "
@@ -143,7 +117,7 @@ def build_weight_load_groups(
 
     owners: dict[tuple[int | None, int, int], str] = {}
     for group in groups:
-        for key in subtree_clone_keys[group.path]:
+        for key in subtree_weight_keys[group.path]:
             previous = owners.setdefault(key, group.path)
             if previous != group.path:
                 raise ValueError(
@@ -305,10 +279,23 @@ class _ModuleCopy:
             name: None if tensor is None else self.tensor(tensor)
             for name, tensor in source._parameters.items()
         }
-        copied._buffers = {
-            name: None if tensor is None else self.tensor(tensor)
-            for name, tensor in source._buffers.items()
+        # Non-persistent buffers are runtime state, not checkpoint state. A
+        # model or quantization method must explicitly expose any buffer whose
+        # value is derived from weights and therefore belongs in the image.
+        derived_tensor_ids = {
+            id(tensor) for _, tensor in iter_derived_weight_tensors(source)
         }
+        copied._buffers = {}
+        for name, tensor in source._buffers.items():
+            if tensor is None:
+                copied._buffers[name] = None
+            elif (
+                name in source._non_persistent_buffers_set
+                and id(tensor) not in derived_tensor_ids
+            ):
+                copied._buffers[name] = tensor
+            else:
+                copied._buffers[name] = self.tensor(tensor)
         copied._modules = {
             name: None if child is None else self.module(child)
             for name, child in source._modules.items()

@@ -246,6 +246,13 @@ class _SelectorDraftSampler:
         # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+        # CUDA graph replay uses the captured physical batch size. Keep the live
+        # logical size in a static device buffer so in-graph selector work can
+        # mask rows that exist only to pad the graph bucket.
+        self.logical_batch_size = torch.full(
+            (1,), max_bs, dtype=torch.int32, device=device
+        )
+        self.row_indices = torch.arange(max_bs, dtype=torch.int32, device=device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
@@ -257,6 +264,7 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
+        self.logical_batch_size.fill_(bs)
         if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -276,7 +284,15 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
-        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        active_rows = self.row_indices[:bs] < self.logical_batch_size[0]
+        # A zero-length KDA padding slot can leave its recurrent output unwritten.
+        # Make those rows finite before the LM head/codebook gathers; the selector
+        # kernel independently masks them so a future producer regression is safe.
+        hs = torch.where(active_rows[:, None, None], hs, 0)
+        anchor_token_ids = torch.where(active_rows, block_ids[:, 0], 0)
+        candidate_ids, scores = _selector_lattice(
+            self.draft_model, hs, anchor_token_ids
+        )
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -284,6 +300,7 @@ class _SelectorDraftSampler:
             uniforms=self.uniforms[:bs].uniform_(),
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
+            logical_batch_size=self.logical_batch_size,
         )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)

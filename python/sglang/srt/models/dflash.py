@@ -1088,6 +1088,7 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
+        logical_batch_size: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
@@ -1099,6 +1100,7 @@ class CandidateSelector(nn.Module):
                 uniforms=uniforms,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
+                logical_batch_size=logical_batch_size,
             )
         top_k = self.top_k
         temps = temperatures.view(-1, 1)

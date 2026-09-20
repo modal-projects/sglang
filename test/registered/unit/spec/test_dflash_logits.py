@@ -311,10 +311,12 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
     sampler.temperatures = torch.zeros(1)
     sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
+    sampler.logical_batch_size = torch.zeros(1, dtype=torch.int32)
     sampler.sampling_enabled = False
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     torch.testing.assert_close(sampler.temperatures, torch.ones(1))
     assert sampler.greedy_mask.tolist() == [True]
+    assert sampler.logical_batch_size.tolist() == [1]
 
     sampler.sampling_enabled = True
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
@@ -359,6 +361,61 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     torch.testing.assert_close(observed["temperatures"], torch.ones(1))
     assert observed["greedy_mask"].tolist() == [True]
     assert worker._selector_sample is None
+
+
+def test_selector_draft_sampler_masks_graph_padding(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    observed = {}
+
+    def selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+        del draft_model
+        observed["pred_hidden"] = pred_hidden.clone()
+        observed["anchor_token_ids"] = anchor_token_ids.clone()
+        bs, slots = pred_hidden.shape[:2]
+        return (
+            torch.zeros((bs, slots, 2), dtype=torch.int64),
+            torch.zeros((bs, slots, 2, 2), dtype=torch.float32),
+        )
+
+    def sample_path(**kwargs):
+        observed["logical_batch_size"] = kwargs["logical_batch_size"].clone()
+        bs, slots = kwargs["candidate_ids"].shape[:2]
+        return (
+            torch.zeros((bs, slots), dtype=torch.int64),
+            torch.zeros((bs, slots, 2), dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(worker_mod, "_selector_lattice", selector_lattice)
+    selector = SimpleNamespace(top_k=2, sample_path=sample_path)
+    sampler = worker_mod._SelectorDraftSampler(
+        draft_model=SimpleNamespace(candidate_selector=selector),
+        block_size=2,
+        max_bs=3,
+        device="cpu",
+        sampling_enabled=True,
+    )
+    sampler.stage_sampling_params(bs=1, sampling_info=None)
+
+    hidden_states = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+            [float("nan"), float("nan")],
+        ]
+    )
+    input_ids = torch.tensor([[7, 8], [999, 999], [999, 999]])
+    sampler(hidden_states, input_ids)
+
+    torch.testing.assert_close(
+        observed["pred_hidden"],
+        torch.tensor([[[3.0, 4.0]], [[0.0, 0.0]], [[0.0, 0.0]]]),
+    )
+    torch.testing.assert_close(observed["anchor_token_ids"], torch.tensor([7, 0, 0]))
+    assert observed["logical_batch_size"].tolist() == [1]
 
 
 def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch):

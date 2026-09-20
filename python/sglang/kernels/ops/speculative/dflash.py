@@ -253,26 +253,39 @@ def _selector_walk_kernel(
     uniforms_ptr,
     temperatures_ptr,
     greedy_ptr,
+    logical_batch_size_ptr,
     tokens_ptr,
     q_ptr,
     slots: tl.constexpr,
     top_k: tl.constexpr,
+    HAS_LOGICAL_BATCH_SIZE: tl.constexpr,
 ):
     """One program per request: a slot's K scores stay in registers and the walk is a
     loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
     row = tl.program_id(0)
     offsets = tl.arange(0, top_k)
+    active = True
+    if HAS_LOGICAL_BATCH_SIZE:
+        active = row < tl.load(logical_batch_size_ptr)
     temperature = tl.load(temperatures_ptr + row)
     greedy = tl.load(greedy_ptr + row) != 0
     previous = 0
     for slot in range(slots):
         base = (row * slots + slot) * top_k
-        scores = tl.load(scores_ptr + (base + previous) * top_k + offsets).to(
-            tl.float32
-        )
+        scores = tl.load(
+            scores_ptr + (base + previous) * top_k + offsets,
+            mask=active,
+            other=0.0,
+        ).to(tl.float32)
         if greedy:
-            best = tl.max(scores, axis=0)
-            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            # Match torch.argmax's NaN behavior instead of letting a NaN maximum
+            # produce no equality winner. The latter leaves index == top_k and
+            # turns the candidate load below into an out-of-bounds read.
+            nan = scores != scores
+            has_nan = tl.sum(nan.to(tl.int32), axis=0) > 0
+            best = tl.max(tl.where(nan, -float("inf"), scores), axis=0)
+            wins = tl.where(has_nan, nan, scores == best)
+            index = tl.min(tl.where(wins, offsets, top_k), axis=0)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
             scaled = scores / temperature
@@ -282,9 +295,12 @@ def _selector_walk_kernel(
             index = tl.sum(
                 tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
             )
-            index = tl.minimum(index, top_k - 1)
+        # Defense in depth for either path: malformed scores must never turn the
+        # candidate lookup into a one-past-the-end device read.
+        index = tl.minimum(index, top_k - 1)
         tl.store(q_ptr + base + offsets, probabilities)
-        tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
+        token = tl.load(candidate_ptr + base + index, mask=active, other=0)
+        tl.store(tokens_ptr + row * slots + slot, token)
         previous = index
 
 
@@ -295,6 +311,7 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    logical_batch_size=None,
 ):
     batch, slots, top_k = candidate_ids.shape
     tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
@@ -307,10 +324,12 @@ def selector_walk_triton(
         uniforms.contiguous(),
         temperatures.contiguous(),
         greedy_mask.contiguous(),
+        logical_batch_size if logical_batch_size is not None else candidate_ids,
         tokens,
         q_rows,
         slots=slots,
         top_k=top_k,
+        HAS_LOGICAL_BATCH_SIZE=logical_batch_size is not None,
         num_warps=1,
     )
     return tokens, q_rows

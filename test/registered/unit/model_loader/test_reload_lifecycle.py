@@ -131,7 +131,14 @@ class TestReloadLifecycle(CustomTestCase):
         runner.gpu_id = 0
         runner.model_config = Mock()
         runner.model = nn.Module()
-        runner.init_cuda_graphs = Mock()
+        runner.prefill_cuda_graph_runner = object()
+        runner.decode_cuda_graph_runner = object()
+
+        def capture():
+            self.assertIsNone(runner.prefill_cuda_graph_runner)
+            self.assertIsNone(runner.decode_cuda_graph_runner)
+
+        runner.init_cuda_graphs = Mock(side_effect=capture)
 
         with patch.object(
             model_runner_mod,

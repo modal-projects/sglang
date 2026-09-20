@@ -223,7 +223,20 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Rows masked before translation carry -1 (padded rows
+                    # from num_token_non_padded, dropped slots).  A plain
+                    # gather wraps -1 to the table's last entry, so on the
+                    # rank that owns the last expert every padded row's top-k
+                    # slots collapse onto that local expert; with a 4096-token
+                    # breakable-prefill tier that is up to 8 x 4095 rows into a
+                    # masked slab sized for num_tokens, and the scatter runs
+                    # off the end of the slab.  Keep -1 as -1.
+                    topk_ids = topk_output.topk_ids
+                    topk_ids_local = torch.where(
+                        topk_ids < 0,
+                        -1,
+                        self.local_expert_mapping[topk_ids.clamp_min(0)],
+                    )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure

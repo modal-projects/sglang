@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.layers.attn_residual import get_cw
@@ -9,35 +10,11 @@ from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     KimiK3LinearForCausalLM,
     KimiK3MLAAttention,
-    _expert_mapping_candidates,
     _merge_weights_as_views,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-
-
-def test_expert_mapping_uses_encoded_expert_id():
-    mappings = [
-        ("w13", "w1", 0, "w1"),
-        ("w13", "w3", 0, "w3"),
-        ("w2", "w2", 0, "w2"),
-        ("w13", "w1", 1, "w1"),
-        ("w13", "w3", 1, "w3"),
-        ("w2", "w2", 1, "w2"),
-    ]
-    by_expert = {
-        expert_id: [mapping for mapping in mappings if mapping[2] == expert_id]
-        for expert_id in range(2)
-    }
-
-    candidates = _expert_mapping_candidates(
-        "model.layers.3.mlp.experts.1.w2.weight",
-        mappings,
-        by_expert,
-    )
-
-    assert candidates == by_expert[1]
 
 
 class _FakeMoE:
@@ -231,6 +208,37 @@ def test_weight_merge_reuses_existing_runtime_storage():
     torch.testing.assert_close(reloaded[2:4], torch.full((2, 2), 5.0))
 
 
+def test_weight_merge_recovers_existing_aliased_storage():
+    modules = [torch.nn.Linear(2, 2, bias=False) for _ in range(2)]
+    merged, sizes = _merge_weights_as_views(modules, pad_rows_to=8)
+
+    recovered, recovered_sizes = _merge_weights_as_views(modules, pad_rows_to=8)
+
+    assert recovered.data_ptr() == merged.data_ptr()
+    assert recovered_sizes == sizes
+
+
+def test_weight_merge_does_not_claim_prefixed_shared_storage():
+    modules = [torch.nn.Linear(2, 2, bias=False) for _ in range(2)]
+    backing = torch.arange(10, dtype=modules[0].weight.dtype).reshape(5, 2)
+    modules[0].weight.data = backing[1:3]
+    modules[1].weight.data = backing[3:5]
+
+    merged, _ = _merge_weights_as_views(modules)
+
+    assert merged.data_ptr() != backing.data_ptr()
+    torch.testing.assert_close(merged, backing[1:5])
+
+
+def test_weight_merge_rejects_runtime_storage_rebinding():
+    modules = [torch.nn.Linear(2, 2, bias=False) for _ in range(2)]
+    merged, _ = _merge_weights_as_views(modules)
+    modules[0].weight.data = modules[0].weight.data.clone()
+
+    with pytest.raises(RuntimeError, match="no longer alias"):
+        _merge_weights_as_views(modules, merged=merged)
+
+
 def test_fused_kda_decode_refresh_preserves_runtime_storage():
     segment = 12 * 128
     attention = SimpleNamespace(
@@ -258,12 +266,88 @@ def test_fused_kda_decode_refresh_preserves_runtime_storage():
     assert [
         tensor.data_ptr() for tensor in attention._k3_fused_decode_args[:-1]
     ] == pointers
-    additional = dict(KimiK3DeltaAttention.get_additional_weight_tensors(model))
+    additional = dict(KimiK3DeltaAttention.get_derived_weight_tensors(model))
     assert len(additional) == 6
     torch.testing.assert_close(
         additional["k3_fused_decode_arg_0"],
         attention.conv_weights.t()[:, :segment],
     )
+
+
+def test_hip_fused_kda_decode_refresh_preserves_runtime_storage():
+    segment = 12 * 128
+    attention = SimpleNamespace(
+        conv_weights=torch.arange(3 * segment * 4, dtype=torch.float32).reshape(
+            3 * segment, 4
+        ),
+        A_log=torch.arange(12, dtype=torch.float32),
+        dt_bias=torch.arange(segment, dtype=torch.float32),
+        lower_bound=0.0,
+    )
+    model = SimpleNamespace(
+        attn=attention,
+        f_b_proj=SimpleNamespace(
+            weight=torch.arange(segment * 128, dtype=torch.bfloat16).reshape(
+                segment, 128
+            )
+        ),
+        o_norm=SimpleNamespace(
+            weight=torch.arange(segment, dtype=torch.bfloat16),
+            eps=1e-5,
+        ),
+        _kda_hip_fused_decode_ready=False,
+    )
+
+    with (
+        patch("sglang.srt.models.kimi_k3._is_hip", True),
+        patch.dict("os.environ", {"SGLANG_K3_KDA_FUSED_BACKEND": "aiter"}),
+        patch(
+            "sglang.kernels.ops.attention.kda_fused_decode_aiter_hip.available",
+            return_value=True,
+        ),
+        patch("sglang.kernels.ops.attention.kda_fused_decode_aiter_hip.warmup"),
+    ):
+        KimiK3DeltaAttention._prepare_fused_decode(model)
+        pointers = [
+            tensor.data_ptr()
+            for tensor in attention._k3_hip_fused_decode_args
+            if isinstance(tensor, torch.Tensor)
+        ]
+        model.o_norm.weight.add_(1)
+        KimiK3DeltaAttention._prepare_fused_decode(model)
+
+    assert [
+        tensor.data_ptr()
+        for tensor in attention._k3_hip_fused_decode_args
+        if isinstance(tensor, torch.Tensor)
+    ] == pointers
+    torch.testing.assert_close(
+        attention._k3_hip_fused_decode_args[1],
+        model.o_norm.weight,
+    )
+
+
+def test_fused_kda_decode_rejects_scalar_contract_change():
+    segment = 12 * 128
+    attention = SimpleNamespace(
+        conv_weights=torch.zeros((3 * segment, 4), dtype=torch.float32),
+        bias=torch.zeros(3 * segment, dtype=torch.float32),
+        A_log=torch.zeros(12, dtype=torch.float32),
+        dt_bias=torch.zeros(segment, dtype=torch.float32),
+    )
+    model = SimpleNamespace(
+        attn=attention,
+        o_norm=SimpleNamespace(
+            weight=torch.ones(segment, dtype=torch.float32),
+            eps=1e-5,
+        ),
+        _kda_fused_decode_ready=False,
+    )
+    KimiK3DeltaAttention._prepare_fused_decode(model)
+    model.o_norm.eps = 1e-6
+
+    with pytest.raises(RuntimeError, match="scalar arguments changed"):
+        KimiK3DeltaAttention._prepare_fused_decode(model)
 
 
 def test_k3_runtime_tensors_are_declared_as_weight_state():
@@ -280,7 +364,7 @@ def test_k3_runtime_tensors_are_declared_as_weight_state():
     )
 
     delta_tensors = dict(
-        KimiK3DeltaAttention.get_additional_weight_tensors(delta_attention)
+        KimiK3DeltaAttention.get_derived_weight_tensors(delta_attention)
     )
     assert delta_tensors == {
         "bfa_w": bfa,
@@ -289,7 +373,7 @@ def test_k3_runtime_tensors_are_declared_as_weight_state():
     }
 
     mla = SimpleNamespace(w_kc=torch.ones(5), w_vc=torch.ones(6))
-    assert dict(KimiK3MLAAttention.get_additional_weight_tensors(mla)) == {
+    assert dict(KimiK3MLAAttention.get_derived_weight_tensors(mla)) == {
         "w_kc": mla.w_kc,
         "w_vc": mla.w_vc,
     }

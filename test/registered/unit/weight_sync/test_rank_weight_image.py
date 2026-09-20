@@ -23,8 +23,13 @@ class _ModelWithDerivedWeight(torch.nn.Module):
         self.derived = torch.arange(9, dtype=torch.int32)
         self.unrelated = torch.arange(11, dtype=torch.int16)
 
-    def get_additional_weight_tensors(self):
+    def get_derived_weight_tensors(self):
         yield "derived", self.derived
+
+
+class _QuantMethodWithDerivedWeight:
+    def get_derived_weight_tensors(self, layer):
+        yield "quant_derived", layer.quant_derived
 
 
 def test_weight_plan_deduplicates_aliases_and_requires_explicit_derived_state():
@@ -65,10 +70,32 @@ def test_weight_plan_excludes_non_persistent_runtime_buffers():
     ]
 
 
-def test_additional_weight_contract_rejects_invalid_entries():
+def test_weight_plan_includes_quantization_derived_state():
     model = torch.nn.Module()
     model.weight = torch.nn.Parameter(torch.ones(2))
-    model.get_additional_weight_tensors = lambda: [("derived", object())]
+    model.quant_derived = torch.arange(3)
+    model.quant_method = _QuantMethodWithDerivedWeight()
+
+    assert [name for name, _ in iter_weight_tensors(model)] == [
+        "weight",
+        "quant_derived",
+    ]
+
+
+def test_weight_plan_ignores_zero_byte_checkpoint_parameters():
+    model = torch.nn.Module()
+    model.empty = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+    model.weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+
+    segments, _ = build_rank_weight_image_plan(model, device_type="cpu")
+
+    assert [segment.name for segment in segments] == ["weight"]
+
+
+def test_derived_weight_contract_rejects_invalid_entries():
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(2))
+    model.get_derived_weight_tensors = lambda: [("derived", object())]
 
     with pytest.raises(TypeError, match="must yield"):
         list(iter_weight_tensors(model))
@@ -92,8 +119,9 @@ def test_staging_state_fails_closed_until_a_complete_image_is_ready():
     assert not image.valid
 
     with pytest.raises(RuntimeError, match="expected=7, actual=8"):
-        image.finish_stage(8)
-    image.finish_stage(7)
+        image.finish_stage(8, [])
+    image.segments = []
+    image.finish_stage(7, [])
     assert image.valid
     assert image.staged
     assert not image.staging
@@ -103,9 +131,6 @@ def test_staging_state_fails_closed_until_a_complete_image_is_ready():
 
     image.registered = True
     image.validate_commit(7)
-    image.accept_staged_baseline()
-    assert image.target_version is None
-    assert not image.staged
 
     image.invalidate("incomplete update")
     assert not image.valid

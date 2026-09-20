@@ -5,12 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +25,12 @@ from sglang.srt.weight_sync.delta_checkpoint import (
     read_delta_checkpoint,
     version_dir,
 )
-from sglang.srt.weight_sync.file_io import PositionalFileRangeReader, read_exact
+from sglang.srt.weight_sync.file_io import (
+    FileDescriptorCache,
+    PositionalFileRangeReader,
+    file_descriptor_cache_limit,
+    read_exact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +229,7 @@ class CanonicalDeltaTransform:
                 "canonical_version": self.checkpoint.version,
                 "target_version": self.target_version,
                 "delta_tensors": 0,
+                "folded_tensors": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
                 "wall_s": 0.0,
@@ -262,6 +266,7 @@ class CanonicalDeltaTransform:
             "target_version": self.target_version,
             "delta_tensors": sum(value["delta_tensors"] for value in file_stats),
             "delta_fragments": sum(value["delta_fragments"] for value in file_stats),
+            "folded_tensors": sum(value["folded_tensors"] for value in file_stats),
             "source_files": sum(value["source_files"] for value in file_stats),
             "target_tensor_bytes": sum(
                 value["target_tensor_bytes"] for value in file_stats
@@ -291,35 +296,19 @@ class CanonicalDeltaTransform:
             for name in operations_by_name
         }
         try:
-            stats = self.transform_tensors(tensors, description=filename)
+            stats = self._transform_tensors(tensors, description=filename)
             stats["filename"] = filename
             return stats
         finally:
             tensors.clear()
 
-    def transform_tensors(
+    def _transform_tensors(
         self,
         tensors: dict[str, torch.Tensor],
         *,
         description: str,
-        write_tensor: (
-            Callable[[str, torch.Tensor, list[tuple[int, int]]], None] | None
-        ) = None,
-        write_block_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Apply and verify deltas in caller-owned canonical byte tensors.
-
-        ``write_tensor`` receives each transformed tensor and the byte ranges
-        that differ from its on-disk source. This lets a disk-backed canonical
-        checkpoint compile and persist the same verified bounded buffer.
-        """
-
-        if write_tensor is not None and (
-            write_block_bytes is None or write_block_bytes <= 0
-        ):
-            raise ValueError("write_block_bytes must be positive when persisting")
-        if write_tensor is not None:
-            assert write_block_bytes is not None
+        """Apply and verify deltas in caller-owned canonical byte tensors."""
         for name, tensor in tensors.items():
             if (
                 tensor.device.type != "cpu"
@@ -341,6 +330,7 @@ class CanonicalDeltaTransform:
                 "description": description,
                 "delta_tensors": 0,
                 "delta_fragments": 0,
+                "folded_tensors": 0,
                 "source_files": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
@@ -363,228 +353,180 @@ class CanonicalDeltaTransform:
             len(operations_by_name),
         )
         budget = _ByteBudget(self.working_memory_budget_bytes)
-        final_operations = {
-            name: operations[-1] for name, operations in operations_by_name.items()
+        source_paths = {
+            operation.source_path
+            for operations in operations_by_name.values()
+            for operation in operations
         }
-        dirty_blocks = (
-            {
-                name: np.zeros(
-                    math.ceil(tensors[name].numel() / write_block_bytes),
-                    dtype=np.bool_,
-                )
-                for name in operations_by_name
-            }
-            if write_tensor is not None
-            else {}
-        )
-        operations_by_source = {}
-        for name, operations in operations_by_name.items():
-            for operation in operations:
-                operations_by_source.setdefault(
-                    (operation.version, operation.source_path), []
-                ).append((name, operation))
+        file_cache_limit = file_descriptor_cache_limit()
+        source_files = FileDescriptorCache(os.O_RDONLY, file_cache_limit)
 
-        def mark_xor_blocks(name: str, position: int, delta: np.ndarray) -> None:
-            assert write_block_bytes is not None
-            cursor = 0
-            block = position // write_block_bytes
-            leading = position % write_block_bytes
-            if leading:
-                count = min(write_block_bytes - leading, delta.size)
-                if np.any(delta[:count]):
-                    dirty_blocks[name][block] = True
-                cursor += count
-                block += 1
-            complete_bytes = (
-                (delta.size - cursor) // write_block_bytes * write_block_bytes
+        def apply_tensor(
+            item: tuple[str, list[_DeltaOperation]],
+        ) -> tuple[int, int, int, float, int]:
+            name, operations = item
+            target_tensor = tensors[name]
+            target = target_tensor.numpy()
+            has_overwrite = any(
+                operation.encoding == "overwrite" for operation in operations
             )
-            if complete_bytes:
-                changes = np.any(
-                    delta[cursor : cursor + complete_bytes].reshape(
-                        -1, write_block_bytes
-                    ),
-                    axis=1,
-                )
-                dirty_blocks[name][block : block + changes.size] |= changes
-                cursor += complete_bytes
-                block += changes.size
-            if cursor < delta.size and np.any(delta[cursor:]):
-                dirty_blocks[name][block] = True
+            folds_lineage = len(operations) > 1
+            working_nbytes = _STREAM_CHUNK_BYTES
+            if folds_lineage:
+                working_nbytes += target.size
+            if has_overwrite:
+                working_nbytes += 4 * target.size
 
-        def apply_operation(
-            item: tuple[str, _DeltaOperation],
-            source_fd: int,
-            decompressor: zstandard.ZstdDecompressor,
-        ) -> tuple[int, int, float]:
-            name, operation = item
-            target = tensors[name].numpy()
-            is_final = operation is final_operations[name]
-            hasher = create_checksum(operation.checksum_algorithm) if is_final else None
-            source = PositionalFileRangeReader(
-                source_fd,
-                operation.source_offset,
-                operation.compressed_nbytes,
-                operation.source_path,
-                max_read_bytes=_STREAM_CHUNK_BYTES,
-            )
-            with decompressor.stream_reader(source, closefd=False) as reader:
-                if operation.encoding == "xor":
-                    with budget.reserve(_STREAM_CHUNK_BYTES):
-                        position = 0
-                        while position < target.size:
-                            block = reader.read(
-                                min(_STREAM_CHUNK_BYTES, target.size - position)
+            def apply_operation(
+                operation: _DeltaOperation,
+                destination: np.ndarray,
+                decompressor: zstandard.ZstdDecompressor,
+            ) -> float:
+                with source_files.acquire(operation.source_path) as source_fd:
+                    source = PositionalFileRangeReader(
+                        source_fd,
+                        operation.source_offset,
+                        operation.compressed_nbytes,
+                        operation.source_path,
+                        max_read_bytes=_STREAM_CHUNK_BYTES,
+                    )
+                    with decompressor.stream_reader(source, closefd=False) as reader:
+                        if operation.encoding == "xor":
+                            position = 0
+                            while position < target.size:
+                                block = reader.read(
+                                    min(
+                                        _STREAM_CHUNK_BYTES,
+                                        target.size - position,
+                                    )
+                                )
+                                if not block:
+                                    break
+                                delta = np.frombuffer(block, dtype=np.uint8)
+                                region = destination[position : position + delta.size]
+                                np.bitwise_xor(region, delta, out=region)
+                                position += delta.size
+                            if position != target.size or reader.read(1):
+                                raise RuntimeError(
+                                    "decompressed XOR size mismatch for "
+                                    f"{name!r}: expected={target.size} "
+                                    f"actual={position}"
+                                )
+                        else:
+                            count = int.from_bytes(read_exact(reader, 4), "little")
+                            if count > target.size:
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            positions_payload = read_exact(reader, 4 * count)
+                            positions = np.frombuffer(
+                                positions_payload, dtype="<u4", count=count
                             )
-                            if not block:
-                                break
-                            delta = np.frombuffer(block, dtype=np.uint8)
-                            region = target[position : position + delta.size]
-                            if write_tensor is not None:
-                                mark_xor_blocks(name, position, delta)
-                            np.bitwise_xor(region, delta, out=region)
-                            if hasher is not None:
-                                hasher.update(region)
-                            position += delta.size
-                        if position != target.size or reader.read(1):
-                            raise RuntimeError(
-                                f"decompressed XOR size mismatch for {name!r}: "
-                                f"expected={target.size} actual={position}"
-                            )
-                else:
-                    count = int.from_bytes(read_exact(reader, 4), "little")
-                    if count > target.size:
-                        raise RuntimeError(f"overwrite payload for {name!r} is invalid")
-                    with budget.reserve(4 * count + _STREAM_CHUNK_BYTES):
-                        positions_payload = read_exact(reader, 4 * count)
-                        positions = np.frombuffer(
-                            positions_payload, dtype="<u4", count=count
-                        )
-                        if count and (
-                            int(positions[-1]) >= target.size
-                            or np.any(positions[1:] <= positions[:-1])
-                        ):
-                            raise RuntimeError(
-                                f"overwrite payload for {name!r} is invalid"
-                            )
-                        position = 0
-                        while position < count:
-                            block_nbytes = min(_STREAM_CHUNK_BYTES, count - position)
-                            values = np.frombuffer(
-                                read_exact(reader, block_nbytes), dtype=np.uint8
-                            )
-                            position_slice = positions[
-                                position : position + block_nbytes
-                            ]
-                            target[position_slice] = values
-                            if write_tensor is not None and block_nbytes:
-                                blocks = position_slice // write_block_bytes
-                                dirty_blocks[name][blocks[0]] = True
-                                if blocks.size > 1:
-                                    dirty_blocks[name][
-                                        blocks[1:][blocks[1:] != blocks[:-1]]
-                                    ] = True
-                            position += block_nbytes
-                    if reader.read(1):
+                            if count and (
+                                int(positions[-1]) >= target.size
+                                or np.any(positions[1:] <= positions[:-1])
+                            ):
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is invalid"
+                                )
+                            position = 0
+                            while position < count:
+                                block_nbytes = min(
+                                    _STREAM_CHUNK_BYTES,
+                                    count - position,
+                                )
+                                values = np.frombuffer(
+                                    read_exact(reader, block_nbytes),
+                                    dtype=np.uint8,
+                                )
+                                destination[
+                                    positions[position : position + block_nbytes]
+                                ] = values
+                                position += block_nbytes
+                            if reader.read(1):
+                                raise RuntimeError(
+                                    f"overwrite payload for {name!r} is oversized"
+                                )
+                    if source.position != operation.compressed_nbytes:
                         raise RuntimeError(
-                            f"overwrite payload for {name!r} is oversized"
+                            "compressed delta range was not fully consumed for "
+                            f"{name!r}: expected={operation.compressed_nbytes} "
+                            f"actual={source.position}"
                         )
-                    if hasher is not None:
-                        hasher.update(target)
-            if source.position != operation.compressed_nbytes:
-                raise RuntimeError(
-                    f"compressed delta range was not fully consumed for {name!r}: "
-                    f"expected={operation.compressed_nbytes} "
-                    f"actual={source.position}"
-                )
+                    return source.read_wall_s
 
-            if hasher is not None:
+            with budget.reserve(working_nbytes):
+                if not folds_lineage:
+                    destination = target
+                elif has_overwrite:
+                    destination = target.copy()
+                else:
+                    destination = np.zeros(target.size, dtype=np.uint8)
+                compressed_bytes = 0
+                source_read_wall_s = 0.0
+                decompressor = zstandard.ZstdDecompressor()
+                for operation in operations:
+                    source_read_wall_s += apply_operation(
+                        operation,
+                        destination,
+                        decompressor,
+                    )
+                    compressed_bytes += operation.compressed_nbytes
+
+                if folds_lineage and not has_overwrite:
+                    np.bitwise_xor(target, destination, out=target)
+                    final_bytes = target
+                elif folds_lineage:
+                    final_bytes = destination
+                else:
+                    final_bytes = target
+
+                final = operations[-1]
+                hasher = create_checksum(final.checksum_algorithm)
+                hasher.update(final_bytes)
                 actual = hasher.hexdigest()
-                if actual != operation.expected_checksum:
+                if actual != final.expected_checksum:
                     raise RuntimeError(
                         f"checksum mismatch after reconstructing {name!r}: "
-                        f"expected={operation.expected_checksum} actual={actual}"
+                        f"expected={final.expected_checksum} actual={actual}"
                     )
-                if write_tensor is not None:
-                    edges = np.flatnonzero(
-                        np.diff(
-                            np.concatenate(
-                                (
-                                    np.array([False]),
-                                    dirty_blocks[name],
-                                    np.array([False]),
-                                )
-                            )
-                        )
-                    )
-                    write_tensor(
-                        name,
-                        tensors[name],
-                        [
-                            (
-                                int(begin) * write_block_bytes,
-                                min(int(end) * write_block_bytes, target.size),
-                            )
-                            for begin, end in edges.reshape(-1, 2)
-                        ],
-                    )
-            return (
-                target.size if is_final else 0,
-                operation.compressed_nbytes,
-                source.read_wall_s,
-            )
 
-        results = []
+                if folds_lineage and has_overwrite:
+                    np.copyto(target, destination)
+                return (
+                    target.size,
+                    len(operations),
+                    compressed_bytes,
+                    source_read_wall_s,
+                    int(folds_lineage),
+                )
+
         started = time.perf_counter()
-        with ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="weight-delta",
-        ) as pool:
-            for (_, source_path), operations in sorted(
-                operations_by_source.items(),
-                key=lambda item: (item[0][0], str(item[0][1])),
-            ):
-                source_fd = os.open(source_path, os.O_RDONLY)
-                futures = []
-                try:
-                    chunk_count = min(workers, len(operations))
-                    chunks = [[] for _ in range(chunk_count)]
-                    chunk_bytes = [0] * chunk_count
-                    for operation in sorted(
-                        operations,
-                        key=lambda item: (-tensors[item[0]].numel(), item[0]),
-                    ):
-                        chunk_index = min(
-                            range(chunk_count), key=chunk_bytes.__getitem__
-                        )
-                        chunks[chunk_index].append(operation)
-                        chunk_bytes[chunk_index] += tensors[operation[0]].numel()
-
-                    def apply_chunk(chunk):
-                        decompressor = zstandard.ZstdDecompressor()
-                        return [
-                            apply_operation(operation, source_fd, decompressor)
-                            for operation in chunk
-                        ]
-
-                    futures = [
-                        pool.submit(apply_chunk, chunk) for chunk in chunks if chunk
-                    ]
-                    wait(futures)
-                    for future in futures:
-                        results.extend(future.result())
-                finally:
-                    wait(futures)
-                    os.close(source_fd)
+        work = sorted(
+            operations_by_name.items(),
+            key=lambda item: (-tensors[item[0]].numel(), item[0]),
+        )
+        try:
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="weight-delta",
+            ) as pool:
+                results = list(pool.map(apply_tensor, work))
+        finally:
+            source_files.close()
 
         return {
             "operation": "canonical_delta_transform",
             "description": description,
             "delta_tensors": len(operations_by_name),
-            "delta_fragments": len(results),
-            "source_files": len(operations_by_source),
+            "delta_fragments": sum(value[1] for value in results),
+            "source_files": len(source_paths),
             "target_tensor_bytes": sum(value[0] for value in results),
-            "compressed_bytes": sum(value[1] for value in results),
-            "source_read_worker_s": round(sum(value[2] for value in results), 6),
+            "compressed_bytes": sum(value[2] for value in results),
+            "source_read_worker_s": round(sum(value[3] for value in results), 6),
+            "folded_tensors": sum(value[4] for value in results),
             "workers": workers,
+            "file_descriptor_cache_limit": file_cache_limit,
+            "peak_source_file_descriptors": source_files.peak_open_files,
             "wall_s": round(time.perf_counter() - started, 6),
         }

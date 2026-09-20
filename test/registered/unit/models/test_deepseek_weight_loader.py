@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
-from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
-    _expert_mapping_candidates,
     _normalize_modelopt_fp4_expert_weight,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -27,13 +27,39 @@ class TestExpertMappingCandidates(unittest.TestCase):
             for expert_id in range(2)
         }
 
-        candidates = _expert_mapping_candidates(
+        candidates = FusedMoE.get_expert_params_mapping_candidates(
             "model.layers.3.mlp.experts.1.w2.weight",
             mappings,
             by_expert,
         )
 
         self.assertEqual(candidates, by_expert[1])
+
+    def test_mapping_candidates_fall_back_without_an_explicit_expert(self):
+        mappings = [("w13", "w1", 0, "w1")]
+        by_expert = FusedMoE.index_expert_params_mapping(mappings)
+
+        self.assertIs(
+            FusedMoE.get_expert_params_mapping_candidates(
+                "model.layers.3.mlp.shared_experts.gate_proj.weight",
+                mappings,
+                by_expert,
+            ),
+            mappings,
+        )
+
+    def test_mapping_candidates_reject_an_unknown_explicit_expert(self):
+        mappings = [("w13", "w1", 0, "w1")]
+        by_expert = FusedMoE.index_expert_params_mapping(mappings)
+
+        self.assertEqual(
+            FusedMoE.get_expert_params_mapping_candidates(
+                "model.layers.3.mlp.experts.7.gate_proj.weight",
+                mappings,
+                by_expert,
+            ),
+            [],
+        )
 
 
 class TestDerivedMLAWeights(unittest.TestCase):
@@ -45,7 +71,7 @@ class TestDerivedMLAWeights(unittest.TestCase):
             runtime_cache=torch.ones(3),
         )
 
-        tensors = dict(DeepseekV2AttentionMLA.get_additional_weight_tensors(attention))
+        tensors = dict(DeepseekV2AttentionMLA.get_derived_weight_tensors(attention))
 
         self.assertEqual(set(tensors), {"w_kc", "w_vc"})
         self.assertIs(tensors["w_kc"], attention.w_kc)

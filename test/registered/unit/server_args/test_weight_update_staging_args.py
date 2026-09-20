@@ -49,6 +49,28 @@ class TestWeightUpdateStagingArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires.*local-checkpoint-dir"):
             validate_weight_update_staging(_config(weight_update_staging="disk"))
 
+    def test_compile_group_budget_applies_only_to_cpu_staging(self):
+        validate_weight_update_staging(
+            _config(
+                weight_update_staging="disk",
+                weight_update_local_checkpoint_dir="/local",
+                weight_update_max_compile_group_gb=0,
+            )
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.validation_hook.get_platform",
+                return_value=SimpleNamespace(is_cuda=True),
+            ),
+            self.assertRaisesRegex(ValueError, "compile-group-gb must be positive"),
+        ):
+            validate_weight_update_staging(
+                _config(
+                    weight_update_staging="cpu",
+                    weight_update_max_compile_group_gb=0,
+                )
+            )
+
     def test_staging_requires_an_integer_initial_version(self):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             validate_weight_update_staging(

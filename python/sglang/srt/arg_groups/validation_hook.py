@@ -54,8 +54,6 @@ def validate_weight_update_staging(server_args: Any) -> None:
         raise ValueError(
             "--weight-update-staging disk requires --weight-update-local-checkpoint-dir"
         )
-    if cfg.weight_update_max_compile_group_gb <= 0:
-        raise ValueError("--weight-update-max-compile-group-gb must be positive")
     try:
         initial_version = int(cfg.weight_version)
     except (TypeError, ValueError) as exc:
@@ -84,6 +82,8 @@ def validate_weight_update_staging(server_args: Any) -> None:
         )
     if backend != "cpu":
         return
+    if cfg.weight_update_max_compile_group_gb <= 0:
+        raise ValueError("--weight-update-max-compile-group-gb must be positive")
     if not get_platform().is_cuda:
         raise ValueError("--weight-update-staging cpu requires CUDA")
     if cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0:

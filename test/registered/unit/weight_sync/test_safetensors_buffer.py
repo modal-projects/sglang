@@ -9,7 +9,10 @@ from safetensors.torch import save_file
 
 import sglang.srt.weight_sync.file_io as file_io
 from sglang.srt.weight_sync.file_io import read_file_into_tensor
-from sglang.srt.weight_sync.safetensors_buffer import SafetensorsBuffer
+from sglang.srt.weight_sync.safetensors_buffer import (
+    SafetensorsBuffer,
+    read_safetensors_file_layout,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -76,6 +79,30 @@ def test_overlapping_tensor_ranges_fail_loudly():
 
     with pytest.raises(ValueError, match="overlaps another tensor"):
         SafetensorsBuffer(source)
+
+
+def test_file_layout_reader_distinguishes_incomplete_payload(tmp_path):
+    path = tmp_path / "model.safetensors"
+    save_file({"weight": torch.arange(32, dtype=torch.uint8)}, path)
+    full = path.read_bytes()
+    path.write_bytes(full[:-1])
+
+    with pytest.raises(FileNotFoundError, match="declared payload"):
+        read_safetensors_file_layout(path)
+
+
+def test_file_layout_reader_rejects_overlapping_ranges(tmp_path):
+    header = json.dumps(
+        {
+            "a": {"dtype": "U8", "shape": [2], "data_offsets": [0, 2]},
+            "b": {"dtype": "U8", "shape": [2], "data_offsets": [1, 3]},
+        }
+    ).encode()
+    path = tmp_path / "model.safetensors"
+    path.write_bytes(len(header).to_bytes(8, "little") + header + bytes([1, 2, 3]))
+
+    with pytest.raises(ValueError, match="overlaps another tensor"):
+        read_safetensors_file_layout(path)
 
 
 def test_file_reader_rejects_non_byte_and_out_of_bounds_targets(tmp_path):

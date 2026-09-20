@@ -21,7 +21,7 @@ class _Block(torch.nn.Module):
         self.alias = torch.nn.Parameter(storage[2 : size + 2], requires_grad=False)
         self.derived = torch.arange(size, dtype=torch.int32)
 
-    def get_additional_weight_tensors(self):
+    def get_derived_weight_tensors(self):
         yield "derived", self.derived
 
 
@@ -102,6 +102,26 @@ def test_runtime_cache_without_weights_does_not_create_a_load_group():
     )
 
     assert [group.path for group in groups] == ["weight"]
+
+
+def test_zero_byte_parameters_do_not_alias_across_load_groups():
+    model = torch.nn.Module()
+    for name in ("left", "right"):
+        block = torch.nn.Module()
+        block.empty = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        block.weight = torch.nn.Parameter(
+            torch.ones(4, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        setattr(model, name, block)
+
+    groups = build_weight_load_groups(
+        model,
+        max_group_bytes=4,
+        device_type="cpu",
+    )
+
+    assert [group.path for group in groups] == ["left", "right"]
 
 
 def test_grouping_rejects_storage_shared_across_units():

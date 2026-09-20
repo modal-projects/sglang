@@ -46,6 +46,17 @@ class _LoadableModel(torch.nn.Module):
             parameters[name].data.copy_(tensor)
 
 
+class _RootLoadableModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(8), requires_grad=False)
+
+    def load_weights(self, weights):
+        for name, tensor in weights:
+            assert name == "weight"
+            self.weight.data.copy_(tensor)
+
+
 class _CPUImage:
     def __init__(self, model):
         self.segments, self.image_nbytes = build_rank_weight_image_plan(
@@ -62,6 +73,7 @@ class _CPUImage:
         self.segments_by_name = {
             name: self._segments_by_storage[_storage_key(tensor)]
             for name, tensor in iter_weight_tensors(model)
+            if tensor.untyped_storage().nbytes() > 0
         }
         self.registered = False
         self.valid = False
@@ -100,8 +112,9 @@ class _CPUImage:
         self.staged = False
         self.target_version = target_version
 
-    def finish_stage(self, target_version):
+    def finish_stage(self, target_version, commit_segments):
         assert self.target_version == target_version
+        self.commit_segments = tuple(commit_segments)
         self.valid = True
         self.staging = False
         self.staged = True
@@ -171,6 +184,16 @@ def test_checkpoint_groups_use_checkpoint_mapper_and_explicit_exclusions():
     assert groups == {"layer": ["checkpoint.weight"]}
     assert ignored == {"draft.weight"}
 
+    compiler = _compiler(model)
+    compiler.prepare_loader_views(
+        {
+            "checkpoint.weight": "model.safetensors",
+            "draft.weight": "model.safetensors",
+        }
+    )
+    with pytest.raises(ValueError, match="draft.weight"):
+        compiler.validate_delta_names(["checkpoint.weight", "draft.weight"])
+
 
 def test_checkpoint_groups_fall_back_to_native_mapper():
     model = _LoadableModel()
@@ -229,6 +252,64 @@ def test_compile_reuses_loader_views_without_mutating_live_weights(monkeypatch):
     assert second["loader_views"]["reused"]
 
 
+def test_prepare_loader_views_does_not_mutate_the_rank_image():
+    model = _LoadableModel()
+    compiler = _compiler(model)
+    compiler.image.image.copy_(
+        torch.arange(compiler.image.image_nbytes, dtype=torch.uint8)
+    )
+    expected = compiler.image.image.clone()
+
+    compiler.prepare_loader_views({"layer.weight": "model.safetensors"})
+
+    torch.testing.assert_close(compiler.image.image, expected)
+
+
+def test_compile_supports_a_root_owned_weight(monkeypatch):
+    _use_plain_loader(monkeypatch)
+    model = _RootLoadableModel()
+    compiler = _compiler(model)
+    value = torch.arange(8, dtype=torch.float32)
+    checkpoint = SimpleNamespace(
+        version=1,
+        weight_map={"weight": "model.safetensors"},
+        get_tensor=lambda _name: value,
+    )
+
+    compiler.compile(checkpoint, target_version=1)
+
+    segment = compiler.image.segments_by_name["weight"]
+    staged = compiler.image.image[
+        segment.image_offset : segment.image_offset + segment.nbytes
+    ].view(torch.float32)
+    torch.testing.assert_close(staged, value)
+
+
+def test_compile_preserves_runtime_storage_absent_from_checkpoint(monkeypatch):
+    _use_plain_loader(monkeypatch)
+    model = _LoadableModel()
+    model.auxiliary = _LoadableBlock()
+    model.auxiliary.weight.data.fill_(17)
+    compiler = _compiler(model)
+    checkpoint = SimpleNamespace(
+        version=1,
+        weight_map={"layer.weight": "model.safetensors"},
+        get_tensor=lambda _name: torch.arange(8, dtype=torch.float32),
+    )
+
+    stats = compiler.compile(checkpoint, target_version=1)
+
+    segment = compiler.image.segments_by_name["auxiliary.weight"]
+    preserved = compiler.image.image[
+        segment.image_offset : segment.image_offset + segment.nbytes
+    ].view(torch.float32)
+    torch.testing.assert_close(preserved, model.auxiliary.weight)
+    assert stats["preserved_storages"] == 1
+    assert stats["preserved_bytes"] == model.auxiliary.weight.nbytes
+    assert stats["commit_bytes"] == model.layer.weight.nbytes
+    assert segment not in compiler.image.commit_segments
+
+
 def test_compile_failure_invalidates_the_image(monkeypatch):
     _use_plain_loader(monkeypatch)
     model = _LoadableModel()
@@ -245,6 +326,25 @@ def test_compile_failure_invalidates_the_image(monkeypatch):
     assert not compiler.image.valid
     assert not compiler.image.staged
     assert "bad tensor" in compiler.image.invalid_reason
+
+
+def test_image_copy_rejects_split_runtime_aliases():
+    model = torch.nn.Module()
+    storage = torch.arange(8, dtype=torch.float32)
+    model.first = torch.nn.Parameter(storage[:4], requires_grad=False)
+    model.second = torch.nn.Parameter(storage[4:], requires_grad=False)
+    compiler = RankWeightCompiler.__new__(RankWeightCompiler)
+    compiler.image = _CPUImage(model)
+    compiler._stream = None
+
+    shadow = torch.nn.Module()
+    first_storage = storage.clone()
+    second_storage = storage.clone()
+    shadow.first = torch.nn.Parameter(first_storage[:4], requires_grad=False)
+    shadow.second = torch.nn.Parameter(second_storage[4:], requires_grad=False)
+
+    with pytest.raises(RuntimeError, match="split aliased runtime storage"):
+        compiler._copy_shadow_to_image("", shadow)
 
 
 def test_compile_rejects_wrong_or_overlapping_targets(monkeypatch):

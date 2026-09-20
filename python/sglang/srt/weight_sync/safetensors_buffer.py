@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -61,6 +63,39 @@ class SafetensorsLayout:
     data_offset: int
     file_nbytes: int
     tensors: dict[str, SafetensorsEntry]
+
+
+def validate_safetensors_weight_map(
+    layouts: dict[str, SafetensorsLayout],
+    indexed_weight_map: dict[str, str] | None,
+) -> dict[str, str]:
+    """Validate an index against the exact tensor ownership of its shards."""
+
+    discovered_weight_map: dict[str, str] = {}
+    for filename, layout in layouts.items():
+        for name in layout.tensors:
+            previous = discovered_weight_map.setdefault(name, filename)
+            if previous != filename:
+                raise ValueError(
+                    f"checkpoint tensor {name!r} appears in both "
+                    f"{previous!r} and {filename!r}"
+                )
+    if not discovered_weight_map:
+        raise ValueError("checkpoint contains no tensors")
+
+    if indexed_weight_map is not None and indexed_weight_map != discovered_weight_map:
+        missing = sorted(set(indexed_weight_map) - set(discovered_weight_map))
+        extra = sorted(set(discovered_weight_map) - set(indexed_weight_map))
+        misplaced = sorted(
+            name
+            for name in set(indexed_weight_map) & set(discovered_weight_map)
+            if indexed_weight_map[name] != discovered_weight_map[name]
+        )
+        raise ValueError(
+            "safetensors index does not match checkpoint shards: "
+            f"missing={missing[:8]} extra={extra[:8]} misplaced={misplaced[:8]}"
+        )
+    return discovered_weight_map
 
 
 def parse_safetensors_header(
@@ -196,6 +231,68 @@ def parse_safetensors_layout(
         header_bytes=header_bytes,
         file_nbytes=file_nbytes,
     )[0]
+
+
+def read_safetensors_file_layout(
+    path: str | Path,
+) -> tuple[SafetensorsLayout, dict[str, str]]:
+    """Read and validate one safetensors layout without loading its payload."""
+
+    path = Path(path)
+    with path.open("rb") as file:
+        file_nbytes = os.fstat(file.fileno()).st_size
+        prefix = file.read(8)
+        if len(prefix) != 8:
+            raise FileNotFoundError(
+                f"safetensors source is shorter than its header prefix: {path}"
+            )
+        header_nbytes = int.from_bytes(prefix, "little")
+        if header_nbytes <= 0 or header_nbytes > MAX_SAFETENSORS_HEADER_BYTES:
+            raise ValueError(
+                f"invalid safetensors header length in {path}: "
+                f"header={header_nbytes} file={file_nbytes}"
+            )
+        if 8 + header_nbytes > file_nbytes:
+            raise FileNotFoundError(
+                f"safetensors source is shorter than its declared header: {path}"
+            )
+        header_bytes = file.read(header_nbytes)
+        if len(header_bytes) != header_nbytes:
+            raise FileNotFoundError(
+                f"safetensors source is shorter than its declared header: {path}"
+            )
+
+    # A published file can expose its header before all payload bytes become
+    # visible. Keep that transient state distinct from malformed metadata.
+    try:
+        raw_header = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid safetensors JSON header in {path}") from exc
+    if isinstance(raw_header, dict):
+        declared_data_nbytes = 0
+        offsets_are_valid = True
+        for name, entry in raw_header.items():
+            if name == "__metadata__":
+                continue
+            offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(isinstance(value, int) for value in offsets)
+            ):
+                offsets_are_valid = False
+                break
+            declared_data_nbytes = max(declared_data_nbytes, offsets[1])
+        if offsets_are_valid and file_nbytes < 8 + header_nbytes + declared_data_nbytes:
+            raise FileNotFoundError(
+                f"safetensors source is shorter than its declared payload: {path}"
+            )
+
+    return parse_safetensors_header(
+        header_nbytes=header_nbytes,
+        header_bytes=header_bytes,
+        file_nbytes=file_nbytes,
+    )
 
 
 class SafetensorsBuffer:

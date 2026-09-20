@@ -437,6 +437,7 @@ class SchedulerWeightUpdaterManager:
                         model_path=self.weight_update_local_checkpoint_dir,
                         load_format=self.tp_worker.model_runner.load_config.load_format,
                         flush_cache=False,
+                        recapture_cuda_graph=True,
                         weight_version=str(recv_req.target_version),
                     )
                     success, message = self.tp_worker.update_weights_from_disk(disk_req)

@@ -56,10 +56,9 @@ def iter_weight_tensors(
     """Yield registered weights plus explicitly declared derived weights.
 
     Parameters and persistent buffers are checkpoint state. Non-persistent
-    buffers are runtime caches or other architecture state and must remain
-    untouched by a weight reload. Kernels that retain checkpoint-derived
-    tensors as ordinary attributes expose those tensors through
-    ``get_additional_weight_tensors()``.
+    buffers are runtime caches or other architecture state and remain untouched
+    unless their owning module or quantization method explicitly exposes them
+    as checkpoint-derived weights.
     """
 
     yield from model.named_parameters(remove_duplicate=False)
@@ -70,16 +69,36 @@ def iter_weight_tensors(
                 yield f"{prefix}{name}", tensor
 
     for module_name, module in model.named_modules():
-        get_extra = getattr(module, "get_additional_weight_tensors", None)
-        if get_extra is None:
-            continue
         prefix = f"{module_name}." if module_name else ""
-        for name, tensor in get_extra():
+        for name, tensor in iter_derived_weight_tensors(module):
+            yield f"{prefix}{name}", tensor
+
+
+def iter_derived_weight_tensors(
+    module: torch.nn.Module,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield unregistered runtime storage derived from checkpoint weights."""
+
+    get_derived = getattr(module, "get_derived_weight_tensors", None)
+    if get_derived is not None:
+        for name, tensor in get_derived():
             if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
                 raise TypeError(
-                    "get_additional_weight_tensors() must yield (str, torch.Tensor)"
+                    "get_derived_weight_tensors() must yield (str, torch.Tensor)"
                 )
-            yield f"{prefix}{name}", tensor
+            yield name, tensor
+
+    quant_method = getattr(module, "quant_method", None)
+    get_quant_derived = getattr(quant_method, "get_derived_weight_tensors", None)
+    if get_quant_derived is None:
+        return
+    for name, tensor in get_quant_derived(module):
+        if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                "quantization get_derived_weight_tensors() must yield "
+                "(str, torch.Tensor)"
+            )
+        yield name, tensor
 
 
 def build_rank_weight_image_plan(
@@ -94,6 +113,8 @@ def build_rank_weight_image_plan(
         if tensor.device.type != device_type:
             continue
         storage = tensor.untyped_storage()
+        if storage.nbytes() == 0:
+            continue
         key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
         current = unique.get(key)
         if current is None or name < current[0]:
@@ -144,6 +165,8 @@ class RankWeightImage:
             if tensor.device.type != "cuda":
                 continue
             storage = tensor.untyped_storage()
+            if storage.nbytes() == 0:
+                continue
             key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
             self.segments_by_name[name] = self._segments_by_device_storage[key]
 
@@ -171,6 +194,7 @@ class RankWeightImage:
                 hook := getattr(module, "process_weights_after_weight_commit", None)
             )
         ]
+        self._commit_segments: tuple[RankWeightSegment, ...] = ()
         self.registered = False
         self.registration_wall_s: float | None = None
         self.target_version: int | None = None
@@ -235,7 +259,11 @@ class RankWeightImage:
         self.target_version = target_version
         self.staging = True
 
-    def finish_stage(self, target_version: int) -> None:
+    def finish_stage(
+        self,
+        target_version: int,
+        commit_segments: Iterable[RankWeightSegment],
+    ) -> None:
         if not self.staging:
             raise RuntimeError("no rank weight image stage is running")
         if self.target_version != target_version:
@@ -243,18 +271,16 @@ class RankWeightImage:
                 "staged version changed while staging: "
                 f"expected={self.target_version}, actual={target_version}"
             )
+        segments = tuple(commit_segments)
+        segment_ids = {id(segment) for segment in segments}
+        if len(segment_ids) != len(segments) or not segment_ids.issubset(
+            {id(segment) for segment in self.segments}
+        ):
+            raise ValueError("commit segments must be unique members of the rank image")
+        self._commit_segments = segments
         self.valid = True
         self.staged = True
         self.staging = False
-        self.invalid_reason = None
-
-    def accept_staged_baseline(self) -> None:
-        """Keep a fully compiled baseline image without exposing a commit."""
-
-        if not self.valid or not self.staged or self.staging:
-            raise RuntimeError("no complete staged image can become the baseline")
-        self.target_version = None
-        self.staged = False
         self.invalid_reason = None
 
     def invalidate(self, reason: str) -> None:
@@ -263,6 +289,7 @@ class RankWeightImage:
         self.valid = False
         self.staged = False
         self.staging = False
+        self._commit_segments = ()
         self.invalid_reason = reason
 
     def _iter_chunks(
@@ -351,13 +378,13 @@ class RankWeightImage:
             )
 
     def commit(self, target_version: int) -> dict[str, int | float | str | bool | None]:
-        """Overwrite every live weight storage from the staged host image."""
+        """Overwrite the live weight storages produced by the staged load."""
 
         self.validate_commit(target_version)
         started = time.perf_counter()
         try:
             with torch.cuda.stream(self._stream):
-                for segment in self.segments:
+                for segment in self._commit_segments:
                     for image_chunk, device_chunk in self._iter_chunks(
                         segment,
                         segment.device_bytes,
@@ -381,64 +408,21 @@ class RankWeightImage:
 
         self.staged = False
         stats = self.stats("commit_rank_weight_image", time.perf_counter() - started)
+        self._commit_segments = ()
         stats["post_commit_hook_wall_s"] = round(post_commit_hook_wall_s, 6)
         return stats
-
-    def validate_against_active(self) -> dict[str, int | float | str]:
-        """Validate the compiled image against the active startup weights."""
-
-        if not self.valid or not self.staged or not self.registered:
-            raise RuntimeError("no complete rank weight image is available")
-        started = time.perf_counter()
-        scratch = torch.empty(
-            min(_COPY_CHUNK_BYTES, self.image_nbytes),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-        segment_mismatches = torch.zeros(
-            len(self.segments),
-            dtype=torch.bool,
-            device=scratch.device,
-        )
-        compared_bytes = 0
-        with torch.cuda.stream(self._stream):
-            for segment_index, segment in enumerate(self.segments):
-                for image_chunk, device_chunk in self._iter_chunks(
-                    segment,
-                    segment.device_bytes,
-                ):
-                    nbytes = image_chunk.numel()
-                    scratch[:nbytes].copy_(image_chunk)
-                    segment_mismatches[segment_index].logical_or_(
-                        torch.any(scratch[:nbytes] != device_chunk)
-                    )
-                    compared_bytes += nbytes
-        self._stream.synchronize()
-
-        mismatches = torch.nonzero(segment_mismatches).flatten().tolist()
-        if mismatches:
-            segment = self.segments[mismatches[0]]
-            raise RuntimeError(
-                "rank weight image does not reproduce the active model: "
-                f"storage={segment.name!r}"
-            )
-        return {
-            "operation": "validate_rank_weight_image",
-            "bytes": compared_bytes,
-            "storages": len(self.segments),
-            "wall_s": round(time.perf_counter() - started, 6),
-        }
 
     def stats(
         self,
         operation: str,
         wall_s: float,
     ) -> dict[str, int | float | str | bool | None]:
-        transferred_bytes = (
-            self.weight_nbytes
-            if operation in {"capture_active_weights", "commit_rank_weight_image"}
-            else 0
-        )
+        if operation == "capture_active_weights":
+            transferred_bytes = self.weight_nbytes
+        elif operation == "commit_rank_weight_image":
+            transferred_bytes = sum(segment.nbytes for segment in self._commit_segments)
+        else:
+            transferred_bytes = 0
         return {
             "operation": operation,
             "target_version": self.target_version,

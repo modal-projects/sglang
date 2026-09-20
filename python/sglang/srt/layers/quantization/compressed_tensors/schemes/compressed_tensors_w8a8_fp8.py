@@ -145,6 +145,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def restore_weights_before_loading(self, layer) -> None:
+        if (
+            self.strategy == QuantizationStrategy.CHANNEL
+            and not is_fp8_fnuz()
+            and not _use_aiter
+            and getattr(layer, "_weight_transposed_for_runtime", False)
+        ):
+            layer.weight.data = layer.weight.data.t()
+            layer._weight_transposed_for_runtime = False
         if self.strategy == QuantizationStrategy.BLOCK:
             restore_ue8m0_scale_checkpoint_layout(layer.weight_scale)
 
@@ -197,11 +205,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 # required by torch.compile to be torch.nn.Parameter
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
-                # The kernel consumes a transpose, but keeping the checkpoint
-                # parameter preserves its loader and storage across reloads.
+                if not getattr(layer, "_weight_transposed_for_runtime", False):
+                    layer.weight.data = layer.weight.data.t()
+                    layer._weight_transposed_for_runtime = True
                 layer.weight.requires_grad_(False)
                 layer.weight_scale.requires_grad_(False)
-                layer.weight_t = layer.weight.data.t()
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -255,7 +263,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             out_dtype = x[2] if len(x) > 2 else None
             return apply_fp8_linear(
                 input=qx,
-                weight=getattr(layer, "weight_t", layer.weight),
+                weight=layer.weight,
                 weight_scale=layer.weight_scale,
                 input_scale=x_scale,
                 bias=bias,
@@ -286,7 +294,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         else:
             return apply_fp8_linear(
                 input=x,
-                weight=getattr(layer, "weight_t", layer.weight),
+                weight=layer.weight,
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,

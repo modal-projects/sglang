@@ -196,6 +196,21 @@ def test_rollback_target_reseeds_canonical(monkeypatch, tmp_path):
     assert stats["canonical_transform"] == {"from": 0, "to": 3}
 
 
+def test_changing_source_lineage_reseeds_canonical(monkeypatch, tmp_path):
+    stager, _ = _new_stager(monkeypatch)
+    stager.initialize(tmp_path / "base", version=0)
+    stager.stage(checkpoint_source_dir=tmp_path / "updates-a", target_version=2)
+    stager.discard_prepared("switch source lineage")
+
+    stats = stager.stage(
+        checkpoint_source_dir=tmp_path / "updates-b",
+        target_version=3,
+    )
+
+    assert stats["canonical_reset"] is True
+    assert stats["canonical_transform"] == {"from": 0, "to": 3}
+
+
 def test_disk_canonical_reopens_after_materialization(monkeypatch, tmp_path):
     local = tmp_path / "canonical"
     stager, materializations = _new_stager(

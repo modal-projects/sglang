@@ -417,6 +417,39 @@ class MaterializeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "blob/index tensor mismatch"):
             self.materialize(1)
 
+    def test_sparse_overwrite_positions_must_be_strictly_increasing(self):
+        self.materialize(2)
+        version = 3
+        vdir = os.path.join(self.pub.source_dir, f"weight_v{version:06d}")
+        os.makedirs(vdir)
+        payload = (
+            (2).to_bytes(4, "little")
+            + np.array([0, 0], dtype="<u4").tobytes()
+            + bytes([1, 2])
+        )
+        write_safetensors(
+            os.path.join(vdir, Publisher.SHARD),
+            {"layer.a": zstandard.ZstdCompressor().compress(payload)},
+            metadata={"layer.a": adler32_hex(self.pub.state["layer.a"])},
+        )
+        with open(os.path.join(vdir, "model.safetensors.index.json"), "w") as file:
+            json.dump(
+                {
+                    "metadata": {
+                        "version": f"{version:06d}",
+                        "base_version": f"{version - 1:06d}",
+                        "delta_encoding": "overwrite",
+                        "compression_format": "zstd",
+                        "checksum_format": "adler32",
+                    },
+                    "weight_map": {"layer.a": Publisher.SHARD},
+                },
+                file,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "overwrite payload.*invalid"):
+            self.materialize(version)
+
     def test_missing_source_version_fails_fast_without_reseed(self):
         # A not-yet-visible source version (publisher/object store not caught
         # up) must raise FileNotFoundError WITHOUT reseeding: reseed can't
@@ -560,7 +593,7 @@ class MaterializeTest(unittest.TestCase):
 
         disk_checkpoint._reset_checkpoint = _spy
         try:
-            with self.assertRaisesRegex(FileNotFoundError, "has no safetensors"):
+            with self.assertRaisesRegex(FileNotFoundError, "missing blob"):
                 self.materialize(3)
         finally:
             disk_checkpoint._reset_checkpoint = orig_reset
@@ -891,6 +924,73 @@ class MaterializeTest(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(FileNotFoundError, "missing blob"):
+            self.materialize(0)
+
+    def test_indexed_base_must_match_exact_shard_contents(self):
+        index_path = os.path.join(
+            self.pub.base_dir,
+            "model.safetensors.index.json",
+        )
+        with open(index_path, "w") as file:
+            json.dump(
+                {
+                    "metadata": {},
+                    "weight_map": {"layer.a": Publisher.SHARD},
+                },
+                file,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "safetensors index does not match checkpoint shards",
+        ):
+            self.materialize(0)
+
+    def test_indexed_base_ignores_unreferenced_safetensors_files(self):
+        index_path = os.path.join(
+            self.pub.base_dir,
+            "model.safetensors.index.json",
+        )
+        with open(index_path, "w") as file:
+            json.dump(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "layer.a": Publisher.SHARD,
+                        "layer.b": Publisher.SHARD,
+                    },
+                },
+                file,
+            )
+        write_safetensors(
+            os.path.join(self.pub.base_dir, "unreferenced.safetensors"),
+            {"unreferenced": b"payload"},
+        )
+
+        self.materialize(0)
+
+        self.assert_at_version(0)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.local, "unreferenced.safetensors"))
+        )
+
+    def test_indexed_base_shard_cannot_escape_checkpoint_directory(self):
+        outside = os.path.join(self._tmp.name, "outside.safetensors")
+        write_safetensors(outside, {"layer.a": b"payload"})
+        link = os.path.join(self.pub.base_dir, "linked.safetensors")
+        os.symlink(outside, link)
+        with open(
+            os.path.join(self.pub.base_dir, "model.safetensors.index.json"), "w"
+        ) as file:
+            json.dump(
+                {
+                    "metadata": {},
+                    "weight_map": {"layer.a": "linked.safetensors"},
+                },
+                file,
+            )
+
+        with self.assertRaisesRegex(ValueError, "invalid checkpoint shard path"):
             self.materialize(0)
 
     def test_mutable_checkpoint_cannot_alias_its_immutable_base(self):

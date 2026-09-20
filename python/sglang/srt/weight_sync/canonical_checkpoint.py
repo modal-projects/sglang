@@ -15,7 +15,10 @@ import torch
 
 from sglang.srt.weight_sync.file_io import read_file_into_tensor
 from sglang.srt.weight_sync.host_local_buffer import HostLocalSharedBuffer
-from sglang.srt.weight_sync.safetensors_buffer import SafetensorsBuffer
+from sglang.srt.weight_sync.safetensors_buffer import (
+    SafetensorsBuffer,
+    validate_safetensors_weight_map,
+)
 
 _ALIGNMENT = 4096
 
@@ -239,7 +242,7 @@ class CanonicalCheckpoint:
                 )
 
         self._files = {}
-        discovered_weight_map = {}
+        layouts = {}
         layout_error = None
         layout_exception = None
         try:
@@ -258,33 +261,11 @@ class CanonicalCheckpoint:
                     )
                 tensor_file = SafetensorsBuffer(source)
                 self._files[checkpoint_file.name] = tensor_file
-                for name in tensor_file.layout.tensors:
-                    previous = discovered_weight_map.setdefault(
-                        name, checkpoint_file.name
-                    )
-                    if previous != checkpoint_file.name:
-                        raise ValueError(
-                            f"checkpoint tensor {name!r} appears in both "
-                            f"{previous!r} and {checkpoint_file.name!r}"
-                        )
-            if not discovered_weight_map:
-                raise ValueError(f"checkpoint contains no tensors: {checkpoint_dir}")
-            if (
-                indexed_weight_map is not None
-                and indexed_weight_map != discovered_weight_map
-            ):
-                missing = sorted(set(indexed_weight_map) - set(discovered_weight_map))
-                extra = sorted(set(discovered_weight_map) - set(indexed_weight_map))
-                misplaced = sorted(
-                    name
-                    for name in set(indexed_weight_map) & set(discovered_weight_map)
-                    if indexed_weight_map[name] != discovered_weight_map[name]
-                )
-                raise ValueError(
-                    "safetensors index does not match checkpoint shards: "
-                    f"missing={missing[:8]} extra={extra[:8]} "
-                    f"misplaced={misplaced[:8]}"
-                )
+                layouts[checkpoint_file.name] = tensor_file.layout
+            discovered_weight_map = validate_safetensors_weight_map(
+                layouts,
+                indexed_weight_map,
+            )
         except Exception as exc:
             layout_exception = exc
             layout_error = f"rank {rank}: {type(exc).__name__}: {exc}"

@@ -1961,7 +1961,7 @@ class DeepseekV2AttentionMLA(
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
 
-    def get_additional_weight_tensors(self):
+    def get_derived_weight_tensors(self):
         """Expose checkpoint-derived MLA tensors that are not registered state."""
 
         for name in (

@@ -17,8 +17,6 @@ import glob
 import json
 import logging
 import os
-import resource
-import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +28,17 @@ import zstandard
 
 from sglang.srt.weight_sync.checksum import calculate_checksum
 from sglang.srt.weight_sync.delta_checkpoint import read_delta_checkpoint
-from sglang.srt.weight_sync.file_io import PositionalFileRangeReader, read_exact
+from sglang.srt.weight_sync.file_io import (
+    FileDescriptorCache,
+    PositionalFileRangeReader,
+    file_descriptor_cache_limit,
+    read_exact,
+)
+from sglang.srt.weight_sync.safetensors_buffer import (
+    SafetensorsLayout,
+    read_safetensors_file_layout,
+    validate_safetensors_weight_map,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +55,6 @@ _DELTA_STREAM_CHUNK_BYTES = 4 << 20
 _MAX_SEED_COPY_WORKERS = 8
 _MAX_DELTA_APPLY_WORKERS = 32
 _MAX_OPEN_FILES_PER_CACHE = 256
-_MAX_SAFETENSORS_HEADER_BYTES = 100 << 20
 _SEED_COPY_CHUNK_BYTES = 16 << 20
 _SEED_LOG_STEP_GB = 50
 
@@ -503,13 +510,22 @@ def _reset_checkpoint(
         raise ValueError(
             "a published full checkpoint cannot also be the mutable local checkpoint"
         )
-    _validate_full_checkpoint(src_dir, version=state.version, is_base=is_base)
+    checkpoint_shards = _validate_full_checkpoint(
+        src_dir,
+        version=state.version,
+        is_base=is_base,
+    )
     os.makedirs(local_checkpoint_dir, exist_ok=True)
     # A full seed replaces every checkpoint byte. Invalidate the old marker
     # before the first mutation so an interrupted copy cannot be mistaken for
     # the previously committed version.
     _clear_applied_version(local_checkpoint_dir)
-    src_files = [entry for entry in os.scandir(src_dir) if entry.is_file()]
+    src_files = [
+        entry
+        for entry in os.scandir(src_dir)
+        if entry.is_file()
+        and (not entry.name.endswith(".safetensors") or entry.name in checkpoint_shards)
+    ]
     total_gb = sum(entry.stat().st_size for entry in src_files) / 1e9
     workers = min(
         _MAX_SEED_COPY_WORKERS,
@@ -560,8 +576,8 @@ def _reset_checkpoint(
     for entry in os.scandir(local_checkpoint_dir):
         if entry.is_file() and entry.name not in names:
             os.remove(entry.path)
-    # a truncated copy (e.g. an object-store mount surfacing metadata before
-    # bytes) must fail loud, not serve bad weights
+    # A truncated copy (for example, a mount surfacing metadata before bytes)
+    # must fail instead of serving corrupt weights.
     for entry in src_files:
         copied = os.path.getsize(os.path.join(local_checkpoint_dir, entry.name))
         if copied != entry.stat().st_size:
@@ -576,91 +592,77 @@ def _tensor_locations(ckpt_dir: str) -> dict:
     """Map each tensor name to (file, byte offset, nbytes) by reading every safetensors header."""
     locations = {}
     for path in sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors"))):
-        header_len, header = _read_safetensors_header(path)
-        for name, info in header.items():
-            if name == "__metadata__":
-                continue
+        layout, _ = read_safetensors_file_layout(path)
+        for name, entry in layout.tensors.items():
             if name in locations:
                 raise ValueError(f"duplicate checkpoint tensor {name!r}")
-            begin, end = info["data_offsets"]
-            locations[name] = (path, 8 + header_len + begin, end - begin)
-    return locations
-
-
-def _read_safetensors_header(path: str) -> tuple[int, dict]:
-    """Read a complete header and reject a truncated or oversized payload."""
-
-    with open(path, "rb") as file:
-        prefix = file.read(8)
-        if len(prefix) != 8:
-            raise FileNotFoundError(f"incomplete safetensors header: {path}")
-        (header_len,) = struct.unpack("<Q", prefix)
-        if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
-            raise ValueError(
-                f"safetensors header exceeds {_MAX_SAFETENSORS_HEADER_BYTES} bytes: "
-                f"{path}"
+            locations[name] = (
+                path,
+                layout.data_offset + entry.relative_begin,
+                entry.relative_end - entry.relative_begin,
             )
-        header_bytes = file.read(header_len)
-    if len(header_bytes) != header_len:
-        raise FileNotFoundError(f"incomplete safetensors header: {path}")
-    try:
-        header = json.loads(header_bytes)
-    except ValueError as exc:
-        raise ValueError(f"invalid safetensors header: {path}") from exc
-    end = 0
-    for name, info in header.items():
-        if name == "__metadata__":
-            continue
-        end = max(end, info["data_offsets"][1])
-    expected_size = 8 + header_len + end
-    actual_size = os.path.getsize(path)
-    if actual_size != expected_size:
-        raise FileNotFoundError(
-            f"incomplete source blob {path}: {actual_size}B, "
-            f"header declares {expected_size}B"
-        )
-    return header_len, header
+    return locations
 
 
 def _validate_full_checkpoint(
     src_dir: str, *, version: int, is_base: bool = False
-) -> None:
+) -> set[str]:
     """Reject incomplete full checkpoints before copying or publishing a marker."""
-
-    headers = {}
-    for path in sorted(glob.glob(os.path.join(src_dir, "*.safetensors"))):
-        _, headers[os.path.basename(path)] = _read_safetensors_header(path)
-    if not headers:
-        raise FileNotFoundError(f"full checkpoint has no safetensors files: {src_dir}")
 
     index_path = os.path.join(src_dir, "model.safetensors.index.json")
     try:
         with open(index_path) as file:
             index = json.load(file)
     except FileNotFoundError as exc:
-        if is_base:
-            return
-        raise FileNotFoundError(
-            f"published full checkpoint has no manifest: {index_path}"
-        ) from exc
-    if not isinstance(index, dict):
-        raise ValueError(f"invalid checkpoint manifest: {index_path}")
-    if not is_base:
-        _validate_published_version(index.get("metadata"), version, index_path)
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError(f"published full checkpoint has no weight map: {index_path}")
-    for name, filename in weight_map.items():
-        header = headers.get(filename)
-        if header is None:
+        if not is_base:
+            raise FileNotFoundError(
+                f"published full checkpoint has no manifest: {index_path}"
+            ) from exc
+        index = None
+
+    weight_map = None
+    if index is not None:
+        if not isinstance(index, dict):
+            raise ValueError(f"invalid checkpoint manifest: {index_path}")
+        if not is_base:
+            _validate_published_version(index.get("metadata"), version, index_path)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(
+                f"published full checkpoint has no weight map: {index_path}"
+            )
+        if not all(
+            isinstance(name, str)
+            and name
+            and isinstance(filename, str)
+            and filename
+            and os.path.basename(filename) == filename
+            for name, filename in weight_map.items()
+        ):
+            raise ValueError(f"invalid safetensors weight map: {index_path}")
+        filenames = sorted(set(weight_map.values()))
+    else:
+        filenames = [
+            os.path.basename(path)
+            for path in sorted(glob.glob(os.path.join(src_dir, "*.safetensors")))
+        ]
+
+    if not filenames:
+        raise FileNotFoundError(f"full checkpoint has no safetensors files: {src_dir}")
+    layouts: dict[str, SafetensorsLayout] = {}
+    resolved_root = os.path.realpath(src_dir)
+    for filename in filenames:
+        path = os.path.realpath(os.path.join(resolved_root, filename))
+        if os.path.commonpath((resolved_root, path)) != resolved_root:
+            raise ValueError(f"invalid checkpoint shard path: {filename!r}")
+        if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"published full checkpoint is missing blob {filename!r}"
             )
-        if name not in header:
-            raise ValueError(
-                f"published full checkpoint blob {filename!r} "
-                f"does not contain indexed tensor {name!r}"
-            )
+        layout, _ = read_safetensors_file_layout(path)
+        layouts[filename] = layout
+    validate_safetensors_weight_map(layouts, weight_map)
+    return set(filenames)
 
 
 @dataclass(frozen=True)
@@ -707,114 +709,6 @@ class _ByteBudget:
             with self.condition:
                 self.used -= charge
                 self.condition.notify_all()
-
-
-@dataclass
-class _CachedFileDescriptor:
-    fd: int
-    users: int = 0
-    dirty: bool = False
-    last_used: int = 0
-
-
-class _FileDescriptorCache:
-    """Share positional-I/O descriptors under a fixed process-local bound."""
-
-    def __init__(self, flags: int, limit: int):
-        self.flags = flags
-        self.limit = limit
-        self.entries: dict[str, _CachedFileDescriptor] = {}
-        self.condition = threading.Condition()
-        self.clock = 0
-        self.peak_open_files = 0
-
-    @contextmanager
-    def acquire(self, path: str, *, write: bool = False):
-        with self.condition:
-            entry = self.entries.get(path)
-            while entry is None:
-                if len(self.entries) < self.limit:
-                    entry = _CachedFileDescriptor(fd=os.open(path, self.flags))
-                    self.entries[path] = entry
-                    self.peak_open_files = max(
-                        self.peak_open_files,
-                        len(self.entries),
-                    )
-                    break
-                idle_path, idle = min(
-                    (
-                        (candidate_path, candidate)
-                        for candidate_path, candidate in self.entries.items()
-                        if candidate.users == 0
-                    ),
-                    key=lambda item: item[1].last_used,
-                    default=(None, None),
-                )
-                if idle is None:
-                    self.condition.wait()
-                    entry = self.entries.get(path)
-                    continue
-                del self.entries[idle_path]
-                self._close(idle)
-            entry.users += 1
-            self.clock += 1
-            entry.last_used = self.clock
-            if write:
-                entry.dirty = True
-        try:
-            yield entry.fd
-        finally:
-            with self.condition:
-                entry.users -= 1
-                self.clock += 1
-                entry.last_used = self.clock
-                self.condition.notify()
-
-    def flush(self) -> None:
-        with self.condition:
-            for entry in self.entries.values():
-                if entry.dirty:
-                    os.fsync(entry.fd)
-                    entry.dirty = False
-
-    def close(self) -> None:
-        with self.condition:
-            entries = list(self.entries.values())
-            self.entries.clear()
-        error = None
-        for entry in entries:
-            try:
-                self._close(entry)
-            except OSError as exc:
-                error = error or exc
-        if error is not None:
-            raise error
-
-    @staticmethod
-    def _close(entry: _CachedFileDescriptor) -> None:
-        try:
-            if entry.dirty:
-                os.fsync(entry.fd)
-        finally:
-            os.close(entry.fd)
-
-
-def _file_descriptor_cache_limit() -> int:
-    """Reserve descriptors for the server while bounding long lineages."""
-
-    try:
-        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-    except (OSError, ValueError):
-        soft_limit = _MAX_OPEN_FILES_PER_CACHE * 2 + 64
-    if soft_limit == resource.RLIM_INFINITY:
-        soft_limit = _MAX_OPEN_FILES_PER_CACHE * 2 + 64
-    return max(
-        1,
-        min(
-            _MAX_OPEN_FILES_PER_CACHE,
-            max(2, soft_limit - 64) // 2,
-        ),
-    )
 
 
 def _pread_exact(
@@ -999,9 +893,12 @@ def _apply_delta_lineage(
     # Planning above validates the complete lineage before any local byte changes.
     # An interruption after this point leaves no marker, forcing a clean seed.
     _clear_applied_version(local_checkpoint_dir)
-    file_cache_limit = _file_descriptor_cache_limit()
-    source_files = _FileDescriptorCache(os.O_RDONLY, file_cache_limit)
-    target_files = _FileDescriptorCache(os.O_RDWR, file_cache_limit)
+    file_cache_limit = file_descriptor_cache_limit(
+        concurrent_caches=2,
+        max_cached_file_descriptors=_MAX_OPEN_FILES_PER_CACHE,
+    )
+    source_files = FileDescriptorCache(os.O_RDONLY, file_cache_limit)
+    target_files = FileDescriptorCache(os.O_RDWR, file_cache_limit)
     memory_budget = _ByteBudget(_DELTA_APPLY_MEMORY_BYTES)
     mismatches = []
     mismatch_lock = threading.Lock()
@@ -1068,9 +965,9 @@ def _apply_delta_lineage(
                                 )
                             positions_buffer = read_exact(reader, 4 * count)
                             positions = np.frombuffer(positions_buffer, dtype="<u4")
-                            if (
-                                count
-                                and int(positions.max()) >= operation.target_nbytes
+                            if count and (
+                                int(positions[-1]) >= operation.target_nbytes
+                                or np.any(positions[1:] <= positions[:-1])
                             ):
                                 raise RuntimeError(
                                     f"overwrite payload for {name!r} is invalid"

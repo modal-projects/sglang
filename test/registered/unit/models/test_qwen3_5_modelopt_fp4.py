@@ -18,8 +18,8 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
-    QWEN3_5_KV_SCALE_MAPPER,
     _QWEN3_5_CHECKPOINT_NAME_MAPPER,
+    QWEN3_5_KV_SCALE_MAPPER,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -162,6 +162,7 @@ class TestQwen3_5CheckpointNameMapper(CustomTestCase):
             _QWEN3_5_CHECKPOINT_NAME_MAPPER.apply_list(
                 [
                     "model.language_model.layers.1.mlp.gate.weight",
+                    "model.language_model.mtp.layers.0.eh_proj.weight",
                     "model.visual.blocks.0.attn.qkv.weight",
                     "mtp.layers.0.eh_proj.weight",
                 ]

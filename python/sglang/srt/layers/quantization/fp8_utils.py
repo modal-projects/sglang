@@ -1583,6 +1583,14 @@ def restore_ue8m0_scale_checkpoint_layout(
     if scale is None or not hasattr(scale, "_checkpoint_scale_layout"):
         return
 
+    runtime_scale = getattr(scale, "_reload_runtime_scale", None)
+    if runtime_scale is not None:
+        # A previous load failed before postprocessing restored the runtime
+        # representation. Reloads are serialized, so discard that incomplete
+        # checkpoint view and restart from the preserved runtime buffer.
+        scale.data = runtime_scale
+        del scale._reload_runtime_scale
+
     checkpoint_shape, checkpoint_dtype, checkpoint_format = (
         scale._checkpoint_scale_layout
     )
@@ -1590,8 +1598,6 @@ def restore_ue8m0_scale_checkpoint_layout(
     if tuple(scale.shape) == checkpoint_shape and scale.dtype == checkpoint_dtype:
         return
 
-    if hasattr(scale, "_reload_runtime_scale"):
-        raise RuntimeError("FP8 scale restoration is already in progress.")
     scale._reload_runtime_scale = scale.data
     scale.data = torch.empty(
         checkpoint_shape,

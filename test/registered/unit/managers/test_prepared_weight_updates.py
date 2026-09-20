@@ -208,6 +208,7 @@ class TestPreparedWeightUpdates(CustomTestCase):
         worker.update_weights_from_disk.assert_called_once()
         disk_request = worker.update_weights_from_disk.call_args.args[0]
         self.assertEqual(disk_request.model_path, "/local")
+        self.assertTrue(disk_request.recapture_cuda_graph)
         self.assertEqual(disk_request.weight_version, "4")
         draft_worker.update_weights_from_disk.assert_not_called()
         self.assertEqual(self.versions, ["4"])

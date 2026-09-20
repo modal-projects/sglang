@@ -410,8 +410,7 @@ class Model(msgspec.Struct):
     weight_update_max_compile_group_gb: A[
         float,
         Arg(
-            help="Upper memory bound in GiB for one native weight-load group "
-            "during CPU image compilation. An indivisible model unit may exceed "
-            "it."
+            help="Target size in GiB when partitioning native weight-load groups "
+            "for CPU image compilation. An indivisible model unit may exceed it."
         ),
     ] = 8.0

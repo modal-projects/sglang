@@ -10,10 +10,11 @@ import torch
 import zstandard
 from safetensors.torch import save_file
 
+import sglang.srt.weight_sync.canonical_delta as canonical_delta
 import sglang.srt.weight_sync.host_local_buffer as host_memory
 from sglang.srt.weight_sync.canonical_checkpoint import CanonicalCheckpoint
-from sglang.srt.weight_sync.checksum import calculate_checksum
 from sglang.srt.weight_sync.canonical_delta import CanonicalDeltaTransform
+from sglang.srt.weight_sync.checksum import calculate_checksum
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -161,6 +162,83 @@ def test_xor_lineage_advances_canonical_checkpoint(tmp_path):
         cached.close()
 
 
+def test_xor_lineage_is_folded_before_canonical_mutation(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {"a": torch.arange(1024, dtype=torch.uint8)}
+    v1 = {"a": v0["a"].roll(1)}
+    v2 = {"a": v1["a"].roll(2)}
+    _write_delta(versions, 1, v0, v1, encoding="xor")
+    _write_delta(versions, 2, v1, v2, encoding="xor")
+    cached = _checkpoint(tmp_path, v0)
+    try:
+        stats = CanonicalDeltaTransform(
+            cached,
+            checkpoint_source_dir=versions,
+            target_version=2,
+            host_group=None,
+        ).apply()
+
+        assert stats["folded_tensors"] == 1
+        torch.testing.assert_close(cached.get_tensor("a"), v2["a"])
+    finally:
+        cached.close()
+
+
+def test_mixed_lineage_is_folded_before_canonical_mutation(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {"a": torch.arange(1024, dtype=torch.uint8)}
+    v1 = {"a": v0["a"].roll(1)}
+    v2 = {"a": v1["a"].clone()}
+    v2["a"][[0, 17, 511, 1023]] = torch.tensor([9, 8, 7, 6], dtype=torch.uint8)
+    v3 = {"a": v2["a"].roll(2)}
+    _write_delta(versions, 1, v0, v1, encoding="xor")
+    _write_delta(versions, 2, v1, v2, encoding="overwrite")
+    _write_delta(versions, 3, v2, v3, encoding="xor")
+    cached = _checkpoint(tmp_path, v0)
+    try:
+        with patch.object(
+            canonical_delta.np,
+            "copyto",
+            wraps=np.copyto,
+        ) as copyto:
+            CanonicalDeltaTransform(
+                cached,
+                checkpoint_source_dir=versions,
+                target_version=3,
+                host_group=None,
+            ).apply()
+
+        assert copyto.call_count == 1
+        torch.testing.assert_close(cached.get_tensor("a"), v3["a"])
+    finally:
+        cached.close()
+
+
+def test_folded_xor_cancellation_reconstructs_original_bytes(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {"a": torch.arange(256, dtype=torch.uint8)}
+    v1 = {"a": v0["a"].roll(1)}
+    v2 = {"a": v0["a"].clone()}
+    _write_delta(versions, 1, v0, v1, encoding="xor")
+    _write_delta(versions, 2, v1, v2, encoding="xor")
+    cached = _checkpoint(tmp_path, v0)
+    target = v0["a"].clone()
+    try:
+        CanonicalDeltaTransform(
+            cached,
+            checkpoint_source_dir=versions,
+            target_version=2,
+            host_group=None,
+        )._transform_tensors(
+            {"a": target},
+            description="test",
+        )
+
+        torch.testing.assert_close(target, v2["a"])
+    finally:
+        cached.close()
+
+
 def test_overwrite_delta_advances_canonical_checkpoint(tmp_path):
     versions = tmp_path / "updates"
     v0 = {"a": torch.arange(256, dtype=torch.uint8)}
@@ -180,7 +258,7 @@ def test_overwrite_delta_advances_canonical_checkpoint(tmp_path):
         cached.close()
 
 
-def test_caller_owned_transform_reports_only_dirty_blocks(tmp_path):
+def test_caller_owned_transform_does_not_advance_checkpoint(tmp_path):
     versions = tmp_path / "updates"
     v0 = {"a": torch.arange(256, dtype=torch.uint8)}
     v1 = {"a": v0["a"].clone()}
@@ -189,7 +267,6 @@ def test_caller_owned_transform_reports_only_dirty_blocks(tmp_path):
     cached = _checkpoint(tmp_path, v0)
     target_bytes = _bytes(v0["a"]).copy()
     target = torch.from_numpy(target_bytes)
-    writes = []
     try:
         transform = CanonicalDeltaTransform(
             cached,
@@ -197,14 +274,11 @@ def test_caller_owned_transform_reports_only_dirty_blocks(tmp_path):
             target_version=1,
             host_group=None,
         )
-        transform.transform_tensors(
+        transform._transform_tensors(
             {"a": target},
             description="test",
-            write_tensor=lambda name, _tensor, ranges: writes.append((name, ranges)),
-            write_block_bytes=64,
         )
         torch.testing.assert_close(target, v1["a"])
-        assert writes == [("a", [(0, 64), (128, 256)])]
         assert cached.version == 0
     finally:
         cached.close()

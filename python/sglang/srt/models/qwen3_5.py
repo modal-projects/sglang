@@ -2176,6 +2176,8 @@ _QWEN3_5_CHECKPOINT_NAME_MAPPER = WeightsMapper(
     },
     orig_to_new_prefix={
         "mtp.": None,
+        "model.language_model.mtp.": None,
+        "model.mtp.": None,
         "model.language_model.": "model.",
         "model.visual.": "visual.",
     },

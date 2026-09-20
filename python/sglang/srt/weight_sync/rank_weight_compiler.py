@@ -256,6 +256,8 @@ class RankWeightCompiler:
         for relative_name, tensor in iter_weight_tensors(shadow):
             if tensor.device.type not in {"cpu", "cuda"}:
                 continue
+            if tensor.untyped_storage().nbytes() == 0:
+                continue
             key = _storage_key(tensor)
             if key in seen_storages:
                 continue
@@ -265,6 +267,11 @@ class RankWeightCompiler:
             if segment is None:
                 raise RuntimeError(
                     f"native weight load produced unknown storage {full_name!r}"
+                )
+            if id(segment) in updated:
+                raise RuntimeError(
+                    "native weight load split aliased runtime storage: "
+                    f"name={full_name!r} storage={segment.name!r}"
                 )
             source = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
                 tensor.untyped_storage(),
@@ -460,7 +467,12 @@ class RankWeightCompiler:
                     "canonical checkpoint did not produce every rank-local "
                     f"weight storage: {missing_names[:20]}"
                 )
-            self.image.finish_stage(target_version)
+            commit_segments = [
+                segment
+                for segment in self.image.segments
+                if id(segment) not in preserved_segments
+            ]
+            self.image.finish_stage(target_version, commit_segments)
         except Exception as exc:
             self.image.invalidate(
                 f"compilation of version {target_version} failed: "
@@ -499,6 +511,7 @@ class RankWeightCompiler:
                 for segment in self.image.segments
                 if id(segment) in preserved_segments
             ),
+            "commit_bytes": sum(segment.nbytes for segment in commit_segments),
             "wall_s": round(time.perf_counter() - started, 6),
             "phases": phases,
             "traffic": traffic,

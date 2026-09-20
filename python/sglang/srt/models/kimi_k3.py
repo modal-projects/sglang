@@ -8,7 +8,6 @@
 
 import logging
 import os
-import re
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -140,16 +139,6 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 
-_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)\.")
-
-
-def _expert_mapping_candidates(name, mappings, mappings_by_expert):
-    match = _EXPERT_ID_PATTERN.search(name)
-    if match is None:
-        return mappings
-    return mappings_by_expert.get(int(match.group(1)), ())
-
-
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -250,22 +239,55 @@ def _merge_weights_as_views(
     ws = [m.weight.data for m in mods]
     sizes = [w.shape[0] for w in ws]
     pad = (-sum(sizes)) % pad_rows_to
-    if merged is not None and merged.shape == (
-        sum(sizes) + pad,
-        ws[0].shape[1],
-    ):
+    expected_shape = (sum(sizes) + pad, ws[0].shape[1])
+
+    def aliases(candidate: torch.Tensor) -> bool:
+        if (
+            candidate.shape != expected_shape
+            or candidate.dtype != ws[0].dtype
+            or candidate.device != ws[0].device
+        ):
+            return False
         offset = 0
         for weight, size in zip(ws, sizes):
-            expected = merged[offset : offset + size]
+            expected = candidate[offset : offset + size]
             if (
                 weight.shape != expected.shape
                 or weight.stride() != expected.stride()
                 or weight.data_ptr() != expected.data_ptr()
             ):
-                break
+                return False
             offset += size
-        else:
+        return True
+
+    if merged is not None:
+        if aliases(merged):
             return merged, sizes
+        if merged.shape != expected_shape:
+            raise RuntimeError(
+                "merged runtime weight layout changed: "
+                f"current={tuple(merged.shape)} expected={expected_shape}"
+            )
+        raise RuntimeError("module weights no longer alias the merged runtime buffer")
+
+    first = ws[0]
+    if first.ndim == 2 and first.is_contiguous() and first.storage_offset() == 0:
+        required_nbytes = (
+            first.storage_offset() + expected_shape[0] * expected_shape[1]
+        ) * first.element_size()
+        if required_nbytes == first.untyped_storage().nbytes():
+            existing = torch.empty(
+                0,
+                dtype=first.dtype,
+                device=first.device,
+            ).set_(
+                first.untyped_storage(),
+                first.storage_offset(),
+                expected_shape,
+                (expected_shape[1], 1),
+            )
+            if aliases(existing):
+                return existing, sizes
     if pad:
         ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
     merged = torch.cat(ws, dim=0).contiguous()
@@ -274,6 +296,41 @@ def _merge_weights_as_views(
         m.weight.data = merged[off : off + n]
         off += n
     return merged, sizes
+
+
+def _copy_fused_decode_args(current, updated):
+    """Refresh fused-kernel arguments without changing captured tensor addresses."""
+
+    if current is None:
+        return updated
+    if not isinstance(current, tuple) or len(current) != len(updated):
+        raise RuntimeError("fused decode argument layout changed after initialization")
+    for old, new in zip(current, updated):
+        old_is_tensor = isinstance(old, torch.Tensor)
+        new_is_tensor = isinstance(new, torch.Tensor)
+        if old_is_tensor != new_is_tensor:
+            raise RuntimeError(
+                "fused decode argument layout changed after initialization"
+            )
+        if new_is_tensor and (
+            old.shape != new.shape or old.dtype != new.dtype or old.device != new.device
+        ):
+            raise RuntimeError(
+                "fused decode tensor layout changed after initialization"
+            )
+        if not new_is_tensor and old != new:
+            raise RuntimeError(
+                "fused decode scalar arguments changed after initialization"
+            )
+
+    values = []
+    for old, new in zip(current, updated):
+        if isinstance(new, torch.Tensor):
+            old.copy_(new)
+            values.append(old)
+        else:
+            values.append(old)
+    return tuple(values)
 
 
 # K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
@@ -1800,6 +1857,10 @@ class KimiK3DeltaAttention(nn.Module):
                     and current.device == updated.device
                 ):
                     current.copy_(updated)
+                elif current is not None:
+                    raise RuntimeError(
+                        f"derived KDA weight layout changed for {name!r}"
+                    )
                 else:
                     setattr(self, name, updated)
         else:
@@ -1902,11 +1963,15 @@ class KimiK3DeltaAttention(nn.Module):
                 norm_weight = self.o_norm.weight.data.to(torch.bfloat16).contiguous()
                 f_b_weight = f_b_weight.view(12, 128, 128).contiguous()
                 a_log = layer.A_log.detach().reshape(-1).contiguous()
-                layer._k3_hip_fused_decode_args = (
+                updated_args = (
                     f_b_weight,
                     norm_weight,
                     float(self.o_norm.eps),
                     a_log,
+                )
+                layer._k3_hip_fused_decode_args = _copy_fused_decode_args(
+                    getattr(layer, "_k3_hip_fused_decode_args", None),
+                    updated_args,
                 )
                 kda_fused_decode_aiter_hip.warmup(
                     f_b_weight=f_b_weight,
@@ -1962,26 +2027,13 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
-        current_args = getattr(layer, "_k3_fused_decode_args", None)
-        if (
-            isinstance(current_args, tuple)
-            and len(current_args) == len(updated_args)
-            and all(
-                isinstance(current, torch.Tensor)
-                and current.shape == updated.shape
-                and current.dtype == updated.dtype
-                and current.device == updated.device
-                for current, updated in zip(current_args[:-1], updated_args[:-1])
-            )
-        ):
-            for current, updated in zip(current_args[:-1], updated_args[:-1]):
-                current.copy_(updated)
-            layer._k3_fused_decode_args = (*current_args[:-1], updated_args[-1])
-        else:
-            layer._k3_fused_decode_args = updated_args
+        layer._k3_fused_decode_args = _copy_fused_decode_args(
+            getattr(layer, "_k3_fused_decode_args", None),
+            updated_args,
+        )
         self._kda_fused_decode_ready = True
 
-    def get_additional_weight_tensors(self):
+    def get_derived_weight_tensors(self):
         for name in ("_bfa_w", "_bfa_f_b_w"):
             tensor = getattr(self, name, None)
             if isinstance(tensor, torch.Tensor):
@@ -2384,12 +2436,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
-
-    def get_additional_weight_tensors(self):
-        for name in ("w_kc", "w_vc"):
-            tensor = getattr(self, name, None)
-            if isinstance(tensor, torch.Tensor):
-                yield name, tensor
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -3269,9 +3315,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         else:
             expert_params_mapping = []
-        expert_params_mapping_by_expert = {}
-        for mapping in expert_params_mapping:
-            expert_params_mapping_by_expert.setdefault(mapping[2], []).append(mapping)
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -3364,7 +3410,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     weight_name,
                     expert_id,
                     shard_id,
-                ) in _expert_mapping_candidates(
+                ) in FusedMoE.get_expert_params_mapping_candidates(
                     name,
                     expert_params_mapping,
                     expert_params_mapping_by_expert,
@@ -3472,6 +3518,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     and current.device == value.device
                 ):
                     current.copy_(value)
+                elif current is not None:
+                    raise RuntimeError(
+                        f"derived MLA weight layout changed for {name!r}"
+                    )
                 else:
                     setattr(self_attn, name, value)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):

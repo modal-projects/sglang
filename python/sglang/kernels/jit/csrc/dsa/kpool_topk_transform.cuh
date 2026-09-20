@@ -283,7 +283,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
       const auto group_id = s_indices[group_rank];
       const auto slot = col % pool_size;
       const auto raw_token = group_id * pool_size + slot;
-      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+      // A violated selector invariant must become padding, never an unchecked
+      // page-table access. This is defense in depth around the radix selector;
+      // valid selections are always in [0, length).
+      dst[col] = (group_id >= 0 && group_id < length)
+          ? transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset)
+          : -1;
     } else if (append_tail && col < history_len + tail_count) {
       const auto raw_token = length * pool_size + (col - history_len);
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);

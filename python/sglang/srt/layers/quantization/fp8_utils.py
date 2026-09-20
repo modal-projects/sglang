@@ -1760,25 +1760,25 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     assert sf_packed.dtype == torch.int32
 
     mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    num_blocks = ceil_div(mn_repeat_128, block_size)
     k = k_div_4 * 4
 
     # packed u8 -> fp32
     sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
-    # remove repeat
-    sf_reshaped = sf_fp32.view(mn, block_size, k)
-    sf_unrepeated = sf_reshaped[:, 0:1, :]
-    if not torch.all(sf_unrepeated == sf_reshaped):
+    # Each scale row is repeated for up to 128 weight rows. The final group is
+    # shorter when the weight's M dimension is not divisible by 128.
+    sf_unrepeated = sf_fp32[::block_size].contiguous()
+    repeated = sf_unrepeated.repeat_interleave(block_size, dim=0)[:mn_repeat_128]
+    if not torch.all(sf_fp32 == repeated):
         from sglang.srt.debug_utils.dumper import get_tensor_info
 
         raise AssertionError(
-            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+            f"sf_fp32 != repeated ({get_tensor_info(sf_fp32)=} {get_tensor_info(repeated)=})"
         )
-    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
 
-    assert sf_unrepeated.shape == (mn, k)
+    assert sf_unrepeated.shape == (num_blocks, k)
     return sf_unrepeated
 
 

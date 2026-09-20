@@ -221,7 +221,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_rel_acq(/*n=*/0);
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -254,7 +254,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_rel_acq(/*n=*/0);
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;

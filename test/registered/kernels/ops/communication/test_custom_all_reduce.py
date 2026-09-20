@@ -193,11 +193,13 @@ def test_custom_all_reduce(
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
+        produced_inputs: list[torch.Tensor] = []
         outs: list[torch.Tensor] = []
         with comm.capture():
             with torch.cuda.graph(graph):
                 for i in range(TEST_LAYERS):
-                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                    produced_inputs.append(graph_inp[i].clone())
+                    outs.append(comm.custom_all_reduce(produced_inputs[-1]))
                 out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 

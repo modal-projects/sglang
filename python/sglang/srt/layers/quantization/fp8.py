@@ -64,8 +64,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    record_ue8m0_scale_checkpoint_layout,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    restore_ue8m0_scale_checkpoint_layout,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
 )
@@ -700,7 +702,13 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant and not self.use_mxfp8:
+            restore_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.use_mxfp8:
+            record_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -1521,7 +1529,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant and not self.use_mxfp8 and not self.is_fp4_expert:
+            restore_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
+            restore_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.use_mxfp8 and not self.is_fp4_expert:
+            record_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
+            record_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1887,7 +1904,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale = None
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
-
         if not (
             (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
         ):
@@ -1968,7 +1984,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return scale.data
 
         def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
-
             weight = weight.contiguous()
             _, _, k = weight.shape
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
@@ -2612,7 +2627,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

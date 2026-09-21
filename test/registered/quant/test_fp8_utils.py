@@ -75,6 +75,23 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
 
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
+    def test_round_trip_with_partial_final_block(self):
+        mn = 2624
+        k_blocks = 48
+        exponents = torch.randint(
+            1,
+            255,
+            ((mn + 127) // 128, k_blocks),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        sf_fp32_original = (exponents << 23).view(torch.float32)
+
+        sf_packed_original = transform_scale_ue8m0(sf_fp32_original, mn=mn)
+        sf_fp32_recreated = inverse_transform_scale_ue8m0(sf_packed_original, mn=mn)
+
+        self.assertTrue(torch.equal(sf_fp32_original, sf_fp32_recreated))
+
     def test_round_trip(self):
         for _ in range(100):
             weight_bf16 = torch.randn(

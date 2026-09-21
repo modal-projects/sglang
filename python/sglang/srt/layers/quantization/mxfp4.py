@@ -317,7 +317,6 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
@@ -356,7 +355,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -440,6 +438,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
                     "or SM120."
                 )
+
+    def supports_deferred_weight_copies(self) -> bool:
+        return True
 
     def create_weights(
         self,
@@ -1586,7 +1587,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import (
             DispatchOutputChecker,
             StandardCombineInput,
@@ -1811,7 +1811,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         w13_weight = torch.nn.Parameter(

@@ -100,6 +100,10 @@ class LinearMethodBase(QuantizeMethodBase):
 class FusedMoEMethodBase(QuantizeMethodBase):
     runner: MoeRunner | None = None
 
+    def supports_deferred_weight_copies(self) -> bool:
+        """Return whether independent expert-weight copies may be deferred."""
+        return False
+
     def create_weights(
         self,
         layer: torch.nn.Module,

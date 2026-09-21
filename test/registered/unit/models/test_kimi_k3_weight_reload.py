@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attn_residual import get_cw
+from sglang.srt.model_loader.utils import STABLE_WEIGHT_SOURCE_ATTR
 from sglang.srt.models.kimi_k3 import (
     KimiK3DecoderLayer,
     KimiK3DeltaAttention,
@@ -15,6 +16,57 @@ from sglang.srt.models.kimi_k3 import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+class _BatchOwner:
+    def __init__(self):
+        self.immediate_calls = []
+        self.batched_calls = []
+
+    def supports_deferred_weight_copies(self):
+        return True
+
+    def weight_loader(self, *args, **kwargs):
+        self.immediate_calls.append((args, kwargs))
+
+    def load_weights_batched(self, calls, *, executor):
+        self.batched_calls.extend(calls)
+
+
+def _weight_loading_model(owner):
+    param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    param.weight_loader = owner.weight_loader
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            linear_attn_config={},
+            is_moe=True,
+            num_experts=1,
+            num_hidden_layers=1,
+            is_linear_attn=False,
+        ),
+        model=SimpleNamespace(start_layer=0, end_layer=1),
+        named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)],
+        post_load_weights=lambda **_: None,
+    )
+
+
+def test_load_weights_only_defers_explicitly_stable_sources():
+    owner = _BatchOwner()
+    model = _weight_loading_model(owner)
+    stable = torch.ones(1)
+    setattr(stable, STABLE_WEIGHT_SOURCE_ATTR, True)
+
+    KimiK3LinearForCausalLM.load_weights(
+        model,
+        [
+            ("model.layers.0.mlp.experts.0.w1.weight", stable),
+            ("model.layers.0.mlp.experts.0.w3.weight", torch.ones(1)),
+        ],
+    )
+
+    assert len(owner.batched_calls) == 1
+    assert owner.batched_calls[0][0][1] is stable
+    assert len(owner.immediate_calls) == 1
 
 
 class _FakeMoE:

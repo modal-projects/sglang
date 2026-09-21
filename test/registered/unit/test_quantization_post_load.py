@@ -45,6 +45,22 @@ class TestModulePostLoadStaging(unittest.TestCase):
         torch.testing.assert_close(module.weight, torch.arange(4.0).reshape(2, 2) + 1)
         torch.testing.assert_close(module.scale, torch.full((2,), 3.0))
 
+    def test_non_blocking_staging_is_complete_on_context_exit(self):
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.arange(4.0).reshape(2, 2).pin_memory())
+
+        with torch.cuda.stream(torch.cuda.Stream(device=PROCESS_DEVICE)):
+            with stage_module_for_post_load(
+                module,
+                PROCESS_DEVICE,
+                pin_memory=True,
+                non_blocking=True,
+            ):
+                module.weight.data.add_(1)
+
+        self.assertEqual(module.weight.device.type, "cpu")
+        torch.testing.assert_close(module.weight, torch.arange(4.0).reshape(2, 2) + 1)
+
     def test_restores_replacements_and_new_state_with_mixed_residency(self):
         module = nn.Module()
         module.weight = nn.Parameter(torch.ones(2, 2))

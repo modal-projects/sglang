@@ -61,6 +61,7 @@ def _copy_data_to_device(
     device: torch.device,
     *,
     pin_memory: bool,
+    non_blocking: bool,
 ) -> torch.Tensor:
     if data.device == device:
         return data
@@ -73,9 +74,9 @@ def _copy_data_to_device(
             device=device,
             pin_memory=pin_memory,
         )
-        result.copy_(data)
+        result.copy_(data, non_blocking=non_blocking)
         return result
-    return data.to(device)
+    return data.to(device, non_blocking=non_blocking)
 
 
 def _restore_tensor(
@@ -84,6 +85,7 @@ def _restore_tensor(
     original_state: _TensorState | None,
     *,
     pin_memory: bool,
+    non_blocking: bool,
 ) -> None:
     if tensor.is_meta:
         raise RuntimeError("Post-load processing produced a meta tensor")
@@ -94,7 +96,10 @@ def _restore_tensor(
         and original_state.staged_data is not None
         and _same_staged_data(tensor.data, original_state.staged_data)
     ):
-        original_state.original_data.copy_(tensor.data)
+        original_state.original_data.copy_(
+            tensor.data,
+            non_blocking=non_blocking,
+        )
         tensor.data = original_state.original_data
         return
 
@@ -102,6 +107,7 @@ def _restore_tensor(
         tensor.data,
         destination,
         pin_memory=pin_memory,
+        non_blocking=non_blocking,
     )
 
 
@@ -111,6 +117,7 @@ def stage_module_for_post_load(
     process_device: torch.device,
     *,
     pin_memory: bool = False,
+    non_blocking: bool = False,
 ) -> Iterator[nn.Module]:
     """Temporarily stage a module's registered state for a post-load hook.
 
@@ -156,7 +163,10 @@ def stage_module_for_post_load(
     try:
         for state in tensor_states.values():
             if state.origin != process_device:
-                state.staged_data = state.tensor.data.to(process_device)
+                state.staged_data = state.tensor.data.to(
+                    process_device,
+                    non_blocking=non_blocking,
+                )
                 state.tensor.data = state.staged_data
         yield module
     finally:
@@ -210,9 +220,12 @@ def stage_module_for_post_load(
                     destination,
                     original_state,
                     pin_memory=pin_memory,
+                    non_blocking=non_blocking,
                 )
             except Exception as error:
                 restore_errors.append(error)
+        if non_blocking and process_device.type == "cuda":
+            torch.cuda.current_stream(process_device).synchronize()
         if len(restore_errors) == 1:
             raise restore_errors[0]
         if restore_errors:

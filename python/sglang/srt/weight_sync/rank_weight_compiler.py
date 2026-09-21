@@ -7,13 +7,13 @@ import logging
 import math
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.canonical_checkpoint import CanonicalCheckpoint
 from sglang.srt.weight_sync.rank_weight_image import (
@@ -328,18 +328,23 @@ class RankWeightCompiler:
         del weights
 
         phase_started = time.perf_counter()
-        stream_context = (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        )
-        with stream_context:
+        if self._stream is None:
             DefaultModelLoader.postprocess_weights(
                 prepared.shadow,
                 self.image.device,
             )
-        if self._stream is not None:
-            self._stream.synchronize()
+        else:
+            # Stage one bounded load group at a time so host/device traffic is
+            # submitted as a batch rather than synchronized once per module.
+            with torch.cuda.stream(self._stream):
+                with stage_module_for_post_load(
+                    prepared.shadow,
+                    self.image.device,
+                    pin_memory=True,
+                    non_blocking=True,
+                ):
+                    for _, module in prepared.shadow.named_modules():
+                        DefaultModelLoader.process_module_weights_after_loading(module)
         postprocess_s = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()

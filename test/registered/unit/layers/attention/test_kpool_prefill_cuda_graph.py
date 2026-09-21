@@ -19,8 +19,11 @@ class _Indexer:
 
 
 class TestKPoolPrefillCudaGraph(unittest.TestCase):
-    def _run(self, *, live_rows, capture_rows, result):
-        forward_batch = types.SimpleNamespace(extend_num_tokens=live_rows)
+    def _run(self, *, live_rows, capture_rows, result, real_rows=None):
+        forward_batch = types.SimpleNamespace(
+            extend_num_tokens=live_rows,
+            global_num_token_non_padded_cpu=real_rows,
+        )
         indexer = _Indexer(result)
         x = torch.zeros(capture_rows, 2)
         q_lora = torch.zeros(capture_rows, 2)
@@ -35,7 +38,10 @@ class TestKPoolPrefillCudaGraph(unittest.TestCase):
             _kpool_indexer_prefill_with_output(
                 indexer, x, q_lora, positions, output, layer_id=7
             )
-        self.assertEqual(indexer.call["x"].shape[0], live_rows)
+        self.assertEqual(
+            indexer.call["x"].shape[0],
+            live_rows if real_rows is None else real_rows,
+        )
         return output
 
     def test_copies_live_result_and_masks_capture_padding(self):
@@ -49,6 +55,17 @@ class TestKPoolPrefillCudaGraph(unittest.TestCase):
         output = self._run(live_rows=1, capture_rows=4, result=result)
         torch.testing.assert_close(output[0], result[0])
         torch.testing.assert_close(output[1:], torch.full((3, 3), -1))
+
+    def test_masks_dp_attention_padding_after_real_result(self):
+        result = torch.arange(57, dtype=torch.int32).reshape(19, 3)
+        output = self._run(
+            live_rows=20,
+            real_rows=19,
+            capture_rows=20,
+            result=result,
+        )
+        torch.testing.assert_close(output[:19], result)
+        torch.testing.assert_close(output[19:], torch.full((1, 3), -1))
 
     def test_rejects_unrelated_row_count(self):
         result = torch.zeros(2, 3, dtype=torch.int32)

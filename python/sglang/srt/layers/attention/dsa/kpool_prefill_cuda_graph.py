@@ -26,11 +26,18 @@ def _kpool_indexer_prefill_with_output(
         raise ValueError(f"Invalid pooled-indexer prefill token count: {n}")
     if n > q_lora.shape[0] or n > positions.shape[0]:
         raise ValueError("Pooled-indexer prefill inputs have inconsistent rows")
+    real_n = forward_batch.global_num_token_non_padded_cpu
+    real_n = n if real_n is None else real_n
+    if not 0 <= real_n <= n:
+        raise ValueError(
+            "Invalid pooled-indexer non-padded token count: "
+            f"real={real_n}, padded={n}"
+        )
     return_indices = output.shape[0] != 0
     result = indexer._forward_cuda_impl(
-        x=x[:n],
-        q_lora=q_lora[:n],
-        positions=positions[:n],
+        x=x[:real_n],
+        q_lora=q_lora[:real_n],
+        positions=positions[:real_n],
         forward_batch=forward_batch,
         layer_id=layer_id,
         return_indices=return_indices,
@@ -42,7 +49,7 @@ def _kpool_indexer_prefill_with_output(
     # therefore returns the captured bucket instead. Both layouts describe the
     # same live prefix; only that prefix may flow into the following captured
     # attention segment.
-    expected_rows = {n, output.shape[0]}
+    expected_rows = {real_n, n, output.shape[0]}
     if (
         result is None
         or result.ndim != 2
@@ -52,12 +59,12 @@ def _kpool_indexer_prefill_with_output(
         result_shape = None if result is None else tuple(result.shape)
         raise ValueError(
             "Pooled-indexer prefill returned an unexpected top-k shape: "
-            f"got {result_shape}, expected ({n}, {output.shape[1]}) or "
-            f"{tuple(output.shape)}"
+            f"got {result_shape}, expected rows in {sorted(expected_rows)} "
+            f"with width {output.shape[1]}"
         )
     # The following captured attention segment reads this stable padded buffer.
-    output[:n].copy_(result[:n])
-    output[n:].fill_(-1)
+    output[:real_n].copy_(result[:real_n])
+    output[real_n:].fill_(-1)
 
 
 def _kpool_indexer_prefill_capture_stub(

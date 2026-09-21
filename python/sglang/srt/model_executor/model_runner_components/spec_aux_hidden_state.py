@@ -243,7 +243,10 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().tp_size,
+            # The draft worker temporarily enters the attention TP group. With
+            # DP attention this is smaller than the global model TP group, so
+            # size its per-rank KV cell against the group that owns the shard.
+            tp_size=get_parallel().attn_tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

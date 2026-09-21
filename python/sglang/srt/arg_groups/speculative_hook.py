@@ -228,6 +228,36 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
+def _validate_dflash_dp_attention(cfg) -> None:
+    """Validate the process-group layout DFlash uses while drafting.
+
+    DFlash temporarily runs candidate selection in the attention TP group. On
+    CUDA, a globally TP-sharded target LM head would therefore expose only one
+    subset of the vocabulary to each DP group. ``enable_dp_lm_head`` shards the
+    head over attention TP instead and replicates it across DP groups.
+
+    NPU retains its existing validated path. XPU DP attention has not been
+    validated, so keep rejecting it rather than widening support implicitly.
+    """
+    if not cfg.enable_dp_attention:
+        return
+
+    if cfg.device == "npu":
+        return
+
+    if not cfg.device.startswith("cuda"):
+        raise ValueError(
+            "DFLASH speculative decoding with dp attention is only supported "
+            "on CUDA or NPU devices."
+        )
+
+    if cfg.dp_size > 1 and not cfg.enable_dp_lm_head:
+        raise ValueError(
+            "DFLASH with dp attention on CUDA requires --enable-dp-lm-head "
+            "so every DP group selects candidates from the full vocabulary."
+        )
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -244,12 +274,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
-        )
+    _validate_dflash_dp_attention(cfg)
 
     if cfg.pp_size != 1:
         raise ValueError(

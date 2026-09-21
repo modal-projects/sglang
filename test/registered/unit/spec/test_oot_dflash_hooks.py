@@ -5,6 +5,7 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _resolve_dflash_draft_attention_backend,
+    _validate_dflash_dp_attention,
 )
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.server_args import ServerArgs
@@ -119,6 +120,46 @@ class TestOOTDFlashHooks(CustomTestCase):
                     None, None, None, None, 0, 0, None
                 )
             self.assertIs(result, expected)
+
+
+class TestDFlashDpAttentionGate(CustomTestCase):
+    def _cfg(
+        self,
+        *,
+        device: str = "cuda",
+        dp_size: int = 2,
+        enable_dp_lm_head: bool = True,
+        enable_dp_attention: bool = True,
+    ) -> Mock:
+        return Mock(
+            device=device,
+            dp_size=dp_size,
+            enable_dp_lm_head=enable_dp_lm_head,
+            enable_dp_attention=enable_dp_attention,
+        )
+
+    def test_cuda_dp_requires_dp_lm_head(self):
+        with self.assertRaisesRegex(ValueError, "enable-dp-lm-head"):
+            _validate_dflash_dp_attention(self._cfg(enable_dp_lm_head=False))
+
+        _validate_dflash_dp_attention(self._cfg())
+
+    def test_degenerate_cuda_dp_does_not_require_replicated_head(self):
+        _validate_dflash_dp_attention(self._cfg(dp_size=1, enable_dp_lm_head=False))
+
+    def test_npu_keeps_existing_dp_path_and_xpu_remains_rejected(self):
+        _validate_dflash_dp_attention(self._cfg(device="npu", enable_dp_lm_head=False))
+        with self.assertRaisesRegex(ValueError, "CUDA or NPU"):
+            _validate_dflash_dp_attention(self._cfg(device="xpu"))
+
+    def test_disabled_dp_attention_is_unrestricted(self):
+        _validate_dflash_dp_attention(
+            self._cfg(
+                device="xpu",
+                enable_dp_attention=False,
+                enable_dp_lm_head=False,
+            )
+        )
 
 
 if __name__ == "__main__":

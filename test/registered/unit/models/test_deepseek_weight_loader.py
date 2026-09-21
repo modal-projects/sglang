@@ -5,9 +5,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.model_loader.utils import STABLE_WEIGHT_SOURCE_ATTR
 from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    NextNDisabledConfig,
     _normalize_modelopt_fp4_expert_weight,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -121,6 +123,63 @@ class TestDerivedMLAWeights(unittest.TestCase):
         torch.testing.assert_close(attention.w_scale, torch.tensor(3.0))
 
 
+class _BatchOwner:
+    def __init__(self):
+        self.immediate_calls = []
+        self.batched_calls = []
+        self.call_order = []
+
+    def supports_deferred_weight_copies(self):
+        return True
+
+    def weight_loader(self, *args, **kwargs):
+        self.immediate_calls.append((args, kwargs))
+        self.call_order.append("immediate")
+
+    def load_weights_batched(self, calls, *, executor):
+        self.batched_calls.extend(calls)
+        self.call_order.append("batched")
+
+
+def _deepseek_weight_loading_model(owner):
+    param = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    param.weight_loader = owner.weight_loader
+    return SimpleNamespace(
+        config=SimpleNamespace(n_routed_experts=1),
+        model=SimpleNamespace(),
+        num_fused_shared_experts=0,
+        quant_config=SimpleNamespace(get_name=lambda: "modelopt_fp4"),
+        _initialize_nextn_conf=lambda _: NextNDisabledConfig(),
+        _maybe_quant_weights_to_fp8_ue8m0=lambda weights, *_: weights,
+        named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)],
+        post_load_weights=lambda **_: None,
+    )
+
+
+class TestDeepseekStableWeightBatching(unittest.TestCase):
+    def test_only_stable_sources_are_deferred(self):
+        owner = _BatchOwner()
+        model = _deepseek_weight_loading_model(owner)
+        stable = torch.ones(1)
+        setattr(stable, STABLE_WEIGHT_SOURCE_ATTR, True)
+
+        DeepseekV2WeightLoaderMixin.do_load_weights(
+            model,
+            [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", stable),
+                (
+                    "model.layers.0.mlp.experts.0.up_proj.weight",
+                    torch.ones(1),
+                ),
+            ],
+        )
+
+        self.assertEqual(len(owner.batched_calls), 1)
+        self.assertIs(owner.batched_calls[0][0][1], stable)
+        self.assertEqual(len(owner.immediate_calls), 1)
+        self.assertEqual(owner.call_order, ["batched", "immediate"])
+
+
 class TestModelOptFp4ExpertWeightNormalization(unittest.TestCase):
     def test_scale_names(self):
         weight = torch.empty(1)
@@ -142,6 +201,7 @@ class TestModelOptFp4ExpertWeightNormalization(unittest.TestCase):
     )
     def test_fp4_storage_is_viewed_as_packed_uint8(self):
         weight = torch.empty(4, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+        setattr(weight, STABLE_WEIGHT_SOURCE_ATTR, True)
         setattr(weight, RUNAI_STREAMER_TENSOR_ATTR, True)
 
         _, packed_weight = _normalize_modelopt_fp4_expert_weight(
@@ -152,6 +212,7 @@ class TestModelOptFp4ExpertWeightNormalization(unittest.TestCase):
         self.assertEqual(packed_weight.dtype, torch.uint8)
         self.assertEqual(packed_weight.shape, weight.shape)
         self.assertEqual(packed_weight.data_ptr(), weight.data_ptr())
+        self.assertTrue(getattr(packed_weight, STABLE_WEIGHT_SOURCE_ATTR))
         self.assertTrue(getattr(packed_weight, RUNAI_STREAMER_TENSOR_ATTR))
 
 

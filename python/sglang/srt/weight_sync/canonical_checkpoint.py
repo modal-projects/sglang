@@ -13,6 +13,7 @@ from typing import Literal
 
 import torch
 
+from sglang.srt.model_loader.utils import STABLE_WEIGHT_SOURCE_ATTR
 from sglang.srt.weight_sync.file_io import read_file_into_tensor
 from sglang.srt.weight_sync.host_local_buffer import HostLocalSharedBuffer
 from sglang.srt.weight_sync.safetensors_buffer import (
@@ -363,7 +364,9 @@ class CanonicalCheckpoint:
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"canonical checkpoint has no tensor {name!r}")
-        return self._files[filename].get_tensor(name)
+        tensor = self._files[filename].get_tensor(name)
+        setattr(tensor, STABLE_WEIGHT_SOURCE_ATTR, True)
+        return tensor
 
     def get_tensor_bytes(self, name: str) -> torch.Tensor:
         self._require_readable()

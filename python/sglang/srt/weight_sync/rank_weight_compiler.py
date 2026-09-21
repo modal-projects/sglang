@@ -7,7 +7,6 @@ import logging
 import math
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +23,7 @@ from sglang.srt.weight_sync.weight_load_isolation import (
     WeightLoadGroup,
     build_weight_load_groups,
     build_weight_loader_view,
+    clone_module_for_weight_loading,
 )
 
 logger = logging.getLogger(__name__)
@@ -328,29 +328,57 @@ class RankWeightCompiler:
         del weights
 
         phase_started = time.perf_counter()
-        stream_context = (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        )
-        with stream_context:
+        processed_shadow = prepared.shadow
+        device_stage_bytes = 0
+        if self._stream is None:
             DefaultModelLoader.postprocess_weights(
-                prepared.shadow,
+                processed_shadow,
                 self.image.device,
             )
-        if self._stream is not None:
+        else:
+            # Post-load transforms are GPU kernels. Stage the bounded group as
+            # one device graph so tensor copies can overlap, then copy the
+            # transformed runtime layout back to the persistent host image.
+            def stage_storage(
+                _tensor: torch.Tensor,
+                source_bytes: torch.Tensor,
+            ) -> torch.Tensor:
+                nonlocal device_stage_bytes
+                staged = torch.empty(
+                    source_bytes.numel(),
+                    dtype=torch.uint8,
+                    device=self.image.device,
+                )
+                staged.copy_(source_bytes, non_blocking=True)
+                device_stage_bytes += source_bytes.numel()
+                return staged
+
+            with torch.cuda.stream(self._stream):
+                processed_shadow = clone_module_for_weight_loading(
+                    prepared.shadow,
+                    target_device=self.image.device,
+                    copy_data=True,
+                    storage_factory=stage_storage,
+                )
+                DefaultModelLoader.postprocess_weights(
+                    processed_shadow,
+                    self.image.device,
+                )
             self._stream.synchronize()
         postprocess_s = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
         updated, group_bytes, cpu_copy_bytes, device_copy_bytes = (
-            self._copy_shadow_to_image(prepared.group.path, prepared.shadow)
+            self._copy_shadow_to_image(prepared.group.path, processed_shadow)
         )
         image_copy_s = time.perf_counter() - phase_started
+        if processed_shadow is not prepared.shadow:
+            del processed_shadow
         stats = {
             "path": prepared.group.path,
             "checkpoint_tensors": len(prepared.checkpoint_names),
             "bytes": group_bytes,
+            "device_stage_bytes": device_stage_bytes,
             "cpu_image_copy_bytes": cpu_copy_bytes,
             "device_image_copy_bytes": device_copy_bytes,
             "restore_s": round(restore_s, 6),
@@ -492,6 +520,7 @@ class RankWeightCompiler:
         traffic = {
             name: sum(group[name] for group in group_stats)
             for name in (
+                "device_stage_bytes",
                 "cpu_image_copy_bytes",
                 "device_image_copy_bytes",
             )

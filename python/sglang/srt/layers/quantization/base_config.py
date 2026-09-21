@@ -50,6 +50,10 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before an in-place weight reload."""
         return
 
+    def weight_staging_postprocess_device(self, layer: nn.Module) -> str:
+        """Return the device required for post-load transforms during staging."""
+        return "cuda"
+
     def get_derived_weight_tensors(
         self, layer: nn.Module
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -99,6 +103,10 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
     runner: MoeRunner | None = None
+
+    def supports_deferred_weight_copies(self) -> bool:
+        """Return whether independent expert-weight copies may be deferred."""
+        return False
 
     def create_weights(
         self,

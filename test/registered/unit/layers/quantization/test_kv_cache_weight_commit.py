@@ -16,7 +16,9 @@ def test_weight_commit_refreshes_runtime_kv_scales():
         v_scale_float=1.0,
     )
 
-    BaseKVCacheMethod(None).process_weights_after_weight_commit(layer)
+    method = BaseKVCacheMethod(None)
+    method.process_weights_after_weight_commit(layer)
 
     assert layer.k_scale_float == 2.0
     assert layer.v_scale_float == 3.0
+    assert method.weight_staging_postprocess_device(layer) == "cpu"

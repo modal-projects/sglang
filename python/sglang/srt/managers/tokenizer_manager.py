@@ -3031,6 +3031,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 labels["priority"] = str(priority)
         if (
             not state.ttft_observed
+            and completion_tokens > 0
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             state.ttft_observed = True

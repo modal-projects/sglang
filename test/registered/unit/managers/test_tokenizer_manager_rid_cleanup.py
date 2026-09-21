@@ -836,6 +836,44 @@ class TestRequestTpot(CustomTestCase):
             {"model_name": "test", "stream": str(stream).lower()},
         )
 
+    def _ttft_count(self):
+        return sum(
+            sample.value
+            for metric in self.registry.collect()
+            for sample in metric.samples
+            if sample.name == "sglang:time_to_first_token_seconds_count"
+        )
+
+    def test_zero_token_completion_has_no_ttft(self):
+        state = _make_req_state()
+        state.obj.log_metrics = True
+        state.obj.custom_labels = None
+        state.obj.sampling_params = {}
+        self.tm.rid_to_state[state.obj.rid] = state
+        output = _make_batch_str_output(state.obj.rid)
+        self.assertEqual(output.completion_tokens, [0])
+        asyncio.run(self.tm._handle_batch_output(output))
+        self.assertTrue(state.finished)
+        self.assertEqual(self._ttft_count(), 0)
+        self.assertIsNone(self._sample("_count"))
+
+    def test_abort_after_first_token_keeps_ttft(self):
+        state = _make_req_state()
+        state.obj.log_metrics = True
+        state.obj.custom_labels = None
+        state.obj.sampling_params = {}
+        self.tm.rid_to_state[state.obj.rid] = state
+        first = _make_batch_str_output(state.obj.rid, _NOT_FINISHED)
+        first.completion_tokens = [1]
+        first.output_ids = [[1]]
+        asyncio.run(self.tm._handle_batch_output(first))
+        self.assertEqual(self._ttft_count(), 1)
+        final = _make_batch_str_output(state.obj.rid, {"type": "abort"})
+        final.completion_tokens = [1]
+        asyncio.run(self.tm._handle_batch_output(final))
+        self.assertEqual(self._ttft_count(), 1)
+        self.assertIsNone(self._sample("_count"))
+
     def test_handler_records_one_request_observation(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
@@ -883,6 +921,7 @@ class TestRequestTpot(CustomTestCase):
                 asyncio.run(self.tm._handle_batch_output(final))
                 self.assertEqual(self._sample("_count", stream), 1)
 
+        self.assertEqual(self._ttft_count(), 2)
         collector = self.tm.metrics_collector
         self.assertEqual(
             collector.histogram_request_tpot._upper_bounds,

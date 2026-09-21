@@ -441,6 +441,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def supports_deferred_weight_copies(self) -> bool:
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,

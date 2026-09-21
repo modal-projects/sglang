@@ -1077,13 +1077,22 @@ class Glm5NextModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm5NextForConditionalGeneration(nn.Module):
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.language_model.": "model.",
-            "model.visual": "visual",
-        }
+_GLM5_NEXT_HF_TO_SGLANG_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "model.language_model.": "model.",
+        "model.visual": "visual",
+    }
+)
+
+
+def _glm5_next_checkpoint_name_mapper(num_hidden_layers: int) -> WeightsMapper:
+    return _GLM5_NEXT_HF_TO_SGLANG_MAPPER | WeightsMapper(
+        orig_to_new_prefix={f"model.layers.{num_hidden_layers}.": None}
     )
+
+
+class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = _GLM5_NEXT_HF_TO_SGLANG_MAPPER
 
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -1112,6 +1121,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
+        self.checkpoint_name_mapper = _glm5_next_checkpoint_name_mapper(
+            text_config.num_hidden_layers
+        )
         self.encoder_only = bool(getattr(config, "encoder_only", False))
         self.language_only = bool(getattr(config, "language_only", False))
 
@@ -1403,6 +1415,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1507,7 +1522,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 break
             else:
                 is_expert_weight = False
-                for mapping in expert_params_mapping:
+                for mapping in FusedMoE.get_expert_params_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
+                ):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

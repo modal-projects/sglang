@@ -166,9 +166,9 @@ def _use_plain_loader(monkeypatch):
     )
 
 
-def test_checkpoint_groups_use_native_mapper_and_explicit_exclusions():
+def test_checkpoint_groups_use_checkpoint_mapper_and_explicit_exclusions():
     model = _LoadableModel()
-    model.hf_to_sglang_mapper = WeightsMapper(
+    model.checkpoint_name_mapper = WeightsMapper(
         orig_to_new_prefix={
             "checkpoint.": "layer.",
             "draft.": None,
@@ -193,6 +193,22 @@ def test_checkpoint_groups_use_native_mapper_and_explicit_exclusions():
     )
     with pytest.raises(ValueError, match="draft.weight"):
         compiler.validate_delta_names(["checkpoint.weight", "draft.weight"])
+
+
+def test_checkpoint_groups_fall_back_to_native_mapper():
+    model = _LoadableModel()
+    model.hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"checkpoint.": "layer."}
+    )
+
+    groups, ignored = _checkpoint_groups(
+        model,
+        ["checkpoint.weight"],
+        [WeightLoadGroup("layer", 32)],
+    )
+
+    assert groups == {"layer": ["checkpoint.weight"]}
+    assert ignored == set()
 
 
 def test_checkpoint_groups_reject_unmapped_names():

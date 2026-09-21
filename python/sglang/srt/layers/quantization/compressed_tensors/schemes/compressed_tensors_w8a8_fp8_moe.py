@@ -82,6 +82,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # ampere and up
         return 80
 
+    def supports_deferred_weight_copies(self) -> bool:
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -370,7 +373,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 

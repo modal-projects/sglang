@@ -37,10 +37,26 @@ def _kpool_indexer_prefill_with_output(
     )
     if not return_indices:
         return
-    if result is None or result.shape != (n, output.shape[1]):
-        raise ValueError("Pooled-indexer prefill returned an unexpected top-k shape")
+    # Most eager indexer paths return only the live rows. The short-sequence
+    # fast path derives its row count from graph-padded attention metadata and
+    # therefore returns the captured bucket instead. Both layouts describe the
+    # same live prefix; only that prefix may flow into the following captured
+    # attention segment.
+    expected_rows = {n, output.shape[0]}
+    if (
+        result is None
+        or result.ndim != 2
+        or result.shape[0] not in expected_rows
+        or result.shape[1] != output.shape[1]
+    ):
+        result_shape = None if result is None else tuple(result.shape)
+        raise ValueError(
+            "Pooled-indexer prefill returned an unexpected top-k shape: "
+            f"got {result_shape}, expected ({n}, {output.shape[1]}) or "
+            f"{tuple(output.shape)}"
+        )
     # The following captured attention segment reads this stable padded buffer.
-    output[:n].copy_(result)
+    output[:n].copy_(result[:n])
     output[n:].fill_(-1)
 
 

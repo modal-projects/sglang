@@ -9,6 +9,7 @@
 import logging
 import os
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -96,6 +97,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_loader.utils import (
+    STABLE_WEIGHT_SOURCE_ATTR,
+    DeferredWeightCopyBatch,
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -3325,13 +3330,24 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        deferred_copies = DeferredWeightCopyBatch()
+
+        def load_weight(weight_loader, *args, **kwargs) -> None:
+            if not deferred_copies.defer(weight_loader, *args, **kwargs):
+                # Preserve native loader order when stable canonical tensors and
+                # ephemeral streamed tensors occur in the same load sequence.
+                deferred_copies.execute()
+                weight_loader(*args, **kwargs)
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
             if name.endswith(".weight_scale") and loaded_weight.ndim == 4:
-                loaded_weight = loaded_weight[:, 0, :, 0]
+                source = loaded_weight
+                loaded_weight = source[:, 0, :, 0]
+                if getattr(source, STABLE_WEIGHT_SOURCE_ATTR, False):
+                    setattr(loaded_weight, STABLE_WEIGHT_SOURCE_ATTR, True)
 
             layer_id = get_layer_id(name)
             if layer_id is not None and (
@@ -3406,7 +3422,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 name = _maybe_map_fp8_pb_scale_name(name, params_dict)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                load_weight(weight_loader, param, loaded_weight, shard_id)
                 break
             else:
                 for (
@@ -3429,7 +3445,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                         break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(
+                    load_weight(
+                        weight_loader,
                         param,
                         loaded_weight,
                         name,
@@ -3458,9 +3475,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight, **kwargs)
+                        load_weight(weight_loader, param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        with ThreadPoolExecutor() as executor:
+            deferred_copies.execute(executor=executor)
         self.post_load_weights(weight_names=loaded_params)
         return loaded_params
 

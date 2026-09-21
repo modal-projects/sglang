@@ -34,7 +34,12 @@ def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
 
 
-def _weight_name_mapper(model: torch.nn.Module) -> WeightsMapper | None:
+def _checkpoint_name_mapper(model: torch.nn.Module) -> WeightsMapper | None:
+    """Return the model's raw-checkpoint to runtime-module name mapping."""
+
+    mapper = getattr(model, "checkpoint_name_mapper", None)
+    if mapper is not None:
+        return mapper
     mapper_factory = getattr(type(model), "get_hf_to_sglang_mapper", None)
     if mapper_factory is not None:
         return mapper_factory(model.config)
@@ -56,7 +61,7 @@ def _checkpoint_groups(
     groups: list[WeightLoadGroup],
 ) -> tuple[dict[str, list[str]], set[str]]:
     paths = {group.path for group in groups}
-    mapper = _weight_name_mapper(model)
+    mapper = _checkpoint_name_mapper(model)
     names_by_group = {group.path: [] for group in groups}
     ignored = set()
     unmapped = []

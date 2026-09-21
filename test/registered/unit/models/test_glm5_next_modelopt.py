@@ -72,6 +72,23 @@ class TestGlm5NextModelOpt(CustomTestCase):
                     config.is_layer_excluded("visual.blocks.0.attn.qkv_proj")
                 )
 
+    def test_checkpoint_mapper_excludes_the_native_nextn_layer(self):
+        mapper = glm5_next._glm5_next_checkpoint_name_mapper(45)
+
+        self.assertEqual(
+            mapper.apply_list(
+                [
+                    "model.language_model.layers.44.mlp.gate.weight",
+                    "model.language_model.layers.45.eh_proj.weight",
+                    "model.visual.blocks.0.attn.qkv.weight",
+                ]
+            ),
+            [
+                "model.layers.44.mlp.gate.weight",
+                "visual.blocks.0.attn.qkv.weight",
+            ],
+        )
+
     def test_nvidia_mixed_precision_shared_experts_disable_fusion(self):
         config = self._config(NVIDIA_EXCLUDE_MODULES)
 

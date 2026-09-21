@@ -7,6 +7,7 @@
 import concurrent.futures
 import contextlib
 import logging
+from collections import defaultdict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
 
 import torch
@@ -19,6 +20,60 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
+
+
+STABLE_WEIGHT_SOURCE_ATTR = "_sglang_stable_weight_source"
+
+
+class DeferredWeightCopyBatch:
+    """Batch loader calls whose source tensors remain valid through execution.
+
+    Model loaders may reuse or stream checkpoint buffers, so deferral is only
+    correct for sources that explicitly carry ``STABLE_WEIGHT_SOURCE_ATTR``.
+    The parameter's bound loader owns the capability decision and still runs
+    its ordinary placement and slicing logic when the batch is executed.
+    """
+
+    def __init__(self) -> None:
+        self._calls: Dict[Any, List[Tuple[Tuple[Any, ...], Dict[str, Any]]]] = (
+            defaultdict(list)
+        )
+
+    def defer(
+        self,
+        weight_loader: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        if len(args) < 2:
+            return False
+
+        loaded_weight = args[1]
+        owner = getattr(weight_loader, "__self__", None)
+        supports_deferral = getattr(owner, "supports_deferred_weight_copies", None)
+        batch_loader = getattr(owner, "load_weights_batched", None)
+        if not (
+            getattr(loaded_weight, STABLE_WEIGHT_SOURCE_ATTR, False)
+            and callable(supports_deferral)
+            and supports_deferral()
+            and callable(batch_loader)
+            and weight_loader == getattr(owner, "weight_loader", None)
+        ):
+            return False
+
+        self._calls[owner].append((args, kwargs))
+        return True
+
+    def execute(
+        self,
+        *,
+        executor: concurrent.futures.Executor | None = None,
+    ) -> None:
+        try:
+            for owner, calls in self._calls.items():
+                owner.load_weights_batched(calls, executor=executor)
+        finally:
+            self._calls.clear()
 
 
 @contextlib.contextmanager

@@ -6,8 +6,8 @@ import gc
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +24,7 @@ from sglang.srt.weight_sync.weight_load_isolation import (
     WeightLoadGroup,
     build_weight_load_groups,
     build_weight_loader_view,
+    clone_module_for_weight_loading,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,36 @@ logger = logging.getLogger(__name__)
 def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     storage = tensor.untyped_storage()
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
+
+
+def _postprocess_device(model: torch.nn.Module) -> torch.device:
+    device = torch.device("cpu")
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        get_device = getattr(quant_method, "weight_staging_postprocess_device", None)
+        method_device = get_device(module) if callable(get_device) else "cuda"
+        if method_device not in {"cpu", "cuda"}:
+            raise ValueError(
+                "weight staging postprocess device must be 'cpu' or 'cuda', "
+                f"got {method_device!r} from {type(quant_method).__name__}"
+            )
+        if method_device == "cuda":
+            device = torch.device("cuda")
+    return device
+
+
+def _cuda_postprocess_methods(model: torch.nn.Module) -> Counter[str]:
+    methods: Counter[str] = Counter()
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        get_device = getattr(quant_method, "weight_staging_postprocess_device", None)
+        if not callable(get_device) or get_device(module) == "cuda":
+            methods[type(quant_method).__name__] += 1
+    return methods
 
 
 def _checkpoint_name_mapper(model: torch.nn.Module) -> WeightsMapper | None:
@@ -106,11 +137,16 @@ class RankWeightCompiler:
                 "rank weight compilation does not support secondary checkpoints"
             )
         self.model = model
-        self.groups = build_weight_load_groups(
-            model,
-            max_group_bytes=max_group_bytes,
-        )
         self.image = RankWeightImage(model)
+        self.postprocess_device = _postprocess_device(model)
+        cuda_methods = _cuda_postprocess_methods(model)
+        if self.postprocess_device.type == "cpu":
+            self.groups = [WeightLoadGroup(path="", nbytes=self.image.weight_nbytes)]
+        else:
+            self.groups = build_weight_load_groups(
+                model,
+                max_group_bytes=max_group_bytes,
+            )
         self._stream = (
             torch.cuda.Stream(device=self.image.device)
             if self.image.device.type == "cuda"
@@ -121,12 +157,15 @@ class RankWeightCompiler:
         self._ignored_checkpoint_names: frozenset[str] = frozenset()
         logger.info(
             "Rank weight compiler layout: groups=%d storages=%d bytes=%d "
-            "max_group_bytes=%d",
+            "postprocess_device=%s max_group_bytes=%d",
             len(self.groups),
             len(self.image.segments),
             self.image.weight_nbytes,
+            self.postprocess_device.type,
             max_group_bytes,
         )
+        if cuda_methods:
+            logger.info("CUDA weight postprocess methods: %s", dict(cuda_methods))
 
     def initialize_from_active(self) -> dict[str, Any]:
         """Seed and register the host image from the serving weights."""
@@ -328,29 +367,61 @@ class RankWeightCompiler:
         del weights
 
         phase_started = time.perf_counter()
-        stream_context = (
-            torch.cuda.stream(self._stream)
-            if self._stream is not None
-            else nullcontext()
-        )
-        with stream_context:
+        processed_shadow = prepared.shadow
+        postprocess_device = _postprocess_device(prepared.shadow)
+        if self._stream is None:
+            postprocess_device = torch.device("cpu")
+        device_stage_bytes = 0
+        if postprocess_device.type == "cpu":
             DefaultModelLoader.postprocess_weights(
-                prepared.shadow,
-                self.image.device,
+                processed_shadow,
+                postprocess_device,
             )
-        if self._stream is not None:
+        else:
+            # Post-load transforms are GPU kernels. Stage the bounded group as
+            # one device graph so tensor copies can overlap, then copy the
+            # transformed runtime layout back to the persistent host image.
+            def stage_storage(
+                _tensor: torch.Tensor,
+                source_bytes: torch.Tensor,
+            ) -> torch.Tensor:
+                nonlocal device_stage_bytes
+                staged = torch.empty(
+                    source_bytes.numel(),
+                    dtype=torch.uint8,
+                    device=self.image.device,
+                )
+                staged.copy_(source_bytes, non_blocking=True)
+                device_stage_bytes += source_bytes.numel()
+                return staged
+
+            with torch.cuda.stream(self._stream):
+                processed_shadow = clone_module_for_weight_loading(
+                    prepared.shadow,
+                    target_device=self.image.device,
+                    copy_data=True,
+                    storage_factory=stage_storage,
+                )
+                DefaultModelLoader.postprocess_weights(
+                    processed_shadow,
+                    self.image.device,
+                )
             self._stream.synchronize()
         postprocess_s = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
         updated, group_bytes, cpu_copy_bytes, device_copy_bytes = (
-            self._copy_shadow_to_image(prepared.group.path, prepared.shadow)
+            self._copy_shadow_to_image(prepared.group.path, processed_shadow)
         )
         image_copy_s = time.perf_counter() - phase_started
+        if processed_shadow is not prepared.shadow:
+            del processed_shadow
         stats = {
             "path": prepared.group.path,
             "checkpoint_tensors": len(prepared.checkpoint_names),
             "bytes": group_bytes,
+            "postprocess_device": postprocess_device.type,
+            "device_stage_bytes": device_stage_bytes,
             "cpu_image_copy_bytes": cpu_copy_bytes,
             "device_image_copy_bytes": device_copy_bytes,
             "restore_s": round(restore_s, 6),
@@ -492,6 +563,7 @@ class RankWeightCompiler:
         traffic = {
             name: sum(group[name] for group in group_stats)
             for name in (
+                "device_stage_bytes",
                 "cpu_image_copy_bytes",
                 "device_image_copy_bytes",
             )

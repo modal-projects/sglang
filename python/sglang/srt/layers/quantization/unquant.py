@@ -427,6 +427,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str:
+        return "cpu"
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
@@ -456,6 +459,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str:
+        return "cpu"
 
     def apply(
         self,

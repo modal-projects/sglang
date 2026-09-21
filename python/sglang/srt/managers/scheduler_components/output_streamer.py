@@ -441,9 +441,14 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                should_output = (
+                # Start nonstreaming request timing at the first internal output,
+                # including a speculative batch containing several tokens.
+                first_output = req.send_token_offset == 0 and bool(req.output_ids)
+                should_output = first_output or (
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
+                if first_output:
+                    should_output &= not req.check_match_stop_str_prefix()
 
         if not should_output:
             return

@@ -105,6 +105,37 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 
+    def test_nonstream_first_batch_is_sent_before_buffer_interval(self):
+        for token_ids in ([1], [1, 2, 3]):
+            with self.subTest(token_ids=token_ids):
+                accumulator = _accumulator()
+                accumulator.default_force_stream_interval = 50
+                req = _FakeReq("r0", list(token_ids))
+                accumulator.accept(req=req)
+                self.assertEqual(accumulator.output_ids, [token_ids])
+                self.assertEqual(req.send_token_offset, len(token_ids))
+                req.output_ids.extend([4, 5])
+                accumulator.accept(req=req)
+                self.assertEqual(len(accumulator.output_ids), 1)
+                # The next periodic flush contains only the unsent tokens.
+                req.output_ids.extend(range(6, 6 + 50 - len(req.output_ids)))
+                accumulator.accept(req=req)
+                self.assertEqual(
+                    accumulator.output_ids[1], req.output_ids[len(token_ids) :]
+                )
+
+    def test_nonstream_first_batch_waits_for_stop_prefix(self):
+        accumulator = _accumulator()
+        accumulator.default_force_stream_interval = 50
+        req = _FakeReq("r0", [1, 2, 3])
+        req.check_match_stop_str_prefix = lambda: True
+        accumulator.accept(req=req)
+        self.assertEqual(accumulator.output_ids, [])
+        self.assertEqual(req.send_token_offset, 0)
+        req.check_match_stop_str_prefix = lambda: False
+        accumulator.accept(req=req)
+        self.assertEqual(accumulator.output_ids, [[1, 2, 3]])
+
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
 

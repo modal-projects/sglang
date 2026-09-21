@@ -1760,6 +1760,17 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_request_tpot = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation=(
+                "Per-request mean decode latency in seconds; excludes aborts "
+                "and requests with fewer than two output tokens."
+            ),
+            # Preserve the existing Kimi TPOT label contract.
+            labelnames=list(dict.fromkeys([*labels.keys(), "stream"])),
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1784,6 +1795,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 **self.labels,
                 phase=phase,
             ).set(float(duration))
+
+    def observe_request_tpot(
+        self, labels: Dict[str, str], value: float, *, stream: bool
+    ):
+        self.histogram_request_tpot.labels(
+            **{**labels, "stream": str(stream).lower()}
+        ).observe(value)
 
     def observe_one_finished_request(
         self,

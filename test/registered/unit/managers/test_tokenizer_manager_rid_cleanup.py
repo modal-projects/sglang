@@ -10,20 +10,25 @@ Covers:
   - _handle_batch_output cleans up rid_to_state on finished requests
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
+  - Request completion metrics and final-only nonstreaming responses
   - Handler failures clean up pending and dispatched requests
 """
 
 import asyncio
 import unittest
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
@@ -33,6 +38,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
 )
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
@@ -801,6 +807,125 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestRequestTpot(CustomTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.enable_metrics = True
+        self.tm.enable_priority_scheduling = False
+        self.registry = CollectorRegistry()
+        with patch.multiple(
+            "prometheus_client",
+            Counter=partial(Counter, registry=self.registry),
+            Gauge=partial(Gauge, registry=self.registry),
+            Histogram=partial(Histogram, registry=self.registry),
+        ):
+            self.tm.metrics_collector = TokenizerMetricsCollector(
+                server_args=SimpleNamespace(
+                    prompt_tokens_buckets=None, generation_tokens_buckets=None
+                ),
+                # Custom labels must not override TPOT's request stream mode.
+                labels={"model_name": "test", "stream": "custom"},
+                bucket_inter_token_latency=[0.01, 0.02, 0.05],
+            )
+
+    def _sample(self, suffix, stream=False):
+        return self.registry.get_sample_value(
+            "sglang:request_time_per_output_token_seconds" + suffix,
+            {"model_name": "test", "stream": str(stream).lower()},
+        )
+
+    def test_handler_records_one_request_observation(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                state = _make_req_state()
+                self.tm.disaggregation_mode = (
+                    DisaggregationMode.DECODE if stream else DisaggregationMode.NULL
+                )
+                state.obj.stream = stream
+                state.obj.log_metrics = True
+                state.obj.custom_labels = {"stream": "request-custom"}
+                state.obj.sampling_params = {}
+                state.time_stats.created_time = 9.0
+                self.tm.rid_to_state[state.obj.rid] = state
+                first = _make_batch_str_output(state.obj.rid, _NOT_FINISHED)
+                first.completion_tokens = [3]  # A speculative first batch.
+                first.output_ids = [[1, 2, 3]]
+                with patch(
+                    "sglang.srt.observability.req_time_stats.time.perf_counter",
+                    return_value=10.0,
+                ):
+                    asyncio.run(self.tm._handle_batch_output(first))
+                self.assertIsNone(self._sample("_count", stream))
+                if not stream:
+                    self.assertEqual(state.out_list, [])
+
+                final = _make_batch_str_output(
+                    state.obj.rid, {"type": "stop" if stream else "length"}
+                )
+                final.completion_tokens = [5]
+                final.output_ids = [[4, 5]]
+                with patch(
+                    "sglang.srt.observability.req_time_stats.time.perf_counter",
+                    return_value=10.08,
+                ):
+                    asyncio.run(self.tm._handle_batch_output(final))
+                self.assertEqual(self._sample("_count", stream), 1)
+                self.assertAlmostEqual(self._sample("_sum", stream), 0.02)
+                meta = state.out_list[-1]["meta_info"]
+                self.assertAlmostEqual(
+                    self._sample("_sum", stream), 1 / meta["decode_throughput"]
+                )
+                self.assertEqual(state.out_list[-1]["output_ids"], [1, 2, 3, 4, 5])
+                self.assertEqual(len(state.out_list), 2 if stream else 1)
+                # A repeated final batch is discarded after request cleanup.
+                asyncio.run(self.tm._handle_batch_output(final))
+                self.assertEqual(self._sample("_count", stream), 1)
+
+        collector = self.tm.metrics_collector
+        self.assertEqual(
+            collector.histogram_request_tpot._upper_bounds,
+            collector.histogram_inter_token_latency._upper_bounds,
+        )
+        self.assertEqual(
+            collector.histogram_request_tpot._upper_bounds,
+            [0.01, 0.02, 0.05, float("inf")],
+        )
+
+    def test_ineligible_requests_are_not_observed(self):
+        cases = [
+            ("prefill", "stop", 5, 50.0),
+            ("none", "abort", 5, 50.0),
+            ("none", None, 5, 50.0),
+            ("none", "stop", 1, 50.0),
+            ("none", "stop", 5, None),
+            ("none", "stop", 5, 0.0),
+            ("none", "stop", 5, -1.0),
+            ("none", "stop", 5, float("nan")),
+            ("none", "stop", 5, float("inf")),
+        ]
+        for mode, reason, tokens, throughput in cases:
+            with self.subTest(
+                mode=mode, reason=reason, tokens=tokens, throughput=throughput
+            ):
+                state = _make_req_state()
+                state.obj.custom_labels = {"stream": "request-custom"}
+                state.obj.sampling_params = {}
+                state.finished = reason is not None
+                self.tm.disaggregation_mode = (
+                    DisaggregationMode.PREFILL
+                    if mode == "prefill"
+                    else DisaggregationMode.NULL
+                )
+                output = _make_batch_str_output(
+                    state.obj.rid, {"type": reason} if reason else _NOT_FINISHED
+                )
+                output.completion_tokens = [tokens]
+                self.tm.collect_metrics(
+                    state, output, 0, {"decode_throughput": throughput}
+                )
+                self.assertIsNone(self._sample("_count"))
 
 
 if __name__ == "__main__":

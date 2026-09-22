@@ -162,6 +162,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
     ] = None
+    speculative_draft_kv_ratio: A[
+        float,
+        "The draft KV pool as a fraction of the target's token capacity. It should be between 0 and 1. At 1.0 (the default) the draft holds one slot per target token. Below 1.0 the draft's KV lives in a sliding-window pool whose out-of-window slots are freed. Requires DFLASH. The window defaults to the draft's sliding_window unless --speculative-draft-window-size is set. Drafts with full-attention layers and targets with sliding-window layers are not supported yet. The pool must still cover the running requests, or startup fails with the smallest usable ratio.",
+    ] = 1.0
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

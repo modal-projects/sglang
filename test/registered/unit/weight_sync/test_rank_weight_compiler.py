@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.rank_weight_compiler import (
@@ -55,6 +56,17 @@ class _RootLoadableModel(torch.nn.Module):
         for name, tensor in weights:
             assert name == "weight"
             self.weight.data.copy_(tensor)
+
+
+class _GemmaNormModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = GemmaRMSNorm(4)
+
+    def load_weights(self, weights):
+        for name, tensor in weights:
+            assert name == "layer.weight"
+            self.layer.weight.weight_loader(self.layer.weight, tensor)
 
 
 class _CPUImage:
@@ -283,6 +295,35 @@ def test_compile_supports_a_root_owned_weight(monkeypatch):
         segment.image_offset : segment.image_offset + segment.nbytes
     ].view(torch.float32)
     torch.testing.assert_close(staged, value)
+
+
+def test_compile_stages_gemma_rmsnorm_weight_and_derived_view(monkeypatch):
+    _use_plain_loader(monkeypatch)
+    model = _GemmaNormModel()
+    compiler = _compiler(model)
+    value = torch.tensor([0.25, -0.5, 1.0, 2.0])
+    checkpoint = SimpleNamespace(
+        version=1,
+        weight_map={"layer.weight": "model.safetensors"},
+        get_tensor=lambda _name: value,
+    )
+
+    compiler.compile(checkpoint, target_version=1)
+
+    def staged(name):
+        segment = compiler.image.segments_by_name[name]
+        return compiler.image.image[
+            segment.image_offset : segment.image_offset + segment.nbytes
+        ].view(torch.float32)
+
+    torch.testing.assert_close(staged("layer.weight"), value)
+    torch.testing.assert_close(staged("layer.gemma_weight"), value + 1)
+    torch.testing.assert_close(model.layer.weight, torch.zeros_like(value))
+    torch.testing.assert_close(model.layer.gemma_weight, torch.ones_like(value))
+    assert {segment.name for segment in compiler.image.commit_segments} == {
+        "layer.weight",
+        "layer.gemma_weight",
+    }
 
 
 def test_compile_preserves_runtime_storage_absent_from_checkpoint(monkeypatch):

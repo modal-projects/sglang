@@ -165,6 +165,15 @@ class _TinyModel(nn.Module):
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
 
 
+class _TinyModelWithDerivedWeight(_TinyModel):
+    def __init__(self):
+        super().__init__()
+        self.runtime_weight = torch.arange(4, dtype=torch.float32)
+
+    def get_derived_weight_tensors(self):
+        yield "runtime_weight", self.runtime_weight
+
+
 class _FakeModelRunner:
     """Minimal stand-in: WeightChecker touches `.model.named_parameters()`,
     `.model.named_buffers()`, plus parallelism attributes for the checksum action."""
@@ -813,6 +822,20 @@ class TestComputeChecksum(_ChecksumTestBase):
             self.model.w.data.fill_(99.0)
         second = self.checker._compute_checksum()["checksums"]["w"]
         self.assertNotEqual(first, second)
+
+    def test_checksum_includes_declared_derived_weights(self):
+        model = _TinyModelWithDerivedWeight().cuda()
+        model.runtime_weight = model.runtime_weight.cuda()
+        checker = WeightChecker(
+            get_model=lambda: model,
+            ps=self.runner.ps,
+        )
+
+        first = checker._compute_checksum()["checksums"]
+        self.assertIn("runtime_weight", first)
+        model.runtime_weight.add_(1)
+        second = checker._compute_checksum()["checksums"]
+        self.assertNotEqual(first["runtime_weight"], second["runtime_weight"])
 
     def test_validates_against_pydantic_schema(self):
         out = self.checker._compute_checksum()

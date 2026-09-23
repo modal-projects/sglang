@@ -1088,6 +1088,11 @@ class GemmaRMSNorm(BaseFusedOp):
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
 
+    def get_derived_weight_tensors(self):
+        # The fused paths consume this precomputed view of ``weight``. Staged
+        # loading must therefore isolate and commit it with the parameter.
+        return (("gemma_weight", self.gemma_weight),)
+
     def _forward_impl(
         self,
         x: torch.Tensor,

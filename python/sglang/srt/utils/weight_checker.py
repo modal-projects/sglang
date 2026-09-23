@@ -15,6 +15,7 @@ from sglang.srt.utils.weight_checker_comparator import (
     compare_weights,
     select_comparable_weight,
 )
+from sglang.srt.weight_sync.rank_weight_image import iter_derived_weight_tensors
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +126,22 @@ class WeightChecker:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
-        quantized_set = _build_quantized_set(self._get_model())
+        model = self._get_model()
+        quantized_set = _build_quantized_set(model)
+        model_state = dict(self._model_state())
+        for module_name, module in model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for name, tensor in iter_derived_weight_tensors(module):
+                full_name = f"{prefix}{name}"
+                existing = model_state.get(full_name)
+                if existing is not None and existing is not tensor:
+                    raise RuntimeError(
+                        f"derived weight name collides with model state: {full_name!r}"
+                    )
+                model_state[full_name] = tensor
         skip_compare_names = {
             name
-            for name, param in self._model_state()
+            for name, param in model_state.items()
             if getattr(param, "_skip_weight_check", False)
         }
 
@@ -136,7 +149,7 @@ class WeightChecker:
         # bf16 hash equal.
         checksums = {}
         for name, should_compare, comparable in _build_check_entries(
-            dict(self._model_state()), skip_compare_names, quantized_set
+            model_state, skip_compare_names, quantized_set
         ):
             if should_compare:
                 checksums[name] = _hash_tensor(comparable.dequantize().data)

@@ -20,7 +20,7 @@ Toggled by ``use_2cta`` in the constructor:
 Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
   Warp 0    DMA_A   TMA-loads A tiles
   Warp 1    DMA_B   TMA-loads B tiles; PDL griddepcontrol.wait
-  Warp 2    MMA     tcgen05.mma into TMEM; owns alloc/dealloc
+  Warp 2    MMA     tcgen05.mma into TMEM; dealloc after peer synchronization
   Warps 4-7 EPILOG  TMEM -> RMEM -> bf16 cast -> st.global
 """
 
@@ -136,6 +136,7 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        self.num_tmem_cols = 256
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -493,20 +494,16 @@ class TgvGemmCuteExtKernel:
                 d_layout,
             )
 
+        # Both CTAs must finish their TMEM accesses before collective deallocation.
         if cutlass.const_expr(self.use_2cta):
-            # Cluster-wide exit barrier (sgl-project/sglang#32907): cluster
-            # sync previously existed only at kernel entry, so one CTA could
-            # retire while its peer still had in-flight peer-redirected
-            # mbarrier arrives / multicast tcgen05.commit / TMEM dealloc
-            # targeting it -> CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT
-            # (Xid 13 "CTA Not Present"). All 8 warps (256 threads) of both
-            # cluster CTAs arrive here after their dispatch branch returns,
-            # so no CTA can exit until the peer's tail work has landed.
-            # relaxed arrive (matches the entry barrier at L378): this fence is
-            # only about CTA lifetime, not inter-CTA smem visibility -- every
-            # cross-CTA datum above already flows through mbarrier phases.
+            # Epilog TMEM loads are already fenced; no peer memory visibility is needed.
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
+        if warp_idx == 2:
+            tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
+            cute.arch.dealloc_tmem(
+                tmem_ptr, self.num_tmem_cols, is_two_cta=self.use_2cta
+            )
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
@@ -705,8 +702,9 @@ class TgvGemmCuteExtKernel:
         # alloc on the other half. For CTA_M=64 the accumulator only uses
         # 64 lanes (16 lanes × 4 subpartitions), well within half-of-TMEM.
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
-        num_tmem_cols = 256
-        cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        cute.arch.alloc_tmem(
+            self.num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta
+        )
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
@@ -771,14 +769,9 @@ class TgvGemmCuteExtKernel:
             with cute.arch.elect_one():
                 tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
-        # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
-        # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # The local epilog must finish its TMEM reads before the cluster rendezvous.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
     # EPILOG WARPS — TMEM → RMEM → bf16 cast → direct st.global to GMEM.
@@ -924,13 +917,11 @@ class TgvGemmCuteExtKernel:
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
 
-        # tcgen05.ld is async — fence makes the result visible to (a) the
-        # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
-        # on bar_tmem_alloc phase 1.
+        # Complete asynchronous TMEM reads before publishing the local epilog arrival.
         cute.arch.fence_view_async_tmem_load()
 
-        # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
-        # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
+        # Phase 1: 128 epilog threads + 32 MMA threads unblock the MMA warp,
+        # which joins the peer rendezvous before deallocation in two-CTA mode.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Add bias in fp32 before the dtype cast.

@@ -73,6 +73,30 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_capture_path: A[
+        Optional[str],
+        "DFLASH only, CUDA PP=DP=1. Opt in to a shared pinned target-feature buffer (prefill tails and committed verification inputs) owned by TP rank 0 at this new file path (prefer /dev/shm). The file must not already exist.",
+    ] = None
+    speculative_capture_slots: A[
+        int,
+        "Number of bounded prefill slots. Unavailable slots drop capture work.",
+    ] = 8
+    speculative_capture_mode: A[
+        Literal["ce", "kl"],
+        "Captured training payload. ce exports tapped features and token labels; kl also exports normalized target LM-head inputs. Both include prefill tails and committed verification inputs.",
+    ] = "kl"
+    speculative_capture_verify_slots: A[
+        Optional[int],
+        "Number of bounded verification slots, independent of prefill capacity. Defaults to max(64, 8 times the prefill slot count). Unavailable slots drop capture work.",
+    ] = None
+    speculative_capture_window: A[
+        Optional[int],
+        "Maximum prompt-tail tokens per capture slot. Defaults to the DFLASH sliding/compact window. This capture limit does not change draft attention.",
+    ] = None
+    speculative_capture_sample_rate: A[
+        float,
+        "Fraction of request IDs eligible for feature capture, between 0 and 1. Sampling is stable across prefill and decode.",
+    ] = 1.0
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",

@@ -87,12 +87,21 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
 
     @contextmanager
-    def _observe_weight_load(self, source: str) -> Iterator[None]:
+    def _observe_weight_load(
+        self, source: str, *, changes_target: bool = True
+    ) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
         # update_weights_from_* call. Engine is paused during the update so
         # the periodic log_stats path can't carry this.
         # `source` distinguishes disk vs distributed vs tensor vs ipc.
         t0 = time.perf_counter()
+        # Invalidate before an attempted target update, including partial/failing
+        # loads and callers that omit weight_version. Draft-only updates preserve
+        # the identity of the raw teacher features.
+        worker = getattr(self.scheduler, "model_worker", None)
+        capture = getattr(worker, "_prefill_capture", None)
+        if changes_target and capture is not None:
+            capture.invalidate_target()
         try:
             yield
         finally:
@@ -159,7 +168,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        with self._observe_weight_load("tensor"):
+        with self._observe_weight_load(
+            "tensor",
+            changes_target=recv_req.disable_draft_model or self.draft_worker is None,
+        ):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
             else:

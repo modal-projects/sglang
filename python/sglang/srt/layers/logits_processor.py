@@ -208,6 +208,10 @@ class LogitsProcessorOutput:
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
 
+    # Opt-in DFlash training capture: normalized, unpruned LM-head inputs.
+    # Borrowed storage; consume before graph replay and clear before scheduling.
+    target_hidden_states: Optional[torch.Tensor] = None
+
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
 
@@ -467,6 +471,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        self.capture_target_hidden_states = False
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -561,6 +566,12 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        target_hidden_states = (
+            hidden_states
+            if self.capture_target_hidden_states
+            and logits_metadata.capture_hidden_mode.is_full()
+            else None
+        )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -574,6 +585,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                target_hidden_states=target_hidden_states,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -591,6 +603,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            target_hidden_states=target_hidden_states,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)

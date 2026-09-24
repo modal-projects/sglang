@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import math
 import os
@@ -22,6 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
+from sglang.srt.managers.auxiliary_output import append_auxiliary_output
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -58,6 +61,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    get_dflash_layer_types,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -562,6 +566,121 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        self._init_prefill_capture()
+
+    def _init_prefill_capture(self) -> None:
+        self._prefill_capture = None
+        spec = get_spec()
+        # DFlash inference already requires complete, replicated auxiliary rows
+        # on every TP rank for its context projection. Export one copy without
+        # another collective or one pinned allocation per rank. DP is rejected
+        # by argument validation: its ranks would own different requests.
+        if spec.speculative_capture_path is None or self.model_runner.tp_rank != 0:
+            return
+
+        from sglang.srt.speculative.prefill_capture import PrefillCapture
+
+        native_window = self.draft_model.get_attention_sliding_window_size()
+        layer_types = get_dflash_layer_types(self.draft_model.config)
+        windows = []
+        if self.draft_window_size is not None:
+            # Compact KV suffixes can retain page_size - 1 extra left rows.
+            windows.append(self.draft_window_size + max(0, self.page_size - 1))
+        if (
+            native_window is not None
+            and layer_types
+            and all(kind == "sliding_attention" for kind in layer_types)
+        ):
+            # SGLang stores window_left; the HF config includes the current token.
+            windows.append(native_window + 1)
+        window = spec.speculative_capture_window
+        if window is None:
+            if not windows:
+                raise ValueError(
+                    "Prefill capture needs --speculative-capture-window for a "
+                    "draft without an all-layer sliding/compact window."
+                )
+            window = min(windows)
+        model_config = getattr(self.model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        config_hash = hashlib.sha256(
+            json.dumps(
+                hf_config.to_dict() if hf_config is not None else {},
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
+        target_model = self.model_runner.model
+        logits_processor = getattr(target_model, "logits_processor", None)
+        capture_teacher = spec.speculative_capture_mode == "kl"
+        if capture_teacher and logits_processor is None:
+            raise ValueError("DFlash KL capture requires a target logits_processor.")
+        head = unwrap_lora_layer(target_model.lm_head)
+        teacher_size = (
+            int(logits_processor.config.hidden_size) if capture_teacher else 0
+        )
+        teacher_head = (
+            {
+                "vocab_size": logits_processor.vocab_size,
+                "logit_scale": logits_processor.logit_scale,
+                "final_logit_softcapping": logits_processor.final_logit_softcapping,
+                "use_fp32_lm_head": logits_processor.use_fp32_lm_head,
+                "rl_on_policy_target": logits_processor.rl_on_policy_target,
+                "weight_dtype": (
+                    str(head.weight.dtype).removeprefix("torch.")
+                    if hasattr(head, "weight")
+                    else None
+                ),
+                "quant_method": (
+                    type(head.quant_method).__name__
+                    if should_apply_lm_head_quant_method(
+                        head, getattr(head, "quant_method", None)
+                    )
+                    else None
+                ),
+            }
+            if capture_teacher
+            else None
+        )
+        self._prefill_capture = PrefillCapture(
+            path=spec.speculative_capture_path,
+            slots=spec.speculative_capture_slots,
+            verify_slots=spec.speculative_capture_verify_slots,
+            window=window,
+            hidden_size=self.draft_model.fc.weight.shape[1],
+            teacher_hidden_size=teacher_size,
+            overlap=True,
+            dtype=self.model_runner.dtype,
+            device=torch.device(self.device),
+            sample_rate=spec.speculative_capture_sample_rate,
+            metadata={
+                "target_model": self.server_args.model_path,
+                "target_revision": self.server_args.revision,
+                "target_config_hash": config_hash,
+                "draft_model": spec.speculative_draft_model_path,
+                "draft_revision": spec.speculative_draft_model_revision,
+                "target_layer_ids": self.model_runner.spec_aux_config.dflash_target_layer_ids,
+                "tp_rank": self.model_runner.tp_rank,
+                "tp_size": self.model_runner.tp_size,
+                "block_size": self.block_size,
+                "mask_token_id": self._mask_token_id,
+                "draft_window_size": self.draft_window_size,
+                "page_size": self.page_size,
+                "native_window_left": native_window,
+                "layer_types": layer_types,
+                "teacher_head": teacher_head,
+                "capture_mode": spec.speculative_capture_mode,
+            },
+        )
+        # Target graphs are initialized after worker construction. Only TP0
+        # exports this alias; no new gather, normalization, or GPU copy is needed.
+        if logits_processor is not None:
+            logits_processor.capture_target_hidden_states = capture_teacher
+
+    def release_host_resources(self) -> None:
+        if self._prefill_capture is not None:
+            self._prefill_capture.close()
 
     @property
     def draft_worker(self):
@@ -2218,6 +2337,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
+            if self._prefill_capture is not None:
+                self._prefill_capture.wait_before_target_forward()
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2255,6 +2376,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "but got None."
                 )
 
+            # Both operations only read target states; start D2H before draft
+            # projection so its payload copy can overlap KV materialization.
+            if self._prefill_capture is not None:
+                self._prefill_capture.offer(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    batch.extend_lens,
+                    logits_output.hidden_states,
+                    teacher_hidden_states=logits_output.target_hidden_states,
+                )
+
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
@@ -2281,6 +2413,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
+            logits_output.target_hidden_states = None
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,
@@ -2319,6 +2452,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # idle rank would disagree with them on DP-gather segment
                 # offsets (padded bucket vs raw counts).
                 idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                if self._prefill_capture is not None:
+                    self._prefill_capture.wait_before_target_forward()
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2672,6 +2807,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if self._prefill_capture is not None:
+            self._prefill_capture.wait_before_target_forward()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -2779,6 +2916,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
+        # KV materialization reads these same states and can overlap their copy.
+        if self._prefill_capture is not None:
+            logits_output.auxiliary_device_output = append_auxiliary_output(
+                logits_output.auxiliary_device_output,
+                self._prefill_capture.offer_verify(
+                    batch.reqs,
+                    hidden,
+                    draft_tokens,
+                    positions,
+                    commit_lens,
+                    teacher_hidden_states=logits_output.target_hidden_states,
+                ),
+            )
+
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_out_cache_loc,
@@ -2789,6 +2940,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        logits_output.target_hidden_states = None
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,

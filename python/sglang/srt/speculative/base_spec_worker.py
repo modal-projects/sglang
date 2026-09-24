@@ -351,6 +351,10 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    def release_host_resources(self) -> None:
+        """Release worker-owned host allocations on graceful scheduler shutdown."""
+        pass
+
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Activate the optimal adaptive step for the current batch size.
 

@@ -1524,6 +1524,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                target_hidden_states=(
+                    output.target_hidden_states[: self.raw_num_token]
+                    if output.target_hidden_states is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)

@@ -117,6 +117,31 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _validate_speculative_capture(cfg) -> None:
+    if cfg.speculative_capture_path is None:
+        return
+    if cfg.speculative_algorithm != "DFLASH":
+        raise ValueError("--speculative-capture-path currently requires DFLASH.")
+    if cfg.device not in (None, "cuda") or (cfg.pp_size, cfg.dp_size) != (1, 1):
+        raise ValueError("Prefill capture currently requires CUDA with PP=DP=1.")
+    if cfg.speculative_capture_slots <= 0:
+        raise ValueError("--speculative-capture-slots must be positive.")
+    if cfg.speculative_capture_mode not in ("ce", "kl"):
+        raise ValueError("--speculative-capture-mode must be ce or kl.")
+    if (
+        cfg.speculative_capture_verify_slots is not None
+        and cfg.speculative_capture_verify_slots <= 0
+    ):
+        raise ValueError("--speculative-capture-verify-slots must be positive.")
+    if (
+        cfg.speculative_capture_window is not None
+        and cfg.speculative_capture_window <= 0
+    ):
+        raise ValueError("--speculative-capture-window must be positive.")
+    if not 0 <= cfg.speculative_capture_sample_rate <= 1:
+        raise ValueError("--speculative-capture-sample-rate must be between 0 and 1.")
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if (
@@ -157,6 +182,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             kwargs=kwargs,
         ),
     )
+
+    _validate_speculative_capture(cfg)
 
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
     # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama

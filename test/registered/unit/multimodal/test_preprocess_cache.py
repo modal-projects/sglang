@@ -1,5 +1,8 @@
+import array
 import asyncio
 import base64
+import ctypes
+import mmap
 import os
 import tempfile
 import unittest
@@ -24,6 +27,7 @@ from sglang.srt.multimodal.cache import (
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -275,6 +279,199 @@ class TestMediaIdentity(unittest.TestCase):
         item.set_pad_value()
 
         self.assertEqual(item.hash, expected)
+
+
+class TestCacheBufferAccounting(CustomTestCase):
+    def test_stride_trick_views_charge_retained_array(self):
+        """Stride-trick wrappers must not hide the allocation retained by a view."""
+        owner = np.zeros(4096, dtype=np.uint8)
+        views = [
+            np.lib.stride_tricks.as_strided(owner, shape=(1,), strides=(1,)),
+            np.lib.stride_tricks.sliding_window_view(owner, 2)[:1],
+        ]
+        for view in views:
+            with self.subTest(shape=view.shape):
+                cache = MultimodalPreprocessCache(max_size_bytes=512)
+                self.assertFalse(cache.put("view", view))
+                for values in (
+                    [view, owner],
+                    [owner, view],
+                    [view.base, view],
+                    [view, view.base],
+                ):
+                    cache = MultimodalPreprocessCache(max_size_bytes=4096)
+                    self.assertTrue(cache.put("views", values))
+                    self.assertEqual(cache.current_size_bytes, 4096)
+
+    def test_ctypes_owner_resolution_preserves_explicit_size_provider(self):
+        """An explicit provider still selects which retained values count."""
+
+        class SizedFields(ctypes.Structure):
+            _fields_ = [("data", ctypes.c_ubyte * 8)]
+
+            def cache_size_items(self):
+                return [self.extra]
+
+        owner = bytearray(4096)
+        wrapper = SizedFields.from_buffer(owner)
+        wrapper.extra = bytearray(8192)
+        cache = MultimodalPreprocessCache(max_size_bytes=4096)
+        self.assertFalse(cache.put("wrapper", wrapper))
+        cache = MultimodalPreprocessCache(max_size_bytes=8192)
+        self.assertTrue(cache.put("wrapper", wrapper))
+        self.assertEqual(cache.current_size_bytes, 8192)
+
+    def test_ctypes_subviews_charge_retained_exporter(self):
+        """Borrowed ctypes buffers must charge the exporter and deduplicate aliases."""
+
+        class Fields(ctypes.Structure):
+            _fields_ = [("data", ctypes.c_ubyte * 8)]
+
+        class Overlay(ctypes.Union):
+            _fields_ = [("data", ctypes.c_ubyte * 8)]
+
+        owner = bytearray(4096)
+        for wrapper in (
+            (ctypes.c_ubyte * 1).from_buffer(owner, 8),
+            ctypes.c_uint32.from_buffer(owner, 8),
+            Fields.from_buffer(owner, 8),
+            Fields.from_buffer(owner, 8).data,
+            Overlay.from_buffer(owner, 8),
+        ):
+            views = [
+                wrapper,
+                memoryview(wrapper),
+                np.frombuffer(wrapper, dtype=np.uint8),
+            ]
+            for index, view in enumerate(views):
+                with self.subTest(wrapper=type(wrapper).__name__, view=index):
+                    cache = MultimodalPreprocessCache(max_size_bytes=512)
+                    self.assertFalse(cache.put("view", view))
+            for values in ([owner, *views], [*views, owner]):
+                with self.subTest(
+                    wrapper=type(wrapper).__name__, owner_first=values[0] is owner
+                ):
+                    cache = MultimodalPreprocessCache(max_size_bytes=4096)
+                    self.assertTrue(cache.put("views", values))
+                    self.assertEqual(cache.current_size_bytes, 4096)
+
+        other_owner = bytearray(4096)
+        self.assertEqual(
+            estimate_cache_size_bytes(
+                [
+                    (ctypes.c_ubyte * 1).from_buffer(owner),
+                    (ctypes.c_ubyte * 1).from_buffer(other_owner),
+                ]
+            ),
+            8192,
+        )
+
+    def test_owning_ctypes_wrappers_charge_retained_referents(self):
+        """Owning pointer storage must not hide a larger retained allocation."""
+
+        class StringField(ctypes.Structure):
+            _fields_ = [("data", ctypes.c_char_p)]
+
+        class PointerField(ctypes.Structure):
+            _fields_ = [("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+        raw = bytes(4096)
+        mutable = bytearray(4096)
+        array = (ctypes.c_ubyte * 4096)()
+        mapping = {raw: bytearray(1)}
+        for owner, wrapper in (
+            (raw, ctypes.c_char_p(raw)),
+            (mutable, ctypes.py_object(mutable)),
+            (raw, StringField(raw)),
+            (array, ctypes.pointer(array)),
+            (array, PointerField(array)),
+            (mapping, ctypes.py_object(mapping)),
+        ):
+            with self.subTest(
+                wrapper=type(wrapper).__name__, owner=type(owner).__name__
+            ):
+                cache = MultimodalPreprocessCache(max_size_bytes=512)
+                self.assertFalse(cache.put("wrapper", wrapper))
+                size = estimate_cache_size_bytes(wrapper)
+                self.assertGreaterEqual(size, 4096 + ctypes.sizeof(wrapper))
+                for values in ([wrapper, owner], [owner, wrapper]):
+                    self.assertEqual(estimate_cache_size_bytes(values), size)
+
+    def test_numpy_views_charge_the_shared_backing_array_once(self):
+        """Small array views must not hide a retained allocation from admission."""
+        owner = np.zeros(4096, dtype=np.uint8)
+        first = owner[2:3]
+        second = owner[8:10]
+        cache = MultimodalPreprocessCache(max_size_bytes=512)
+
+        self.assertFalse(cache.put("view", first))
+        for value in (first, [first, second], [owner, first], [first, owner]):
+            with self.subTest(shape=type(value).__name__):
+                self.assertEqual(estimate_cache_size_bytes(value), owner.nbytes)
+
+        cache = MultimodalPreprocessCache(max_size_bytes=owner.nbytes)
+        self.assertTrue(cache.put("views", [first, second]))
+        self.assertEqual(cache.current_size_bytes, owner.nbytes)
+
+    def test_numpy_and_memoryview_charge_external_buffer_owners(self):
+        """A one-byte view can retain a larger bytes or bytearray exporter."""
+        for buffer_type in (bytes, bytearray):
+            with self.subTest(buffer_type=buffer_type.__name__):
+                owner = buffer_type(4096)
+                view = memoryview(owner)[4:8]
+                array = np.frombuffer(view, dtype=np.uint8)[1:2]
+                cache = MultimodalPreprocessCache(max_size_bytes=512)
+
+                self.assertFalse(cache.put("array", array))
+                self.assertFalse(cache.put("view", view))
+                for value in (array, view, [array, view, owner], [owner, view, array]):
+                    self.assertEqual(estimate_cache_size_bytes(value), len(owner))
+
+    def test_mapping_views_charge_mapping_length_and_deduplicate(self):
+        """A mapped buffer is charged by its mapping, not its Python wrapper."""
+        with mmap.mmap(-1, 4096) as owner:
+            view = memoryview(owner)[4:8]
+            array = np.ndarray(shape=(1,), dtype=np.uint8, buffer=owner, offset=8)
+            try:
+                cache = MultimodalPreprocessCache(max_size_bytes=512)
+                self.assertFalse(cache.put("array", array))
+                self.assertFalse(cache.put("view", view))
+                self.assertEqual(
+                    estimate_cache_size_bytes([array, view, owner]), len(owner)
+                )
+                self.assertEqual(
+                    estimate_cache_size_bytes([owner, view, array]), len(owner)
+                )
+            finally:
+                del array, view
+
+    def test_buffer_exporters_charge_bytes_and_deduplicate_views(self):
+        """Buffer wrappers must not hide retained bytes or charge shared owners twice."""
+        for owner in (
+            (ctypes.c_ubyte * 4096)(),
+            (ctypes.c_uint32 * 1024)(),
+            (ctypes.c_char * 4096)(),
+            array.array("I", bytes(4096)),
+        ):
+            views = [
+                memoryview(owner),
+                memoryview(owner)[1:2],
+                memoryview(owner)[8:2:-2],
+                np.ndarray(shape=(1,), dtype=np.uint8, buffer=owner, offset=8),
+                np.frombuffer(memoryview(owner), dtype=np.uint8)[1:2],
+            ]
+            for index, value in enumerate([owner, *views]):
+                with self.subTest(owner=type(owner).__name__, view=index):
+                    cache = MultimodalPreprocessCache(max_size_bytes=512)
+                    self.assertFalse(cache.put("value", value))
+                    self.assertEqual(estimate_cache_size_bytes(value), 4096)
+            for values in ([owner, *views], [*views, owner]):
+                with self.subTest(
+                    owner=type(owner).__name__, owner_first=values[0] is owner
+                ):
+                    cache = MultimodalPreprocessCache(max_size_bytes=4096)
+                    self.assertTrue(cache.put("views", values))
+                    self.assertEqual(cache.current_size_bytes, 4096)
 
 
 class TestMultimodalPreprocessCache(unittest.TestCase):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import sys
 import threading
 from collections import OrderedDict
@@ -28,6 +29,11 @@ from typing import (
 import numpy as np
 import torch
 from PIL import Image
+
+try:
+    from numpy.lib._stride_tricks_impl import DummyArray
+except ImportError:
+    from numpy.lib.stride_tricks import DummyArray
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -74,6 +80,13 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
     """Estimate owned CPU bytes, returning None for GPU-backed artifacts."""
     seen: set[int] = set()
 
+    def buffer_nbytes(item: Any) -> Optional[int]:
+        try:
+            with memoryview(item) as view:
+                return view.nbytes
+        except TypeError:
+            return None
+
     def visit(item: Any) -> Optional[int]:
         if item is None or isinstance(item, (bool, int, float)):
             return sys.getsizeof(item)
@@ -86,16 +99,53 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
             if item.device.type != "cpu":
                 return None
             return item.untyped_storage().nbytes()
-        if isinstance(item, np.ndarray):
-            return int(item.nbytes)
+        if isinstance(item, (np.ndarray, DummyArray)):
+            # A view retains its backing allocation, including external buffers.
+            root = item
+            while isinstance(root.base, (np.ndarray, DummyArray)):
+                if id(root.base) in seen:
+                    return 0
+                root = root.base
+                seen.add(id(root))
+            if root.base is not None and buffer_nbytes(root.base) is not None:
+                return visit(root.base)
+            return int(root.nbytes)
         if isinstance(item, Image.Image):
             return len(item.tobytes())
-        if isinstance(item, (bytes, bytearray, memoryview)):
+        if isinstance(item, memoryview):
+            return visit(item.obj)
+        if isinstance(item, (bytes, bytearray)):
             return len(item)
         if isinstance(item, str):
             return len(item.encode())
         if isinstance(item, CacheSizeProvider):
             return visit(item.cache_size_items())
+        if isinstance(
+            item,
+            (
+                ctypes.Array,
+                ctypes.Structure,
+                ctypes.Union,
+                ctypes._SimpleCData,
+                ctypes._Pointer,
+            ),
+        ):
+            if item._b_base_ is not None:
+                return visit(item._b_base_)
+            if item._objects is not None:
+                # Owning wrappers retain referents in addition to inline storage.
+                total = ctypes.sizeof(item) if item._b_needsfree_ else 0
+                owners = item._objects
+                if isinstance(owners, dict) and not isinstance(item, ctypes.py_object):
+                    owners = owners.values()
+                else:
+                    owners = (owners,)
+                for owner in owners:
+                    size = visit(owner)
+                    if size is None:
+                        return None
+                    total += size
+                return total
         if isinstance(item, Mapping):
             total = 0
             for key, child in item.items():
@@ -113,7 +163,8 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
                     return None
                 total += child_size
             return total
-        return sys.getsizeof(item)
+        size = buffer_nbytes(item)
+        return sys.getsizeof(item) if size is None else size
 
     return visit(value)
 

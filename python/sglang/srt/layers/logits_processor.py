@@ -94,11 +94,12 @@ class SamplingMaskStatus(IntEnum):
 
 @dataclasses.dataclass
 class SamplingMaskOutput:
-    """Tensor result for opted-in rows in batch order."""
+    """Sampling-support IDs and optional full-support behavior logprobs."""
 
     token_ids: torch.Tensor
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
+    support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
     output_lens: Optional[torch.Tensor] = None
 
@@ -106,6 +107,8 @@ class SamplingMaskOutput:
         self.token_ids = fn(self.token_ids)
         self.lengths = fn(self.lengths)
         self.selected_logprobs = fn(self.selected_logprobs)
+        if self.support_logprobs is not None:
+            self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
         if self.output_lens is not None:
             self.output_lens = fn(self.output_lens)
@@ -224,8 +227,8 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Post-filter support IDs, bounded by server capacity, and selected-token
-    # logprob over the full realized support.
+    # Post-filter support IDs and requested behavior logprobs, bounded by server
+    # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
     next_token_sampling_mask_idx: Optional[
         List[Optional[Union[List[int], List[List[int]]]]]

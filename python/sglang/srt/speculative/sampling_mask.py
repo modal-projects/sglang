@@ -75,6 +75,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             token_ids=support_tokens,
             lengths=support_lens,
             selected_logprobs=selected_logprobs,
+            support_logprobs=None,
             statuses=statuses,
             output_lens=output_lens,
         )

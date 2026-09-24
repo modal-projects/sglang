@@ -917,6 +917,7 @@ class WaitingMMRequestBase(ABC):
         self.status = WaitingMMRequestStatus.PENDING
         self.error_msg = None
         self.error_code = None
+        self.err_type = None
         self.start_time = time.time()
         # Optional GPU pool bounding received embeddings (zmq_to_scheduler):
         # _try_recv_mm_data stages parts into one slot, staying PENDING while
@@ -1011,10 +1012,11 @@ class WaitingMMRequestBase(ABC):
             self.recv_socket.close()
             self.recv_socket = None
 
-    def _fail_and_release(self, error_msg, error_code=None) -> None:
+    def _fail_and_release(self, error_msg, error_code=None, *, err_type=None) -> None:
         """Terminal failure: record the error, free buffers, close the socket."""
         self.error_msg = error_msg
         self.error_code = error_code
+        self.err_type = err_type
         self.status = WaitingMMRequestStatus.FAIL
         self.release_resources()
         self.close_recv_socket()
@@ -2043,7 +2045,9 @@ class MMReceiverBase(ABC):
                 WaitingMMRequestStatus.PENDING,
                 WaitingMMRequestStatus.SUCCESS,
             ):
-                waiting_req._fail_and_release("Aborted by user", error_code=400)
+                waiting_req._fail_and_release(
+                    "Aborted by user", error_code=400, err_type="cancelled"
+                )
                 waiting_req.release_resources()
                 logger.info(f"Abort waiting mm request. rid={waiting_req.rid}")
 
@@ -2255,24 +2259,27 @@ class MMReceiverBase(ABC):
         The encoder sends ZMQ error signals to each TP rank's receive socket,
         but they can arrive at different times. ``all_reduce`` on status makes
         every rank enter FAIL together while only some ranks have populated
-        ``error_msg`` / ``error_code``. attn_tp_rank 0 streams the abort to the
-        client, so merge the best-known payload from all ranks first.
+        ``error_msg`` / ``error_code`` / ``err_type``. attn_tp_rank 0 streams the
+        abort, so merge the best-known payload from all ranks first.
         """
         if self.tp_size <= 1 or self.tp_group is None:
             return
 
         gathered = self.tp_group.all_gather_object(
-            (waiting_req.error_msg, waiting_req.error_code)
+            (waiting_req.error_msg, waiting_req.error_code, waiting_req.err_type)
         )
         best_msg = waiting_req.error_msg
         best_code = waiting_req.error_code
-        for msg, code in gathered:
+        best_type = waiting_req.err_type
+        for msg, code, err_type in gathered:
             if msg is not None:
                 best_msg = msg
             if code is not None:
                 best_code = code
+                best_type = err_type
         waiting_req.error_msg = best_msg
         waiting_req.error_code = best_code
+        waiting_req.err_type = best_type
 
     # For zmq_to_scheduler
     def _drain_scheduler_embeddings(self):
@@ -2400,6 +2407,7 @@ class MMReceiverBase(ABC):
                             self.create_req(recv_req),
                             error_msg,
                             HTTPStatus.INTERNAL_SERVER_ERROR,
+                            None,
                         )
                     )
                     continue
@@ -2450,6 +2458,7 @@ class MMReceiverBase(ABC):
                         self.create_req(waiting_req.recv_req),
                         waiting_req.error_msg,
                         waiting_req.error_code,
+                        waiting_req.err_type,
                     )
                 )
             elif status_value == WaitingMMRequestStatus.TIMEOUT:
@@ -2462,6 +2471,7 @@ class MMReceiverBase(ABC):
                         self.create_req(waiting_req.recv_req),
                         f"Timeout waiting for image embedding after {self.wait_timeout}s",
                         HTTPStatus.REQUEST_TIMEOUT,
+                        "encoder_timeout",
                     )
                 )
             else:  # status_value == WaitingMMRequestStatus.PENDING

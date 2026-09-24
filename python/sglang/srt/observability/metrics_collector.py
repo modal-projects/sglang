@@ -21,6 +21,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1522,6 +1523,51 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
 
+FINISHED_OUTCOMES = (
+    "success",
+    "abort",
+    "rejected",
+    "invalid_request",
+    "engine_fault",
+    "other",
+)
+
+
+def finished_outcome(finish_reason: Optional[Dict[str, Any]]) -> str:
+    """Classify serialized finish metadata into a bounded request outcome."""
+    if not isinstance(finish_reason, dict):
+        return "other"
+    reason_type = finish_reason.get("type")
+    if reason_type == "stop" and finish_reason.get("err_type") == "invalid_token":
+        return "engine_fault"
+    if reason_type in ("stop", "length"):
+        return "success"
+    if reason_type != "abort":
+        return "other"
+    try:
+        status = int(finish_reason.get("status_code"))
+    except (TypeError, ValueError):
+        return "abort"
+    if (
+        status == HTTPStatus.BAD_REQUEST
+        and finish_reason.get("err_type") == "cancelled"
+    ):
+        return "abort"
+    # Internal embedding waits retain HTTP 408 for API compatibility.
+    if (
+        status == HTTPStatus.REQUEST_TIMEOUT
+        and finish_reason.get("err_type") == "encoder_timeout"
+    ):
+        return "engine_fault"
+    if status in (HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE):
+        return "rejected"
+    if 400 <= status < 500:
+        return "invalid_request"
+    if 500 <= status < 600:
+        return "engine_fault"
+    return "abort"
+
+
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
@@ -1540,7 +1586,27 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
-        self.labels = labels or {}
+        self.labels = labels = labels or {}
+        if "outcome" in labels:
+            raise ValueError("Tokenizer metric label 'outcome' is reserved")
+
+        self.finished_requests_by_outcome = Counter(
+            name="sglang:finished_requests_by_outcome_total",
+            documentation="Terminal requests by outcome: success, abort (cancelled), rejected (429/503), invalid_request (other 4xx), engine_fault (other 5xx, invalid generated token, or tagged internal encoder timeout), other. Includes aborts without output.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_prompt_tokens_by_outcome = Counter(
+            name="sglang:finished_prompt_tokens_by_outcome_total",
+            documentation="Prompt token usage of terminal requests by outcome. Scheduler abort echoes have unknown usage and add zero.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.finished_cached_tokens_by_outcome = Counter(
+            name="sglang:finished_cached_tokens_by_outcome_total",
+            documentation="Cached token usage of terminal requests by outcome. Scheduler abort echoes have unknown usage and add zero.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self._seeded_outcome_label_sets = set()
+        self._seed_outcome_series(labels)
 
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
@@ -1782,6 +1848,41 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 phase=phase,
             ).set(float(duration))
 
+    def _seed_outcome_series(self, labels: Dict[str, str]) -> None:
+        # Match the label-value conversion performed by the metric backends.
+        key = tuple(sorted((name, str(value)) for name, value in labels.items()))
+        if key in self._seeded_outcome_label_sets:
+            return
+        for outcome in FINISHED_OUTCOMES:
+            for counter in (
+                self.finished_requests_by_outcome,
+                self.finished_prompt_tokens_by_outcome,
+                self.finished_cached_tokens_by_outcome,
+            ):
+                # Injected backends may retain their existing inc(0) no-op.
+                counter.labels(**labels, outcome=outcome).inc(0)
+        self._seeded_outcome_label_sets.add(key)
+
+    def observe_finished_outcome(
+        self,
+        labels: Dict[str, str],
+        outcome: str,
+        prompt_tokens: int,
+        cached_tokens: int,
+    ) -> None:
+        self._seed_outcome_series(labels)
+        if outcome not in FINISHED_OUTCOMES:
+            outcome = "other"
+        outcome_labels = {**labels, "outcome": outcome}
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(
+            prompt_tokens
+        )
+        if cached_tokens > 0:
+            self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(
+                cached_tokens
+            )
+        self.finished_requests_by_outcome.labels(**outcome_labels).inc()
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1794,6 +1895,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
     ):
+        # Invalid negative usage must not inflate the uncached prompt length.
+        cached_tokens = max(cached_tokens, 0)
         stream_labels = {
             **labels,
             "is_streaming": "true" if is_streaming else "false",

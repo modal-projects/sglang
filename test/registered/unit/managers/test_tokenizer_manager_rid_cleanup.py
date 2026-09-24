@@ -15,9 +15,12 @@ Covers:
 
 import asyncio
 import unittest
+from array import array
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -26,17 +29,22 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
+    BatchEmbeddingOutput,
     BatchStrOutput,
+    EmbeddingReqInput,
     GenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_STR, Req
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
 )
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -801,6 +809,335 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestFinishedOutcomeMetrics(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.enable_metrics = True
+        self.tm.enable_priority_scheduling = True
+        self.registry = CollectorRegistry()
+        self.labels = {"model_name": "test-model", "priority": "", "workload": ""}
+
+        class Collector(TokenizerMetricsCollector):
+            _counter_cls = partial(Counter, registry=self.registry)
+            _gauge_cls = partial(Gauge, registry=self.registry)
+            _histogram_cls = partial(Histogram, registry=self.registry)
+
+        self.tm.metrics_collector = Collector(labels=self.labels)
+
+    def add_request(self, rid, *, stream=False, log_metrics=True):
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=GenerateReqInput(
+                rid=rid,
+                text="test",
+                sampling_params={},
+                stream=stream,
+                custom_labels={"workload": "interactive"},
+                priority=7,
+                log_metrics=log_metrics,
+            ),
+            time_stats=APIServerReqTimeStats(),
+        )
+        self.tm.rid_to_state[rid] = state
+        return state
+
+    def sample(self, name, **extra):
+        labels = {**self.labels, "workload": "interactive", "priority": "7", **extra}
+        return self.registry.get_sample_value("sglang:" + name, labels)
+
+    def test_terminal_batches_classify_one_outcome_and_keep_legacy_metrics(self):
+        """Every terminal reason must land in exactly one bounded counter."""
+        for index, (reason, expected) in enumerate(
+            (
+                ({"type": "stop"}, "success"),
+                ({"type": "length"}, "success"),
+                (FINISH_ABORT().to_json(), "abort"),
+                (FINISH_ABORT(status_code=429).to_json(), "rejected"),
+                (FINISH_ABORT(status_code=503).to_json(), "rejected"),
+                (FINISH_ABORT(status_code=400).to_json(), "invalid_request"),
+                (FINISH_ABORT(status_code=408).to_json(), "invalid_request"),
+                (FINISH_ABORT(status_code=500).to_json(), "engine_fault"),
+                (
+                    FINISH_ABORT(status_code=408, err_type="encoder_timeout").to_json(),
+                    "engine_fault",
+                ),
+                ({"type": "future"}, "other"),
+            )
+        ):
+            with self.subTest(reason=reason):
+                before = (
+                    self.sample("finished_requests_by_outcome_total", outcome=expected)
+                    or 0
+                )
+                rid = f"terminal-{index}"
+                state = self.add_request(rid, stream=True)
+                output = _make_batch_str_output(rid, reason)
+                output.prompt_tokens = [12]
+                output.cached_tokens = [4]
+                output.completion_tokens = [2]
+                asyncio.run(self.tm._handle_batch_output(output))
+                self.assertEqual(
+                    self.sample("finished_requests_by_outcome_total", outcome=expected),
+                    before + 1,
+                )
+                self.assertNotIn(rid, self.tm.rid_to_state)
+                self.assertEqual(
+                    state.out_list[-1]["meta_info"]["finish_reason"], reason
+                )
+        self.assertEqual(
+            sum(
+                self.sample("finished_requests_by_outcome_total", outcome=outcome)
+                for outcome in (
+                    "success",
+                    "abort",
+                    "rejected",
+                    "invalid_request",
+                    "engine_fault",
+                    "other",
+                )
+            ),
+            10,
+        )
+        self.assertEqual(self.sample("num_requests_total", is_streaming="true"), 10)
+        self.assertEqual(self.sample("prompt_tokens_total", is_streaming="true"), 120)
+
+    def test_invalid_token_producer_is_engine_fault_without_matching_stop_text(self):
+        """Invalid generated IDs must not become success, even with legacy stop metadata."""
+        for token_id in (-1, 16, None):
+            with self.subTest(token_id=token_id):
+                rid = f"vocab-{token_id}"
+                if token_id is None:
+                    finish = FINISH_MATCHED_STR(matched="NaN happened")
+                    expected = "success"
+                else:
+                    request = Req(
+                        rid=rid,
+                        origin_input_text="test",
+                        origin_input_ids=array("q", [1]),
+                        sampling_params=SamplingParams(max_new_tokens=2),
+                        eos_token_ids={2},
+                        vocab_size=16,
+                    )
+                    request.output_ids = array("q", [token_id])
+                    request.update_finish_state(new_accepted_len=1)
+                    finish = request.finished_reason
+                    expected = "engine_fault"
+                    self.assertEqual(list(request.output_ids), [2])
+                reason = msgspec.json.decode(msgspec.json.encode(finish.to_json()))
+                before = (
+                    self.sample("finished_requests_by_outcome_total", outcome=expected)
+                    or 0
+                )
+                self.add_request(rid)
+                output = _make_batch_str_output(rid, reason)
+                output.prompt_tokens = [3]
+                output.cached_tokens = [0]
+                output.completion_tokens = [1]
+                output.output_ids = [[2]]
+                asyncio.run(self.tm._handle_batch_output(output))
+                self.assertEqual(
+                    self.sample("finished_requests_by_outcome_total", outcome=expected),
+                    before + 1,
+                )
+                self.assertEqual(reason["type"], "stop")
+                self.assertEqual(reason["matched"], "NaN happened")
+                if token_id is None:
+                    self.assertEqual(
+                        reason, {"type": "stop", "matched": "NaN happened"}
+                    )
+                else:
+                    self.assertEqual(reason["err_type"], "invalid_token")
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="engine_fault"), 2
+        )
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="success"), 1
+        )
+        self.assertEqual(
+            self.sample("finished_prompt_tokens_by_outcome_total", outcome="success"), 3
+        )
+
+    def test_invalid_token_after_length_budget_does_not_change_committed_outcome(self):
+        """Discarded speculative output must not relabel a valid length-limited prefix."""
+        for budget, expected, output_ids in (
+            (2, "success", [4, 5]),
+            (3, "engine_fault", [4, 5, 2]),
+        ):
+            with self.subTest(budget=budget):
+                rid = f"budget-{budget}"
+                request = Req(
+                    rid=rid,
+                    origin_input_text="test",
+                    origin_input_ids=array("q", [1]),
+                    sampling_params=SamplingParams(max_new_tokens=budget),
+                    eos_token_ids={2},
+                    vocab_size=16,
+                )
+                request.output_ids = array("q", [4, 5, 16])
+                request.update_finish_state(new_accepted_len=2)
+                committed = list(request.output_ids_through_stop)
+                self.assertEqual(committed, output_ids)
+                self.assertEqual(request.finished_len, budget)
+                reason = msgspec.json.decode(
+                    msgspec.json.encode(request.finished_reason.to_json())
+                )
+                if budget == 2:
+                    self.assertEqual(reason, {"type": "length", "length": 2})
+                else:
+                    self.assertEqual(reason["err_type"], "invalid_token")
+                self.add_request(rid)
+                output = _make_batch_str_output(rid, reason)
+                output.prompt_tokens = [3]
+                output.cached_tokens = [0]
+                output.completion_tokens = [len(committed)]
+                output.output_ids = [committed]
+                asyncio.run(self.tm._handle_batch_output(output))
+                self.assertEqual(
+                    self.sample("finished_requests_by_outcome_total", outcome=expected),
+                    1,
+                )
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="success"), 1
+        )
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="engine_fault"), 1
+        )
+
+    def test_structured_custom_labels_do_not_interrupt_terminal_handlers(self):
+        """Allowed label values must use the metric backend's string conversion."""
+        for echo, value in ((False, ["interactive"]), (True, {"phase": "interactive"})):
+            with self.subTest(echo=echo, value=value):
+                rid = f"custom-label-{echo}"
+                state = self.add_request(rid)
+                state.obj.custom_labels = {"workload": value}
+                if echo:
+                    self.tm._handle_abort_req(AbortReq(rid=rid))
+                    outcome = "abort"
+                else:
+                    asyncio.run(
+                        self.tm._handle_batch_output(_make_batch_str_output(rid))
+                    )
+                    outcome = "success"
+                self.assertNotIn(rid, self.tm.rid_to_state)
+                self.assertTrue(state.event.is_set())
+                self.assertEqual(
+                    self.sample(
+                        "finished_requests_by_outcome_total",
+                        workload=str(value),
+                        outcome=outcome,
+                    ),
+                    1,
+                )
+
+    def test_abort_echo_counts_once_without_latency_or_usage_observations(self):
+        """Queue rejections have no output or known token usage to observe."""
+        state = self.add_request("echo")
+        abort = AbortReq(
+            rid="echo", finished_reason=FINISH_ABORT(status_code=503).to_json()
+        )
+        self.tm._handle_abort_req(abort)
+        self.tm._handle_abort_req(abort)
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="rejected"), 1
+        )
+        self.assertEqual(
+            self.sample("finished_prompt_tokens_by_outcome_total", outcome="rejected"),
+            0,
+        )
+        self.assertTrue(state.event.is_set())
+        for metric in self.registry.collect():
+            if metric.type == "histogram":
+                self.assertFalse(
+                    [
+                        sample
+                        for sample in metric.samples
+                        if sample.name.endswith("_count") and sample.value
+                    ]
+                )
+
+    def test_output_and_echo_race_count_once_in_either_order(self):
+        """Whichever terminal handler removes the rid must win accounting."""
+        for echo_first in (False, True):
+            rid = f"race-{echo_first}"
+            self.add_request(rid)
+            reason = FINISH_ABORT(status_code=500).to_json()
+            output = _make_batch_str_output(rid, reason)
+            output.completion_tokens = [0]
+            abort = AbortReq(rid=rid, finished_reason=reason)
+            if echo_first:
+                self.tm._handle_abort_req(abort)
+            asyncio.run(self.tm._handle_batch_output(output))
+            self.tm._handle_abort_req(abort)
+        self.assertEqual(
+            self.sample("finished_requests_by_outcome_total", outcome="engine_fault"), 2
+        )
+        self.assertIsNone(
+            self.sample("time_to_first_token_seconds_count", is_streaming="false")
+        )
+        self.assertIsNone(self.sample("inter_token_latency_seconds_count"))
+
+    def test_disabled_request_metrics_excludes_both_terminal_paths(self):
+        for echo in (False, True):
+            rid = f"disabled-{echo}"
+            self.add_request(rid, log_metrics=False)
+            if echo:
+                self.tm._handle_abort_req(AbortReq(rid=rid))
+            else:
+                asyncio.run(self.tm._handle_batch_output(_make_batch_str_output(rid)))
+        self.assertIsNone(
+            self.sample("finished_requests_by_outcome_total", outcome="success")
+        )
+        self.assertIsNone(
+            self.sample("finished_requests_by_outcome_total", outcome="abort")
+        )
+
+    def test_unfinished_output_is_not_terminal(self):
+        self.add_request("partial")
+        output = _make_batch_str_output("partial", _NOT_FINISHED)
+        output.completion_tokens = [1]
+        asyncio.run(self.tm._handle_batch_output(output))
+        self.assertIn("partial", self.tm.rid_to_state)
+        self.assertIsNone(
+            self.sample("finished_requests_by_outcome_total", outcome="success")
+        )
+
+    def test_embedding_finish_keeps_zero_generation_ttft(self):
+        """No generation-token field must not make embeddings look aborted."""
+        state = self.add_request("embedding")
+        state.obj = EmbeddingReqInput(
+            rid="embedding", text="test", priority=7, sampling_params={}
+        )
+        output = BatchEmbeddingOutput(
+            rids=["embedding"],
+            finished_reasons=[{"type": "stop"}],
+            embeddings=[[0.5]],
+            prompt_tokens=[3],
+            cached_tokens=[0],
+            retraction_counts=[0],
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+        )
+        asyncio.run(self.tm._handle_batch_output(output))
+        labels = {**self.labels, "priority": "7"}
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:finished_requests_by_outcome_total",
+                {**labels, "outcome": "success"},
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.registry.get_sample_value(
+                "sglang:time_to_first_token_seconds_count",
+                {**labels, "is_streaming": "false"},
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,10 @@ pub enum FinishKind {
     Stop {
         #[serde(default)]
         matched: Option<Matched>,
+        // Box rare error metadata to keep ChunkEvent within its 144-byte bound.
+        #[allow(clippy::box_collection)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        err_type: Option<Box<String>>,
     },
     /// `FINISH_LENGTH` — hit `max_new_tokens` (or the context limit).
     Length {
@@ -92,7 +96,7 @@ impl FinishReason {
     /// length/abort and for an unknown type.
     pub fn matched(&self) -> Option<&Matched> {
         match self {
-            FinishReason::Known(FinishKind::Stop { matched }) => matched.as_ref(),
+            FinishReason::Known(FinishKind::Stop { matched, .. }) => matched.as_ref(),
             _ => None,
         }
     }
@@ -191,6 +195,10 @@ mod tests {
         for wire in [
             serde_json::json!({"type": "stop", "matched": 9}),
             serde_json::json!({"type": "stop", "matched": "</s>"}),
+            serde_json::json!({"type": "stop", "matched": "NaN happened"}),
+            serde_json::json!({
+                "type": "stop", "matched": "NaN happened", "err_type": "invalid_token"
+            }),
             serde_json::json!({"type": "stop", "matched": [9, 10]}),
             serde_json::json!({"type": "length", "length": 8}),
             serde_json::json!({
@@ -208,6 +216,9 @@ mod tests {
                 "must classify, not fall back to Unknown: {wire}"
             );
             assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+            let packed = rmp_serde::to_vec_named(&wire).unwrap();
+            let from_msgpack: FinishReason = rmp_serde::from_slice(&packed).unwrap();
+            assert_eq!(serde_json::to_value(from_msgpack).unwrap(), wire);
         }
     }
 

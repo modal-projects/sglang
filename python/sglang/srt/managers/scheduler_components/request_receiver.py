@@ -238,14 +238,16 @@ class SchedulerRequestReceiver:
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for req, error_msg, error_code in abort_reqs:
+            for req, error_msg, error_code, err_type in abort_reqs:
                 if error_code is None:
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 elif isinstance(error_code, HTTPStatus):
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
-                prepare_abort(req, error_msg, status_code=status_code)
+                prepare_abort(
+                    req, error_msg, status_code=status_code, err_type=err_type
+                )
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
 

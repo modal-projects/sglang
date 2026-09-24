@@ -181,7 +181,12 @@ class RadixCacheCpp(BasePrefixCache):
         return self.tree.total_size()
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self,
+        req: Req,
+        is_insert: bool = True,
+        *,
+        kv_len_to_handle: int,
+        is_retract: bool = False,
     ):
         """Cache request when it finishes."""
         self._reject_cache_salt(req.cache_salt)

@@ -2190,6 +2190,14 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class SessionReapPlan(msgspec.Struct, frozen=True):
+    """Rank-identical session reap decision computed on the request-receiving
+    leader and applied on every rank at the same scheduler-loop position."""
+
+    deferred: List[str]
+    timed_out: List[str]
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

@@ -169,6 +169,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionReapPlan,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -191,6 +192,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
+from sglang.srt.managers.mm_utils import discard_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
@@ -206,6 +208,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
+    MultimodalProcessorOutput,
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -2084,8 +2087,11 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
-        now = time.monotonic()
-        self.session_controller.maybe_reap(now)
+        reap_plans = [r for r in recv_reqs if isinstance(r, SessionReapPlan)]
+        if reap_plans:
+            recv_reqs = [r for r in recv_reqs if not isinstance(r, SessionReapPlan)]
+            for plan in reap_plans:
+                self.session_controller.apply_reap(plan)
 
         for recv_req in recv_reqs:
             vmm_errors = None
@@ -2307,6 +2313,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            plan_session_reap=self.session_controller.plan_reap,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -2844,11 +2851,6 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-
         else:
             # Session not found, or session is closing
             if session_id in self.session_controller:
@@ -2867,8 +2869,17 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+
+        if req.to_finish is not None or isinstance(req.finished_reason, FINISH_ABORT):
+            _release_unadmitted_mm_inputs(recv_req)
+            if req.to_finish is not None:
+                req.finished_reason = req.to_finish
+                req.to_finish = None
+            req.time_stats.trace_ctx.abort(
+                abort_info={"reason": req.finished_reason.message}
+            )
+            req.time_stats.set_quick_finish_time()
+            self.output_streamer.stream_output([req], req.return_logprob)
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
@@ -5878,6 +5889,16 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
+
+
+def _release_unadmitted_mm_inputs(recv_req: TokenizedGenerateReqInput) -> None:
+    raw_mm_inputs = recv_req.mm_inputs
+    if isinstance(raw_mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)):
+        discard_shm_features(recv_req)
+        # These items have not joined session history. Release without hashing or
+        # reconstructing them, then omit the abandoned payload from PP relay.
+        MultimodalInputs(mm_items=raw_mm_inputs.mm_items).release_features()
+    recv_req.mm_inputs = None
 
 
 def _make_abort_req(

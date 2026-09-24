@@ -103,5 +103,30 @@ def test_kpe_2d_accepted():
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 
 
+@pytest.mark.parametrize("batch_size", [16, 32])
+@pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (2.0, 0.5)])
+def test_scaled_prefix_overflow(batch_size, k_scale, v_scale):
+    """Both pack dispatches saturate finite overflow after checkpoint scaling."""
+    values = torch.tensor([-1024.0, -448.0, 0.0, 448.0, 1024.0], device=DEVICE)
+    indices = torch.arange(batch_size * 2 * 256, device=DEVICE) % values.numel()
+    projected = values[indices].reshape(batch_size, 2, 256).to(torch.bfloat16)
+    k_nope, v = projected[..., :128], projected[..., 128:]
+    k_pe = projected[:, :1, :64]
+    k_out, v_out = mla_kv_pack_quantize_fp8(
+        k_nope,
+        k_pe,
+        v,
+        k_scale_inv=1 / k_scale,
+        v_scale_inv=1 / v_scale,
+        enable_pdl=False,
+    )
+    k_dense = torch.cat((k_nope, k_pe.expand(-1, 2, -1)), dim=-1)
+    limit = torch.finfo(torch.float8_e4m3fn).max
+    k_ref = (k_dense.float() / k_scale).clamp(-limit, limit).to(torch.float8_e4m3fn)
+    v_ref = (v.float() / v_scale).clamp(-limit, limit).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(k_out.float(), k_ref.float(), rtol=0, atol=0)
+    torch.testing.assert_close(v_out.float(), v_ref.float(), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -296,12 +296,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
     def pack_prefix_chunk_kv(
         self,
+        layer: RadixAttention,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
-        strided ``v`` into contig FP8 V in a single kernel.
+        strided ``v`` into contig FP8 V in a single kernel, using unit scales
+        independently of the layer's checkpoint scales.
         """
         return mla_kv_pack_quantize_fp8(
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()

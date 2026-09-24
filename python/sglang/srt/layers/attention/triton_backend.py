@@ -1350,6 +1350,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def pack_prefix_chunk_kv(
         self,
+        layer: RadixAttention,
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         v: torch.Tensor,

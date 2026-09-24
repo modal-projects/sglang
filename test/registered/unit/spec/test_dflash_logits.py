@@ -7,10 +7,12 @@ import torch
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
+    DFlashGroupedConv,
     _grouped_conv,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
@@ -403,11 +405,12 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 
-def test_grouped_conv_supports_runtime_block_sizes():
+@pytest.mark.parametrize("taps", [2, 3])
+def test_grouped_conv_supports_runtime_block_sizes(taps):
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""
     torch.manual_seed(0)
-    groups, group_size, taps = 3, 2, 2
+    groups, group_size = 3, 2
     hidden_size = groups * group_size
     batch_size = 2
 
@@ -432,6 +435,85 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+class TestGroupedConvBoundaries(CustomTestCase):
+    def test_nonfinite_neighbor_preserves_independent_block_output(self):
+        """Non-finite rows in one request must not change another request's
+        convolution, in eager execution or the compiled serving path."""
+        torch.manual_seed(7)
+        groups, group_size = 3, 2
+        for stance in ("force_eager", "default"):
+            with torch.compiler.set_stance(stance), torch.no_grad():
+                for block_size, taps in ((5, 2), (8, 3)):
+                    hidden = torch.randn(3 * block_size, groups * group_size)
+                    delta = torch.randn(3 * block_size, taps, groups)
+                    base = torch.randn(taps, groups * group_size)
+                    clean = slice(2 * block_size, 3 * block_size)
+                    expected = _grouped_conv(
+                        hidden[clean],
+                        delta[clean],
+                        base,
+                        block_size,
+                        groups,
+                        group_size,
+                        taps,
+                    )
+                    for value in (float("nan"), float("inf"), -float("inf")):
+                        with self.subTest(
+                            stance=stance, block_size=block_size, value=value
+                        ):
+                            changed = hidden.clone()
+                            changed[2 * block_size - taps + 1 : 2 * block_size] = value
+                            actual = _grouped_conv(
+                                changed,
+                                delta,
+                                base,
+                                block_size,
+                                groups,
+                                group_size,
+                                taps,
+                            )
+                            torch.testing.assert_close(actual[clean], expected)
+                            self.assertTrue(torch.isfinite(actual[clean]).all())
+                            self.assertFalse(
+                                torch.isfinite(
+                                    actual[block_size : 2 * block_size]
+                                ).all()
+                            )
+
+    def test_prepare_and_finish_preserve_independent_blocks(self):
+        """Both convolution sides must preserve a finite request when an
+        adjacent request has non-finite activations."""
+        torch.manual_seed(11)
+        block_size, hidden_size, taps = 8, 6, 3
+        layer = DFlashGroupedConv(hidden_size, block_size, taps, group_size=2)
+        hidden = torch.randn(3 * block_size, hidden_size)
+        outputs = torch.randn_like(hidden)
+        clean = slice(2 * block_size, 3 * block_size)
+        with torch.no_grad():
+            layer.base_kernel.normal_()
+        for stance in ("force_eager", "default"):
+            with torch.compiler.set_stance(stance), torch.no_grad():
+                expected_input, expected_coefficients = layer.prepare(hidden[clean])
+                expected_output = layer.finish(outputs[clean], expected_coefficients)
+                for value in (float("nan"), float("inf"), -float("inf")):
+                    changed_hidden = hidden.clone()
+                    changed_outputs = outputs.clone()
+                    changed_hidden[block_size : 2 * block_size] = value
+                    changed_outputs[block_size : 2 * block_size] = value
+                    actual_input, coefficients = layer.prepare(changed_hidden)
+                    actual_output = layer.finish(changed_outputs, coefficients)
+                    torch.testing.assert_close(
+                        coefficients[clean], expected_coefficients
+                    )
+                    for side, actual, expected in (
+                        ("prepare", actual_input, expected_input),
+                        ("finish", actual_output, expected_output),
+                    ):
+                        with self.subTest(stance=stance, value=value, side=side):
+                            torch.testing.assert_close(actual[clean], expected)
+                            self.assertTrue(torch.isfinite(actual[clean]).all())
 
 
 if __name__ == "__main__":

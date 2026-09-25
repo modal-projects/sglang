@@ -9,7 +9,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, Summ
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.min_free_slots_delayer import MinFreeSlotsDelayer
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, IncLockRefResult
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -341,6 +341,53 @@ class TestSchedulerAdmissionMetrics(CustomTestCase):
                     self.assertIsNone(batch)
                     self.assertEqual(scheduler.running_batch.reqs, [victim])
                     self.assert_counts(registry, "request_slots", 1, 1)
+
+    def test_prefill_cadence_counts_waiters_without_changing_countdown(self):
+        """Cadence deferrals count waiters and resume after the configured interval."""
+        for enabled in (False, True):
+            for waiting_count in (0, 2):
+                with self.subTest(enabled=enabled, waiting_count=waiting_count):
+                    waiting = [self.request(str(i)) for i in range(waiting_count)]
+                    scheduler, registry = self.scheduler(waiting, enabled=enabled)
+                    scheduler.scheduler_stage_metrics = None
+                    scheduler.process_pending_chunked_abort = MagicMock()
+                    scheduler.enable_fpm = False
+                    scheduler.enable_hisparse = False
+                    scheduler.require_mlp_sync = False
+                    scheduler.prefill_decode_interval = 2
+                    scheduler._prefill_decode_interval_remaining = 2
+                    scheduler.dp_attn_adapter = SimpleNamespace(
+                        maybe_prepare_mlp_sync_batch=lambda batch, **kwargs: batch,
+                        maybe_convert_decode_to_extend=lambda batch: batch,
+                    )
+                    scheduler.ngram_embedding_manager = SimpleNamespace(
+                        prepare_for_forward=lambda batch, **kwargs: batch
+                    )
+                    scheduler.get_new_batch_prefill = MagicMock(
+                        return_value=NextBatchPlan(
+                            batch_to_run=None, running_batch=scheduler.running_batch
+                        )
+                    )
+
+                    for remaining in (1, 0):
+                        plan = scheduler.get_next_batch_to_run(
+                            scheduler.running_batch, None
+                        )
+                        self.assertIsNone(plan.batch_to_run)
+                        self.assertEqual(scheduler.waiting_queue, waiting)
+                        self.assertEqual(
+                            scheduler._prefill_decode_interval_remaining, remaining
+                        )
+                        scheduler.get_new_batch_prefill.assert_not_called()
+
+                    scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+                    scheduler.get_new_batch_prefill.assert_called_once()
+                    if enabled and waiting_count:
+                        self.assert_counts(
+                            registry, "prefill_cadence", 2, 2 * waiting_count
+                        )
+                    else:
+                        self.assertEqual(self.counts(registry), {})
 
     def test_metrics_disabled_preserves_scheduling(self):
         outcomes = []

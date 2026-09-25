@@ -3650,6 +3650,10 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
+            if self.metrics_collector_context.current_scheduler_metrics_enabled:
+                self.metrics_collector.record_admission_blocked(
+                    "prefill_cadence", len(self.waiting_queue)
+                )
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)

@@ -568,6 +568,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if self.is_mamba_enabled and self.is_swa_enabled:
+            # Validator consensus cannot attribute an SWA obstruction to Mamba.
+            result = result._replace(mamba_cache_miss_eligible=False)
         return result
 
     def supports_fast_match_prefix(self) -> bool:

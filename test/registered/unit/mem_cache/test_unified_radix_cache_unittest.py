@@ -37,8 +37,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
+    get_mamba_cache_miss_cause,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -8367,6 +8370,232 @@ class TestMambaCheckpointGrid(CustomTestCase):
         self.assertEqual(
             self._branching_seqlen(tree_page_size=32, full_hit_length=160), 128
         )
+
+
+class TestMambaCheckpointGap(CustomTestCase):
+    """Checkpoint loss belongs to its endpoint and the current reusable gap."""
+
+    cfg = TestMambaCheckpointGrid.cfg
+    _rid = 0
+    _make_req = UnifiedRadixCacheSuite._make_req
+    _alloc = UnifiedRadixCacheSuite._alloc
+    _insert = UnifiedRadixCacheSuite._insert
+
+    def _fixture(self, *depths):
+        # Loss history is currently a Python TreeCore contract. The shared Rust
+        # entry point also imports this class, so choose its backend explicitly.
+        with mock.patch(f"{__name__}._TREE_CORE_TEST_BACKEND", "python"):
+            cache, allocator, req_pool = build_fixture(
+                self.cfg, mamba_cache_chunk_size=64
+            )
+        nodes = {}
+        for depth in depths:
+            self._insert(cache, allocator, req_pool, list(range(depth)))
+            nodes[depth] = self._match(cache, depth).best_match_node
+        return cache, allocator, req_pool, nodes
+
+    def _match(self, cache, depth):
+        return cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(depth))))
+        )
+
+    def _evict_state(self, cache, node, layer=EvictLayer.DEVICE):
+        result = cache.tree_core.evict_component(node, ComponentType.MAMBA, layer)
+        freed = sum(
+            len(value)
+            for frees in (result.device_frees, result.host_frees)
+            for value in frees.get(ComponentType.MAMBA, [])
+        )
+        cache._free_values(result.device_frees, result.host_frees)
+        return freed
+
+    def _publish_full_backup(self, cache, nodes):
+        # Supply completed transfer slot IDs at the storage boundary. Tree
+        # publication and host-aware matching use the production methods.
+        for node in nodes.values():
+            cache.tree_core.commit_backup(
+                node, _device_value(cache, node, ComponentType.FULL).cpu(), {}
+            )
+            cache.tree_core.mark_write_through_pending([node], ack_id=node)
+            cache.tree_core.finish_write_through([node], ack_id=node)
+
+    def _assert_gap(self, cache, depth, tokens, cause):
+        result = self._match(cache, depth)
+        self.assertEqual(result.full_kv_hit_length, depth)
+        self.assertEqual(get_mamba_cache_miss_tokens(result), tokens)
+        self.assertEqual(get_mamba_cache_miss_cause(result), cause)
+        return result
+
+    def _commit_transfer(self, cache, node, phase, transfer, **kwargs):
+        actions = []
+        cache.tree_core.commit_hicache_transfers(
+            node,
+            phase,
+            {ComponentType.MAMBA: [transfer]},
+            cache_actions=actions,
+            **kwargs,
+        )
+        cache._apply_cache_actions(actions)
+
+    def test_interior_eviction_explains_gap_with_never_saved_endpoint(self):
+        cache, _, _, nodes = self._fixture(64, 128, 256)
+        self._assert_gap(cache, 192, 64, "never_saved")
+
+        self.assertEqual(self._evict_state(cache, nodes[128]), 1)
+
+        result = self._assert_gap(cache, 192, 128, "state_evicted")
+        self.assertEqual(result.best_match_node, nodes[64])
+        self.assertEqual(result.mamba_branching_seqlen, 192)
+        cache.sanity_check()
+
+    def test_split_keeps_loss_on_suffix_and_excludes_unaligned_loss(self):
+        for checkpoint_depth, expected_cause in (
+            (160, "never_saved"),
+            (192, "state_evicted"),
+        ):
+            with self.subTest(checkpoint_depth=checkpoint_depth):
+                cache, _, _, nodes = self._fixture(64, checkpoint_depth)
+                lost_node = nodes[checkpoint_depth]
+                self.assertEqual(self._evict_state(cache, lost_node), 1)
+
+                self._assert_gap(cache, 128, 64, "never_saved")
+                split_node = cache.tree_core.get_parent_node_id(lost_node)
+                self.assertFalse(
+                    cache.tree_core.node_by_id(split_node).mamba_state_evicted
+                )
+                self.assertTrue(
+                    cache.tree_core.node_by_id(lost_node).mamba_state_evicted
+                )
+                # Evicting a split endpoint that never held state is a no-op.
+                self.assertEqual(self._evict_state(cache, split_node), 0)
+                self._assert_gap(cache, 128, 64, "never_saved")
+                self._assert_gap(
+                    cache,
+                    checkpoint_depth,
+                    64 if checkpoint_depth == 160 else 128,
+                    expected_cause,
+                )
+                cache.sanity_check()
+
+    def test_reusable_checkpoint_excludes_earlier_eviction(self):
+        cache, _, _, nodes = self._fixture(64, 128, 192, 320)
+        self.assertEqual(self._evict_state(cache, nodes[128]), 1)
+
+        result = self._assert_gap(cache, 256, 64, "never_saved")
+
+        self.assertEqual(result.best_match_node, nodes[192])
+        cache.sanity_check()
+
+    def test_only_last_checkpoint_copy_loss_marks_gap(self):
+        for first_layer, last_layer in (
+            (EvictLayer.DEVICE, EvictLayer.HOST),
+            (EvictLayer.HOST, EvictLayer.DEVICE),
+        ):
+            with self.subTest(first_layer=first_layer):
+                cache, _, _, nodes = self._fixture(64, 192)
+                node = nodes[192]
+                cache.tree_core.set_hicache_enabled()
+                self._publish_full_backup(cache, nodes)
+                self._commit_transfer(
+                    cache,
+                    node,
+                    CacheTransferPhase.BACKUP_HOST,
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        host_indices=torch.tensor([0], dtype=torch.int64),
+                    ),
+                )
+
+                self.assertEqual(self._evict_state(cache, node, first_layer), 1)
+                survivor = self._assert_gap(cache, 192, 0, "never_saved")
+                self.assertFalse(cache.tree_core.node_by_id(node).mamba_state_evicted)
+                if first_layer == EvictLayer.DEVICE:
+                    self.assertEqual(survivor.mamba_host_hit_length, 1)
+                    self.assertEqual(survivor.host_hit_length, 128)
+
+                self.assertEqual(self._evict_state(cache, node, last_layer), 1)
+                self._assert_gap(cache, 192, 128, "state_evicted")
+                cache.sanity_check()
+
+    def test_insert_storage_restore_and_loadback_clear_loss_history(self):
+        for restore in ("insert", "storage", "loadback"):
+            with self.subTest(restore=restore):
+                cache, allocator, req_pool, nodes = self._fixture(64, 192)
+                node = nodes[192]
+                self.assertEqual(self._evict_state(cache, node), 1)
+                self._assert_gap(cache, 192, 128, "state_evicted")
+
+                if restore == "insert":
+                    self._insert(cache, allocator, req_pool, list(range(192)))
+                elif restore == "storage":
+                    cache.tree_core.set_hicache_enabled()
+                    self._publish_full_backup(cache, nodes)
+                    self._commit_transfer(
+                        cache,
+                        node,
+                        CacheTransferPhase.PREFETCH,
+                        PoolTransfer(
+                            name=PoolName.MAMBA,
+                            host_indices=torch.tensor([0], dtype=torch.int64),
+                        ),
+                        insert_result=InsertResult(
+                            prefix_len=192, inserted_host_node=node
+                        ),
+                        pool_storage_result=PoolTransferResult(
+                            kv_hit_pages=6,
+                            extra_pool_hit_pages={PoolName.MAMBA: 1},
+                        ),
+                    )
+                else:
+                    restored_slot = req_pool.mamba_allocator.alloc(1)
+                    self.assertIsNotNone(restored_slot)
+                    self._commit_transfer(
+                        cache,
+                        node,
+                        CacheTransferPhase.LOAD_BACK,
+                        PoolTransfer(name=PoolName.MAMBA, device_indices=restored_slot),
+                    )
+
+                self.assertFalse(cache.tree_core.node_by_id(node).mamba_state_evicted)
+                self._assert_gap(cache, 192, 0, "never_saved")
+                cache.sanity_check()
+
+    def test_reset_drops_history_for_reused_token_path(self):
+        cache, allocator, req_pool, nodes = self._fixture(64, 128, 192)
+        self._evict_state(cache, nodes[128])
+        self._evict_state(cache, nodes[192])
+        self._assert_gap(cache, 192, 128, "state_evicted")
+
+        cache.reset()
+        for depth in (64, 192):
+            self._insert(cache, allocator, req_pool, list(range(depth)))
+
+        self._assert_gap(cache, 128, 64, "never_saved")
+        cache.sanity_check()
+
+    def test_swa_obstruction_does_not_attribute_available_mamba_state_as_miss(self):
+        cfg = replace(
+            self.cfg,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=64,
+        )
+        with mock.patch.object(self, "cfg", cfg):
+            cache, _, _, nodes = self._fixture(64, 96, 128)
+        result = cache.tree_core.evict_component(
+            nodes[96], ComponentType.SWA, EvictLayer.DEVICE
+        )
+        cache._free_values(result.device_frees, result.host_frees)
+        self._evict_state(cache, nodes[96])
+
+        result = self._match(cache, 128)
+
+        self.assertIsNotNone(_device_value(cache, nodes[128], ComponentType.MAMBA))
+        self.assertEqual(result.full_kv_hit_length, 128)
+        self.assertEqual(len(result.device_indices), 64)
+        self.assertEqual(result.mamba_branching_seqlen, 128)
+        self.assertFalse(result.mamba_cache_miss_eligible)
+        self.assertEqual(get_mamba_cache_miss_tokens(result), 0)
+        cache.sanity_check()
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):

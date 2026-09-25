@@ -65,6 +65,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_cause,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -209,6 +211,11 @@ def match_prefix_for_req(
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
     )
+    req.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
+    req.mamba_cache_miss_end = min(
+        match_result.mamba_branching_seqlen or 0, match_result.full_kv_hit_length
+    )
+    req.mamba_cache_miss_cause = get_mamba_cache_miss_cause(match_result)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen

@@ -103,6 +103,9 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    mamba_cache_miss_by_cause: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_adder(
@@ -112,6 +115,23 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        mamba_cache_miss_by_cause = {}
+        for req in adder.can_run_list:
+            if req._mamba_cache_miss_reported:
+                continue
+            req._mamba_cache_miss_reported = True
+            # Load-back may expose resident FULL behind host-only Mamba state.
+            miss_tokens = min(
+                req.mamba_cache_miss_tokens,
+                max(0, req.mamba_cache_miss_end - len(req.prefix_indices)),
+            )
+            if miss_tokens > 0:
+                cause = req.mamba_cache_miss_cause
+                num_requests, num_tokens = mamba_cache_miss_by_cause.get(cause, (0, 0))
+                mamba_cache_miss_by_cause[cause] = (
+                    num_requests + 1,
+                    num_tokens + miss_tokens,
+                )
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
@@ -126,6 +146,7 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            mamba_cache_miss_by_cause=mamba_cache_miss_by_cause,
         )
 
 
@@ -732,6 +753,15 @@ class SchedulerMetricsReporter:
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )
+            ps = self.scheduler.ps
+            if ps.attn_tp_rank == 0 and ps.attn_cp_rank == 0 and ps.pp_rank == 0:
+                for cause, (
+                    num_requests,
+                    num_tokens,
+                ) in prefill_stats.mamba_cache_miss_by_cause.items():
+                    self.metrics_collector.increment_mamba_cache_miss(
+                        num_requests=num_requests, num_tokens=num_tokens, cause=cause
+                    )
             if self.enable_mfu_metrics:
                 flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)
                 self.metrics_collector.increment_estimated_perf(

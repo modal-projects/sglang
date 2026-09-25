@@ -258,8 +258,32 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    # None means the tree backend does not track checkpoint-loss history.
+    mamba_state_evicted_in_gap: Optional[bool] = None
+    mamba_cache_miss_eligible: bool = True
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+
+
+def get_mamba_cache_miss_tokens(match_result: MatchResult) -> int:
+    """Full-KV tokens within the aligned gap beyond the reusable checkpoint."""
+    if (
+        not match_result.mamba_cache_miss_eligible
+        or match_result.mamba_branching_seqlen is None
+    ):
+        return 0
+    reusable = len(match_result.device_indices) + match_result.host_hit_length
+    return max(
+        0,
+        min(match_result.mamba_branching_seqlen, match_result.full_kv_hit_length)
+        - reusable,
+    )
+
+
+def get_mamba_cache_miss_cause(match_result: MatchResult) -> str:
+    if match_result.mamba_state_evicted_in_gap is None:
+        return "unknown"
+    return "state_evicted" if match_result.mamba_state_evicted_in_gap else "never_saved"
 
 
 def zero_match_result(
@@ -281,6 +305,7 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        mamba_state_evicted_in_gap=None,
     )
 
 

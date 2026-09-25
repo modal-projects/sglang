@@ -30,13 +30,15 @@ class TestExternalHashPadding(CustomTestCase):
         output = MultimodalProcessorOutput(
             mm_items=[item], input_ids=ids, padded_input_ids=original_padding
         )
-        manager = SimpleNamespace(
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.__dict__.update(
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
                     architectures=["Qwen3VLForConditionalGeneration"]
                 )
             ),
             mm_processor=SimpleNamespace(
+                use_cuda_ipc=False,
                 prefer_tokenized_input=True,
                 process_mm_data_async=AsyncMock(return_value=output),
             ),

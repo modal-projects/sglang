@@ -274,15 +274,19 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
-    def __init__(self, matched: str):
+    def __init__(self, matched: str, *, err_type: Optional[str] = None):
         super().__init__()
         self.matched = matched
+        self.err_type = err_type
 
     def to_json(self):
-        return {
+        reason = {
             "type": "stop",  # to match OpenAI API's return value
             "matched": self.matched,
         }
+        if self.err_type is not None:
+            reason["err_type"] = self.err_type
+        return reason
 
 
 class FINISHED_MATCHED_REGEX(BaseFinishReason):
@@ -1822,7 +1826,9 @@ class Req(ReqDllmMixin):
                     )
                 if self.eos_token_ids:
                     self.output_ids[offset] = next(iter(self.eos_token_ids))
-                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                self.finished_reason = FINISH_MATCHED_STR(
+                    matched="NaN happened", err_type="invalid_token"
+                )
                 self.finished_len = offset + 1
                 return True
 

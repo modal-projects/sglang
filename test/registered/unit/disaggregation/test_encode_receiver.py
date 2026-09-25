@@ -5,9 +5,13 @@ import threading
 import time
 import unittest
 from array import array
+from functools import partial
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import msgspec
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
@@ -18,8 +22,13 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _ReceiveRegistrationRunner,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
+from sglang.srt.managers.io_struct import AbortReq, EncoderDispatchErrorReq
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.observability import metrics_collector
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +48,7 @@ def _make_registration_request(request_cls):
     request.status = WaitingMMRequestStatus.PENDING
     request.error_msg = None
     request.error_code = None
+    request.err_type = None
     request.embedding_pool = None
     request.embeddings_buffer = None
     request.recv_embedding_data = None
@@ -215,6 +225,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
                 self.status = WaitingMMRequestStatus.PENDING
                 self.error_msg = None
                 self.error_code = None
+                self.err_type = None
                 self.start_time = 0
 
             def _try_recv_mm_data(self):
@@ -258,7 +269,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertEqual(owner.error_msg, dispatch_error.error_msg)
         self.assertEqual(owner.error_code, dispatch_error.error_code)
         self.assertEqual(other.status, WaitingMMRequestStatus.PENDING)
-        self.assertEqual([req.rid for req, _, _ in abort_reqs], [owner.rid])
+        self.assertEqual([req.rid for req, _, _, _ in abort_reqs], [owner.rid])
 
     def test_extra_key_and_cache_salt_are_forwarded(self):
         scheduler = SimpleNamespace(
@@ -357,6 +368,7 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
             status = WaitingMMRequestStatus.PENDING
             error_msg = "peer failed"
             error_code = None
+            err_type = None
             start_time = 0
             released = False
             closed = False
@@ -393,6 +405,196 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestEncoderTimeoutOutcome(CustomTestCase):
+    def test_internal_timeout_preserves_http_status_and_failure_origin(self):
+        """Only a receiver wait timeout is an engine fault; external 408 stays invalid."""
+        for internal_timeout in (False, True):
+            with self.subTest(internal_timeout=internal_timeout):
+                request = SimpleNamespace(rid="timeout", return_logprob=False)
+                waiting = SimpleNamespace(
+                    rid=request.rid,
+                    recv_req=request,
+                    status=WaitingMMRequestStatus.PENDING
+                    if internal_timeout
+                    else WaitingMMRequestStatus.FAIL,
+                    error_msg="upstream timeout",
+                    error_code=HTTPStatus.REQUEST_TIMEOUT,
+                    err_type=None,
+                    start_time=0 if internal_timeout else time.time(),
+                    _try_recv_mm_data=lambda: None,
+                    release_resources=lambda: None,
+                    close_recv_socket=lambda: None,
+                )
+                receiver = SimpleNamespace(
+                    waiting_list=[waiting],
+                    waiting_by_rid={waiting.rid: waiting},
+                    scheduler_recv_socket=None,
+                    wait_timeout=10,
+                    tp_group=SimpleNamespace(cpu_group=None),
+                    _drain_scheduler_embeddings=lambda: None,
+                    _sync_fail_info_across_tp=lambda request: None,
+                    create_req=lambda request: request,
+                )
+                receiver.process_waiting_requests = lambda reqs: (
+                    MMReceiverBase._process_waiting_requests(
+                        receiver, reqs, waiting_cls=None
+                    )
+                )
+                emitted = []
+                scheduler = SimpleNamespace(
+                    ps=SimpleNamespace(pp_rank=0),
+                    mm_receiver=receiver,
+                    stream_output=lambda reqs, logprob: emitted.extend(
+                        req.finished_reason.to_json() for req in reqs
+                    ),
+                )
+                with (
+                    get_context().override_server_args(
+                        language_only=True, encoder_transfer_backend="zmq_to_scheduler"
+                    ),
+                    patch("torch.distributed.all_reduce"),
+                ):
+                    self.assertEqual(
+                        SchedulerRequestReceiver._apply_mm_receiver(scheduler, []), []
+                    )
+                self.assertEqual(len(emitted), 1)
+                self.assertEqual(emitted[0]["status_code"], HTTPStatus.REQUEST_TIMEOUT)
+                self.assertEqual(
+                    emitted[0]["err_type"],
+                    "encoder_timeout" if internal_timeout else None,
+                )
+                self.assertEqual(
+                    metrics_collector.finished_outcome(emitted[0]),
+                    "engine_fault" if internal_timeout else "invalid_request",
+                )
+                self.assertEqual(receiver.waiting_list, [])
+                self.assertEqual(receiver.waiting_by_rid, {})
+
+
+class TestEncoderCancellationOutcome(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            language_only=True, encoder_transfer_backend="zmq_to_scheduler"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.registry = CollectorRegistry()
+        self.labels = {"model_name": "test-model"}
+
+        class Collector(metrics_collector.TokenizerMetricsCollector):
+            _counter_cls = partial(Counter, registry=self.registry)
+            _gauge_cls = partial(Gauge, registry=self.registry)
+            _histogram_cls = partial(Histogram, registry=self.registry)
+
+        self.collector = Collector(labels=self.labels)
+
+    def make_receiver(self):
+        waiting = _make_registration_request(WaitingZmqRequest)
+        waiting.start_time = time.time()
+        waiting.recv_req.return_logprob = False
+        receiver = SimpleNamespace(
+            waiting_list=[waiting],
+            waiting_by_rid={waiting.rid: waiting},
+            scheduler_recv_socket=None,
+            wait_timeout=10,
+            tp_size=1,
+            tp_group=SimpleNamespace(cpu_group=None),
+            _drain_scheduler_embeddings=lambda: None,
+            create_req=lambda request: request,
+        )
+        receiver._sync_fail_info_across_tp = lambda request: (
+            MMReceiverBase._sync_fail_info_across_tp(receiver, request)
+        )
+        receiver.process_waiting_requests = lambda reqs: (
+            MMReceiverBase._process_waiting_requests(receiver, reqs, waiting_cls=None)
+        )
+        return receiver, waiting
+
+    def finish(self, receiver):
+        emitted = []
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0),
+            mm_receiver=receiver,
+            stream_output=lambda reqs, logprob: emitted.extend(
+                req.finished_reason.to_json() for req in reqs
+            ),
+        )
+        SchedulerRequestReceiver._apply_mm_receiver(scheduler, [])
+        self.assertEqual(len(emitted), 1)
+        reason = msgspec.json.decode(msgspec.json.encode(emitted[0]))
+        self.collector.observe_finished_outcome(
+            self.labels, metrics_collector.finished_outcome(reason), 0, 0
+        )
+        return reason
+
+    def sample(self, outcome):
+        return self.registry.get_sample_value(
+            "sglang:finished_requests_by_outcome_total",
+            {**self.labels, "outcome": outcome},
+        )
+
+    def test_user_abort_is_distinct_from_encoder_bad_request(self):
+        """A cancellation's existing HTTP 400 must not become an invalid request."""
+        for cancelled in (True, False):
+            with self.subTest(cancelled=cancelled):
+                receiver, waiting = self.make_receiver()
+                before_abort = self.sample("abort")
+                before_invalid = self.sample("invalid_request")
+                if cancelled:
+                    MMReceiverBase.abort_waiting_requests(
+                        receiver, AbortReq(rid=waiting.rid)
+                    )
+                else:
+                    waiting._fail_and_release("Aborted by user", error_code=400)
+                with patch("torch.distributed.all_reduce"):
+                    reason = self.finish(receiver)
+                self.assertEqual(self.sample("abort"), before_abort + int(cancelled))
+                self.assertEqual(
+                    self.sample("invalid_request"), before_invalid + int(not cancelled)
+                )
+                self.assertEqual(reason["status_code"], 400)
+                self.assertEqual(reason["err_type"], "cancelled" if cancelled else None)
+                self.assertEqual(reason["message"], "Aborted by user")
+
+    def test_peer_cancellation_retains_marker_at_streaming_rank(self):
+        """TP error propagation must carry the cancellation tag with its status."""
+        receiver, waiting = self.make_receiver()
+        peer_receiver, peer = self.make_receiver()
+        MMReceiverBase.abort_waiting_requests(peer_receiver, AbortReq(rid=peer.rid))
+        receiver.tp_size = 2
+        receiver.tp_group.all_gather_object = lambda local: [
+            local,
+            (peer.error_msg, peer.error_code, peer.err_type),
+        ]
+
+        def peer_failed(status, **kwargs):
+            status.fill_(WaitingMMRequestStatus.FAIL)
+
+        with patch("torch.distributed.all_reduce", peer_failed):
+            reason = self.finish(receiver)
+        self.assertEqual(self.sample("abort"), 1)
+        self.assertEqual(self.sample("invalid_request"), 0)
+        self.assertEqual(reason["status_code"], 400)
+        self.assertEqual(reason["err_type"], "cancelled")
+
+    def test_peer_bad_request_cannot_reuse_another_ranks_cancel_marker(self):
+        """A selected peer error must carry its own type, including no tag."""
+        receiver, waiting = self.make_receiver()
+        MMReceiverBase.abort_waiting_requests(receiver, AbortReq(rid=waiting.rid))
+        receiver.tp_size = 2
+        receiver.tp_group.all_gather_object = lambda local: [
+            local,
+            ("bad media", 400, None),
+        ]
+        with patch("torch.distributed.all_reduce"):
+            reason = self.finish(receiver)
+        self.assertEqual(self.sample("invalid_request"), 1)
+        self.assertEqual(self.sample("abort"), 0)
+        self.assertEqual(reason["err_type"], None)
+        self.assertEqual(reason["message"], "bad media")
 
 
 if __name__ == "__main__":

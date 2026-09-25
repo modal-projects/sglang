@@ -690,7 +690,8 @@ mod tests {
             events[1].finish_reason,
             Some(
                 FinishKind::Stop {
-                    matched: Some(Matched::Token(5))
+                    matched: Some(Matched::Token(5)),
+                    err_type: None,
                 }
                 .into()
             )

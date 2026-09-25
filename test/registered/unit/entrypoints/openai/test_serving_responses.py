@@ -1,12 +1,15 @@
 import argparse
 import asyncio
+import json
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
 import pytest
+from fastapi import HTTPException
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -14,11 +17,20 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
-from utils import StreamFixture, engine_chunk, event_payloads, make_serving
+from utils import (
+    StreamFixture,
+    collect_stream_events,
+    engine_chunk,
+    event_payloads,
+    generation_error_chunk,
+    generation_fault_reasons,
+    make_serving,
+)
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
     SimpleContext,
+    StreamingHarmonyContext,
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
@@ -33,6 +45,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -1726,6 +1739,176 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+class ResponsesErrorsTestCase(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"
+        )
+
+    def test_create_responses_preserves_transport_error_status(self):
+        """The outer request handler must not relabel engine errors as HTTP 400."""
+        for status in (408, 429, 500, 502, 503):
+            with self.subTest(status=status):
+                serving = make_serving()
+                serving.use_harmony = False
+                serving.default_chat_template_kwargs = {}
+                serving.template_manager.chat_template_name = None
+                serving.template_manager.jinja_template_content_format = "string"
+                serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [
+                    1,
+                    2,
+                    3,
+                ]
+                serving.tokenizer_manager.abort_request = Mock()
+                serving.reasoning_parser = None
+                serving.tool_call_parser = None
+
+                async def generate(*args, **kwargs):
+                    raise HTTPException(status_code=status, detail="generation failed")
+                    yield
+
+                serving.tokenizer_manager.generate_request = generate
+                response = asyncio.run(
+                    serving.create_responses(
+                        ResponsesRequest(model="x", input="hi", store=False)
+                    )
+                )
+                self.assertEqual(response.status_code, status)
+                self.assertNotIn("usage", json.loads(response.body))
+
+    def test_terminal_outcomes_usage_and_storage_agree(self):
+        """Faults fail without usage while release cancellation/length semantics survive."""
+        cases = [
+            (reason, "failed", "server_error", False)
+            for reason, _ in generation_fault_reasons()
+        ]
+        for code in (400, 408, 429, "429", 503, "503", None):
+            cases.append(
+                (
+                    FINISH_ABORT("stopped", code).to_json(),
+                    "failed",
+                    "rate_limit_exceeded"
+                    if str(code) == "429"
+                    else "invalid_prompt"
+                    if code in (400, 408)
+                    else "server_error",
+                    True,
+                )
+            )
+        cases += [
+            (
+                FINISH_ABORT("cancelled", 400, "cancelled").to_json(),
+                "failed",
+                "server_error",
+                True,
+            ),
+            ({"type": "stop"}, "completed", None, True),
+            ({"type": "length", "length": 2}, "incomplete", None, True),
+        ]
+        for reason, status, error_code, has_usage in cases:
+            for harmony in (False, True):
+                for stream in (False, True):
+                    with self.subTest(reason=reason, harmony=harmony, stream=stream):
+                        serving = make_serving()
+                        serving.reasoning_parser = None
+                        serving.tool_call_parser = None
+                        serving.use_harmony = harmony
+                        request = ResponsesRequest(
+                            model="x", input="hi", stream=stream, store=True
+                        )
+                        metadata = RequestResponseMetadata(
+                            request_id=request.request_id
+                        )
+                        chunk = generation_error_chunk(reason)
+                        context = SimpleContext()
+                        context.last_output = chunk
+                        if harmony:
+                            context = Mock(
+                                spec=StreamingHarmonyContext
+                                if stream
+                                else HarmonyContext
+                            )
+                            context.finish_reason = reason
+                            context.num_prompt_tokens = 5
+                            context.num_output_tokens = 2
+                            context.num_cached_tokens = 1
+                            context.num_reasoning_tokens = 0
+                            context.messages = []
+                            context.num_init_messages = 0
+                            context.parser = SimpleNamespace(
+                                current_content="Partial",
+                                current_role=Role.ASSISTANT,
+                                current_channel="final",
+                                current_recipient=None,
+                            )
+
+                        async def generate():
+                            yield context if harmony else chunk
+
+                        kwargs = {
+                            "request": request,
+                            "sampling_params": {},
+                            "result_generator": generate(),
+                            "model_name": "x",
+                            "tokenizer": Mock(),
+                            "request_metadata": metadata,
+                            "require_reasoning": False,
+                        }
+                        if not stream:
+                            response = asyncio.run(
+                                serving.responses_full_generator(
+                                    context=context, **kwargs
+                                )
+                            ).model_dump()
+                        else:
+                            generator = (
+                                serving.responses_stream_generator(
+                                    context=context, **kwargs
+                                )
+                                if harmony
+                                else serving.responses_stream_generator_non_harmony(
+                                    **kwargs
+                                )
+                            )
+                            events = event_payloads(
+                                asyncio.run(collect_stream_events(generator))
+                            )
+                            terminal = events[-1]
+                            self.assertEqual(terminal["type"], f"response.{status}")
+                            self.assertEqual(
+                                [e["sequence_number"] for e in events],
+                                list(range(len(events))),
+                            )
+                            self.assertEqual(
+                                sum(
+                                    e["type"]
+                                    in (
+                                        "response.failed",
+                                        "response.completed",
+                                        "response.incomplete",
+                                    )
+                                    for e in events
+                                ),
+                                1,
+                            )
+                            response = terminal["response"]
+                        self.assertEqual(response["status"], status)
+                        self.assertTrue(response["output"])
+                        self.assertEqual(response["usage"] is not None, has_usage)
+                        self.assertEqual(
+                            metadata.final_usage_info is not None, has_usage
+                        )
+                        if error_code:
+                            self.assertEqual(response["error"]["code"], error_code)
+                        else:
+                            self.assertIsNone(response["error"])
+                        stored = serving.response_store[request.request_id]
+                        self.assertEqual(stored.status, status)
+                        self.assertEqual(stored.usage is not None, has_usage)
 
 
 if __name__ == "__main__":

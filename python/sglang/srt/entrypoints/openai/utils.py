@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 def get_generation_error(finish_reason: Any) -> Optional[ErrorResponse]:
     if not isinstance(finish_reason, dict):
         return None
+    message = finish_reason.get("message")
     if finish_reason.get("type") == "abort":
         try:
             status = int(finish_reason.get("status_code"))
@@ -30,6 +31,9 @@ def get_generation_error(finish_reason: Any) -> Optional[ErrorResponse]:
             return None
     elif finished_outcome(finish_reason) == "engine_fault":
         status = HTTPStatus.INTERNAL_SERVER_ERROR
+        matched = finish_reason.get("matched")
+        if isinstance(matched, str):
+            message = matched
     else:
         return None
     try:
@@ -38,7 +42,7 @@ def get_generation_error(finish_reason: Any) -> Optional[ErrorResponse]:
         err_type = "InternalServerError" if status >= 500 else "BadRequestError"
     return ErrorResponse(
         object="error",
-        message=finish_reason.get("message") or "Generation aborted.",
+        message=message or "Generation aborted.",
         type=err_type,
         code=status,
     )

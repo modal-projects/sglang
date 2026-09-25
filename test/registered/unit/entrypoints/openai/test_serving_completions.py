@@ -4,20 +4,30 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
 import json
 import unittest
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi import Request
+from fastapi import HTTPException, Request
+from test_serving_chat import _MockTemplateManager as _MockChatTemplateManager
+from test_serving_chat import _MockTokenizerManager
+from utils import generation_error_chunk, generation_fault_reasons
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_STR
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -598,6 +608,215 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+
+class GenerationErrorsTestCase(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", enable_cache_report=True), role="tokenizer"
+        )
+
+    def fixture(self, chat, *, stream=True, continuous=False, optional_fields=False):
+        manager = _MockTokenizerManager()
+        manager.request_logger = Mock(log_requests=False)
+        template = _MockChatTemplateManager()
+        options = {"include_usage": True, "continuous_usage_stats": continuous}
+        kwargs = {
+            "model": "x",
+            "stream": stream,
+            "stream_options": options if stream else None,
+            "return_hidden_states": True,
+        }
+        if chat:
+            serving = OpenAIServingChat(manager, template)
+            request = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hi"}],
+                return_input_ids_in_sglext=True,
+                return_output_ids_in_sglext=True,
+                logprobs=optional_fields,
+                **kwargs,
+            )
+        else:
+            serving = OpenAIServingCompletion(manager, template)
+            request = CompletionRequest(
+                prompt="Hi",
+                return_token_ids=optional_fields,
+                logprobs=1 if optional_fields else None,
+                **kwargs,
+            )
+        raw = Mock(spec=Request)
+        raw.headers = {}
+        return serving, request, raw
+
+    def run_request(self, serving, request, raw, chunks):
+        async def generate(*args, **kwargs):
+            for chunk in chunks:
+                if isinstance(chunk, Exception):
+                    raise chunk
+                yield chunk
+
+        serving.tokenizer_manager.generate_request = generate
+
+        async def collect():
+            with patch.object(
+                serving,
+                "_convert_to_internal_request",
+                return_value=(GenerateReqInput(text="Hi"), request),
+            ):
+                response = await serving.handle_request(request, raw)
+            if request.stream:
+                self.assertEqual(response.status_code, 200)
+                return [chunk async for chunk in response.body_iterator]
+            return response
+
+        return asyncio.run(collect())
+
+    def test_fault_stream_ends_at_error_without_usage_or_buffered_metadata(self):
+        """A fault ends all choices; only earlier continuous usage can remain."""
+        for chat in (True, False):
+            for reason, status in generation_fault_reasons():
+                for partial in (False, True):
+                    for continuous in (False, True):
+                        with self.subTest(
+                            chat=chat,
+                            reason=reason,
+                            partial=partial,
+                            continuous=continuous,
+                        ):
+                            serving, request, raw = self.fixture(
+                                chat, continuous=continuous
+                            )
+                            request.n = 2
+                            chunks = (
+                                [generation_error_chunk({"type": "stop"})]
+                                if partial
+                                else []
+                            )
+                            chunks.append(generation_error_chunk(reason, index=1))
+                            chunks.append(
+                                generation_error_chunk({"type": "stop"}, index=1)
+                            )
+                            wire = self.run_request(serving, request, raw, chunks)
+                            self.assertEqual(wire[-1], "data: [DONE]\n\n")
+                            events = [
+                                json.loads(x.removeprefix("data: ")) for x in wire[:-1]
+                            ]
+                            self.assertEqual(events[-1]["error"]["code"], status)
+                            self.assertEqual(sum("error" in e for e in events), 1)
+                            self.assertFalse(
+                                any(e.get("choices") == [] for e in events)
+                            )
+                            usages = [e["usage"] for e in events if e.get("usage")]
+                            self.assertEqual(bool(usages), partial and continuous)
+
+    def test_fault_before_optional_output_fields_has_only_error_and_done(self):
+        """Terminal faults do not require token IDs or logprob payloads."""
+        for chat in (True, False):
+            with self.subTest(chat=chat):
+                serving, request, raw = self.fixture(chat, optional_fields=True)
+                chunk = generation_error_chunk(
+                    FINISH_ABORT("engine failed", 500).to_json()
+                )
+                del chunk["output_ids"]
+                wire = self.run_request(serving, request, raw, [chunk])
+                self.assertEqual(len(wire), 2)
+                self.assertEqual(json.loads(wire[0][6:])["error"]["code"], 500)
+                self.assertEqual(wire[1], "data: [DONE]\n\n")
+
+    def test_fault_error_preserves_producer_message(self):
+        """Invalid-token stops retain their cause in streamed and full errors."""
+        cases = (
+            (
+                FINISH_MATCHED_STR("NaN happened", err_type="invalid_token").to_json(),
+                "NaN happened",
+            ),
+            (
+                {"type": "stop", "err_type": "invalid_token", "matched": 7},
+                "Generation aborted.",
+            ),
+            (FINISH_ABORT("engine failed", 500).to_json(), "engine failed"),
+        )
+        for chat in (True, False):
+            for stream in (True, False):
+                for reason, message in cases:
+                    with self.subTest(chat=chat, stream=stream, reason=reason):
+                        serving, request, raw = self.fixture(chat, stream=stream)
+                        response = self.run_request(
+                            serving, request, raw, [generation_error_chunk(reason)]
+                        )
+                        if stream:
+                            self.assertEqual(len(response), 2)
+                            self.assertEqual(response[-1], "data: [DONE]\n\n")
+                            error = json.loads(response[0][6:])["error"]
+                        else:
+                            self.assertEqual(response.status_code, 500)
+                            error = json.loads(response.body)
+                        self.assertEqual(error["message"], message)
+
+    def test_rejection_cancellation_and_natural_finish_keep_usage(self):
+        """Usage policy remains distinct from failure and cancellation status."""
+        reasons = [
+            FINISH_ABORT("request stopped", status).to_json()
+            for status in (400, 408, 429, 503, None)
+        ]
+        reasons += [
+            FINISH_ABORT("cancelled", 400, "cancelled").to_json(),
+            {"type": "stop"},
+            {"type": "length", "length": 2},
+        ]
+        for chat in (True, False):
+            for reason in reasons:
+                with self.subTest(chat=chat, reason=reason):
+                    serving, request, raw = self.fixture(chat)
+                    wire = self.run_request(
+                        serving, request, raw, [generation_error_chunk(reason)]
+                    )
+                    self.assertEqual(wire[-1], "data: [DONE]\n\n")
+                    footer = json.loads(wire[-2][6:])
+                    self.assertEqual(footer["choices"], [])
+                    self.assertEqual(footer["usage"]["total_tokens"], 7)
+
+    def test_nonstream_fault_result_cannot_be_serialized_as_success(self):
+        """Fault metadata that does not raise in the tokenizer still returns an error."""
+        for chat in (True, False):
+            for reason, status in generation_fault_reasons():
+                with self.subTest(chat=chat, reason=reason):
+                    serving, request, raw = self.fixture(
+                        chat, stream=False, optional_fields=True
+                    )
+                    result = self.run_request(
+                        serving,
+                        request,
+                        raw,
+                        [
+                            [
+                                generation_error_chunk({"type": "stop"}),
+                                generation_error_chunk(reason, index=1),
+                            ]
+                        ],
+                    )
+                    self.assertEqual(result.status_code, status)
+                    body = json.loads(result.body)
+                    self.assertEqual(body["object"], "error")
+                    self.assertNotIn("usage", body)
+                    self.assertNotIn("choices", body)
+
+    def test_nonstream_transport_errors_keep_status_without_usage(self):
+        """Errors raised by the tokenizer keep their HTTP status and error body."""
+        for chat in (True, False):
+            for status in (400, 408, 429, 500, 502, 503):
+                with self.subTest(chat=chat, status=status):
+                    serving, request, raw = self.fixture(chat, stream=False)
+                    response = self.run_request(
+                        serving,
+                        request,
+                        raw,
+                        [HTTPException(status_code=status, detail="generation failed")],
+                    )
+                    self.assertEqual(response.status_code, status)
+                    self.assertNotIn("usage", json.loads(response.body))
 
 
 if __name__ == "__main__":

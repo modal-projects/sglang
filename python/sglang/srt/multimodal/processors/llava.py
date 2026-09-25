@@ -297,6 +297,25 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
     models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
+    @property
+    def mm_feature_transport(self) -> str:
+        return self.inner.mm_feature_transport
+
+    @property
+    def use_cuda_ipc(self) -> bool:
+        return self.inner.use_cuda_ipc
+
+    @property
+    def cudaipc_mmfeature_pool(self):
+        # The inner processor creates and owns the pool used by request cleanup.
+        return self.inner.cudaipc_mmfeature_pool
+
+    def clear_preprocess_cache(self) -> None:
+        self.inner.clear_preprocess_cache()
+
+    def shutdown(self) -> None:
+        self.inner.shutdown()
+
     def _get_sgl_processor_cls(self, model_type: str):
         if model_type == "clip_vision_model":
             return LlavaImageProcessor

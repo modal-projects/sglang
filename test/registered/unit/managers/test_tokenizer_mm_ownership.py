@@ -5,7 +5,7 @@ import pickle
 import threading
 import unittest
 from array import array
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from multiprocessing import shared_memory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -33,6 +33,8 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.llava import LlavaMultimodalProcessor
 from sglang.srt.multimodal.transport import cuda_ipc
 from sglang.srt.multimodal.transport.producer_lifecycle import (
     cancel_undispatched_inputs,
@@ -152,6 +154,64 @@ def _manager(pool, output=None):
     return manager
 
 
+@contextmanager
+def _llava_processor(transport, pool, *, skip_mm_pool=False):
+    override = get_context().override_server_args(
+        mm_feature_transport=transport,
+        mm_process_config={},
+        mm_preprocess_cache_size_mb=0,
+        mm_processor_worker_num=1,
+        mm_io_worker_num=1,
+        tokenizer_worker_num=1,
+    )
+    override.install()
+    try:
+        with (
+            patch.object(
+                BaseMultimodalProcessor,
+                "__init__",
+                autospec=True,
+                side_effect=BaseMultimodalProcessor.__init__,
+            ) as initialize,
+            patch(
+                "sglang.srt.multimodal.processors.base_processor.concurrent.futures.ThreadPoolExecutor"
+            ) as io_factory,
+            patch.object(
+                BaseMultimodalProcessor, "_create_cpu_executor"
+            ) as cpu_factory,
+            patch(
+                "sglang.srt.multimodal.processors.base_processor.MmItemMemoryPool",
+                return_value=pool,
+            ) as pool_factory,
+        ):
+            processor = LlavaMultimodalProcessor(
+                SimpleNamespace(
+                    vision_config=SimpleNamespace(model_type="clip_vision_model"),
+                    text_config=SimpleNamespace(),
+                ),
+                SimpleNamespace(base_gpu_id=0, tp_size=2),
+                SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda text: [])),
+                transport_mode=None,
+                skip_mm_pool=skip_mm_pool,
+            )
+            processor.inner.shutdown = Mock(wraps=processor.inner.shutdown)
+            processor.inner.clear_preprocess_cache = Mock(
+                wraps=processor.inner.clear_preprocess_cache
+            )
+            try:
+                yield SimpleNamespace(
+                    processor=processor,
+                    initialize=initialize,
+                    pool_factory=pool_factory,
+                    io_executor=io_factory.return_value,
+                    cpu_executor=cpu_factory.return_value,
+                )
+            finally:
+                processor.shutdown()
+    finally:
+        override.restore()
+
+
 class TestTokenizerMultimodalOwnership(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
@@ -171,6 +231,79 @@ class TestTokenizerMultimodalOwnership(CustomTestCase):
             patcher = patch(target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_llava_wrapper_has_one_transport_and_shutdown_owner(self):
+        for transport, skip_mm_pool in (
+            ("cpu", False),
+            ("cuda_vmm", False),
+            ("cuda_ipc", False),
+            ("cuda_ipc", True),
+        ):
+            with self.subTest(transport=transport, skip_mm_pool=skip_mm_pool):
+                pool = Mock()
+                owns_pool = transport == "cuda_ipc" and not skip_mm_pool
+                with _llava_processor(
+                    transport, pool, skip_mm_pool=skip_mm_pool
+                ) as fixture:
+                    processor = fixture.processor
+                    manager = _manager(None)
+                    manager.mm_processor = processor
+                    fixture.initialize.assert_called_once()
+                    self.assertIs(fixture.initialize.call_args.args[0], processor.inner)
+                    self.assertEqual(fixture.pool_factory.call_count, int(owns_pool))
+                    self.assertEqual(processor.mm_feature_transport, transport)
+                    self.assertEqual(processor.use_cuda_ipc, transport == "cuda_ipc")
+                    self.assertEqual(
+                        processor.keep_mm_features_on_device, transport != "cpu"
+                    )
+                    expected_pool = pool if owns_pool else None
+                    self.assertIs(processor.cudaipc_mmfeature_pool, expected_pool)
+                    self.assertIs(manager._mm_feature_pool(), expected_pool)
+                    self.assertNotIn("cudaipc_mmfeature_pool", vars(processor))
+                    processor.clear_preprocess_cache()
+                    processor.inner.clear_preprocess_cache.assert_called_once_with()
+                processor.inner.shutdown.assert_called_once_with()
+                self.assertEqual(processor.inner.clear_preprocess_cache.call_count, 2)
+                fixture.io_executor.shutdown.assert_called_once_with(
+                    wait=False, cancel_futures=True
+                )
+                fixture.cpu_executor.shutdown.assert_called_once_with(
+                    wait=False, cancel_futures=True
+                )
+                self.assertEqual(pool.shutdown.call_count, int(owns_pool))
+                self.assertIs(manager._mm_feature_pool(), expected_pool)
+
+    def test_llava_wrapper_uses_inner_pool_for_snapshot_and_cancellation(self):
+        pool = _make_pool()
+        pool.shutdown = Mock()
+        output = _make_output(pool)
+        proxy = output.mm_items[0].feature
+        pool.copy_proxy_to_cpu = Mock(wraps=pool.copy_proxy_to_cpu)
+        pool.cancel_proxy = Mock(wraps=pool.cancel_proxy)
+        with (
+            _llava_processor("cuda_ipc", pool) as fixture,
+            patch.object(proxy, "acknowledge_consumption") as acknowledge,
+        ):
+            manager = _manager(None)
+            manager.mm_processor = fixture.processor
+            owner = manager._mm_feature_pool()
+            self.assertIs(owner, fixture.processor.inner.cudaipc_mmfeature_pool)
+            detached = detach_for_parallel_sampling(owner, [output, output])
+            cancel_undispatched_inputs(owner, [output, output])
+            pool.copy_proxy_to_cpu.assert_called_once_with(proxy)
+            pool.cancel_proxy.assert_called_once_with(proxy)
+            acknowledge.assert_not_called()
+            self.assertEqual(pool._pool.cancelled, [0])
+            self.assertFalse(pool._pool._occupied)
+            pool.memory_pool.zero_()
+            for clone in detached:
+                self.assertEqual(clone.mm_items[0].feature.tolist(), [3.0, 7.0])
+                self.assertIs(
+                    clone.mm_items[0].feature, clone.mm_items[0].precomputed_embeddings
+                )
+            self.assertIsNone(output.mm_items[0].feature)
+            self.assertIsNone(output.mm_items[0].precomputed_embeddings)
+        pool.shutdown.assert_called_once_with()
 
     def test_clone_detachment_survives_pool_reuse_and_deduplicates_aliases(self):
         """Samples retain their values after their shared source lease is recycled."""

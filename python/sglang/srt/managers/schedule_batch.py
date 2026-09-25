@@ -107,6 +107,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
+    get_mamba_cache_miss_cause,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -1114,6 +1116,11 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        self.mamba_cache_miss_tokens = 0
+        self.mamba_cache_miss_end = 0
+        self.mamba_cache_miss_cause = "unknown"
+        # First-admission accounting persists across chunks and retractions.
+        self._mamba_cache_miss_reported = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1605,6 +1612,12 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.mamba_cache_miss_tokens = get_mamba_cache_miss_tokens(match_result)
+            self.mamba_cache_miss_end = min(
+                match_result.mamba_branching_seqlen or 0,
+                match_result.full_kv_hit_length,
+            )
+            self.mamba_cache_miss_cause = get_mamba_cache_miss_cause(match_result)
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1913,6 +1926,9 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cache_miss_tokens = 0
+        self.mamba_cache_miss_end = 0
+        self.mamba_cache_miss_cause = "unknown"
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0

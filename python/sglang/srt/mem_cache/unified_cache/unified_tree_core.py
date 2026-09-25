@@ -127,6 +127,7 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        self.mamba_state_evicted = False
         self.external_cache_stored = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -786,6 +787,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            first_evicted_mamba_seqlen,
             action,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
@@ -795,6 +797,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            first_evicted_mamba_seqlen,
             action,
         )
 
@@ -806,6 +809,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         UnifiedTreeNode,
         int,
         int,
+        Optional[int],
         Optional[CacheAction | ComponentAction],
     ]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
@@ -820,6 +824,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node = node
         best_match_device_value_len = 0
         full_kv_hit_length = 0
+        first_evicted_mamba_seqlen = None
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         if separate_device_match:
@@ -840,11 +845,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return all([v(node) for v in validators])
 
         def _update_best_if_valid(node):
-            nonlocal best_match_node
+            nonlocal best_match_node, first_evicted_mamba_seqlen
             nonlocal best_match_device_value_len, best_match_device_node
             matched = _all_valid(validators, node)
             if matched:
                 best_match_node = node
+                first_evicted_mamba_seqlen = None
+            elif node.mamba_state_evicted and first_evicted_mamba_seqlen is None:
+                state = node.component_data[ComponentType.MAMBA]
+                if state.value is None and state.host_value is None:
+                    first_evicted_mamba_seqlen = full_kv_hit_length
 
             if not separate_device_match:
                 if matched:
@@ -885,6 +895,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            first_evicted_mamba_seqlen,
             action,
         )
 
@@ -922,6 +933,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
         full_kv_hit_length: int,
+        first_evicted_mamba_seqlen: Optional[int],
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
         node_update = best_match_node
@@ -964,6 +976,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
+        if (
+            first_evicted_mamba_seqlen is not None
+            and result.mamba_branching_seqlen is not None
+            and first_evicted_mamba_seqlen <= result.mamba_branching_seqlen
+        ):
+            result = result._replace(mamba_state_evicted_in_gap=True)
         # Expose only NodeIds outside TreeCore.
         return result._replace(
             last_device_node=result.last_device_node.id,
@@ -2628,6 +2646,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         cd = node.component_data[component_type]
         cd.value = value
+        if component_type == ComponentType.MAMBA:
+            node.mamba_state_evicted = False
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):
             host_lru.remove_node(node)

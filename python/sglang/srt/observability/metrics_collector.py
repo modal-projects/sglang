@@ -911,6 +911,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
+        self.mamba_cache_miss_requests_total = Counter(
+            name="sglang:mamba_cache_miss_requests_total",
+            documentation="Requests first admitted with an aligned Full-KV checkpoint gap.",
+            labelnames=list(labels.keys()) + ["cause"],
+        )
+        self.mamba_cache_miss_tokens_total = Counter(
+            name="sglang:mamba_cache_miss_tokens_total",
+            documentation="Full-KV tokens in first-admission aligned Mamba checkpoint gaps.",
+            labelnames=list(labels.keys()) + ["cause"],
+        )
+        for cause in ("state_evicted", "never_saved", "unknown"):
+            self.mamba_cache_miss_requests_total.labels(**labels, cause=cause)
+            self.mamba_cache_miss_tokens_total.labels(**labels, cause=cause)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1295,6 +1308,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     mode=mode,
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
+
+    def increment_mamba_cache_miss(
+        self, num_requests: int, num_tokens: int, cause: str
+    ) -> None:
+        if num_requests > 0:
+            self.mamba_cache_miss_requests_total.labels(**self.labels, cause=cause).inc(
+                num_requests
+            )
+        if num_tokens > 0:
+            self.mamba_cache_miss_tokens_total.labels(**self.labels, cause=cause).inc(
+                num_tokens
+            )
 
     def increment_effective_prefill_tokens(
         self,

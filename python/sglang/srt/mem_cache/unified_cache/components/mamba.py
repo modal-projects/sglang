@@ -182,7 +182,10 @@ class MambaComponent(TreeComponent):
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
 
-        return result._replace(mamba_branching_seqlen=branching_seqlen)
+        return result._replace(
+            mamba_branching_seqlen=branching_seqlen,
+            mamba_state_evicted_in_gap=False,
+        )
 
     def finalize_match_result_in_cache(
         self, params: MatchPrefixParams, result: MatchResult
@@ -224,6 +227,7 @@ class MambaComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
+        node.mamba_state_evicted = False
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -349,6 +353,8 @@ class MambaComponent(TreeComponent):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
 
+        if (freed or host_freed) and cd.value is None and cd.host_value is None:
+            node.mamba_state_evicted = True
         return freed, host_freed
 
     def _evict_device_start(self, request_cnt: int) -> None:
@@ -803,6 +809,7 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                    node.mamba_state_evicted = False
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
@@ -846,6 +853,7 @@ class MambaComponent(TreeComponent):
                 return
 
             target_node.component_data[ct].host_value = host_indices.clone()
+            target_node.mamba_state_evicted = False
             if target_node.component_data[ct].value is None:
                 host_lru = self.tree_core.host_lru_lists[ct]
                 if not host_lru.in_list(target_node):

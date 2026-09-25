@@ -1,6 +1,10 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.tokenizer_segment_cache import (
+    patch_chat_segment_cache,
+    unpatch_chat_segment_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +17,22 @@ def patch_tokenizer(tokenizer):
         logger.info(
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer)}"
         )
-        return _SpecialTokensCachePatcher.patch(tokenizer)
+        tokenizer = _SpecialTokensCachePatcher.patch(tokenizer)
+        patch_chat_segment_cache(
+            tokenizer, max_chars=envs.SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS.get()
+        )
 
     return tokenizer
 
 
+def patch_mm_processor_tokenizer(tokenizer):
+    if envs.SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS.get() > 0:
+        return patch_tokenizer(tokenizer)
+    return tokenizer
+
+
 def unpatch_tokenizer(tokenizer):
+    unpatch_chat_segment_cache(tokenizer)
     return _SpecialTokensCachePatcher.unpatch(tokenizer)
 
 

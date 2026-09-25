@@ -1397,6 +1397,9 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Per-instance Kimi chat-segment text budget; 0 disables the cache.
+    # Entries and token storage are also bounded by this budget.
+    SGLANG_CHAT_SEGMENT_CACHE_MAX_CHARS = EnvInt(0)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

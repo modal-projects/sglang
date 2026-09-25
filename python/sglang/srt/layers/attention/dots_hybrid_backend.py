@@ -145,6 +145,9 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
 
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        return self.backend.drain_fp8_range_observations()
+
     @property
     def forward_metadata(self):
         return self._active_backend.forward_metadata
@@ -409,6 +412,12 @@ class DotsHybridAttnBackend(AttentionBackend):
         # SWA latent expansion uses host sequence-length mirrors.
         self.needs_cpu_seq_lens = True
         self._dp_rebuilt_batch_id: int | None = None
+
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        events = self.dsa_backend.drain_fp8_range_observations()
+        if self.swa_backend is not self.dsa_backend:
+            events.extend(self.swa_backend.drain_fp8_range_observations())
+        return events
 
     @staticmethod
     def _is_swa_layer(layer: RadixAttention) -> bool:

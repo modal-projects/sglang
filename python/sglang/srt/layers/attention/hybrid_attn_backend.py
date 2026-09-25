@@ -52,6 +52,12 @@ class HybridAttnBackend(AttentionBackend):
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
 
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        events = self.prefill_backend.drain_fp8_range_observations()
+        if self.decode_backend is not self.prefill_backend:
+            events.extend(self.decode_backend.drain_fp8_range_observations())
+        return events
+
     @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.

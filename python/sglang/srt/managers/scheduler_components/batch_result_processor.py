@@ -492,6 +492,8 @@ class SchedulerBatchResultProcessor:
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+        else:
+            self.metrics_reporter.report_fp8_range_observations()
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()

@@ -341,3 +341,7 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        """Return and reset sampled (layer, kind, row count) observations."""
+        return []

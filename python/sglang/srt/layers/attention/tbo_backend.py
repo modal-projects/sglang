@@ -184,6 +184,15 @@ class TboAttnBackend(AttentionBackend):
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        events = []
+        seen = set()
+        for backend in (self.primary, *self.children):
+            if id(backend) not in seen:
+                seen.add(id(backend))
+                events.extend(backend.drain_fp8_range_observations())
+        return events
+
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         # Needs an explicit override: the base declares this as a property, so

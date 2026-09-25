@@ -43,6 +43,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv_ghost import (
+    GhostMetrics,
+    InitializableGhostMetrics,
+    KVGhostTracker,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -168,7 +173,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.disable = params.disable
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(params)
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
@@ -209,6 +214,7 @@ class UnifiedRadixCache(BasePrefixCache):
             params=params,
             components=self.components,
         )
+        self._init_ghost_tracker(params)
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -369,6 +375,30 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+    def _init_ghost_tracker(self, params: CacheInitParams) -> None:
+        capacity = envs.SGLANG_KV_GHOST_CAPACITY_PAGES.get()
+        if capacity < 0:
+            raise ValueError("SGLANG_KV_GHOST_CAPACITY_PAGES must be nonnegative")
+        if not params.enable_metrics or capacity == 0 or self.disable:
+            return
+        if not isinstance(self.tree_core, UnifiedTreeCore):
+            raise ValueError("KV ghost metrics require the Python tree core")
+        if not self.emit_logical_cache_metrics:
+            return
+        metrics = self.metrics_collector
+        if not isinstance(metrics, GhostMetrics):
+            logger.warning("Custom cache collector does not support KV ghost metrics")
+            return
+        tracker = KVGhostTracker(
+            capacity=capacity,
+            ttl_seconds=envs.SGLANG_KV_GHOST_TTL_SECONDS.get(),
+            page_size=params.page_size,
+            metrics=metrics,
+        )
+        if isinstance(metrics, InitializableGhostMetrics):
+            metrics.initialize_kv_ghost_metrics()
+        self.tree_core.ghost_tracker = tracker
 
     def reset(self) -> None:
         if self.linker is not None:

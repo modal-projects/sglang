@@ -1221,6 +1221,7 @@ class BufferModePipeline:
         # prev_prefix_len covers the already-device-resident head.
         insert_result = cache.insert(
             InsertParams(
+                restored_from_cache=True,
                 key=key,
                 value=torch.cat([req.prefix_indices, device_indices]),
                 prev_prefix_len=splice_base,

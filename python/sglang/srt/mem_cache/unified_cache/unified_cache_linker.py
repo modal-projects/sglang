@@ -365,6 +365,7 @@ class UnifiedCacheLinkerWrapper:
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
                 track_adopted_ranges=True,
+                restored_from_cache=True,
             )
         )
         if mamba_transfer is not None and insert_result.mamba_exist:

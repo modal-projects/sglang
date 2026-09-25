@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv_ghost import KVGhostTracker
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -134,6 +135,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        self.ghost_digests: Optional[list[bytes]] = None
+        self.ghost_end = 0
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
@@ -461,6 +464,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             enabled=params.enable_kv_cache_events, page_size=self.page_size
         )
 
+        self.ghost_tracker: Optional[KVGhostTracker] = None
         self._prefix_refs = PrefixRefRegistry()
         self.reset()
 
@@ -477,6 +481,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
         self._prefix_refs.clear()
+        if self.ghost_tracker is not None:
+            self.ghost_tracker.reset()
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -488,6 +494,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
+        self.root_node.ghost_digests = []
         for ct in self.component_types:
             self.root_node.component_data[ct].lock_ref = 1
 
@@ -561,6 +568,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, ref: PrefixRef, start: int
     ) -> list[CacheAction | ComponentAction]:
         self._check_prefix_ref_boundary(start)
+        if self.ghost_tracker is not None and self._prefix_refs.is_active(ref):
+            self.ghost_tracker.invalidate_ref(ref._id, start)
         actions = []
         for span_start, node_id in self._prefix_refs.overlapping(ref, start):
             node = self._node_arena.get(node_id)
@@ -580,6 +589,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             pending.extend(node.children.values())
             if node.retired:
                 continue
+            if self.ghost_tracker is not None:
+                self.ghost_tracker.retire_anchor(node.id)
             for medium, bit in _KV_EVENT_TIER_BITS.items():
                 if node.published_kv_tiers & bit:
                     self._record_remove_event(node, medium=medium)
@@ -590,6 +601,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def release_prefix_ref(self, ref: PrefixRef) -> None:
         self._prefix_refs.release(ref)
+        if self.ghost_tracker is not None:
+            self.ghost_tracker.release_ref(ref._id)
 
     def is_invalidated(self, node_id: NodeId) -> bool:
         node = self._node_arena.get(node_id)
@@ -741,6 +754,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
+        if self.ghost_tracker is not None and node.parent is not None:
+            self.ghost_tracker.on_deleted(
+                node.id, node.parent.id, self._prefix_refs.references(node.id)
+            )
         self._node_arena.pop(node.id, None)
         self._prefix_refs.remove(node.id)
 
@@ -1310,6 +1327,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node,
                 state.value[:prefix_len],
                 session_id=state.params.session_id,
+                restored_from_cache=state.params.restored_from_cache,
             )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
@@ -1391,6 +1409,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             state.target_node = state.node
 
+        if state.is_new_leaf and self.ghost_tracker is not None:
+            self.ghost_tracker.on_inserted(
+                state.target_node, restored=state.params.restored_from_cache
+            )
+
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
         # All hooks run before their emitted actions execute; an action failure
@@ -1470,6 +1493,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         child.key = child.key[split_len:]
         new_node.children = {child._edge_key(self.page_size): child}
         self._prefix_refs.split(child.id, new_node.id, split_len)
+        if child.ghost_digests is not None:
+            split_pages = split_len // self.page_size
+            new_node.ghost_digests = child.ghost_digests[:split_pages]
+            child.ghost_digests = child.ghost_digests[split_pages:]
+            new_node.ghost_end = child.ghost_end - len(child.key)
+            if self.ghost_tracker is not None:
+                self.ghost_tracker.on_split(child.id, new_node.id, new_node.ghost_end)
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
@@ -1544,6 +1574,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node: UnifiedTreeNode,
         fresh_value: torch.Tensor,
         session_id: Optional[str] = None,
+        restored_from_cache: bool = False,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1552,6 +1583,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
+        if self.ghost_tracker is not None and cd.host_value is None:
+            self.ghost_tracker.on_inserted(node, restored=restored_from_cache)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -2068,6 +2101,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
+        if (
+            self.ghost_tracker is not None
+            and comp.component_type == BASE_COMPONENT_TYPE
+        ):
+            self._record_capacity_ghost(node, device_freed, host_freed)
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed
@@ -2092,6 +2130,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if lru.in_list(node):
                     lru.remove_node(node)
         return device_freed, host_freed
+
+    def _record_capacity_ghost(
+        self, node: UnifiedTreeNode, device_freed: int, host_freed: int
+    ) -> None:
+        if node.retired:
+            return
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        # FULL defers clearing its device value until SWA has consumed it.
+        if (device_freed > 0 and full.host_value is None) or (
+            host_freed > 0 and full.value is None
+        ):
+            self.ghost_tracker.on_dropped(node)
 
     def _iteratively_delete_tombstone_leaf(
         self,
@@ -2283,6 +2333,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
         self._record_store_event(new_node, medium=StorageMedium.CPU)
+        if self.ghost_tracker is not None and not new_node.retired:
+            self.ghost_tracker.on_inserted(new_node, restored=True)
         return result
 
     def build_backup_spec(self, node_id: NodeId):

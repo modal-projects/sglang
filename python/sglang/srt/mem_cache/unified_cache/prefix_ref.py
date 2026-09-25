@@ -35,6 +35,10 @@ class PrefixRefRegistry:
         if ref._owner is not self._owner:
             raise ValueError("prefix receipt belongs to another tree core")
 
+    def is_active(self, ref: PrefixRef) -> bool:
+        self._validate_owner(ref)
+        return ref._id in self._refs
+
     def overlapping(self, ref: PrefixRef, start: int):
         self._validate_owner(ref)
         return sorted(
@@ -65,6 +69,10 @@ class PrefixRefRegistry:
                 self._by_node[child_id].remove(ref_id)
         if child_id in self._by_node and not self._by_node[child_id]:
             del self._by_node[child_id]
+
+    def references(self, node_id: NodeId):
+        for ref_id in self._by_node.get(node_id, ()):
+            yield ref_id, self._refs[ref_id][node_id][1]
 
     def remove(self, node_id: NodeId):
         for ref_id in self._by_node.pop(node_id, ()):

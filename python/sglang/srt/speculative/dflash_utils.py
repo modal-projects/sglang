@@ -952,6 +952,7 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
     fixed_token_id: int = 100,
+    first_invalid_rows: Optional[torch.Tensor] = None,
 ) -> None:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
     block_size = candidates.shape[1]
@@ -964,6 +965,9 @@ def apply_dflash_simulated_acceptance(
 
     accept_len.fill_(forced_accept_len)
     commit_lens.fill_(forced_commit_len)
+    if first_invalid_rows is not None:
+        # The worker captured the first pre-repair invalid row across the block.
+        first_invalid_rows.masked_fill_(first_invalid_rows > accept_len, -1)
 
     if simulate_acc_token_mode != "real-draft-token":
         bonus.fill_(fixed_token_id)
@@ -990,6 +994,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
     first_invalid_rows: Optional[torch.Tensor] = None,
+    invalid_row_scan_lens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -1119,7 +1124,11 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             # The result owns storage outside the borrowed probability pool.
             write_first_invalid_rows(
                 valid_rows=valid_rows,
-                correct_lens=accept_token_num,
+                correct_lens=(
+                    invalid_row_scan_lens
+                    if invalid_row_scan_lens is not None
+                    else accept_token_num
+                ),
                 out=first_invalid_rows,
             )
             del valid_rows

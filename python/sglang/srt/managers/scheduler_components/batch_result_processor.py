@@ -848,12 +848,16 @@ class SchedulerBatchResultProcessor:
                 req.spec_num_correct_drafts += correct
                 req.update_spec_correct_drafts_histogram(correct)
                 observations.append(correct)
+                # DSpark reports uncapped block acceptance and the planned cap.
+                # Only invalid-result settlement clips those observations.
                 if block_lens is not None:
-                    block_count = min(block_lens[i], count)
+                    block_count = (
+                        min(block_lens[i], count) if invalid >= 0 else block_lens[i]
+                    )
                     req.spec_num_block_accept_tokens += block_count
                     result.num_block_accept_tokens += block_count
                 if cap_lens is not None:
-                    cap_count = min(cap_lens[i], count)
+                    cap_count = min(cap_lens[i], count) if invalid >= 0 else cap_lens[i]
                     req.spec_num_cap_tokens += cap_count
                     req.update_spec_cap_lens_histogram(cap_count)
                     result.num_cap_tokens += cap_count

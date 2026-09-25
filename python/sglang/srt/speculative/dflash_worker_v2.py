@@ -1456,6 +1456,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
         first_invalid_rows: torch.Tensor,
+        invalid_row_scan_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
@@ -1482,6 +1483,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
                 first_invalid_rows=first_invalid_rows,
+                invalid_row_scan_lens=invalid_row_scan_lens,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
@@ -2112,6 +2114,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         first_invalid_rows = torch.empty(
             bs, dtype=torch.int32, device=candidates.device
         )
+        # Simulation can change the reached prefix after acceptance. Capture the
+        # first invalid row across the block before any target values are repaired.
+        invalid_row_scan_lens = (
+            torch.full(
+                (bs,),
+                int(self.block_size) - 1,
+                dtype=torch.int32,
+                device=candidates.device,
+            )
+            if SIMULATE_ACC_LEN > 0
+            else None
+        )
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2122,6 +2136,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
                 first_invalid_rows=first_invalid_rows,
+                invalid_row_scan_lens=invalid_row_scan_lens,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
@@ -2137,6 +2152,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
                 first_invalid_rows=first_invalid_rows,
+                invalid_row_scan_lens=invalid_row_scan_lens,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
@@ -2189,7 +2205,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
             write_first_invalid_rows(
-                valid_rows=valid_rows, correct_lens=accept_len, out=first_invalid_rows
+                valid_rows=valid_rows,
+                correct_lens=(
+                    invalid_row_scan_lens
+                    if invalid_row_scan_lens is not None
+                    else accept_len
+                ),
+                out=first_invalid_rows,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, first_invalid_rows)
         return (
@@ -2834,6 +2856,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                first_invalid_rows=first_invalid_rows,
             )
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.

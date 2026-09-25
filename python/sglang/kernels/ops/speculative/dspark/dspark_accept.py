@@ -92,6 +92,7 @@ def _accept_sampling_core(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
     first_invalid_rows: Optional[torch.Tensor] = None,
+    invalid_row_scan_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -151,7 +152,13 @@ def _accept_sampling_core(
         cap_trim_lens = torch.zeros_like(correct_len)
     if first_invalid_rows is not None:
         write_first_invalid_rows(
-            valid_rows=valid_rows, correct_lens=correct_len, out=first_invalid_rows
+            valid_rows=valid_rows,
+            correct_lens=(
+                invalid_row_scan_lens
+                if invalid_row_scan_lens is not None
+                else correct_len
+            ),
+            out=first_invalid_rows,
         )
     return correct_len, cap_trim_lens, accept_index, predicts
 
@@ -167,6 +174,7 @@ def accept_sampling(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     first_invalid_rows: Optional[torch.Tensor] = None,
+    invalid_row_scan_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -180,6 +188,7 @@ def accept_sampling(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         first_invalid_rows=first_invalid_rows,
+        invalid_row_scan_lens=invalid_row_scan_lens,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)

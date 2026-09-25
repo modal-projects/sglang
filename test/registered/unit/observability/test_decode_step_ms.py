@@ -66,6 +66,14 @@ def _make_scheduler():
     return scheduler
 
 
+def _bind_result_dispatch(scheduler, scheduler_class):
+    # Some scheduler versions extract dispatch from the outer result boundary.
+    # Keep that production path active instead of creating a no-op child mock.
+    dispatch = getattr(scheduler_class, "_process_batch_result", None)
+    if dispatch is not None:
+        scheduler._process_batch_result = types.MethodType(dispatch, scheduler)
+
+
 def _make_reporter() -> SchedulerMetricsReporter:
     context = SchedulerMetricsCollectorContext(
         enable_metrics=False,
@@ -263,6 +271,7 @@ class TestConvertedDecodeAccounting(_ReporterTestBase):
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = self.reporter.scheduler
+        _bind_result_dispatch(scheduler, Scheduler)
         scheduler.metrics_reporter = self.reporter
         scheduler.scheduler_stage_metrics = self.reporter.scheduler_stage_metrics
         scheduler.batch_result_processor = processor
@@ -436,6 +445,7 @@ class TestResultHousekeepingAccounting(_ReporterTestBase):
         self.reporter = _make_reporter()
         reporter = self.reporter
         scheduler = reporter.scheduler
+        _bind_result_dispatch(scheduler, Scheduler)
         scheduler.metrics_reporter = reporter
         scheduler.batch_result_processor = _make_result_processor(reporter)
         scheduler.scheduler_stage_metrics = reporter.scheduler_stage_metrics
@@ -454,11 +464,12 @@ class TestResultHousekeepingAccounting(_ReporterTestBase):
             Scheduler.maybe_send_health_check_signal(scheduler)
         )
 
-        def slow_report(*args, **kwargs):
+        def slow_report_effect(*args, **kwargs):
             self.clock.set(12.0)
             if raises:
                 raise RuntimeError("reporting failed")
 
+        slow_report = MagicMock(side_effect=slow_report_effect)
         scheduler.ipc_channels.send_to_tokenizer.send_output.side_effect = slow_report
         reporter._device_timer_window_batch_count = 0
         reporter._device_timer_window_start = 0.0
@@ -491,6 +502,7 @@ class TestResultHousekeepingAccounting(_ReporterTestBase):
                     self._batch(mode),
                     GenerationBatchResult(next_token_ids=torch.tensor([4])),
                 )
+        slow_report.assert_called_once()
         if following_prefill or following_idle:
             scheduler.return_health_check_ipcs.clear()
             if following_prefill:

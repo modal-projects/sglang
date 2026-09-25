@@ -4740,6 +4740,7 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+                self.metrics_reporter._maybe_log_idle_metrics()
             return
         self.metrics_reporter.record_scheduler_idle()
 

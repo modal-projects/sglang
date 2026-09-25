@@ -352,6 +352,8 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
+            elif server_is_idle:
+                self.metrics_reporter._maybe_log_idle_metrics()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -549,6 +551,8 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
+            elif server_is_idle:
+                self.metrics_reporter._maybe_log_idle_metrics()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth

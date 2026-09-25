@@ -485,14 +485,19 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 self.feature, ipc_consumer_count
             )
             if consumer_count == 1:
-                self.feature = self.feature.reconstruct_on_target_device(target_device)
+                self.feature = self.feature.reconstruct_on_target_device(
+                    target_device, **self._transport_acknowledgement_args(self.feature)
+                )
             else:
                 self.feature = self.feature.reconstruct_on_target_device(
                     target_device, consumer_count=consumer_count
                 )
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
-                self.precomputed_embeddings.reconstruct_on_target_device(target_device)
+                self.precomputed_embeddings.reconstruct_on_target_device(
+                    target_device,
+                    **self._transport_acknowledgement_args(self.precomputed_embeddings),
+                )
             )
         for extra_key in self.model_specific_data:
             if extra_key == RETAINED_CUDA_IPC_FEATURE_PROXY_KEY:
@@ -502,7 +507,12 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             ):
                 extra_data = self.model_specific_data[
                     extra_key
-                ].reconstruct_on_target_device(target_device)
+                ].reconstruct_on_target_device(
+                    target_device,
+                    **self._transport_acknowledgement_args(
+                        self.model_specific_data[extra_key]
+                    ),
+                )
                 self.model_specific_data[extra_key] = extra_data
 
     def can_defer_cuda_ipc_feature_reconstruction(self) -> bool:
@@ -532,7 +542,12 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             consumer_count = self._resolve_transport_consumer_count(
                 self.feature, consumer_count
             )
-            self.feature.acknowledge_consumption(consumer_count)
+            kwargs = (
+                self._transport_acknowledgement_args(self.feature)
+                if consumer_count == 1
+                else {}
+            )
+            self.feature.acknowledge_consumption(consumer_count, **kwargs)
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
@@ -547,7 +562,10 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 continue
             count = self._resolve_transport_consumer_count(value, consumer_count)
             try:
-                value.release_without_reconstruction(count)
+                kwargs = (
+                    self._transport_acknowledgement_args(value) if count == 1 else {}
+                )
+                value.release_without_reconstruction(count, **kwargs)
             except Exception:
                 logger.warning(
                     "Failed to release an abandoned multimodal transport proxy",
@@ -563,6 +581,45 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             getattr(proxy, "consumer_count", requested_count),
         )
         return min(requested_count, proxy_count)
+
+    def materialize_deferred_cuda_ipc_feature(self, target_device=None) -> None:
+        """Keep owned bytes for cache eviction, retraction, and session reuse."""
+        if self.can_defer_cuda_ipc_feature_reconstruction():
+            if target_device is None:
+                target_device = torch.cuda.current_device()
+            # Every rank can become the encoder owner on a later prefill.
+            # Each live rank releases its word after its own copy is enqueued.
+            self.reconstruct(target_device)
+
+    @staticmethod
+    def _transport_acknowledgement_args(proxy) -> dict:
+        """Assign unused global pool words to the receiving DP group's leader."""
+        if proxy.total_consumer_count == 1:
+            return {}
+        parallel = get_parallel()
+        if proxy.total_consumer_count != parallel.tp_size:
+            return {}
+        width = parallel.attn_tp_size * parallel.attn_cp_size
+        if width == parallel.tp_size:
+            return {}
+        first = (
+            parallel.tp_rank
+            - parallel.attn_cp_rank * parallel.attn_tp_size
+            - parallel.attn_tp_rank
+        )
+        if parallel.tp_rank != first:
+            return {}
+        # Work requests are broadcast to this contiguous CP x attention-TP
+        # group only. Other global TP ranks never receive this lease.
+        inactive = tuple(
+            rank
+            for rank in range(proxy.total_consumer_count)
+            if not first <= rank < first + width
+        )
+        return {
+            "consumer_rank": parallel.tp_rank,
+            "acknowledge_ranks": (parallel.tp_rank, *inactive),
+        }
 
 
 class MultimodalProcessorOutput(
@@ -711,21 +768,9 @@ class MultimodalInputs:
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
 
-        # try reconstructing from cuda-ipc
-        reconstruct_device = None
-        try:
-            for mm_item in mm_items:
-                if (
-                    mm_item.has_cuda_ipc_proxy()
-                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
-                ):
-                    if reconstruct_device is None:
-                        reconstruct_device = torch.cuda.current_device()
-                    mm_item.reconstruct(reconstruct_device)
-        except BaseException:
-            for mm_item in mm_items:
-                mm_item.release_transport_proxies()
-            raise
+        # Items are shared with the raw request relayed by the PP scheduler.
+        # A native CUDA IPC ticket belongs only to its first-stage TP recipient.
+        MultimodalInputs._reconstruct_cuda_ipc_items(mm_items)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -848,6 +893,34 @@ class MultimodalInputs:
                 # set token_ids
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
+
+    @staticmethod
+    def _reconstruct_cuda_ipc_items(mm_items, *, force_eager=False):
+        """Consume local transport tickets before relaying inputs to another stage."""
+        reconstruct_device = None
+        try:
+            for mm_item in mm_items:
+                if not mm_item.has_cuda_ipc_proxy():
+                    continue
+                if (
+                    mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                    and not force_eager
+                    and get_parallel().pp_size == 1
+                ):
+                    continue
+                if reconstruct_device is None:
+                    reconstruct_device = torch.cuda.current_device()
+                mm_item.reconstruct(reconstruct_device)
+                if mm_item.has_cuda_ipc_proxy() and (
+                    force_eager or get_parallel().pp_size > 1
+                ):
+                    raise RuntimeError(
+                        "Cannot relay CUDA IPC transport proxies across pipeline stages"
+                    )
+        except BaseException:
+            for mm_item in mm_items:
+                mm_item.release_transport_proxies()
+            raise
         # other args would be kept intact
 
 

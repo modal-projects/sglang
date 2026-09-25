@@ -1,14 +1,19 @@
 import logging
 import threading
+import uuid
 from typing import Any, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.transport.memory_pool import (
+    CONTROL_WORD_BYTES,
     DEFAULT_MAX_INFLIGHT_SLICES,
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,
+    resolve_consumer_rank,
+    stream_wait_value32,
+    stream_write_value32,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,9 +24,8 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
 
-# Processors set this marker only when their encoder consumes each IPC feature
-# on a single TP rank.  The scheduler then keeps the feature lazy until the
-# model has computed the data-parallel assignment.
+# Defer producer-backed features until scheduling; each live reader still
+# materializes an owned copy before acknowledging its lease.
 DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY = (
     "_sglang_defer_cuda_ipc_feature_reconstruction"
 )
@@ -50,41 +54,46 @@ def get_mm_feature_pool_size_per_worker(
 
 
 # Cache for pool-level IPC handles on the consumer side.
-# Key: the pool CUDA IPC handle tuple. Value: opened UntypedStorage.
+# Key: consumer device, allocation handle and storage offset.
 _pool_storage_cache: dict = {}
 _pool_cache_lock = threading.Lock()
 
+# One high-water generation and rank mask per control slot, independent of
+# mapping eviction: a serialized alias can outlive its original mapping.
+_pool_acknowledged_generations: dict[Any, dict[int, tuple[int, int]]] = {}
+_pool_consumer_lock = threading.RLock()
+_pool_imported_generations: dict[Any, dict[int, tuple[int, dict]]] = {}
+_IMPORT_FAILED = object()
+
+
+def _release_ipc_export(handle) -> None:
+    torch.UntypedStorage._release_ipc_counter_cuda(handle[4], handle[5])
+
+
+def _export_pool_storage(storage, consumer_count: int) -> tuple:
+    handles = []
+    try:
+        for _ in range(consumer_count):
+            # A distinct StorageImpl retains the pool without stacking export
+            # contexts on the pool's persistent DataPtr.
+            exported = storage[:]
+            handles.append(exported._share_cuda_())
+            del exported
+    except BaseException:
+        for handle in handles:
+            _release_ipc_export(handle)
+        torch.cuda.ipc_collect()
+        raise
+    torch.cuda.ipc_collect()
+    return tuple(handles)
+
 
 def _normalize_pool_cache_key(pool_handle, device_index: int) -> tuple[Any, ...]:
-    normalized_handle = (
-        pool_handle if isinstance(pool_handle, tuple) else tuple(pool_handle)
-    )
-    return (device_index, normalized_handle)
+    return (device_index, pool_handle[1], pool_handle[3])
 
 
 def _open_pooled_storage_uncached(pool_handle):
     return torch.UntypedStorage._new_shared_cuda(*pool_handle)
-
-
-def _pool_handle_cache_get_or_open(cache_key, pool_handle):
-    storage = _pool_storage_cache.get(cache_key)
-    if storage is None:
-        with _pool_cache_lock:
-            storage = _pool_storage_cache.get(cache_key)
-            if storage is None:
-                storage = _open_pooled_storage_uncached(pool_handle)
-                _pool_storage_cache[cache_key] = storage
-    return storage
-
-
-def _pool_handle_cache_set(cache_key, storage):
-    with _pool_cache_lock:
-        _pool_storage_cache[cache_key] = storage
-
-
-def _pool_handle_cache_invalidate(cache_key):
-    with _pool_cache_lock:
-        _pool_storage_cache.pop(cache_key, None)
 
 
 def _pool_handle_cache_clear():
@@ -116,8 +125,11 @@ class MmItemMemoryPool:
             transport_name="CUDA IPC",
             max_inflight_slices=max_inflight_slices,
         )
-        storage = self.memory_pool.untyped_storage()
-        self._pool_ipc_handle = storage._share_cuda_()
+        self._pool_id = uuid.uuid4().hex
+        self._export_lock = threading.Lock()
+        self._closed = False
+        self._exports = {}
+        self._cancel_states = {}
         self._pool_full_warned = False
 
         logger.debug(
@@ -126,7 +138,16 @@ class MmItemMemoryPool:
         )
 
     def shutdown(self):
-        self._pool.shutdown()
+        with self._export_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._pool.shutdown()
+            with torch.cuda.device(self.device_id):
+                torch.cuda.ipc_collect()
+
+    def owns_proxy(self, proxy: "CudaIpcTensorTransportProxy") -> bool:
+        return proxy.proxy_state["ipc_extra"]["pool_id"] == self._pool_id
 
     @property
     def active_lease_count(self) -> int:
@@ -135,34 +156,132 @@ class MmItemMemoryPool:
     def wrap_tensor(
         self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
     ) -> Optional["CudaIpcTensorTransportProxy"]:
+        with self._export_lock:
+            if self._closed:
+                raise RuntimeError("Cannot export from a closed CUDA IPC pool")
+            return self._wrap_tensor(
+                tensor, use_pool_handle_cache=use_pool_handle_cache
+            )
+
+    def _wrap_tensor(
+        self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
+    ) -> Optional["CudaIpcTensorTransportProxy"]:
         lease, destination = self._pool.copy_tensor(tensor)
         if lease is None:
             nbytes = tensor.numel() * tensor.element_size()
             self._warn_pool_full_once(nbytes)
             return None
 
+        try:
+            handles = _export_pool_storage(
+                self.memory_pool.untyped_storage(), self.consumer_count
+            )
+        except BaseException:
+            self._pool.cancel_lease(
+                ready_byte_offset=lease.ready_byte_offset,
+                ack_byte_offset=lease.ack_byte_offset,
+                generation=lease.generation,
+            )
+            raise
+        self._exports[lease.ready_byte_offset] = (lease.generation, handles, set())
+        self._cancel_states.pop(lease.ready_byte_offset, None)
         return CudaIpcTensorTransportProxy(
             data=destination,
             info_data=tensor,
-            pool_ipc_handle=self._pool_ipc_handle,
+            pool_ipc_handle=handles[0],
             pool_byte_offset=lease.start,
             ready_byte_offset=lease.ready_byte_offset,
             ack_byte_offset=lease.ack_byte_offset,
             generation=lease.generation,
             total_consumer_count=self.consumer_count,
             use_pool_handle_cache=use_pool_handle_cache,
+            pool_id=self._pool_id,
+            pool_ipc_handles=handles,
         )
 
     def cancel_proxy(self, proxy: "CudaIpcTensorTransportProxy") -> None:
         """Return a published slice when its request was never dispatched."""
-        ipc_extra = proxy.proxy_state["ipc_extra"]
-        if tuple(ipc_extra["pool_handle"]) != tuple(self._pool_ipc_handle):
+        if not self.owns_proxy(proxy):
             raise RuntimeError("CUDA IPC proxy does not belong to this pool")
-        self._pool.cancel_lease(
-            ready_byte_offset=proxy.ready_byte_offset,
-            ack_byte_offset=proxy.ack_byte_offset,
-            generation=proxy.generation,
-        )
+        with self._export_lock:
+            entry = self._exports.get(proxy.ready_byte_offset)
+            if entry is None or entry[0] != proxy.generation:
+                raise RuntimeError("Cannot cancel inactive CUDA IPC native exports")
+            _, handles, released = entry
+            with self._pool._lock:
+                stride = self._pool.control_words_per_slot * CONTROL_WORD_BYTES
+                lease = self._pool._occupied.get(proxy.ready_byte_offset // stride)
+                if (
+                    lease is None
+                    or lease.generation != proxy.generation
+                    or lease.ready_byte_offset != proxy.ready_byte_offset
+                    or lease.ack_byte_offset != proxy.ack_byte_offset
+                ):
+                    raise RuntimeError("Cannot cancel inactive CUDA IPC pool lease")
+                previous = self._cancel_states.get(proxy.ready_byte_offset)
+                if (
+                    previous is not None
+                    and previous[0] == proxy.generation
+                    and previous[2]
+                ):
+                    return
+                for rank, handle in enumerate(handles):
+                    if rank not in released:
+                        _release_ipc_export(handle)
+                        released.add(rank)
+            with torch.cuda.device(self.device_id):
+                stream = torch.cuda.current_stream(self.device_id)
+                if previous is not None and previous[0] == proxy.generation:
+                    if stream != previous[1]:
+                        stream.wait_stream(previous[1])
+                self._cancel_states[proxy.ready_byte_offset] = (
+                    proxy.generation,
+                    stream,
+                    False,
+                )
+                self._pool.cancel_lease(
+                    ready_byte_offset=proxy.ready_byte_offset,
+                    ack_byte_offset=proxy.ack_byte_offset,
+                    generation=proxy.generation,
+                )
+                self._cancel_states[proxy.ready_byte_offset] = (
+                    proxy.generation,
+                    stream,
+                    True,
+                )
+            torch.cuda.ipc_collect()
+
+    def copy_proxy_to_cpu(self, proxy: "CudaIpcTensorTransportProxy") -> torch.Tensor:
+        """Snapshot an undispatched lease without acknowledging its consumers."""
+        ipc_extra = proxy.proxy_state["ipc_extra"]
+        if not self.owns_proxy(proxy):
+            raise RuntimeError("CUDA IPC proxy does not belong to this pool")
+        pool = self._pool
+        slot_stride = pool.control_words_per_slot * CONTROL_WORD_BYTES
+        with pool._lock:
+            lease = pool._occupied.get(proxy.ready_byte_offset // slot_stride)
+            if (
+                lease is None
+                or lease.generation != proxy.generation
+                or lease.ready_byte_offset != proxy.ready_byte_offset
+                or lease.ack_byte_offset != proxy.ack_byte_offset
+                or lease.start != ipc_extra["pool_byte_offset"]
+                or lease.nbytes != ipc_extra["nbytes"]
+            ):
+                raise RuntimeError("Cannot copy inactive CUDA IPC pool lease")
+            with torch.cuda.device(self.device_id):
+                stream_wait_value32(
+                    self.device_id,
+                    pool.base_address + lease.ready_byte_offset,
+                    lease.generation,
+                    "CUDA IPC",
+                )
+                return (
+                    self.memory_pool[lease.start : lease.start + lease.nbytes]
+                    .view(ipc_extra["recons_dtype"])
+                    .reshape(ipc_extra["recons_shape"])
+                    .to(device="cpu", copy=True)
+                )
 
     def _warn_pool_full_once(self, nbytes: int):
         if self._pool_full_warned:
@@ -201,6 +320,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         generation: int,
         total_consumer_count: int,
         use_pool_handle_cache: bool,
+        *,
+        pool_id=None,
+        pool_ipc_handles=None,
     ):
         if (not isinstance(data, torch.Tensor)) or (
             not isinstance(info_data, torch.Tensor)
@@ -220,6 +342,13 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         self.proxy_state = {
             "ipc_extra": {
                 "pool_handle": pool_ipc_handle,
+                "pool_handles": (
+                    (pool_ipc_handle,)
+                    if pool_ipc_handles is None and total_consumer_count == 1
+                    else pool_ipc_handles
+                ),
+                "single_export": pool_ipc_handles is None and total_consumer_count == 1,
+                "pool_id": tuple(pool_ipc_handle) if pool_id is None else pool_id,
                 "pool_byte_offset": pool_byte_offset,
                 "shape": data.shape,
                 "dtype": data.dtype,
@@ -233,72 +362,213 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             "tensor_data": None,
         }
         self.reconstruct_tensor = None
+        self._reconstruct_device_idx = None
+        self._reconstruct_stream = None
+        self._acknowledge_ranks = None
         # Keep uncached mappings alive until the work enqueued on the consumer
         # stream has completed.
         self._pool_storage = None
+        self._pool_storage_device_id = None
+        self._pool_storage_stream = None
         self._borrowed_storage = None
         self._borrowed_base_address = None
         self._borrowed_device_id = None
 
-    def _reconstruct_from_ipc_extra(
-        self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
-    ):
-        shape = ipc_extra["shape"]
-        dtype = ipc_extra["dtype"]
-        stride = ipc_extra["stride"]
-        # Redirect handle[0] to the consumer's device so _new_shared_cuda's
-        # CUDAGuard stays there; peer access handles the cross-GPU open.
-        pool_handle = ipc_extra["pool_handle"]
-        redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
-        target_device = torch.device(f"cuda:{rebuild_device_idx}")
-        cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
+    def _acknowledged_generation(self) -> tuple[int, int]:
+        pool_key = self.proxy_state["ipc_extra"]["pool_id"]
+        return _pool_acknowledged_generations.get(pool_key, {}).get(
+            self.ready_byte_offset, (0, 0)
+        )
 
-        with torch.cuda.device(target_device):
-            if use_cache:
-                storage = _pool_handle_cache_get_or_open(cache_key, redirected_handle)
+    def _native_slot(self, *, create: bool = False):
+        extra = self.proxy_state["ipc_extra"]
+        slots = _pool_imported_generations.get(extra["pool_id"], {})
+        entry = slots.get(self.ready_byte_offset)
+        if (
+            create
+            and extra["single_export"]
+            and slots
+            and (entry is None or entry[0] != self.generation)
+        ):
+            raise RuntimeError(
+                "A single CUDA IPC export cannot be reused for another lease"
+            )
+        if create and (entry is None or entry[0] < self.generation):
+            slots = _pool_imported_generations.setdefault(extra["pool_id"], {})
+            entry = (self.generation, {})
+            slots[self.ready_byte_offset] = entry
+        return entry
+
+    def _retire_unused_export(self, rank: int) -> None:
+        handles = self.proxy_state["ipc_extra"]["pool_handles"]
+        if handles is None:
+            return
+        entry = self._native_slot(create=True)
+        if entry[0] != self.generation:
+            return
+        imports = entry[1]
+        if rank not in imports:
+            imports[rank] = _IMPORT_FAILED
+            _release_ipc_export(handles[rank])
+            imports[rank] = None
+        elif imports[rank] is _IMPORT_FAILED:
+            raise RuntimeError("CUDA IPC import failed with uncertain native ownership")
+
+    def _check_read(self, consumer_rank: Optional[int] = None) -> None:
+        rank = resolve_consumer_rank(
+            self.total_consumer_count, consumer_rank, self.transport_name
+        )
+        generation, rank_mask = self._acknowledged_generation()
+        native = self._native_slot()
+        if native is not None and native[0] > self.generation:
+            raise RuntimeError("Cannot read an acknowledged CUDA IPC pool lease")
+        if generation > self.generation or (
+            generation == self.generation and rank_mask & (1 << rank)
+        ):
+            raise RuntimeError(
+                "Cannot read an acknowledged CUDA IPC pool lease "
+                f"(offset={self.ready_byte_offset}, generation={self.generation})"
+            )
+
+    def _set_acknowledge_ranks(
+        self, acknowledge_ranks, consumer_count: int, consumer_rank: Optional[int]
+    ) -> None:
+        if acknowledge_ranks is None:
+            return
+        ranks = tuple(acknowledge_ranks)
+        own_rank = resolve_consumer_rank(
+            self.total_consumer_count, consumer_rank, self.transport_name
+        )
+        if (
+            consumer_count != 1
+            or own_rank not in ranks
+            or len(set(ranks)) != len(ranks)
+            or any(rank < 0 or rank >= self.total_consumer_count for rank in ranks)
+        ):
+            raise ValueError(
+                "Explicit CUDA IPC acknowledgement ranks must contain the reader "
+                "and unique valid ranks, with consumer_count=1"
+            )
+        if self._acknowledge_ranks is not None and self._acknowledge_ranks != ranks:
+            raise ValueError("Cannot change CUDA IPC acknowledgement ranks")
+        # Keep the selected ranks through failures so generic request cleanup
+        # cannot acknowledge a live peer that this reader does not own.
+        self._acknowledge_ranks = ranks
+
+    def _pending_consumer_ranks(self, consumer_count, consumer_rank):
+        ranks = (
+            self._acknowledge_ranks
+            if self._acknowledge_ranks is not None
+            else self._consumer_ranks(consumer_count, consumer_rank)
+        )
+        generation, rank_mask = self._acknowledged_generation()
+        native = self._native_slot()
+        if generation > self.generation or (
+            native is not None and native[0] > self.generation
+        ):
+            return ()
+        return tuple(
+            rank
+            for rank in ranks
+            if generation < self.generation or not rank_mask & (1 << rank)
+        )
+
+    def _acknowledge_on_stream(
+        self,
+        base_address: int,
+        device_id: int,
+        consumer_count: int,
+        consumer_rank: Optional[int] = None,
+    ) -> None:
+        with _pool_consumer_lock:
+            if self._consumer_acknowledged:
+                return
+            pool_key = self.proxy_state["ipc_extra"]["pool_id"]
+            for rank in self._pending_consumer_ranks(consumer_count, consumer_rank):
+                self._retire_unused_export(rank)
+                native = self._native_slot()
+                imported = None if native is None else native[1].get(rank)
+                if imported is not None:
+                    stream = torch.cuda.current_stream(device_id)
+                    if stream != imported[2]:
+                        stream.wait_stream(imported[2])
+                stream_write_value32(
+                    device_id,
+                    base_address + self.ack_byte_offset + rank * CONTROL_WORD_BYTES,
+                    self.generation,
+                    self.transport_name,
+                )
+                generation, rank_mask = self._acknowledged_generation()
+                if generation != self.generation:
+                    rank_mask = 0
+                _pool_acknowledged_generations.setdefault(pool_key, {})[
+                    self.ready_byte_offset
+                ] = (self.generation, rank_mask | (1 << rank))
+                if native is not None:
+                    native[1][rank] = None
+            self._consumer_acknowledged = True
+
+    def _open_pool_slice(self, rebuild_device_idx: int, consumer_rank=None):
+        ipc_extra = self.proxy_state["ipc_extra"]
+        handles = ipc_extra["pool_handles"]
+        if handles is None or len(handles) != self.total_consumer_count:
+            raise RuntimeError("CUDA IPC requires one native export per consumer")
+        rank = resolve_consumer_rank(
+            self.total_consumer_count, consumer_rank, self.transport_name
+        )
+        with _pool_consumer_lock, torch.cuda.device(rebuild_device_idx):
+            self._check_read(rank)
+            entry = self._native_slot(create=True)
+            imports = entry[1]
+            stream = torch.cuda.current_stream(rebuild_device_idx)
+            if rank in imports:
+                imported = imports[rank]
+                if imported is None or imported is _IMPORT_FAILED:
+                    raise RuntimeError(
+                        "CUDA IPC native export was already retired or failed"
+                    )
+                storage, mapped_device, prior_stream = imported
+                if mapped_device != rebuild_device_idx:
+                    raise RuntimeError(
+                        "Cannot reopen a CUDA IPC export on another device"
+                    )
+                if stream != prior_stream:
+                    stream.wait_stream(prior_stream)
             else:
-                storage = _open_pooled_storage_uncached(redirected_handle)
+                handle = handles[rank]
+                cache_key = _normalize_pool_cache_key(handle, rebuild_device_idx)
+                storage = (
+                    _pool_storage_cache.get(cache_key)
+                    if ipc_extra["use_pool_handle_cache"]
+                    else None
+                )
+                if storage is None:
+                    # A failed native open can already have consumed its counter;
+                    # never retry that reservation or guess a compensating decrement.
+                    imports[rank] = _IMPORT_FAILED
+                    redirected_handle = (rebuild_device_idx,) + tuple(handle)[1:]
+                    storage = _open_pooled_storage_uncached(redirected_handle)
+                    imports[rank] = (storage, rebuild_device_idx, stream)
+                    if ipc_extra["use_pool_handle_cache"]:
+                        with _pool_cache_lock:
+                            _pool_storage_cache[cache_key] = storage
+                else:
+                    imports[rank] = _IMPORT_FAILED
+                    _release_ipc_export(handle)
+            imports[rank] = (storage, rebuild_device_idx, stream)
             slice_storage = storage[
                 ipc_extra["pool_byte_offset"] : ipc_extra["pool_byte_offset"]
                 + ipc_extra["nbytes"]
             ]
-            slice_tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
+            slice_tensor = torch.empty(
+                0, dtype=ipc_extra["dtype"], device=f"cuda:{rebuild_device_idx}"
+            ).set_(
                 slice_storage,
                 storage_offset=ipc_extra["storage_offset"],
-                size=shape,
-                stride=stride,
+                size=ipc_extra["shape"],
+                stride=ipc_extra["stride"],
             )
-
-        return slice_tensor, storage
-
-    def _open_pool_slice(self, rebuild_device_idx: int):
-        ipc_extra = self.proxy_state["ipc_extra"]
-        use_cache = ipc_extra["use_pool_handle_cache"]
-        try:
-            return self._reconstruct_from_ipc_extra(
-                ipc_extra,
-                use_cache=use_cache,
-                rebuild_device_idx=rebuild_device_idx,
-            )
-        except Exception as exc:
-            if not use_cache:
-                raise
-            cache_key = _normalize_pool_cache_key(
-                ipc_extra["pool_handle"], rebuild_device_idx
-            )
-            logger.info(
-                "Failed to deserialize from cached pooled CUDA IPC handle (%s). "
-                "Invalidating cache entry and retrying uncached.",
-                exc,
-            )
-            _pool_handle_cache_invalidate(cache_key)
-            result = self._reconstruct_from_ipc_extra(
-                ipc_extra,
-                use_cache=False,
-                rebuild_device_idx=rebuild_device_idx,
-            )
-            _pool_handle_cache_set(cache_key, result[1])
-            return result
+            return slice_tensor, storage
 
     def _retain_storage_until_stream_completes(self, storage, device_id: int) -> None:
         if self.proxy_state["ipc_extra"]["use_pool_handle_cache"]:
@@ -309,23 +579,57 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             # An uncached mapping is owned only by this proxy. The caller
             # replaces the proxy immediately, so finish the current stream
             # before allowing the mapping to close.
-            torch.cuda.current_stream(device_id).synchronize()
+            stream = torch.cuda.current_stream(device_id)
+            if self._pool_storage_stream is not None:
+                stream.wait_stream(self._pool_storage_stream)
+            stream.synchronize()
+            self._pool_storage = None
+            self._pool_storage_device_id = None
+            self._pool_storage_stream = None
 
     def acknowledge_consumption(
-        self, consumer_count: int = 1, consumer_rank: Optional[int] = None
+        self,
+        consumer_count: int = 1,
+        consumer_rank: Optional[int] = None,
+        *,
+        acknowledge_ranks: Optional[tuple[int, ...]] = None,
     ) -> None:
         """Stream-order pool release when a cache hit needs no tensor copy."""
-        if self._consumer_acknowledged:
-            return
-        device_id = torch.cuda.current_device()
-        with torch.cuda.device(device_id):
-            _, storage = self._open_pool_slice(device_id)
-            base_address = storage.data_ptr()
-            self._wait_until_ready(base_address, device_id)
-            self._acknowledge_on_stream(
-                base_address, device_id, consumer_count, consumer_rank
+        with _pool_consumer_lock:
+            self._set_acknowledge_ranks(
+                acknowledge_ranks, consumer_count, consumer_rank
             )
-        self._retain_storage_until_stream_completes(storage, device_id)
+            if self._consumer_acknowledged:
+                return
+            if not self._pending_consumer_ranks(consumer_count, consumer_rank):
+                self._consumer_acknowledged = True
+                if self._pool_storage is not None:
+                    self._retain_storage_until_stream_completes(
+                        self._pool_storage, self._pool_storage_device_id
+                    )
+                return
+            device_id = (
+                self._pool_storage_device_id
+                if self._pool_storage is not None
+                else torch.cuda.current_device()
+            )
+            with torch.cuda.device(device_id):
+                stream = torch.cuda.current_stream(device_id)
+                if self._pool_storage is None:
+                    _, storage = self._open_pool_slice(device_id, consumer_rank)
+                    self._pool_storage = storage
+                    self._pool_storage_device_id = device_id
+                    self._pool_storage_stream = stream
+                else:
+                    storage = self._pool_storage
+                    if stream != self._pool_storage_stream:
+                        stream.wait_stream(self._pool_storage_stream)
+                base_address = storage.data_ptr()
+                self._wait_until_ready(base_address, device_id)
+                self._acknowledge_on_stream(
+                    base_address, device_id, consumer_count, consumer_rank
+                )
+            self._retain_storage_until_stream_completes(storage, device_id)
 
     def borrow_on_target_device(
         self, rebuild_device_idx: int
@@ -335,7 +639,8 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         if not ipc_extra["use_pool_handle_cache"] or self._consumer_acknowledged:
             return None
 
-        with torch.cuda.device(rebuild_device_idx):
+        with _pool_consumer_lock, torch.cuda.device(rebuild_device_idx):
+            self._check_read()
             slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, rebuild_device_idx)
@@ -352,7 +657,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         self, consumer_count: int = 1, consumer_rank: Optional[int] = None
     ) -> None:
         """Release a borrowed view after all current-stream reads are enqueued."""
-        storage = getattr(self, "_borrowed_storage", None)
+        storage = self._borrowed_storage
         if storage is None:
             return
         device_id = self._borrowed_device_id
@@ -368,44 +673,72 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         self._borrowed_base_address = None
         self._borrowed_device_id = None
 
-    def release_without_reconstruction(self, consumer_count: int = 1) -> None:
+    def release_without_reconstruction(
+        self,
+        consumer_count: int = 1,
+        consumer_rank: Optional[int] = None,
+        *,
+        acknowledge_ranks: Optional[tuple[int, ...]] = None,
+    ) -> None:
         """Release a pool slice when its request abandons this proxy."""
-        if getattr(self, "_borrowed_storage", None) is not None:
-            self.release_borrowed_on_current_stream(consumer_count)
-        else:
-            self.acknowledge_consumption(consumer_count)
+        with _pool_consumer_lock:
+            self._set_acknowledge_ranks(
+                acknowledge_ranks, consumer_count, consumer_rank
+            )
+            if self._borrowed_storage is not None:
+                self.release_borrowed_on_current_stream(consumer_count, consumer_rank)
+            else:
+                self.acknowledge_consumption(consumer_count, consumer_rank)
 
     def reconstruct_on_target_device(
         self,
         rebuild_device_idx,
         consumer_count: int = 1,
         consumer_rank: Optional[int] = None,
+        *,
+        acknowledge_ranks: Optional[tuple[int, ...]] = None,
     ):
         rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
-        if (
-            isinstance(self.reconstruct_tensor, torch.Tensor)
-            and self.reconstruct_tensor.device == rebuild_device
-        ):
-            return self.reconstruct_tensor
-
-        ipc_extra = self.proxy_state["ipc_extra"]
-        with torch.cuda.device(rebuild_device):
-            slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
-            base_address = storage.data_ptr()
-            self._wait_until_ready(base_address, rebuild_device_idx)
-            reconstructed_tensor = torch.empty(
-                ipc_extra["recons_shape"],
-                dtype=ipc_extra["recons_dtype"],
-                device=rebuild_device,
-            ).contiguous()
-            reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
-            self._acknowledge_on_stream(
-                base_address,
-                rebuild_device_idx,
-                consumer_count,
-                consumer_rank,
+        with _pool_consumer_lock, torch.cuda.device(rebuild_device):
+            self._set_acknowledge_ranks(
+                acknowledge_ranks, consumer_count, consumer_rank
             )
-
-        self._retain_storage_until_stream_completes(storage, rebuild_device_idx)
-        self.reconstruct_tensor = reconstructed_tensor
-        return self.reconstruct_tensor
+            if (
+                self.reconstruct_tensor is not None
+                and self._reconstruct_device_idx == rebuild_device_idx
+            ):
+                current_stream = torch.cuda.current_stream(rebuild_device_idx)
+                if current_stream != self._reconstruct_stream:
+                    current_stream.wait_stream(self._reconstruct_stream)
+                if self._consumer_acknowledged:
+                    return self.reconstruct_tensor
+                storage = self._pool_storage
+            else:
+                self._check_read(consumer_rank)
+                ipc_extra = self.proxy_state["ipc_extra"]
+                slice_tensor, storage = self._open_pool_slice(
+                    rebuild_device_idx, consumer_rank
+                )
+                self._pool_storage = storage
+                self._pool_storage_device_id = rebuild_device_idx
+                self._pool_storage_stream = torch.cuda.current_stream(
+                    rebuild_device_idx
+                )
+                self._wait_until_ready(storage.data_ptr(), rebuild_device_idx)
+                reconstructed_tensor = torch.empty(
+                    ipc_extra["recons_shape"],
+                    dtype=ipc_extra["recons_dtype"],
+                    device=rebuild_device,
+                ).contiguous()
+                reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
+                # Keep the owned copy and mapping if a later acknowledgement
+                # fails; retrying must not read a partially released lease.
+                self.reconstruct_tensor = reconstructed_tensor
+                self._reconstruct_device_idx = rebuild_device_idx
+                self._reconstruct_stream = torch.cuda.current_stream(rebuild_device_idx)
+                self._pool_storage = storage
+            self._acknowledge_on_stream(
+                storage.data_ptr(), rebuild_device_idx, consumer_count, consumer_rank
+            )
+            self._retain_storage_until_stream_completes(storage, rebuild_device_idx)
+            return self.reconstruct_tensor

@@ -34,6 +34,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupContext,
+    storage_supports_host_dedup,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -124,6 +128,8 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_prebuild: Optional[MLAHostDedupContext] = None,
+        enable_mla_hicache_host_dedup: bool = False,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -144,12 +150,31 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            mla_dedup_prebuild=mla_dedup_prebuild,
+            enable_mla_hicache_host_dedup=enable_mla_hicache_host_dedup,
         )
+        # The base gate ran with storage_backend=None; re-apply it with the
+        # real startup backend so broadcast never runs against full
+        # (non-dummy) pools.
+        if self.mla_broadcast_enabled and not storage_supports_host_dedup(
+            startup_storage_backend
+        ):
+            self._destroy_mla_broadcast_group()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
+
+        if self.mla_broadcast_enabled:
+            mamba_entry = getattr(mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
+            if mamba_entry is not None and getattr(
+                mamba_entry.host_pool, "_is_dummy", False
+            ):
+                raise AssertionError(
+                    "Mamba/KDA HiCache state must remain rank-local when target "
+                    "MLA host memory is deduplicated."
+                )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -173,6 +198,27 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.mla_broadcast_enabled and PoolName.MAMBA in getattr(
+            self.mem_pool_host, "entry_map", {}
+        ):
+            raise RuntimeError(
+                "Hybrid MLA+Mamba host dedup currently supports L2 only. "
+                "Rank-local Mamba/KDA L3 storage keys are not implemented."
+            )
+        if self.mla_broadcast_enabled and any(
+            name
+            in (
+                PoolName.DRAFT,
+                PoolName.DRAFT_INDEXER,
+                PoolName.DRAFT_SWA,
+            )
+            for name in getattr(self.mem_pool_host, "entry_map", {})
+        ):
+            raise RuntimeError(
+                "Cannot attach HiCache L3 storage while MLA host-memory dedup "
+                "and a local draft L2 cache are both active. Draft L3 needs "
+                "per-rank storage keys and is not implemented."
+            )
         super().attach_storage_backend(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -181,15 +227,36 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            # Dummy pool: nothing to register; this rank never reads L3.
+            if getattr(entry.host_pool, "_is_dummy", False):
+                continue
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        if (
+            self.mla_broadcast_enabled
+            and self.enable_storage
+            and entry.name
+            in (
+                PoolName.DRAFT,
+                PoolName.DRAFT_INDEXER,
+                PoolName.DRAFT_SWA,
+            )
+        ):
+            raise NotImplementedError(
+                "Draft HiCache L3 storage is not supported together with MLA "
+                "host-memory dedup. Draft L2 host cache is supported, but L3 "
+                "needs per-rank draft storage keys."
+            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
+            # Dummy pool: nothing to register; this rank never reads L3.
+            if getattr(entry.host_pool, "_is_dummy", False):
+                return
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -512,6 +579,82 @@ class HybridCacheController(BaseHiCacheController):
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 
+    def _resolve_mla_load(self, op: CacheOperation):
+        """Split the resolved L2 transfers into dedup target and rank-local pools."""
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        source = None
+        rank_local = []
+        for transfer in transfers:
+            if transfer.host_pool is anchor_pool:
+                source = transfer
+            elif not getattr(transfer.host_pool, "_is_dummy", False):
+                rank_local.append(transfer)
+        if not self.mla_broadcaster.is_src:
+            # Peers receive the deduplicated target over NCCL; only rank-local
+            # pools (Mamba/KDA, draft) read this rank's own host memory.
+            source = None
+        return source, rank_local
+
+    def _load_mla_source_layer(self, source, layer_id: int) -> None:
+        local_layer_id = (
+            source.layer_mapper(layer_id)
+            if source.layer_mapper is not None
+            else layer_id
+        )
+        if local_layer_id is None:
+            return
+        source.host_pool.load_to_device_per_layer(
+            source.device_pool,
+            source.host_indices,
+            source.device_indices,
+            local_layer_id,
+            self.io_backend,
+        )
+
+    def _record_mla_source_load(self, source) -> None:
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+        for indices in (source.host_indices, source.device_indices):
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(load_stream)
+
+    def _load_mla_rank_local_layer(self, rank_local, layer_id: int) -> None:
+        for transfer in rank_local or []:
+            if transfer.layer_mapper is not None:
+                local_layer_id = transfer.layer_mapper(layer_id)
+            elif layer_id < transfer.host_pool.layer_num:
+                local_layer_id = layer_id
+            else:
+                local_layer_id = None
+            if local_layer_id is None:
+                continue
+            transfer.host_pool.load_to_device_per_layer(
+                transfer.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                self.io_backend,
+                is_draft=transfer.is_draft,
+            )
+
+    def _record_mla_rank_local_load(self, rank_local) -> None:
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+        for transfer in rank_local or []:
+            for indices in (transfer.host_indices, transfer.device_indices):
+                if indices is not None and indices.is_cuda:
+                    indices.record_stream(load_stream)
+
+    def _mla_broadcast_layer_id(self, transfer_layer_id: int) -> Optional[int]:
+        # Map a transfer-layer id through the anchor layer mapper; Mamba
+        # layers deliberately do not participate in the target broadcast.
+        mapper = self.mem_pool_host.anchor_entry.layer_mapper
+        if mapper is None:
+            return transfer_layer_id
+        return mapper(transfer_layer_id)
+
     def load(
         self,
         host_indices: torch.Tensor,
@@ -655,6 +798,25 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
+        # precede super()._page_transfer and the sidecar batch_get below;
+        # pool_transfers_done lets this rank pass the all-reduced termination
+        # check.
+        if self._mla_skip_host_io:
+            self._page_transfer_dummy(operation)
+            operation.pool_transfers_done = True
+            if operation.pool_transfers is not None:
+                # Keep the sidecar PrefetchAck the sync thread expects from
+                # every rank; no sidecar IO happens on a dummy rank.
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        operation=operation,
+                        pool_hits={},
+                    )
+                )
+            return
+
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 

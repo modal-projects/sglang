@@ -92,6 +92,7 @@ def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -103,6 +104,26 @@ def maybe_register_hicache_draft(
     if not isinstance(tree_cache, UnifiedRadixCache):
         raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 
+    controller = tree_cache.cache_controller
+    if getattr(controller, "mla_broadcast_enabled", False):
+        if controller.enable_storage:
+            raise NotImplementedError(
+                "Draft HiCache L3 storage is not supported together with MLA "
+                "host-memory dedup. Draft L2 host cache is supported, but L3 "
+                "needs per-rank draft storage keys."
+            )
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        draft_pool = draft_plan.device_pools[0]
+        if isinstance(draft_pool, HybridLinearKVPool):
+            # Hybrid draft runners keep their sole attention layer in this sub-pool.
+            draft_pool = draft_pool.full_kv_pool
+        _validate_dedup_draft_index_domain(
+            cache_controller=controller,
+            draft_pool=draft_pool,
+            spec_algorithm=spec_algorithm,
+        )
+
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         build_hicache_draft_sidecars,
     )
@@ -113,6 +134,29 @@ def maybe_register_hicache_draft(
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
+
+
+def _validate_dedup_draft_index_domain(
+    *, cache_controller, draft_pool, spec_algorithm
+) -> None:
+    """Fail closed unless target indices are valid in the mirrored draft pool."""
+    if not cache_controller.mla_broadcast_enabled:
+        return
+    if spec_algorithm is None or not spec_algorithm.is_dflash():
+        raise ValueError("MLA HiCache host dedup draft mirroring requires DFlash.")
+
+    target_pool = cache_controller.mem_pool_device
+    target_size = int(target_pool.size)
+    draft_size = int(draft_pool.size)
+    target_page_size = int(target_pool.page_size)
+    draft_page_size = int(draft_pool.page_size)
+    if draft_size != target_size or draft_page_size != target_page_size:
+        raise ValueError(
+            "MLA HiCache host dedup requires target and DFlash draft pools to "
+            "share one global KV slot domain; got "
+            f"target(size={target_size}, page_size={target_page_size}) and "
+            f"draft(size={draft_size}, page_size={draft_page_size})."
+        )
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device
@@ -249,6 +293,15 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
+    # The sidecar draft pool mirrors target host indices, so the dedup
+    # preflight must account for it before any large host allocation.
+    hicache_draft_kv_pool = None
+    if hicache_draft_plan is not None and hicache_draft_plan.device_pools:
+        from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+        if hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR:
+            hicache_draft_kv_pool = hicache_draft_plan.device_pools[0]
+
     disable_radix_cache = get_memory().disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
@@ -304,6 +357,7 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        hicache_draft_kv_pool=hicache_draft_kv_pool,
         # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
         # TreeCache.page_size should keep the same as allocator.page_size to
         # avoid kv page eviction conflicts.
@@ -360,6 +414,7 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
+            spec_algorithm=spec_algorithm,
         )
 
     if retraction_backup == "host_pool":

@@ -3039,6 +3039,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Best-effort auto-detach of the storage backend on process shutdown."""
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
+        try:
+            if self.cache_controller is not None:
+                self.cache_controller._destroy_mla_broadcast_group()
+        except Exception:
+            logger.exception("Failed to destroy MLA broadcast group.")
 
     def clear_storage_backend(self) -> bool:
         if self._storage_attachment is None:

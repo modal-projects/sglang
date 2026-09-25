@@ -4224,9 +4224,21 @@ class Scheduler(
         )
         sched_sampling_info = batch.sampling_info
 
-        # 2. sampling_info substitute
+        # 2. Snapshot penalties only after filter/merge and relay resolution.
+        # Both target verify and the mixed-extend ordinary sampler consume it.
         if sched_sampling_info is not None:
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
+            penalty_state = None
+            if batch.spec_algorithm.is_dflash_family():
+                from sglang.srt.speculative.dflash_penalties import (
+                    prepare_dflash_penalty_state,
+                )
+
+                penalty_state = prepare_dflash_penalty_state(
+                    batch=batch, future_map=self.future_map if overlap else None
+                )
+            batch.sampling_info = sched_sampling_info.copy_for_forward(
+                dflash_penalty_state=penalty_state
+            )
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:
@@ -4522,6 +4534,20 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
+        penalty_state = (
+            batch.sampling_info.dflash_block_penalty_state
+            if batch.sampling_info is not None
+            else None
+        )
+        if penalty_state is not None:
+            self.future_map.stash_penalty_outputs(
+                indices=future_indices,
+                tokens=batch_result.next_token_ids.reshape(len(batch.reqs), -1),
+                num_valid=batch_result.accept_lens,
+                end_positions=batch_result.new_seq_lens,
+                request_generations=penalty_state.request_generations,
+                resolved_token_lens=penalty_state.resolved_token_lens,
+            )
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req

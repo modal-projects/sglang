@@ -245,6 +245,81 @@ class ConfidenceRelay(msgspec.Struct):
         )
 
 
+class PendingPenaltyOutput(msgspec.Struct, frozen=True):
+    tokens: torch.Tensor
+    num_valid: torch.Tensor
+
+
+class PenaltyOutputRelay:
+    """Owned output runs indexed by pool row, fenced by request generation."""
+
+    def __init__(self, *, pool_size: int, device):
+        self.pool_size = pool_size
+        self.device = device
+        self.tokens = None
+        self.num_valid = None
+        self.start_positions = None
+        self.request_generations = None
+
+    def store(
+        self,
+        *,
+        indices,
+        tokens,
+        num_valid,
+        end_positions,
+        request_generations,
+        resolved_token_lens,
+    ) -> None:
+        width = tokens.shape[1]
+        if self.tokens is None:
+            self.tokens = torch.zeros(
+                (self.pool_size, width), dtype=torch.int64, device=self.device
+            )
+            self.num_valid = torch.zeros(
+                self.pool_size, dtype=torch.int64, device=self.device
+            )
+            self.start_positions = torch.zeros_like(self.num_valid)
+            self.request_generations = torch.zeros_like(self.num_valid)
+        elif width > self.tokens.shape[1]:
+            grown = self.tokens.new_zeros((self.pool_size, width))
+            grown[:, : self.tokens.shape[1]] = self.tokens
+            self.tokens = grown
+        if num_valid is None:
+            num_valid = torch.ones_like(end_positions)
+        # Intermediate prefill chunks sample inside the existing input. Those
+        # discarded tokens never cross the captured output-history boundary.
+        num_valid = torch.where(end_positions >= resolved_token_lens, num_valid, 0)
+        self.tokens[indices, :width] = tokens
+        self.num_valid[indices] = num_valid
+        self.start_positions[indices] = end_positions - num_valid + 1
+        self.request_generations[indices] = request_generations
+
+    def resolve(
+        self,
+        *,
+        indices,
+        resolved_token_lens,
+        request_generations,
+    ) -> Optional[PendingPenaltyOutput]:
+        if self.tokens is None:
+            return None
+        # Advanced indexing owns each gathered row. No forward snapshot aliases
+        # this relay or the model's reusable output buffers.
+        tokens = self.tokens[indices]
+        width = tokens.shape[1]
+        consumed = (resolved_token_lens - self.start_positions[indices]).clamp(0, width)
+        num_valid = (self.num_valid[indices] - consumed).clamp_min(0)
+        num_valid = torch.where(
+            self.request_generations[indices] == request_generations, num_valid, 0
+        )
+        columns = torch.arange(width, device=tokens.device)[None, :]
+        offsets = (consumed[:, None] + columns).clamp_max(width - 1)
+        tokens = tokens.gather(1, offsets)
+        tokens = torch.where(columns < num_valid[:, None], tokens, 0)
+        return PendingPenaltyOutput(tokens=tokens, num_valid=num_valid)
+
+
 class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
@@ -308,6 +383,10 @@ class FutureMap:
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
+
+        self.penalty_output_relay = PenaltyOutputRelay(
+            pool_size=self.req_pool_size, device=self.device
+        )
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
         # Debug consume-once state: armed by a recording publish, consumed by
@@ -458,6 +537,38 @@ class FutureMap:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
+
+    def stash_penalty_outputs(
+        self,
+        *,
+        indices,
+        tokens,
+        num_valid,
+        end_positions,
+        request_generations,
+        resolved_token_lens,
+    ) -> None:
+        self.penalty_output_relay.store(
+            indices=indices,
+            tokens=tokens,
+            num_valid=num_valid,
+            end_positions=end_positions,
+            request_generations=request_generations,
+            resolved_token_lens=resolved_token_lens,
+        )
+
+    def resolve_penalty_outputs(
+        self,
+        *,
+        indices,
+        resolved_token_lens,
+        request_generations,
+    ) -> Optional[PendingPenaltyOutput]:
+        return self.penalty_output_relay.resolve(
+            indices=indices,
+            resolved_token_lens=resolved_token_lens,
+            request_generations=request_generations,
+        )
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor

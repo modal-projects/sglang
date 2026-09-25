@@ -1281,6 +1281,8 @@ class Req(ReqDllmMixin):
         self.has_log_time_stats: bool = False
 
         # For disaggregation
+        # Captured before prefill replaces the output budget with one handoff slot.
+        self.prefill_has_requested_output: Optional[bool] = None
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room

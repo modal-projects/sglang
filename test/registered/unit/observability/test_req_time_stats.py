@@ -15,12 +15,19 @@ set_finished_time() closes the trace root span, so they have to be derived
 inside that call rather than by the caller.
 """
 
+import asyncio
+import json
 import pickle
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import sglang.srt.observability.req_time_stats as rts
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.request_metrics_exporter import FileRequestMetricsExporter
 from sglang.srt.observability.trace import SpanAttributes
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +40,8 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         src.enable_metrics = True
         src.wait_queue_entry_time = 123.456
         src.prefill_finished_time = 0.0
+        src.set_first_token_generated_time(ts=125.0)
+        src.completion_time = 130.0
 
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
             blob = pickle.dumps(src)
@@ -44,6 +53,83 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
 
         self.assertEqual(hop2.prefill_finished_time, 0.0)
         self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
+        self.assertEqual(hop2.first_token_generated_time, 116.0)
+        self.assertEqual(hop2.completion_time, 121.0)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
+            meta_info = hop2.convert_to_output_meta_info()
+        self.assertEqual(meta_info["first_token_generated_time"], 1_000_125.0)
+        self.assertEqual(meta_info["scheduler_completion_time"], 1_000_130.0)
+
+    def test_unset_milestones_stay_absent_after_two_hops(self):
+        src = rts.SchedulerReqTimeStats(enable_metrics=True)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 100.0):
+            blob = pickle.dumps(src)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 90.0):
+            blob = pickle.dumps(pickle.loads(blob))
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 80.0):
+            restored = pickle.loads(blob)
+            meta_info = restored.convert_to_output_meta_info()
+        self.assertEqual(restored.first_token_generated_time, 0.0)
+        self.assertEqual(restored.completion_time, 0.0)
+        self.assertNotIn("first_token_generated_time", meta_info)
+        self.assertNotIn("scheduler_completion_time", meta_info)
+
+    def test_metrics_disabled_does_not_serialize_timing(self):
+        src = rts.SchedulerReqTimeStats()
+        src.set_first_token_generated_time(ts=5.0)
+        src.completion_time = 6.0
+        restored = pickle.loads(pickle.dumps(src))
+        self.assertNotIn(
+            "first_token_generated_time", restored.convert_to_output_meta_info()
+        )
+        self.assertNotIn(
+            "scheduler_completion_time", restored.convert_to_output_meta_info()
+        )
+
+
+class TestGeneratedTokenTiming(CustomTestCase):
+    def test_retraction_and_prefill_retry_preserve_first_commit(self):
+        stats = rts.SchedulerReqTimeStats()
+        stats.set_first_token_generated_time(ts=5.0)
+        stats.set_retract_time(ts=6.0)
+        stats.reset_prefill_retry_time()
+        stats.set_first_token_generated_time(ts=8.0)
+        self.assertEqual(stats.first_token_generated_time, 5.0)
+
+    def test_native_timestamps_reach_file_exporter(self):
+        """Buffered first delivery must not replace the scheduler commit clock."""
+        scheduler_stats = rts.SchedulerReqTimeStats(enable_metrics=True)
+        scheduler_stats.set_first_token_generated_time(ts=5.0)
+        scheduler_stats.completion_time = 9.0
+        api_stats = rts.APIServerReqTimeStats()
+        api_stats.created_time = 1.0
+        api_stats.first_token_time = 12.0
+        api_stats.finished_time = 13.0
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 100.0):
+            meta_info = scheduler_stats.convert_to_output_meta_info()
+            meta_info.update(api_stats.convert_to_output_meta_info(scheduler_stats, 3))
+        out = {"meta_info": meta_info, "text": "example"}
+        with tempfile.TemporaryDirectory() as directory:
+            exporter = FileRequestMetricsExporter(
+                ServerArgs(model_path="model", export_metrics_to_file_dir=directory),
+                obj_skip_names=None,
+                out_skip_names=None,
+            )
+            try:
+                asyncio.run(exporter.write_record(GenerateReqInput(rid="test"), out))
+            finally:
+                exporter.close()
+            files = list(Path(directory).glob("*.log"))
+            self.assertEqual(len(files), 1)
+            record = json.loads(files[0].read_text())
+        self.assertEqual(record["first_token_generated_time"], 105.0)
+        self.assertEqual(record["scheduler_completion_time"], 109.0)
+        self.assertEqual(record["request_received_ts"], 101.0)
+        self.assertEqual(record["request_finished_ts"], 113.0)
+        self.assertEqual(
+            record["scheduler_completion_time"] - record["first_token_generated_time"],
+            4.0,
+        )
 
 
 class TestConvertToGenAiSpanAttrs(CustomTestCase):

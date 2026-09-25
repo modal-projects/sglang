@@ -419,6 +419,8 @@ class PrefillBootstrapQueue:
         """
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
+        if req.prefill_has_requested_output is None:
+            req.prefill_has_requested_output = req.sampling_params.max_new_tokens != 0
         req.sampling_params.max_new_tokens = 1
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -831,6 +833,8 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
+                if req.prefill_has_requested_output:
+                    req.time_stats.set_first_token_generated_time()
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:

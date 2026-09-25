@@ -1,6 +1,7 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.tokenizer_encode_fast_path import _EncodePieceFastPathPatcher
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +14,21 @@ def patch_tokenizer(tokenizer):
         logger.info(
             f"Applying special tokens cache patch for Kimi tokenizer: {type(tokenizer)}"
         )
-        return _SpecialTokensCachePatcher.patch(tokenizer)
+        _SpecialTokensCachePatcher.patch(tokenizer)
+        if envs.SGLANG_OPT_KIMI_ENCODE_FAST_PATH.get():
+            _EncodePieceFastPathPatcher.patch(tokenizer)
 
     return tokenizer
 
 
+def patch_mm_processor_tokenizer(tokenizer):
+    if envs.SGLANG_OPT_KIMI_ENCODE_FAST_PATH.get():
+        return patch_tokenizer(tokenizer)
+    return tokenizer
+
+
 def unpatch_tokenizer(tokenizer):
+    _EncodePieceFastPathPatcher.unpatch(tokenizer)
     return _SpecialTokensCachePatcher.unpatch(tokenizer)
 
 

@@ -37,21 +37,20 @@ class _EncodePieceFastPathPatcher:
             if allow_special_tokens:
                 state = self.__dict__.get(_SPECIAL_IDS_ATTR)
                 if state is None or state[0] is not self.model:
-                    # Configured literals can overlap or exceed the splitter limit.
-                    single_ids = {
-                        literal: token_id
-                        for literal, token_id in self.special_tokens.items()
-                        if literal
-                        and len(literal) <= max_unsplit_text_chars
-                        and original_encode_text_piece(self, literal, True)
-                        == [token_id]
-                    }
-                    state = (self.model, single_ids)
+                    state = (self.model, {})
                     self.__dict__[_SPECIAL_IDS_ATTR] = state
                 special_id = state[1].get(text)
                 if special_id is not None:
                     return [special_id]
-                return original_encode_text_piece(self, text, allow_special_tokens)
+                token_ids = original_encode_text_piece(self, text, allow_special_tokens)
+                if text not in state[1] and 0 < len(text) <= max_unsplit_text_chars:
+                    special_id = self.special_tokens.get(text)
+                    if special_id is not None:
+                        # Configured literals can have different tiktoken precedence.
+                        state[1][text] = (
+                            special_id if token_ids == [special_id] else None
+                        )
+                return token_ids
             if len(text) <= max_unsplit_text_chars and not _special_literal_regex(
                 self
             ).search(text):

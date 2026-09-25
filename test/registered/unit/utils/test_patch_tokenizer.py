@@ -234,7 +234,12 @@ class TestEncodePieceFastPath(CustomTestCase):
         ) as slow:
             _EncodePieceFastPathPatcher.patch(tokenizer)
             try:
-                tokenizer._encode_text_piece(segments[0][0], True)
+                self.assertEqual(
+                    expected[0], tokenizer._encode_text_piece(segments[0][0], True)
+                )
+                self.assertEqual(slow.call_count, 1)
+                for text, allowed in segments[1:]:
+                    tokenizer._encode_text_piece(text, allowed)
                 slow.reset_mock()
                 actual = [
                     tokenizer._encode_text_piece(text, allowed)
@@ -275,14 +280,17 @@ class TestEncodePieceFastPath(CustomTestCase):
                 expected = original(configured, text, True)
                 _EncodePieceFastPathPatcher.patch(configured)
                 try:
-                    self.assertEqual(
-                        expected, configured._encode_text_piece(text, True)
-                    )
+                    for _ in range(2):
+                        self.assertEqual(
+                            expected, configured._encode_text_piece(text, True)
+                        )
                     configured.model = tokenizer.model
-                    self.assertEqual(
-                        original(configured, text, True),
-                        configured._encode_text_piece(text, True),
-                    )
+                    expected_after_replacement = original(configured, text, True)
+                    for _ in range(2):
+                        self.assertEqual(
+                            expected_after_replacement,
+                            configured._encode_text_piece(text, True),
+                        )
                 finally:
                     _EncodePieceFastPathPatcher.unpatch(configured)
 

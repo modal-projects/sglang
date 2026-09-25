@@ -64,6 +64,10 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         self._is_dummy = is_dummy
         self.device_pool = device_pool
+        # Track the anchor's DCP placement so the inherited logical_size /
+        # logical_page_size properties agree with the anchor's slot domain.
+        self.dcp_size = anchor_host.dcp_size
+        self.dcp_rank = anchor_host.dcp_rank
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory

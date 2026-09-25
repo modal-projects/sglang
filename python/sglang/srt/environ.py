@@ -747,6 +747,9 @@ class Envs:
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Fail-closed cap on the node-aggregate HiCache host plan (1x dedup
+    # target + tp_size x rank-local pools), checked at startup.
+    SGLANG_HICACHE_HOST_BUDGET_GIB = EnvInt(800)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)

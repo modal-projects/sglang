@@ -400,6 +400,41 @@ class SchedulerMetricsReporter:
             var_decode_kv_tokens=decode_kv.variance(),
         )
 
+    def _update_queue_depths(self) -> None:
+        scheduler = self.scheduler
+        mode = scheduler.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            # Inflight requests have finished prefill and only await KV transfer.
+            prefill_depth = len(scheduler.disagg_prefill_bootstrap_queue.queue) + len(
+                scheduler.waiting_queue
+            )
+            decode_depth = 0
+        elif mode == DisaggregationMode.DECODE:
+            prefill_depth = 0
+            prealloc_queue = scheduler.disagg_decode_prealloc_queue
+            transfer_queue = scheduler.disagg_decode_transfer_queue
+            # Normal first-decode handoffs are excluded from decode pressure.
+            # Resume clears is_retracted before queuing; persistent markers remain.
+            decode_depth = (
+                len(prealloc_queue.retracted_queue)
+                + len(prealloc_queue.held_rebootstrap_reqs)
+                + sum(1 for req in prealloc_queue.queue if req.is_rebootstrap)
+                + sum(1 for req in transfer_queue.queue if req.is_rebootstrap)
+                + sum(
+                    1
+                    for req in scheduler.waiting_queue
+                    if req.retracted_stain
+                    or getattr(req, "pd_rebootstrap_in_progress", False)
+                )
+            )
+        else:
+            queue = self.stats.num_queue_reqs
+            decode_depth = queue.num_retracted
+            prefill_depth = queue.total - decode_depth
+        self.stats.prefill_queue_depth = prefill_depth
+        self.stats.decode_queue_depth = decode_depth
+        self.stats.num_prefill_inflight_reqs = int(scheduler.chunked_req is not None)
+
     def _build_queued_request_metrics(self):
         from sglang.srt.observability.forward_pass_metrics import (
             QueuedRequestMetrics,
@@ -777,8 +812,9 @@ class SchedulerMetricsReporter:
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
+                self.scheduler.waiting_queue, priority_enabled, count_retracted=True
             )
+            self._update_queue_depths()
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
@@ -995,8 +1031,9 @@ class SchedulerMetricsReporter:
                 batch.reqs, priority_enabled
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
+                self.scheduler.waiting_queue, priority_enabled, count_retracted=True
             )
+            self._update_queue_depths()
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
@@ -1340,8 +1377,9 @@ class SchedulerMetricsReporter:
         )
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(
-            self.scheduler.waiting_queue, priority_enabled
+            self.scheduler.waiting_queue, priority_enabled, count_retracted=True
         )
+        self._update_queue_depths()
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(

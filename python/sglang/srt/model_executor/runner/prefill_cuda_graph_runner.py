@@ -90,12 +90,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     prefill_graph_tolerates_sum_len,
 )
-from sglang.srt.model_executor.forward_context import (
-    ForwardContext,
-    forward_context,
-    get_req_to_token_pool,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -1191,9 +1186,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.extend_prefix_lens_cpu,
                 forward_batch.extend_seq_lens,
                 forward_batch.req_pool_indices,
-                get_req_to_token_pool().req_to_token,
+                model_runner.req_to_token_pool.req_to_token,
                 forward_batch.seq_lens_sum,
-                get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                model_runner.token_to_kv_pool.get_kv_buffer_shape()[0],
                 model_runner.kv_cache_dtype,
                 model_runner.device,
                 create_chunked_prefix_cache_kv_indices,

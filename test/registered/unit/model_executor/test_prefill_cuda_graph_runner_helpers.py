@@ -4,7 +4,6 @@ import unittest
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -73,6 +72,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             model=Model(),
             kv_cache_dtype=torch.bfloat16,
             device=torch.device("cpu"),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(16).reshape(2, 8)
+            ),
+            token_to_kv_pool=SimpleNamespace(get_kv_buffer_shape=lambda: (32, 1, 4)),
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_target_verify=lambda: False),
@@ -84,27 +87,13 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             seq_lens_sum=5,
             attn_dcp_metadata=None,
         )
-        req_to_token = torch.arange(16).reshape(2, 8)
-        req_pool = SimpleNamespace(req_to_token=req_to_token)
-        token_pool = SimpleNamespace(get_kv_buffer_shape=lambda: (32, 1, 4))
-
-        with (
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
-                "get_req_to_token_pool",
-                return_value=req_pool,
-            ),
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
-                "get_token_to_kv_pool",
-                return_value=token_pool,
-            ),
-        ):
-            runner._prepare_dcp_metadata(batch)
+        runner._prepare_dcp_metadata(batch)
 
         self.assertIs(batch.attn_dcp_metadata, marker)
         self.assertIsNotNone(captured_args)
-        self.assertIs(captured_args[5], req_to_token)
+        self.assertIs(
+            captured_args[5], runner.model_runner.req_to_token_pool.req_to_token
+        )
         self.assertEqual(captured_args[7], 32)
 
     def test_prepare_dcp_metadata_skips_target_verify_and_draft(self):

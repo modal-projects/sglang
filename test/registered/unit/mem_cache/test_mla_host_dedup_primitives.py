@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
+    _prebuild_prefetch_sync_groups,
     maybe_create_mla_host_dedup_context,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
@@ -203,11 +204,43 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
 
         create_group.assert_called_once_with(group_ranks=[4, 5], backend="nccl")
         broadcast.assert_called_once()
-        self.assertEqual(broadcast.call_args.args[0].numel(), 1)
+        # Production-sized payload: one full KV chunk, not a 1-element probe,
+        # so NCCL's lazy size-dependent device buffers allocate at build time.
+        self.assertEqual(
+            broadcast.call_args.args[0].numel(),
+            device_pool.kv_cache_dim * envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.get(),
+        )
         self.assertIs(broadcast.call_args.kwargs["group"], dedicated_group)
         self.assertEqual(broadcast.call_args.kwargs["src"], 4)
         synchronize.assert_called_once_with(device_pool.device)
         self.assertIs(broadcaster.group, dedicated_group)
+
+    def test_warmup_covers_kv_chunk_and_full_indexer_staging(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.device = torch.device("cpu")
+        broadcaster.chunk_tokens = 3
+        broadcaster.kv_staging = torch.zeros(2 * 3 * 4)
+        broadcaster.idx_staging = torch.zeros(2 * 3 * 7)
+        broadcaster.device_pool = SimpleNamespace(kv_cache_dim=4)
+
+        with (
+            mock.patch.object(torch.distributed, "broadcast") as broadcast,
+            mock.patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            broadcaster._warmup_group()
+
+        self.assertEqual(broadcast.call_count, 2)
+        kv_payload, idx_payload = (call.args[0] for call in broadcast.call_args_list)
+        # One production KV chunk; the complete DSA indexer staging buffer.
+        self.assertEqual(kv_payload.numel(), 3 * 4)
+        self.assertIs(idx_payload, broadcaster.idx_staging)
+        for call in broadcast.call_args_list:
+            self.assertIs(call.kwargs["group"], broadcaster.group)
+            self.assertEqual(call.kwargs["src"], 0)
+        synchronize.assert_called_once_with(broadcaster.device)
 
     def test_indexer_pages_preserve_logical_order(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
@@ -252,6 +285,56 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         )
         self.assertIsNone(context.prefetch_hits_sync_groups)
         self.assertIsNone(context.prefetch_completion_sync_groups)
+
+    def test_prebuild_prefetch_sync_groups_include_pipeline_group(self):
+        tp_group, attn_tp_group, pp_group = object(), object(), object()
+        ranks_by_group = {attn_tp_group: [0, 1], pp_group: [0, 2]}
+        created = []
+
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed,
+                "get_process_group_ranks",
+                side_effect=lambda group: ranks_by_group[group],
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                side_effect=lambda group_ranks, backend: (
+                    created.append((list(group_ranks), backend)) or object()
+                ),
+            ),
+        ):
+            groups = _prebuild_prefetch_sync_groups(
+                tp_group, None, attn_tp_group, pp_group
+            )
+
+        # Same construction and ordering as the controller's: attention
+        # groups first, then the pipeline group.
+        self.assertEqual(created, [([0, 1], "gloo"), ([0, 2], "gloo")])
+        self.assertEqual(len(groups), 2)
+
+    def test_broadcast_skips_zero_row_indexer_layers(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        kv_buffers = [torch.arange(24, dtype=torch.float32).reshape(6, 1, 4)]
+        # A layer reusing the previous layer's top-k keeps a 0-row
+        # placeholder indexer buffer (skip_topk_layers).
+        broadcaster.idx_bufs = [torch.empty(0, 7)]
+        broadcaster.idx_staging = torch.empty(6 * 7)
+        broadcaster.idx_elem = 7
+        broadcaster.device_pool = SimpleNamespace(kv_buffer=kv_buffers, kv_cache_dim=4)
+        broadcaster.kv_staging = torch.empty(6 * 4)
+        prepared = (torch.tensor([0, 2, 5]), torch.tensor([0, 1, 2]))
+
+        with mock.patch.object(torch.distributed, "broadcast") as broadcast:
+            broadcaster.broadcast_loaded_layer(0, prepared)
+
+        # Only the KV layer broadcasts; the 0-row indexer layer is skipped
+        # instead of indexing out of bounds on every rank.
+        broadcast.assert_called_once()
 
 
 if __name__ == "__main__":

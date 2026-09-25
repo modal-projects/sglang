@@ -39,6 +39,11 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Some composites bypass __init__; each launch installs instance state.
+    _page_reuse_forward_done_event = None
+    _freed_since_forward_launch = False
+    _carry_frees_into_next_launch = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -109,6 +114,36 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def _forward_fence_children(self):
+        return ()
+
+    def note_forward_launch(self, forward_done_event) -> None:
+        """Track completion of an overlap forward, including its KV writes."""
+        self._page_reuse_forward_done_event = forward_done_event
+        # The next scheduling pass follows the previous result's synchronization.
+        # Processing before launch can leave this batch writing already-freed pages.
+        self._freed_since_forward_launch = (
+            self._carry_frees_into_next_launch and self._freed_since_forward_launch
+        )
+        self._carry_frees_into_next_launch = False
+        for child in self._forward_fence_children():
+            child.note_forward_launch(forward_done_event)
+
+    def carry_frees_into_next_launch(self) -> None:
+        """The next batch was built before its predecessor released pages."""
+        self._carry_frees_into_next_launch = True
+        for child in self._forward_fence_children():
+            child.carry_frees_into_next_launch()
+
+    def wait_for_forward(self) -> None:
+        """Order the current stream after the last reported overlap forward."""
+        if self._page_reuse_forward_done_event is not None:
+            self._page_reuse_forward_done_event.wait()
+
+    def _fence_recycled_pages(self) -> None:
+        if self._freed_since_forward_launch:
+            self.wait_for_forward()
 
     def get_all_free_pages(self):
         # Debug / invariant census; None when the pool has no page free list.

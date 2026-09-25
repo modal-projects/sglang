@@ -811,6 +811,9 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
     `UnifiedMambaSlotAllocator`.
     """
 
+    def _forward_fence_children(self):
+        return (*super()._forward_fence_children(), self.mamba_allocator)
+
     def __init__(
         self,
         *,

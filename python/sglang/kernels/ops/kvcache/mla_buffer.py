@@ -39,9 +39,10 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    loc = loc // DCP_WORLD_SIZE
+    is_valid = is_valid & (loc != reserved_skip_index)
     safe_loc = tl.where(is_valid, loc, 0)
-    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     # Three-way branch to handle boundary correctly while preserving fast path

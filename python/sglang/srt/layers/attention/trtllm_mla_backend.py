@@ -1207,8 +1207,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
-        # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
-        # is also its only skip. A DCP-resolved loc never reaches here -- see
+        # `loc` is WIDENED: the kernel resolves ownership before checking the
+        # physical padding row. A DCP-resolved loc never reaches here -- see
         # the `_fused_set_kv_concat_q_fp8` gate.
         assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
             "fused fp8 KV write reached with a DCP-resolved loc"

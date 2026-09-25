@@ -141,6 +141,11 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+def _zero_rows(buf: torch.Tensor, rows: torch.Tensor) -> None:
+    # Float8 tensors have no index_fill kernel; zero their storage bytes.
+    buf.view(torch.uint8).index_fill_(0, rows, 0)
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -187,12 +192,16 @@ def _set_kv_buffer_impl(
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k
+        k_cache[0].zero_()
         with device_module.stream(alt_stream):
             v_cache[indices] = v
+            v_cache[0].zero_()
         current_stream.wait_stream(alt_stream)
     else:  # fallback to naive implementation
         k_cache[indices] = k
         v_cache[indices] = v
+        k_cache[0].zero_()
+        v_cache[0].zero_()
 
 
 def _set_kv_buffer_prefix_valid_impl(
@@ -1860,6 +1869,20 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def supports_zero_pages(self) -> bool:
+        # Inheriting a payload-only implementation is unsafe for quantized layouts.
+        return "zero_pages" in type(self).__dict__
+
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        """Clear physical page envelopes across all layers on the current stream."""
+        raise NotImplementedError()
+
+    def _page_rows(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return (
+            page_ids[:, None] * self.page_size
+            + torch.arange(self.page_size, device=page_ids.device)
+        ).reshape(-1)
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -2124,6 +2147,18 @@ class MHATokenToKVPool(KVCache):
     @property
     def is_quantized_kv_cache(self) -> bool:
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
+
+    def supports_zero_pages(self) -> bool:
+        return super().supports_zero_pages() and not self.is_quantized_kv_cache
+
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        rows = (
+            page_ids
+            if self.use_hnd or self.kv_cache_layout == "vectorized_5d"
+            else self._page_rows(page_ids)
+        )
+        for buf in (*self.k_buffer, *self.v_buffer):
+            _zero_rows(buf, rows)
 
     def _create_buffers(self):
         if self.is_quantized_kv_cache:
@@ -3969,6 +4004,12 @@ class HybridLinearKVPool(KVCache):
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
+    def supports_zero_pages(self) -> bool:
+        return super().supports_zero_pages() and self.full_kv_pool.supports_zero_pages()
+
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        self.full_kv_pool.zero_pages(page_ids)
+
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
         # is dense over only full-attention layers.  Shape discovery does not
@@ -4396,6 +4437,11 @@ class MLATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.kv_buffer
 
+    def zero_pages(self, page_ids: torch.Tensor) -> None:
+        rows = self._page_rows(page_ids)
+        for buf in self.kv_buffer:
+            _zero_rows(buf, rows)
+
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
@@ -4496,6 +4542,7 @@ class MLATokenToKVPool(KVCache):
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.kv_buffer[layer_id - self.start_layer][0].zero_()
 
     def _write_mla_kv_buffer(
         self,

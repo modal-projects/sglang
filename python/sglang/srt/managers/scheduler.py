@@ -1977,6 +1977,8 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
+                if batch:
+                    self.token_to_kv_pool_allocator.carry_frees_into_next_launch()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -4327,13 +4329,12 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
+                        # The shared-read barrier may precede the last KV write.
+                        allocator = self.token_to_kv_pool_allocator
+                        forward_done = self.device_module.Event()
+                        forward_done.record(stream=self.forward_stream)
+                        allocator.note_forward_launch(forward_done)
                         if self.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
                             allocator.set_latest_forward_done_event(forward_done)
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).

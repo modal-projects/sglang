@@ -594,6 +594,14 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     @staticmethod
     def _transport_acknowledgement_args(proxy) -> dict:
         """Assign unused global pool words to the receiving DP group's leader."""
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmTensorTransportProxy,
+        )
+
+        # VMM selects acknowledgement slots from its attention-group topology.
+        # It does not implement the native IPC global-rank keyword contract.
+        if isinstance(proxy, CudaVmmTensorTransportProxy):
+            return {}
         if proxy.total_consumer_count == 1:
             return {}
         parallel = get_parallel()

@@ -100,6 +100,10 @@ class Memory(msgspec.Struct):
     # Hierarchical cache
     # -------------------------------------------------------------------------
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_mla_hicache_host_dedup: A[
+        bool,
+        "Deduplicate the MLA/DSA HiCache host KV pool across attention-TP ranks: only rank 0 keeps a physical host pool and the other ranks receive loaded pages over NCCL. Requires --enable-hierarchical-cache, --dcp-size=1, and no registered (RDMA) storage backend.",
+    ] = False
     hicache_host_memory_mode: A[
         str,
         Arg(

@@ -167,6 +167,101 @@ class HostPoolGroup:
             released += self.free(transfer.host_indices, pool=transfer.name)
         return released
 
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id: int,
+        io_backend: str,
+        pool_transfers: list[PoolTransfer] | None = None,
+    ) -> None:
+        # Group-level duck-typed transfer surface. The L2 transfer engine
+        # currently only drives per-entry host pools (L2Transfer.host_pool);
+        # these four methods are exercised by tests and reserved for engine
+        # paths that move several pools of one op together.
+        # 1. Anchor (KV) transfer
+        anchor = self.anchor_entry
+        local_layer_id = anchor.layer_mapper(layer_id)
+        if local_layer_id is not None and host_indices.numel() > 0:
+            anchor.host_pool.load_to_device_per_layer(
+                anchor.device_pool,
+                host_indices,
+                device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+        # 2. Extra pool transfers
+        self.load_extra_to_device_per_layer(
+            layer_id, io_backend, pool_transfers=pool_transfers
+        )
+
+    def load_extra_to_device_per_layer(
+        self,
+        layer_id: int,
+        io_backend: str,
+        pool_transfers: list[PoolTransfer] | None = None,
+        pool_names: set[PoolName] | None = None,
+    ) -> None:
+        """Load selected non-anchor pools for one global transfer layer."""
+        for transfer in pool_transfers or []:
+            if pool_names is not None and transfer.name not in pool_names:
+                continue
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            local_layer_id = entry.layer_mapper(layer_id)
+            if local_layer_id is None:
+                continue
+            entry.host_pool.load_to_device_per_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend: str,
+        pool_transfers: list[PoolTransfer] | None = None,
+    ) -> None:
+        # 1. Anchor (KV) backup
+        self.anchor_entry.host_pool.backup_from_device_all_layer(
+            self.anchor_entry.device_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+        )
+        # 2. Extra pool backup
+        self.backup_extra_from_device_all_layer(
+            io_backend, pool_transfers=pool_transfers
+        )
+
+    def backup_extra_from_device_all_layer(
+        self,
+        io_backend: str,
+        pool_transfers: list[PoolTransfer] | None = None,
+        pool_names: set[PoolName] | None = None,
+    ) -> None:
+        """Back up selected non-anchor pools without touching the anchor."""
+        for transfer in pool_transfers or []:
+            if pool_names is not None and transfer.name not in pool_names:
+                continue
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            entry.host_pool.backup_from_device_all_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                io_backend,
+            )
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer

@@ -1,4 +1,12 @@
-"""Deduplicate MLA/DSA host cache across attention-TP ranks."""
+"""Deduplicate MLA/DSA host cache across attention-TP ranks.
+
+MLA KV is identical on every attn-TP rank, so only the src rank (attn-TP
+rank 0) keeps a real host pool; the other ranks run allocator-only "dummy"
+pools and receive loaded pages via an NCCL broadcast on the load stream.
+
+Single source of truth for the dedup gating and the broadcast machinery -
+every dedup decision elsewhere must derive from these helpers.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +19,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
+    MHATokenToKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
 )
@@ -31,6 +41,181 @@ def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
     return storage_backend in _DEDUP_COMPATIBLE_STORAGE
 
 
+def _aligned_host_tokens(
+    *,
+    device_tokens: int,
+    size_per_token: int,
+    host_to_device_ratio: float,
+    host_size_gb: int,
+    page_size: int,
+) -> int:
+    requested = (
+        int(host_size_gb * 1e9 // size_per_token)
+        if host_size_gb > 0
+        else int(device_tokens * host_to_device_ratio)
+    )
+    return (requested // page_size + 1) * page_size
+
+
+def estimate_mla_host_pool_bytes(
+    device_pool: MLATokenToKVPool,
+    *,
+    host_to_device_ratio: float,
+    host_size_gb: int,
+    page_size: int,
+) -> tuple[int, int]:
+    """Return (bytes, tokens) without allocating the MLA host pool."""
+    kv_cache_dim = getattr(device_pool, "kv_cache_dim", None)
+    if kv_cache_dim is None:
+        kv_cache_dim = device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+    size_per_token = (
+        kv_cache_dim * device_pool.store_dtype.itemsize * device_pool.layer_num
+    )
+    tokens = _aligned_host_tokens(
+        device_tokens=device_pool.size,
+        size_per_token=size_per_token,
+        host_to_device_ratio=host_to_device_ratio,
+        host_size_gb=host_size_gb,
+        page_size=page_size,
+    )
+    return tokens * size_per_token, tokens
+
+
+def estimate_mamba_host_pool_bytes(
+    device_pool,
+    *,
+    host_to_device_ratio: float,
+    host_size_gb: int,
+) -> tuple[int, int]:
+    """Return (bytes, tokens) for one rank-local Mamba/KDA host pool."""
+    conv_bytes = sum(
+        math.prod(state.shape[2:]) * state.element_size()
+        for state in device_pool.mamba_cache.conv
+    )
+    temporal = device_pool.mamba_cache.temporal
+    temporal_bytes = math.prod(temporal.shape[2:]) * temporal.element_size()
+    size_per_token = (conv_bytes + temporal_bytes) * device_pool.num_mamba_layers
+    tokens = _aligned_host_tokens(
+        device_tokens=device_pool.size,
+        size_per_token=size_per_token,
+        host_to_device_ratio=host_to_device_ratio,
+        host_size_gb=host_size_gb,
+        page_size=1,
+    )
+    return tokens * size_per_token, tokens
+
+
+def estimate_draft_host_pool_bytes(
+    device_pool, *, host_tokens: int, page_size: int
+) -> tuple[int, int]:
+    """Return (bytes, tokens) for one rank-local draft L2 pool."""
+    if isinstance(device_pool, MLATokenToKVPool):
+        kv_cache_dim = getattr(device_pool, "kv_cache_dim", None)
+        if kv_cache_dim is None:
+            kv_cache_dim = device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+        size_per_token = (
+            kv_cache_dim * device_pool.store_dtype.itemsize * device_pool.layer_num
+        )
+    elif isinstance(device_pool, MHATokenToKVPool):
+        size_per_token = (
+            2
+            * device_pool.head_num
+            * device_pool.head_dim
+            * device_pool.layer_num
+            * device_pool.store_dtype.itemsize
+        )
+    else:
+        raise ValueError(
+            "Cannot estimate HiCache draft host memory for "
+            f"{type(device_pool).__name__}."
+        )
+    tokens = (host_tokens // page_size + 1) * page_size
+    return tokens * size_per_token, tokens
+
+
+def enforce_hicache_host_budget(
+    *,
+    target_bytes: int,
+    rank_local_bytes: dict[str, int],
+    tp_size: int,
+    context: str,
+) -> int:
+    """Log and validate one deterministic, node-aggregate HiCache plan."""
+    budget_gib = envs.SGLANG_HICACHE_HOST_BUDGET_GIB.get()
+    if budget_gib <= 0:
+        raise ValueError("SGLANG_HICACHE_HOST_BUDGET_GIB must be positive.")
+    aggregate = target_bytes + tp_size * sum(rank_local_bytes.values())
+    parts = ", ".join(
+        [
+            f"target_mla={target_bytes / (1024**3):.2f} GiB x1",
+            *[
+                f"{name}={num_bytes / (1024**3):.2f} GiB x{tp_size}"
+                for name, num_bytes in sorted(rank_local_bytes.items())
+            ],
+        ]
+    )
+    logger.info(
+        "HiCache aggregate host budget (%s): %s; total=%.2f GiB, cap=%d GiB",
+        context,
+        parts,
+        aggregate / (1024**3),
+        budget_gib,
+    )
+    if aggregate > budget_gib * (1024**3):
+        raise ValueError(
+            f"HiCache aggregate host plan for {context} requires "
+            f"{aggregate / (1024**3):.2f} GiB ({parts}), exceeding "
+            f"SGLANG_HICACHE_HOST_BUDGET_GIB={budget_gib}. Reduce "
+            "--hicache-ratio/--hicache-size or raise the explicit cap."
+        )
+    return aggregate
+
+
+def enforce_dedup_draft_host_budget(
+    controller, draft_device_pool, *, page_size: int
+) -> int:
+    """Revalidate the aggregate plan before allocating a rank-local draft L2."""
+    group = controller.mem_pool_host
+    anchor = getattr(group, "anchor_entry", None)
+    target = group if anchor is None else anchor.host_pool
+    target_bytes = target.size * target.size_per_token
+    target_tokens = target.size
+
+    mamba_bytes = 0
+    mamba_tokens = 0
+    entry_map = getattr(group, "entry_map", {})
+    mamba_entry = entry_map.get(PoolName.MAMBA)
+    if mamba_entry is not None:
+        mamba = mamba_entry.host_pool
+        mamba_bytes = mamba.size * mamba.size_per_token
+        mamba_tokens = mamba.size
+
+    draft_bytes, draft_tokens = estimate_draft_host_pool_bytes(
+        draft_device_pool,
+        host_tokens=target_tokens,
+        page_size=page_size,
+    )
+    _, tp_size = mla_dedup_rank_and_size()
+    # All three allocator implementations preallocate CPU bookkeeping:
+    # target/draft use uint8+int64+bool (10 B/slot), Mamba uint8+int64.
+    allocator_metadata_bytes = target_tokens * 10 + mamba_tokens * 9 + draft_tokens * 10
+    rank_local = {
+        "allocator_metadata": allocator_metadata_bytes,
+        "draft": draft_bytes,
+    }
+    if mamba_entry is not None:
+        rank_local["mamba"] = mamba_bytes
+    return enforce_hicache_host_budget(
+        target_bytes=target_bytes,
+        rank_local_bytes=rank_local,
+        tp_size=tp_size,
+        context=(
+            f"MLA dedup with draft L2 "
+            f"(target_tokens={target_tokens}, draft_tokens={draft_tokens})"
+        ),
+    )
+
+
 def mla_dedup_rank_and_size() -> tuple[int, int]:
     """Attn-TP rank/size when DP attention is enabled, model-TP otherwise."""
     parallel = get_parallel()
@@ -39,15 +224,65 @@ def mla_dedup_rank_and_size() -> tuple[int, int]:
     return parallel.tp_rank, parallel.tp_size
 
 
-def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
+def mla_host_dedup_eligible(
+    kv_cache, storage_backend: Optional[str], enabled: bool = False
+) -> bool:
     """Rank-independent gate. CUDA only; FP4 excluded (its per-rank scale
     buffer is not covered by the broadcast)."""
     return (
-        isinstance(kv_cache, MLATokenToKVPool)
+        enabled
+        and isinstance(kv_cache, MLATokenToKVPool)
         and not isinstance(kv_cache, MLATokenToKVPoolFP4)
         and is_cuda()
         and storage_supports_host_dedup(storage_backend)
     )
+
+
+def require_mla_host_dedup_supported(
+    kv_cache, storage_backend: Optional[str], enabled: bool = False
+) -> None:
+    """Fail closed when the opt-in cannot preserve target-cache semantics."""
+    if not enabled:
+        return
+    if not isinstance(kv_cache, MLATokenToKVPool):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup requires an MLA target KV pool, "
+            f"got {type(kv_cache).__name__}."
+        )
+    if isinstance(kv_cache, MLATokenToKVPoolFP4):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup does not support FP4 MLA KV: "
+            "the per-rank scale buffer is not broadcast."
+        )
+    if getattr(kv_cache, "layer_shard_enabled", False):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup requires every attention-TP "
+            "rank to own every target MLA layer."
+        )
+    if not is_cuda():
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup currently requires CUDA/NCCL."
+        )
+    if not storage_supports_host_dedup(storage_backend):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup does not support storage backend "
+            f"{storage_backend!r}; only L2-only mode or the file backend is "
+            "supported."
+        )
+    _, size = mla_dedup_rank_and_size()
+    if size <= 1:
+        raise ValueError("--enable-mla-hicache-host-dedup requires attention TP > 1.")
+
+
+def is_mla_dedup_dummy_rank(
+    kv_cache, storage_backend: Optional[str], enabled: bool = False
+) -> bool:
+    """Whether this rank must construct an allocator-only (dummy) host pool."""
+    require_mla_host_dedup_supported(kv_cache, storage_backend, enabled)
+    if not mla_host_dedup_eligible(kv_cache, storage_backend, enabled):
+        return False
+    rank, size = mla_dedup_rank_and_size()
+    return size > 1 and rank != 0
 
 
 class MLAHostDedupBroadcaster:
@@ -116,11 +351,31 @@ class MLAHostDedupBroadcaster:
         return broadcaster
 
     def _warmup_group(self) -> None:
-        """Initialize the NCCL communicator before serving."""
-        warmup = self.kv_staging[:1]
+        """Initialize the NCCL communicator before serving.
+
+        NCCL allocates this communicator's device buffers lazily at its
+        FIRST collective - which for this group is the first host-tier
+        loadback, potentially hours into serving on a ~full device. That
+        allocation then fails (ncclUnhandledCudaError), poisoning the group
+        and every later loadback. Pre-pay the first-collective allocation
+        here, at build time, with a production-shaped payload: one KV chunk
+        plus the complete DSA indexer staging (the largest indexer payload
+        the load path issues). Real loads broadcast KV in chunks of up to
+        layer_num * chunk_tokens rows, so the warmed KV payload is not the
+        maximum KV collective; the goal is the communicator's
+        first-collective allocation, not every size-dependent path. All
+        participants reach build() in lockstep (world collective).
+        """
+        warmup = self.kv_staging[: self.chunk_tokens * self.device_pool.kv_cache_dim]
         if self.is_src:
             warmup.zero_()
         torch.distributed.broadcast(warmup, src=self.src_global_rank, group=self.group)
+        if self.idx_staging is not None:
+            if self.is_src:
+                self.idx_staging.zero_()
+            torch.distributed.broadcast(
+                self.idx_staging, src=self.src_global_rank, group=self.group
+            )
         torch.cuda.synchronize(self.device)
         logger.info("MLA host-dedup NCCL broadcast group warmup completed")
 
@@ -155,6 +410,7 @@ class MLAHostDedupBroadcaster:
         self,
         layer_id: int,
         prepared: tuple[torch.Tensor, Optional[torch.Tensor]],
+        trace=None,
     ) -> None:
         """Broadcast one loaded KV layer and its optional DSA indexer layer."""
         indices, page_idx = prepared
@@ -164,15 +420,26 @@ class MLAHostDedupBroadcaster:
             indices,
             self.device_pool.kv_cache_dim,
             layer_id,
+            trace=trace,
+            trace_prefix="kv",
         )
         if self.idx_bufs is not None:
             assert page_idx is not None
+            if self.idx_bufs[layer_id].shape[0] == 0:
+                # This layer reuses the previous layer's top-k and keeps a
+                # 0-row placeholder indexer buffer: there is nothing to
+                # broadcast. skip_topk_layers is pool-level state, identical
+                # on every rank, so skipping stays collective-aligned. The KV
+                # broadcast above and the layer-completion event still happen.
+                return
             self._bcast_layer(
                 self.idx_bufs,
                 self.idx_staging,
                 page_idx,
                 self.idx_elem,
                 layer_id,
+                trace=trace,
+                trace_prefix="indexer",
             )
 
     def _bcast_layer(
@@ -182,6 +449,8 @@ class MLAHostDedupBroadcaster:
         target,
         elem,
         layer_id: int,
+        trace=None,
+        trace_prefix: str = "kv",
     ) -> None:
         """Broadcast one layer in chunks using the shared staging buffer."""
         n = target.shape[0]
@@ -196,12 +465,49 @@ class MLAHostDedupBroadcaster:
             chunk = staging[: cur * elem]
             chunk_rows = chunk.view(cur, *row_shape)
             if self.is_src:
+                pack_start = self._trace_event(trace)
                 torch.index_select(layer_buf, 0, idx, out=chunk_rows)
+                self._finish_trace_phase(
+                    trace,
+                    f"{trace_prefix}_pack",
+                    pack_start,
+                    chunk.numel() * chunk.element_size(),
+                )
+            nccl_start = self._trace_event(trace)
             torch.distributed.broadcast(
                 chunk, src=self.src_global_rank, group=self.group
             )
+            self._finish_trace_phase(
+                trace,
+                f"{trace_prefix}_nccl",
+                nccl_start,
+                chunk.numel() * chunk.element_size(),
+            )
             if not self.is_src:
+                scatter_start = self._trace_event(trace)
                 layer_buf.index_copy_(0, idx, chunk_rows)
+                self._finish_trace_phase(
+                    trace,
+                    f"{trace_prefix}_scatter",
+                    scatter_start,
+                    chunk.numel() * chunk.element_size(),
+                )
+
+    @staticmethod
+    def _trace_event(trace):
+        if trace is None:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _finish_trace_phase(trace, name: str, start, num_bytes: int) -> None:
+        if trace is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        trace["events"].append((name, start, end, num_bytes))
 
     def destroy(self) -> None:
         if self.group is None:
@@ -252,11 +558,13 @@ def maybe_create_mla_host_dedup_context(
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[MLAHostDedupContext]:
     """Create dedup state before host allocation, or preserve the original path."""
     if not enabled:
         return None
-    if not mla_host_dedup_eligible(kv_cache, storage_backend):
+    require_mla_host_dedup_supported(kv_cache, storage_backend, enabled)
+    if not mla_host_dedup_eligible(kv_cache, storage_backend, enabled):
         return None
     if mla_dedup_rank_and_size()[1] <= 1:
         return None
@@ -266,10 +574,10 @@ def maybe_create_mla_host_dedup_context(
     prefetch_completion_sync_groups = None
     if storage_backend is not None:
         prefetch_hits_sync_groups = _prebuild_prefetch_sync_groups(
-            tp_group, attn_cp_group, attn_tp_group
+            tp_group, attn_cp_group, attn_tp_group, pp_group
         )
         prefetch_completion_sync_groups = _prebuild_prefetch_sync_groups(
-            tp_group, attn_cp_group, attn_tp_group
+            tp_group, attn_cp_group, attn_tp_group, pp_group
         )
     return MLAHostDedupContext(
         broadcaster,
@@ -278,12 +586,60 @@ def maybe_create_mla_host_dedup_context(
     )
 
 
+def maybe_prebuild_mla_host_dedup(
+    kv_cache,
+    tp_group: torch.distributed.ProcessGroup,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup],
+    attn_tp_group: Optional[torch.distributed.ProcessGroup],
+    storage_backend: Optional[str],
+    enabled: bool = False,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Optional[MLAHostDedupContext]:
+    """Issue the controller's init-time world collectives BEFORE the host KV
+    pool is allocated.
+
+    The src rank can spend many minutes pinning host KV while the dummy
+    ranks race ahead into create_custom_parallel_group (NCCL bcast group +
+    gloo prefetch groups) and trip the 600s NCCL watchdog; prebuilding
+    completes the rendezvouses in lockstep first. Returns None when dedup
+    does not engage - same gating as the controller, so groups are never
+    built on ranks that would ignore them.
+    """
+    context = maybe_create_mla_host_dedup_context(
+        kv_cache,
+        tp_group,
+        attn_cp_group,
+        attn_tp_group,
+        storage_backend,
+        enabled,
+        pp_group,
+    )
+    if context is None:
+        return None
+    rank, size = mla_dedup_rank_and_size()
+    logger.info(
+        "MLA HiCache host dedup active: attn_tp_rank=%d/%d, role=%s, "
+        "target_host_pool=%s",
+        rank,
+        size,
+        "owner" if context.is_src else "receiver",
+        "physical" if context.is_src else "allocator-only",
+    )
+    return context
+
+
 def _prebuild_prefetch_sync_groups(
     tp_group: torch.distributed.ProcessGroup,
     attn_cp_group: Optional[torch.distributed.ProcessGroup],
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> List[torch.distributed.ProcessGroup]:
-    """Prebuild one set of HiCache storage synchronization groups."""
+    """Prebuild one set of HiCache storage synchronization groups.
+
+    Same construction and ordering as HiCacheController._create_sync_groups:
+    attention groups first (CP before TP), then the pipeline group, so the
+    prebuilt lists are drop-in replacements for the controller's.
+    """
     from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
     groups: List[torch.distributed.ProcessGroup] = []
@@ -292,6 +648,8 @@ def _prebuild_prefetch_sync_groups(
         base_groups = [attn_cp_group, attn_tp_group]
     else:
         base_groups = [tp_group]
+    if pp_group is not None:
+        base_groups.append(pp_group)
     for group in base_groups:
         if group is None or torch.distributed.get_world_size(group=group) == 1:
             continue

@@ -353,6 +353,48 @@ class TestDFlashPendingPenalties(CustomTestCase):
         self.assertIsNone(scheduler.future_map.penalty_output_relay.num_valid)
         self.assert_consumers(batch, info, [[5, 7]])
 
+    def test_invalid_pending_rows_leave_retirement_to_cpu(self):
+        """Invalid live IDs cannot index penalties before CPU retirement."""
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            for invalid in (-1, VOCAB_SIZE, VOCAB_SIZE + 1):
+                for position in range(3):
+                    with self.subTest(
+                        algorithm=algorithm, invalid=invalid, position=position
+                    ):
+                        scheduler = _SchedulerBoundary(algorithm)
+                        batch = _batch(
+                            [_req([5]), _req([4]), _req([6])],
+                            [3, 4, 5],
+                            algorithm=algorithm,
+                        )
+                        run = [7, 8, 9]
+                        run[position] = invalid
+                        tokens = torch.tensor([run, [0, 8, -1], [-1, -1, -1]])
+                        original = tokens.clone()
+                        scheduler.publish(
+                            batch, tokens, torch.tensor([3, 2, 0]), [5, 4, 2]
+                        )
+                        # The invalid row will retire; valid peers still consume
+                        # their full suffix, and invalid padding has no effect.
+                        self.assert_consumers(
+                            batch,
+                            scheduler.snapshot(batch),
+                            [[5], [4, 0, 8], [6]],
+                        )
+                        torch.testing.assert_close(tokens, original)
+                        torch.testing.assert_close(
+                            scheduler.future_map.penalty_output_relay.tokens[
+                                batch.req_pool_indices
+                            ],
+                            original,
+                        )
+                        req = batch.reqs[0]
+                        req.output_ids.extend(run)
+                        req.update_finish_state(new_accepted_len=3)
+                        self.assertTrue(req.finished())
+                        self.assertEqual(req.finished_len, position + 2)
+                        self.assertEqual(list(req.output_ids), [5] + run)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -108,9 +108,16 @@ class DFlashBlockPenaltyState(msgspec.Struct, frozen=True):
         """Fold an owned pending suffix into this temporary forward snapshot."""
         k = tokens.shape[1]
         valid = torch.arange(k, device=tokens.device)[None, :] < num_valid[:, None]
-        # Redirect padding to a valid id even when graph outputs use -1 tails.
-        ids = torch.where(valid, tokens, tokens[:, :1])
+        vocab_size = self.additive_base.shape[1]
+        invalid = valid & ((tokens < 0) | (tokens >= vocab_size))
+        # CPU result handling retires invalid output rows and discards their
+        # next overlap result. Keep those rows out of this temporary snapshot
+        # without changing the tokens or the CPU's retained-prefix policy.
+        num_valid = torch.where(invalid.any(dim=1), 0, num_valid)
         any_valid = (num_valid > 0)[:, None]
+        valid = valid & any_valid
+        # Redirect padding to a valid id even when graph outputs use -1 tails.
+        ids = torch.where(valid, tokens, tokens[:, :1].clamp(0, vocab_size - 1))
         if self.frequency_penalties is not None:
             self.additive_base.scatter_add_(
                 1, ids, -self.frequency_penalties.expand(-1, k) * valid

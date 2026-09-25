@@ -5454,11 +5454,12 @@ class Scheduler(
                     idx += 1
                     continue
                 self._prepare_queue_abort(req, recv_req)
-                self._release_dropped_waiting_req_mm_inputs(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req, finished_reason=req.finished_reason.to_json()),
                     req,
                 )
+                # Keep session and media ownership while a failed send is retryable.
+                self._release_dropped_waiting_req_mm_inputs(req)
                 held_rebootstrap.pop(idx)
 
             # Abort requests whose KV is already backed up for retraction.

@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     Req,
     release_req,
@@ -49,6 +51,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -1401,6 +1404,105 @@ class TestSessionQueueAbort(CustomTestCase):
         )
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         self._assert_idle(observer, checker)
+
+    def test_held_rebootstrap_send_failure_preserves_ownership_until_retry(self):
+        for abort_all in (False, True):
+            with self.subTest(abort_all=abort_all):
+                (
+                    _server_args,
+                    cache,
+                    allocator,
+                    req_to_token_pool,
+                    observer,
+                    checker,
+                    session,
+                ) = self._setup_first_turn()
+                req = session.create_req(_recv("held", [32, 33]), None, VOCAB_SIZE)
+                req.init_next_round_input(cache)
+                _prefill(req, cache, allocator, req_to_token_pool)
+                release_req(
+                    req=req,
+                    remaing_req_count=1,
+                    req_to_token_pool=req_to_token_pool,
+                    token_to_kv_pool_allocator=allocator,
+                    tree_cache=cache,
+                    hisparse_coordinator=None,
+                    offload_kv=False,
+                )
+                self.assertFalse(req.kv.holds_kv)
+                self.assertEqual(session._inflight_rid, req.rid)
+                self._assert_idle(observer, checker)
+
+                earlier = Req(
+                    rid="earlier",
+                    origin_input_text="",
+                    origin_input_ids=array("q", [1, 2]),
+                    sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
+                    vocab_size=VOCAB_SIZE,
+                )
+                proxies = []
+                items = []
+                for owned_req in (earlier, req):
+                    proxy = CudaIpcTensorTransportProxy.__new__(
+                        CudaIpcTensorTransportProxy
+                    )
+                    proxy.total_consumer_count = 1
+                    proxy.release_without_reconstruction = Mock()
+                    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+                    owned_req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+                    proxies.append(proxy)
+                    items.append(item)
+
+                scheduler = _scheduler_stub(cache)
+                scheduler.disaggregation_mode = DisaggregationMode.DECODE
+                held = [earlier, req]
+                scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+                    queue=[], retracted_queue=[], held_rebootstrap_reqs=held
+                )
+                scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+                send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+                send_output.side_effect = (
+                    [None, RuntimeError("ipc"), None]
+                    if abort_all
+                    else [RuntimeError("ipc"), None]
+                )
+                abort = AbortReq(rid="" if abort_all else req.rid, abort_all=abort_all)
+
+                with self.assertRaisesRegex(RuntimeError, "ipc"):
+                    scheduler.abort_request(abort)
+                self.assertEqual(held, [req] if abort_all else [earlier, req])
+                self.assertEqual(session._inflight_rid, req.rid)
+                self.assertIs(items[1].feature, proxies[1])
+                proxies[1].release_without_reconstruction.assert_not_called()
+                self.assertEqual(
+                    proxies[0].release_without_reconstruction.call_count,
+                    int(abort_all),
+                )
+                with patch(
+                    "sglang.srt.managers.schedule_batch.get_parallel",
+                    return_value=SimpleNamespace(tp_rank=0),
+                ):
+                    following = session.create_req(
+                        _recv("following", [99]), None, VOCAB_SIZE
+                    )
+                self.assertIsInstance(following.to_finish, FINISH_ABORT)
+                self.assertEqual(session._inflight_rid, req.rid)
+
+                scheduler.abort_request(abort)
+                self.assertEqual(held, [] if abort_all else [earlier])
+                self.assertIsNone(session._inflight_rid)
+                self.assertIsNone(items[1].feature)
+                proxies[1].release_without_reconstruction.assert_called_once_with(1)
+                self.assertEqual(
+                    proxies[0].release_without_reconstruction.call_count,
+                    int(abort_all),
+                )
+                self.assertEqual(send_output.call_count, 3 if abort_all else 2)
+                self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+                resumed = session.create_req(_recv("resumed", [100]), None, VOCAB_SIZE)
+                self.assertIsNone(resumed.to_finish)
+                session.abort_req(resumed.rid)
+                self._assert_idle(observer, checker)
 
     def test_dllm_queue_abort_stamps_finish_abort_and_clears_session(self):
         (

@@ -3296,6 +3296,7 @@ class Scheduler(
                     "status_code",
                     HTTPStatus.SERVICE_UNAVAILABLE if recv_req.abort_message else None,
                 ),
+                err_type=reason.get("err_type"),
             )
 
     def retire_unadmitted_request(self, req: Req) -> None:

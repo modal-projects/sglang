@@ -1620,6 +1620,86 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertFalse(session.has_unfinished_request())
         send_output.assert_called_once()
 
+    def test_queued_abort_preserves_error_metadata_and_prior_reason(self):
+        from sglang.srt.dllm.mixin.scheduler import DllmManager
+
+        cases = [
+            (queue, prior)
+            for queue in ("waiting", "held", "retracted", "dllm")
+            for prior in ("fresh", "deferred", "terminal")
+            if (queue, prior) != ("dllm", "terminal")
+        ]
+        for queue, prior in cases:
+            with self.subTest(queue=queue, prior=prior):
+                (
+                    _server_args,
+                    cache,
+                    allocator,
+                    req_to_token_pool,
+                    observer,
+                    checker,
+                    session,
+                ) = self._setup_first_turn()
+                req = session.create_req(_recv("turn-2", [32, 33]), None, VOCAB_SIZE)
+                req.init_next_round_input(cache)
+                scheduler = _scheduler_stub(cache)
+                override = get_context().override_server_args(
+                    disaggregation_decode_retraction_backup="cpu_tensor"
+                )
+                override.install()
+                try:
+                    if queue in ("held", "retracted"):
+                        release_req(
+                            req=req,
+                            remaing_req_count=1,
+                            req_to_token_pool=req_to_token_pool,
+                            token_to_kv_pool_allocator=allocator,
+                            tree_cache=cache,
+                            hisparse_coordinator=None,
+                            offload_kv=False,
+                        )
+                        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+                        if queue == "retracted":
+                            req.kv.retraction_backup = RetractionBackup(
+                                cpu_tensors=torch.empty(0)
+                            )
+                        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+                            queue=[],
+                            held_rebootstrap_reqs=[req] if queue == "held" else [],
+                            retracted_queue=[req] if queue == "retracted" else [],
+                        )
+                        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+                            queue=[]
+                        )
+                    elif queue == "dllm":
+                        scheduler.dllm_config = object()
+                        scheduler.dllm_manager = DllmManager()
+                        scheduler.dllm_manager.staging_queue = [req]
+                    else:
+                        scheduler.waiting_queue = [req]
+
+                    incoming = FINISH_ABORT("supplied error", 422, "SuppliedError")
+                    existing = FINISH_ABORT("existing error", 409, "ExistingError")
+                    if prior == "terminal":
+                        req.finished_reason = existing
+                    elif prior == "deferred":
+                        req.to_finish = existing
+                    expected = incoming if prior == "fresh" else existing
+                    scheduler.abort_request(
+                        AbortReq(rid=req.rid, finished_reason=incoming.to_json())
+                    )
+
+                    self.assertEqual(req.finished_reason.to_json(), expected.to_json())
+                    sender = scheduler.ipc_channels.send_to_tokenizer.send_output
+                    sender.assert_called_once()
+                    self.assertEqual(
+                        sender.call_args.args[0].finished_reason, expected.to_json()
+                    )
+                    self.assertFalse(session.has_unfinished_request())
+                    self._assert_idle(observer, checker)
+                finally:
+                    override.restore()
+
     def test_dllm_deferred_abort_keeps_timeout_reason(self):
         """A running-timeout abort deferred for a pending overlap result must
         keep its message + 503 on to_finish; a bare FINISH_ABORT would stream

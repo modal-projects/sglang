@@ -1689,11 +1689,11 @@ def setup_state_kv_args(
             )
 
 
-def prepare_abort(req: Req, error_message: str, status_code=None):
+def prepare_abort(req: Req, error_message: str, status_code=None, err_type=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finished_reason = FINISH_ABORT(error_message, status_code, err_type)
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

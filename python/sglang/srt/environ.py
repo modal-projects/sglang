@@ -1048,6 +1048,7 @@ class Envs:
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK = EnvBool(False)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # Split TRTLLM-GEN decode attention into sorted, equal-size request groups.
     # One preserves the default single-call path; values above one are useful

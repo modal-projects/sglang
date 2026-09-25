@@ -14,6 +14,9 @@ import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -91,6 +94,9 @@ TRTLLM_BLOCK_CONSTRAINT = 128
 
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
 
+# Keep ordinary preparation for small materialized prefix chunks.
+_MIN_FUSED_PREFIX_KV_TOKENS = 32 * 1024
+
 
 def _multi_ctas_kv_counter_bytes(
     device: torch.device, num_q_heads: int, batch_size: int
@@ -119,32 +125,35 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
     return torch.zeros(required_bytes, dtype=torch.uint8, device=device)
 
 
+def _layer_kv_scales(layer: RadixAttention) -> tuple[float, float]:
+    return (
+        1.0 if layer.k_scale_float is None else layer.k_scale_float,
+        1.0 if layer.v_scale_float is None else layer.v_scale_float,
+    )
+
+
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
+    k_scale, v_scale = _layer_kv_scales(layer)
 
-    k_scale = getattr(layer, "k_scale_float", None)
-    if k_scale is None:
-        k_scale = 1.0
-    if k_scale != 1.0:
-        assert hasattr(layer, "k_scale"), "k_scale is not set"
-        k_2d, _ = scaled_fp8_quant(
-            k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
-        )
-        k = k_2d.reshape(k.shape)
-    else:
-        k = k.to(torch.float8_e4m3fn)
+    # Packed prefix K/V already include the checkpoint scales; retain their descales.
+    if k.dtype != torch.float8_e4m3fn:
+        if k_scale != 1.0:
+            k_2d, _ = scaled_fp8_quant(
+                k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
+            )
+            k = k_2d.reshape(k.shape)
+        else:
+            k = k.to(torch.float8_e4m3fn)
 
-    v_scale = getattr(layer, "v_scale_float", None)
-    if v_scale is None:
-        v_scale = 1.0
-    if v_scale != 1.0:
-        assert hasattr(layer, "v_scale"), "v_scale is not set"
-        v_2d, _ = scaled_fp8_quant(
-            v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
-        )
-        v = v_2d.reshape(v.shape)
-    else:
-        v = v.to(torch.float8_e4m3fn)
+    if v.dtype != torch.float8_e4m3fn:
+        if v_scale != 1.0:
+            v_2d, _ = scaled_fp8_quant(
+                v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
+            )
+            v = v_2d.reshape(v.shape)
+        else:
+            v = v.to(torch.float8_e4m3fn)
 
     return q, k, v, k_scale, v_scale
 
@@ -1131,6 +1140,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out, lse = result
             return out, lse_log2_to_ln(lse)
         return result
+
+    def pack_prefix_chunk_kv(
+        self,
+        layer: RadixAttention,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Pack prefix K/V with checkpoint scaling, or return None for ordinary packing."""
+        if (
+            not envs.SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.get()
+            or self.data_type != torch.float8_e4m3fn
+            or k_nope.shape[0] < _MIN_FUSED_PREFIX_KV_TOKENS
+        ):
+            return None
+        head_dims = (k_nope.shape[-1], k_pe.shape[-1], v.shape[-1])
+        if k_nope.dtype not in (torch.bfloat16, torch.float16) or any(
+            dim <= 0 or dim & (dim - 1) for dim in head_dims
+        ):
+            return None
+        k_scale, v_scale = _layer_kv_scales(layer)
+        return mla_kv_pack_quantize_fp8(
+            k_nope,
+            k_pe,
+            v,
+            k_scale_inv=1.0 / k_scale,
+            v_scale_inv=1.0 / v_scale,
+            enable_pdl=_ENABLE_PDL,
+        )
 
     def _set_kv_and_concat_q_fused(
         self,

@@ -448,6 +448,7 @@ class DeepseekMHAForwardMixin:
         kv = self.kv_b_proj(kv_a_normed)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         prefix_k, prefix_v = backend.pack_prefix_chunk_kv(
+            self.attn_mha,
             kv[..., : self.qk_nope_head_dim],
             k_pe,
             kv[..., self.qk_nope_head_dim :],
@@ -472,12 +473,16 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        # Unit-scale FP8 attention still projects its cached latents in BF16.
         from sglang.srt.layers.attention.merge_state import merge_state
 
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
-        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        kv_a_dtype = (
+            torch.bfloat16
+            if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else q.dtype
+        )
         get_mla_kv_buffer = (
             self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer
         )
@@ -499,7 +504,9 @@ class DeepseekMHAForwardMixin:
             )
             k_nope = kv[..., : self.qk_nope_head_dim]
             v_dense = kv[..., self.qk_nope_head_dim :]
-            packed_prefix_k, packed_prefix_v = pack_fn(k_nope, k_pe, v_dense)
+            packed_prefix_k, packed_prefix_v = pack_fn(
+                self.attn_mha, k_nope, k_pe, v_dense
+            )
             del kv_a_normed, k_pe, kv, k_nope, v_dense
 
         assert forward_batch.num_prefix_chunks is not None
@@ -533,8 +540,13 @@ class DeepseekMHAForwardMixin:
                 v_dense = kv[..., self.qk_nope_head_dim :]
                 k_nope = kv[..., : self.qk_nope_head_dim]
 
-                if pack_fn is not None:
-                    k, v = pack_fn(k_nope, k_pe, v_dense)
+                packed_kv = (
+                    pack_fn(self.attn_mha, k_nope, k_pe, v_dense)
+                    if pack_fn is not None
+                    else None
+                )
+                if packed_kv is not None:
+                    k, v = packed_kv
                 else:
                     v = v_dense
                     k = torch.empty(

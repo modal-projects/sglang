@@ -271,8 +271,13 @@ def _selector_walk_kernel(
             tl.float32
         )
         if greedy:
-            best = tl.max(scores, axis=0)
-            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            # torch.argmax selects the first NaN, or otherwise the first maximum.
+            # Keep the selected index in this row even when every score is NaN.
+            nan = scores != scores
+            first_nan = tl.min(tl.where(nan, offsets, top_k), axis=0)
+            best = tl.max(tl.where(nan, -float("inf"), scores), axis=0)
+            first_max = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            index = tl.where(first_nan < top_k, first_nan, first_max)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
             scaled = scores / temperature

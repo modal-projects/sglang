@@ -17,6 +17,17 @@ import msgspec
 NodeId = int
 
 
+class PrefixRef(msgspec.Struct, frozen=True):
+    """Opaque, core-owned reference to captured prefix generations.
+
+    The handle owns metadata, not KV buffers. Release it after the last delayed
+    consumer. Its fields are private to the TreeCore implementations.
+    """
+
+    _owner: object
+    _id: int
+
+
 class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
@@ -165,6 +176,39 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""
+        ...
+
+    @abstractmethod
+    def capture_prefix_ref(self, node_id: NodeId, end: int) -> PrefixRef:
+        """Capture original generations in [0, end) along this node's prefix.
+
+        End and invalidation start use page-aligned logical radix-key units
+        (bigram atoms for an eagle tree). End cannot exceed the node's depth.
+        Capture and invalidate require a completed insert transaction.
+        """
+        ...
+
+    @abstractmethod
+    def invalidate_prefix_ref(
+        self, ref: PrefixRef, start: int
+    ) -> list[CacheAction | ComponentAction]:
+        """Retire captured spans after start and their dependent descendants.
+
+        Drain returned split actions before another controller operation. Old
+        owners and transfers retain their buffers until normal release/eviction.
+        Deleted, released and reset receipts do nothing; other-core refs raise.
+        This changes local lookup only, not external persistent storage.
+        """
+        ...
+
+    @abstractmethod
+    def release_prefix_ref(self, ref: PrefixRef) -> None:
+        """Idempotently release the receipt's metadata, without freeing KV."""
+        ...
+
+    @abstractmethod
+    def is_invalidated(self, node_id: NodeId) -> bool:
+        """Whether the generation is retired or its node no longer exists."""
         ...
 
     @abstractmethod

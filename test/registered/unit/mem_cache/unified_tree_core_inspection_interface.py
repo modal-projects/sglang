@@ -35,6 +35,11 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     # ==== Read-only inspection ====
 
     @abstractmethod
+    def prefix_ref_counts(self) -> tuple[int, int]:
+        """Active receipts and captured fragments, with reverse-index validation."""
+        ...
+
+    @abstractmethod
     def contains_node(self, node_id: NodeId) -> bool:
         """Whether the node id is live in the tree."""
         ...

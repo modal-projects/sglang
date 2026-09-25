@@ -7,8 +7,147 @@ use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds};
 
+#[test]
+fn prefix_receipt_follows_split_survivor_after_suffix_slot_reuse() {
+    let mut tc = core();
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params(&key, &[10, 11, 12, 13]));
+    let old = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let receipt = tc.capture_prefix_ref(old, 4).unwrap();
+    let old_idx = tc.arena.resolve(old).unwrap();
+    let (prefix_idx, action) = tc.split_node_(old_idx, 2);
+    assert!(action.is_none());
+    let prefix = tc.arena.node(prefix_idx).id;
+    assert_eq!(tc.prefix_refs.counts(), (1, 2));
+    tc.sanity_check(&[], &[]);
+    let (_, freed) = tc.evict_device_leaf(old, false).unwrap();
+    assert!(freed.device_frees[&FULL][0].equal(&Tensor::from_slice(&[12_i64, 13])));
+    assert_eq!(tc.prefix_refs.counts(), (1, 1));
+    tc.sanity_check(&[], &[]);
+
+    tc.invalidate_prefix_ref(receipt, 0).unwrap();
+    assert!(tc.is_invalidated(prefix));
+    assert!(tc.is_invalidated(old));
+    tc.insert(&insert_params(&key, &[20, 21, 22, 23]));
+    let replacement = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    assert_eq!(tc.arena.resolve(replacement).unwrap(), old_idx);
+    assert_ne!(replacement, old);
+    tc.invalidate_prefix_ref(receipt, 0).unwrap();
+    assert!(!tc.is_invalidated(replacement));
+    assert!(
+        tc.match_prefix(&match_params(&key))
+            .device_indices
+            .equal(&Tensor::from_slice(&[20_i64, 21, 22, 23]))
+    );
+    tc.evict_device_leaf(prefix, false).unwrap();
+    assert_eq!(tc.prefix_refs.counts(), (1, 0));
+    tc.release_prefix_ref(receipt);
+    assert_eq!(tc.prefix_refs.counts(), (0, 0));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn prefix_receipts_never_alias_other_cores_or_reset_generations() {
+    let mut first = core();
+    let mut second = core();
+    let key = vec![1, 2];
+    first.insert(&insert_params(&key, &[10, 11]));
+    second.insert(&insert_params(&key, &[20, 21]));
+    let first_node = first.match_prefix(&match_params(&key)).best_match_node_id;
+    let second_node = second.match_prefix(&match_params(&key)).best_match_node_id;
+    let first_ref = first.capture_prefix_ref(first_node, 2).unwrap();
+    let second_ref = second.capture_prefix_ref(second_node, 2).unwrap();
+    assert_ne!(first_ref, second_ref);
+    second.invalidate_prefix_ref(first_ref, 0).unwrap();
+    second.release_prefix_ref(first_ref);
+    assert!(!second.is_invalidated(second_node));
+    assert_eq!(second.prefix_refs.counts(), (1, 1));
+    first.reset();
+    first.insert(&insert_params(&key, &[30, 31]));
+    let replacement = first.match_prefix(&match_params(&key)).best_match_node_id;
+    let replacement_ref = first.capture_prefix_ref(replacement, 2).unwrap();
+    first.invalidate_prefix_ref(first_ref, 0).unwrap();
+    first.release_prefix_ref(first_ref);
+    assert!(!first.is_invalidated(replacement));
+    first.release_prefix_ref(replacement_ref);
+    second.release_prefix_ref(second_ref);
+    assert_eq!(first.prefix_refs.counts(), (0, 0));
+    assert_eq!(second.prefix_refs.counts(), (0, 0));
+    first.sanity_check(&[], &[]);
+    second.sanity_check(&[], &[]);
+}
+
+#[test]
+fn prefix_receipt_fragments_are_bounded_and_removed_on_release() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let key = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    tc.insert(&insert_params(&key, &[10, 11, 12, 13, 14, 15, 16, 17]));
+    let old = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let receipts: Vec<_> = [2, 4, 8]
+        .into_iter()
+        .map(|end| tc.capture_prefix_ref(old, end).unwrap())
+        .collect();
+    for end in [6, 4, 2] {
+        tc.match_prefix(&match_params(&key[..end].to_vec()));
+        assert!(tc.prefix_refs.counts().1 <= (2 + 4 + 8) / 2);
+        tc.sanity_check(&[], &[]);
+    }
+    for receipt in receipts {
+        tc.release_prefix_ref(receipt);
+        tc.release_prefix_ref(receipt);
+    }
+    assert_eq!(tc.prefix_refs.counts(), (0, 0));
+    assert_eq!(tc.total_size(), (8, 0));
+    tc.sanity_check(&[], &[]);
+}
+
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
+}
+
+#[test]
+fn splitting_a_retired_generation_preserves_its_lock_and_live_replacement() {
+    let mut tc = core();
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params(&key, &[10, 11, 12, 13]));
+    let old = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let receipt = tc.capture_prefix_ref(old, 4).unwrap();
+    let lock = tc.inc_lock_ref(old, ComponentSet::EMPTY).unwrap();
+    tc.invalidate_prefix_ref(receipt, 0).unwrap();
+    tc.insert(&insert_params(&key, &[20, 21, 22, 23]));
+    let replacement = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    let old_idx = tc.arena.resolve(old).unwrap();
+    let (prefix, action) = tc.split_node_(old_idx, 2);
+    assert!(action.is_none());
+    assert!(tc.arena.node(prefix).retired);
+    assert!(tc.is_invalidated(old));
+    assert!(!tc.is_invalidated(replacement));
+    assert_eq!(tc.full_protected_size(), 4);
+    tc.sanity_check(&[], &[]);
+    tc.dec_lock_ref(
+        old,
+        &DecLockRefParams {
+            node_id: lock.node_id,
+            skipped_lock_components: lock.skipped_lock_components,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(tc.full_protected_size(), 0);
+    assert_eq!(
+        tc.match_prefix(&match_params(&key)).best_match_node_id,
+        replacement
+    );
+    tc.release_prefix_ref(receipt);
+    assert_eq!(tc.prefix_refs.counts(), (0, 0));
+    tc.sanity_check(&[], &[]);
 }
 
 // Records every refresh_lru dispatch; unrelated hooks stay unimplemented.
@@ -934,7 +1073,7 @@ fn split_wires_the_new_node_between_parent_and_child() {
         tc.arena
             .node(new_node)
             .children
-            .get(&(KeyNamespace::default(), vec![3])),
+            .get(&ChildEdge::Live(KeyNamespace::default(), vec![3])),
         Some(&c)
     );
     assert_eq!(tc.arena.node(new_node).parent(), root);
@@ -4443,7 +4582,7 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
         .arena
         .resolve(result.best_match_node_id)
         .expect("live test node");
-    let child = tc.arena.node(parent).children[&(KeyNamespace::default(), vec![3])];
+    let child = tc.arena.node(parent).children[&ChildEdge::Live(KeyNamespace::default(), vec![3])];
     {
         let parent_node = tc.arena.node(parent);
         assert_eq!(parent_node.key, vec![1, 2]);
@@ -7719,10 +7858,13 @@ fn sanity_check_detects_a_reverse_map_mismatch() {
     let parent = tc.arena.node(leaf_idx3).parent();
     let key = tc.arena.node(leaf_idx3).key.child_key(1);
     let parent_node = tc.arena.node_mut(parent);
-    parent_node.children.remove(&(KeyNamespace::default(), key));
     parent_node
         .children
-        .insert((KeyNamespace::default(), vec![99]), leaf_idx3);
+        .remove(&ChildEdge::Live(KeyNamespace::default(), key));
+    parent_node.children.insert(
+        ChildEdge::Live(KeyNamespace::default(), vec![99]),
+        leaf_idx3,
+    );
     tc.sanity_check(&[], &[]);
 }
 
@@ -7802,7 +7944,7 @@ fn cyclic_child_map_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.arena
         .node_mut(tc.arena.resolve(leaf).expect("live test node"))
         .children
-        .insert((KeyNamespace::default(), vec![50]), parent);
+        .insert(ChildEdge::Live(KeyNamespace::default(), vec![50]), parent);
     tc
 }
 

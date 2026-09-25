@@ -73,6 +73,7 @@ fn node_access_error(error: NodeAccessError) -> PyErr {
 fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
     match error {
         TreeCoreRuntimeError::NodeAccess(error) => node_access_error(error),
+        TreeCoreRuntimeError::InvalidPrefixRefBoundary => PyValueError::new_err(error.to_string()),
         error => PyRuntimeError::new_err(error.to_string()),
     }
 }
@@ -2439,6 +2440,30 @@ macro_rules! tree_core_binding {
             /// Drop the entire tree and reinitialize empty state.
             fn reset(&self, py: Python<'_>) {
                 self.inner.reset(py)
+            }
+
+            fn capture_prefix_ref(&self, py: Python<'_>, node_id: NodeId, end: usize) -> PyResult<usize> {
+                py.allow_threads(|| self.inner.core().capture_prefix_ref(node_id, end))
+                    .map_err(tree_core_runtime_error)
+            }
+
+            fn invalidate_prefix_ref(&self, py: Python<'_>, receipt: usize, start: usize) -> PyResult<Py<PyList>> {
+                let actions = py.allow_threads(|| self.inner.core().invalidate_prefix_ref(receipt, start))
+                    .map_err(tree_core_runtime_error)?;
+                cache_actions_to_py(py, actions)
+            }
+
+            fn release_prefix_ref(&self, py: Python<'_>, receipt: usize) {
+                py.allow_threads(|| self.inner.core().release_prefix_ref(receipt));
+            }
+
+            fn is_invalidated(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                py.allow_threads(|| self.inner.core().is_invalidated(node_id))
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_prefix_ref_counts(&self, py: Python<'_>) -> (usize, usize) {
+                py.allow_threads(|| self.inner.core().inspect_prefix_ref_counts())
             }
 
             /// Match a key against the tree.

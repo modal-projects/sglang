@@ -17,10 +17,11 @@ use crate::components::{
 use crate::node::EvictableNodeSet;
 use crate::node::Node;
 use crate::node::NodeArena;
-use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
+use crate::node::{ChildEdge, ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
+use crate::prefix_ref::{PrefixRef, PrefixRefRegistry};
 use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
 
@@ -569,6 +570,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
     ongoing_insert_walk_state: Option<InsertWalkState<K>>,
+    prefix_refs: PrefixRefRegistry,
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
@@ -743,6 +745,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
+            prefix_refs: PrefixRefRegistry::default(),
         };
         for ct in &component_types {
             let component: Arc<dyn TreeComponent<K> + Send + Sync> = match ct {
@@ -758,6 +761,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
     /// match result.
     pub fn reset(&mut self) {
+        self.prefix_refs.clear();
         self.arena.reset();
         self.component_states = Default::default();
         self.evictable_device_leaves = EvictableNodeSet::new();
@@ -768,6 +772,109 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.full_evict_device_heap.clear();
         self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
+    }
+
+    fn check_prefix_ref_boundary(&self, boundary: usize) -> Result<(), TreeCoreRuntimeError> {
+        if self.ongoing_insert_walk_state.is_some() {
+            return Err(TreeCoreRuntimeError::PrefixRefDuringInsert);
+        }
+        if !boundary.is_multiple_of(self.page_size) {
+            return Err(TreeCoreRuntimeError::InvalidPrefixRefBoundary);
+        }
+        Ok(())
+    }
+
+    pub fn capture_prefix_ref(
+        &mut self,
+        node_id: NodeId,
+        end: usize,
+    ) -> Result<PrefixRef, TreeCoreRuntimeError> {
+        self.check_prefix_ref_boundary(end)?;
+        let mut current = self.arena.resolve(node_id)?;
+        let mut path = Vec::new();
+        let mut depth = 0;
+        while current != self.arena.root() {
+            let node = self.arena.node(current);
+            depth += node.key.atom_len();
+            path.push(current);
+            current = node.parent();
+        }
+        if end > depth {
+            return Err(TreeCoreRuntimeError::InvalidPrefixRefBoundary);
+        }
+        let mut start = 0;
+        let mut spans = HashMap::new();
+        for idx in path.into_iter().rev() {
+            if start >= end {
+                break;
+            }
+            let node = self.arena.node(idx);
+            spans.insert(node.id, (start, end.min(start + node.key.atom_len())));
+            start += node.key.atom_len();
+        }
+        Ok(self.prefix_refs.capture(spans))
+    }
+
+    pub fn invalidate_prefix_ref(
+        &mut self,
+        receipt: PrefixRef,
+        start: usize,
+    ) -> Result<Vec<CacheAction>, TreeCoreRuntimeError> {
+        self.check_prefix_ref_boundary(start)?;
+        let mut actions = Vec::new();
+        for (span_start, node_id) in self.prefix_refs.overlapping(receipt, start) {
+            let Ok(idx) = self.arena.resolve(node_id) else {
+                continue;
+            };
+            if self.arena.node(idx).retired {
+                continue;
+            }
+            if start > span_start {
+                let (_, action) = self.split_node_(idx, start - span_start);
+                actions.extend(action);
+            }
+            self.retire_subtree_(idx);
+        }
+        Ok(actions)
+    }
+
+    fn retire_subtree_(&mut self, idx: NodeIdx_) {
+        let mut pending = vec![idx];
+        while let Some(idx) = pending.pop() {
+            let node = self.arena.node(idx);
+            pending.extend(node.children.values().copied());
+            if node.retired {
+                continue;
+            }
+            let parent = node.parent();
+            let edge = node.edge_key(self.page_size);
+            let id = node.id;
+            let published_tiers = node.published_kv_tiers;
+            for medium in [StorageMedium::Gpu, StorageMedium::Cpu] {
+                if published_tiers & medium.publication_bit() != 0 {
+                    self.record_remove_event_(idx, medium);
+                }
+            }
+            assert_eq!(
+                self.arena.node_mut(parent).children.remove(&edge),
+                Some(idx)
+            );
+            self.arena.node_mut(idx).retired = true;
+            self.arena
+                .node_mut(parent)
+                .children
+                .insert(ChildEdge::Retired(id), idx);
+        }
+    }
+
+    pub fn release_prefix_ref(&mut self, receipt: PrefixRef) {
+        self.prefix_refs.release(receipt);
+    }
+
+    pub fn is_invalidated(&self, node_id: NodeId) -> bool {
+        self.arena
+            .resolve(node_id)
+            .map_or(true, |idx| self.arena.node(idx).retired)
     }
 
     /// Create a keyed, parented node not yet in its parent's child map;
@@ -807,7 +914,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         } else {
             self.arena.node(parent_id).namespace.clone()
         };
+        let retired = self.arena.node(parent_id).retired;
         let new_node = self.arena.node_mut(new_node_id);
+        new_node.retired = retired;
         new_node.key = key;
         new_node.parent = Some(parent_id);
         new_node.namespace = ns;
@@ -1865,6 +1974,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // The new node takes the child's prefix, link position, and stats.
         let child = self.arena.node(child_id);
         let parent_id = child.parent();
+        let old_edge = child.edge_key(page_size);
+        let retired = child.retired;
+        let published_tiers = child.published_kv_tiers;
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
         let (key_head, key_tail) = child.key.split_at(split_len);
@@ -1878,15 +1990,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             Some(child.creation_counter),
             child_namespace.as_ref(),
         );
-        self.arena.node_mut(new_node_id).children.insert(
-            (child_namespace.clone(), key_tail.child_key(page_size)),
-            child_id,
-        );
+        self.arena.node_mut(new_node_id).retired = retired;
+        self.arena.node_mut(new_node_id).published_kv_tiers = published_tiers;
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
         child.key = key_tail;
+        let child_edge = child.edge_key(page_size);
+        self.arena
+            .node_mut(new_node_id)
+            .children
+            .insert(child_edge, child_id);
+        self.prefix_refs.split(
+            self.arena.node(child_id).id,
+            self.arena.node(new_node_id).id,
+            split_len,
+        );
+        let child = self.arena.node_mut(child_id);
         let (new_node_hash, child_hash) =
             crate::node::split_node_hash_value(child.hash_value.take(), split_len, self.page_size);
         child.hash_value = child_hash;
@@ -1906,13 +2027,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let component = Arc::clone(&self.components[i]);
             component.redistribute_on_node_split(self, new_node_id, child_id);
         }
-        let replaced = self
-            .arena
-            .insert_child_edge(parent_id, parent_map_key, new_node_id);
+        let replaced = self.arena.node_mut(parent_id).children.remove(&old_edge);
         assert_eq!(
             replaced,
             Some(child_id),
             "split_node_: the parent's page entry must map to the split child"
+        );
+        assert!(
+            self.arena
+                .insert_child_edge(parent_id, parent_map_key, new_node_id)
+                .is_none()
         );
 
         // Preserve the load-back pin across a split.
@@ -2629,6 +2753,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Unlink a leaf from its parent.
     pub fn remove_leaf_from_parent_(&mut self, node_id: NodeIdx_) {
+        self.prefix_refs.remove(self.arena.node(node_id).id);
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
         self.namespaced_event_hashes
@@ -2938,7 +3063,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         medium: StorageMedium,
         session_id: Option<&str>,
     ) {
-        if !self.enable_kv_cache_events {
+        if !self.enable_kv_cache_events || self.arena.node(node_id).retired {
             return;
         }
         if self.arena.node(node_id).hash_value.is_none() {
@@ -3006,11 +3131,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         for event in events {
             self.enqueue_kv_event_(event);
         }
+        self.arena.node_mut(node_id).published_kv_tiers |= medium.publication_bit();
     }
 
     /// Queue one BlockRemoved carrying all the node's page hashes; hashes lazily if needed.
     fn record_remove_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
-        if !self.enable_kv_cache_events {
+        if !self.enable_kv_cache_events || self.arena.node(node_id).retired {
             return;
         }
         if self.arena.node(node_id).hash_value.is_none() {
@@ -3040,6 +3166,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 medium,
             });
         }
+        self.arena.node_mut(node_id).published_kv_tiers &= !medium.publication_bit();
     }
 
     /// Queue the all-cleared marker.
@@ -3339,6 +3466,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
+        if self.arena.node(node_id).retired {
+            return Ok((
+                PoolTransfer {
+                    name: PoolName::Kv,
+                    host_indices: Some(Tensor::empty([0], (Kind::Int64, tch::Device::Cpu))),
+                    nodes_to_load: Some(Vec::new()),
+                    ..Default::default()
+                },
+                HashMap::new(),
+            ));
+        }
         // Component hooks take primitives, not Req: extract its fields here.
         let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
         let mut kv_transfers = self
@@ -4104,7 +4242,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         // Parent ↔ child bidirectional consistency
         for &node_id in &all_nodes {
-            for ((edge_namespace, edge_key), &child_id) in &self.arena.node(node_id).children {
+            for (edge, &child_id) in &self.arena.node(node_id).children {
                 let child = self.arena.node(child_id);
                 let child_parent = child.try_parent();
                 if child_parent != Some(node_id) {
@@ -4121,15 +4259,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     continue;
                 }
                 // The edge key must be the child's own namespaced child key.
-                if *edge_key != child.key.child_key(self.page_size) {
+                if *edge != child.edge_key(self.page_size) {
                     errors.push(format!(
                         "[Tree] child {child_id} not mapped under its own child key"
                     ));
                 }
-                if *edge_namespace != child.namespace {
+                if self.arena.node(node_id).retired && !child.retired {
                     errors.push(format!(
-                        "[Tree] child {child_id} namespace {:?} filed under {edge_namespace:?}",
-                        child.namespace
+                        "[Tree] live child {child_id} under retired parent {node_id}"
                     ));
                 }
                 // Namespaces partition at the root; below it children inherit.
@@ -4506,6 +4643,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 #[cfg(any(test, feature = "inspection"))]
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
     // Test-only inspection support for the backend-neutral Python suite.
+
+    pub fn inspect_prefix_ref_counts(&self) -> (usize, usize) {
+        self.prefix_refs.counts()
+    }
 
     /// Whether the external node handle is currently live.
     pub fn inspect_contains_node(&self, node_id: NodeId) -> bool {
@@ -5128,6 +5269,13 @@ pub enum StorageMedium {
 }
 
 impl StorageMedium {
+    fn publication_bit(self) -> u8 {
+        match self {
+            StorageMedium::Gpu => 1,
+            StorageMedium::Cpu => 2,
+        }
+    }
+
     /// The python StorageMedium enum value.
     pub fn as_str(self) -> &'static str {
         match self {

@@ -4596,43 +4596,63 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        # Flush async trace ops here: in overlap mode this CPU work runs while
-        # the next batch's GPU forward is in flight, giving free overlap.
-        flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
-            snapshot=snapshot,
+        is_decode_result = batch.forward_mode.is_decode()
+        is_converted_decode = (
+            batch.forward_mode.is_extend()
+            and batch.prefill_stats is None
+            and bool(batch.decoding_reqs)
         )
+        is_gap_result = batch.forward_mode.is_idle() or (
+            batch.forward_mode.is_extend() and not is_converted_decode
+        )
+        try:
+            # Flush async trace ops here: in overlap mode this CPU work runs while
+            # the next batch's GPU forward is in flight, giving free overlap.
+            flush_trace_batch(batch.reqs)
+            snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+            # Router-facing gauge on the dedicated PUB socket, reusing the
+            # snapshot above rather than walking the queues again.
+            self.load_publisher.publish_load_stat(
+                self.load_inquirer.get_loads,
+                force=batch.forward_mode.is_extend(),
+                snapshot=snapshot,
+            )
 
-        if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
-        elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
-            else:
-                self.batch_result_processor.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
-        elif batch.forward_mode.is_idle():
-            self.batch_result_processor.process_batch_result_idle(batch, result)
+            if batch.forward_mode.is_decode():
+                self.batch_result_processor.process_batch_result_decode(batch, result)
+            elif batch.forward_mode.is_extend():
+                if batch.is_dllm():
+                    self.process_batch_result_dllm(batch, result)
+                elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.process_batch_result_disagg_prefill(batch, result)
+                else:
+                    self.batch_result_processor.process_batch_result_prefill(
+                        batch, result
+                    )
+            elif batch.forward_mode.is_prebuilt():
+                self.batch_result_processor.process_batch_result_prebuilt(batch)
+            elif batch.forward_mode.is_idle():
+                self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        self._record_step_counters(batch, result)
+            self._record_step_counters(batch, result)
 
-        self.metrics_reporter.log_batch_result_stats(batch, result)
+            self.metrics_reporter.log_batch_result_stats(batch, result)
 
-        # Emit forward pass metrics (every iteration when enabled)
-        if self.enable_fpm:
-            self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+            # Emit forward pass metrics (every iteration when enabled)
+            if self.enable_fpm:
+                self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
-        self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
-        self.metrics_reporter.update_device_timer()
+            self._maybe_clear_mm_inputs(batch)
+            self.maybe_send_health_check_signal()
+            self.metrics_reporter.update_device_timer()
+        finally:
+            # Common result housekeeping follows the mode-specific reports.
+            if is_converted_decode:
+                self.metrics_reporter.mark_decode()
+            elif is_gap_result:
+                self.metrics_reporter.mark_idle()
+            elif is_decode_result:
+                self.metrics_reporter.mark_decode(count_step=False)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -4719,91 +4739,101 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
-        """Idle housekeeping: guard, check, metrics, reset, sleep."""
-        # Flush any health-check signal deferred while the engine was busy.
-        self.maybe_send_health_check_signal()
+        """Idle housekeeping: mark idle, guard, check, metrics, reset, sleep."""
+        self.metrics_reporter.mark_idle()
+        try:
+            # Flush any health-check signal deferred while the engine was busy.
+            self.maybe_send_health_check_signal()
 
-        # Publish before the fully-idle gate: a no-batch-but-not-idle stall
-        # (queues parked under KV pressure / disagg transfer) has no
-        # process_batch_result to publish the growing gauge, and gating here
-        # froze /get_loads, DP balancing, and the LoadStat for the stall. This
-        # path spins without sleeping, so a wall-clock floor bounds the
-        # O(queue) get_loads for both sinks; the fully-idle publish runs
-        # post-flush below.
-        fully_idle = self.is_fully_idle()
-        if not fully_idle:
-            self.metrics_reporter.record_scheduler_active()
-            now = time.monotonic()
-            if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
-                self._last_stall_publish_ts = now
-                snapshot = self.publish_load_snapshot(force=True)
-                self.load_publisher.publish_load_stat(
-                    self.load_inquirer.get_loads, force=True, snapshot=snapshot
-                )
-            return
-        self.metrics_reporter.record_scheduler_idle()
-
-        if self.enable_unified_memory:
-            try:
-                self.token_to_kv_pool_allocator.flush_opportunistic()
-            except Exception:
-                pass
-
-        # memory leak check (skipped for hisparse — pool counters intentionally
-        # diverge during host-backup, see _get_swa_token_info clamp).
-        # Also skipped while deferred KV releases are pending: they hold pages out
-        # of the allocator by design, so the pool is transiently below `total` and
-        # would trip the idle leak invariant. Resumes once the holds resolve.
-        deferred_pending = (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-        )
-        with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
-                has_leak, messages = self.invariant_checker._check_all_pools(
-                    self.pool_stats_observer.get_pool_stats(),
-                )
-                if has_leak:
-                    self.invariant_checker._report_leak("pool", "\n".join(messages))
-                self.invariant_checker._check_req_pool()
-                # Byte-conservation diagnostic (allocator-owned; static pools
-                # return [] — the token identity above can't see byte leaks).
-                byte_violations = (
-                    self.token_to_kv_pool_allocator.verify_byte_accounting()
-                )
-                if byte_violations:
-                    self.invariant_checker._report_leak(
-                        "pool-bytes", "\n".join(byte_violations)
+            # Publish before the fully-idle gate: a no-batch-but-not-idle stall
+            # (queues parked under KV pressure / disagg transfer) has no
+            # process_batch_result to publish the growing gauge, and gating here
+            # froze /get_loads, DP balancing, and the LoadStat for the stall. This
+            # path spins without sleeping, so a wall-clock floor bounds the
+            # O(queue) get_loads for both sinks; the fully-idle publish runs
+            # post-flush below.
+            fully_idle = self.is_fully_idle()
+            if not fully_idle:
+                self.metrics_reporter.record_scheduler_active()
+                now = time.monotonic()
+                if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
+                    self._last_stall_publish_ts = now
+                    snapshot = self.publish_load_snapshot(force=True)
+                    self.load_publisher.publish_load_stat(
+                        self.load_inquirer.get_loads, force=True, snapshot=snapshot
                     )
+                return
+            self.metrics_reporter.record_scheduler_idle()
 
-            # tree cache sanity check
-            self.invariant_checker._check_tree_cache()
+            if self.enable_unified_memory:
+                try:
+                    self.token_to_kv_pool_allocator.flush_opportunistic()
+                except Exception:
+                    pass
 
-        # metrics every 30s
-        self.metrics_reporter._maybe_log_idle_metrics()
+            # memory leak check (skipped for hisparse — pool counters intentionally
+            # diverge during host-backup, see _get_swa_token_info clamp).
+            # Also skipped while deferred KV releases are pending: they hold pages out
+            # of the allocator by design, so the pool is transiently below `total` and
+            # would trip the idle leak invariant. Resumes once the holds resolve.
+            deferred_pending = (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+            )
+            with self.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_SANITY_CHECK_CACHE
+            ):
+                if not self.enable_hisparse and not deferred_pending:
+                    has_leak, messages = self.invariant_checker._check_all_pools(
+                        self.pool_stats_observer.get_pool_stats(),
+                    )
+                    if has_leak:
+                        self.invariant_checker._report_leak("pool", "\n".join(messages))
+                    self.invariant_checker._check_req_pool()
+                    # Byte-conservation diagnostic (allocator-owned; static pools
+                    # return [] — the token identity above can't see byte leaks).
+                    byte_violations = (
+                        self.token_to_kv_pool_allocator.verify_byte_accounting()
+                    )
+                    if byte_violations:
+                        self.invariant_checker._report_leak(
+                            "pool-bytes", "\n".join(byte_violations)
+                        )
 
-        # kv event publishing
-        self.kv_events_publisher.publish_kv_events()
+                # tree cache sanity check
+                self.invariant_checker._check_tree_cache()
 
-        # reset token ratio
-        self.new_token_ratio_tracker.reset()
+            # metrics every 30s
+            self.metrics_reporter._maybe_log_idle_metrics()
 
-        # Fully-idle publish, post-flush so the gauge reflects compacted KV.
-        # Forced (immediate) so the busy->idle transition is never delayed.
-        snapshot = self.publish_load_snapshot(force=True)
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads, force=True, snapshot=snapshot
-        )
+            # kv event publishing
+            self.kv_events_publisher.publish_kv_events()
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
-        self.metrics_reporter.record_scheduler_idle()
+            # reset token ratio
+            self.new_token_ratio_tracker.reset()
+
+            # Fully-idle publish, post-flush so the gauge reflects compacted KV.
+            # Forced (immediate) so the busy->idle transition is never delayed.
+            snapshot = self.publish_load_snapshot(force=True)
+            self.load_publisher.publish_load_stat(
+                self.load_inquirer.get_loads, force=True, snapshot=snapshot
+            )
+
+            # The blocked poll belongs to the idle interval.
+            self.maybe_sleep_on_idle()
+            self.metrics_reporter.record_scheduler_idle()
+        finally:
+            self.metrics_reporter.mark_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
-        if self.is_fully_idle():
-            self.metrics_reporter.record_scheduler_idle()
-        else:
-            self.metrics_reporter.record_scheduler_active()
+        # Pause duration and its metric export belong to the gap.
+        try:
+            if self.is_fully_idle():
+                self.metrics_reporter.record_scheduler_idle()
+            else:
+                self.metrics_reporter.record_scheduler_active()
+        finally:
+            self.metrics_reporter.mark_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.

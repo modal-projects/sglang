@@ -282,6 +282,62 @@ class TestRankConsistentEncode(CustomTestCase):
                         group.flags, [[0]] if distributed and size == 2 else []
                     )
 
+    def test_forced_reencode_is_reused_by_subsequent_hits(self):
+        """Batch-dependent rounding must not leave different encodings cached."""
+        for route in ("batch", "by_item", "full"):
+            with self.subTest(route=route):
+                items = [_item(11, 2)]
+                fresh = items[0].feature
+                prior = torch.nextafter(fresh, torch.full_like(fresh, float("inf")))
+                caches = []
+                for rank in (0, 1):
+                    mm_schedule.init_mm_embedding_cache(1 << 20)
+                    cache = mm_schedule.embedding_cache
+                    caches.append(cache)
+                    if rank == 0:
+                        with patch.object(dist, "is_initialized", return_value=False):
+                            _run_route(route, items, lambda batch: prior)
+                    cache.set(
+                        99, mm_schedule.EmbeddingResult(embedding=torch.ones(1, 2))
+                    )
+
+                first_results = []
+                next_results = []
+                for rank, cache in enumerate(caches):
+                    mm_schedule.embedding_cache = cache
+                    with (
+                        patch.object(dist, "is_initialized", return_value=True),
+                        patch.object(
+                            mm_schedule,
+                            "get_parallel",
+                            return_value=_parallel(_PeerGroup([1 - rank]), rank),
+                        ),
+                    ):
+                        first_results.append(
+                            _run_route(route, items, lambda batch: fresh)
+                        )
+
+                    def unexpected_encode(batch):
+                        self.fail("A subsequent unanimous hit entered the encoder")
+
+                    with (
+                        patch.object(dist, "is_initialized", return_value=True),
+                        patch.object(
+                            mm_schedule,
+                            "get_parallel",
+                            return_value=_parallel(_PeerGroup([0]), rank),
+                        ),
+                    ):
+                        next_results.append(_run_route(route, items, unexpected_encode))
+                    self.assertTrue(torch.equal(first_results[-1], next_results[-1]))
+                    self.assertTrue(
+                        torch.equal(cache.get_single(99).embedding, torch.ones(1, 2))
+                    )
+                    self.assertEqual(
+                        cache.current_size, fresh.numel() * fresh.element_size() + 8
+                    )
+                self.assertTrue(torch.equal(next_results[0], next_results[1]))
+
     def test_dispatcher_uses_agreement_on_each_route(self):
         """Platform fallback and combined requests must retain the agreement gate."""
         for route in ("batch", "by_item", "full"):

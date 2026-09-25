@@ -276,6 +276,15 @@ def _rank_consistent_miss_hashes(
     return {k for k, f in zip(ordered_keys, flags.tolist()) if f > 0}
 
 
+def _invalidate_reencoded_cache_entries(
+    cache_keys: Set[Tuple[Optional[int], int]],
+) -> None:
+    # The cache retains existing keys; discard each physical key once before
+    # publishing any re-encodes so later hits retain the agreed result.
+    for item_hash in {cache_key[0] for cache_key in cache_keys}:
+        embedding_cache.free(item_hash, None)
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -320,6 +329,7 @@ def _get_chunked_embedding_full(
             sync_group,
             device,
         )
+        _invalidate_reencoded_cache_entries(global_misses)
         if global_misses and embedding_per_req is not None:
             logger.warning(
                 "mm embedding cache hit on this rank but miss on a peer for a "
@@ -452,6 +462,7 @@ def _batch_encode_per_image_misses(
             global_misses = _rank_consistent_miss_hashes(
                 ordered_keys, set(unique_misses), sync_group, device
             )
+            _invalidate_reencoded_cache_entries(global_misses)
             forced = [
                 k for k in ordered_keys if k in global_misses and k not in unique_misses
             ]
@@ -572,6 +583,7 @@ def _get_chunked_embedding_by_item(
         global_misses = _rank_consistent_miss_hashes(
             ordered_keys, local_misses, sync_group, device
         )
+        _invalidate_reencoded_cache_entries(global_misses)
         forced = {
             k for k in ordered_keys if k in global_misses and k not in local_misses
         }

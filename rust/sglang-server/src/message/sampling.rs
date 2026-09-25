@@ -15,6 +15,9 @@ use crate::utils::{error::Error, regex::RegexPattern};
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;
+// Keep these numeric limits aligned with Python SamplingParams.verify.
+const LOGIT_BIAS_MAX_ABS: f64 = 1e30;
+const REPETITION_PENALTY_MIN: f64 = 1e-6;
 /// `TOP_K_ALL = 1 << 30` — `top_k` sentinel for "consider the whole vocabulary".
 const TOP_K_ALL: i64 = 1 << 30;
 /// Most stop STRINGS accepted per request. The scheduler scans the decoded text
@@ -549,9 +552,10 @@ impl SamplingParams {
                 self.presence_penalty
             )));
         }
-        if !(self.repetition_penalty > 0.0 && self.repetition_penalty <= 2.0) {
+        if !(REPETITION_PENALTY_MIN..=2.0).contains(&self.repetition_penalty) {
             return Err(bad(format!(
-                "repetition_penalty must be in (0, 2], got {}",
+                "repetition_penalty must be in [{REPETITION_PENALTY_MIN:e}, 2] \
+                 (1.0 = no penalty), got {}",
                 self.repetition_penalty
             )));
         }
@@ -581,7 +585,7 @@ impl SamplingParams {
         // *range* check needs the vocab size (`None` = unknown, skip it); the key
         // format is checked either way, since `int(key)` runs regardless.
         if let Some(logit_bias) = &self.logit_bias {
-            for key in logit_bias.keys() {
+            for (key, bias) in logit_bias {
                 let token_id: u64 = key
                     .parse()
                     .map_err(|_| bad(format!("logit_bias keys must be token ids, got {key:?}")))?;
@@ -589,6 +593,12 @@ impl SamplingParams {
                     return Err(bad(format!(
                         "logit_bias must have keys in [0, {}], got {token_id}",
                         vocab_size - 1
+                    )));
+                }
+                if !bias.is_finite() || bias.abs() > LOGIT_BIAS_MAX_ABS {
+                    return Err(bad(format!(
+                        "logit_bias values must be finite numbers with |value| <= \
+                         {LOGIT_BIAS_MAX_ABS:e}, got {bias:?} for token {key}."
                     )));
                 }
             }
@@ -962,6 +972,7 @@ mod tests {
             r#"{"presence_penalty": 2.0}"#,
             r#"{"presence_penalty": -2.0}"#,
             r#"{"repetition_penalty": 2.0}"#,
+            r#"{"repetition_penalty": 1e-6}"#,
             r#"{"max_new_tokens": 0}"#,
             r#"{"min_new_tokens": 0}"#,
             // min == max is in range: `[0, max_new_tokens]` is inclusive.
@@ -982,7 +993,7 @@ mod tests {
     fn verify_rejects_just_past_the_boundaries() {
         for json in [
             r#"{"top_p": 0.0, "temperature": 0.7}"#, // exclusive lower bound
-            r#"{"repetition_penalty": 0.0}"#,        // exclusive lower bound
+            r#"{"repetition_penalty": 0.0000009999999}"#,
             r#"{"top_k": 0, "temperature": 0.7}"#,
             r#"{"min_p": 1.0000001, "temperature": 0.7}"#,
             r#"{"frequency_penalty": 2.0000001}"#,
@@ -1156,6 +1167,62 @@ mod tests {
         let mut sp: SamplingParams =
             serde_json::from_str(r#"{"logit_bias": {"999": -1.0}}"#).unwrap();
         assert!(sp.normalize(false, 1000).is_ok());
+    }
+
+    /// Normalization rejects positive penalties below the shared numeric floor.
+    #[test]
+    fn repetition_penalty_below_numeric_floor_is_rejected() {
+        for penalty in [1e-8, 1e-6_f64.next_down()] {
+            let mut sp = SamplingParams {
+                repetition_penalty: penalty,
+                ..Default::default()
+            };
+            let err = sp.normalize(false, TEST_VOCAB).expect_err("must reject");
+            assert_eq!(err.http_status(), 400);
+            assert!(
+                err.to_string()
+                    .contains("repetition_penalty must be in [1e-6, 2]")
+            );
+        }
+    }
+
+    /// Invalid bias values receive a validation error before reaching the wire.
+    #[test]
+    fn logit_bias_outside_numeric_contract_is_rejected() {
+        for bias in [
+            1e30_f64.next_up(),
+            -1e30_f64.next_up(),
+            1e31,
+            -1e31,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let mut sp = SamplingParams {
+                logit_bias: Some(BTreeMap::from([("5".into(), bias)])),
+                ..Default::default()
+            };
+            let err = sp.normalize(false, TEST_VOCAB).expect_err("must reject");
+            assert_eq!(err.http_status(), 400);
+            assert!(err.to_string().contains("logit_bias values"));
+            assert!(err.to_string().contains("1e30"));
+            assert!(err.to_string().contains("token 5"));
+        }
+    }
+
+    /// Retain inclusive bounds and large finite biases for greedy and sampling.
+    #[test]
+    fn numeric_parameter_boundaries_remain_valid() {
+        for temperature in [0.0, 1e-6, 0.5, 1.0] {
+            for penalty in [1e-6, 1e-3, 1.0, 2.0] {
+                let input = serde_json::json!({
+                    "temperature": temperature,
+                    "repetition_penalty": penalty,
+                    "logit_bias": {"0": -1e30, "1": 1e30, "2": -1e9, "3": 100, "4": -100},
+                });
+                norm(&input.to_string());
+            }
+        }
     }
 
     /// The key *format* check is separate from the vocab bound: the scheduler

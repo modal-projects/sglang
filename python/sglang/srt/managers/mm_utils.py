@@ -432,7 +432,7 @@ def embed_mm_inputs(
     Embed multimodal inputs and integrate them with text token embeddings.
 
     Args:
-        mm_inputs_list: List of multimodal inputs to process
+        mm_inputs_list: One record per packed request; text requests have empty mm_items
         extend_prefix_lens: Prefix lengths for each request
         extend_seq_lens: Sequence lengths for each request
         input_ids: Input token IDs tensor
@@ -569,7 +569,9 @@ def _embed_mm_inputs_with_split(
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
+        if not items:
+            continue
+        if all(
             getattr(item, "precomputed_embeddings", None) is not None for item in items
         ):
             precomputed_req_indices.append(idx)
@@ -594,9 +596,6 @@ def _embed_mm_inputs_with_split(
         )
 
     all_seq_lens = forward_batch.extend_seq_lens_cpu
-    mm_batch_indices = [
-        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
-    ]
     token_starts = []
     cumulative = 0
     for sl in all_seq_lens:
@@ -622,10 +621,9 @@ def _embed_mm_inputs_with_split(
         sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
         sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
         sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
-        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
         sub_slices = [
             input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
-            for bi in group_batch_indices
+            for bi in group_req_indices
         ]
         sub_input_ids = torch.cat(sub_slices)
 
@@ -638,7 +636,7 @@ def _embed_mm_inputs_with_split(
         )
 
         offset = 0
-        for bi in group_batch_indices:
+        for bi in group_req_indices:
             req_len = all_seq_lens[bi]
             start = token_starts[bi]
             input_embeds[start : start + req_len] = sub_embeds[
@@ -689,19 +687,13 @@ def general_mm_embed_routine(
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.contains_mm_inputs()
         ):
+            # Keep text requests so offsets stay aligned with the packed tokens.
             mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+                mm_input if mm_input is not None else MultimodalInputs(mm_items=[])
+                for mm_input in forward_batch.mm_inputs
             ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
+            extend_prefix_lens = forward_batch.extend_prefix_lens_cpu
+            extend_seq_lens = forward_batch.extend_seq_lens_cpu
             server_args = get_server_args()
             # Makes VLM profiles directly attributable: this range includes
             # encoder/ViT execution and multimodal feature placement, while

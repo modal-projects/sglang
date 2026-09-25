@@ -1628,6 +1628,9 @@ class BaseMultimodalProcessor(ABC):
 
         # deal with metadata fields when data_dict is preprocessed input: convert from tensor to expected python types
         # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
+        cache_identity = get_data_value("cache_identity")
+        if cache_identity is not None and len(items) != 1:
+            raise ValueError("cache_identity requires exactly one multimodal item")
         if len(items) == 1:
             item = next(iter(items.values()))
 
@@ -1638,22 +1641,27 @@ class BaseMultimodalProcessor(ABC):
                     offsets = offsets.detach().cpu().tolist()
                 item.offsets = [(int(start), int(end)) for start, end in offsets]
 
+            if cache_identity is not None:
+                from sglang.srt.multimodal.cache.identity import parse_content_hash
+
+                item.set_content_hash(parse_content_hash(cache_identity))
+
             # adjust hash_value
             hash_value = get_data_value("hash")
             if hash_value is not None:
                 if isinstance(hash_value, torch.Tensor):
                     hash_value = hash_value.item()
-                item.hash = (
+                item.set_hash(
                     hash_value
                     if isinstance(hash_value, str)
                     and hash_value.startswith(("sha256:", "int:"))
                     else int(hash_value)
                 )
-                pad_value = get_data_value("pad_value")
-                if pad_value is not None:
-                    if isinstance(pad_value, torch.Tensor):
-                        pad_value = pad_value.item()
-                    item.pad_value = int(pad_value)
+            pad_value = get_data_value("pad_value")
+            if pad_value is not None and item.hash is not None:
+                if isinstance(pad_value, torch.Tensor):
+                    pad_value = pad_value.item()
+                item.pad_value = int(pad_value)
 
         return list(items.values())
 

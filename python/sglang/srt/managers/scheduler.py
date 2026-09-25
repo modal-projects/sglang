@@ -207,6 +207,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    MultimodalContentIdentityError,
     MultimodalInputs,
     MultimodalProcessorOutput,
     NextBatchPlan,
@@ -2190,7 +2191,7 @@ class Scheduler(
                 )
                 error_msg = f"Multimodal feature reconstruction failed ({details})"
                 logger.error(error_msg)
-                tokenized_req.mm_inputs = None
+                # Rejection owns cleanup of any raw or partially prepared items.
                 request_errors.append(error_msg)
             else:
                 request_errors.append(None)
@@ -2642,23 +2643,32 @@ class Scheduler(
         return result.inputs
 
     def _get_multimodal_inputs(self, mm_inputs):
-        if isinstance(mm_inputs, MMInputsProcessError):
-            raise _MultimodalInputProcessingError(mm_inputs.message)
-        if isinstance(mm_inputs, MultimodalInputs):
-            if get_parallel().pp_size > 1:
-                MultimodalInputs._reconstruct_cuda_ipc_items(
-                    mm_inputs.mm_items, force_eager=True
-                )
-            return mm_inputs
+        try:
+            if isinstance(mm_inputs, MMInputsProcessError):
+                raise _MultimodalInputProcessingError(mm_inputs.message)
+            if isinstance(mm_inputs, MultimodalInputs):
+                if get_parallel().pp_size > 1:
+                    MultimodalInputs._reconstruct_cuda_ipc_items(
+                        mm_inputs.mm_items, force_eager=True
+                    )
+                for item in mm_inputs.mm_items:
+                    _ = item.cache_key
+                return mm_inputs
 
-        # Each receiving TP rank owns a distinct native CUDA IPC ticket. Entry-
-        # rank-only reconstruction would leave the other tickets unclaimed.
-        has_cuda_ipc = mm_inputs is not None and any(
-            item.has_cuda_ipc_proxy() for item in mm_inputs.mm_items
-        )
-        if get_mm().enable_broadcast_mm_inputs_process and not has_cuda_ipc:
-            return self._process_and_broadcast_mm_inputs(mm_inputs)
-        return MultimodalInputs.from_processor_output(mm_inputs)
+            # Each receiving TP rank owns a distinct native CUDA IPC ticket. Entry-
+            # rank-only reconstruction would leave the other tickets unclaimed.
+            has_cuda_ipc = mm_inputs is not None and any(
+                item.has_cuda_ipc_proxy() for item in mm_inputs.mm_items
+            )
+            if get_mm().enable_broadcast_mm_inputs_process and not has_cuda_ipc:
+                return self._process_and_broadcast_mm_inputs(mm_inputs)
+            return MultimodalInputs.from_processor_output(mm_inputs)
+        except _MultimodalInputProcessingError:
+            raise
+        except MultimodalContentIdentityError as error:
+            raise _MultimodalInputProcessingError(
+                f"Multimodal input processing failed: {type(error).__name__}: {error}"
+            ) from error
 
     def _attach_multimodal_inputs(
         self,

@@ -43,10 +43,8 @@ def parse_content_hash(value: Optional[str]) -> Optional[str]:
     digest = value[len(CONTENT_HASH_PREFIX) :]
     if len(digest) != _SHA256_HEX_LENGTH:
         raise ValueError("content_hash must contain exactly 64 SHA-256 hex digits")
-    try:
-        bytes.fromhex(digest)
-    except ValueError as exc:
-        raise ValueError("content_hash contains non-hexadecimal characters") from exc
+    if any(char not in "0123456789abcdefABCDEF" for char in digest):
+        raise ValueError("content_hash contains non-hexadecimal characters")
     return CONTENT_HASH_PREFIX + digest.lower()
 
 

@@ -14,18 +14,22 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
     Req,
+    _compute_pad_value,
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.multimodal.cache.identity import (
     build_artifact_key,
     multimodal_hash_as_int,
+    parse_content_hash,
     resolve_multimodal_item_hash,
 )
 from sglang.srt.multimodal.encoder_preprocessing import hash_raw_encoder_item
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.utils.msgpack_utils import enc_hook, ext_hook
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -252,6 +256,172 @@ class TestContentIdentity(unittest.TestCase):
                 cpu_hash = resolve_multimodal_item_hash(feature=feature)
                 cuda_hash = resolve_multimodal_item_hash(feature=feature.cuda())
                 self.assertEqual(cpu_hash, cuda_hash)
+
+
+class TestContentIdentityIngress(CustomTestCase):
+    def test_content_hash_requires_exactly_64_ascii_hex_characters(self):
+        """Whitespace accepted by a byte decoder is not part of the digest schema."""
+        self.assertIsNone(parse_content_hash(None))
+        for digest in ("ab" * 32, "AB" * 32, "aB09" * 16):
+            with self.subTest(valid=digest):
+                self.assertEqual(
+                    parse_content_hash("sha256:" + digest), "sha256:" + digest.lower()
+                )
+        for digest in (
+            "a" * 63,
+            "a" * 65,
+            "a" * 62 + " \t",
+            "ab" * 15 + "\n " + "cd" * 16,
+            "g" * 64,
+            "ａ" * 64,
+        ):
+            with self.subTest(invalid=digest), self.assertRaises(ValueError):
+                parse_content_hash("sha256:" + digest)
+        with self.assertRaises(ValueError):
+            parse_content_hash("SHA256:" + "ab" * 32)
+
+    @staticmethod
+    def _collect(data):
+        processor = SimpleNamespace(
+            ATTR_NAME_TO_MODALITY={
+                "pixel_values": Modality.IMAGE,
+                "image_grid_thw": Modality.IMAGE,
+                "audio_features": Modality.AUDIO,
+            },
+            FEATURE_NAMES=["pixel_values", "audio_features"],
+        )
+        return BaseMultimodalProcessor.collect_mm_items_from_processor_output(
+            processor, data
+        )
+
+    def test_payload_cache_key_is_derived_before_any_explicit_padding(self):
+        """A routing hint cannot replace available feature or embedding content."""
+        feature = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        for field in ("feature", "precomputed_embeddings"):
+            with self.subTest(field=field):
+                item = MultimodalDataItem(
+                    modality=Modality.IMAGE, hash=17, **{field: feature}
+                )
+                other_hint = MultimodalDataItem(
+                    modality=Modality.IMAGE, hash=18, **{field: feature}
+                )
+                identity = item.cache_key
+                self.assertRegex(identity, r"^sha256:[0-9a-f]{64}$")
+                self.assertEqual(identity, other_hint.cache_key)
+                self.assertEqual(item.hash, 17)
+                encoded = msgspec.msgpack.encode(item, enc_hook=enc_hook)
+                decoded = msgspec.msgpack.decode(
+                    encoded, type=MultimodalDataItem, ext_hook=ext_hook
+                )
+                self.assertEqual(decoded.cache_key, identity)
+                torch.testing.assert_close(getattr(decoded, field), feature)
+
+    def test_offline_identity_survives_collection_routing_and_wire(self):
+        """Explicit processor authority survives payload omission and route overrides."""
+        feature = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        identity = resolve_multimodal_item_hash(
+            feature=feature, model_specific_data={"processor": "offline-v1"}
+        )
+        for field in ("pixel_values", "precomputed_embeddings", None):
+            for routing_hash, pad_value in ((None, None), (17, None), (17, 1000123)):
+                with self.subTest(
+                    field=field, routing_hash=routing_hash, pad_value=pad_value
+                ):
+                    data = {
+                        "format": "processor_output",
+                        "modality": "image",
+                        "cache_identity": identity,
+                        "offsets": torch.tensor([[1, 3]]),
+                        "image_grid_thw": torch.tensor([[1, 1, 3]]),
+                    }
+                    if field is not None:
+                        data[field] = feature
+                    if routing_hash is not None:
+                        data["hash"] = routing_hash
+                    if pad_value is not None:
+                        data["pad_value"] = pad_value
+                    items = self._collect(data)
+                    self.assertEqual(len(items), 1)
+                    item = items[0]
+                    expected_hash = identity if routing_hash is None else routing_hash
+                    expected_pad = (
+                        _compute_pad_value(expected_hash)
+                        if pad_value is None
+                        else pad_value
+                    )
+                    self.assertEqual(item.cache_identity, identity)
+                    self.assertEqual(item.hash, expected_hash)
+                    self.assertEqual(item.pad_value, expected_pad)
+                    output = MultimodalProcessorOutput(mm_items=items)
+                    encoded = msgspec.msgpack.encode(output, enc_hook=enc_hook)
+                    decoded = msgspec.msgpack.decode(
+                        encoded, type=MultimodalProcessorOutput, ext_hook=ext_hook
+                    )
+                    inputs = MultimodalInputs.from_processor_output(decoded)
+                    self.assertEqual(inputs.mm_items[0].cache_key, identity)
+                    self.assertEqual(inputs.mm_items[0].pad_value, expected_pad)
+                    self.assertEqual(inputs.mm_items[0].offsets, [(1, 3)])
+                    spans = inputs.cache_spans(
+                        array("q", [1, expected_pad, expected_pad, expected_pad])
+                    )
+                    self.assertEqual(spans[0].identity, identity)
+                    self.assertEqual((spans[0].start, spans[0].end), (1, 4))
+
+    def test_routing_only_padding_does_not_authorize_cache_use(self):
+        """Legacy padding remains valid while payload-free cache use is rejected."""
+        item = MultimodalDataItem(modality=Modality.IMAGE, hash=17, offsets=[(1, 2)])
+        item.set_pad_value()
+        self.assertEqual(item.hash, 17)
+        self.assertEqual(item.pad_value, _compute_pad_value(17))
+        self.assertIsNone(item.cache_identity)
+        with self.assertRaisesRegex(ValueError, "processor content identity"):
+            _ = item.cache_key
+        with self.assertRaisesRegex(ValueError, "processor content identity"):
+            MultimodalInputs.from_processor_output(
+                MultimodalProcessorOutput(mm_items=[item])
+            )
+        with self.assertRaisesRegex(ValueError, "processor content identity"):
+            MultimodalInputs(mm_items=[item]).cache_spans(array("q", [1, 2, 3]))
+
+    def test_explicit_key_only_item_remains_valid_without_feature_bytes(self):
+        """Artifact and native producers can retain their previously computed key."""
+        identity = resolve_multimodal_item_hash(feature=torch.arange(4))
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=17,
+            cache_identity=identity,
+            offsets=[(1, 2)],
+        )
+        inputs = MultimodalInputs.from_processor_output(
+            MultimodalProcessorOutput(mm_items=[item])
+        )
+        self.assertIs(inputs.mm_items[0], item)
+        self.assertEqual(item.cache_key, identity)
+        self.assertIsNone(item.feature)
+        self.assertIsNone(item.precomputed_embeddings)
+
+    def test_malformed_or_ambiguous_explicit_identity_is_rejected(self):
+        """An explicit authority field must be a full digest for one item."""
+        for identity in (17, "invalid", "sha256:1234"):
+            with self.subTest(identity=identity):
+                with self.assertRaises(ValueError):
+                    self._collect(
+                        {"pixel_values": torch.ones(1), "cache_identity": identity}
+                    )
+                item = MultimodalDataItem(
+                    modality=Modality.IMAGE, hash=17, cache_identity=identity
+                )
+                with self.assertRaises(ValueError):
+                    _ = item.cache_key
+        identity = resolve_multimodal_item_hash(feature=torch.arange(4))
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            self._collect(
+                {
+                    "pixel_values": torch.ones(1),
+                    "audio_features": torch.ones(1),
+                    "cache_identity": identity,
+                }
+            )
 
 
 if __name__ == "__main__":

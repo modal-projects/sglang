@@ -357,6 +357,10 @@ class MultimodalInputFormat(Enum):
 MultimodalDataValue: TypeAlias = object
 
 
+class MultimodalContentIdentityError(ValueError):
+    """Request metadata cannot establish an authoritative media identity."""
+
+
 class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
@@ -441,8 +445,30 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         self.set_hash(self.cache_identity)
 
     @property
-    def cache_key(self) -> Optional[int | str]:
-        return self.cache_identity if self.cache_identity is not None else self.hash
+    def cache_key(self) -> str:
+        from sglang.srt.multimodal.cache.identity import parse_content_hash
+
+        if (
+            self.cache_identity is None
+            and self.feature is None
+            and self.precomputed_embeddings is None
+        ):
+            raise MultimodalContentIdentityError(
+                "Multimodal cache lookup requires features, embeddings, "
+                "or a processor content identity"
+            )
+        if self.cache_identity is not None:
+            try:
+                self.cache_identity = parse_content_hash(self.cache_identity)
+            except ValueError as error:
+                raise MultimodalContentIdentityError(str(error)) from error
+        # Transport/materialization errors keep their original exception type.
+        self.set_pad_value()
+        if self.cache_identity is None:
+            raise MultimodalContentIdentityError(
+                "Multimodal cache lookup requires a content identity"
+            )
+        return self.cache_identity
 
     @staticmethod
     def is_empty_list(l):
@@ -452,6 +478,19 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def set_pad_value(self):
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+
+        if (
+            self.cache_identity is None
+            and self.feature is None
+            and self.precomputed_embeddings is None
+        ):
+            if self.hash is None:
+                raise ValueError(
+                    "An item without a hash must contain features or embeddings"
+                )
+            if self.pad_value is None:
+                self.pad_value = _compute_pad_value(self.hash)
+            return
 
         if self.cache_identity is None:
             ignored_metadata = {
@@ -491,11 +530,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                     metadata["frame_layout"] = prompt
             metadata.update(modality=self.modality.name, format=self.format.name)
             content_hash = resolve_multimodal_item_hash(
-                existing_hash=(
-                    self.hash
-                    if self.feature is None and self.precomputed_embeddings is None
-                    else None
-                ),
                 feature=self.feature,
                 precomputed_embeddings=self.precomputed_embeddings,
             )
@@ -829,24 +863,21 @@ class MultimodalInputs:
     def cache_spans(self, token_ids: array) -> tuple[MultimodalKeySpan, ...]:
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        for item in self.mm_items:
-            item.set_pad_value()
+        cache_identities = [item.cache_key for item in self.mm_items]
         if self.num_image_tokens:
             identity = resolve_multimodal_item_hash(
                 existing_hash=0,
-                model_specific_data={
-                    "encoder_items": [item.cache_key for item in self.mm_items]
-                },
+                model_specific_data={"encoder_items": cache_identities},
             )
             return (MultimodalKeySpan(0, self.num_image_tokens, identity),)
 
         spans = list(self.cache_span_overrides)
         if not spans:
-            for item in self.mm_items:
+            for item, cache_identity in zip(self.mm_items, cache_identities):
                 offset = 0
                 for start, end in item.offsets or ():
                     spans.append(
-                        MultimodalKeySpan(start, end + 1, item.cache_identity, offset)
+                        MultimodalKeySpan(start, end + 1, cache_identity, offset)
                     )
                     offset += end - start + 1
         spans.sort(key=lambda span: span.start)
@@ -858,10 +889,10 @@ class MultimodalInputs:
         # Older padding adapters expose only placeholders, so all media that
         # can fill a placeholder participates in that span's identity.
         by_placeholder = {}
-        for item in self.mm_items:
+        for item, cache_identity in zip(self.mm_items, cache_identities):
             if item.offsets and not self.cache_span_overrides:
                 continue
-            by_placeholder.setdefault(item.pad_value, []).append(item.cache_key)
+            by_placeholder.setdefault(item.pad_value, []).append(cache_identity)
         identities = {
             value: resolve_multimodal_item_hash(
                 existing_hash=0, model_specific_data={"items": hashes}
@@ -996,7 +1027,9 @@ class MultimodalInputs:
                         item.feature = try_add_to_buffer(item.feature)
 
         for item in mm_items:
-            item.set_pad_value()
+            # Reject missing authority while errors can still be attributed to
+            # this request, before embedding or prefix cache lookup.
+            _ = item.cache_key
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:

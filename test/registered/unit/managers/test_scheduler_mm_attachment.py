@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    MMInputsProcessError,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -27,14 +28,20 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+    MultimodalProcessorOutput,
 )
-from sglang.srt.managers.scheduler import Scheduler, _MultimodalInputProcessingError
+from sglang.srt.managers.scheduler import (
+    Scheduler,
+    _MultimodalInputProcessingError,
+    _release_unadmitted_mm_inputs,
+)
 from sglang.srt.multimodal.transport import cuda_ipc, memory_pool
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -103,12 +110,16 @@ def _scheduler(session=None):
 
 class TestSchedulerMultimodalAttachment(CustomTestCase):
     def setUp(self):
-        override = get_context().override_server_args(speculative_algorithm=None)
+        override = get_context().override_server_args(
+            speculative_algorithm=None, enable_broadcast_mm_inputs_process=False
+        )
         override.install()
         self.addCleanup(override.restore)
         self.raw = torch.tensor([3, 7], dtype=torch.float32).view(torch.uint8)
         self.writes = []
         self.proxy_number = 0
+        self.vmm_pools = {}
+        self.vmm_pool_reads = []
         stream = Mock()
         real_empty = torch.empty
 
@@ -141,7 +152,15 @@ class TestSchedulerMultimodalAttachment(CustomTestCase):
             ),
             patch(
                 "sglang.srt.managers.schedule_batch.get_parallel",
-                return_value=SimpleNamespace(tp_rank=0),
+                return_value=SimpleNamespace(tp_rank=0, pp_size=1),
+            ),
+            patch.object(vmm, "_get_imported_pool", side_effect=self._open_vmm_pool),
+            patch.object(
+                vmm,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    attn_cp_rank=1, attn_tp_size=2, attn_tp_rank=1
+                ),
             ),
         )
         for context in patches:
@@ -166,9 +185,254 @@ class TestSchedulerMultimodalAttachment(CustomTestCase):
             use_pool_handle_cache=True,
         )
         item = MultimodalDataItem(
-            modality=Modality.IMAGE, feature=proxy, offsets=[(0, 0)]
+            modality=Modality.IMAGE,
+            feature=self.raw.view(torch.float32),
+            offsets=[(0, 0)],
         )
+        item.set_pad_value()
+        item.feature = proxy
         return MultimodalInputs(mm_items=[item]), proxy
+
+    def _open_vmm_pool(self, *, fabric_handle, **_kwargs):
+        self.vmm_pool_reads.append(fabric_handle)
+        return self.vmm_pools[fabric_handle]
+
+    def _vmm_proxies(self, *, packed):
+        self.proxy_number += 1
+        handle = f"synthetic-vmm-{self.proxy_number}".encode()
+        memory = torch.zeros(128, dtype=torch.uint8)
+        self.vmm_pools[handle] = SimpleNamespace(memory=memory)
+        kwargs = dict(
+            fabric_handle=handle,
+            posix_socket_path=None,
+            allocation_size=128,
+            data_offset=64,
+            data_nbytes=16 if packed else 8,
+            control_offset=0,
+            consumer_count=4,
+        )
+        if packed:
+            owner = vmm._CudaVmmPackedTransportOwner(**kwargs)
+            proxies = [
+                vmm.CudaVmmPackedTensorTransportProxy(
+                    owner=owner,
+                    layout=vmm._CudaVmmPackedTensorLayout(
+                        relative_offset=offset,
+                        data_nbytes=8,
+                        shape=torch.Size([2]),
+                        dtype=torch.float32,
+                    ),
+                )
+                for offset in (0, 8)
+            ]
+        else:
+            proxies = [
+                vmm.CudaVmmTensorTransportProxy(
+                    **kwargs, shape=torch.Size([2]), dtype=torch.float32
+                )
+            ]
+        return proxies, handle
+
+    def _rejection_inputs(self, *, prepared, invalid):
+        native_inputs, native_proxy = self._incoming()
+        ordinary, ordinary_handle = self._vmm_proxies(packed=False)
+        packed, packed_handle = self._vmm_proxies(packed=True)
+        items = native_inputs.mm_items
+        for proxy in ordinary + packed:
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=self.raw.view(torch.float32),
+                offsets=[(0, 0)],
+            )
+            item.set_pad_value()
+            item.feature = proxy
+            items.append(item)
+        for item in items:
+            item.model_specific_data[
+                cuda_ipc.DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+            ] = True
+        if invalid:
+            items = [MultimodalDataItem(modality=Modality.IMAGE, hash=17)] + items
+        container = MultimodalInputs if prepared else MultimodalProcessorOutput
+        return (
+            container(mm_items=items),
+            [native_proxy, *ordinary, *packed],
+            [ordinary_handle, packed_handle],
+        )
+
+    def _assert_unconsumed(self, proxies, handles):
+        self.assertTrue(all(not proxy._consumer_acknowledged for proxy in proxies))
+        self.assertEqual(self.writes, [])
+        for handle in handles:
+            self.assertEqual(
+                self.vmm_pools[handle].memory[:16].view(torch.int32).tolist(),
+                [0, 0, 0, 0],
+            )
+            self.assertEqual(self.vmm_pool_reads.count(handle), 0)
+
+    def _assert_rejected_and_released(
+        self, scheduler, received, owners, proxies, handles
+    ):
+        self.assertEqual(scheduler._add_request_to_queue.call_count, 1)
+        rejected = scheduler._add_request_to_queue.call_args.args[0]
+        self.assertIsInstance(rejected.to_finish, FINISH_ABORT)
+        self.assertEqual(rejected.to_finish.status_code, 500)
+        self.assertEqual(rejected.to_finish.err_type, "InternalServerError")
+        self.assertIsNone(received.mm_inputs)
+        self.assertIsNone(rejected.multimodal_inputs)
+        self.assertTrue(all(item.feature is None for item in owners.mm_items))
+        self.assertTrue(all(proxy._consumer_acknowledged for proxy in proxies))
+        self.assertTrue(proxies[-1]._packed_owner._consumer_acknowledged)
+        self.assertEqual(len(self.writes), 1)
+        for handle in handles:
+            self.assertEqual(
+                self.vmm_pools[handle].memory[:16].view(torch.int32).tolist(),
+                [0, 0, 0, 1],
+            )
+            self.assertEqual(self.vmm_pool_reads.count(handle), 1)
+        # Repeated caller cleanup cannot consume the shared native/VMM leases twice.
+        _release_unadmitted_mm_inputs(received)
+        MultimodalInputs(mm_items=owners.mm_items).release_features()
+        self.assertEqual(len(self.writes), 1)
+        for handle in handles:
+            self.assertEqual(self.vmm_pool_reads.count(handle), 1)
+
+    def test_direct_intake_wraps_authority_errors_without_double_wrapping(self):
+        """Raw and prepared inputs retain their cause in one request-local error."""
+        scheduler = _scheduler()
+        for container in (MultimodalProcessorOutput, MultimodalInputs):
+            with self.subTest(container=container.__name__):
+                inputs = container(
+                    mm_items=[MultimodalDataItem(modality=Modality.IMAGE, hash=17)]
+                )
+                with self.assertRaises(_MultimodalInputProcessingError) as caught:
+                    scheduler._get_multimodal_inputs(inputs)
+                self.assertIsInstance(caught.exception.__cause__, ValueError)
+                self.assertIn(
+                    "processor content identity", str(caught.exception.__cause__)
+                )
+        with self.assertRaises(_MultimodalInputProcessingError) as caught:
+            scheduler._get_multimodal_inputs(MMInputsProcessError("already attributed"))
+        self.assertEqual(str(caught.exception), "already attributed")
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_missing_authority_is_rejected_by_both_handlers_and_releases_siblings(self):
+        """A direct intake rejection must clean up every deferred valid sibling."""
+        for embedding in (False, True):
+            for prepared in (False, True):
+                with self.subTest(embedding=embedding, prepared=prepared):
+                    self.writes.clear()
+                    owners, proxies, handles = self._rejection_inputs(
+                        prepared=prepared, invalid=True
+                    )
+                    self._assert_unconsumed(proxies, handles)
+                    received = _recv(owners, embedding=embedding)
+                    scheduler = _scheduler()
+                    method = (
+                        scheduler.handle_embedding_request
+                        if embedding
+                        else scheduler.handle_generate_request
+                    )
+                    try:
+                        method(received)
+                    except Exception as error:
+                        self.fail(
+                            f"Per-request rejection contract raised {type(error).__name__}: {error}"
+                        )
+                    self._assert_rejected_and_released(
+                        scheduler, received, owners, proxies, handles
+                    )
+
+    def test_unrelated_direct_errors_preserve_exception_and_raw_owner(self):
+        """Authority handling must not turn arbitrary converter failures into recovery."""
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type.__name__):
+                incoming, proxy = self._incoming()
+                raw = MultimodalProcessorOutput(mm_items=incoming.mm_items)
+                received = _recv(raw)
+                original = error_type("ordinary converter failure")
+                with patch.object(
+                    MultimodalInputs, "from_processor_output", side_effect=original
+                ):
+                    try:
+                        _scheduler()._get_multimodal_inputs(received.mm_inputs)
+                    except Exception as error:
+                        self.assertIs(error, original)
+                    else:
+                        self.fail("The original converter exception did not propagate")
+                self.assertIs(received.mm_inputs, raw)
+                self.assertIs(raw.mm_items[0].feature, proxy)
+                self.assertFalse(proxy._consumer_acknowledged)
+                self.assertEqual(self.writes, [])
+
+    def test_materialization_failure_retains_owners_until_handler_cleanup(self):
+        """Local and peer rejection keep raw/prepared owners until request cleanup."""
+        for embedding in (False, True):
+            for failure, prepared in (
+                ("local", False),
+                ("peer", False),
+                ("peer", True),
+            ):
+                with self.subTest(
+                    embedding=embedding, failure=failure, prepared=prepared
+                ):
+                    self.writes.clear()
+                    owners, proxies, handles = self._rejection_inputs(
+                        prepared=prepared, invalid=failure == "local"
+                    )
+                    received = _recv(owners, embedding=embedding)
+                    scheduler = _scheduler()
+                    scheduler.dp_tp_cpu_group = object()
+
+                    def gather(errors, local_error, **_kwargs):
+                        if failure == "local":
+                            self.assertIn("processor content identity", local_error)
+                            errors[:] = [local_error, None]
+                        else:
+                            self.assertIsNone(local_error)
+                            errors[:] = [None, "ValueError: peer rejected its media"]
+
+                    with (
+                        patch.object(
+                            torch.distributed, "is_available", return_value=True
+                        ),
+                        patch.object(
+                            torch.distributed, "is_initialized", return_value=True
+                        ),
+                        patch.object(
+                            torch.distributed, "get_world_size", return_value=2
+                        ),
+                        patch.object(
+                            torch.distributed, "all_gather_object", side_effect=gather
+                        ),
+                    ):
+                        errors = scheduler._materialize_cuda_vmm_inputs(received)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn(
+                        "rank 0" if failure == "local" else "rank 1", errors[0]
+                    )
+                    self.assertIsNotNone(
+                        received.mm_inputs,
+                        "Rejected media owner cleared before handler cleanup",
+                    )
+                    self.assertEqual(
+                        [id(item) for item in received.mm_inputs.mm_items],
+                        [id(item) for item in owners.mm_items],
+                    )
+                    if failure == "local":
+                        self.assertIs(received.mm_inputs, owners)
+                    else:
+                        self.assertIsInstance(received.mm_inputs, MultimodalInputs)
+                    self._assert_unconsumed(proxies, handles)
+                    try:
+                        scheduler._dispatch_tokenized_mm_requests(received, errors)
+                    except Exception as error:
+                        self.fail(
+                            f"Per-request rejection contract raised {type(error).__name__}: {error}"
+                        )
+                    self._assert_rejected_and_released(
+                        scheduler, received, owners, proxies, handles
+                    )
 
     def _committed_parent(self, session):
         parent = session.create_req(

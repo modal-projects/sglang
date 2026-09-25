@@ -791,13 +791,15 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.dp_tp_cpu_group = object()
         request = TokenizedRequest()
+        raw_inputs = request.mm_inputs
+        prepared_inputs = object()
 
         def gather_errors(errors, local_error, **_kwargs):
             errors[:] = [local_error, remote_error]
 
         materialize = MagicMock(
             side_effect=local_exception,
-            return_value=object(),
+            return_value=prepared_inputs,
         )
         with (
             patch.object(
@@ -830,7 +832,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         ):
             errors = scheduler._materialize_cuda_vmm_inputs(request)
 
-        return request, errors
+        return request, errors, raw_inputs, prepared_inputs
 
     def test_materializes_inputs_directly_before_base_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
@@ -1063,11 +1065,14 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         )
         for local_exception, remote_error, expected in cases:
             with self.subTest(expected=expected):
-                request, errors = self._materialize_with_rank_errors(
-                    local_exception, remote_error
+                request, errors, raw_inputs, prepared_inputs = (
+                    self._materialize_with_rank_errors(local_exception, remote_error)
                 )
                 self.assertIn(expected, errors[0])
-                self.assertIsNone(request.mm_inputs)
+                self.assertIs(
+                    request.mm_inputs,
+                    raw_inputs if local_exception is not None else prepared_inputs,
+                )
 
     def test_vmm_batch_dispatches_good_and_failed_requests_individually(self):
         from sglang.srt.managers import scheduler as scheduler_module

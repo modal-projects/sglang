@@ -90,7 +90,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     prefill_graph_tolerates_sum_len,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -1156,6 +1161,45 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             assert self.attn_metadata_buffers is not None
             self.attn_metadata_buffers[shape_key] = metadata
 
+    def _prepare_dcp_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Build live decode-CP metadata for a prefill capture or replay.
+
+        DCP's extend path reads its gather buffers and translated prefix indices
+        directly from ``ForwardBatch.attn_dcp_metadata``.  Unlike ordinary
+        attention planning, that state is not owned by the attention backend,
+        so the prefill graph runner must attach it to the exact static batch
+        used by the breakable graph's eager attention segments.
+
+        The attention segments are graph breaks: allocating these variable-size
+        buffers before capture/replay is both intentional and address-safe.
+        """
+        model_runner = self.model_runner
+        if (
+            model_runner.ps.attn_dcp_size <= 1
+            or model_runner.is_draft_worker
+            or forward_batch.forward_mode.is_target_verify()
+            or not hasattr(
+                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            )
+        ):
+            return
+
+        forward_batch.attn_dcp_metadata = (
+            model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens,
+                forward_batch.req_pool_indices,
+                get_req_to_token_pool().req_to_token,
+                forward_batch.seq_lens_sum,
+                get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                model_runner.kv_cache_dtype,
+                model_runner.device,
+                create_chunked_prefix_cache_kv_indices,
+            )
+        )
+
     def _prepare_forward_metadata_for_replay(
         self,
         forward_batch: ForwardBatch,
@@ -1593,6 +1637,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        self._prepare_dcp_metadata(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1928,6 +1973,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch = static_forward_batch
 
         shape_key = self._shape_key(static_num_tokens, forward_batch)
+        self._prepare_dcp_metadata(static_forward_batch)
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, shape_key
         )

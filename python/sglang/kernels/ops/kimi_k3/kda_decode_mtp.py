@@ -272,7 +272,9 @@ def kda_decode_mtp_kernel(
     # CUDA-graph padding rows use slot == -1.
     if slot < 0:
         cute.arch.griddepcontrol_wait()
-        pad_bos = cu_seqlens[i_n]
+        # Graph metadata repeats the last live endpoint, but output storage
+        # reserves a distinct fixed-width interval for every padded request.
+        pad_bos = i_n * T_LOOP
         for i_t in cutlass.range_constexpr(T_LOOP):
             if tidx < HEAD_DIM:
                 o[0, pad_bos + i_t, i_hv, tidx] = cutlass.BFloat16(0.0)

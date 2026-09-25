@@ -1994,6 +1994,191 @@ class TestSessionQueueAbort(CustomTestCase):
                     )
                     self._assert_idle(observer, checker)
 
+    def test_dllm_staged_abort_reclaims_unresolved_block(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.dllm.config import DllmConfig
+        from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator import paged as paged_module
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        class CpuPagedKernel:
+            def __getitem__(self, grid):
+                def run(prefix, seq, last, free, out, block_size, page_size):
+                    paged_module.alloc_extend_naive(
+                        prefix, seq, last, free, out, page_size, "cpu"
+                    )
+
+                return run
+
+        for cache_type in (RadixCache, UnifiedRadixCache):
+            for page_size in (1, 4):
+                with self.subTest(cache=cache_type.__name__, page_size=page_size):
+                    set_global_server_args_for_scheduler(
+                        ServerArgs(
+                            model_path="dummy",
+                            page_size=page_size,
+                            attention_backend="torch_native",
+                        )
+                    )
+                    pool = ReqToTokenPool(
+                        size=8,
+                        max_context_len=128,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    kv_pool = MHATokenToKVPool(
+                        size=64,
+                        page_size=page_size,
+                        dtype=torch.float16,
+                        head_num=2,
+                        head_dim=8,
+                        layer_num=1,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    allocator_kwargs = dict(
+                        size=64,
+                        dtype=torch.float16,
+                        device="cpu",
+                        kvcache=kv_pool,
+                        need_sort=False,
+                    )
+                    allocator = (
+                        TokenToKVPoolAllocator(**allocator_kwargs)
+                        if page_size == 1
+                        else PagedTokenToKVPoolAllocator(
+                            **allocator_kwargs, page_size=page_size
+                        )
+                    )
+                    cache = cache_type(
+                        CacheInitParams(
+                            disable=False,
+                            req_to_token_pool=pool,
+                            token_to_kv_pool_allocator=allocator,
+                            page_size=page_size,
+                            tree_components=(ComponentType.FULL,),
+                        )
+                    )
+                    prompt = array("q", [10, 11, 12, 13])
+                    cache.insert(
+                        InsertParams(key=RadixKey(prompt), value=allocator.alloc(4))
+                    )
+                    config = DllmConfig(
+                        "LowConfidence",
+                        {},
+                        block_size=page_size,
+                        mask_id=99,
+                        max_running_requests=16,
+                        first_done_first_out_mode=True,
+                    )
+                    req = Req(
+                        rid="unresolved",
+                        origin_input_text="",
+                        origin_input_ids=prompt,
+                        sampling_params=SamplingParams(
+                            temperature=0, max_new_tokens=16
+                        ),
+                        vocab_size=VOCAB_SIZE,
+                        dllm_config=config,
+                    )
+                    req.init_next_round_input(cache)
+                    req.determine_dllm_phase()
+                    self.assertEqual(len(req.prefix_indices), 4)
+                    self.assertEqual(
+                        list(req.full_untruncated_fill_ids),
+                        list(prompt) + [config.mask_id] * config.block_size,
+                    )
+                    adder = PrefillAdder(
+                        page_size=page_size,
+                        tree_cache=cache,
+                        token_to_kv_pool_allocator=allocator,
+                        running_batch=ScheduleBatch(reqs=[]),
+                        new_token_ratio=1.0,
+                        rem_input_tokens=64,
+                        rem_chunk_tokens=None,
+                        dllm_config=config,
+                    )
+                    adder._req_inc_lock_ref(req)
+                    adder.add_dllm_staging_req(req)
+                    scheduler = _scheduler_stub(cache)
+                    scheduler.dllm_config = config
+                    scheduler.dllm_manager = DllmManager(config)
+                    scheduler.token_to_kv_pool_allocator = allocator
+                    scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+                    scheduler.metrics_reporter = SimpleNamespace(
+                        num_generated_tokens=0, report_prefill_stats=Mock()
+                    )
+                    SchedulerDllmMixin._update_state_for_batch(
+                        scheduler, adder.can_run_list, adder
+                    )
+                    batch = ScheduleBatch.init_new(
+                        [req],
+                        pool,
+                        allocator,
+                        cache,
+                        SimpleNamespace(
+                            vocab_size=VOCAB_SIZE, is_encoder_decoder=False
+                        ),
+                        False,
+                        SpeculativeAlgorithm.NONE,
+                        dllm_config=config,
+                    )
+                    # Exercise real allocation bookkeeping with the paged
+                    # allocation kernel's production CPU reference.
+                    allocation_kernel = (
+                        patch.object(
+                            paged_module, "alloc_extend_kernel", CpuPagedKernel()
+                        )
+                        if page_size > 1
+                        else nullcontext()
+                    )
+                    with allocation_kernel:
+                        batch.prepare_for_extend()
+                    self.assertEqual(req.kv.kv_committed_len, 4 + config.block_size)
+                    self.assertEqual(req.kv.kv_allocated_len, 4 + config.block_size)
+                    scheduler.last_batch = batch
+                    batch.prefill_stats = None
+                    result = SimpleNamespace(
+                        copy_done=None,
+                        next_token_ids=[torch.tensor([99] * config.block_size)],
+                        accept_length_per_req_cpu=[0],
+                        dllm_algo_state=None,
+                        can_run_cuda_graph=False,
+                    )
+                    SchedulerDllmMixin.process_batch_result_dllm(
+                        scheduler, batch, result
+                    )
+                    self.assertEqual(len(req.dllm_incomplete_ids), config.block_size)
+                    self.assertEqual(list(req.output_ids), [])
+                    self.assertIn(req, scheduler.dllm_manager.staging_queue)
+                    self.assertFalse(scheduler.enable_overlap)
+
+                    scheduler.abort_request(AbortReq(rid=req.rid))
+                    self.assertTrue(req.finished())
+                    self.assertFalse(req.kv.holds_kv)
+                    self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+                    self.assertEqual(pool.available_size(), 8)
+                    self.assertEqual(
+                        allocator.available_size() + cache.evictable_size(), 64
+                    )
+                    available = allocator.available_size()
+                    scheduler.abort_request(AbortReq(rid=req.rid))
+                    self.assertEqual(allocator.available_size(), available)
+                    scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+                    cache.evict(EvictParams(num_tokens=64))
+                    self.assertEqual(allocator.available_size(), 64)
+                    pages = allocator.get_all_free_pages().tolist()
+                    self.assertEqual(len(pages), len(set(pages)))
+                    self.assertTrue(all(page > 0 for page in pages))
+                    self.assertEqual(len(pool.free_slots), len(set(pool.free_slots)))
+
     def test_unadmitted_abort_releases_real_session_resources(self):
         """Input and PD capacity rejection cannot leave a turn or its row owned."""
         from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue

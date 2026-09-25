@@ -258,6 +258,19 @@ class TestContentIdentity(unittest.TestCase):
                 self.assertEqual(cpu_hash, cuda_hash)
 
 
+class _IdentityCollectorProcessor(BaseMultimodalProcessor):
+    def __init__(self):
+        self.ATTR_NAME_TO_MODALITY = {
+            "pixel_values": Modality.IMAGE,
+            "image_grid_thw": Modality.IMAGE,
+            "audio_features": Modality.AUDIO,
+        }
+        self.FEATURE_NAMES = ["pixel_values", "audio_features"]
+
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError
+
+
 class TestContentIdentityIngress(CustomTestCase):
     def test_content_hash_requires_exactly_64_ascii_hex_characters(self):
         """Whitespace accepted by a byte decoder is not part of the digest schema."""
@@ -282,16 +295,8 @@ class TestContentIdentityIngress(CustomTestCase):
 
     @staticmethod
     def _collect(data):
-        processor = SimpleNamespace(
-            ATTR_NAME_TO_MODALITY={
-                "pixel_values": Modality.IMAGE,
-                "image_grid_thw": Modality.IMAGE,
-                "audio_features": Modality.AUDIO,
-            },
-            FEATURE_NAMES=["pixel_values", "audio_features"],
-        )
-        return BaseMultimodalProcessor.collect_mm_items_from_processor_output(
-            processor, data
+        return _IdentityCollectorProcessor().collect_mm_items_from_processor_output(
+            data
         )
 
     def test_payload_cache_key_is_derived_before_any_explicit_padding(self):

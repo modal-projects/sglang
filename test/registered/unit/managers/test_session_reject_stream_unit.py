@@ -3,6 +3,8 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -245,8 +247,10 @@ class TestSessionRejectStream(CustomTestCase):
                         inherited_proxy.total_consumer_count = 1
                         inherited_proxy.release_without_reconstruction = Mock()
                         inherited = MultimodalDataItem(
-                            modality=Modality.IMAGE, feature=inherited_proxy
+                            modality=Modality.IMAGE, feature=torch.tensor([1.0])
                         )
+                        inherited.set_pad_value()
+                        inherited.feature = inherited_proxy
                         if appended:
                             prior = session.create_req(_recv("prior", [1, 2]), None, 16)
                             prior.multimodal_inputs = MultimodalInputs(
@@ -268,8 +272,10 @@ class TestSessionRejectStream(CustomTestCase):
                         own_proxy.total_consumer_count = 1
                         own_proxy.release_without_reconstruction = Mock()
                         own = MultimodalDataItem(
-                            modality=Modality.IMAGE, feature=own_proxy
+                            modality=Modality.IMAGE, feature=torch.tensor([2.0])
                         )
+                        own.set_pad_value()
+                        own.feature = own_proxy
                         recv_req = _recv("rejected", [3, 4, 5])
                         if appended and not streaming:
                             recv_req.session_params.rid = "prior"

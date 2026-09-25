@@ -5,15 +5,16 @@ import unittest
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.managers import mm_schedule
+from sglang.srt.managers import mm_schedule, schedule_batch
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.multimodal.transport import memory_pool
+from sglang.srt.multimodal.transport import cuda_ipc, memory_pool
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -369,19 +370,30 @@ class TestRankConsistentEncode(CustomTestCase):
                 torch.testing.assert_close(result, item.feature + 100)
 
     def test_deferred_feature_ack_waits_for_agreement(self):
-        """A peer miss must keep the real proxy live until the encoder consumes it."""
+        """Cache agreement must retain each rank's features for a later eviction."""
         for route in ("full", "by_item"):
             for peer_miss in (False, True):
-                for rank in (0, 1):
+                for rank in (0, 1, 2, 3):
                     with self.subTest(route=route, peer_miss=peer_miss, rank=rank):
                         item = _item(11, 2)
                         expected = item.feature.clone()
                         _cache(route, [item], [0])
+                        mm_schedule.embedding_cache.max_size = 16
+                        storage = torch.zeros(512, dtype=torch.uint8)
+                        data = storage[256:272]
+                        data.copy_(expected.view(torch.uint8).reshape(-1))
+                        pool_id = uuid4().hex
+                        handles = tuple(
+                            (0, pool_id, 512, 0, (pool_id, peer), 0, b"event", False)
+                            for peer in range(4)
+                        )
                         proxy = CudaIpcTensorTransportProxy(
-                            data=expected,
+                            data=data,
                             info_data=expected,
-                            pool_ipc_handle=(0,),
-                            pool_byte_offset=0,
+                            pool_ipc_handle=handles[0],
+                            pool_ipc_handles=handles,
+                            pool_id=pool_id,
+                            pool_byte_offset=256,
                             ready_byte_offset=32,
                             ack_byte_offset=64,
                             generation=7,
@@ -389,12 +401,27 @@ class TestRankConsistentEncode(CustomTestCase):
                             use_pool_handle_cache=True,
                         )
                         item.feature = proxy
+                        item.pad_value = 1001
+                        item.model_specific_data[
+                            cuda_ipc.DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                        ] = True
                         writes = []
+                        encoded = []
+                        real_empty = torch.empty
+
+                        def cpu_empty(*args, **kwargs):
+                            kwargs["device"] = "cpu"
+                            return real_empty(*args, **kwargs)
 
                         def encode(batch):
-                            self.assertFalse(proxy._consumer_acknowledged)
-                            proxy.acknowledge_consumption(4)
-                            return expected + 100
+                            if not encoded:
+                                self.assertEqual(
+                                    proxy._consumer_acknowledged, not peer_miss
+                                )
+                            for entry in batch:
+                                entry.materialize_deferred_cuda_ipc_feature()
+                            encoded.append([entry.feature.clone() for entry in batch])
+                            return torch.cat([entry.feature + 100 for entry in batch])
 
                         with (
                             patch.object(dist, "is_initialized", return_value=True),
@@ -402,38 +429,74 @@ class TestRankConsistentEncode(CustomTestCase):
                                 mm_schedule,
                                 "get_parallel",
                                 return_value=_parallel(
-                                    _PeerGroup([int(peer_miss)]), rank
+                                    _PeerGroup([int(peer_miss)]), rank % 2
                                 ),
                             ),
+                            patch.object(
+                                memory_pool,
+                                "get_parallel",
+                                return_value=SimpleNamespace(tp_rank=rank),
+                            ),
+                            patch.object(
+                                schedule_batch,
+                                "get_parallel",
+                                return_value=SimpleNamespace(
+                                    tp_size=4,
+                                    tp_rank=rank,
+                                    attn_tp_size=2,
+                                    attn_tp_rank=rank % 2,
+                                    attn_cp_size=2,
+                                    attn_cp_rank=rank // 2,
+                                ),
+                            ),
+                            patch.object(torch, "empty", side_effect=cpu_empty),
                             patch.object(torch.cuda, "current_device", return_value=0),
+                            patch.object(
+                                torch.cuda, "current_stream", return_value=Mock()
+                            ),
                             patch.object(
                                 torch.cuda, "device", return_value=nullcontext()
                             ),
                             patch.object(
-                                proxy,
-                                "_open_pool_slice",
-                                return_value=(expected, expected.untyped_storage()),
+                                cuda_ipc,
+                                "_open_pooled_storage_uncached",
+                                return_value=storage.untyped_storage(),
                             ),
                             patch.object(memory_pool, "stream_wait_value32"),
+                            patch.object(cuda_ipc, "_release_ipc_export"),
                             patch.object(
-                                memory_pool,
+                                cuda_ipc,
                                 "stream_write_value32",
                                 side_effect=lambda *args: writes.append(args),
                             ),
                         ):
                             result = _run_route(route, [item], encode)
+                            self.assertTrue(proxy._consumer_acknowledged)
                             self.assertEqual(
-                                proxy._consumer_acknowledged, peer_miss or rank == 0
+                                [
+                                    (address - storage.data_ptr(), value)
+                                    for _, address, value, _ in writes
+                                ],
+                                [(64 + rank * 4, 7)],
                             )
-                            self.assertEqual(
-                                len(writes), 4 if peer_miss or rank == 0 else 0
+                            self.assertEqual(len(encoded), int(peer_miss))
+                            torch.testing.assert_close(
+                                result, expected + (100 if peer_miss else 0)
                             )
-                            # Subsequent request cleanup must not acknowledge twice.
+
+                            # Recycle/overwrite the producer bytes, then evict the
+                            # embedding using the real bounded LRU admission path.
+                            data.fill_(255)
+                            mm_schedule.embedding_cache.set(
+                                99,
+                                mm_schedule.EmbeddingResult(embedding=expected + 200),
+                            )
+                            result = _run_route(route, [item], encode)
+                            torch.testing.assert_close(result, expected + 100)
+                            torch.testing.assert_close(item.feature, expected)
+                            self.assertEqual(len(encoded), int(peer_miss) + 1)
                             item.release_transport_proxies(4)
-                            self.assertEqual(len(writes), 4)
-                        torch.testing.assert_close(
-                            result, expected + (100 if peer_miss else 0)
-                        )
+                            self.assertEqual(len(writes), 1)
 
     @unittest.skipUnless(
         dist.is_available() and dist.is_gloo_available(), "Gloo is required"

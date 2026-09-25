@@ -2659,6 +2659,62 @@ class Scheduler(
             return self._process_and_broadcast_mm_inputs(mm_inputs)
         return MultimodalInputs.from_processor_output(mm_inputs)
 
+    def _attach_multimodal_inputs(
+        self,
+        recv_req,
+        req: Req,
+        image_inputs: MultimodalInputs,
+        *,
+        adjust_offsets=False,
+    ) -> None:
+        transferred = False
+        try:
+            if adjust_offsets:
+                SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                )
+            req.extend_image_inputs(image_inputs)
+            transferred = True
+            self._maybe_compute_mrope_positions(req)
+        except BaseException as error:
+            try:
+                try:
+                    if not transferred:
+                        # A failed merge may already have attached some incoming items.
+                        attached = (
+                            {id(item) for item in req.multimodal_inputs.mm_items}
+                            if req.multimodal_inputs is not None
+                            else set()
+                        )
+                        image_inputs.release_features(
+                            [
+                                item
+                                for item in image_inputs.mm_items
+                                if id(item) not in attached
+                            ]
+                        )
+                finally:
+                    if req.session is not None:
+                        if req.finished_reason is None:
+                            req.finished_reason = req.to_finish or FINISH_ABORT(
+                                str(error),
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                "InternalServerError",
+                            )
+                            req.to_finish = None
+                        req.session.discard_req(req)
+                    elif req.multimodal_inputs is not None:
+                        req.multimodal_inputs.release_features()
+                        req.multimodal_inputs = None
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
         """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
@@ -2816,6 +2872,7 @@ class Scheduler(
             if is_beam:
                 error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
+                    _release_unadmitted_mm_inputs(recv_req)
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
@@ -2827,6 +2884,7 @@ class Scheduler(
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
                 ):
+                    _release_unadmitted_mm_inputs(recv_req)
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
@@ -2894,6 +2952,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
+            _release_unadmitted_mm_inputs(recv_req)
             req.set_finish_with_abort(
                 mm_input_error,
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -2906,6 +2965,7 @@ class Scheduler(
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
+                _release_unadmitted_mm_inputs(recv_req)
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2914,6 +2974,7 @@ class Scheduler(
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
             if error_msg is not None:
+                _release_unadmitted_mm_inputs(recv_req)
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2924,6 +2985,7 @@ class Scheduler(
                 self.disaggregation_mode != DisaggregationMode.NULL
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
+                _release_unadmitted_mm_inputs(recv_req)
                 self._reject_sampling_mask_request(
                     req,
                     "return_sampling_mask requires "
@@ -2940,6 +3002,7 @@ class Scheduler(
                     f"{top_k}. Lower top_k or increase "
                     "--sampling-mask-max-tokens."
                 )
+                _release_unadmitted_mm_inputs(recv_req)
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
@@ -2950,6 +3013,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
+            _release_unadmitted_mm_inputs(recv_req)
             self._reject_sampling_mask_request(req, error_msg)
             return
 
@@ -2960,6 +3024,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
+            _release_unadmitted_mm_inputs(recv_req)
             self._reject_sampling_mask_request(req, error_msg)
             return
 
@@ -2968,6 +3033,7 @@ class Scheduler(
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             except _MultimodalInputProcessingError as error:
+                _release_unadmitted_mm_inputs(recv_req)
                 req.set_finish_with_abort(
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -2977,23 +3043,11 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-            SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
-
-            # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
-            # The pad function is model-specific and can be None for some backends.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                )
-            req.extend_image_inputs(image_inputs)
-            self._maybe_compute_mrope_positions(req)
+            self._attach_multimodal_inputs(
+                recv_req, req, image_inputs, adjust_offsets=True
+            )
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                _release_request_owned_mm_inputs(req, detach=True)
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
@@ -3014,7 +3068,6 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
-            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3041,7 +3094,6 @@ class Scheduler(
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
-            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3060,7 +3112,6 @@ class Scheduler(
                 "output logprobs."
             )
             req.logprob_start_len = -1
-            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3082,7 +3133,6 @@ class Scheduler(
 
             if error_msg is not None:
                 req.routed_experts_start_len = 0
-                _release_request_owned_mm_inputs(req, detach=True)
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
@@ -3329,8 +3379,6 @@ class Scheduler(
     def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
         """Release request-owned media and clear only the matching session turn."""
         _release_request_owned_mm_inputs(req)
-        if req.session is not None:
-            req.session.abort_req(req.rid)
 
     def _release_dropped_waiting_req_mamba_slot(self, req: Req) -> None:
         # A restored row's Mamba state remains owned by the session slot.
@@ -3475,6 +3523,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
+            _release_unadmitted_mm_inputs(recv_req)
             req.set_finish_with_abort(
                 mm_input_error,
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -3488,6 +3537,7 @@ class Scheduler(
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             except _MultimodalInputProcessingError as error:
+                _release_unadmitted_mm_inputs(recv_req)
                 req.set_finish_with_abort(
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -3495,21 +3545,7 @@ class Scheduler(
                 )
                 self._add_request_to_queue(req)
                 return
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            # The `pad_input_ids_func` is model-specific and may be None for
-            # embedding models or models not requiring special padding.
-            # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                # See companion call site above for the array.array wrap rationale.
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                )
-
-            req.extend_image_inputs(image_inputs)
-            self._maybe_compute_mrope_positions(req)
+            self._attach_multimodal_inputs(recv_req, req, image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -6040,38 +6076,11 @@ def _release_unadmitted_mm_inputs(recv_req: TokenizedGenerateReqInput) -> None:
 
 
 def _release_request_owned_mm_inputs(req: Req, *, detach: bool = False) -> None:
-    # A request whose media pointer will be cleared cannot retain its own inputs.
     if req.session is not None:
-        mm = req.multimodal_inputs
-        if mm is not None:
-            own_start = 0
-            retained = False
-            for node in req.session.req_nodes.values():
-                if detach and node.req is req:
-                    continue
-                other = node.req.multimodal_inputs
-                if other is None:
-                    continue
-                if other is mm:
-                    # The session retains this exact object (a committed
-                    # turn's shared history or this req's own node):
-                    # every item is session-owned.
-                    retained = True
-                    break
-                inherited = other.mm_items
-                if len(inherited) <= len(mm.mm_items) and all(
-                    mm.mm_items[i] is inherited[i] for i in range(len(inherited))
-                ):
-                    own_start = max(own_start, len(inherited))
-            if not retained:
-                if own_start == 0:
-                    # A first turn that never committed owns all of its
-                    # multimodal inputs; session close only scans
-                    # req_nodes, so nothing else would release them.
-                    mm.release_features()
-                    req.multimodal_inputs = None
-                else:
-                    mm.release_features(mm.mm_items[own_start:])
+        if detach:
+            req.session.discard_req(req)
+        else:
+            req.session.release_finished_req_mm_inputs(req)
     elif req.multimodal_inputs is not None:
         req.multimodal_inputs.release_features()
         req.multimodal_inputs = None

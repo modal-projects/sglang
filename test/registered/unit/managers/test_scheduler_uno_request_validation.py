@@ -40,8 +40,9 @@ class TestSchedulerUnoRequestValidation(CustomTestCase):
             session_id=None,
             input_embeds=None,
             bootstrap_port=1,
+            mm_inputs=None,
         )
-        req = MagicMock()
+        req = MagicMock(to_finish=None, finished_reason=None)
         error = "UNO request is unsupported."
 
         with (

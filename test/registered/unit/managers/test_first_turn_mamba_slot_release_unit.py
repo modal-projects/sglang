@@ -13,10 +13,13 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,27 +27,31 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _waiting_req(rid, mamba_pool_idx, req_pool_idx=None, kv_allocated_len=0):
-    return SimpleNamespace(
+    session = Session(0, "session-a", streaming=True)
+    recv_req = TokenizedGenerateReqInput(
         rid=rid,
-        session=SimpleNamespace(abort_req=Mock()),
-        multimodal_inputs=None,
-        finished_reason=None,
-        to_finish=None,
+        input_text=None,
+        input_ids=array("q", [1, 2]),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(temperature=0, max_new_tokens=4),
         return_logprob=False,
-        kv=ReqKvInfo(
-            req_pool_idx=req_pool_idx,
-            kv_allocated_len=kv_allocated_len,
-            mamba_pool_idx=mamba_pool_idx,
-        ),
+        logprob_start_len=0,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=True,
+        session_params=SessionParams(id=session.session_id),
         priority=5,
-        cache_request_handle=None,
-        weight_version_events=[],
-        output_ids=array("q"),
-        time_stats=SimpleNamespace(
-            wait_queue_entry_time=time.perf_counter() - 100,
-            trace_ctx=SimpleNamespace(abort=Mock()),
-        ),
     )
+    req = session.create_req(recv_req, tokenizer=None, vocab_size=16)
+    req.kv = ReqKvInfo(
+        req_pool_idx=req_pool_idx,
+        kv_allocated_len=kv_allocated_len,
+        mamba_pool_idx=mamba_pool_idx,
+    )
+    req.time_stats.wait_queue_entry_time = time.perf_counter() - 100
+    return req
 
 
 def _scheduler_stub(waiting_queue):
@@ -110,7 +117,8 @@ class TestFirstTurnMambaSlotRelease(CustomTestCase):
         mamba_allocator.free.assert_called_once()
         self.assertEqual(mamba_allocator.free.call_args[0][0].flatten().tolist(), [3])
         self.assertIsNone(req.kv.mamba_pool_idx)
-        req.session.abort_req.assert_called_once_with(req.rid)
+        self.assertFalse(req.session.has_unfinished_request())
+        self.assertTrue(req.finished())
 
     def test_priority_eviction_releases_first_turn_mamba_slot(self):
         candidate = _waiting_req("turn-1", mamba_pool_idx=torch.tensor([3]))
@@ -127,6 +135,8 @@ class TestFirstTurnMambaSlotRelease(CustomTestCase):
         mamba_allocator.free.assert_called_once()
         self.assertEqual(mamba_allocator.free.call_args[0][0].flatten().tolist(), [3])
         self.assertIsNone(candidate.kv.mamba_pool_idx)
+        self.assertFalse(candidate.session.has_unfinished_request())
+        self.assertTrue(candidate.finished())
 
     def test_priority_disabled_reject_releases_first_turn_mamba_slot(self):
         """A priority request rejected because priority scheduling is
@@ -145,7 +155,7 @@ class TestFirstTurnMambaSlotRelease(CustomTestCase):
         mamba_allocator.free.assert_called_once()
         self.assertEqual(mamba_allocator.free.call_args[0][0].flatten().tolist(), [3])
         self.assertIsNone(req.kv.mamba_pool_idx)
-        req.session.abort_req.assert_called_once_with(req.rid)
+        self.assertFalse(req.session.has_unfinished_request())
         self.assertIsNotNone(req.finished_reason)
         self.assertEqual(req.finished_reason.status_code, 503)
         send_output.assert_called_once()

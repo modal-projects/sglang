@@ -169,7 +169,7 @@ class TestSessionRejectStream(CustomTestCase):
 
                     with patch(
                         "sglang.srt.managers.scheduler.get_parallel",
-                        return_value=SimpleNamespace(attn_dcp_size=1),
+                        return_value=SimpleNamespace(attn_dcp_size=1, pp_size=1),
                     ):
                         scheduler.handle_generate_request(
                             recv_req, mm_input_error="Media preprocessing failed first."
@@ -253,8 +253,14 @@ class TestSessionRejectStream(CustomTestCase):
                                 mm_items=[inherited]
                             )
                             prior.finished_reason = FINISH_LENGTH(length=0)
+                            self.assertTrue(session.has_unfinished_request())
+                            self.assertFalse(prior.kv.holds_kv)
+                            self.assertFalse(prior.kv.holds_mamba)
+                            self.assertIsNone(prior.kv.retraction_backup)
                             if streaming:
                                 session.finish_req(prior)
+                            session.release_finished_req_mm_inputs(prior)
+                            self.assertFalse(session.has_unfinished_request())
 
                         own_proxy = CudaIpcTensorTransportProxy.__new__(
                             CudaIpcTensorTransportProxy
@@ -281,7 +287,9 @@ class TestSessionRejectStream(CustomTestCase):
                         with (
                             patch(
                                 "sglang.srt.managers.scheduler.get_parallel",
-                                return_value=SimpleNamespace(attn_dcp_size=1),
+                                return_value=SimpleNamespace(
+                                    attn_dcp_size=1, pp_size=1
+                                ),
                             ),
                             patch(
                                 "sglang.srt.managers.scheduler.get_device",

@@ -32,7 +32,7 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -104,7 +104,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -121,6 +121,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.multimodal.transport.producer_lifecycle import (
+    await_dispatch_completion,
+    await_processor_output,
+    cancel_undispatched_inputs,
+    detach_for_parallel_sampling,
+    gather_tokenized_requests,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -247,6 +254,7 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    encoder_dispatch_ready: Optional[threading.Event] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -877,7 +885,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
-        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        request_states = {
+            rid: self.rid_to_state[rid]
+            for rid in ([obj.rid] if obj.is_single else obj.rid)
+        }
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -894,15 +905,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
-                    state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    try:
+                        state = self.rid_to_state[obj.rid]
+                        if obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        response_generator = self._wait_one_response(obj, request)
+                    except BaseException:
+                        cancel_undispatched_inputs(
+                            self._mm_feature_pool(), (tokenized_obj.mm_inputs,)
+                        )
+                        raise
                     await self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
+                    async for response in response_generator:
                         yield response
                 else:
                     async for response in self._handle_batch_request(
-                        obj, request, request_rids
+                        obj, request, request_states
                     ):
                         yield response
         except BaseException:
@@ -913,7 +931,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
-            self._release_req_states_on_failure(request_rids)
+            self._release_req_states_on_failure(request_states)
             raise
 
     def _detect_input_format(
@@ -1145,12 +1163,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                    mm_inputs = await await_processor_output(
+                        self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=mm_processor_input,
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        ),
+                        pool=self._mm_feature_pool(),
                     )
             elif (
                 get_disagg().language_only
@@ -1160,14 +1181,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
+                mm_inputs = await await_processor_output(
+                    self.mm_processor.process_mm_data_async(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text=mm_processor_input,
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    ),
+                    pool=self._mm_feature_pool(),
                 )
 
+        else:
+            mm_inputs = None
+
+        try:
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
             if mm_inputs and mm_inputs.token_type_ids is not None:
@@ -1213,13 +1241,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for item in mm_inputs.mm_items:
                     if isinstance(item, MultimodalDataItem):
                         item.set_pad_value()
-        else:
-            mm_inputs = None
+            self._validate_one_request(obj, input_ids)
+            return self._create_tokenized_object(
+                obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            )
+        except BaseException:
+            cancel_undispatched_inputs(self._mm_feature_pool(), (mm_inputs,))
+            raise
 
-        self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
-        )
+    def _mm_feature_pool(self):
+        if self.mm_processor is not None and self.mm_processor.use_cuda_ipc:
+            return self.mm_processor.cudaipc_mmfeature_pool
+        return None
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -1578,7 +1611,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # so lets construct the return object
         if not self._batch_has_text(batch_size, obj):
             # All requests already have input_ids, no need to tokenize
-            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+            tokenized_objs = []
+            try:
+                for i in range(batch_size):
+                    tokenized_objs.append(await self._tokenize_one_request(obj[i]))
+                return tokenized_objs
+            except BaseException as error:
+                try:
+                    cancel_undispatched_inputs(
+                        self._mm_feature_pool(),
+                        (item.mm_inputs for item in tokenized_objs),
+                    )
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
 
         self._validate_batch_tokenization_constraints(batch_size, obj)
 
@@ -1662,6 +1708,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        mm_inputs = tokenized_obj.mm_inputs
+        state = self.rid_to_state.get(tokenized_obj.rid)
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1674,25 +1722,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
-            self._dispatch_to_scheduler(tokenized_obj)
-            self._mark_state_dispatched(tokenized_obj.rid)
+            cancellation = await await_dispatch_completion(
+                self._async_dispatch_to_scheduler(tokenized_obj)
+            )
             dispatched = True
-            dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
-            if dispatch_ready is not None:
-                dispatch_ready.set()
+            self._mark_state_dispatched(state)
+            if state is not None:
+                self._release_encoder_dispatch_ready(tokenized_obj.rid, state)
             tokenized_obj.time_stats = time_stats
+            if cancellation is not None:
+                raise cancellation
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
-        finally:
+        except BaseException as error:
             if not dispatched:
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                try:
+                    try:
+                        self.cuda_vmm_feature_transport.cancel_for_dispatch(
+                            prepared_mm_items
+                        )
+                    finally:
+                        try:
+                            cancel_undispatched_inputs(
+                                self._mm_feature_pool(), (mm_inputs,)
+                            )
+                        finally:
+                            discard_shm_features(tokenized_obj)
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
 
-    def _mark_state_dispatched(self, rid: str):
-        """Record that *rid* reached the scheduler.
+    def _mark_state_dispatched(self, state: ReqState | None):
+        """Record send acceptance on the state captured before dispatch.
 
         Only dispatched requests are aborted (not discarded) by the
         handler-failure cleanup; see _release_req_states_on_failure.
         """
-        state = self.rid_to_state.get(rid)
         if state is not None:
             state.dispatched = True
 
@@ -1703,6 +1767,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        mm_inputs_batch = [obj.mm_inputs for obj in tokenized_objs]
+        states = [self.rid_to_state.get(obj.rid) for obj in tokenized_objs]
         prepared_mm_items = []
         dispatched = False
         try:
@@ -1722,16 +1788,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-            self._dispatch_to_scheduler(batch_req)
-            for tokenized_obj in tokenized_objs:
-                self._mark_state_dispatched(tokenized_obj.rid)
+            cancellation = await await_dispatch_completion(
+                self._async_dispatch_to_scheduler(batch_req)
+            )
             dispatched = True
+            for state in states:
+                self._mark_state_dispatched(state)
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
+            if cancellation is not None:
+                raise cancellation
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
-        finally:
+        except BaseException as error:
             if not dispatched:
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                try:
+                    try:
+                        self.cuda_vmm_feature_transport.cancel_for_dispatch(
+                            prepared_mm_items
+                        )
+                    finally:
+                        try:
+                            cancel_undispatched_inputs(
+                                self._mm_feature_pool(), mm_inputs_batch
+                            )
+                        finally:
+                            for tokenized_obj in tokenized_objs:
+                                discard_shm_features(tokenized_obj)
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
 
     def _coalesce_streaming_chunks(
         self,
@@ -1796,7 +1881,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            if self.rid_to_state.get(state.obj.rid) is state:
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
@@ -1816,7 +1901,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        # Batch dispatch builds every waiter before advancing any.
+        # Dispatch captures every waiter before yielding to the socket send.
         # Both removers append the output after the del, so the ReqState stays valid.
         state = self.rid_to_state[obj.rid]
         return self._stream_one_response(obj=obj, state=state, request=request)
@@ -1939,10 +2024,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-        request_rids: Optional[set[str]] = None,
+        request_states: Optional[Dict[str, ReqState]] = None,
     ):
-        if request_rids is None:
-            request_rids = set(obj.rid)
+        if request_states is None:
+            request_states = {}
         batch_size = obj.batch_size
 
         generators = []
@@ -1950,16 +2035,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                try:
+                    for i in range(batch_size):
+                        tmp_obj = obj[i]
+                        state = self.rid_to_state[tmp_obj.rid]
+                        if tmp_obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                        generators.append(self._wait_one_response(tmp_obj, request))
+                        rids.append(tmp_obj.rid)
+                except BaseException:
+                    cancel_undispatched_inputs(
+                        self._mm_feature_pool(),
+                        (item.mm_inputs for item in tokenized_objs),
+                    )
+                    raise
                 await self._send_batch_request(tokenized_objs)
-
-                # Set up generators for each request in the batch
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    state = self.rid_to_state[tmp_obj.rid]
-                    if tmp_obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 with (
@@ -1972,11 +2062,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                        state = self.rid_to_state[tmp_obj.rid]
-                        if tmp_obj.return_prompt_token_ids:
-                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        try:
+                            state = self.rid_to_state[tmp_obj.rid]
+                            if tmp_obj.return_prompt_token_ids:
+                                state.prompt_token_ids = list(tokenized_obj.input_ids)
+                            generators.append(self._wait_one_response(tmp_obj, request))
+                        except BaseException:
+                            cancel_undispatched_inputs(
+                                self._mm_feature_pool(), (tokenized_obj.mm_inputs,)
+                            )
+                            raise
                         await self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -1989,16 +2085,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+            tokenized_objs = await gather_tokenized_requests(
+                (self._tokenize_one_request(item) for item in objs),
+                pool=self._mm_feature_pool(),
             )
+
+            raw_mm_inputs = [item.mm_inputs for item in tokenized_objs]
+            try:
+                clone_inputs = detach_for_parallel_sampling(
+                    self._mm_feature_pool(), raw_mm_inputs
+                )
+            finally:
+                cancel_undispatched_inputs(self._mm_feature_pool(), raw_mm_inputs)
+            for tokenized_obj, mm_inputs in zip(tokenized_objs, clone_inputs):
+                tokenized_obj.mm_inputs = mm_inputs
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                if tokenized_obj.mm_inputs is not None:
                     tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
                     tokenized_obj.mm_inputs.mm_items = [
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
@@ -2008,9 +2115,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
-                request_rids.add(tmp_obj.rid)
+                request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
+                response_generator = self._wait_one_response(tmp_obj, request)
                 await self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                await response_generator.__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -2018,20 +2126,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                    if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                    if tokenized_obj.mm_inputs is not None:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
-                    request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
+                    request_states[tmp_obj.rid] = state
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    await self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
+                    await self._send_one_request(tokenized_obj)
                     rids.append(tmp_obj.rid)
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
@@ -3608,15 +3716,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _release_req_states_on_failure(self, rids: Iterable[str]):
+    def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.
 
         Undelivered states are removed locally. Dispatched requests are aborted
         and retained until the scheduler response removes them.
         """
-        for rid in rids:
-            state = self.rid_to_state.get(rid)
-            if state is not None:
+        for rid, state in request_states.items():
+            if self.rid_to_state.get(rid) is state:
                 if state.dispatched:
                     try:
                         self.abort_request(rid)
@@ -3626,17 +3733,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                 else:
                     del self.rid_to_state[rid]
-            dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
-            if dispatch_ready is not None:
-                dispatch_ready.set()
+            self._release_encoder_dispatch_ready(rid, state)
 
-    def _forward_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
-        if error.rid in self.rid_to_state:
+    def _release_encoder_dispatch_ready(self, rid: str, state: ReqState) -> None:
+        dispatch_ready = state.encoder_dispatch_ready
+        if dispatch_ready is not None:
+            if self.encoder_dispatch_ready.get(rid) is dispatch_ready:
+                self.encoder_dispatch_ready.pop(rid)
+            state.encoder_dispatch_ready = None
+            dispatch_ready.set()
+
+    def _forward_encoder_dispatch_error(
+        self, error: EncoderDispatchErrorReq, state: ReqState
+    ) -> None:
+        if self.rid_to_state.get(error.rid) is state:
             self._dispatch_to_scheduler(error)
 
-    def _schedule_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
+    def _schedule_encoder_dispatch_error(
+        self, error: EncoderDispatchErrorReq, state: ReqState
+    ) -> None:
         self.event_loop.call_soon_threadsafe(
-            self._forward_encoder_dispatch_error, error
+            self._forward_encoder_dispatch_error, error, state
         )
 
     def _should_dispatch_to_encoder(
@@ -3682,18 +3799,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "zmq_to_scheduler",
                     "mooncake",
                 ]:
+                    state = self.rid_to_state[obj.rid]
                     time_stats_json = None
                     if self.enable_trace:
-                        state = self.rid_to_state.get(obj.rid)
-                        if state is not None:
-                            time_stats_json = state.time_stats.encode_json()
+                        time_stats_json = state.time_stats.encode_json()
 
                     dispatch_ready = self.mm_receiver.send_encode_request(
                         obj,
                         time_stats_json=time_stats_json,
-                        on_dispatch_error=self._schedule_encoder_dispatch_error,
+                        on_dispatch_error=partial(
+                            self._schedule_encoder_dispatch_error, state=state
+                        ),
                     )
                     if dispatch_ready is not None:
+                        state.encoder_dispatch_ready = dispatch_ready
                         self.encoder_dispatch_ready[obj.rid] = dispatch_ready
             else:
                 obj.need_wait_for_mm_inputs = False

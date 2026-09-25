@@ -74,7 +74,15 @@ class TestSessionRejectRawMedia(CustomTestCase):
         publish(self.args, role="scheduler")
         parallel = patch(
             "sglang.srt.managers.schedule_batch.get_parallel",
-            return_value=SimpleNamespace(tp_rank=0),
+            return_value=SimpleNamespace(
+                tp_rank=0,
+                tp_size=2,
+                attn_tp_rank=0,
+                attn_tp_size=2,
+                attn_cp_rank=0,
+                attn_cp_size=1,
+                pp_size=1,
+            ),
         )
         parallel.start()
         self.addCleanup(parallel.stop)

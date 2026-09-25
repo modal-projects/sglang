@@ -14,10 +14,15 @@ Covers:
 """
 
 import asyncio
+import threading
 import unittest
+from array import array
+from itertools import product
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -27,7 +32,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    BatchTokenizedGenerateReqInput,
+    EncoderDispatchErrorReq,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -37,6 +45,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -129,6 +138,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm.mm_processor = None
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -139,6 +149,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm._async_dispatch_to_scheduler = AsyncMock()
     return tm
 
 
@@ -507,8 +518,9 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
     def test_undelivered_single_is_dropped(self):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
-        tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._release_req_states_on_failure([rid])
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        tm._release_req_states_on_failure({rid: state})
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_undelivered_batch_removes_all(self):
@@ -516,7 +528,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
-        tm._release_req_states_on_failure(rids)
+        tm._release_req_states_on_failure(dict(tm.rid_to_state))
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
@@ -524,7 +536,9 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         """A rid that is no longer present must not raise."""
         tm = _make_tokenizer_manager(self)
         tm.rid_to_state["p1"] = _make_req_state("p1")
-        tm._release_req_states_on_failure(["p1", "already_gone"])
+        tm._release_req_states_on_failure(
+            {**tm.rid_to_state, "already_gone": _make_req_state("already_gone")}
+        )
         self.assertNotIn("p1", tm.rid_to_state)
 
     def test_dispatched_single_is_aborted_and_state_kept(self):
@@ -537,8 +551,8 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         state = _make_req_state(rid)
         state.dispatched = True
         tm.rid_to_state[rid] = state
-        tm._release_req_states_on_failure([rid])
-        tm._release_req_states_on_failure([rid])
+        tm._release_req_states_on_failure({rid: state})
+        tm._release_req_states_on_failure({rid: state})
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual(
@@ -558,7 +572,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         live.dispatched = True
         tm.rid_to_state[delivered] = live
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
-        tm._release_req_states_on_failure([delivered, undelivered])
+        tm._release_req_states_on_failure(dict(tm.rid_to_state))
 
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual([type(m) for m in sent], [AbortReq])
@@ -577,7 +591,7 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         tm.rid_to_state[undelivered] = _make_req_state(undelivered)
 
         with self.assertLogs(level="ERROR"):
-            tm._release_req_states_on_failure([delivered, undelivered])
+            tm._release_req_states_on_failure(dict(tm.rid_to_state))
 
         self.assertIn(delivered, tm.rid_to_state)
         self.assertFalse(live.abort_sent)
@@ -690,25 +704,41 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             self.assertNotIn(r, tm.rid_to_state)
 
     def test_parallel_sampling_failure_cleans_generated_rid(self):
-        tm = _make_tm_for_generate(self)
-        obj = GenerateReqInput(
-            text=["hello"],
-            rid=["base"],
-            sampling_params={"n": 2},
-        )
-        tokenized = MagicMock()
-        tokenized.mm_inputs = None
-        tokenized.sampling_params = MagicMock()
-        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
-        tm._send_one_request = Mock(side_effect=RuntimeError("dispatch failed"))
+        """Both prefix and sample states must join their handler's cleanup ownership."""
+        for fail_at_sample in (False, True):
+            with self.subTest(fail_at_sample=fail_at_sample):
+                tm = _make_tm_for_generate(self)
+                tm.request_metrics_exporter_manager = Mock()
+                tm.request_metrics_exporter_manager.exporter_enabled.return_value = (
+                    False
+                )
+                obj = GenerateReqInput(
+                    text=["hello"],
+                    rid=["base"],
+                    sampling_params={"n": 2},
+                )
+                tokenized = MagicMock()
+                tokenized.mm_inputs = None
+                tokenized.sampling_params = SimpleNamespace(max_new_tokens=1)
+                tm._tokenize_one_request = AsyncMock(return_value=tokenized)
 
-        async def drive():
-            await tm.generate_request(obj).__anext__()
+                async def send(request):
+                    if fail_at_sample and request.sampling_params.max_new_tokens == 0:
+                        await tm._handle_batch_output(
+                            _make_batch_str_output(request.rid)
+                        )
+                    else:
+                        raise RuntimeError("dispatch failed")
 
-        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-            asyncio.run(drive())
+                tm._send_one_request = send
 
-        self.assertFalse(tm.rid_to_state)
+                async def drive():
+                    await tm.generate_request(obj).__anext__()
+
+                with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+                    asyncio.run(drive())
+
+                self.assertFalse(tm.rid_to_state)
 
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate(self)
@@ -755,6 +785,256 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         self.assertEqual(out["meta_info"]["id"], rid)
         self.assertEqual(out["text"], "hello")
 
+    def test_terminal_output_during_dispatch_still_reaches_request_caller(self):
+        """A fast terminal response can free request state before send returns."""
+        for mode in ("single", "batch", "sequential", "parallel"):
+            with self.subTest(mode=mode):
+                tm = _make_tm_for_generate(self)
+                tm.request_metrics_exporter_manager = Mock()
+                tm.request_metrics_exporter_manager.exporter_enabled.return_value = (
+                    False
+                )
+                tm._should_use_batch_tokenization = Mock(return_value=mode == "batch")
+                obj = GenerateReqInput(
+                    input_ids=[1] if mode == "single" else [[1], [2]],
+                    sampling_params={"n": 2 if mode == "parallel" else 1},
+                    return_prompt_token_ids=True,
+                )
+
+                async def tokenize(request):
+                    return SimpleNamespace(
+                        rid=request.rid,
+                        input_ids=request.input_ids,
+                        mm_inputs=None,
+                        sampling_params=SimpleNamespace(max_new_tokens=1),
+                        time_stats=tm.rid_to_state[request.rid].time_stats,
+                    )
+
+                async def tokenize_batch(batch_size, request):
+                    return [await tokenize(request[i]) for i in range(batch_size)]
+
+                async def send_one(request):
+                    await tm._handle_batch_output(_make_batch_str_output(request.rid))
+                    self.assertNotIn(request.rid, tm.rid_to_state)
+
+                async def send_batch(requests):
+                    for request in requests:
+                        await send_one(request)
+
+                tm._tokenize_one_request = tokenize
+                tm._batch_tokenize_and_process = tokenize_batch
+                tm._send_one_request = send_one
+                tm._send_batch_request = send_batch
+
+                async def drive():
+                    return [result async for result in tm.generate_request(obj)]
+
+                results = asyncio.run(drive())
+                outputs = results if mode == "single" else results[0]
+                expected_count = {
+                    "single": 1,
+                    "batch": 2,
+                    "sequential": 2,
+                    "parallel": 4,
+                }
+                self.assertEqual(len(outputs), expected_count[mode])
+                self.assertTrue(all(output["text"] == "hello" for output in outputs))
+                self.assertTrue(
+                    all(
+                        output["prompt_token_ids"] == [1]
+                        or output["prompt_token_ids"] == [2]
+                        for output in outputs
+                    )
+                )
+                for output in outputs:
+                    self.assertNotIn(output["meta_info"]["id"], tm.rid_to_state)
+
+
+class TestFailureCleanupAfterRequestIdReuse(CustomTestCase):
+    def test_old_send_failure_preserves_replacement_state(self):
+        """A terminal reply and RID reuse can precede the old send's completion."""
+        for mode, failure, dispatched in product(
+            ("single", "batch", "parallel_prefix", "parallel_sample"),
+            ("cancel", "bookkeeping", "terminal_abort"),
+            (False, True),
+        ):
+            with self.subTest(mode=mode, failure=failure, dispatched=dispatched):
+                self._check_reused_state(mode, failure, dispatched)
+
+    def _check_reused_state(self, mode, failure, replacement_dispatched):
+        tm = _make_tm_for_generate(self)
+        tm.request_metrics_exporter_manager = Mock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm._dispatch_to_scheduler = Mock()
+        tm._should_use_batch_tokenization = Mock(return_value=mode == "batch")
+        obj = GenerateReqInput(
+            input_ids=[1] if mode == "single" else [[1]],
+            sampling_params={"n": 2 if mode.startswith("parallel") else 1},
+        )
+        send_error = RuntimeError("dispatch bookkeeping failed")
+        old_ready = threading.Event()
+        replacement_ready = threading.Event()
+        replaced = {}
+
+        async def tokenize(request):
+            result = TokenizedGenerateReqInput(
+                rid=request.rid,
+                input_text=None,
+                input_ids=array("q", [1]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+            result.time_stats = tm.rid_to_state[request.rid].time_stats
+            return result
+
+        async def tokenize_batch(batch_size, request):
+            return [await tokenize(request[i]) for i in range(batch_size)]
+
+        async def dispatch(request):
+            requests = (
+                request.batch
+                if isinstance(request, BatchTokenizedGenerateReqInput)
+                else [request]
+            )
+            target = requests[0]
+            if replaced:
+                for item in requests:
+                    await tm._handle_batch_output(_make_batch_str_output(item.rid))
+                return
+            if mode == "parallel_sample" and target.sampling_params.max_new_tokens == 0:
+                await tm._handle_batch_output(_make_batch_str_output(target.rid))
+                return
+            original = tm.rid_to_state[target.rid]
+            original.encoder_dispatch_ready = old_ready
+            tm.encoder_dispatch_ready[target.rid] = old_ready
+            if failure == "bookkeeping":
+                target.time_stats.set_api_server_dispatch_finish_time = Mock(
+                    side_effect=send_error
+                )
+            finish = (
+                {"type": "abort", "status_code": 503, "message": "old terminal failure"}
+                if failure == "terminal_abort"
+                else None
+            )
+            for item in requests:
+                await tm._handle_batch_output(
+                    _make_batch_str_output(item.rid, finished_reason=finish)
+                )
+            replacement_obj = GenerateReqInput(input_ids=[2], rid=target.rid)
+            replacement_obj.normalize_batch_and_arguments()
+            tm._init_req_state(replacement_obj)
+            replacement = tm.rid_to_state[target.rid]
+            replacement.dispatched = replacement_dispatched
+            replacement.encoder_dispatch_ready = replacement_ready
+            tm.encoder_dispatch_ready[target.rid] = replacement_ready
+            replaced.update(rid=target.rid, state=replacement)
+            if failure == "cancel":
+                task.cancel()
+                await asyncio.sleep(0)
+
+        tm._tokenize_one_request = tokenize
+        tm._batch_tokenize_and_process = tokenize_batch
+        tm._async_dispatch_to_scheduler = dispatch
+
+        async def drive():
+            nonlocal task
+            task = asyncio.create_task(tm.generate_request(obj).__anext__())
+            error_type = {
+                "cancel": asyncio.CancelledError,
+                "bookkeeping": RuntimeError,
+                "terminal_abort": HTTPException,
+            }[failure]
+            with self.assertRaises(error_type) as raised:
+                await task
+            if failure == "bookkeeping":
+                self.assertIs(raised.exception, send_error)
+            elif failure == "terminal_abort":
+                self.assertEqual(raised.exception.status_code, 503)
+
+        task = None
+        asyncio.run(drive())
+        self.assertEqual(list(tm.rid_to_state), [replaced["rid"]])
+        self.assertIs(tm.rid_to_state[replaced["rid"]], replaced["state"])
+        self.assertFalse(replaced["state"].abort_sent)
+        self.assertEqual(replaced["state"].dispatched, replacement_dispatched)
+        self.assertTrue(old_ready.is_set())
+        self.assertFalse(replacement_ready.is_set())
+        self.assertIs(tm.encoder_dispatch_ready[replaced["rid"]], replacement_ready)
+        self.assertEqual(tm._dispatch_to_scheduler.call_args_list, [])
+
+    def test_old_encoder_callback_cannot_target_reused_request_id(self):
+        """Releasing an old encoder waiter must not forward its error to a new RID owner."""
+        tm = _make_tm_for_generate(self)
+        tm.request_metrics_exporter_manager = Mock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        tm._dispatch_to_scheduler = Mock()
+        events = [threading.Event(), threading.Event()]
+        callbacks = []
+
+        def encode(request, *, time_stats_json, on_dispatch_error):
+            callbacks.append(on_dispatch_error)
+            return events[len(callbacks) - 1]
+
+        tm.mm_receiver = SimpleNamespace(send_encode_request=encode)
+        override = get_context().override_server_args(
+            enable_adaptive_dispatch_to_encoder=False,
+            encoder_transfer_backend="zmq_to_scheduler",
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        def create_owner():
+            obj = GenerateReqInput(
+                input_ids=[1], image_data=["synthetic"], rid="encoder-reuse"
+            )
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            tm._handle_epd_disaggregation_encode_request(obj)
+            return tm.rid_to_state[obj.rid]
+
+        async def drive():
+            tm.event_loop = asyncio.get_running_loop()
+            original = create_owner()
+            error = EncoderDispatchErrorReq(
+                rid="encoder-reuse", error_msg="old encoder failed", error_code=502
+            )
+            callbacks[0](error)
+            await asyncio.sleep(0)
+            self.assertEqual(
+                [call.args[0] for call in tm._dispatch_to_scheduler.call_args_list],
+                [error],
+            )
+            tm._dispatch_to_scheduler.reset_mock()
+            await tm._handle_batch_output(_make_batch_str_output("encoder-reuse"))
+            replacement = create_owner()
+            tm._release_req_states_on_failure({"encoder-reuse": original})
+            callbacks[0](error)
+            await asyncio.sleep(0)
+            self.assertIs(tm.rid_to_state["encoder-reuse"], replacement)
+            self.assertIs(tm.encoder_dispatch_ready["encoder-reuse"], events[1])
+            self.assertTrue(events[0].is_set())
+            self.assertFalse(events[1].is_set())
+            self.assertEqual(tm._dispatch_to_scheduler.call_args_list, [])
+            callbacks[1](error)
+            await asyncio.sleep(0)
+            self.assertEqual(
+                [call.args[0] for call in tm._dispatch_to_scheduler.call_args_list],
+                [error],
+            )
+
+        asyncio.run(drive())
+
 
 class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
     """Cancellation after dispatch must stop the scheduler request."""
@@ -782,10 +1062,10 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
             task = asyncio.create_task(tm.generate_request(obj).__anext__())
             for _ in range(100):
                 await asyncio.sleep(0)
-                if tm._dispatch_to_scheduler.called:
+                if tm.rid_to_state[rid].dispatched:
                     break
             self.assertTrue(
-                tm._dispatch_to_scheduler.called, "request never dispatched"
+                tm._async_dispatch_to_scheduler.called, "request never dispatched"
             )
             state = tm.rid_to_state.get(rid)
             self.assertIsNotNone(state)

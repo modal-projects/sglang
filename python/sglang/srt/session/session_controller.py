@@ -60,6 +60,8 @@ class SessionReqNode:
         if self.req.finished_reason is None:
             self.req.to_finish = FINISH_ABORT()
         del req_dict[self.req.rid]
+        if self.req.session is not None:
+            self.req.session.retire_req(self.req)
 
     def abort(self):
         if self.req.finished_reason is None:
@@ -98,6 +100,8 @@ class Session:
         self.close_on_finish: bool = False
         self._inflight: bool = False
         self._inflight_rid: Optional[str] = None
+        self._active_reqs: Dict[int, Req] = {}
+        self._retired_reqs: Dict[int, Req] = {}
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -111,9 +115,91 @@ class Session:
         return time.monotonic() - self.last_active_time > self.timeout
 
     def has_unfinished_request(self) -> bool:
-        if self.streaming and self._inflight:
+        if self._active_reqs or (self.streaming and self._inflight):
             return True
-        return any(not node.req.finished() for node in self.req_nodes.values())
+        return any(not req.finished() for req in self._iter_reqs())
+
+    def _iter_reqs(self):
+        yield from (node.req for node in self.req_nodes.values())
+        yield from self._retired_reqs.values()
+        yield from self._active_reqs.values()
+
+    def retire_req(self, req: Req) -> None:
+        if req.finished() and id(req) not in self._active_reqs:
+            self.release_req_mm_inputs(req)
+        else:
+            # Replacement removes history before the scheduler finishes its work.
+            self._retired_reqs[id(req)] = req
+
+    def _unlink_req_node(self, node: SessionReqNode) -> None:
+        if self.req_nodes.get(node.req.rid) is node:
+            del self.req_nodes[node.req.rid]
+        parent = node.parent
+        if parent is not None:
+            index = parent.children.index(node)
+            parent.children[index : index + 1] = node.children
+        for child in node.children:
+            child.parent = parent
+        node.parent = None
+        node.children = []
+
+    def discard_req(self, req: Req) -> None:
+        assert not (
+            req.kv.holds_kv
+            or req.kv.holds_mamba
+            or req.kv.retraction_backup is not None
+        ), "An abandoned session turn must release its KV ownership before discard"
+        node = self.req_nodes.get(req.rid)
+        if node is not None and node.req is req:
+            self._unlink_req_node(node)
+        self._retire_aborted_req_mm_inputs(req)
+
+    def release_finished_req_mm_inputs(self, req: Req) -> None:
+        # A finish reason can precede deferred KV release. The scheduler calls
+        # this only after its terminal resource cleanup is complete.
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            self._retire_aborted_req_mm_inputs(req)
+        elif id(req) in self._retired_reqs:
+            self.release_req_mm_inputs(req)
+        else:
+            self._active_reqs.pop(id(req), None)
+
+    def _retire_aborted_req_mm_inputs(self, req: Req) -> None:
+        if self._active_reqs.get(id(req)) is req and self._inflight_rid == req.rid:
+            self._inflight = False
+            self._inflight_rid = None
+        node = self.req_nodes.get(req.rid)
+        if not self.streaming and node is not None and node.req is req:
+            # Tree sessions allow later turns to append to aborted history.
+            self._active_reqs.pop(id(req), None)
+        else:
+            self.release_req_mm_inputs(req)
+
+    def release_req_mm_inputs(self, req: Req) -> None:
+        mm = req.multimodal_inputs
+        if mm is not None:
+            if not (req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens):
+                (
+                    req.mm_image_tokens,
+                    req.mm_audio_tokens,
+                    req.mm_video_tokens,
+                ) = mm.compute_mm_token_counts()
+            retained = {
+                id(item)
+                for other in self._iter_reqs()
+                if other is not req and other.multimodal_inputs is not None
+                for item in other.multimodal_inputs.mm_items
+            }
+            owned = []
+            for item in mm.mm_items:
+                if id(item) not in retained:
+                    retained.add(id(item))
+                    owned.append(item)
+            if owned:
+                mm.release_features(owned)
+            req.multimodal_inputs = None
+        self._retired_reqs.pop(id(req), None)
+        self._active_reqs.pop(id(req), None)
 
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -247,8 +333,8 @@ class Session:
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
+                while self.req_nodes:
+                    next(iter(self.req_nodes.values())).clear(self.req_nodes)
             else:
                 if session_params.rid not in self.req_nodes:
                     abort = True
@@ -336,7 +422,7 @@ class Session:
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
-        if last_req is not None:
+        if last_req is not None and not abort:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
@@ -351,8 +437,15 @@ class Session:
             self._inflight_rid = req.rid
         else:
             self.last_active_time = time.monotonic()
+            previous = self.req_nodes.get(req.rid)
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
+            if previous is not None:
+                self._unlink_req_node(previous)
+                self.retire_req(previous.req)
+
+        if not abort:
+            self._active_reqs[id(new_req)] = new_req
 
         return new_req
 
@@ -360,22 +453,31 @@ class Session:
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
         self._inflight_rid = None
+        self._active_reqs.pop(id(req), None)
+        previous = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
+            previous = prev_node.req
             self.req_nodes.clear()
         self.req_nodes[req.rid] = SessionReqNode(req)
+        if previous is not None and previous is not req:
+            self.release_req_mm_inputs(previous)
         # Confirm this req's token arrays as the session's rollback point.
         self.committed_origin_len = len(req.origin_input_ids)
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
     def abort_req(self, rid: Optional[str] = None):
-        """Clear inflight flag on abort (req_nodes stays unchanged)."""
-        if rid is not None and self._inflight_rid != rid:
+        """Retire an aborted turn after its KV ownership has been released."""
+        if self.streaming and rid is not None and self._inflight_rid != rid:
             return
+        target_rid = self._inflight_rid if rid is None else rid
         self._inflight = False
         self._inflight_rid = None
+        for req in list(self._active_reqs.values()):
+            if req.rid == target_rid:
+                self._retire_aborted_req_mm_inputs(req)
 
 
 class SessionController:
@@ -425,12 +527,9 @@ class SessionController:
             [last_node] = session.req_nodes.values()
             req = last_node.req
 
-        if session.streaming and session.has_unfinished_request():
-            # An in-flight request is still decoding on this session's KV
-            # memory. Freeing now would corrupt the scheduler. Mark the
-            # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
-            # and we schedule release_session for after it completes.
+        if session.has_unfinished_request():
+            # A finish reason may precede deferred KV release. Keep media and
+            # session storage until the scheduler retires every active owner.
             session.close_on_finish = True
             logger.info(
                 "Deferring session close for %s (unfinished request)",
@@ -446,13 +545,19 @@ class SessionController:
         # Release multimodal features held by session requests.
         # Session reqs skip the normal mm cleanup path (scheduler and
         # output_processor) so features stay alive until the session closes.
-        seen_mm = set()
-        for node in session.req_nodes.values():
-            mm = node.req.multimodal_inputs
-            if mm is not None and id(mm) not in seen_mm:
-                seen_mm.add(id(mm))
-                mm.release_features()
-            node.req.multimodal_inputs = None
+        seen_items = set()
+        for retained_req in session._iter_reqs():
+            mm = retained_req.multimodal_inputs
+            if mm is not None:
+                owned = []
+                for item in mm.mm_items:
+                    if id(item) not in seen_items:
+                        seen_items.add(id(item))
+                        owned.append(item)
+                if owned:
+                    mm.release_features(owned)
+            retained_req.multimodal_inputs = None
+        session._retired_reqs.clear()
 
         self.tree_cache.release_radix_session(session_id)
         self.tree_cache.release_session(session_id)
@@ -504,9 +609,7 @@ class SessionController:
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:
-        if not session.req_nodes:
-            return True
-        return all(node.req.finished() for node in session.req_nodes.values())
+        return not session.has_unfinished_request()
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

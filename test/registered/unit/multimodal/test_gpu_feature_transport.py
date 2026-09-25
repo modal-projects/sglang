@@ -378,11 +378,12 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(TokenizerManager)
         manager.rid_to_state = {}
+        manager.mm_processor = None
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         transport.prepare_for_dispatch_async = AsyncMock(return_value=[])
         manager.cuda_vmm_feature_transport = transport
-        manager._dispatch_to_scheduler = MagicMock()
+        manager._async_dispatch_to_scheduler = AsyncMock()
         tokenized_obj = SimpleNamespace(
             rid="test-request",
             mm_inputs=None,
@@ -393,7 +394,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         with patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj):
             asyncio.run(manager._send_one_request(tokenized_obj))
 
-        manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
+        manager._async_dispatch_to_scheduler.assert_awaited_once_with(tokenized_obj)
         transport.prepare_for_dispatch_async.assert_awaited_once_with((None,))
         transport.cancel_for_dispatch.assert_not_called()
 
@@ -407,9 +408,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.mm_processor = None
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
-        manager._dispatch_to_scheduler = MagicMock(
+        manager._async_dispatch_to_scheduler = AsyncMock(
             side_effect=RuntimeError("send failed")
         )
         items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
@@ -443,9 +445,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.mm_processor = None
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
-        manager._dispatch_to_scheduler = MagicMock()
+        manager._async_dispatch_to_scheduler = AsyncMock()
         time_stats = MagicMock()
         time_stats.set_api_server_dispatch_finish_time.side_effect = RuntimeError(
             "bookkeeping failed"
@@ -466,7 +469,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         ):
             asyncio.run(manager._send_one_request(tokenized_obj))
 
-        manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
+        manager._async_dispatch_to_scheduler.assert_awaited_once_with(tokenized_obj)
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_async_publication_keeps_event_loop_responsive(self):

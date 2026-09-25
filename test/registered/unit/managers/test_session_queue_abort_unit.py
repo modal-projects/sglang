@@ -1,4 +1,3 @@
-import dataclasses
 import types
 import unittest
 from array import array
@@ -65,6 +64,20 @@ PAGE = 1
 KV_SIZE = 512
 MAMBA_SIZE = 8
 VOCAB_SIZE = 32000
+
+
+class _TrackedMediaItem(MultimodalDataItem):
+    release_count: int = 0
+
+    def release_transport_proxies(self, consumer_count: int = 1) -> None:
+        self.release_count += 1
+        super().release_transport_proxies(consumer_count)
+
+
+def _media_item():
+    return _TrackedMediaItem(
+        modality=Modality.IMAGE, feature=torch.ones(1), offsets=[(0, 0)]
+    )
 
 
 def _build():
@@ -618,7 +631,7 @@ class TestSessionQueueAbort(CustomTestCase):
                 )
                 req.init_next_round_input(cache)
                 _prefill(req, cache, allocator, req_to_token_pool)
-                own_media = Mock(feature=torch.ones(1))
+                own_media = _media_item()
                 req.multimodal_inputs = MultimodalInputs(mm_items=[own_media])
 
                 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -706,11 +719,13 @@ class TestSessionQueueAbort(CustomTestCase):
                     manager.note_abort_ack(req.bootstrap_room, 0)
                     transfer_queue.resolve_deferred_releases()
                     self.assertTrue(session.has_unfinished_request())
+                    self.assertEqual(own_media.feature.tolist(), [1.0])
                     manager.note_abort_ack(req.bootstrap_room, 1)
                     transfer_queue.resolve_deferred_releases()
                     transfer_queue.resolve_deferred_releases()
                     self.assertEqual(transfer_queue._deferred_releases, [])
                 self.assertIsNone(own_media.feature)
+                self.assertEqual(own_media.release_count, 1)
                 self.assertFalse(session.has_unfinished_request())
                 self.assertIsNone(req.kv.req_pool_idx)
                 self._assert_idle(observer, checker)
@@ -1179,8 +1194,7 @@ class TestSessionQueueAbort(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda **kwargs: None)
         )
-        media_item = Mock()
-        media_item.feature = Mock()
+        media_item = _media_item()
         req.multimodal_inputs = MultimodalInputs(mm_items=[media_item])
 
         scheduler = _scheduler_stub(cache)
@@ -1195,7 +1209,7 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertEqual(req.finished_reason.status_code, 500)
         self.assertFalse(fresh.has_unfinished_request())
-        media_item.release_transport_proxies.assert_called_once_with()
+        self.assertEqual(media_item.release_count, 1)
         self.assertIsNone(media_item.feature)
         self.assertIsNone(req.multimodal_inputs)
         scheduler.metrics_collector.increment_bootstrap_failed_reqs.assert_called_once()
@@ -1557,7 +1571,8 @@ class TestSessionQueueAbort(CustomTestCase):
         # Finished in the last forward but not yet dropped by
         # filter_finished_reqs(); the abort must not restamp it.
         req.finished_reason = FINISH_LENGTH(length=1)
-        req.multimodal_inputs = Mock()
+        media_item = _media_item()
+        req.multimodal_inputs = MultimodalInputs(mm_items=[media_item])
 
         scheduler = _scheduler_stub(cache)
         scheduler.dllm_config = object()
@@ -1570,6 +1585,8 @@ class TestSessionQueueAbort(CustomTestCase):
 
         self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
         self.assertIsNotNone(req.multimodal_inputs)
+        self.assertEqual(media_item.feature.tolist(), [1.0])
+        self.assertEqual(media_item.release_count, 0)
         send_output.assert_not_called()
 
     def test_dllm_abort_defers_req_with_pending_overlap_result(self):
@@ -1801,13 +1818,16 @@ class TestSessionQueueAbort(CustomTestCase):
             tokenizer=None,
             vocab_size=VOCAB_SIZE,
         )
-        mm = Mock()
-        req.multimodal_inputs = mm
+        media_item = _media_item()
+        req.multimodal_inputs = MultimodalInputs(mm_items=[media_item])
         scheduler = _scheduler_stub(cache)
 
+        scheduler._prepare_queue_abort(req, AbortReq(rid=req.rid))
         scheduler._release_dropped_waiting_req_mm_inputs(req)
 
-        mm.release_features.assert_called_once_with()
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(media_item.release_count, 1)
+        self.assertIsNone(media_item.feature)
         self.assertIsNone(req.multimodal_inputs)
         self.assertFalse(fresh.has_unfinished_request())
         self._assert_idle(_observer, _checker)
@@ -1827,7 +1847,8 @@ class TestSessionQueueAbort(CustomTestCase):
         ) = self._setup_first_turn()
         # The committed first turn holds the session's shared multimodal
         # inputs; a new turn inherits that exact object (see create_req).
-        shared_mm = Mock()
+        media_item = _media_item()
+        shared_mm = MultimodalInputs(mm_items=[media_item])
         [committed] = session.req_nodes.values()
         committed.req.multimodal_inputs = shared_mm
         req2 = session.create_req(
@@ -1838,10 +1859,14 @@ class TestSessionQueueAbort(CustomTestCase):
         self.assertIs(req2.multimodal_inputs, shared_mm)
         scheduler = _scheduler_stub(cache)
 
+        scheduler._prepare_queue_abort(req2, AbortReq(rid=req2.rid))
         scheduler._release_dropped_waiting_req_mm_inputs(req2)
 
-        shared_mm.release_features.assert_not_called()
-        self.assertIs(req2.multimodal_inputs, shared_mm)
+        self.assertIsInstance(req2.finished_reason, FINISH_ABORT)
+        self.assertEqual(media_item.release_count, 0)
+        self.assertEqual(media_item.feature.tolist(), [1.0])
+        self.assertIs(committed.req.multimodal_inputs, shared_mm)
+        self.assertIsNone(req2.multimodal_inputs)
         self.assertFalse(session.has_unfinished_request())
 
     def test_restored_turn_drop_releases_only_turn_added_mm_items(self):
@@ -1857,10 +1882,8 @@ class TestSessionQueueAbort(CustomTestCase):
             _checker,
             session,
         ) = self._setup_first_turn()
-        inherited_item = Mock()
-        inherited_item.feature = Mock()
-        own_item = Mock()
-        own_item.feature = Mock()
+        inherited_item = _media_item()
+        own_item = _media_item()
         [committed] = session.req_nodes.values()
         committed.req.multimodal_inputs = MultimodalInputs(mm_items=[inherited_item])
         req2 = session.create_req(
@@ -1868,20 +1891,19 @@ class TestSessionQueueAbort(CustomTestCase):
             tokenizer=None,
             vocab_size=VOCAB_SIZE,
         )
-        # The turn appends its own media on a private copy, leaving the
-        # session's shared object untouched (see _extend_session_image_inputs).
-        req2.multimodal_inputs = dataclasses.replace(req2.multimodal_inputs)
-        req2.multimodal_inputs.mm_items = req2.multimodal_inputs.mm_items + [own_item]
+        req2.extend_image_inputs(MultimodalInputs(mm_items=[own_item]))
         scheduler = _scheduler_stub(cache)
 
+        scheduler._prepare_queue_abort(req2, AbortReq(rid=req2.rid))
         scheduler._release_dropped_waiting_req_mm_inputs(req2)
 
         # The turn's own addition is released...
-        own_item.release_transport_proxies.assert_called_once_with()
+        self.assertEqual(own_item.release_count, 1)
         self.assertIsNone(own_item.feature)
+        self.assertIsNone(req2.multimodal_inputs)
         # ...while the shared inherited item and history are preserved.
-        inherited_item.release_transport_proxies.assert_not_called()
-        self.assertIsNotNone(inherited_item.feature)
+        self.assertEqual(inherited_item.release_count, 0)
+        self.assertEqual(inherited_item.feature.tolist(), [1.0])
         self.assertEqual(committed.req.multimodal_inputs.mm_items, [inherited_item])
         self.assertFalse(session.has_unfinished_request())
         # The session stays usable: a follow-up turn inherits the intact
@@ -1908,7 +1930,7 @@ class TestSessionQueueAbort(CustomTestCase):
                 )
                 req.init_next_round_input(cache)
                 _prefill(req, cache, allocator, pool)
-                own_media = Mock(feature=torch.ones(1))
+                own_media = _media_item()
                 req.multimodal_inputs = MultimodalInputs(mm_items=[own_media])
                 scheduler = _scheduler_stub(cache)
                 fdfo = shape == "zero_accept"
@@ -1971,6 +1993,7 @@ class TestSessionQueueAbort(CustomTestCase):
                     self.assertEqual(req.finished_reason.status_code, 503)
                     self.assertEqual(list(req.output_ids), [])
                     self.assertIsNone(own_media.feature)
+                    self.assertEqual(own_media.release_count, 1)
                     self.assertFalse(session.has_unfinished_request())
                     self.assertFalse(req.kv.holds_kv)
                     self.assertFalse(cache.session.has_slot(session.session_id))
@@ -1984,6 +2007,7 @@ class TestSessionQueueAbort(CustomTestCase):
                         scheduler, batch, result
                     )
                     self.assertEqual(release.call_count, 1)
+                    self.assertEqual(own_media.release_count, 1)
                     self.assertEqual(
                         snapshot,
                         (

@@ -293,6 +293,7 @@ def release_kv_cache(
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
+        _finish_session_media(req, is_retract=is_retract)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
@@ -307,6 +308,7 @@ def release_kv_cache(
     # internally, then sets req_pool_idx = None.
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     if not req.kv.holds_kv:
+        _finish_session_media(req, is_retract=is_retract)
         return
 
     start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
@@ -324,6 +326,14 @@ def release_kv_cache(
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
     req.kv.mark_kv_released()
+    _finish_session_media(req, is_retract=is_retract)
+
+
+def _finish_session_media(req: Req, *, is_retract: bool) -> None:
+    # A terminal reason may precede asynchronous KV transfer completion.
+    # Retire the request's media owner only at this completed release boundary.
+    if not is_retract and req.session is not None and req.finished():
+        req.session.release_finished_req_mm_inputs(req)
 
 
 def _release_overallocated_kv_indices(

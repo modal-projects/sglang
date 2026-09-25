@@ -40,14 +40,28 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler._add_request_to_queue = MagicMock()
                 scheduler.output_streamer = MagicMock()
+                scheduler.tree_cache = MagicMock()
+                scheduler.beam_coordinator = MagicMock()
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
                     input_embeds=None,
                     bootstrap_port=1,
                     bootstrap_room=9,
+                    mm_inputs=None,
                 )
-                req = MagicMock(return_sampling_mask=True, return_logprob=False)
+                req = MagicMock(
+                    return_sampling_mask=True,
+                    return_logprob=False,
+                    to_finish=None,
+                    finished_reason=None,
+                    session=None,
+                    multimodal_inputs=None,
+                    kv=SimpleNamespace(
+                        retraction_backup=None, holds_kv=False, holds_mamba=False
+                    ),
+                )
+                req.finished.return_value = True
                 with (
                     patch(
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",

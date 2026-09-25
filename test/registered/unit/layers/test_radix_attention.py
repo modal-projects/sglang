@@ -83,6 +83,20 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             raw_num_tokens=None,
         )
 
+    def test_zero_padded_tail_supports_strided_dcp_output(self):
+        # DCP attention can expose a head-sharded, non-contiguous output view.
+        # The PCG cleanup must mutate that view's backing storage rather than
+        # requiring a contiguous flattening.
+        storage = torch.full((4, 3, 2), 7.0)
+        output = storage.transpose(1, 2)
+        self.assertFalse(output.is_contiguous())
+        context = SimpleNamespace(num_tokens=4, raw_num_tokens=2)
+
+        radix_attention_module._zero_padded_pcg_tail(output, context)
+
+        self.assertTrue(torch.all(output[:2] == 7))
+        self.assertTrue(torch.all(output[2:] == 0))
+
     def test_forward_dispatches_all_graph_and_lse_variants(self):
         layer = self._new_layer()
         query = torch.zeros((4, 2, 3))

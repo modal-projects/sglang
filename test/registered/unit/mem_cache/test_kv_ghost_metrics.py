@@ -282,6 +282,35 @@ class TestKVGhostMetrics(CustomTestCase):
             self._metric(registry, "kv_recomputed_after_evict_tokens_total"), 4
         )
 
+    def test_equal_lookup_keys_share_history_across_integer_storage_widths(self):
+        """Logical page identity cannot depend on the token buffer element width."""
+        for bigram in (False, True):
+            with self.subTest(bigram=bigram):
+                cache, registry = self._cache()
+                tokens = range(5 if bigram else 4)
+                keys = [
+                    RadixKey(
+                        array(typecode, tokens),
+                        extra_key="adapter",
+                        cache_salt="tenant-a",
+                        is_bigram=bigram,
+                    )
+                    for typecode in ("q", "I")
+                ]
+                self.assertEqual(keys[0].match(keys[1]), len(keys[0]))
+                for start in range(0, len(keys[0]), cache.page_size):
+                    self.assertEqual(
+                        keys[0].child_key_at(start, cache.page_size),
+                        keys[1].child_key_at(start, cache.page_size),
+                    )
+                cache.insert(InsertParams(key=keys[0], value=torch.arange(4)))
+                cache.evict(EvictParams(num_tokens=4))
+                cache.insert(InsertParams(key=keys[1], value=torch.arange(4)))
+                self.assertEqual(
+                    self._metric(registry, "kv_recomputed_after_evict_tokens_total"), 4
+                )
+                self.assertEqual(len(cache.tree_core.ghost_tracker._entries), 0)
+
     def test_split_preserves_salted_bigram_page_identity(self):
         """Splitting at page boundaries must preserve the evicted suffix identity."""
         for bigram in (False, True):

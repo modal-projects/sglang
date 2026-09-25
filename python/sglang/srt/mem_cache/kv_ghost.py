@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from array import array
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
 
@@ -64,12 +63,10 @@ def _node_digests(node: UnifiedTreeNode, page_size: int) -> list[bytes]:
             prior = namespace.digest()
         digests = []
         for start in range(0, len(key) // page_size * page_size, page_size):
-            page = key[start : start + page_size]
-            token_ids = page.raw_token_ids()
-            if not isinstance(token_ids, array):
-                token_ids = array("q", token_ids)
+            # Use the lookup identity, including any content-aware key fields.
+            page_key = key.child_key_at(start, page_size)
             prior = hashlib.blake2b(
-                prior + token_ids.tobytes(), digest_size=16
+                prior + msgspec.msgpack.encode(page_key), digest_size=16
             ).digest()
             digests.append(prior)
         current.ghost_digests = previous = digests

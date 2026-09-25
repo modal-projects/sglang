@@ -278,6 +278,7 @@ class TestMambaCacheMissAdmission(CustomTestCase):
             device="cpu",
             forward_ct=0,
             waiting_queue=[],
+            chunked_req=None,
             grammar_manager=[],
             enable_priority_scheduling=False,
             enable_hierarchical_cache=False,

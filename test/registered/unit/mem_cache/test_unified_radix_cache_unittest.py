@@ -765,9 +765,9 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                 return capacity["available"]
             return real_available_size(requested_type)
 
-        def free_values(device_frees, host_frees):
+        def free_values(device_frees, host_frees, **kwargs):
             freed_auxiliary = bool(device_frees.get(component_type))
-            real_free_values(device_frees, host_frees)
+            real_free_values(device_frees, host_frees, **kwargs)
             if freed_auxiliary:
                 auxiliary_drains["count"] += 1
                 capacity["available"] = self._SHORTFALL
@@ -9436,7 +9436,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             with self.subTest(step=name):
                 drained = []
 
-                def record(device_frees, host_frees):
+                def record(device_frees, host_frees, **kwargs):
                     drained.append((dict(device_frees), dict(host_frees)))
                     device_frees.clear()
                     host_frees.clear()

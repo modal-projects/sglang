@@ -2105,6 +2105,19 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
         )
 
 
+_CACHE_EVICTION_CAUSES = frozenset(
+    (
+        "full_pressure",
+        "swa_pressure",
+        "mamba_pressure",
+        "mamba_donor",
+        "host_pressure",
+        "mamba_path_cap",
+        "other",
+    )
+)
+
+
 class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
@@ -2284,6 +2297,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
+        self.evicted_tokens_by_cause = None
+        self.mamba_states_evicted = None
+        self._eviction_counter_cls = Counter
+
     def configure_logical_cache_metrics(
         self, *, emit_cache_metrics: bool, logical_labels: Dict[str, str]
     ) -> None:
@@ -2362,6 +2379,43 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         if self._kv_ghost_initialized:
             self.kv_recomputed_after_evict_tokens.inc(num_tokens)
             self.kv_reinsert_after_evict_seconds.observe(delay_seconds)
+
+    def _init_eviction_cause_metrics(self) -> None:
+        Counter = self._eviction_counter_cls
+        self.evicted_tokens_by_cause = Counter(
+            name="sglang:kv_evicted_tokens_by_cause_total",
+            documentation="Cached Full or SWA token slots released by Unified "
+            "cache eviction, by component, tier and initiating cause. "
+            "Includes demotion and collateral frees; excludes request-owned "
+            "and duplicate-insert frees. Exported once per attention replica.",
+            labelnames=list(self.logical_labels) + ["component", "tier", "cause"],
+        )
+        self.mamba_states_evicted = Counter(
+            name="sglang:mamba_states_evicted_total",
+            documentation="Cached Mamba state slots released by Unified cache "
+            "eviction, by tier and initiating cause. Includes collateral "
+            "and path-cap frees. Exported once per attention replica.",
+            labelnames=list(self.logical_labels) + ["tier", "cause"],
+        )
+
+    def increment_eviction_cause(
+        self, num_evicted: int, component: str, tier: str, cause: str
+    ) -> None:
+        if not self.emit_cache_metrics or num_evicted <= 0:
+            return
+        if cause not in _CACHE_EVICTION_CAUSES:
+            cause = "other"
+        if tier not in ("device", "host"):
+            raise ValueError(f"Unknown cache eviction tier: {tier}")
+        if self.evicted_tokens_by_cause is None:
+            self._init_eviction_cause_metrics()
+        labels = dict(self.logical_labels, tier=tier, cause=cause)
+        if component == "mamba":
+            self.mamba_states_evicted.labels(**labels).inc(num_evicted)
+        elif component in ("full", "swa"):
+            self.evicted_tokens_by_cause.labels(**labels, component=component).inc(
+                num_evicted
+            )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)

@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
+    EvictionFreeCause,
     InsertStepResult,
     NodeId,
     PrefixRef,
@@ -261,15 +262,35 @@ def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
     return {int(component): freed for component, freed in tracker.items()}
 
 
+def _append_eviction_frees(binding_result, device_frees, host_frees, free_causes):
+    if free_causes is not None:
+        for component, tier, index, cause in binding_result.free_causes:
+            component_type = ComponentType(component)
+            if cause != "other":
+                raise ValueError(f"unknown free cause: {cause}")
+            if tier == "device":
+                offset = len(device_frees.get(component_type, ()))
+                free = EvictionFreeCause(component_type, "device", offset + index)
+            elif tier == "host":
+                offset = len(host_frees.get(component_type, ()))
+                free = EvictionFreeCause(component_type, "host", offset + index)
+            else:
+                raise ValueError(f"unknown free tier: {tier}")
+            free_causes.append(free)
+    for component, tensors in binding_result.new_device_frees.items():
+        device_frees[ComponentType(component)].extend(tensors)
+    for component, tensors in binding_result.new_host_frees.items():
+        host_frees[ComponentType(component)].extend(tensors)
+
+
 def _fill_evict_result(binding_result, result):
     """Map a binding eviction step into an interface step result; both carry
     this step's per-component deltas and freed tensors."""
     for component, delta in binding_result.tracker.items():
         result.tracker[ComponentType(component)] = delta
-    for component, tensors in binding_result.new_device_frees.items():
-        result.device_frees[ComponentType(component)].extend(tensors)
-    for component, tensors in binding_result.new_host_frees.items():
-        result.host_frees[ComponentType(component)].extend(tensors)
+    _append_eviction_frees(
+        binding_result, result.device_frees, result.host_frees, result.free_causes
+    )
     return result
 
 
@@ -683,12 +704,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        free_causes: Optional[list[EvictionFreeCause]] = None,
     ) -> None:
         binding_result = self._binding.evict_excess_path_states(tail_node_id)
-        for component, tensors in binding_result.new_device_frees.items():
-            device_frees[ComponentType(component)].extend(tensors)
-        for component, tensors in binding_result.new_host_frees.items():
-            host_frees[ComponentType(component)].extend(tensors)
+        _append_eviction_frees(binding_result, device_frees, host_frees, free_causes)
 
     # ==== HiCache ====
 

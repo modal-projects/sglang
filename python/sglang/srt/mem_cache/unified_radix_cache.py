@@ -16,6 +16,7 @@ from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -105,6 +106,9 @@ if TYPE_CHECKING:
         PrefetchOperation,
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        EvictionFreeCause,
+    )
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -680,6 +684,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     donor_result = self._evict(
                         EvictParams(num_tokens=full_evictable),
                         {ComponentType.FULL: mamba_target},
+                        cause="mamba_donor",
                     )
                     result.num_tokens_evicted += donor_result.num_tokens_evicted
                     result.swa_num_tokens_evicted += donor_result.swa_num_tokens_evicted
@@ -735,6 +740,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        cause: Optional[str] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -746,6 +753,7 @@ class UnifiedRadixCache(BasePrefixCache):
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
+            cause=cause,
         )
 
         if (
@@ -766,13 +774,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        *,
+        cause: str = "other",
+        free_causes: Sequence[EvictionFreeCause] = (),
     ) -> None:
         """Free a tree-side step's returned device and host values right away."""
         # Both drains must run even if one raises.
         try:
-            self._drain_device_frees(device_frees)
+            self._drain_device_frees(device_frees, cause=cause, free_causes=free_causes)
         finally:
-            self._drain_host_frees(host_frees)
+            self._drain_host_frees(host_frees, cause=cause, free_causes=free_causes)
 
     def _accumulate_tracker(
         self,
@@ -784,11 +795,20 @@ class UnifiedRadixCache(BasePrefixCache):
             tracker[ct] += n
 
     def _evict_device_next_node(
-        self, component_type: ComponentType, tracker: dict[ComponentType, int]
+        self,
+        component_type: ComponentType,
+        tracker: dict[ComponentType, int],
+        *,
+        cause: str = "other",
     ) -> tuple[Optional[NodeId], bool]:
         """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees,
+            result.host_frees,
+            cause=cause,
+            free_causes=result.free_causes,
+        )
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -798,12 +818,21 @@ class UnifiedRadixCache(BasePrefixCache):
         return result.node_id, result.made_progress
 
     def _evict_device_leaf(
-        self, node_id: NodeId, tracker: dict[ComponentType, int]
+        self,
+        node_id: NodeId,
+        tracker: dict[ComponentType, int],
+        *,
+        cause: str = "other",
     ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees,
+            result.host_frees,
+            cause=cause,
+            free_causes=result.free_causes,
+        )
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -812,10 +841,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self._accumulate_tracker(tracker, result.tracker)
         return result.backup_kv
 
-    def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
+    def _demote(
+        self,
+        node_id: NodeId,
+        tracker: dict[ComponentType, int],
+        *,
+        cause: str = "other",
+    ) -> None:
         """Demote a backed-up node, consuming its step result."""
         result = self.tree_core.demote(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees,
+            result.host_frees,
+            cause=cause,
+            free_causes=result.free_causes,
+        )
         self._accumulate_tracker(tracker, result.tracker)
 
     def _drop_subtree_no_host(
@@ -823,7 +863,12 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
         result = self.tree_core.drop_subtree_no_host(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees,
+            result.host_frees,
+            cause="host_pressure",
+            free_causes=result.free_causes,
+        )
         if result.is_dropped:
             self._record_dropped_tokens(
                 result.tracker.get(BASE_COMPONENT_TYPE, 0), reason="host_pressure"
@@ -838,6 +883,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        cause: Optional[str] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -881,15 +928,24 @@ class UnifiedRadixCache(BasePrefixCache):
             # on a shared pool, released enough bytes to satisfy its allocation.
             if tracker[ct] >= request_cnt or target_reached(ct):
                 continue
+            eviction_cause = cause or {
+                ComponentType.FULL: "full_pressure",
+                ComponentType.SWA: "swa_pressure",
+                ComponentType.MAMBA: "mamba_pressure",
+            }.get(ct, "other")
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while True:
-                    node_id, made_progress = self._evict_device_next_node(ct, tracker)
+                    node_id, made_progress = self._evict_device_next_node(
+                        ct, tracker, cause=eviction_cause
+                    )
                     if node_id is None:
                         if not made_progress:
                             break
                     else:
-                        backup_kv = self._evict_device_leaf(node_id, tracker)
+                        backup_kv = self._evict_device_leaf(
+                            node_id, tracker, cause=eviction_cause
+                        )
                     if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
                         written = self._execute_and_commit_kv_backup(
@@ -897,7 +953,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         if written > 0:
                             self.writing_check(write_back=True)
-                            self._demote(node_id, tracker)
+                            self._demote(node_id, tracker, cause=eviction_cause)
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
@@ -971,7 +1027,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return
         result = self.tree_core.dec_swa_lock_only(node_id, params)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees, result.host_frees, free_causes=result.free_causes
+        )
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
@@ -1313,21 +1371,84 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
+    def _eviction_observer(self):
+        if not self.emit_logical_cache_metrics or self.metrics_collector is None:
+            return None
+        # This method is optional for user-provided legacy collectors.
+        return getattr(self.metrics_collector, "increment_eviction_cause", None)
+
     def _drain_device_frees(
-        self, device_frees: dict[ComponentType, list[torch.Tensor]]
+        self,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        *,
+        cause: str = "other",
+        free_causes: Sequence[EvictionFreeCause] = (),
     ) -> None:
-        # Free per component device slots, consuming each entry as it frees.
+        observe = self._eviction_observer()
+        overrides = (
+            {
+                (entry.component_type, entry.index): entry.cause
+                for entry in free_causes
+                if entry.tier == "device"
+            }
+            if observe is not None
+            else {}
+        )
         for ct in list(device_frees):
-            self._apply_cache_action(
-                FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
-            )
+            values = device_frees.pop(ct)
+            if observe is None:
+                self._apply_cache_action(
+                    FreeComponentDeviceSlot(values, component_type=ct)
+                )
+                continue
+            for index, indices in enumerate(values):
+                self._apply_cache_action(
+                    FreeComponentDeviceSlot([indices], component_type=ct)
+                )
+                # Request-owned SWA rings survive cache eviction.
+                if ct == ComponentType.SWA and is_swa_req_ring(
+                    self.token_to_kv_pool_allocator
+                ):
+                    continue
+                observe(
+                    num_evicted=len(indices),
+                    component=ct.name.lower(),
+                    tier="device",
+                    cause=overrides.get((ct, index), cause),
+                )
 
     def _drain_host_frees(
-        self, host_frees: dict[ComponentType, list[torch.Tensor]]
+        self,
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        *,
+        cause: str = "other",
+        free_causes: Sequence[EvictionFreeCause] = (),
     ) -> None:
-        # Free per component host-pool slots, consuming each entry as it frees.
+        observe = self._eviction_observer()
+        overrides = (
+            {
+                (entry.component_type, entry.index): entry.cause
+                for entry in free_causes
+                if entry.tier == "host"
+            }
+            if observe is not None
+            else {}
+        )
         for ct in list(host_frees):
-            self.components[ct].free_host_values(host_frees.pop(ct))
+            values = host_frees.pop(ct)
+            if observe is None:
+                self.components[ct].free_host_values(values)
+                continue
+            for index, indices in enumerate(values):
+                freed = self.components[ct].free_host_values([indices])
+                if freed is None:
+                    continue
+                observe(
+                    num_evicted=freed,
+                    component=ct.name.lower(),
+                    tier="host",
+                    cause=overrides.get((ct, index), cause),
+                )
 
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
@@ -1338,7 +1459,12 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
-        self._free_values(result.device_frees, result.host_frees)
+        self._free_values(
+            result.device_frees,
+            result.host_frees,
+            cause="host_pressure",
+            free_causes=result.free_causes,
+        )
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----

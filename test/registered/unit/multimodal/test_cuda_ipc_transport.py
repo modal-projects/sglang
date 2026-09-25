@@ -193,7 +193,7 @@ class TestCudaIpcTransport(CustomTestCase):
             args=(proxy_queue, consumer_done, producer_results),
         )
         producer.start()
-        proxy = None
+        proxy = item = output = None
         producer_result = None
         original_empty = torch.empty
         try:
@@ -234,7 +234,7 @@ class TestCudaIpcTransport(CustomTestCase):
             torch.cuda.synchronize()
             self.assertTrue(proxy._consumer_acknowledged)
         finally:
-            del proxy
+            del output, item, proxy
             _pool_handle_cache_clear()
             gc.collect()
             torch.cuda.ipc_collect()
@@ -252,9 +252,18 @@ class TestCudaIpcTransport(CustomTestCase):
             self.assertEqual(producer.exitcode, 0)
 
     def test_uncached_mapping_waits_before_proxy_release(self):
-        proxy = object.__new__(CudaIpcTensorTransportProxy)
-        proxy.proxy_state = {"ipc_extra": {"use_pool_handle_cache": False}}
-        proxy._pool_storage = None
+        feature = torch.ones(4)
+        proxy = CudaIpcTensorTransportProxy(
+            data=feature.view(torch.uint8),
+            info_data=feature,
+            pool_ipc_handle=(0,),
+            pool_byte_offset=256,
+            ready_byte_offset=0,
+            ack_byte_offset=4,
+            generation=1,
+            total_consumer_count=1,
+            use_pool_handle_cache=False,
+        )
         stream = Mock()
 
         with patch(

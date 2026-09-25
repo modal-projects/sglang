@@ -424,6 +424,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
+        self.cudaipc_mmfeature_pool = None
         if self.use_cuda_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
@@ -497,6 +498,8 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+        if self.cudaipc_mmfeature_pool is not None:
+            self.cudaipc_mmfeature_pool.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"

@@ -115,10 +115,20 @@ class StreamOrderedPoolConsumerMixin:
     ) -> None:
         if self._consumer_acknowledged:
             return
+        for rank in self._consumer_ranks(consumer_count, consumer_rank):
+            stream_write_value32(
+                device_id,
+                base_address + self.ack_byte_offset + rank * CONTROL_WORD_BYTES,
+                self.generation,
+                self.transport_name,
+            )
+        self._consumer_acknowledged = True
+
+    def _consumer_ranks(self, consumer_count: int, consumer_rank: Optional[int]):
         if consumer_count == self.total_consumer_count:
-            consumer_ranks = range(self.total_consumer_count)
+            return range(self.total_consumer_count)
         elif consumer_count == 1:
-            consumer_ranks = (
+            return (
                 resolve_consumer_rank(
                     self.total_consumer_count,
                     consumer_rank,
@@ -131,15 +141,6 @@ class StreamOrderedPoolConsumerMixin:
                 "or the complete consumer group, got "
                 f"{consumer_count}/{self.total_consumer_count}"
             )
-
-        for rank in consumer_ranks:
-            stream_write_value32(
-                device_id,
-                base_address + self.ack_byte_offset + rank * CONTROL_WORD_BYTES,
-                self.generation,
-                self.transport_name,
-            )
-        self._consumer_acknowledged = True
 
 
 @dataclass(frozen=True)

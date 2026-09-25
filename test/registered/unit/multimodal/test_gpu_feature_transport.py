@@ -2,7 +2,7 @@ import asyncio
 import concurrent.futures
 import threading
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -27,6 +27,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         class FakeProxy(CudaIpcTensorTransportProxy):
             def __init__(self, *, fail_reconstruct=False, fail_release=False):
+                self.total_consumer_count = 1
                 self.fail_reconstruct = fail_reconstruct
                 self.fail_release = fail_release
                 self.released = False
@@ -926,6 +927,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         from sglang.srt.managers.schedule_batch import MultimodalInputs
         from sglang.srt.managers.scheduler import Scheduler
 
+        self._publish(pp_size=1)
         scheduler = object.__new__(Scheduler)
         mm_inputs = MultimodalInputs(mm_items=[])
 
@@ -1180,6 +1182,184 @@ class TestVmmConsumerCount(unittest.TestCase):
             self.assertEqual(proxy._acknowledgement_range(1), (3, 4))
             self.assertEqual(proxy._acknowledgement_range(2), (2, 4))
             self.assertEqual(proxy._acknowledgement_range(4), (0, 4))
+
+
+class TestVmmMultimodalItemContract(unittest.TestCase):
+    """Exercise real VMM methods with CPU allocation and mapping boundaries."""
+
+    def _proxies(self, *, packed=False, count=3):
+        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
+
+        self.memory = torch.zeros(256, dtype=torch.uint8)
+        self.expected = [
+            torch.tensor([i + 3, i + 7], dtype=torch.float32) for i in range(count)
+        ]
+        common = dict(
+            fabric_handle=b"cpu-fixture",
+            posix_socket_path=None,
+            allocation_size=self.memory.numel(),
+            consumer_count=4,
+        )
+        if packed:
+            owner = vmm._CudaVmmPackedTransportOwner(
+                **common, data_offset=128, data_nbytes=count * 8, control_offset=0
+            )
+        proxies = []
+        for index, value in enumerate(self.expected):
+            self.memory[128 + index * 8 : 136 + index * 8].copy_(
+                value.view(torch.uint8)
+            )
+            if packed:
+                proxy = vmm.CudaVmmPackedTensorTransportProxy(
+                    owner=owner,
+                    layout=vmm._CudaVmmPackedTensorLayout(
+                        relative_offset=index * 8,
+                        data_nbytes=8,
+                        shape=value.shape,
+                        dtype=value.dtype,
+                    ),
+                )
+            else:
+                proxy = vmm.CudaVmmTensorTransportProxy(
+                    **common,
+                    data_offset=128 + index * 8,
+                    data_nbytes=8,
+                    control_offset=index * 16,
+                    shape=value.shape,
+                    dtype=value.dtype,
+                )
+            self.assertFalse(hasattr(proxy, "total_consumer_count"))
+            self.assertFalse(hasattr(proxy, "_borrowed_storage"))
+            proxies.append(proxy)
+        return proxies
+
+    @contextmanager
+    def _cpu_consumer(self):
+        from sglang.srt.managers import schedule_batch
+        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
+
+        device = torch.device
+
+        def cpu_device(*args, **kwargs):
+            resolved = device(*args, **kwargs)
+            return device("cpu") if resolved.type == "cuda" else resolved
+
+        # An attention subgroup consumes VMM's four local slots. Its global
+        # native IPC rank is different and must not be sent as a VMM keyword.
+        parallel = SimpleNamespace(
+            tp_size=8,
+            tp_rank=7,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            attn_cp_size=2,
+            attn_cp_rank=1,
+        )
+        with (
+            patch.object(vmm, "get_parallel", return_value=parallel),
+            patch.object(schedule_batch, "get_parallel", return_value=parallel),
+            patch.object(torch, "device", side_effect=cpu_device),
+            patch.object(torch.cuda, "device", side_effect=lambda *_: nullcontext()),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(
+                vmm,
+                "_get_imported_pool",
+                return_value=SimpleNamespace(memory=self.memory),
+            ) as imported,
+        ):
+            yield imported
+
+    def test_ordinary_reconstruction_handles_all_item_proxy_fields(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        proxies = self._proxies()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=proxies[0],
+            precomputed_embeddings=proxies[1],
+            model_specific_data={"auxiliary": proxies[2]},
+        )
+        with self._cpu_consumer():
+            item.reconstruct(0)
+        for value, expected in zip(
+            [
+                item.feature,
+                item.precomputed_embeddings,
+                item.model_specific_data["auxiliary"],
+            ],
+            self.expected,
+            strict=True,
+        ):
+            torch.testing.assert_close(value, expected)
+        self.assertEqual(self.memory[:48].view(torch.int32).tolist(), [0, 0, 0, 1] * 3)
+        self.assertTrue(all(proxy._consumer_acknowledged for proxy in proxies))
+
+    def test_packed_reconstruction_keeps_sibling_views(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        proxies = self._proxies(packed=True, count=2)
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+            for proxy in proxies
+        ]
+        with self._cpu_consumer():
+            for item in items:
+                item.reconstruct(0)
+        for item, expected in zip(items, self.expected, strict=True):
+            torch.testing.assert_close(item.feature, expected)
+        self.assertEqual(self.memory[:16].view(torch.int32).tolist(), [0, 0, 0, 1])
+        self.assertTrue(all(proxy._consumer_acknowledged for proxy in proxies))
+
+    def test_deferred_acknowledgement_retains_vmm_count_contract(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        for count, expected in (
+            (1, [0, 0, 0, 1]),
+            (2, [0, 0, 1, 1]),
+            (4, [1, 1, 1, 1]),
+        ):
+            with self.subTest(count=count):
+                proxy = self._proxies(count=1)[0]
+                item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+                with self._cpu_consumer() as imported:
+                    item.acknowledge_deferred_cuda_ipc_feature(count)
+                    item.acknowledge_deferred_cuda_ipc_feature(count)
+                self.assertEqual(imported.call_count, 1)
+                self.assertEqual(self.memory[:16].view(torch.int32).tolist(), expected)
+                self.assertIsNone(proxy.reconstruct_tensor)
+
+    def test_abandoned_ordinary_and_packed_features_acknowledge_once(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalInputs,
+        )
+
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                proxies = self._proxies(packed=packed, count=2)
+                inputs = MultimodalInputs(
+                    mm_items=[
+                        MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+                        for proxy in proxies
+                    ]
+                )
+                with self._cpu_consumer() as imported:
+                    inputs.release_features()
+                    self.assertTrue(
+                        all(proxy._consumer_acknowledged for proxy in proxies)
+                    )
+                    for proxy in proxies:
+                        proxy.release_without_reconstruction()
+                self.assertEqual(imported.call_count, 1 if packed else 2)
+                self.assertEqual(
+                    self.memory[: 16 if packed else 32].view(torch.int32).tolist(),
+                    [0, 0, 0, 1] * (1 if packed else 2),
+                )
+                self.assertTrue(all(item.feature is None for item in inputs.mm_items))
+                self.assertTrue(all(proxy._consumer_acknowledged for proxy in proxies))
+                self.assertTrue(
+                    all(proxy.reconstruct_tensor is None for proxy in proxies)
+                )
 
 
 if __name__ == "__main__":

@@ -856,6 +856,10 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
         with torch.cuda.device(device_index):
             self._acknowledge_consumption(device_index, consumer_count)
 
+    def release_without_reconstruction(self, consumer_count: int | None = None) -> None:
+        """Release an abandoned VMM slice through its count-only acknowledgement."""
+        self.acknowledge_consumption(consumer_count)
+
     def reconstruct_on_target_device(
         self, rebuild_device_idx, consumer_count: int | None = None
     ):

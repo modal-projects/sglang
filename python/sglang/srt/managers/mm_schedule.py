@@ -220,21 +220,9 @@ def _move_items_to_device(
 def _acknowledge_deferred_cuda_ipc_cache_hits(
     items: List[MultimodalDataItem],
 ) -> None:
-    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
-
-    On an encoder-DP miss, exactly one rank copies an image and acknowledges
-    the full TP group.  On a cache hit no rank copies it, so rank zero performs
-    the equivalent single acknowledgement.  This preserves the fixed-pool
-    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
-    """
-    parallel = get_parallel()
-    if parallel.attn_tp_rank != 0:
-        return
-    # The pool's recycler counts the whole TP group, so the acknowledgement must
-    # match that count even when an attention subgroup is smaller.
-    consumer_count = max(parallel.tp_size, 1)
+    """Keep reusable features before releasing a cache-hit transport lease."""
     for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
+        item.materialize_deferred_cuda_ipc_feature()
 
 
 def _mm_encode_sync_group():
@@ -871,6 +859,11 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
+    # Include prefix-resident items: a later retraction or session turn can
+    # need their encoder features after the embedding cache has evicted them.
+    for item in embedding_items:
+        item.materialize_deferred_cuda_ipc_feature()
+
     original_input_ids = input_ids
     num_mm_tokens_in_input_ids = _count_mm_tokens_in_extend(
         prefix_length,

@@ -405,6 +405,32 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
 
 class TestStreamOrderedMmFeaturePool(CustomTestCase):
+    def test_processor_shutdown_includes_optional_cuda_ipc_pool(self):
+        """Processor teardown must close its IPC export gate without dropping its owner."""
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        for with_pool in (False, True):
+            with self.subTest(with_pool=with_pool):
+                with patch.object(
+                    BaseMultimodalProcessor, "__abstractmethods__", set()
+                ):
+                    processor = object.__new__(BaseMultimodalProcessor)
+                processor.mm_preprocess_cache = MagicMock()
+                processor.io_executor = MagicMock()
+                processor.cpu_executor = MagicMock()
+                processor.mm_processor_executor = MagicMock()
+                pool = MagicMock() if with_pool else None
+                processor.cudaipc_mmfeature_pool = pool
+
+                processor.shutdown()
+
+                self.assertIs(processor.cudaipc_mmfeature_pool, pool)
+                processor.mm_processor_executor.shutdown.assert_called_once()
+                if with_pool:
+                    pool.shutdown.assert_called_once()
+
     def test_consumer_slot_uses_global_tp_rank(self):
         from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 

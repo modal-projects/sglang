@@ -52,6 +52,20 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        """Feed multiple committed output tokens per request to the penalizers."""
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_tokens_multi(
+                output_ids=output_ids, num_valid=num_valid
+            )
+
+    def reset_output_tokens(self, indices: torch.Tensor) -> None:
+        for penalizer in self.penalizers.values():
+            if penalizer._is_prepared:
+                penalizer._reset_output_tokens(indices)
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
@@ -215,6 +229,14 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_output_tokens_multi(output_ids=output_ids, num_valid=num_valid)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -257,6 +279,14 @@ class _BatchedPenalizer(abc.ABC):
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass
+
+    def _cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        raise NotImplementedError
+
+    def _reset_output_tokens(self, indices: torch.Tensor) -> None:
+        raise NotImplementedError
 
     @abc.abstractmethod
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

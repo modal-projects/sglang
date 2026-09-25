@@ -19,6 +19,10 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.dflash_penalties import (
+    DFlashBlockPenaltyState,
+    _apply_block_penalties,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -212,6 +216,7 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    candidates: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
@@ -247,6 +252,16 @@ def apply_dflash_verify_logits_adjustments(
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
+    state = sampling_info.dflash_block_penalty_state
+    if state is None and penalizer is not None and penalizer.is_required:
+        state = DFlashBlockPenaltyState.from_orchestrator(penalizer)
+    if candidates is not None:
+        if tuple(candidates.shape) != (bs, draft_token_num):
+            raise ValueError(
+                "candidates shape mismatch for DFlash verify adjustments. "
+                f"Expected {(bs, draft_token_num)}, got {tuple(candidates.shape)}."
+            )
+
     logits_3d: Optional[torch.Tensor] = None
 
     def get_logits_3d() -> torch.Tensor:
@@ -254,6 +269,41 @@ def apply_dflash_verify_logits_adjustments(
         if logits_3d is None:
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
+
+    if candidates is not None and state is not None:
+        if state.additive_base.shape[0] != bs:
+            raise ValueError(
+                "penalty state rows mismatch: "
+                f"Expected {bs}, got {state.additive_base.shape[0]}."
+            )
+        # Per-position penalties rolled forward across the verify block; the
+        # grammar mask and logit bias still apply on every position below.
+        _apply_block_penalties(
+            next_token_logits,
+            state,
+            candidates,
+            bs,
+            draft_token_num,
+        )
+        if grammar_mask is not None:
+            masked = torch.zeros(
+                (bs, next_token_logits.shape[1]),
+                dtype=torch.float32,
+                device=next_token_logits.device,
+            )
+            grammar_mask.apply(masked)
+            get_logits_3d().add_(masked[:, None, :].to(dtype=next_token_logits.dtype))
+        if logit_bias is not None:
+            if (
+                logit_bias.device != next_token_logits.device
+                or logit_bias.dtype != next_token_logits.dtype
+            ):
+                logit_bias = logit_bias.to(
+                    device=next_token_logits.device,
+                    dtype=next_token_logits.dtype,
+                )
+            get_logits_3d().add_(logit_bias[:, None, :])
+        return
 
     # Dense fallback only when we need live penalizer application or a vocab mask.
     # In overlap scheduling the common path is `acc_linear_penalties`, which can be

@@ -21,6 +21,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
+    from sglang.srt.speculative.dflash_penalties import DFlashBlockPenaltyState
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Owned effective history, shared by ordinary sampling and DFLASH verify.
+    dflash_block_penalty_state: Optional[DFlashBlockPenaltyState] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -185,6 +188,12 @@ class SamplingBatchInfo:
         # While we can choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
+        if batch.spec_algorithm is not None and batch.spec_algorithm.is_dflash_family():
+            # Extend preparation recreates penalizer buffers for every chunk.
+            # Retained outputs must be fed to each fresh set of buffers.
+            for req in reqs:
+                req.penalty_cumulated_len = 0
+
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
@@ -298,6 +307,10 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = None
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
+        if self.dflash_block_penalty_state is not None:
+            self.dflash_block_penalty_state.apply(logits)
+            return
+
         if self.acc_additive_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_additive_penalties)
@@ -505,10 +518,21 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+    def copy_for_forward(
+        self, *, dflash_penalty_state: Optional[DFlashBlockPenaltyState] = None
+    ):
+        if dflash_penalty_state is not None:
+            return dataclasses.replace(
+                self,
+                penalizer_orchestrator=None,
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                dflash_block_penalty_state=dflash_penalty_state,
+            )
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        return dataclasses.replace(
+            self, penalizer_orchestrator=None, dflash_block_penalty_state=None
+        )
 
 
 def merge_bias_tensor(

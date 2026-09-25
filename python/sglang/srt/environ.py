@@ -670,6 +670,9 @@ class Envs:
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # Bounded local-eviction history; zero pages disables measurement.
+    SGLANG_KV_GHOST_CAPACITY_PAGES = EnvInt(0)
+    SGLANG_KV_GHOST_TTL_SECONDS = EnvFloat(300.0)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)

@@ -2109,6 +2109,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
+        *,
+        emit_cache_metrics: bool = True,
+        logical_labels: Optional[Dict[str, str]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -2118,6 +2121,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+        self.emit_cache_metrics = emit_cache_metrics
+        self.logical_labels = labels if logical_labels is None else logical_labels
+        self._kv_ghost_initialized = False
 
         bucket_eviction_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_EVICTION_DURATION"
@@ -2277,6 +2283,85 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "eager write-through did not complete before eviction.",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
+
+    def configure_logical_cache_metrics(
+        self, *, emit_cache_metrics: bool, logical_labels: Dict[str, str]
+    ) -> None:
+        self.emit_cache_metrics = emit_cache_metrics
+        self.logical_labels = logical_labels
+
+    def initialize_kv_ghost_metrics(self) -> None:
+        if not self.emit_cache_metrics or self._kv_ghost_initialized:
+            return
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Histogram = self._histogram_cls or _PromHistogram
+        labels = self.logical_labels
+
+        def counter(name, documentation):
+            metric = Counter(name=name, documentation=documentation, labelnames=labels)
+            return metric.labels(**labels) if labels else metric
+
+        self.kv_inserted_tokens = counter(
+            "sglang:kv_inserted_tokens_total",
+            "Fresh logical KV tokens adopted without a surviving local host copy.",
+        )
+        self.kv_recomputed_after_evict_tokens = counter(
+            "sglang:kv_recomputed_after_evict_tokens_total",
+            "Fresh logical KV tokens matching bounded local capacity-eviction history.",
+        )
+        self.kv_ghost_recorded_pages = counter(
+            "sglang:kv_ghost_list_recorded_pages_total",
+            "New page identities entered into bounded local eviction history.",
+        )
+        discarded = Counter(
+            name="sglang:kv_ghost_list_discarded_pages_total",
+            documentation="Page identities removed from bounded local eviction history.",
+            labelnames=[*labels, "reason"],
+        )
+        self.kv_ghost_discarded_pages = {
+            reason: discarded.labels(**labels, reason=reason)
+            for reason in (
+                "capacity",
+                "ttl",
+                "flush",
+                "invalidate",
+                "reinsert",
+                "restored",
+            )
+        }
+        delay = Histogram(
+            name="sglang:kv_reinsert_after_evict_seconds",
+            documentation="Seconds from local last-copy capacity eviction to fresh "
+            "KV adoption, once per returned eviction fragment.",
+            labelnames=labels,
+            buckets=(0.01, 0.1, 1, 10, 30, 60, 120, 300, 600, 1800, 3600),
+        )
+        self.kv_reinsert_after_evict_seconds = (
+            delay.labels(**labels) if labels else delay
+        )
+        self._kv_ghost_initialized = True
+
+    def increment_kv_inserted_tokens(self, num_tokens: int) -> None:
+        if self._kv_ghost_initialized:
+            self.kv_inserted_tokens.inc(num_tokens)
+
+    def increment_kv_ghost_list_recorded(self, num_pages: int) -> None:
+        if self._kv_ghost_initialized:
+            self.kv_ghost_recorded_pages.inc(num_pages)
+
+    def increment_kv_ghost_list_discarded(self, reason: str, num_pages: int) -> None:
+        if self._kv_ghost_initialized:
+            self.kv_ghost_discarded_pages[reason].inc(num_pages)
+
+    def observe_kv_reinsert_after_evict(
+        self, delay_seconds: float, num_tokens: int
+    ) -> None:
+        if self._kv_ghost_initialized:
+            self.kv_recomputed_after_evict_tokens.inc(num_tokens)
+            self.kv_reinsert_after_evict_seconds.observe(delay_seconds)
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)

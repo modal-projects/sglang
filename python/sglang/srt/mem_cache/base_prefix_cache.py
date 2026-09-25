@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -94,6 +96,8 @@ class InsertParams:
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
+    # The adopted KV came from another cache tier, without model recomputation.
+    restored_from_cache: bool = False
 
     # Logical-page KV sharding: rotation base of the chain the inserted
     # values belong to (stamped onto new tree nodes; None when sharding is
@@ -327,6 +331,18 @@ def _dfs_weight_order(
     return order
 
 
+@runtime_checkable
+class _LogicalCacheMetrics(Protocol):
+    emit_cache_metrics: bool
+
+
+@runtime_checkable
+class _ConfigurableLogicalCacheMetrics(Protocol):
+    def configure_logical_cache_metrics(
+        self, *, emit_cache_metrics: bool, logical_labels: dict[str, str]
+    ) -> None: ...
+
+
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
@@ -339,7 +355,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
-    def init_metrics_collector(self):
+    emit_logical_cache_metrics: bool = False
+
+    def init_metrics_collector(self, params: Optional[CacheInitParams] = None):
         labels = {"cache_type": self.__class__.__name__}
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
@@ -347,7 +365,31 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             STAT_LOGGER_ROLE_RADIX_CACHE,
             RadixCacheMetricsCollector,
         )
-        self.metrics_collector = radix_cache_cls(labels=labels)
+        emit = params is None or (params.attn_tp_rank == 0 and params.attn_cp_rank == 0)
+        logical_labels = dict(labels)
+        if params is not None:
+            logical_labels.update(
+                dp_rank=str(params.dp_rank), pp_rank=str(params.pp_rank)
+            )
+        kwargs = dict(
+            labels=labels, emit_cache_metrics=emit, logical_labels=logical_labels
+        )
+        signature = inspect.signature(radix_cache_cls)
+        if not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        ):
+            kwargs = {k: v for k, v in kwargs.items() if k in signature.parameters}
+        self.metrics_collector = radix_cache_cls(**kwargs)
+        self.emit_logical_cache_metrics = emit and (
+            not isinstance(self.metrics_collector, _LogicalCacheMetrics)
+            or self.metrics_collector.emit_cache_metrics
+        )
+        if isinstance(self.metrics_collector, _ConfigurableLogicalCacheMetrics):
+            self.metrics_collector.configure_logical_cache_metrics(
+                emit_cache_metrics=self.emit_logical_cache_metrics,
+                logical_labels=logical_labels,
+            )
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:

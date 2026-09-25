@@ -326,6 +326,12 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+        dp_rank=(
+            ps.attn_dp_rank
+            if get_parallel().enable_dp_attention
+            else (ps.dp_rank if ps.dp_rank is not None else 0)
+        ),
+        attn_tp_rank=ps.attn_tp_rank,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,

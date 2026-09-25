@@ -266,6 +266,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
         Summary = self._summary_cls or _PromSummary
 
+        reserved_labels = {"cap_source", "device_type"}.intersection(labels)
+        if reserved_labels:
+            raise ValueError(
+                f"Reserved scheduler metric labels: {sorted(reserved_labels)}"
+            )
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -882,7 +887,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Execution
         # =================================================================
-        if labels["moe_ep_rank"] == 0 and exports_expert_balancedness_to_prometheus():
+        if (
+            labels.get("moe_ep_rank") == 0
+            and exports_expert_balancedness_to_prometheus()
+        ):
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
@@ -940,8 +948,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
-        self.scheduler_idle_seconds_total.labels(**labels)
-        self.scheduler_process_cpu_seconds_total.labels(**labels)
+        if labels:
+            self.scheduler_idle_seconds_total.labels(**labels)
+            self.scheduler_process_cpu_seconds_total.labels(**labels)
         for category in SCHEDULER_STAGE_CATEGORIES:
             self.scheduler_stage_seconds_total.labels(**labels, category=category)
         self.estimated_flops_per_gpu_total = Counter(
@@ -1066,6 +1075,44 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["phase"],
             multiprocess_mode="mostrecent",
         )
+        self.max_running_requests = Gauge(
+            name="sglang:max_running_requests",
+            documentation=(
+                "Effective concurrent request limit per data-parallel worker. "
+                "cap_source is requested, estimated, kv_capacity, mamba_pool, "
+                "or unknown when the runner supplies no resolved source. Ties retain the "
+                "first bound in that order at initial resolution; a post-capture "
+                "tie retains the installed bound."
+            ),
+            labelnames=[*labels.keys(), "cap_source"],
+            multiprocess_mode="mostrecent",
+        )
+        self.max_queued_requests = (
+            Gauge(
+                name="sglang:max_queued_requests",
+                documentation=(
+                    "Configured ordinary waiting-queue limit; absent when "
+                    "unlimited or disaggregated."
+                ),
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            if (
+                get_schedule().max_queued_requests is not None
+                and get_disagg().disaggregation_mode == DisaggregationMode.NULL.value
+            )
+            else None
+        )
+        self.configured_device_count = Gauge(
+            name="sglang:configured_device_count",
+            documentation=(
+                "Configured device count across TP, PP and DP for the serving engine. "
+                "DP attention shares the TP devices. Repeated across scheduler labels; "
+                "do not sum across ranks."
+            ),
+            labelnames=[*labels.keys(), "device_type"],
+            multiprocess_mode="mostrecent",
+        )
         self.max_running_requests_under_SLO = Gauge(
             name="sglang:max_running_requests_under_SLO",
             documentation="The maximum number of running requests under SLO.",
@@ -1160,7 +1207,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
-        gauge.labels(**self.labels).set(data)
+        (gauge.labels(**self.labels) if self.labels else gauge).set(data)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
         # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
@@ -1499,7 +1546,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        max_running_requests: Optional[int] = None,
+        max_running_requests_cap_source: Optional[str] = None,
+        max_queued_requests: Optional[int] = None,
+        device_type: Optional[str] = None,
+        configured_device_count: Optional[int] = None,
     ) -> None:
+        if max_running_requests is not None:
+            self.max_running_requests.labels(
+                **self.labels, cap_source=max_running_requests_cap_source or "unknown"
+            ).set(max_running_requests)
+        if max_queued_requests is not None and self.max_queued_requests is not None:
+            self._log_gauge(self.max_queued_requests, max_queued_requests)
+        if device_type is not None and configured_device_count is not None:
+            self.configured_device_count.labels(
+                **self.labels, device_type=device_type
+            ).set(configured_device_count)
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
         if max_total_num_tokens_swa is not None:
             self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)

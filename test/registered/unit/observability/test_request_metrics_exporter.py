@@ -9,15 +9,18 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 import asyncio
+import copy
 import json
 import os
 import shutil
 import tempfile
 import types
 import unittest
+from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.test.test_utils import CustomTestCase
 
 # ── Test helper classes (local only, never injected into sys.modules) ──
 
@@ -192,7 +195,7 @@ class TestFormatOutputData(unittest.TestCase):
         self.assertNotIn("secret", result)
 
 
-class TestFileRequestMetricsExporter(unittest.TestCase):
+class TestFileRequestMetricsExporter(CustomTestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
 
@@ -285,6 +288,97 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
 
         files = os.listdir(self.tmp_dir)
         self.assertEqual(len(files), 0)
+
+    def test_finish_metadata_round_trip_preserves_response(self):
+        """File summaries must not replace raw finish metadata or mutate responses."""
+        exporter = self._make_exporter()
+        self.addCleanup(exporter.close)
+        obj = _GenerateReqInput(rid="finished", text="hello")
+        reasons = [
+            ({"type": "stop", "matched": [2]}, "stop", 200),
+            ({"type": "length", "length": 8}, "length", 200),
+            (
+                {"type": "abort", "status_code": HTTPStatus.SERVICE_UNAVAILABLE},
+                "abort",
+                503,
+            ),
+            ({"type": "abort", "status_code": 200}, "abort", 200),
+            ({"type": "future_reason", "status_code": 503}, "unknown", None),
+            (None, "unknown", None),
+            ("stop", "unknown", None),
+            ({"type": ["stop"]}, "unknown", None),
+        ]
+        originals = []
+        for reason, _, _ in reasons:
+            out = {
+                "text": "answer",
+                "status_code": 200,
+                "meta_info": {"finish_reason": reason, "completion_tokens": 8},
+            }
+            original = copy.deepcopy(out)
+            asyncio.run(exporter.write_record(obj, out))
+            self.assertEqual(out, original)
+            originals.append(original)
+
+        with open(os.path.join(self.tmp_dir, os.listdir(self.tmp_dir)[0])) as f:
+            records = [json.loads(line) for line in f]
+        self.assertEqual(len(records), len(reasons))
+        for record, original, (_, reason_type, status) in zip(
+            records, originals, reasons
+        ):
+            self.assertEqual(record.pop("finish_reason_type"), reason_type)
+            self.assertEqual(record.pop("finish_reason_status_code"), status)
+            self.assertEqual(
+                json.loads(record.pop("request_parameters"))["rid"], obj.rid
+            )
+            self.assertEqual(record, original["meta_info"])
+
+    def test_abort_status_requires_http_integer(self):
+        """Transport status and coercible values must not disguise an abort."""
+        exporter = self._make_exporter()
+        obj = _GenerateReqInput(rid="aborted")
+        for status in (None, True, False, "503", 503.0, 99, 600, {}, []):
+            with self.subTest(status=status):
+                record = exporter._format_output_data(
+                    obj,
+                    {
+                        "status_code": 200,
+                        "meta_info": {
+                            "finish_reason": {"type": "abort", "status_code": status}
+                        },
+                    },
+                )
+                self.assertEqual(record["finish_reason_type"], "abort")
+                self.assertIsNone(record["finish_reason_status_code"])
+        for status in (100, 599):
+            with self.subTest(status=status):
+                record = exporter._format_output_data(
+                    obj,
+                    {
+                        "meta_info": {
+                            "finish_reason": {"type": "abort", "status_code": status}
+                        }
+                    },
+                )
+                self.assertEqual(record["finish_reason_status_code"], status)
+
+    def test_finish_fields_respect_output_exclusions(self):
+        """Excluded finish metadata must not leak through derived file fields."""
+        obj = _GenerateReqInput(rid="filtered")
+        out = {"meta_info": {"finish_reason": {"type": "abort", "status_code": 503}}}
+        exporter = FileRequestMetricsExporter(
+            _make_server_args(self.tmp_dir), None, {"finish_reason"}
+        )
+        record = exporter._format_output_data(obj, out)
+        self.assertNotIn("finish_reason", record)
+        self.assertEqual(record["finish_reason_type"], "unknown")
+        self.assertIsNone(record["finish_reason_status_code"])
+
+        exporter.out_skip_names = {"finish_reason_type", "finish_reason_status_code"}
+        record = exporter._format_output_data(obj, out)
+        self.assertNotIn("finish_reason_type", record)
+        self.assertNotIn("finish_reason_status_code", record)
+        self.assertEqual(record["finish_reason"], out["meta_info"]["finish_reason"])
 
     def test_write_record_handler_none(self):
         """If file handler is None after ensure, write_record returns early."""

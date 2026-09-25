@@ -2036,6 +2036,9 @@ class TestSessionQueueAbort(CustomTestCase):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.managers.schedule_policy import AddReqResult
         from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.observability.metrics_collector import (
+            SchedulerMetricsCollectorContext,
+        )
 
         for restored in (False, True):
             with self.subTest(restored=restored):
@@ -2060,6 +2063,13 @@ class TestSessionQueueAbort(CustomTestCase):
                 )
                 scheduler = _scheduler_stub(cache)
                 scheduler.waiting_queue = [req]
+                scheduler.metrics_collector_context = SchedulerMetricsCollectorContext(
+                    enable_metrics=False,
+                    is_stats_logging_rank=True,
+                    current_scheduler_metrics_enabled=False,
+                    enable_kv_cache_events=False,
+                    collector=None,
+                )
                 scheduler.grammar_manager.has_waiting_grammars = lambda: False
                 scheduler.enable_priority_preemption = False
                 scheduler.is_hybrid_swa = False

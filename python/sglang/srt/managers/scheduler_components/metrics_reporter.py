@@ -893,7 +893,11 @@ class SchedulerMetricsReporter:
             spec_cap_length = 0
             spec_block_accept_length = 0
         else:
-            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            spec_accept_length = (
+                self.spec_num_accept_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
+            )
             num_correct_drafts = self.spec_num_correct_drafts
             if get_spec().speculative_num_draft_tokens:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1

@@ -87,6 +87,10 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
 )
+from sglang.srt.speculative.verify_validity import (
+    prepare_verify_rows_,
+    write_first_invalid_rows,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import empty_context
 
@@ -1451,6 +1455,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
+        first_invalid_rows: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
@@ -1476,6 +1481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                first_invalid_rows=first_invalid_rows,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
@@ -2103,6 +2109,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         new_seq_lens = None
         target_predict = None
+        first_invalid_rows = torch.empty(
+            bs, dtype=torch.int32, device=candidates.device
+        )
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2112,9 +2121,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                first_invalid_rows=first_invalid_rows,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, first_invalid_rows)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
@@ -2125,11 +2136,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                first_invalid_rows=first_invalid_rows,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, first_invalid_rows)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
+            valid_rows = prepare_verify_rows_(
+                next_token_logits.view(bs, int(self.block_size), -1), is_logits=True
+            )
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
@@ -2172,7 +2188,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+            write_first_invalid_rows(
+                valid_rows=valid_rows, correct_lens=accept_len, out=first_invalid_rows
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, first_invalid_rows)
+        return (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            target_predict,
+            first_invalid_rows,
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2773,6 +2801,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
+            first_invalid_rows,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2862,6 +2891,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
+            first_invalid_rows=first_invalid_rows,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),

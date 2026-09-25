@@ -17,6 +17,10 @@ from sglang.srt.speculative.dflash_utils import (
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
+from sglang.srt.speculative.verify_validity import (
+    prepare_verify_rows_,
+    write_first_invalid_rows,
+)
 
 
 class AcceptSampling:
@@ -87,6 +91,7 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    first_invalid_rows: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -105,6 +110,8 @@ def _accept_sampling_core(
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
         )
+    if first_invalid_rows is not None:
+        valid_rows = prepare_verify_rows_(target_probs, is_logits=False)
     (
         retrieve_index,
         retrieve_next_token,
@@ -142,6 +149,10 @@ def _accept_sampling_core(
         )
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
+    if first_invalid_rows is not None:
+        write_first_invalid_rows(
+            valid_rows=valid_rows, correct_lens=correct_len, out=first_invalid_rows
+        )
     return correct_len, cap_trim_lens, accept_index, predicts
 
 
@@ -155,6 +166,7 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    first_invalid_rows: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -167,6 +179,7 @@ def accept_sampling(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        first_invalid_rows=first_invalid_rows,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)

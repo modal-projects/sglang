@@ -13,6 +13,7 @@
 # ==============================================================================
 """Constrained decoding with outlines backend."""
 
+import copy
 import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
@@ -76,6 +77,9 @@ class OutlinesGrammar(BaseGrammarObject):
 
     def copy(self):
         return OutlinesGrammar(self.guide, self.jump_forward_map)
+
+    def fork(self):
+        return copy.copy(self)
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple]:
         if not self.jump_forward_map:

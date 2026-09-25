@@ -25,6 +25,11 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        BasePrefixCache,
+        CacheRequestHandle,
+    )
+    from sglang.srt.mem_cache.cache_verification import CacheVerificationAttempt
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -52,6 +57,14 @@ class GenerationBatchResult:
         Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
     ] = None
     num_correct_drafts: int = 0  # no bonus included
+    num_generated_tokens: Optional[int] = None
+    num_spec_verify_rows: Optional[int] = None
+    # Zero-based reached output position; -1 means no invalid row.
+    first_invalid_rows: Optional[torch.Tensor] = None
+    spec_request_attempts: Optional[list[tuple[CacheRequestHandle, int]]] = None
+    cache_verification_attempts: Optional[list[Optional[CacheVerificationAttempt]]] = (
+        None
+    )
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
@@ -127,7 +140,16 @@ class GenerationBatchResult:
         return isinstance(self.next_token_ids, torch.Tensor)
 
     def get_num_generated_tokens(self, batch_size: int) -> int:
+        if self.num_generated_tokens is not None:
+            return self.num_generated_tokens
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
+
+    def release_verification_attempts(self, tree_cache: BasePrefixCache) -> None:
+        attempts = self.cache_verification_attempts
+        self.cache_verification_attempts = None
+        if attempts is not None:
+            for attempt in attempts:
+                tree_cache.release_verification_attempt(attempt)
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
@@ -167,6 +189,9 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.first_invalid_rows is not None:
+            self.first_invalid_rows = _async_d2h(self.first_invalid_rows)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

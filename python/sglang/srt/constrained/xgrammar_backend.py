@@ -13,6 +13,7 @@
 # ==============================================================================
 """Constrained decoding with xgrammar backend."""
 
+import copy
 import dataclasses
 import json
 import logging
@@ -159,6 +160,12 @@ class XGrammarGrammar(BaseGrammarObject):
             self.key_string,
             grammar_stats,
         )
+
+    def fork(self):
+        forked = copy.copy(self)
+        forked.matcher = self.matcher.fork()
+        forked.accepted_tokens = list(self.accepted_tokens)
+        return forked
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         s = self.matcher.find_jump_forward_string()

@@ -421,6 +421,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_invalidated(self, node_id: NodeId) -> bool:
         return self._binding.is_invalidated(node_id)
 
+    def prefix_node_span(self, node_id: NodeId) -> tuple[int, int]:
+        return self._binding.prefix_node_span(node_id)
+
     def reset(self) -> None:
         self._binding.reset()
         # Node handles are never re-minted, so the fresh root gets a new one.

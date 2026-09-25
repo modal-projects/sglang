@@ -877,6 +877,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map_or(true, |idx| self.arena.node(idx).retired)
     }
 
+    /// Absolute logical-key span of this identity, including retired live nodes.
+    pub fn prefix_node_span(&self, node_id: NodeId) -> Result<(usize, usize), NodeAccessError> {
+        let mut current = self.arena.resolve(node_id)?;
+        let length = self.arena.node(current).key.atom_len();
+        let mut end = 0;
+        while !self.arena.node(current).is_root() {
+            let node = self.arena.node(current);
+            end += node.key.atom_len();
+            current = node.parent();
+        }
+        Ok((end - length, end))
+    }
+
     /// Create a keyed, parented node not yet in its parent's child map;
     /// `creation_counter` None keeps the fresh allocation stamp.
     pub fn new_node_(

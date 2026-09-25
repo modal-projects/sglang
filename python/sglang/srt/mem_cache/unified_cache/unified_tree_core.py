@@ -617,6 +617,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if self.kv_events.enabled:
             node.published_kv_tiers &= ~_KV_EVENT_TIER_BITS[medium]
 
+    def prefix_node_span(self, node_id: NodeId) -> tuple[int, int]:
+        node = self.node_by_id(node_id)
+        length = 0 if node is self.root_node else len(node.key)
+        end = 0
+        while node is not self.root_node:
+            end += len(node.key)
+            node = node.parent
+        return end - length, end
+
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId back to its tree node.
 

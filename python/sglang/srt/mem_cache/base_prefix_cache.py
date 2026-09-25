@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.common import RetractionBackup
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -427,6 +428,35 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         per-chain base override this. See UnifiedTreeNode.rotation_base.
         """
         return None
+
+    def record_prefix_admission(self, req: Req) -> None:
+        pass
+
+    def capture_verification_attempt(self, req: Req):
+        return None
+
+    def invalidate_verification_attempt(self, attempt) -> None:
+        pass
+
+    def release_verification_attempt(self, attempt) -> None:
+        pass
+
+    def close_verification_attempt(self, req: Req) -> None:
+        """Close an admitted attempt that will publish no further cache state."""
+        pass
+
+    def request_cache_invalid(self, req: Req) -> bool:
+        return req.cache_invalid
+
+    def record_retraction_backup(
+        self, req: Req, backup: Optional[RetractionBackup]
+    ) -> Optional[RetractionBackup]:
+        return backup
+
+    def record_retraction_backup_restore(
+        self, req: Req, backup: RetractionBackup
+    ) -> None:
+        pass
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):

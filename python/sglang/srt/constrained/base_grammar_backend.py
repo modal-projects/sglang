@@ -108,6 +108,10 @@ class BaseGrammarObject:
     def copy(self) -> "BaseGrammarObject":
         return self
 
+    def fork(self) -> "BaseGrammarObject":
+        """Clone the current decoding state for an independent tentative run."""
+        raise NotImplementedError()
+
     @property
     def finished(self):
         return self._finished

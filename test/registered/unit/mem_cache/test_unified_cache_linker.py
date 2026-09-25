@@ -152,6 +152,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "record_committed_host_restore": MagicMock(),
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)

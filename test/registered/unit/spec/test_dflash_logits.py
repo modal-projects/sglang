@@ -394,13 +394,16 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         bs=1,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _, target_predict = result
+    accept_len, commit_lens, bonus, out_tokens, _, target_predict, first_invalid = (
+        result
+    )
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]
     assert out_tokens.tolist() == [[7, 0]]
     assert target_predict.tolist() == [[1, 0]]
-    assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+    assert first_invalid.tolist() == [-1]
+    assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY] * 2
 
 
 def test_grouped_conv_supports_runtime_block_sizes():

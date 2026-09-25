@@ -2461,6 +2461,11 @@ macro_rules! tree_core_binding {
                 py.allow_threads(|| self.inner.core().is_invalidated(node_id))
             }
 
+            fn prefix_node_span(&self, py: Python<'_>, node_id: NodeId) -> PyResult<(usize, usize)> {
+                py.allow_threads(|| self.inner.core().prefix_node_span(node_id))
+                    .map_err(node_access_error)
+            }
+
             #[cfg(feature = "inspection")]
             fn inspect_prefix_ref_counts(&self, py: Python<'_>) -> (usize, usize) {
                 py.allow_threads(|| self.inner.core().inspect_prefix_ref_counts())

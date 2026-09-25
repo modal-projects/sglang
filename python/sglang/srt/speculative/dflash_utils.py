@@ -20,6 +20,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
+from sglang.srt.speculative.verify_validity import (
+    prepare_verify_rows_,
+    write_first_invalid_rows,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -985,6 +989,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
+    first_invalid_rows: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -1086,6 +1091,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             uniform_top_k_value=uniform_top_k_value,
             use_sparse_topk=use_sparse_topk,
         )
+        if first_invalid_rows is not None:
+            valid_rows = prepare_verify_rows_(target_probs, is_logits=False)
         draft_probs = torch.zeros_like(target_probs)
         candidates_i64 = (
             candidates
@@ -1108,6 +1115,14 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             threshold_acc=threshold_acc,
             deterministic=True,
         )
+        if first_invalid_rows is not None:
+            # The result owns storage outside the borrowed probability pool.
+            write_first_invalid_rows(
+                valid_rows=valid_rows,
+                correct_lens=accept_token_num,
+                out=first_invalid_rows,
+            )
+            del valid_rows
         del target_probs, draft_probs, candidates_i64
         del coins, coins_for_final_sampling
 

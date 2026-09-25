@@ -376,6 +376,7 @@ class UnifiedCacheLinkerWrapper:
             insert_result.last_device_node, req.last_node
         )
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
+        restored_ranges = []
         load_transfers = self._update_load(
             ExternalLinkerLoadPhase.COMMIT,
             req,
@@ -383,9 +384,17 @@ class UnifiedCacheLinkerWrapper:
             prefix_len,
             insert_result=insert_result,
             canonical_full=canonical_tail,
+            restored_ranges=restored_ranges,
         )
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        if restored_ranges:
+            cache.record_committed_host_restore(
+                req,
+                insert_result.last_device_node,
+                min(start for start, _ in restored_ranges),
+                prefix_len,
+            )
 
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
@@ -418,6 +427,7 @@ class UnifiedCacheLinkerWrapper:
         *,
         insert_result=None,
         canonical_full: torch.Tensor | None = None,
+        restored_ranges: list[tuple[int, int]] | None = None,
     ) -> list[PoolTransfer]:
         if not component_transfers:
             return []
@@ -463,6 +473,11 @@ class UnifiedCacheLinkerWrapper:
                 canonical_full=component_canonical,
             )
             if transfer is not None:
+                if (
+                    phase == ExternalLinkerLoadPhase.COMMIT
+                    and restored_ranges is not None
+                ):
+                    restored_ranges.extend(ranges)
                 result.append(transfer)
         return result
 

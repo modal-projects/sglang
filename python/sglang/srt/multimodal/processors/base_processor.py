@@ -6,10 +6,12 @@ import multiprocessing as mp
 import os
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -236,6 +238,7 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    mm_feature_transport_observer: Optional[Callable[[str, int, float], None]] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -1696,7 +1699,36 @@ class BaseMultimodalProcessor(ABC):
             tensor,
             use_pool_handle_cache=self.use_ipc_pool_handle_cache,
         )
-        return proxy if proxy is not None else tensor.cpu()
+        observer = self.mm_feature_transport_observer
+        if observer is None:
+            return proxy if proxy is not None else tensor.cpu()
+
+        if proxy is not None:
+            try:
+                self._observe_mm_feature_transport("cuda_ipc", tensor)
+            except BaseException:
+                self.cudaipc_mmfeature_pool.cancel_proxy(proxy)
+                raise
+            return proxy
+
+        start = time.perf_counter()
+        cpu_tensor = tensor.cpu()
+        seconds = time.perf_counter() - start
+        self._observe_mm_feature_transport("cpu_fallback", tensor, seconds)
+        return cpu_tensor
+
+    def _observe_mm_feature_transport(
+        self, transport: str, tensor: torch.Tensor, seconds: float = 0.0
+    ) -> None:
+        try:
+            self.mm_feature_transport_observer(
+                transport, tensor.numel() * tensor.element_size(), seconds
+            )
+        except Exception:
+            # A metrics backend failure must not strand a producer lease.
+            logger.warning(
+                "Failed to observe multimodal feature transport", exc_info=True
+            )
 
     @staticmethod
     def _move_feature_to_cpu(value):

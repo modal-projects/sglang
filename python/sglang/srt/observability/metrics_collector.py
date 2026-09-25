@@ -1541,6 +1541,19 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        request_label_names = set(
+            get_observability().tokenizer_metrics_allowed_custom_labels or ()
+        )
+        if get_schedule().enable_priority_scheduling:
+            request_label_names.add("priority")
+        # The processor observes producer work without a request-label context.
+        self.mm_feature_transport_labels = {
+            key: value
+            for key, value in self.labels.items()
+            if key not in request_label_names
+        }
+        if "transport" in self.mm_feature_transport_labels:
+            raise ValueError("transport is a reserved feature transport metric label")
 
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
@@ -1664,6 +1677,39 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
+
+        self.mm_feature_transport_tensors_total = Counter(
+            name="sglang:mm_feature_transport_tensors_total",
+            documentation=(
+                "Multimodal feature tensors wrapped for CUDA IPC or copied to host "
+                "after pool exhaustion. Counts producer outcomes, not delivery."
+            ),
+            labelnames=[*self.mm_feature_transport_labels.keys(), "transport"],
+        )
+        self.mm_feature_transport_bytes_total = Counter(
+            name="sglang:mm_feature_transport_bytes_total",
+            documentation=(
+                "Logical bytes (numel times element size) of multimodal features "
+                "wrapped for CUDA IPC or copied to host after pool exhaustion."
+            ),
+            labelnames=[*self.mm_feature_transport_labels.keys(), "transport"],
+        )
+        self.mm_feature_cpu_fallback_seconds_total = Counter(
+            name="sglang:mm_feature_cpu_fallback_seconds_total",
+            documentation=(
+                "Wall time of successful synchronous feature copies to host after "
+                "pool exhaustion, including waits for GPU work. Excludes serialization."
+            ),
+            labelnames=self.mm_feature_transport_labels.keys(),
+        )
+        for transport in ("cuda_ipc", "cpu_fallback"):
+            self.mm_feature_transport_tensors_total.labels(
+                **self.mm_feature_transport_labels, transport=transport
+            )
+            self.mm_feature_transport_bytes_total.labels(
+                **self.mm_feature_transport_labels, transport=transport
+            )
+        self._mm_feature_cpu_fallback_seconds_series()
 
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
@@ -1889,6 +1935,23 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def observe_mm_feature_transport(
+        self, transport: str, nbytes: int, seconds: float = 0.0
+    ) -> None:
+        if transport not in ("cuda_ipc", "cpu_fallback"):
+            raise ValueError(f"Unknown multimodal feature transport: {transport}")
+        labels = {**self.mm_feature_transport_labels, "transport": transport}
+        self.mm_feature_transport_tensors_total.labels(**labels).inc()
+        self.mm_feature_transport_bytes_total.labels(**labels).inc(nbytes)
+        if transport == "cpu_fallback":
+            self._mm_feature_cpu_fallback_seconds_series().inc(seconds)
+
+    def _mm_feature_cpu_fallback_seconds_series(self):
+        counter = self.mm_feature_cpu_fallback_seconds_total
+        # Unlabeled Prometheus counters reject .labels(), including during setup.
+        labels = self.mm_feature_transport_labels
+        return counter.labels(**labels) if labels else counter
 
 
 @dataclass

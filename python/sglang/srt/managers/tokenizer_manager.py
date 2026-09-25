@@ -806,6 +806,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
             )
 
+            if self.mm_processor is not None:
+                # Custom collectors may omit this optional observation hook.
+                self.mm_processor.mm_feature_transport_observer = getattr(
+                    self.metrics_collector, "observe_mm_feature_transport", None
+                )
+
             start_cpu_monitor_thread("tokenizer")
 
         if get_observability().gc_warning_threshold_secs > 0.0:

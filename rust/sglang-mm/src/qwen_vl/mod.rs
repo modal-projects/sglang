@@ -24,7 +24,7 @@ pub struct MropeItem {
 
 /// Resolved processor params, deserialized from the Python-side spec JSON
 /// (unknown fields like `family` are ignored here).
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QwenVlSpec {
     pub image_token_id: i32,
     pub patch_size: usize,
@@ -40,7 +40,7 @@ pub struct QwenVlSpec {
 
 /// The HF image processor the pipeline must match bit-exactly. Defaults to the
 /// one a default server runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resampler {
     /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
@@ -61,6 +61,7 @@ impl From<Resampler> for resize::Resample {
 
 pub struct QwenVlProcessor {
     spec: QwenVlSpec,
+    cache_identity_config: Vec<u8>,
     /// Per-channel u8 → normalized-f32 lookup; see [`normalize_lut`].
     lut: [[f32; 256]; 3],
 }
@@ -89,7 +90,19 @@ impl QwenVlProcessor {
         let lut = core::array::from_fn(|c| {
             normalize_lut(spec.resample, spec.image_mean[c], spec.image_std[c])
         });
-        Ok(Self { spec, lut })
+        // JSON renders non-finite floats as null; preserve their exact bits too.
+        let cache_identity_config = serde_json::to_vec(&(
+            "qwen-vl-v1",
+            &spec,
+            spec.image_mean.map(f32::to_bits),
+            spec.image_std.map(f32::to_bits),
+        ))
+        .map_err(|error| format!("qwen_vl config identity: {error}"))?;
+        Ok(Self {
+            spec,
+            lut,
+            cache_identity_config,
+        })
     }
 
     pub fn from_spec_json(json: &str) -> Result<Self, String> {
@@ -154,6 +167,10 @@ impl QwenVlProcessor {
 }
 
 impl MmFamilyProcessor for QwenVlProcessor {
+    fn cache_identity_config(&self) -> Option<&[u8]> {
+        Some(&self.cache_identity_config)
+    }
+
     fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String> {
         let DecodedMedia::Image { rgb, height, width } = media;
         let (h, w) = (*height, *width);
@@ -355,6 +372,7 @@ pub struct QwenPackedOutput {
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
+    pub cache_identities: Vec<String>,
     /// Per item inclusive token range in `input_ids`.
     pub offsets: Vec<(u32, u32)>,
     /// Flattened row-major `[3, input_len]` M-RoPE positions.
@@ -371,6 +389,7 @@ pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, St
     let mut features = Vec::new();
     let mut grids = Vec::with_capacity(output.items.len());
     let mut hashes = Vec::with_capacity(output.items.len());
+    let mut cache_identities = Vec::with_capacity(output.items.len());
     for item in output.items {
         let TensorData::F32(pixel_values) = item.feature.data else {
             return Err("qwen_vl pack: expected f32 feature".into());
@@ -386,12 +405,14 @@ pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, St
             .ok_or("qwen_vl pack: missing image_grid_thw")?;
         grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
         hashes.push(item.hash);
+        cache_identities.push(item.cache_identity);
     }
     Ok(QwenPackedOutput {
         input_ids: output.input_ids,
         features,
         grids,
         hashes,
+        cache_identities,
         offsets: output.offsets,
         mrope: positions,
         mrope_delta: delta,
@@ -490,13 +511,14 @@ mod python {
     /// Drive the same typed native Qwen request pipeline used by
     /// `sglang-server` (whose message layer owns the wire-payload parsing).
     #[pyfunction]
-    #[pyo3(signature = (input_ids, images, spec_json))]
+    #[pyo3(signature = (input_ids, images, spec_json, *, include_cache_identities = false))]
     fn process_mm<'py>(
         py: Python<'py>,
         input_ids: Option<Vec<i32>>,
         images: Vec<PyImageSource>,
         spec_json: String,
-    ) -> PyResult<PyNativeOutput<'py>> {
+        include_cache_identities: bool,
+    ) -> PyResult<Py<PyAny>> {
         let images = images
             .into_iter()
             .map(|source| match source {
@@ -518,7 +540,8 @@ mod python {
                 pack_output(output)
             })
             .map_err(PyValueError::new_err)?;
-        Ok((
+        let cache_identities = packed.cache_identities;
+        let output: PyNativeOutput<'py> = (
             packed.input_ids,
             packed.features.into_pyarray(py),
             packed
@@ -530,7 +553,25 @@ mod python {
             packed.offsets,
             packed.mrope.into_pyarray(py),
             packed.mrope_delta,
-        ))
+        );
+        if include_cache_identities {
+            let (ids, features, grids, hashes, offsets, mrope, delta) = output;
+            Ok((
+                ids,
+                features,
+                grids,
+                hashes,
+                offsets,
+                mrope,
+                delta,
+                cache_identities,
+            )
+                .into_pyobject(py)?
+                .into_any()
+                .unbind())
+        } else {
+            Ok(output.into_pyobject(py)?.into_any().unbind())
+        }
     }
 
     pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -562,6 +603,32 @@ mod tests {
             image_mean: [0.0; 3],
             image_std: [1.0; 3],
             resample: Resampler::default(),
+        }
+    }
+
+    #[test]
+    fn config_identity_preserves_normalization_float_bits() {
+        for field in ["mean", "std"] {
+            let mut identities = std::collections::HashSet::new();
+            for bits in [
+                0,
+                0x8000_0000,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7fc0_0000,
+                0x7fc0_0001,
+            ] {
+                let mut config = spec();
+                let values = if field == "mean" {
+                    &mut config.image_mean
+                } else {
+                    &mut config.image_std
+                };
+                values[0] = f32::from_bits(bits);
+                let processor = QwenVlProcessor::new(config).unwrap();
+                identities.insert(processor.cache_identity_config().unwrap().to_vec());
+            }
+            assert_eq!(identities.len(), 6, "{field} configuration lost float bits");
         }
     }
 

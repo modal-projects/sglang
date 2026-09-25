@@ -104,6 +104,7 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
+        self.emit_full_hashes = False
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -654,6 +655,7 @@ class MambaRadixCache(BasePrefixCache):
                         token_ids[:page_aligned_len],
                         req.extra_key,
                         cache_salt=req.cache_salt,
+                        mm_spans=req.mm_cache_spans,
                     ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
@@ -773,6 +775,7 @@ class MambaRadixCache(BasePrefixCache):
                     page_aligned_token_ids,
                     req.extra_key,
                     cache_salt=req.cache_salt,
+                    mm_spans=req.mm_cache_spans,
                 ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
@@ -791,6 +794,7 @@ class MambaRadixCache(BasePrefixCache):
                     page_aligned_token_ids,
                     req.extra_key,
                     cache_salt=req.cache_salt,
+                    mm_spans=req.mm_cache_spans,
                 )
             )
         )
@@ -1238,6 +1242,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
+        new_node.emit_full_hashes = child.emit_full_hashes
         new_node.value = child.value[:split_len].clone()
 
         # child time should be later than the new parent's time in the full LRU

@@ -117,6 +117,7 @@ from sglang.srt.mem_cache.common import (
     retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.multimodal_key import MultimodalKeySpan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -158,7 +159,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
-_MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
 
@@ -251,9 +251,11 @@ def split_cached_prefix_by_tier(
     return device, host, storage
 
 
-def _compute_pad_value(hash: int) -> int:
-    """Compute pad value from hash."""
-    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+def _compute_pad_value(hash: int | str) -> int:
+    """Compute a bounded model placeholder from an item identity."""
+    from sglang.srt.multimodal.cache.identity import multimodal_hash_as_int
+
+    return MM_PAD_SHIFT_VALUE + (multimodal_hash_as_int(hash) % (1 << 30))
 
 
 class BaseFinishReason:
@@ -355,6 +357,10 @@ class MultimodalInputFormat(Enum):
 MultimodalDataValue: TypeAlias = object
 
 
+class MultimodalContentIdentityError(ValueError):
+    """Request metadata cannot establish an authoritative media identity."""
+
+
 class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=True):
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
@@ -366,7 +372,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     """
 
     modality: Modality
-    hash: Optional[int] = None
+    hash: Optional[int | str] = None
     pad_value: Optional[int] = None
     offsets: Optional[List[Tuple[int, int]]] = None
 
@@ -386,10 +392,12 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
+    # Content-derived authority survives caller routing-hash overrides.
+    cache_identity: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.hash is not None:
-            msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+            self.hash = self.hash
 
     def __getattr__(self, name: str) -> MultimodalDataValue:
         if name in self.model_specific_data:
@@ -401,8 +409,15 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def __setattr__(self, name: str, value: MultimodalDataValue) -> None:
         if name in self.__struct_fields__:
-            if name == "hash" and isinstance(value, int):
-                value &= _MM_HASH_MASK
+            if name == "hash" and value is None:
+                msgspec.Struct.__setattr__(self, "cache_identity", None)
+                msgspec.Struct.__setattr__(self, "pad_value", None)
+            if name == "hash" and value is not None:
+                from sglang.srt.multimodal.cache.identity import (
+                    normalize_multimodal_hash,
+                )
+
+                value = normalize_multimodal_hash(value)
             msgspec.Struct.__setattr__(self, name, value)
         else:
             self.model_specific_data[name] = value
@@ -413,9 +428,47 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def set(self, key: str, value: MultimodalDataValue) -> None:
         self.__setitem__(key, value)
 
-    def set_hash(self, hash_value: int) -> None:
+    def set_hash(self, hash_value: int | str) -> None:
         self.hash = hash_value
-        self.pad_value = _compute_pad_value(hash_value)
+        self.pad_value = _compute_pad_value(self.hash)
+
+    def set_content_hash(self, content_hash: int | str) -> None:
+        from sglang.srt.multimodal.cache.identity import parse_content_hash
+
+        if isinstance(content_hash, int):
+            self.set_hash(content_hash)
+            self.set_pad_value()
+            return
+        self.cache_identity = parse_content_hash(content_hash)
+        if self.cache_identity is None:
+            raise ValueError("content hash must not be None")
+        self.set_hash(self.cache_identity)
+
+    @property
+    def cache_key(self) -> str:
+        from sglang.srt.multimodal.cache.identity import parse_content_hash
+
+        if (
+            self.cache_identity is None
+            and self.feature is None
+            and self.precomputed_embeddings is None
+        ):
+            raise MultimodalContentIdentityError(
+                "Multimodal cache lookup requires features, embeddings, "
+                "or a processor content identity"
+            )
+        if self.cache_identity is not None:
+            try:
+                self.cache_identity = parse_content_hash(self.cache_identity)
+            except ValueError as error:
+                raise MultimodalContentIdentityError(str(error)) from error
+        # Transport/materialization errors keep their original exception type.
+        self.set_pad_value()
+        if self.cache_identity is None:
+            raise MultimodalContentIdentityError(
+                "Multimodal cache lookup requires a content identity"
+            )
+        return self.cache_identity
 
     @staticmethod
     def is_empty_list(l):
@@ -424,17 +477,72 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        if self.pad_value is not None:
-            return
-
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        self.hash = resolve_multimodal_item_hash(
-            existing_hash=self.hash,
-            feature=self.feature,
-            precomputed_embeddings=self.precomputed_embeddings,
-        )
-        self.pad_value = _compute_pad_value(self.hash)
+        if (
+            self.cache_identity is None
+            and self.feature is None
+            and self.precomputed_embeddings is None
+        ):
+            if self.hash is None:
+                raise ValueError(
+                    "An item without a hash must contain features or embeddings"
+                )
+            if self.pad_value is None:
+                self.pad_value = _compute_pad_value(self.hash)
+            return
+
+        if self.cache_identity is None:
+            ignored_metadata = {
+                "input_ids",
+                "offsets",
+                "hash",
+                "pad_value",
+                "format",
+                "modality",
+                "cache_identity",
+                "pre_chunked_input_ids",
+                CUDA_IPC_FEATURE_COPY_EVENT_KEY,
+                RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
+                DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+                "_sglang_borrow_cuda_ipc_feature",
+            }
+            metadata = {
+                name: value
+                for name, value in self.model_specific_data.items()
+                if name not in ignored_metadata
+            }
+            prompt = self.model_specific_data.get("pre_chunked_input_ids")
+            if prompt is not None:
+                if self.offsets:
+                    start = min(lo for lo, _ in self.offsets)
+                    end = max(hi for _, hi in self.offsets) + 1
+                    local_tokens = list(prompt[start:end])
+                    for lo, hi in self.offsets:
+                        local_tokens[lo - start : hi + 1 - start] = [None] * (
+                            hi - lo + 1
+                        )
+                    metadata["frame_layout"] = (
+                        [(lo - start, hi - start) for lo, hi in self.offsets],
+                        local_tokens,
+                    )
+                else:
+                    metadata["frame_layout"] = prompt
+            metadata.update(modality=self.modality.name, format=self.format.name)
+            content_hash = resolve_multimodal_item_hash(
+                feature=self.feature,
+                precomputed_embeddings=self.precomputed_embeddings,
+            )
+            self.cache_identity = resolve_multimodal_item_hash(
+                existing_hash=content_hash,
+                model_specific_data=metadata,
+            )
+            if self.hash is None:
+                self.hash = content_hash
+        if self.hash is None:
+            self.hash = self.cache_identity
+        if self.pad_value is None:
+            self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -527,6 +635,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY, False
             )
             and self.hash is not None
+            and self.cache_identity is not None
             and self.pad_value is not None
             and isinstance(self.feature, CudaIpcTensorTransportProxy)
             and not isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
@@ -724,6 +833,7 @@ class MultimodalInputs:
     padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
+    cache_span_overrides: tuple[MultimodalKeySpan, ...] = ()
 
     # image
     im_token_id: Optional[int] = None
@@ -750,6 +860,64 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    def cache_spans(self, token_ids: array) -> tuple[MultimodalKeySpan, ...]:
+        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+
+        cache_identities = [item.cache_key for item in self.mm_items]
+        if self.num_image_tokens:
+            identity = resolve_multimodal_item_hash(
+                existing_hash=0,
+                model_specific_data={"encoder_items": cache_identities},
+            )
+            return (MultimodalKeySpan(0, self.num_image_tokens, identity),)
+
+        spans = list(self.cache_span_overrides)
+        if not spans:
+            for item, cache_identity in zip(self.mm_items, cache_identities):
+                offset = 0
+                for start, end in item.offsets or ():
+                    spans.append(
+                        MultimodalKeySpan(start, end + 1, cache_identity, offset)
+                    )
+                    offset += end - start + 1
+        spans.sort(key=lambda span: span.start)
+        if not self.cache_span_overrides and all(
+            item.offsets for item in self.mm_items
+        ):
+            return tuple(spans)
+
+        # Older padding adapters expose only placeholders, so all media that
+        # can fill a placeholder participates in that span's identity.
+        by_placeholder = {}
+        for item, cache_identity in zip(self.mm_items, cache_identities):
+            if item.offsets and not self.cache_span_overrides:
+                continue
+            by_placeholder.setdefault(item.pad_value, []).append(cache_identity)
+        identities = {
+            value: resolve_multimodal_item_hash(
+                existing_hash=0, model_specific_data={"items": hashes}
+            )
+            for value, hashes in by_placeholder.items()
+        }
+        position = 0
+        while position < len(token_ids):
+            containing_span = next(
+                (span for span in spans if span.start <= position < span.end), None
+            )
+            if containing_span is not None:
+                position = containing_span.end
+                continue
+            value = token_ids[position]
+            if value not in identities:
+                position += 1
+                continue
+            end = position + 1
+            while end < len(token_ids) and token_ids[end] == value:
+                end += 1
+            spans.append(MultimodalKeySpan(position, end, identities[value]))
+            position = end
+        return tuple(sorted(spans, key=lambda span: span.start))
+
     def release_features(self, items: Optional[List[MultimodalDataItem]] = None):
         """Release feature tensors to free GPU memory.
 
@@ -769,6 +937,64 @@ class MultimodalInputs:
                 )
             finally:
                 item.feature = None
+
+    def for_prefix(self, token_ids: array, length: int) -> Optional[MultimodalInputs]:
+        """Retain whole media owners when a session rewrites its token history."""
+        if length >= len(token_ids):
+            return self
+        if length == 0:
+            return None
+
+        # Aggregate encoders and legacy padding metadata describe one group.
+        # Splitting that group would require slicing model-specific features.
+        aggregate = (
+            self.cache_span_overrides
+            or self.num_image_tokens
+            or self.image_pad_len is not None
+            or self.vision_position_ids is not None
+            or self.media_nums_per_sample is not None
+            or self.visible_frame_counts is not None
+            or "image_offsets" in self.__dict__
+            or "data_offsets" in self.__dict__
+            or any(not item.offsets for item in self.mm_items)
+        )
+        if aggregate:
+            spans = self.cache_spans(token_ids)
+            if not spans:
+                raise ValueError("Cannot truncate session media without token offsets.")
+            groups = [(self.mm_items, [(span.start, span.end) for span in spans])]
+        else:
+            groups = [
+                ([item], [(start, end + 1) for start, end in item.offsets])
+                for item in self.mm_items
+            ]
+
+        retained = []
+        for items, spans in groups:
+            if all(end <= length for _, end in spans):
+                retained.extend(items)
+            elif any(start < length for start, _ in spans):
+                raise ValueError("Session offset cannot split a multimodal item.")
+        if not retained:
+            return None
+
+        # Retain the item objects themselves: session ownership follows their
+        # identities, and copying an unopened transport proxy would alias a lease.
+        result = copy.copy(self)
+        result.mm_items = retained
+        if self.padded_input_ids is not None:
+            result.padded_input_ids = self.padded_input_ids[:length]
+        if self.mrope_positions is not None:
+            result.mrope_positions = self.mrope_positions[:, :length]
+            if result.mrope_positions.numel():
+                result.mrope_position_delta = (
+                    result.mrope_positions.max() + 1 - result.mrope_positions.shape[1]
+                ).reshape(1, 1)
+            else:
+                result.mrope_positions = None
+                result.mrope_position_delta = None
+            result.mrope_position_delta_repeated_cache = None
+        return result
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -801,7 +1027,9 @@ class MultimodalInputs:
                         item.feature = try_add_to_buffer(item.feature)
 
         for item in mm_items:
-            item.set_pad_value()
+            # Reject missing authority while errors can still be attributed to
+            # this request, before embedding or prefix cache lookup.
+            _ = item.cache_key
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:
@@ -872,11 +1100,17 @@ class MultimodalInputs:
         optional_args = [
             "mm_items",
             "image_pad_len",
+            "cache_span_overrides",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
             if self_arg is not None:
                 setattr(self, arg, self_arg + getattr(other, arg))
+
+        for arg in ("image_offsets", "data_offsets"):
+            other_offsets = other.__dict__.get(arg)
+            if other_offsets is not None:
+                setattr(self, arg, self.__dict__.get(arg, []) + other_offsets)
 
         mrope_positions = self.mrope_positions
         if mrope_positions is not None:
@@ -1180,6 +1414,7 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        self._mm_cache_spans: Optional[tuple[MultimodalKeySpan, ...]] = None
         # Pre-computed multimodal prompt token counts; populated on the prefill
         # node and transferred to decode via the metadata buffer in disagg (PD) mode.
         self.mm_image_tokens: int = 0
@@ -1510,6 +1745,7 @@ class Req(ReqDllmMixin):
         self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
+        self._mm_cache_spans = None
         if self.session is not None:
             self._extend_session_image_inputs(image_inputs)
         elif self.multimodal_inputs is None:
@@ -1517,13 +1753,23 @@ class Req(ReqDllmMixin):
         else:
             self.multimodal_inputs.merge(image_inputs)
 
+    @property
+    def mm_cache_spans(self) -> tuple[MultimodalKeySpan, ...]:
+        if self._mm_cache_spans is None:
+            self._mm_cache_spans = (
+                self.multimodal_inputs.cache_spans(self.origin_input_ids)
+                if self.multimodal_inputs is not None
+                else ()
+            )
+        return self._mm_cache_spans
+
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""
         # Padding can change token values without changing their count.
         self.full_untruncated_fill_ids = array("q")
         if self.multimodal_inputs is not None:
             # Branches and aborted turns must leave the parent's metadata intact.
-            self.multimodal_inputs = dataclasses.replace(self.multimodal_inputs)
+            self.multimodal_inputs = copy.copy(self.multimodal_inputs)
 
         positions = image_inputs.mrope_positions
         if positions is not None:
@@ -1662,6 +1908,7 @@ class Req(ReqDllmMixin):
                         extra_key=self.extra_key,
                         limit=key_limit,
                         cache_salt=self.cache_salt,
+                        mm_spans=self.mm_cache_spans,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,

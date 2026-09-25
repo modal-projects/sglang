@@ -50,12 +50,15 @@ if TYPE_CHECKING:
             )
 
         def match_prefix(
-            self, prefix: List[int]
+            self,
+            prefix: List[int],
+            mm_spans: Tuple[Tuple[int, int, str, int], ...] = (),
         ) -> Tuple[List[torch.Tensor], int, TreeNodeCpp, TreeNodeCpp]:
             """
             Matches a prefix in the radix tree.
             Args:
                 prefix (List[int]): The prefix to match.
+                mm_spans: Raw token spans (start, exclusive end, full identity, media offset).
             Returns:
                 Tuple[List[torch.Tensor], TreeNodeCpp, TreeNodeCpp]:
                     0. A list of indices that is matched by the prefix on the GPU.
@@ -63,7 +66,7 @@ if TYPE_CHECKING:
                     2. The last node of the prefix matched on the GPU.
                     3. The last node of the prefix matched on the CPU.
             """
-            return self.tree.match_prefix(prefix)
+            return self.tree.match_prefix(prefix, mm_spans)
 
         def evict(self, num_tokens: int) -> List[torch.Tensor]:
             """
@@ -86,20 +89,24 @@ if TYPE_CHECKING:
             return self.tree.lock_ref(handle, lock)
 
         def writing_through(
-            self, key: List[int], indices: torch.Tensor
+            self,
+            key: List[int],
+            indices: torch.Tensor,
+            mm_spans: Tuple[Tuple[int, int, str, int], ...] = (),
         ) -> Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
             """
             Inserts a key-value pair into the radix tree and perform write-through check.
             Args:
                 key (List[int]): The key to insert.
                 indices (torch.Tensor): The value associated with the key.
+                mm_spans: Raw token spans (start, exclusive end, full identity, media offset).
             Returns:
                 Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
                     0. A list of (IOHandle, device indices, host indices) tuples.
                        These IOhandles require write-through to the CPU in python side.
                     1. The number of indices that are matched on device.
             """
-            return self.tree.writing_through(key, indices)
+            return self.tree.writing_through(key, indices, mm_spans)
 
         def loading_onboard(
             self,

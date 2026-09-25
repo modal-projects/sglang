@@ -1242,16 +1242,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
-            # Caller-supplied per-image hashes (external KV routers, e.g.
-            # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
+            # Caller routing hints change placeholders while retaining the
+            # processor's content authority. Malformed hints are ignored.
             caller_mm_hashes = getattr(obj, "mm_hashes", None)
             if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
                 if len(caller_mm_hashes) != len(mm_inputs.mm_items):
@@ -1267,6 +1259,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             continue
                         try:
                             item.set_hash(int(hex_hash, 16))
+                            # Processors may have padded with the original hash.
+                            # Let the scheduler rebuild IDs using the caller's hash.
+                            mm_inputs.padded_input_ids = None
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Ignoring malformed mm_hashes entry %r; "

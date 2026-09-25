@@ -79,8 +79,11 @@ class TestQwenE2eParity(CustomTestCase):
     def run_native(self, spec, sources):
         """The Rust path: the `process_mm` driver, then the drain
         adapter — the same two steps `RustServer.drain` performs."""
-        ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
-            PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
+        ids, features, grids, hashes, offsets, mrope, delta, identities = DRIVER(
+            PROMPT_PER_IMAGE * len(sources),
+            sources,
+            spec.rust_json(),
+            include_cache_identities=True,
         )
         # The shape of Rust's MmEncodedResult, inline transport
         # (test_wrap_encoded pins the shm shape).
@@ -89,6 +92,7 @@ class TestQwenE2eParity(CustomTestCase):
             shm_names=None,
             grids=grids,
             hashes=hashes,
+            cache_identities=identities,
             offsets=offsets,
             mrope=mrope,
             mrope_delta=delta,

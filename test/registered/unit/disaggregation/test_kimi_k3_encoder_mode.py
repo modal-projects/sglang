@@ -915,7 +915,7 @@ def test_encoder_preprocessed_items_hash_individually():
         mm_inputs["pixel_values"], grid_thws, Modality.IMAGE, mm_inputs
     )
 
-    assert hashes == [item.hash for item in items]
+    assert hashes == [item.cache_identity for item in items]
     assert hashes[0] != hashes[1]
 
 

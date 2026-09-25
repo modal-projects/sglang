@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from datetime import timedelta
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
@@ -49,6 +50,13 @@ def _item(identity, rows):
     )
 
 
+def _content_item(value, rows):
+    item = _item(value, rows)
+    item.set_pad_value()
+    item.set_hash(11)
+    return item
+
+
 def _offsets(items):
     offsets = []
     cursor = 0
@@ -91,7 +99,7 @@ def _cache(route, items, hits, *, stale=False):
     if route == "full":
         if hits:
             key = mm_schedule.MultiModalStaticCache.combine_hashes(
-                [item.hash for item in items]
+                [item.cache_key for item in items]
             )
             value = torch.cat([item.feature for item in items])
             if stale:
@@ -105,7 +113,7 @@ def _cache(route, items, hits, *, stale=False):
             if stale:
                 value = value[:-1]
             mm_schedule.embedding_cache.set(
-                items[i].hash, mm_schedule.EmbeddingResult(embedding=value)
+                items[i].cache_key, mm_schedule.EmbeddingResult(embedding=value)
             )
 
 
@@ -129,9 +137,20 @@ def _collective_worker(rank, rendezvous):
         with patch.object(
             mm_schedule, "get_parallel", return_value=_parallel(_GlooGroup(), rank)
         ):
-            for route in ("batch", "by_item", "full"):
+            for route, content_keys in product(
+                ("batch", "by_item", "full"), (False, True)
+            ):
                 for mode in ("asymmetric", "all_hit", "all_miss", "stale"):
-                    items = [_item(11, 2), _item(22, 3)]
+                    if content_keys:
+                        items = [
+                            _content_item(11, 2),
+                            _content_item(22, 2),
+                            _content_item(11, 2),
+                        ]
+                        assert len({item.hash for item in items}) == 1
+                        assert len({item.cache_key for item in items}) == 2
+                    else:
+                        items = [_item(11, 2), _item(22, 3)]
                     if mode == "asymmetric":
                         hits = [rank] if route != "full" else ([0] if rank == 0 else [])
                     elif mode == "all_hit":
@@ -144,7 +163,9 @@ def _collective_worker(rank, rendezvous):
                     calls = []
 
                     def encode(batch):
-                        identities = [(item.hash, len(item.feature)) for item in batch]
+                        identities = [
+                            (item.cache_key, len(item.feature)) for item in batch
+                        ]
                         peers = [None, None]
                         dist.all_gather_object(peers, identities)
                         assert peers[0] == peers[1], peers
@@ -168,6 +189,62 @@ class TestRankConsistentEncode(CustomTestCase):
 
     def tearDown(self):
         mm_schedule.embedding_cache = self.old_cache
+
+    def test_content_keys_with_shared_routing_hints_and_repeated_spans(self):
+        """Local hits and TP miss unions retain each distinct content identity."""
+        for route, mode in product(
+            ("batch", "by_item", "full"),
+            ("all_hit", "all_miss", "mixed", "peer_miss"),
+        ):
+            with self.subTest(route=route, mode=mode):
+                items = [
+                    _content_item(11, 2),
+                    _content_item(22, 2),
+                    _content_item(11, 2),
+                ]
+                a, b, repeated_a = items
+                self.assertEqual(a.hash, b.hash)
+                self.assertEqual(a.pad_value, b.pad_value)
+                self.assertNotEqual(a.cache_key, b.cache_key)
+                self.assertEqual(a.cache_key, repeated_a.cache_key)
+                hits = [] if mode == "all_miss" else [0]
+                if mode == "all_hit":
+                    hits = [0, 1]
+                cached_items = (
+                    [a, repeated_a, a] if route == "full" and mode == "mixed" else items
+                )
+                _cache(route, cached_items, hits)
+                peer_flags = [int(mode == "peer_miss")]
+                if route != "full":
+                    peer_flags.append(0)
+                group = _PeerGroup(peer_flags)
+                encoded = []
+
+                def encode(batch):
+                    encoded.extend(item.cache_key for item in batch)
+                    return torch.cat([item.feature + 100 for item in batch])
+
+                with (
+                    patch.object(dist, "is_initialized", return_value=True),
+                    patch.object(
+                        mm_schedule, "get_parallel", return_value=_parallel(group)
+                    ),
+                ):
+                    result = _run_route(route, items, encode, prefix=1, extend=4)
+
+                if mode == "all_hit":
+                    expected_encoded = []
+                    values = [item.feature for item in items]
+                elif mode == "mixed" and route != "full":
+                    expected_encoded = [b.cache_key]
+                    values = [a.feature, b.feature + 100, repeated_a.feature]
+                else:
+                    expected_encoded = [a.cache_key, b.cache_key]
+                    if route != "batch":
+                        expected_encoded.append(a.cache_key)
+                    values = [item.feature + 100 for item in items]
+                self.assertEqual(encoded, expected_encoded)
+                torch.testing.assert_close(result, torch.cat(values)[1:5])
 
     def test_asymmetric_hits_keep_original_encode_order(self):
         """A local hit before a local miss must retain its batch position."""
@@ -285,11 +362,35 @@ class TestRankConsistentEncode(CustomTestCase):
 
     def test_forced_reencode_is_reused_by_subsequent_hits(self):
         """Batch-dependent rounding must not leave different encodings cached."""
-        for route in ("batch", "by_item", "full"):
-            with self.subTest(route=route):
-                items = [_item(11, 2)]
-                fresh = items[0].feature
-                prior = torch.nextafter(fresh, torch.full_like(fresh, float("inf")))
+        for route, content_keys in product(("batch", "by_item", "full"), (False, True)):
+            with self.subTest(route=route, content_keys=content_keys):
+                if content_keys:
+                    items = [
+                        _content_item(11, 2),
+                        _content_item(22, 2),
+                        _content_item(11, 2),
+                    ]
+                    self.assertEqual(len({item.hash for item in items}), 1)
+                    self.assertEqual(len({item.pad_value for item in items}), 1)
+                    self.assertNotEqual(items[0].cache_key, items[1].cache_key)
+                    self.assertEqual(items[0].cache_key, items[2].cache_key)
+                    for item in items:
+                        self.assertRegex(item.cache_key, r"^sha256:[0-9a-f]{64}$")
+                else:
+                    items = [_item(11, 2)]
+                unique_items = {item.cache_key: item for item in items}
+                stored_items = items if route == "full" else unique_items.values()
+                fresh = torch.cat([item.feature for item in stored_items])
+                expected = torch.cat([item.feature for item in items])
+                flag_count = 1 if route == "full" else len(unique_items)
+
+                def encode(batch):
+                    return torch.cat([item.feature for item in batch])
+
+                def encode_prior(batch):
+                    value = encode(batch)
+                    return torch.nextafter(value, torch.full_like(value, float("inf")))
+
                 caches = []
                 for rank in (0, 1):
                     mm_schedule.init_mm_embedding_cache(1 << 20)
@@ -297,7 +398,7 @@ class TestRankConsistentEncode(CustomTestCase):
                     caches.append(cache)
                     if rank == 0:
                         with patch.object(dist, "is_initialized", return_value=False):
-                            _run_route(route, items, lambda batch: prior)
+                            _run_route(route, items, encode_prior)
                     cache.set(
                         99, mm_schedule.EmbeddingResult(embedding=torch.ones(1, 2))
                     )
@@ -311,12 +412,12 @@ class TestRankConsistentEncode(CustomTestCase):
                         patch.object(
                             mm_schedule,
                             "get_parallel",
-                            return_value=_parallel(_PeerGroup([1 - rank]), rank),
+                            return_value=_parallel(
+                                _PeerGroup([1 - rank] * flag_count), rank
+                            ),
                         ),
                     ):
-                        first_results.append(
-                            _run_route(route, items, lambda batch: fresh)
-                        )
+                        first_results.append(_run_route(route, items, encode))
 
                     def unexpected_encode(batch):
                         self.fail("A subsequent unanimous hit entered the encoder")
@@ -326,11 +427,16 @@ class TestRankConsistentEncode(CustomTestCase):
                         patch.object(
                             mm_schedule,
                             "get_parallel",
-                            return_value=_parallel(_PeerGroup([0]), rank),
+                            return_value=_parallel(_PeerGroup([0] * flag_count), rank),
                         ),
                     ):
                         next_results.append(_run_route(route, items, unexpected_encode))
                     self.assertTrue(torch.equal(first_results[-1], next_results[-1]))
+                    self.assertTrue(torch.equal(first_results[-1], expected))
+                    if route == "full":
+                        self.assertTrue(
+                            cache.has(tuple(item.cache_key for item in items))
+                        )
                     self.assertTrue(
                         torch.equal(cache.get_single(99).embedding, torch.ones(1, 2))
                     )
@@ -376,6 +482,7 @@ class TestRankConsistentEncode(CustomTestCase):
                 for rank in (0, 1, 2, 3):
                     with self.subTest(route=route, peer_miss=peer_miss, rank=rank):
                         item = _item(11, 2)
+                        item.set_pad_value()
                         expected = item.feature.clone()
                         _cache(route, [item], [0])
                         mm_schedule.embedding_cache.max_size = 16

@@ -56,8 +56,13 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and (
+                    (tail.block_hashes_sha256 is None)
+                    == (event.block_hashes_sha256 is None)
+                ):
                     tail.block_hashes.extend(event.block_hashes)
+                    if tail.block_hashes_sha256 is not None:
+                        tail.block_hashes_sha256.extend(event.block_hashes_sha256)
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
@@ -69,9 +74,19 @@ class KVCacheEventRecorder:
                     and tail.session_id == event.session_id
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
+                    and (
+                        tail.block_hashes_sha256 is None
+                        and event.block_hashes_sha256 is None
+                        or tail.block_hashes_sha256 is not None
+                        and event.block_hashes_sha256 is not None
+                        and event.parent_block_hash_sha256
+                        == tail.block_hashes_sha256[-1]
+                    )
                 ):
                     tail.block_hashes.extend(event.block_hashes)
                     tail.token_ids.extend(event.token_ids)
+                    if tail.block_hashes_sha256 is not None:
+                        tail.block_hashes_sha256.extend(event.block_hashes_sha256)
                     return
 
         self._queue.append(event)
@@ -84,7 +99,7 @@ class KVCacheEventRecorder:
             return node.hash_value
         return compute_node_event_hash_values(node, self.page_size)
 
-    def _parent_block_hash(self, node: Any) -> Optional[int]:
+    def _parent_hash(self, node: Any) -> Optional[str]:
         """The hash the first page of ``node`` links back to.
 
         ``None`` when the parent is the tree root: a root carries an empty
@@ -101,7 +116,24 @@ class KVCacheEventRecorder:
             parent_hash_values = parent.hash_value
         if not parent_hash_values:
             return None
-        return hash_str_to_int64(parent_hash_values[-1])
+        return parent_hash_values[-1]
+
+    def _parent_block_hash(self, node: Any) -> Optional[int]:
+        digest = self._parent_hash(node)
+        return hash_str_to_int64(digest) if digest is not None else None
+
+    def _needs_full_hashes(self, node: Any) -> bool:
+        current = node
+        while current is not None:
+            if (
+                current.emit_full_hashes
+                or current.key is not None
+                and current.key.mm_spans
+            ):
+                node.emit_full_hashes = True
+                return True
+            current = current.parent
+        return False
 
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None
@@ -116,6 +148,8 @@ class KVCacheEventRecorder:
 
         event_hash_values = self._node_event_hash_values(node)
         parent_block_hash = self._parent_block_hash(node)
+        full_hashes = self._needs_full_hashes(node)
+        parent_full_hash = self._parent_hash(node) if full_hashes else None
 
         page_index = 0
         logical_len = len(node.key)
@@ -143,10 +177,15 @@ class KVCacheEventRecorder:
                     medium=medium,
                     cache_salt=node.key.cache_salt,
                     session_id=session_id,
+                    block_hashes_sha256=(
+                        [event_hash_values[page_index]] if full_hashes else None
+                    ),
+                    parent_block_hash_sha256=parent_full_hash,
                 )
             )
 
             parent_block_hash = block_hash
+            parent_full_hash = event_hash_values[page_index] if full_hashes else None
             page_index += 1
 
     def record_remove(self, node: Any, medium=None) -> None:
@@ -173,7 +212,17 @@ class KVCacheEventRecorder:
             page_index += 1
 
         if block_hashes:
-            self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+            self.enqueue(
+                BlockRemoved(
+                    block_hashes=block_hashes,
+                    medium=medium,
+                    block_hashes_sha256=(
+                        event_hash_values[:page_index]
+                        if self._needs_full_hashes(node)
+                        else None
+                    ),
+                )
+            )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:

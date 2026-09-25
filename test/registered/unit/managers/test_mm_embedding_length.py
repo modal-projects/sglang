@@ -126,7 +126,7 @@ def test_adjust_embedding_length_rejects_short_embedding():
         mm_utils._adjust_embedding_length(embedding, 3, Mock())
 
 
-def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
+def test_get_embedding_and_mask_uses_updated_offsets_after_input_ids_rewrite():
     input_ids = torch.zeros(8, dtype=torch.long)
     rewritten_input_ids = input_ids.clone()
     embedding = torch.zeros(2, 4)
@@ -134,13 +134,18 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
     mask_sum.item.return_value = 2
     mask = Mock()
     mask.sum.return_value = mask_sum
+    offsets = [[(2, 4)]]
+
+    def rewrite(*args):
+        offsets[0][:] = [(2, 3)]
+        return embedding, rewritten_input_ids
 
     with (
         patch.object(mm_utils, "_get_precomputed_embedding", return_value=None),
         patch.object(
             mm_utils,
             "_get_chunked_prefill_embedding",
-            return_value=(embedding, rewritten_input_ids),
+            side_effect=rewrite,
         ),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
@@ -152,11 +157,10 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
             items_size=[0, 1],
             prefix_length=[0],
             extend_length=[8],
-            items_offset_list=[[(2, 4)]],
+            items_offset_list=offsets,
         )
 
-    mask.sum.assert_called_once_with()
-    mask_sum.item.assert_called_once_with()
+    mask.sum.assert_not_called()
     assert result is embedding
     assert result_mask is mask
     assert result_input_ids is rewritten_input_ids

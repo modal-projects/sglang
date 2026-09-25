@@ -51,7 +51,8 @@ MmInput { text?, input_ids?, images }
   2. family.layout(input_ids, geometries)   → TokenLayout
        apply_layout: expanded input_ids + per-item (start, end) offsets
   3. family.positions(len, offsets, geoms)  → Rope1D | MRope
-  4. Output { input_ids, items: [{feature, aux, hash}], offsets, positions }
+  4. full content/config/grid identity per item
+       Output { input_ids, items: [{feature, aux, hash, cache_identity}], offsets, positions }
 ```
 
 The driver owns these steps and their failure semantics — any `Err` at any
@@ -62,10 +63,11 @@ the request. With qwen as the example:
 
 - **`process_item`** — one decoded image → `ProcessedItem`:
   - `feature`: the model's feature tensor. Qwen: `pixel_values`, from
-    smart_resize → bicubic → normalize → patchify. The item identity is the
-    driver's hash of the raw encoded source bytes, taken before decode — the
-    same role as Python's `hash_feature`, but a different algorithm over
-    different input, so never comparable across paths.
+    smart_resize → bicubic → normalize → patchify. The driver's compact hash
+    of raw source bytes remains the routing hash. A separate full SHA-256
+    `cache_identity` covers framed source bytes, effective processor config,
+    feature shape/dtype, auxiliary tensors, and grid. Families without a
+    deterministic configuration contract also include feature bytes.
   - `aux`: named tensors for the model runner. Qwen: `image_grid_thw`;
     other families: `image_sizes`, `tgt_sizes`, ... (Python:
     `model_specific_data`).
@@ -207,7 +209,10 @@ impl ImageProcessorSpec for MyModelProcessor {
 - Lanczos and Bicubic resize are bit-exact clones of PIL's fixed-point
   implementations.
 - `common::content_hash_u64` is blake3, *not* Python's SHA-256
-  `mm_utils.data_hash`. Hashes are consistent within one path only.
+  `mm_utils.data_hash`. Routing hashes are consistent within one path only.
+  Caller routing overrides never replace worker-produced cache identities.
+  `qwen_vl.process_mm` keeps its seven-field tuple by default; passing
+  `include_cache_identities=True` appends the authoritative per-item identities.
 
 ## Build
 

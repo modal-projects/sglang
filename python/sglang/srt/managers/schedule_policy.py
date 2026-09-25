@@ -179,6 +179,7 @@ def match_prefix_for_req(
                 extra_key=req.extra_key,
                 limit=key_limit,
                 cache_salt=req.cache_salt,
+                mm_spans=req.mm_cache_spans,
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
@@ -385,6 +386,7 @@ class SchedulePolicy:
                             token_ids=prefix_ids,
                             extra_key=extra_key,
                             cache_salt=cache_salt,
+                            mm_spans=r.mm_cache_spans,
                         )
                     )
                 )
@@ -406,6 +408,7 @@ class SchedulePolicy:
                                 token_ids=prefix_ids,
                                 extra_key=extra_key,
                                 cache_salt=cache_salt,
+                                mm_spans=r.mm_cache_spans,
                             ),
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )

@@ -84,7 +84,7 @@ class QwenVLImagePreprocessArtifact:
 
     content_digest: str
     artifact_key: str
-    feature_hash: int
+    feature_hash: int | str
     feature: Optional[torch.Tensor]
     model_specific_data: dict[str, Any]
 
@@ -848,7 +848,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             # cache identity from it so independently preprocessed copies in
             # different tokenizer workers share the same radix/VLM cache key.
             feature_hash = resolve_multimodal_item_hash(
-                existing_hash=0, namespace=entry.artifact_key
+                existing_hash=0,
+                namespace=entry.artifact_key,
+                model_specific_data={"grid_thw": tuple(grid.tolist())},
             )
             artifacts.append(
                 QwenVLImagePreprocessArtifact(
@@ -923,7 +925,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 offsets=[offset],
                 model_specific_data=deepcopy(artifact.model_specific_data),
             )
-            item.set_hash(artifact.feature_hash)
+            item.set_content_hash(artifact.feature_hash)
             mm_items.append(item)
 
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(

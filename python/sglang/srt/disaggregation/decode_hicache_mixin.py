@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.multimodal_key import slice_mm_spans
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -93,6 +94,9 @@ class DecodeHiCachePreallocMixin:
                     prefix_keys,
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    mm_spans=slice_mm_spans(
+                        req.mm_cache_spans, matched_len, len(req.origin_input_ids)
+                    ),
                 )
 
         return DecodePrefixMatch(
@@ -120,9 +124,8 @@ class DecodeHiCachePreallocMixin:
             return
         try:
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
+            # The cache clips logical hits while retaining any raw bigram boundary.
+            suffix = req.origin_input_ids[matched_len:]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
                 self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
@@ -137,6 +140,14 @@ class DecodeHiCachePreallocMixin:
                 prefix_keys,
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                matched_prefix_tokens=req.origin_input_ids[:matched_len],
+                storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
+                mm_spans=slice_mm_spans(
+                    req.mm_cache_spans, matched_len, matched_len + len(suffix)
+                ),
+                matched_prefix_mm_spans=slice_mm_spans(
+                    req.mm_cache_spans, 0, matched_len
+                ),
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle

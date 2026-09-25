@@ -257,7 +257,7 @@ class RustMmProcessor:
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         ``take_mm_result``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
-        views them, and each item's ``hash`` is worker-precomputed so
+        views them, and each item's ``cache_identity`` is worker-precomputed so
         ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
@@ -275,8 +275,14 @@ class RustMmProcessor:
             features = torch.from_numpy(encoded.features.reshape(-1, spec.feature_dim))
         items = []
         row = 0
-        for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(encoded.grids, encoded.hashes, encoded.offsets)
+        for index, ((t, h, w), item_hash, offset, cache_identity) in enumerate(
+            zip(
+                encoded.grids,
+                encoded.hashes,
+                encoded.offsets,
+                encoded.cache_identities,
+                strict=True,
+            )
         ):
             n = t * h * w
             if shm_names is None:
@@ -301,6 +307,7 @@ class RustMmProcessor:
                     modality=Modality.IMAGE,
                     feature=feature,
                     hash=item_hash,
+                    cache_identity=cache_identity,
                     offsets=[tuple(offset)],
                     model_specific_data={
                         "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)

@@ -79,19 +79,21 @@ class LlavaBaseForCausalLM(nn.Module):
     def pad_input_ids(
         self, input_ids: array[int], image_inputs: MultimodalInputs
     ) -> array[int]:
-        image_sizes = flatten_nested_list(
-            [item.image_sizes for item in image_inputs.mm_items]
-        )
-
-        pad_values = [item.pad_value for item in image_inputs.mm_items]
+        images = [
+            (item, image_size)
+            for item in image_inputs.mm_items
+            for image_size in flatten_nested_list(item.image_sizes)
+        ]
+        for item in image_inputs.mm_items:
+            item.offsets = []
 
         # hardcode for spatial_unpad + anyres
         # Use per-item aspect_ratio from processor if available, else infer
         image_aspect_ratio = self._infer_image_aspect_ratio(image_inputs.mm_items)
         offset_list = []
         image_inputs.image_pad_len = []
-        for image_idx, image_s in enumerate(image_sizes):
-            if len(image_sizes) > 16:
+        for item, image_s in images:
+            if len(images) > 16:
                 # 2x2 pooling with stride 2
                 new_image_feature_len = (
                     math.ceil(self.image_size / self.patch_size / 2) ** 2
@@ -130,7 +132,7 @@ class LlavaBaseForCausalLM(nn.Module):
             except ValueError:
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
-            pad_token = pad_values[image_idx % len(pad_values)]
+            pad_token = item.pad_value
             input_ids = (
                 input_ids[:offset]
                 + array("q", [pad_token]) * new_image_feature_len
@@ -138,6 +140,7 @@ class LlavaBaseForCausalLM(nn.Module):
             )
             offset_list.append(offset)
             image_inputs.image_pad_len.append(new_image_feature_len)
+            item.offsets.append((offset, offset + new_image_feature_len - 1))
 
         image_inputs.image_offsets = offset_list
         return input_ids

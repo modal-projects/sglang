@@ -12,7 +12,8 @@ use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::runtime::Runnable;
 
 /// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
+/// router's pad values stay compatible. Authoritative identities are separate.
+/// A length mismatch or malformed
 /// entry warns and keeps the computed hash — never blocks the request.
 fn apply_caller_hashes(hashes: &mut [u64], caller: &[String]) {
     if caller.is_empty() {
@@ -106,6 +107,7 @@ fn process(
             offsets: packed.offsets,
             mrope: packed.mrope,
             mrope_delta: packed.mrope_delta,
+            cache_identities: packed.cache_identities,
         },
     );
     Ok(packed.input_ids)
@@ -171,6 +173,50 @@ impl Runnable for MmWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_routing_override_preserves_worker_identity() {
+        let spec = r#"{"family":"qwen_vl","image_token_id":1,"patch_size":2,
+            "merge_size":2,"temporal_patch_size":2,"min_pixels":4,
+            "max_pixels":1073741824,"image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0]}"#;
+        let ctx = MmContext {
+            family: sglang_mm::registry::pipeline_from_spec(spec).unwrap(),
+            tokenizer: None,
+            results: MmResultStore::default(),
+            feature_shm: false,
+        };
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNQSJgARwzEcQCzQxEBCWxTrgAAAABJRU5ErkJggg==";
+        let different_image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNQTJgARwzEcQC08xERT1S+HAAAAABJRU5ErkJggg==";
+        let mut entries = Vec::new();
+        for (index, (caller_hashes, source)) in [
+            (vec![], image),
+            (vec!["ff".to_string()], image),
+            (vec!["ff".to_string()], different_image),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rid: Rid = format!("image-{index}").into();
+            process(
+                &ctx,
+                &rid,
+                crate::message::request::MmWorkItem {
+                    input_ids: Some(vec![1]),
+                    image_data: vec![crate::message::multimodal::MmItem::Source(source.into())],
+                    mm_hashes: caller_hashes,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            entries.push(ctx.results.take(rid.as_str()).unwrap());
+        }
+        assert_ne!(entries[0].hashes, entries[1].hashes);
+        assert_eq!(entries[1].hashes, [255]);
+        assert_eq!(entries[0].cache_identities, entries[1].cache_identities);
+        assert_eq!(entries[0].cache_identities[0].len(), 71);
+        assert_eq!(entries[1].hashes, entries[2].hashes);
+        assert_ne!(entries[1].cache_identities, entries[2].cache_identities);
+    }
 
     /// Caller hashes override computed ones; mismatched lengths and malformed
     /// entries fall back per item, never reject (Python parity).

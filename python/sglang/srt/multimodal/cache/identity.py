@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, TypeAlias, runtime_checkable
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -20,6 +20,7 @@ from PIL import Image
 from sglang.srt.runtime_context import get_mm, get_model
 
 CONTENT_HASH_PREFIX = "sha256:"
+MultimodalHash: TypeAlias = int | str
 _SHA256_HEX_LENGTH = 64
 _MEDIA_ENVELOPE_FIELDS = frozenset(
     {"type", "format", "url", "image", "video", "audio", "content_hash"}
@@ -42,15 +43,41 @@ def parse_content_hash(value: Optional[str]) -> Optional[str]:
     digest = value[len(CONTENT_HASH_PREFIX) :]
     if len(digest) != _SHA256_HEX_LENGTH:
         raise ValueError("content_hash must contain exactly 64 SHA-256 hex digits")
-    try:
-        bytes.fromhex(digest)
-    except ValueError as exc:
-        raise ValueError("content_hash contains non-hexadecimal characters") from exc
+    if any(char not in "0123456789abcdefABCDEF" for char in digest):
+        raise ValueError("content_hash contains non-hexadecimal characters")
     return CONTENT_HASH_PREFIX + digest.lower()
 
 
 def _digest_bytes(payload: bytes) -> str:
     return CONTENT_HASH_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def normalize_multimodal_hash(value: MultimodalHash) -> MultimodalHash:
+    """Keep legacy integer identities and encode wider integers losslessly on the wire."""
+    if isinstance(value, bool):
+        raise ValueError("item hash must be a non-negative integer or SHA-256 digest")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("item hash must be a non-negative integer")
+        return value if value < 1 << 64 else "int:" + format(value, "x")
+    if isinstance(value, str) and value.startswith("int:"):
+        try:
+            return normalize_multimodal_hash(int(value[4:], 16))
+        except ValueError as exc:
+            raise ValueError(
+                "item integer hash must contain hexadecimal digits"
+            ) from exc
+    digest = parse_content_hash(value)
+    if digest is None:
+        raise ValueError("item hash must not be None")
+    return digest
+
+
+def multimodal_hash_as_int(value: MultimodalHash) -> int:
+    value = normalize_multimodal_hash(value)
+    if isinstance(value, int):
+        return value
+    return int(value.split(":", 1)[1], 16)
 
 
 def _hash_parts(*parts: bytes) -> str:
@@ -255,7 +282,7 @@ def _canonicalize(value: Any) -> Any:
         return {"type": "torch_dtype", "value": str(value)}
     if isinstance(value, torch.Tensor):
         snapshot = value.detach().to("cpu").contiguous()
-        payload = snapshot.view(torch.uint8).numpy().tobytes()
+        payload = snapshot.reshape(-1).view(torch.uint8).numpy().tobytes()
         return {
             "type": "torch_tensor",
             "dtype": str(snapshot.dtype),
@@ -328,11 +355,12 @@ def build_artifact_key(
 
 def resolve_multimodal_item_hash(
     *,
-    existing_hash: Optional[int] = None,
+    existing_hash: Optional[MultimodalHash] = None,
     feature: Any = None,
     precomputed_embeddings: Any = None,
     namespace: Optional[str] = None,
-) -> int:
+    model_specific_data: Optional[Mapping[str, Any]] = None,
+) -> MultimodalHash:
     """Unified helper for resolving a hash for MultimodalDataItem cache, optionally scoped to an artifact identity.
 
     Args:
@@ -344,37 +372,43 @@ def resolve_multimodal_item_hash(
     if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
         import uuid
 
-        item_hash = uuid.uuid4().int
+        item_hash = normalize_multimodal_hash(uuid.uuid4().int)
     elif existing_hash is not None:
-        # if exists, reuse
-        item_hash = existing_hash
+        item_hash = normalize_multimodal_hash(existing_hash)
     else:
-        # hash from feature
-        from sglang.srt.managers.mm_utils import hash_feature
-
         value = feature if feature is not None else precomputed_embeddings
-        item_hash = hash_feature(value)
+        item_hash = _feature_digest(value)
 
-    if namespace is None:
+    if namespace is None and not model_specific_data:
         return item_hash
 
-    if isinstance(item_hash, bool) or not isinstance(item_hash, int) or item_hash < 0:
-        raise ValueError("item hash must be a non-negative integer")
-    namespace = parse_content_hash(namespace)
-    assert namespace is not None
-    hash_bytes = item_hash.to_bytes(
-        max(1, (item_hash.bit_length() + 7) // 8), byteorder="big", signed=False
+    return _digest_bytes(
+        _canonical_json(
+            {
+                "version": "multimodal-feature-v2",
+                "feature": item_hash,
+                "namespace": parse_content_hash(namespace),
+                "model_specific_data": model_specific_data or {},
+            }
+        )
     )
-    digest = _hash_parts(
-        b"multimodal-feature-v1",
-        bytes.fromhex(namespace[len(CONTENT_HASH_PREFIX) :]),
-        hash_bytes,
-    )
-    return int.from_bytes(
-        bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
-        byteorder="big",
-        signed=False,
-    )
+
+
+def _feature_digest(value: Any) -> str:
+    from sglang.srt.managers.mm_utils import ShmPointerMMData
+    from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+
+    if value is None:
+        raise ValueError("an item without a hash must contain features or embeddings")
+    if isinstance(value, ShmPointerMMData):
+        value = value.tensor
+    elif isinstance(value, CudaIpcTensorTransportProxy):
+        value = value.reconstruct_on_target_device(torch.cuda.current_device())
+    if isinstance(value, Image.Image):
+        return _snapshot_pil(value).content_digest
+    if isinstance(value, (list, tuple)):
+        return _digest_bytes(_canonical_json([_feature_digest(item) for item in value]))
+    return _digest_bytes(_canonical_json(value))
 
 
 def build_processor_fingerprint(

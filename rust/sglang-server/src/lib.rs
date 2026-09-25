@@ -57,6 +57,8 @@ struct MmEncodedResult {
     /// M-RoPE delta, `max(mrope) + 1 - seq_len`, added to the plain sequence
     /// position during decoding.
     mrope_delta: i64,
+    /// Worker-computed SHA-256 identities; caller routing overrides never change these.
+    cache_identities: Vec<String>,
 }
 
 /// Columnar request batch handed to Python by [`Server::recv_requests`].
@@ -235,6 +237,7 @@ impl Server {
             offsets: res.offsets,
             mrope: res.mrope.into_pyarray(py).unbind(),
             mrope_delta: res.mrope_delta,
+            cache_identities: res.cache_identities,
         })
     }
 

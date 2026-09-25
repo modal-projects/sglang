@@ -94,7 +94,7 @@ class KimiK3ImagePreprocessArtifact:
 
     content_digest: str
     artifact_key: str
-    feature_hash: int
+    feature_hash: int | str
     original_size: tuple[int, int]
     resize_config: KimiK3ResizeConfig
     grid_thw: tuple[int, int, int]

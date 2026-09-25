@@ -2897,6 +2897,8 @@ fn insert_coalesces_parent_linked_block_stores() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))
@@ -2934,6 +2936,8 @@ fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))
@@ -3009,6 +3013,8 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: token_only
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))
@@ -3105,6 +3111,8 @@ fn salted_event_hash_walk_is_iterative_and_on_demand() {
 fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     let mut tc = events_core(2);
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![1],
         parent_block_hash: None,
         token_ids: vec![10, 11],
@@ -3116,6 +3124,8 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![2],
         parent_block_hash: Some(1),
         token_ids: vec![12],
@@ -3127,6 +3137,8 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![3],
         parent_block_hash: Some(2),
         token_ids: vec![13],
@@ -3138,6 +3150,8 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![4],
         parent_block_hash: None,
         token_ids: vec![14],
@@ -3148,21 +3162,25 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes_sha256: None,
         block_hashes: vec![1],
         medium: StorageMedium::Gpu,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes_sha256: None,
         block_hashes: vec![2, 3],
         medium: StorageMedium::Gpu,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     assert!(matches!(
         tc.kv_event_queue.last(),
-        Some(KvCacheEvent::BlockRemoved { block_hashes, .. })
+        Some(KvCacheEvent::BlockRemoved {
+            block_hashes_sha256: None, block_hashes, .. })
             if block_hashes.as_slice() == [1, 2, 3]
     ));
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes_sha256: None,
         block_hashes: vec![4],
         medium: StorageMedium::Cpu,
     });
@@ -3170,6 +3188,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.record_all_cleared_event();
     assert_eq!(tc.kv_event_queue.len(), 7);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes_sha256: None,
         block_hashes: vec![5],
         medium: StorageMedium::Cpu,
     });
@@ -3181,6 +3200,8 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
 
     tc.kv_event_queue.clear();
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![1],
         parent_block_hash: None,
         token_ids: vec![10, 11],
@@ -3190,6 +3211,8 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         session_id: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes_sha256: None,
+        parent_block_hash_sha256: None,
         block_hashes: vec![2],
         parent_block_hash: Some(1),
         token_ids: vec![12, 13],
@@ -3223,6 +3246,7 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockRemoved {
+            block_hashes_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|h| crate::node::hash_str_to_int64(h))
@@ -3259,6 +3283,8 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))
@@ -3286,6 +3312,8 @@ fn finish_write_through_emits_cpu_stored_events() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
@@ -3318,6 +3346,7 @@ fn host_eviction_emits_a_cpu_block_removed() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockRemoved {
+            block_hashes_sha256: None,
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             medium: StorageMedium::Cpu,
         }]
@@ -3342,6 +3371,8 @@ fn load_back_commit_emits_gpu_stored_events() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
@@ -3362,6 +3393,8 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
@@ -3413,6 +3446,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
         tc.take_events(),
         vec![
             KvCacheEvent::BlockRemoved {
+                block_hashes_sha256: None,
                 block_hashes: child_hashes
                     .iter()
                     .map(|h| crate::node::hash_str_to_int64(h))
@@ -3420,6 +3454,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                 medium: StorageMedium::Cpu,
             },
             KvCacheEvent::BlockRemoved {
+                block_hashes_sha256: None,
                 block_hashes: leaf_hashes
                     .iter()
                     .map(|h| crate::node::hash_str_to_int64(h))
@@ -3451,6 +3486,8 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: vec![crate::node::hash_str_to_int64(&leaf_hashes[0])],
             parent_block_hash: Some(crate::node::hash_str_to_int64(&base_hashes[0])),
             token_ids: vec![5, 6],
@@ -3512,6 +3549,8 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     assert!(tc.take_events().iter().all(|event| !matches!(
         event,
         KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             medium: StorageMedium::Cpu,
             ..
         }
@@ -3530,6 +3569,8 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))
@@ -3859,6 +3900,8 @@ fn insert_host_publishes_a_host_store_event() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
+            block_hashes_sha256: None,
+            parent_block_hash_sha256: None,
             block_hashes: hashes
                 .iter()
                 .map(|hash| crate::node::hash_str_to_int64(hash))

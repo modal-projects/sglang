@@ -341,9 +341,7 @@ class Session:
                     abort_message = "Invalid request session id"
                 else:
                     last_req_node = self.req_nodes[session_params.rid]
-                    last_req_node.abort()
                     last_req = last_req_node.req
-                    last_req_node.clear_children(self.req_nodes)
         else:
             if session_params.rid is not None:
                 if session_params.rid not in self.req_nodes:
@@ -389,6 +387,24 @@ class Session:
                 "A session request must contain input tokens after restoring history."
             )
 
+        inherited_media = None
+        if (
+            last_req is not None
+            and not abort
+            and last_req.multimodal_inputs is not None
+        ):
+            try:
+                inherited_media = (
+                    last_req.multimodal_inputs
+                    if self.streaming
+                    else last_req.multimodal_inputs.for_prefix(
+                        last_req.origin_input_ids, len(input_ids) - len(req.input_ids)
+                    )
+                )
+            except ValueError as error:
+                abort = True
+                abort_message = str(error)
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
@@ -422,8 +438,8 @@ class Session:
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
-        if last_req is not None and not abort:
-            new_req.multimodal_inputs = last_req.multimodal_inputs
+        if not abort:
+            new_req.multimodal_inputs = inherited_media
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
@@ -437,6 +453,9 @@ class Session:
             self._inflight_rid = req.rid
         else:
             self.last_active_time = time.monotonic()
+            if session_params.replace and last_req_node is not None:
+                last_req_node.abort()
+                last_req_node.clear_children(self.req_nodes)
             previous = self.req_nodes.get(req.rid)
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node

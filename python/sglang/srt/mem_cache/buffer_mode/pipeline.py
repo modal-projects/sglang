@@ -49,6 +49,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.multimodal_key import (
+    MultimodalKeySpan,
+    shift_mm_spans,
+    slice_mm_spans,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
@@ -113,6 +118,7 @@ class _StagedPrefetch(msgspec.Struct):
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
+    mm_spans: tuple[MultimodalKeySpan, ...] = ()
 
 
 class _OngoingBufferLoadBack(msgspec.Struct):
@@ -135,6 +141,30 @@ class _AnchorLock(msgspec.Struct):
 
     node_id: NodeId
     tokens: int
+
+
+def _concat_prefetch_key(
+    *,
+    prefix_tokens: list[int],
+    prefix_mm_spans: tuple[MultimodalKeySpan, ...],
+    suffix_key: RadixKey,
+    num_tokens: int,
+) -> RadixKey:
+    # The prefix excludes the bigram boundary; the suffix owns that raw token.
+    suffix_tokens = suffix_key.raw_token_ids()[: num_tokens + int(suffix_key.is_bigram)]
+    token_ids = array("q", prefix_tokens)
+    token_ids.extend(suffix_tokens)
+    mm_spans = prefix_mm_spans + shift_mm_spans(
+        slice_mm_spans(suffix_key.mm_spans, 0, len(suffix_tokens)),
+        len(prefix_tokens),
+    )
+    return RadixKey(
+        token_ids,
+        extra_key=suffix_key.extra_key,
+        is_bigram=suffix_key.is_bigram,
+        cache_salt=suffix_key.cache_salt,
+        mm_spans=mm_spans,
+    )
 
 
 def _track_content_refs(refs: dict[str, int], hash_values: list[str]) -> None:
@@ -275,7 +305,13 @@ class BufferModePipeline:
         self.pending_hit_allocs: deque = deque()
         self._staged_admission_defers: dict[CacheRequestHandle, int] = {}
         self._prefetch_prefix_ctx: dict[
-            CacheRequestHandle, tuple[list[int], Optional[str], Optional[str]]
+            CacheRequestHandle,
+            tuple[
+                list[int],
+                Optional[str],
+                Optional[str],
+                tuple[MultimodalKeySpan, ...],
+            ],
         ] = {}
         self.staged_prefetches: dict[CacheRequestHandle, _StagedPrefetch] = {}
         self.ongoing_buffer_load_back: dict[int, _OngoingBufferLoadBack] = {}
@@ -709,7 +745,7 @@ class BufferModePipeline:
             )
         operation_id = self._cache.cache_controller.write_storage(
             entry.host_indices,
-            snapshot.key.token_ids,
+            snapshot.key,
             snapshot.hash_values,
             snapshot.prefix_keys,
             extra_pools=storage_xfers or None,
@@ -768,26 +804,31 @@ class BufferModePipeline:
         assert request not in self.anchor_locks, (
             f"prefetch anchor already locked: {request.rid}"
         )
-        prefix_tokens, extra_key, cache_salt = self._prefetch_prefix_ctx[request]
+        prefix_tokens, extra_key, cache_salt, prefix_mm_spans = (
+            self._prefetch_prefix_ctx[request]
+        )
         matched_len = len(prefix_tokens)
         assert matched_len + remaining_full_tokens > 0, (
             f"empty prefetch span: {request.rid}"
         )
-        full_key_tokens = array("q", prefix_tokens)
         if remaining_full_tokens or self._cache.tree_core.is_eagle:
             info = self._cache.ongoing_prefetch[request]
-            raw_len = remaining_full_tokens + int(info.prefetch_key.is_bigram)
-            full_key_tokens.extend(info.prefetch_key.token_ids[:raw_len])
+            key = _concat_prefetch_key(
+                prefix_tokens=prefix_tokens,
+                prefix_mm_spans=prefix_mm_spans,
+                suffix_key=info.prefetch_key,
+                num_tokens=remaining_full_tokens,
+            )
+        else:
+            key = RadixKey(
+                array("q", prefix_tokens),
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+                mm_spans=prefix_mm_spans,
+            )
         cache = self._cache
         matched_full, anchor_node, anchor_tokens = (
-            cache.tree_core.match_full_device_prefix(
-                RadixKey(
-                    full_key_tokens,
-                    extra_key=extra_key,
-                    is_bigram=cache.tree_core.is_eagle,
-                    cache_salt=cache_salt,
-                )
-            )
+            cache.tree_core.match_full_device_prefix(key)
         )
         if matched_full < matched_len:
             return "anchor_lost", matched_full
@@ -843,15 +884,13 @@ class BufferModePipeline:
         info = self._cache.ongoing_prefetch.get(request)
         if info is None or span_tokens <= 0:
             return False
-        prefix_tokens, _, _ = self._prefetch_prefix_ctx[request]
+        prefix_tokens, _, _, prefix_mm_spans = self._prefetch_prefix_ctx[request]
         span_key = info.prefetch_key
-        full_tokens = array("q", prefix_tokens)
-        full_tokens.extend(span_key[:span_tokens].token_ids)
-        key = RadixKey(
-            full_tokens,
-            extra_key=span_key.extra_key,
-            is_bigram=self._cache.tree_core.is_eagle,
-            cache_salt=span_key.cache_salt,
+        key = _concat_prefetch_key(
+            prefix_tokens=prefix_tokens,
+            prefix_mm_spans=prefix_mm_spans,
+            suffix_key=span_key,
+            num_tokens=span_tokens,
         )
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
         return len(match.device_indices) >= len(key)
@@ -862,14 +901,17 @@ class BufferModePipeline:
         matched_prefix_tokens,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ) -> None:
         """Record the device-matched prefix (and its tree-key namespace) at
         prefetch enqueue; consumed at staging commit to build the full-span
         tree key, and by try_lock_anchor to re-match a stale anchor."""
+        prefix_tokens = list(matched_prefix_tokens or [])
         self._prefetch_prefix_ctx[request] = (
-            list(matched_prefix_tokens or []),
+            prefix_tokens,
             extra_key,
             cache_salt,
+            slice_mm_spans(mm_spans, 0, len(prefix_tokens)),
         )
 
     def pop_prefix_ctx(self, request: CacheRequestHandle) -> None:
@@ -896,6 +938,7 @@ class BufferModePipeline:
             extra_key=f.extra_key,
             is_bigram=self._cache.tree_core.is_eagle,
             cache_salt=f.cache_salt,
+            mm_spans=f.mm_spans,
         )
         matched_len, node_id, _ = self._cache.tree_core.match_full_device_prefix(key)
         if matched_len < f.matched_len:
@@ -1014,16 +1057,16 @@ class BufferModePipeline:
         # prefetch is later dropped unconsumed.
         cache.storage_existence_cache.add(PoolName.KV, list(staged_hashes))
         occupied_tokens = self._occupied_span(host_indices)
+        key = _concat_prefetch_key(
+            prefix_tokens=prefix_tokens,
+            prefix_mm_spans=prefix_ctx[3],
+            suffix_key=prefetch_key,
+            num_tokens=num_tokens,
+        )
 
         self.staged_prefetches[request] = _StagedPrefetch(
             request=request,
-            key_tokens=array(
-                "q",
-                prefix_tokens
-                + list(
-                    prefetch_key.token_ids[: num_tokens + int(prefetch_key.is_bigram)]
-                ),
-            ),
+            key_tokens=key.token_ids,
             extra_key=prefetch_key.extra_key,
             cache_salt=prefetch_key.cache_salt,
             matched_len=len(prefix_tokens),
@@ -1033,6 +1076,7 @@ class BufferModePipeline:
             aux_xfers=aux_xfers,
             hash_values=staged_hashes,
             operation_id=operation.id,
+            mm_spans=key.mm_spans,
         )
         cache.prefetch_loaded_tokens_by_reqid[request] = num_tokens
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start

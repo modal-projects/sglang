@@ -116,7 +116,24 @@ def get_hash_str(
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str | List[str]:
+    from sglang.srt.mem_cache.multimodal_key import hash_mm_page
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
+    if isinstance(token_ids, RadixKey) and token_ids.mm_spans and len(token_ids):
+        width = len(token_ids) if page_size is None else page_size
+        if width < 1:
+            raise ValueError("page_size must be positive")
+        hashes = []
+        for start in range(0, len(token_ids), width):
+            end = min(start + width, len(token_ids))
+            page = token_ids[start:end]
+            if page.mm_spans:
+                prior_digest = hash_mm_page(page, 0, len(page), prior_digest)
+            else:
+                prior_digest = bytes.fromhex(get_native_hash(page, prior_digest, None))
+            hashes.append(prior_digest.hex())
+        return hashes[0] if page_size is None else hashes
     return get_native_hash(token_ids, prior_digest, page_size)
 
 

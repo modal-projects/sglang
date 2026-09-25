@@ -55,10 +55,11 @@ struct RadixTree::Impl {
   }
 
   // node: x -> [GPU]
-  TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices) {
+  TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices, mm_spans_t mm_spans = {}) {
     auto new_node_ptr = std::make_unique<TreeNode>(m_node_counter++);
     auto new_node = new_node_ptr.get();
     new_node_ptr->_unsafe_tokens() = std::move(vec);
+    new_node_ptr->_unsafe_mm_spans() = std::move(mm_spans);
     new_node_ptr->_unsafe_device_indices() = std::move(indices);
     m_evictable_size += new_node_ptr->length();
     add_child(parent, std::move(new_node_ptr));
@@ -80,7 +81,7 @@ struct RadixTree::Impl {
    * @return A pair containing the last node that matches the key and
    * the total prefix length matched (on gpu and cpu) so far.
    */
-  std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
+  std::pair<TreeNode*, std::size_t> tree_walk(token_slice key, mm_span_slice mm_spans = {}) {
     _assert(key.size() % page_size == 0, "Key should be page-aligned");
 
     std::size_t total_prefix_length = 0;
@@ -88,7 +89,7 @@ struct RadixTree::Impl {
 
     const auto now = std::chrono::steady_clock::now();
     while (key.size() > 0) {
-      const auto iterator = node->find_child(get_key(key));
+      const auto iterator = node->find_child(get_key(key, mm_spans, total_prefix_length));
       if (iterator == node->end()) break;
 
       // walk to the child node
@@ -96,7 +97,7 @@ struct RadixTree::Impl {
 
       // at least `page_size` tokens are matched, and there may be more tokens to match
       // the return value prefix_length is no less than `page_size`
-      const auto prefix_length = align(node->diff_key(key, page_size) + page_size);
+      const auto prefix_length = align(node->diff_key(key, page_size, mm_spans, total_prefix_length) + page_size);
       total_prefix_length += prefix_length;
 
       // split the node if the prefix is not the whole token vector
@@ -248,16 +249,16 @@ struct RadixTree::Impl {
 
  private:
   // some auxiliary functions
-  token_vec_t& get_key(token_slice tokens) {
+  token_vec_t& get_key(token_slice tokens, mm_span_slice mm_spans = {}, std::size_t start = 0) {
     _assert(tokens.size() >= page_size, "Key should be at least page-sized");
     tokens = tokens.subspan(0, page_size);
-    m_cached_vec.assign(tokens.begin(), tokens.end());
+    make_page_key(m_cached_vec, tokens, mm_spans, start);
     return m_cached_vec;
   }
 
   // justify for _unsafe call: we need to read the key part of the tokens
   token_vec_t& get_key(TreeNode* node) {
-    return get_key(node->_unsafe_tokens());
+    return get_key(node->_unsafe_tokens(), node->_unsafe_mm_spans());
   }
 
   void add_child(TreeNode* parent, std::unique_ptr<TreeNode>&& child) {

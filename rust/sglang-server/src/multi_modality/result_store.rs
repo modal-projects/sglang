@@ -25,6 +25,7 @@ pub struct MmEncodedEntry {
     /// Flattened row-major `[3, input_len]` M-RoPE positions.
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
+    pub cache_identities: Vec<String>,
 }
 
 /// Where a result's feature buffers live between worker and drain.

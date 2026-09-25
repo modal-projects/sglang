@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import free_kv_row_segments
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.multimodal_key import shift_mm_spans
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -82,6 +83,7 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
+        self.emit_full_hashes = False
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -482,6 +484,7 @@ class SWARadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
         ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -531,6 +534,7 @@ class SWARadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.kv.cache_protected_len
@@ -1049,8 +1053,11 @@ class SWARadixCache(BasePrefixCache):
                 node.key.extra_key,
                 is_bigram=node.key.is_bigram,
                 cache_salt=node.key.cache_salt,
+                mm_spans=node.key.mm_spans
+                + shift_mm_spans(child.key.mm_spans, len(node.key.token_ids)),
             )
             node.value = torch.cat([node.value, child.value])
+            node.emit_full_hashes = node.emit_full_hashes or child.emit_full_hashes
             node.children = child.children
             for grandchild in node.children.values():
                 grandchild.parent = node
@@ -1119,6 +1126,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
+        new_node.emit_full_hashes = child.emit_full_hashes
         assert len(new_node.key) > 0, f"new_node.key should not be empty"
         new_node.value = child.value[:split_len].clone()
         # parent inherits the swa_uuid from child for swa lock ref

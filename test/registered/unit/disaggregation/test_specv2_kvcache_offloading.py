@@ -26,6 +26,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.multimodal_key import MultimodalKeySpan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
@@ -48,6 +49,7 @@ def _make_mock_req(
     req.rid = rid
     req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.cache_salt = None
+    req.mm_cache_spans = ()
     req.origin_input_ids = list(range(origin_len))
     req.kv = ReqKvInfo(
         req_pool_idx=req_pool_idx,
@@ -108,6 +110,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
     manager.page_size = page_size
+    manager.is_bigram = False
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
@@ -138,7 +141,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         ]:
             with self.subTest(extra_key=extra_key, cache_salt=cache_salt):
                 namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
-                req = SimpleNamespace(**namespace)
+                req = SimpleNamespace(**namespace, mm_cache_spans=())
                 prefix = manager._compute_prefix_hash(req, tokens[:4])
                 tail = manager._compute_prefix_hash(req, tokens[4:], prefix[-1])
                 self.assertEqual(
@@ -469,6 +472,145 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertEqual(len(manager.offloaded_state), 0)
         self.assertEqual(len(manager.offload_inflight), 0)
+
+
+class TestDecodeOffloadContentIdentity(CustomTestCase):
+    def test_prefix_and_continuation_use_the_same_storage_grammar(self):
+        """A short media span must keep the same hash through every offload split."""
+        tokens = [10, 99, 99, 20, 99, 30, 40, 50, 60]
+        identity = "sha256:" + "a" * 64
+        spans = (
+            MultimodalKeySpan(1, 3, identity),
+            MultimodalKeySpan(4, 5, identity),
+        )
+        for bigram in (False, True):
+            for mm_spans in ((), spans):
+                for extra_key, cache_salt in (
+                    (None, None),
+                    ("model-a", None),
+                    (None, "tenant-a"),
+                    ("model-a", "tenant-a"),
+                ):
+                    with self.subTest(
+                        bigram=bigram,
+                        media=bool(mm_spans),
+                        extra_key=extra_key,
+                        cache_salt=cache_salt,
+                    ):
+                        manager, _ = _make_manager(pool_size=16, page_size=2)
+                        manager.is_bigram = bigram
+                        req = SimpleNamespace(
+                            extra_key=extra_key,
+                            cache_salt=cache_salt,
+                            mm_cache_spans=mm_spans,
+                        )
+                        key = RadixKey(
+                            tokens,
+                            extra_key=extra_key,
+                            cache_salt=cache_salt,
+                            is_bigram=bigram,
+                            mm_spans=mm_spans,
+                        ).page_aligned(2)
+                        expected = get_storage_hash_str(key, page_size=2)
+                        boundary = int(bigram)
+                        prefix = manager._compute_prefix_hash(
+                            req, tokens[: 4 + boundary]
+                        )
+                        tail = manager._compute_prefix_hash(
+                            req,
+                            tokens[4 : len(key) + boundary],
+                            prefix[-1],
+                            token_start=4,
+                        )
+                        self.assertEqual(prefix + tail, expected)
+
+    def test_delayed_ack_retains_multimodal_tail_and_bigram_boundaries(self):
+        """Queued spans retain media offsets after request metadata is cleared."""
+        identity = "sha256:" + "b" * 64
+        spans = (
+            MultimodalKeySpan(1, 3, identity),
+            MultimodalKeySpan(5, 7, identity),
+        )
+        for bigram in (False, True):
+            with self.subTest(bigram=bigram):
+                manager, _ = _make_manager(pool_size=32, page_size=2)
+                manager.is_bigram = bigram
+                manager.offload_stride = 2
+                manager.request_counter = 0
+                manager.decode_host_mem_pool = object()
+                stored = []
+                copied = []
+
+                def copy_to_host(*, device_indices, node_id):
+                    copied.append(device_indices.clone())
+                    return device_indices.clone()
+
+                def write_storage(host_indices, key, *, hash_value):
+                    stored.append((key, list(hash_value), host_indices.clone()))
+                    return len(stored)
+
+                manager.cache_controller = SimpleNamespace(
+                    write=copy_to_host, write_storage=write_storage, ack_write_queue=[]
+                )
+                req = _make_mock_req(0, 24, 24, rid="media", origin_len=7)
+                req.extra_key, req.cache_salt = "model-a", "tenant-a"
+                req.origin_input_ids = [10, 99, 99, 20, 30, 99, 99]
+                req.output_ids = [40, 41, 42, 43]
+                req.mm_cache_spans = spans
+                req.finished.return_value = False
+                self.assertTrue(manager.offload_kv_cache(req))
+                first_key = manager.ongoing_offload[1][2]
+                self.assertIsInstance(first_key, RadixKey)
+                self.assertEqual(
+                    first_key.mm_spans, (MultimodalKeySpan(0, 1, identity, offset=1),)
+                )
+                initial_hash = manager.offloaded_state[req].last_hash
+
+                req.output_ids.extend([44, 45, 46, 47])
+                self.assertTrue(manager.offload_kv_cache(req))
+                all_tokens = req.origin_input_ids + req.output_ids[:-1]
+                expected_key = RadixKey(
+                    all_tokens,
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
+                    is_bigram=bigram,
+                    mm_spans=spans,
+                ).page_aligned(2)
+                prefill_len = manager._prefill_offloaded_len(req)
+                prefix_hashes = get_storage_hash_str(
+                    expected_key[:prefill_len], page_size=2
+                )
+                self.assertEqual(initial_hash, prefix_hashes[-1])
+
+                req.mm_cache_spans = ()
+                req.multimodal_inputs = None
+                for ack_id in (1, 2):
+                    manager.cache_controller.ack_write_queue.append(
+                        HiCacheAck(None, _FinishedEvent(), [ack_id])
+                    )
+                    manager._check_offload_progress(1)
+                actual_hashes = prefix_hashes + [
+                    h for _, hashes, _ in stored for h in hashes
+                ]
+                self.assertEqual(
+                    actual_hashes, get_storage_hash_str(expected_key, page_size=2)
+                )
+                self.assertEqual(
+                    manager.offloaded_state[req].last_hash, actual_hashes[-1]
+                )
+                self.assertNotIn(req, manager.offload_inflight)
+                start = prefill_len
+                for (key, _, host), device in zip(stored, copied):
+                    self.assertEqual(len(key.raw_token_ids()), len(key) + int(bigram))
+                    self.assertEqual(
+                        key.raw_token_ids(),
+                        expected_key[start : start + len(key)].raw_token_ids(),
+                    )
+                    torch.testing.assert_close(host, device)
+                    torch.testing.assert_close(
+                        device, torch.arange(start, start + len(key))
+                    )
+                    start += len(key)
 
 
 class TestSamplingMaskAbortOffload(CustomTestCase):

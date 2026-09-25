@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "common.h"
+#include "multimodal_key.h"
 
 namespace radix_tree_v2 {
 
@@ -140,6 +141,9 @@ struct TreeNode {
     old_node->m_tokens = token_vec_t(tokens.begin() + prefix_length, tokens.end());
     new_node->m_tokens = std::move(tokens);
     new_node->m_tokens.resize(prefix_length);
+    auto mm_spans = std::move(old_node->m_mm_spans);
+    old_node->m_mm_spans = slice_mm_spans(mm_spans, prefix_length, prefix_length + old_node->length());
+    new_node->m_mm_spans = slice_mm_spans(mm_spans, 0, prefix_length);
 
     // set up values
     const int64_t new_size = new_node->length();
@@ -169,11 +173,9 @@ struct TreeNode {
   }
 
   /// @return The first index in `m_tokens` that differs from `key`.
-  std::size_t diff_key(token_slice key, std::size_t offset) const {
-    const auto a = token_slice{key}.subspan(offset);
-    const auto b = token_slice{m_tokens}.subspan(offset);
-    const auto [it_a, it_b] = std::ranges::mismatch(a, b);
-    return it_a - a.begin();  // return the index of the first differing token
+  std::size_t
+  diff_key(token_slice key, std::size_t offset, mm_span_slice mm_spans = {}, std::size_t key_start = 0) const {
+    return matching_token_count(key, mm_spans, key_start, m_tokens, m_mm_spans, offset);
   }
 
   at::Tensor device_indices() const {
@@ -186,6 +188,9 @@ struct TreeNode {
   // visiting tokens are always unsafe (use `diff_key` instead)
   token_vec_t& _unsafe_tokens() {
     return m_tokens;
+  }
+  mm_spans_t& _unsafe_mm_spans() {
+    return m_mm_spans;
   }
   at::Tensor& _unsafe_device_indices() {
     return m_device_indices;
@@ -235,6 +240,7 @@ struct TreeNode {
   IOTicket m_io_ticket;
 
   token_vec_t m_tokens;
+  mm_spans_t m_mm_spans;
   at::Tensor m_device_indices;  // indices of device value
   at::Tensor m_host_indices;    // indices of host value
   TreeNode* m_parent;

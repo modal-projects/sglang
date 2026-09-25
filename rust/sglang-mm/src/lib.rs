@@ -8,6 +8,7 @@
 
 pub mod common;
 pub mod driver;
+mod identity;
 pub mod inkling;
 pub mod pipeline;
 pub mod qwen_vl;

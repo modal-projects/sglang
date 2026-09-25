@@ -173,8 +173,12 @@ class TestCudaIpcPipelineIntake(CustomTestCase):
         )
         if field == "auxiliary":
             item.feature = torch.ones(2, 2)
+            item.model_specific_data[field] = expected
+            item.set_pad_value()
             item.model_specific_data[field] = proxy
         else:
+            setattr(item, field, expected)
+            item.set_pad_value()
             setattr(item, field, proxy)
         return item, expected
 
@@ -245,6 +249,10 @@ class TestCudaIpcPipelineIntake(CustomTestCase):
                 )
                 for item, field, (_, expected) in zip(received.mm_items, fields, pairs):
                     torch.testing.assert_close(self._field(item, field), expected)
+                self.assertEqual(
+                    [item.cache_key for item in received.mm_items],
+                    [item.cache_key for item in items],
+                )
                 self.parallel.pp_rank = 1
                 later = self._scheduler(0)._get_multimodal_inputs(received)
                 self.assertFalse(
@@ -259,6 +267,7 @@ class TestCudaIpcPipelineIntake(CustomTestCase):
         """The single-stage lazy path keeps its ticket until local feature use."""
         self.parallel.pp_size = 1
         item, expected = self._item("feature")
+        identity = item.cache_key
         encoded = pickle.dumps(MultimodalProcessorOutput(mm_items=[item]))
         for rank in (0, 1):
             raw = pickle.loads(encoded)
@@ -269,6 +278,22 @@ class TestCudaIpcPipelineIntake(CustomTestCase):
             self.assertEqual(len(self.opens), rank)
             result.mm_items[0].materialize_deferred_cuda_ipc_feature()
             torch.testing.assert_close(result.mm_items[0].feature, expected)
+            self.assertEqual(result.mm_items[0].cache_key, identity)
+        self.assertEqual(len(self.opens), 2)
+
+    def test_single_stage_reconstructs_before_computing_missing_identity(self):
+        """An old sender's routing hash keeps the eager intake fallback valid."""
+        self.parallel.pp_size = 1
+        item, expected = self._item("feature")
+        identity = item.cache_key
+        item.cache_identity = None
+        encoded = pickle.dumps(MultimodalProcessorOutput(mm_items=[item]))
+        for rank in (0, 1):
+            raw = pickle.loads(encoded)
+            result = self._scheduler(rank)._get_multimodal_inputs(raw)
+            torch.testing.assert_close(result.mm_items[0].feature, expected)
+            self.assertEqual(result.mm_items[0].cache_key, identity)
+            self.assertEqual(len(self.opens), rank + 1)
         self.assertEqual(len(self.opens), 2)
 
     def test_cpu_inputs_keep_broadcast_processing_knob(self):

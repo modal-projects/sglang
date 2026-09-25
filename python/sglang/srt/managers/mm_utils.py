@@ -301,6 +301,33 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         if len(start_indices) != len(end_indices):
             return input_ids
 
+        if not start_indices:
+            return list(input_ids)
+
+        # Some precomputed inputs repeat the full range list for every item.
+        provided_offsets = sorted(
+            offset for item in mm_inputs.mm_items for offset in item.offsets or ()
+        )
+        if (
+            mm_inputs.mm_items
+            and all(item.offsets for item in mm_inputs.mm_items)
+            and all(
+                left[1] < right[0]
+                for left, right in zip(provided_offsets, provided_offsets[1:])
+            )
+        ):
+            # Processor offsets also identify per-patch owners and absolute session positions.
+            mm_inputs.data_offsets = sorted(
+                start - 1
+                for item in mm_inputs.mm_items
+                for start, _end in item.offsets
+                if start > 0 and input_ids[start - 1] in self.data_start_token_ids
+            )
+            return MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids, mm_inputs.mm_items
+            )
+
+        item_offsets = [[] for _item in mm_inputs.mm_items]
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
@@ -314,12 +341,16 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             num_tokens = end_idx - start_idx - 1
             pad_value = pad_values[data_idx]
             padded_ids.extend([pad_value] * num_tokens)
+            if num_tokens > 0:
+                item_offsets[data_idx].append((start_idx + 1, end_idx - 1))
 
             last_idx = end_idx
 
         padded_ids.extend(input_ids[last_idx:])
 
         assert len(input_ids) == len(padded_ids), "Length validation fails"
+        for item, offsets in zip(mm_inputs.mm_items, item_offsets):
+            item.offsets = offsets
         return padded_ids
 
 
@@ -401,7 +432,7 @@ def embed_mm_inputs(
     Embed multimodal inputs and integrate them with text token embeddings.
 
     Args:
-        mm_inputs_list: List of multimodal inputs to process
+        mm_inputs_list: One record per packed request; text requests have empty mm_items
         extend_prefix_lens: Prefix lengths for each request
         extend_seq_lens: Sequence lengths for each request
         input_ids: Input token IDs tensor
@@ -538,7 +569,9 @@ def _embed_mm_inputs_with_split(
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
+        if not items:
+            continue
+        if all(
             getattr(item, "precomputed_embeddings", None) is not None for item in items
         ):
             precomputed_req_indices.append(idx)
@@ -563,9 +596,6 @@ def _embed_mm_inputs_with_split(
         )
 
     all_seq_lens = forward_batch.extend_seq_lens_cpu
-    mm_batch_indices = [
-        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
-    ]
     token_starts = []
     cumulative = 0
     for sl in all_seq_lens:
@@ -591,10 +621,9 @@ def _embed_mm_inputs_with_split(
         sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
         sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
         sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
-        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
         sub_slices = [
             input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
-            for bi in group_batch_indices
+            for bi in group_req_indices
         ]
         sub_input_ids = torch.cat(sub_slices)
 
@@ -607,7 +636,7 @@ def _embed_mm_inputs_with_split(
         )
 
         offset = 0
-        for bi in group_batch_indices:
+        for bi in group_req_indices:
             req_len = all_seq_lens[bi]
             start = token_starts[bi]
             input_embeds[start : start + req_len] = sub_embeds[
@@ -658,19 +687,13 @@ def general_mm_embed_routine(
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.contains_mm_inputs()
         ):
+            # Keep text requests so offsets stay aligned with the packed tokens.
             mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+                mm_input if mm_input is not None else MultimodalInputs(mm_items=[])
+                for mm_input in forward_batch.mm_inputs
             ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
+            extend_prefix_lens = forward_batch.extend_prefix_lens_cpu
+            extend_seq_lens = forward_batch.extend_seq_lens_cpu
             server_args = get_server_args()
             # Makes VLM profiles directly attributable: this range includes
             # encoder/ViT execution and multimodal feature placement, while
@@ -1285,7 +1308,9 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    def __init__(
+        self, tensor: torch.Tensor, precomputed_hash: Optional[int | str] = None
+    ):
         self._shm_handle = None
         self.tensor = None
         self._materialization_error = None
@@ -1412,7 +1437,9 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
-def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+def _wrap_shm_or_inline(
+    tensor: torch.Tensor, precomputed_hash: Optional[int | str] = None
+):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
     under a burst of multimodal requests."""
@@ -1427,7 +1454,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
         return tensor
 
 
-def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int | str] = None):
     """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
 
     ``precomputed_hash`` is only forwarded for the single-tensor case.

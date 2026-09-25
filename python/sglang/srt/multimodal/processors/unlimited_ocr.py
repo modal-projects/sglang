@@ -1,6 +1,5 @@
 """Standalone UNLIMITED-OCR processor."""
 
-import hashlib
 import logging
 from typing import List, Union
 
@@ -67,20 +66,18 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
     def _mix_config_into_hash(mm_items, processor_kwargs):
         """Mix images_config into mm_item hashes so that different configs
         produce different pad_values, avoiding radix/embedding cache collisions."""
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        config_bytes = str(sorted(processor_kwargs.items())).encode()
         for item in mm_items:
-            if item.feature is not None:
-                base_hash = hash_feature(item.feature)
-            elif item.precomputed_embeddings is not None:
-                base_hash = hash_feature(item.precomputed_embeddings)
-            else:
+            if item.feature is None and item.precomputed_embeddings is None:
                 continue
-            combined = hashlib.sha256(
-                base_hash.to_bytes(8, byteorder="big") + config_bytes
-            ).digest()[:8]
-            item.hash = int.from_bytes(combined, byteorder="big", signed=False)
+            item.set_content_hash(
+                resolve_multimodal_item_hash(
+                    feature=item.feature,
+                    precomputed_embeddings=item.precomputed_embeddings,
+                    model_specific_data={"processor_kwargs": processor_kwargs},
+                )
+            )
 
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs

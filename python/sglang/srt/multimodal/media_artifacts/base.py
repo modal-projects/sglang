@@ -42,6 +42,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.cache.identity import normalize_multimodal_hash
 from sglang.srt.utils import load_image
 
 
@@ -57,7 +58,7 @@ class MediaArtifact(Protocol):
 
     content_digest: str
     artifact_key: str
-    feature_hash: int
+    feature_hash: int | str
 
     @property
     def has_feature(self) -> bool: ...
@@ -205,14 +206,7 @@ class MediaArtifactCacheMixin:
             raise ValueError("prepare_artifact_batch changed the media content digest")
         if artifact.artifact_key != entry.artifact_key:
             raise ValueError("prepare_artifact_batch changed the media artifact key")
-        if (
-            isinstance(artifact.feature_hash, bool)
-            or not isinstance(artifact.feature_hash, int)
-            or artifact.feature_hash < 0
-        ):
-            raise ValueError(
-                "Media artifact feature_hash must be a non-negative integer"
-            )
+        normalize_multimodal_hash(artifact.feature_hash)
 
     async def _run_preprocess_and_build_artifact_batch(
         self, entries: Sequence[MediaArtifactInput]

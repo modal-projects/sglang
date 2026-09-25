@@ -39,6 +39,7 @@ class TestPureSWARadixCache(CustomTestCase):
             output_ids=[],
             extra_key=None,
             cache_salt=None,
+            mm_cache_spans=(),
             last_node=None,
             kv=SimpleNamespace(
                 req_pool_idx=0,

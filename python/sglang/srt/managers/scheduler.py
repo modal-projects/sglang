@@ -3690,7 +3690,9 @@ class Scheduler(
             # The converted batch re-enters via the last_batch extend-merge
             # next iteration; empty running_batch or it merges with itself.
             running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
+                reqs=[],
+                batch_is_full=running_batch.batch_is_full,
+                admission_stop_reason=running_batch.admission_stop_reason,
             )
         ret = converted
         self._arm_prefill_decode_interval(ret)
@@ -3712,6 +3714,8 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        record_admission_cause: bool = False,
+        admitted_requests: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
@@ -3725,6 +3729,13 @@ class Scheduler(
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, available // beam_width)
 
+        if record_admission_cause and admitted_requests >= res:
+            request_budget = (
+                available if beam_width is None else available // beam_width
+            )
+            active_batch.admission_stop_reason = (
+                "microbatch_limit" if pp_budget <= request_budget else "request_slots"
+            )
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -3759,6 +3770,9 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        admission_metrics = (
+            self.metrics_collector_context.current_scheduler_metrics_enabled
+        )
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -3772,6 +3786,10 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if admission_metrics and self.waiting_queue:
+                self.metrics_collector.record_admission_blocked(
+                    running_batch.admission_stop_reason, len(self.waiting_queue)
+                )
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -3786,6 +3804,10 @@ class Scheduler(
                 ),
             )
         ):
+            if admission_metrics:
+                self.metrics_collector.record_admission_blocked(
+                    "min_free_slots", len(self.waiting_queue)
+                )
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -3794,11 +3816,20 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
+            self.get_num_allocatable_reqs(
+                running_bs,
+                running_batch=running_batch,
+                record_admission_cause=admission_metrics,
+            )
+            <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if admission_metrics:
+                self.metrics_collector.record_admission_blocked(
+                    running_batch.admission_stop_reason, len(self.waiting_queue)
+                )
             return None, running_batch
 
         # Get priority queue
@@ -3847,8 +3878,12 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            enable_admission_metrics=admission_metrics,
         )
 
+        continuation = self.chunked_req if admission_metrics else None
+        skipped_requests = 0
+        stop_reason = None
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3873,6 +3908,8 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if admission_metrics:
+                    skipped_requests += 1
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3883,18 +3920,27 @@ class Scheduler(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                record_admission_cause=admission_metrics,
+                admitted_requests=len(adder.can_run_list),
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    if admission_metrics and not running_batch.batch_is_full:
+                        running_batch.admission_stop_reason = "request_slots"
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    stop_reason = (
+                        running_batch.admission_stop_reason
+                        if admission_metrics
+                        else None
+                    )
                     break
 
             if self.enable_hicache_storage:
@@ -3903,6 +3949,8 @@ class Scheduler(
                 )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if admission_metrics:
+                        skipped_requests += 1
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -3920,12 +3968,16 @@ class Scheduler(
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                if admission_metrics:
+                    skipped_requests += 1
                 continue
             if (
                 self.enable_hicache_storage
                 and buffer_pipeline is not None
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
+                if admission_metrics:
+                    skipped_requests += 1
                 continue
             res = adder.add_one_req(
                 req,
@@ -3937,6 +3989,8 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                if admission_metrics:
+                    stop_reason = adder.admission_stop_reason
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
@@ -3948,6 +4002,8 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
+                if admission_metrics and running_batch.batch_is_full:
+                    running_batch.admission_stop_reason = stop_reason
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -3970,6 +4026,11 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if admission_metrics and stop_reason is not None:
+            admitted = sum(req is not continuation for req in can_run_list)
+            self.metrics_collector.record_admission_blocked(
+                stop_reason, len(self.waiting_queue) - admitted - skipped_requests
+            )
         if len(can_run_list) == 0:
             return None, running_batch
 
@@ -4063,7 +4124,9 @@ class Scheduler(
                         running_batch.req_pool_indices, last_tokens
                     )
                 running_batch = ScheduleBatch(
-                    reqs=[], batch_is_full=running_batch.batch_is_full
+                    reqs=[],
+                    batch_is_full=running_batch.batch_is_full,
+                    admission_stop_reason=running_batch.admission_stop_reason,
                 )
         else:
             new_batch.decoding_reqs = None

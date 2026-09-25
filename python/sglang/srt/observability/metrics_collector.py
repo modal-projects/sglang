@@ -266,6 +266,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
         Summary = self._summary_cls or _PromSummary
 
+        if "reason" in labels:
+            raise ValueError("Metric label 'reason' is reserved for admission metrics.")
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -276,6 +278,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Basics
         # =================================================================
+        self.admission_blocked_passes = Counter(
+            name="sglang:admission_blocked_passes_total",
+            documentation="Prefill passes with waiting requests left behind by an admission constraint.",
+            labelnames=[*labels, "reason"],
+        )
+        self.admission_blocked_requests = Counter(
+            name="sglang:admission_blocked_requests_total",
+            documentation="Waiting requests at constrained prefill passes, excluding admitted and observed skips; retries count again.",
+            labelnames=[*labels, "reason"],
+        )
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests.",
@@ -1157,6 +1169,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             enable_kv_cache_events=enable_kv_cache_events,
             collector=collector,
         )
+
+    def record_admission_blocked(self, reason: Optional[str], requests: int) -> None:
+        if reason is None or requests <= 0:
+            return
+        labels = {**self.labels, "reason": reason}
+        self.admission_blocked_passes.labels(**labels).inc()
+        self.admission_blocked_requests.labels(**labels).inc(requests)
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.

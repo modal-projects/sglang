@@ -131,6 +131,47 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_admission_reason_tracks_first_binding_budget(self):
+        """The same NO_TOKEN verdict must identify the pool that actually stopped admission."""
+        for enabled in (False, True):
+            for token_budget, swa_budget, mamba_slots, reason in (
+                (0, 0, 0, "token_capacity"),
+                (100, 0, 0, "swa_capacity"),
+                (100, 100, 0, "mamba_slots"),
+            ):
+                with self.subTest(enabled=enabled, reason=reason):
+                    allocator = self.create_token_allocator(
+                        available_size=token_budget,
+                        full_available_size=token_budget,
+                        swa_available_size=swa_budget,
+                    )
+                    adder = self.create_adder(
+                        self.create_running_batch(),
+                        token_to_kv_pool_allocator=allocator,
+                        enable_admission_metrics=enabled,
+                    )
+                    adder.is_hybrid_swa = True
+                    adder.rem_mamba_slots = mamba_slots
+                    self.assertEqual(adder.budget_state(), AddReqResult.NO_TOKEN)
+                    self.assertEqual(
+                        adder.admission_stop_reason, reason if enabled else None
+                    )
+
+    def test_input_budget_precedes_chunk_budget_after_admission(self):
+        """A pass that exhausts both budgets must retain the first decision's cause."""
+        adder = self.create_adder(
+            self.create_running_batch(),
+            token_to_kv_pool_allocator=self.create_token_allocator(available_size=100),
+            rem_input_tokens=0,
+            rem_chunk_tokens=0,
+            enable_admission_metrics=True,
+        )
+        self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
+        self.assertEqual(adder.admission_stop_reason, "input_tokens")
+        adder.rem_input_tokens = 100
+        self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
+        self.assertEqual(adder.admission_stop_reason, "chunk_tokens")
+
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())
         req = self.create_mock_req("storage-hit", priority=0, max_new_tokens=1)
@@ -931,12 +972,33 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 
+    def test_request_cap_precedes_host_load_and_host_decline_has_own_cause(self):
+        """Request limits and deferred host loading share OTHER but need distinct causes."""
+        for cap, reason in ((0, "prefill_requests"), (None, "host_load")):
+            with self.subTest(reason=reason):
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000,
+                    delayer=None,
+                    prefill_max_requests=cap,
+                    enable_admission_metrics=True,
+                )
+                req = self._create_host_hit_req(host_hit=24, tail=8)
+                self.mock_tree_cache.init_load_back.return_value = None
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(result, AddReqResult.OTHER)
+                self.assertEqual(adder.admission_stop_reason, reason)
+                self.assertEqual(adder.can_run_list, [])
+
     def test_delay_verdict_blocks_admissible_request(self):
         """An admissible request must still be gated by the (relocated)
         negotiate: on a delay verdict it is not admitted, and the rank
         reported prefillable=True exactly once."""
         delayer = _RecordingDelayer(allow=False)
-        adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=delayer, enable_admission_metrics=True
+        )
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
@@ -945,6 +1007,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.admission_stop_reason, "prefill_delay")
         self.assertEqual(delayer.calls, [True])
         self.assertEqual(adder.can_run_list, [])
 
@@ -1023,6 +1086,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
+        adder.enable_admission_metrics = False
         adder.can_run_list = [
             SimpleNamespace(extend_input_len=length) for length in extend_lens
         ]
@@ -1043,6 +1107,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_compact_prefill_tile_budget_admits_more_than_legacy(self):
         adder = self._adder_with_extend_lens([1, 7, 13])
+        adder.enable_admission_metrics = True
 
         # The tile-budget admission is gated on HIP in production; force the gate
         # on so this vendor-neutral admission-math check runs on any CI runner.
@@ -1059,6 +1124,7 @@ class TestPrefillAdder(CustomTestCase):
             patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+            self.assertEqual(adder.admission_stop_reason, "prefill_tiles")
 
     def test_prefill_tile_budget_always_allows_first_request(self):
         adder = self._adder_with_extend_lens([])

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 import jinja2
 import openai.types.responses as openai_responses_types
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
     ResponseOutputText,
@@ -84,6 +84,7 @@ from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.metrics_collector import finished_outcome
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -660,6 +661,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     require_reasoning=require_reasoning,
                 )
                 return result
+            except HTTPException as e:
+                return self.create_error_response(
+                    str(e.detail),
+                    err_type=(
+                        "server_error"
+                        if e.status_code >= 500
+                        else "invalid_request_error"
+                    ),
+                    status_code=e.status_code,
+                )
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
@@ -853,6 +864,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
+        if finished_outcome(finish_reason) == "engine_fault":
+            usage = None
         request_metadata.final_usage_info = usage
 
         response = ResponsesResponse.from_request(
@@ -948,6 +961,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _status_from_finish_reason(finish_reason: Any) -> str:
+        if finished_outcome(finish_reason) == "engine_fault":
+            return "failed"
         reason = None
         if isinstance(finish_reason, dict):
             reason = finish_reason.get("type")
@@ -966,7 +981,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         message = (
             finish_reason.get("message") if isinstance(finish_reason, dict) else None
         )
-        return {"code": "server_error", "message": message or "Generation aborted"}
+        outcome = finished_outcome(finish_reason)
+        code = "server_error"
+        if outcome == "invalid_request":
+            code = "invalid_prompt"
+        elif outcome == "rejected" and int(finish_reason["status_code"]) == 429:
+            code = "rate_limit_exceeded"
+        return {"code": code, "message": message or "Generation aborted"}
 
     @staticmethod
     def _terminal_stream_event(response: dict):
@@ -2627,6 +2648,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=cached_tokens
             )
+        if finished_outcome(finish_reason) == "engine_fault":
+            usage = None
         request_metadata.final_usage_info = usage
 
         final_response = ResponsesResponse.from_request(

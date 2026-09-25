@@ -8,9 +8,9 @@ import time
 import uuid
 from collections import OrderedDict
 from enum import Enum
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+from sglang.srt.observability.metrics_collector import finished_outcome
 from sglang.srt.runtime_context import get_model, get_serving
 
 
@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
+    get_generation_error,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
@@ -1838,6 +1839,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
+                error = get_generation_error(finish_reason)
+                if error is not None:
+                    error_json = self.create_streaming_error_response(
+                        message=error.message,
+                        err_type=error.type,
+                        status_code=error.code,
+                    )
+                    yield f"data: {error_json}\n\n"
+                    if finished_outcome(finish_reason) == "engine_fault":
+                        # A fault terminates the whole response, including buffered
+                        # choice finishes, metadata, and the final usage record.
+                        yield "data: [DONE]\n\n"
+                        return
+                    error_aborted = True
+                    break
+
                 if return_input_ids and input_ids is None:
                     # The prompt is the full, shared prompt (same across choices
                     # and constant across chunks), so capture it once.
@@ -1876,24 +1893,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    # Abort with an explicit error status_code is a system error
-                    # (timeout, OOM, validation): emit a streaming error chunk.
-                    # A graceful abort (no status_code, e.g. user-initiated via
-                    # /abort_request or session lifecycle cleanup) falls through
-                    # to the normal chunk path, matching the non-stream behavior
-                    # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
-                    ):
-                        code = finish_reason["status_code"]
-                        error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
-                        )
-                        yield f"data: {error}\n\n"
-                        error_aborted = True
-                        break
                     finish_reasons[index] = finish_reason
 
                 # First chunk with role
@@ -2121,6 +2120,13 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        for item in ret:
+            error = get_generation_error(item["meta_info"].get("finish_reason"))
+            if error is not None:
+                return ORJSONResponse(
+                    content=error.model_dump(), status_code=error.code
+                )
+
         if self.chat_encoding_spec == "kimi_k3":
             ret = [
                 {

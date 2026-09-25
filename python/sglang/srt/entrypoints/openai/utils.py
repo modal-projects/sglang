@@ -1,4 +1,5 @@
 import logging
+from http import HTTPStatus
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
@@ -7,12 +8,40 @@ from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
     ChatCompletionRequest,
     CompletionRequest,
+    ErrorResponse,
     LogProbs,
     SpecTokensDetails,
     StreamOptions,
 )
+from sglang.srt.observability.metrics_collector import finished_outcome
 
 logger = logging.getLogger(__name__)
+
+
+def get_generation_error(finish_reason: Any) -> Optional[ErrorResponse]:
+    if not isinstance(finish_reason, dict):
+        return None
+    if finish_reason.get("type") == "abort":
+        try:
+            status = int(finish_reason.get("status_code"))
+        except (TypeError, ValueError):
+            return None
+        if not 400 <= status < 600:
+            return None
+    elif finished_outcome(finish_reason) == "engine_fault":
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+    else:
+        return None
+    try:
+        err_type = HTTPStatus(status).name
+    except ValueError:
+        err_type = "InternalServerError" if status >= 500 else "BadRequestError"
+    return ErrorResponse(
+        object="error",
+        message=finish_reason.get("message") or "Generation aborted.",
+        type=err_type,
+        code=status,
+    )
 
 
 def to_openai_style_logprobs(

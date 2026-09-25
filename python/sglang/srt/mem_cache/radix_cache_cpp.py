@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     RadixTreeCpp,
     TreeNodeCpp,
 )
+from sglang.srt.mem_cache.multimodal_key import slice_mm_spans
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import (
     get_memory,
@@ -109,10 +110,8 @@ class RadixCacheCpp(BasePrefixCache):
         self.tree.reset()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        key = params.key
-        self._reject_cache_salt(key.cache_salt)
-        device_indices_vec, host_indices_length, node_gpu, node_cpu = (
-            self.tree.match_prefix(key.raw_token_ids())
+        device_indices_vec, host_indices_length, node_gpu, node_cpu = self._match_key(
+            params.key
         )
         return MatchResult(
             device_indices=self._merge_tensor(device_indices_vec),
@@ -121,6 +120,22 @@ class RadixCacheCpp(BasePrefixCache):
             best_match_node=node_cpu,
             host_hit_length=host_indices_length,
         )
+
+    @staticmethod
+    def _native_mm_spans(key: RadixKey, token_count: int):
+        return tuple(
+            (span.start, span.end, span.identity, span.offset)
+            for span in slice_mm_spans(key.mm_spans, 0, token_count)
+        )
+
+    def _match_key(self, key: RadixKey):
+        self._reject_cache_salt(key.cache_salt)
+        tokens = key.raw_token_ids()
+        if key.mm_spans:
+            return self.tree.match_prefix(
+                tokens, self._native_mm_spans(key, len(tokens))
+            )
+        return self.tree.match_prefix(tokens)
 
     def _insert(self, key: RadixKey, value: torch.Tensor) -> int:
         """
@@ -131,7 +146,13 @@ class RadixCacheCpp(BasePrefixCache):
         Returns:
             int: Number of device indices that were already present in the tree before the insertion.
         """
-        ongoing_write, length = self.tree.writing_through(key.token_ids, value)
+        tokens = key.raw_token_ids()
+        if key.mm_spans:
+            ongoing_write, length = self.tree.writing_through(
+                tokens, value, self._native_mm_spans(key, len(tokens))
+            )
+        else:
+            ongoing_write, length = self.tree.writing_through(tokens, value)
         if self.cache_controller is None:
             assert len(ongoing_write) == 0, "Implementation error"
             return length
@@ -203,7 +224,8 @@ class RadixCacheCpp(BasePrefixCache):
 
         if is_insert:
             new_prefix_len = self._insert(
-                RadixKey(token_ids, req.extra_key), kv_indices
+                RadixKey(token_ids, req.extra_key, mm_spans=req.mm_cache_spans),
+                kv_indices,
             )
             # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
             assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -238,16 +260,15 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self._insert(RadixKey(token_ids, req.extra_key), kv_indices)
+        key = RadixKey(token_ids, req.extra_key, mm_spans=req.mm_cache_spans)
+        new_prefix_len = self._insert(key, kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
 
         # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
-        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(
-            RadixKey(token_ids, req.extra_key).token_ids
-        )
+        new_indices_vec, _, new_last_node, _ = self._match_key(key)
         new_indices = self._merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)
 

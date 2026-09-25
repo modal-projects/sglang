@@ -291,6 +291,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.multimodal_key import slice_mm_spans
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -3201,6 +3202,10 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    mm_spans=slice_mm_spans(req.mm_cache_spans, matched_len, match_end),
+                    matched_prefix_mm_spans=slice_mm_spans(
+                        req.mm_cache_spans, 0, matched_len
+                    ),
                 )
 
     def _process_storage_prefetch_retries(self):

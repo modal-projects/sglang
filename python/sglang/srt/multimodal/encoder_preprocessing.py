@@ -1,10 +1,8 @@
-import hashlib
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Protocol, Sequence, runtime_checkable
 
-import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -36,23 +34,11 @@ def resolve_encoder_media_processor_config(
     return EncoderMediaProcessorConfig()
 
 
-def hash_raw_encoder_item(value: Any) -> int:
+def hash_raw_encoder_item(value: Any) -> str:
     """Hash raw CPU media including layout metadata, before owner materialization."""
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().contiguous().numpy()
-    elif not isinstance(value, np.ndarray):
-        from PIL import Image
+    from sglang.srt.multimodal.cache import snapshot_media
 
-        if not isinstance(value, Image.Image):
-            raise TypeError(f"Unsupported raw encoder item: {type(value)}")
-        value = np.asarray(value)
-
-    value = np.ascontiguousarray(value)
-    hasher = hashlib.sha256()
-    hasher.update(value.dtype.str.encode())
-    hasher.update(repr(value.shape).encode())
-    hasher.update(memoryview(value))
-    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+    return snapshot_media(value).content_digest
 
 
 class EncoderPreprocessOutput(dict):

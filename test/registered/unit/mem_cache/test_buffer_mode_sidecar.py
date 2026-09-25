@@ -260,7 +260,7 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = cache
-        pipeline._prefetch_prefix_ctx = {req_id: ([], None, None)}
+        pipeline._prefetch_prefix_ctx = {req_id: ([], None, None, ())}
         pipeline.staged_prefetches = {}
 
         self.assertTrue(

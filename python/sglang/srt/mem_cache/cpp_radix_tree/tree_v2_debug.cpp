@@ -97,7 +97,9 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     _check(node != nullptr, "Node is null", nid);
     _check(node->on_gpu() || node->on_cpu(), "Node is not on GPU or CPU", nid);
     _check(node->parent() == parent, "Parent is not correct", nid);
-    _check(key.size() == page_size && node->diff_key(key, 0) == page_size, "Key is not correct", nid);
+    token_vec_t expected_key;
+    make_page_key(expected_key, token_slice{node->_unsafe_tokens()}.first(page_size), node->_unsafe_mm_spans());
+    _check(std::ranges::equal(key, expected_key), "Key is not correct", nid);
     _check(depth_map.count(node) == 0, "Node is visited twice", nid);
     _check(m_node_map.count(nid) == 1, "Node is not in the map", nid);
     _check(m_node_map.at(nid) == node, "Node in the map is not the same as the one in the stack", nid);

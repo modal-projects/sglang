@@ -44,6 +44,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.multimodal_key import (
+    MultimodalKeySpan,
+    shift_mm_spans,
+    slice_mm_spans,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1020,6 +1025,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.extra_key,
                 is_bigram=self.tree_core.is_eagle,
                 cache_salt=req.cache_salt,
+                mm_spans=req.mm_cache_spans,
             ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
@@ -1042,6 +1048,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.extra_key,
                 is_bigram=self.tree_core.is_eagle,
                 cache_salt=req.cache_salt,
+                mm_spans=req.mm_cache_spans,
             ).page_aligned(self.page_size)
             if (
                 not result.rotation_tail_declined
@@ -1146,6 +1153,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
         )
 
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
@@ -1881,6 +1889,7 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ) -> int:
         """Probe L3 with the request namespace."""
         if (
@@ -1895,6 +1904,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
+            mm_spans=slice_mm_spans(mm_spans, 0, len(new_input_tokens)),
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1926,6 +1936,8 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
+        matched_prefix_mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1969,6 +1981,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
+            mm_spans=slice_mm_spans(mm_spans, 0, len(new_input_tokens)),
         ).page_aligned(self.page_size)
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
@@ -2057,6 +2070,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 matched_prefix_tokens,
                 extra_key=extra_key,
                 cache_salt=cache_salt,
+                mm_spans=matched_prefix_mm_spans,
             )
         else:
             # Cache mode reserves the requested span up front; buffer mode
@@ -2601,14 +2615,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         old_key = info.prefetch_key
         prefix_ctx = self.buffer_pipeline._prefetch_prefix_ctx[request]
-        prefix_tokens, extra_key, cache_salt = prefix_ctx
+        prefix_tokens, extra_key, cache_salt, prefix_mm_spans = prefix_ctx
         # Prefix context excludes the boundary token; the suffix owns it even
         # when all FULL pages are trimmed and only sidecars remain to fetch.
         new_prefix_tokens = prefix_tokens + list(old_key.token_ids[:trim_tokens])
+        new_prefix_mm_spans = prefix_mm_spans + shift_mm_spans(
+            slice_mm_spans(old_key.mm_spans, 0, trim_tokens), len(prefix_tokens)
+        )
         self.buffer_pipeline._prefetch_prefix_ctx[request] = (
             new_prefix_tokens,
             extra_key,
             cache_salt,
+            new_prefix_mm_spans,
         )
         info = info._replace(
             prefetch_key=RadixKey(
@@ -2616,6 +2634,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_key=old_key.extra_key,
                 is_bigram=old_key.is_bigram,
                 cache_salt=old_key.cache_salt,
+                mm_spans=slice_mm_spans(
+                    old_key.mm_spans, trim_tokens, len(old_key.raw_token_ids())
+                ),
             )
         )
         self.ongoing_prefetch[request] = info

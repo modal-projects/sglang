@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -487,6 +487,9 @@ class KimiK3ImageProcessor(
             )
             items.append(item)
 
+        items = self._postprocess_mm_items_before_transport(
+            items, images=base_output.images
+        )
         self._precompute_hashes_before_cpu_transfer(items)
         return MultimodalProcessorOutput(
             input_ids=input_ids.flatten().tolist(),
@@ -506,9 +509,11 @@ class KimiK3ImageProcessor(
         deferred: Optional[KimiK3DeferredPreprocessing] = None,
     ) -> KimiK3ImagePreprocessArtifact:
         """Freeze one image's prompt-independent preprocessing result."""
-        # Use the same feature-hash contract as MultimodalDataItem.
+        # The artifact namespace commits to raw content and preprocessing settings.
         feature_hash = resolve_multimodal_item_hash(
-            feature=feature, namespace=artifact_key
+            existing_hash=0,
+            namespace=artifact_key,
+            model_specific_data={"grid_thw": grid_thw},
         )
         if not self.keep_mm_features_on_device and feature.device.type != "cpu":
             feature = feature.cpu()
@@ -644,7 +649,7 @@ class KimiK3ImageProcessor(
                 offsets=[offset],
                 model_specific_data=model_specific_data,
             )
-            item.set_hash(artifact.feature_hash)
+            item.set_content_hash(artifact.feature_hash)
             if self.keep_mm_features_on_device and item.feature is not None:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
@@ -656,6 +661,36 @@ class KimiK3ImageProcessor(
             mm_items=self._prepare_mm_items_for_transport(items),
             im_token_id=self.mm_tokens.image_token_id,
         )
+
+    def _postprocess_mm_items_before_transport(self, mm_items, *, images):
+        raw_images = (
+            images
+            if images is not None and len(images) == len(mm_items)
+            else [None] * len(mm_items)
+        )
+        for item, image in zip(mm_items, raw_images):
+            if item.hash is not None:
+                continue
+            content_hash = (
+                snapshot_media(image).content_digest
+                if isinstance(image, (Image.Image, torch.Tensor, np.ndarray))
+                else None
+            )
+            item.set_content_hash(
+                resolve_multimodal_item_hash(
+                    existing_hash=content_hash,
+                    feature=item.feature,
+                    precomputed_embeddings=item.precomputed_embeddings,
+                    model_specific_data={
+                        "grid": item.model_specific_data.get("image_grid_thw"),
+                        "preprocessing": self._processor.preprocess_config,
+                        "deferred": item.model_specific_data.get(
+                            DEFERRED_PREPROCESSING_KEY
+                        ),
+                    },
+                )
+            )
+        return mm_items
 
     async def _process_mm_data_uncached(
         self, image_data, input_text, request_obj, **kwargs

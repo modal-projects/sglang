@@ -136,6 +136,7 @@ class UnifiedTreeNode:
         self.hash_value = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
+        self.emit_full_hashes = False
         self.hit_count = 0
         self.external_cache_stored = False
         self.priority = priority
@@ -676,6 +677,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=node.key.extra_key,
                 is_bigram=node.key.is_bigram,
                 cache_salt=node.key.cache_salt,
+                mm_spans=node.key.mm_spans,
             ),
             prefix_keys=(
                 node.get_prefix_hash_values(parent) if pass_prefix_keys else None
@@ -1457,6 +1459,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.published_kv_tiers = child.published_kv_tiers
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
+        new_node.emit_full_hashes = child.emit_full_hashes
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time

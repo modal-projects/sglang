@@ -177,6 +177,15 @@ class FlexKVRadixCache(RadixCache):
         device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
+        if params.key.mm_spans:
+            # FlexKV namespaces do not provide per-span identity matching.
+            # Preserve the full local match and transfer only the earlier text.
+            if params.key.is_bigram:
+                return base_res
+            key = key[: params.key.mm_spans[0].start].page_aligned(self.page_size)
+            if len(key) <= device_value.numel():
+                return base_res
+
         if self._mode is FlexKVMode.MP:
             if params.req is None:
                 return base_res
@@ -222,6 +231,7 @@ class FlexKVRadixCache(RadixCache):
                 key.extra_key,
                 key.is_bigram,
                 cache_salt=key.cache_salt,
+                mm_spans=key.mm_spans,
             ),
             value_numel=device_len,
         )
@@ -412,6 +422,12 @@ class FlexKVRadixCache(RadixCache):
             )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        if req.mm_cache_spans:
+            # External token-to-KV counts do not represent the bigram boundary.
+            text_end = 0 if self.is_eagle else req.mm_cache_spans[0].start
+            text_end = text_end // self.page_size * self.page_size
+            token_ids = token_ids[:text_end]
+            kv_committed_len = len(token_ids)
         if not token_ids:
             return
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -426,6 +442,7 @@ class FlexKVRadixCache(RadixCache):
                     token_ids,
                     req.extra_key,
                     cache_salt=req.cache_salt,
+                    mm_spans=req.mm_cache_spans,
                 )
             )
         )
@@ -503,11 +520,38 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(handle)
 
     def prefetch_from_storage(
-        self, handle: CacheRequestHandle, last_host_node: TreeNode, token_ids
+        self,
+        handle: CacheRequestHandle,
+        last_host_node: TreeNode,
+        token_ids,
+        last_hash=None,
+        prefix_keys=None,
+        *,
+        matched_prefix_tokens=None,
+        extra_key=None,
+        cache_salt=None,
+        storage_hit_end=None,
+        mm_spans=(),
+        matched_prefix_mm_spans=(),
     ) -> None:
         """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
+        # Text after a media span is conditioned on that media's full identity.
+        if matched_prefix_mm_spans or (self.is_eagle and mm_spans):
+            return
+        prefix = (
+            list(matched_prefix_tokens) if matched_prefix_tokens is not None else []
+        )
+        token_ids = prefix + list(token_ids)
+        if storage_hit_end is not None:
+            token_ids = token_ids[: max(0, storage_hit_end)]
+        if mm_spans:
+            text_end = min(len(token_ids), len(prefix) + mm_spans[0].start)
+            text_end = text_end // self.page_size * self.page_size
+            token_ids = token_ids[:text_end]
+        if not token_ids:
+            return
         try:
-            self.flexkv_connector.prefetch_async(handle, list(token_ids))
+            self.flexkv_connector.prefetch_async(handle, token_ids)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 

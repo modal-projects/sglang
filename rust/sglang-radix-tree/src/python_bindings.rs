@@ -1,6 +1,5 @@
 //! Python bindings: the `mem_cache` extension module and its TreeCore adapter.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -11,7 +10,9 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::multimodal_key::{MultimodalKey, MultimodalSpan, key_hash_strings, validate_spans};
 use crate::node::ChildKeyType;
+
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
@@ -20,6 +21,52 @@ use crate::unified_tree_core::{
     MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
     UnifiedTreeCore,
 };
+
+type MmSpanInput = (usize, usize, String, u64);
+
+fn parse_mm_spans(spans: Vec<MmSpanInput>, raw_len: usize) -> PyResult<Vec<MultimodalSpan>> {
+    let mut result = Vec::with_capacity(spans.len());
+    for (start, end, identity, offset) in spans {
+        let digest = identity
+            .strip_prefix("sha256:")
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                PyValueError::new_err("multimodal identity must be a full SHA-256 digest")
+            })?;
+        result.push(MultimodalSpan {
+            start,
+            end,
+            identity: crate::node::parse_prior_hash(digest),
+            offset,
+        });
+    }
+    validate_spans(&result, raw_len).map_err(PyValueError::new_err)?;
+    Ok(result)
+}
+
+fn mm_span_tuples(spans: &[MultimodalSpan]) -> Vec<MmSpanInput> {
+    spans
+        .iter()
+        .map(|span| {
+            (
+                span.start,
+                span.end,
+                format!("sha256:{}", crate::node::digest_to_hex(&span.identity)),
+                span.offset,
+            )
+        })
+        .collect()
+}
+
+fn read_multimodal_key(
+    py: Python<'_>,
+    key: &Bound<'_, PyAny>,
+    spans: Option<Vec<MmSpanInput>>,
+) -> PyResult<MultimodalKey<Vec<i64>>> {
+    let tokens = py_array_to_vec_i64(py, key)?;
+    let spans = parse_mm_spans(spans.unwrap_or_default(), tokens.len())?;
+    Ok(MultimodalKey::new(tokens, spans))
+}
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
 /// "cuda" means index 0, so callers must resolve the index themselves.
@@ -481,26 +528,53 @@ impl TreeCoreInitParamsBinding {
 }
 
 /// Python-visible match params; converts into MatchPrefixParams.
-#[pyclass(get_all, set_all)]
+#[pyclass]
 #[derive(Clone)]
 pub struct MatchParamsBinding {
-    pub key: Vec<i64>,
+    key: MultimodalKey<Vec<i64>>,
+    #[pyo3(get, set)]
     pub extra_key: Option<String>,
+    #[pyo3(get, set)]
     pub cache_salt: Option<String>,
 }
 
 #[pymethods]
 impl MatchParamsBinding {
+    #[getter]
+    fn key(&self) -> Vec<i64> {
+        self.key.tokens.clone()
+    }
+
+    #[setter]
+    fn set_key(&mut self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        let tokens = py_array_to_vec_i64(py, key)?;
+        validate_spans(&self.key.spans, tokens.len()).map_err(PyValueError::new_err)?;
+        self.key.tokens = tokens;
+        Ok(())
+    }
+
+    #[getter]
+    fn mm_spans(&self) -> Vec<MmSpanInput> {
+        mm_span_tuples(&self.key.spans)
+    }
+
+    #[setter]
+    fn set_mm_spans(&mut self, spans: Vec<MmSpanInput>) -> PyResult<()> {
+        self.key.spans = parse_mm_spans(spans, self.key.tokens.len())?;
+        Ok(())
+    }
+
     #[new]
-    #[pyo3(signature = (key, extra_key = None, cache_salt = None))]
+    #[pyo3(signature = (key, extra_key = None, cache_salt = None, mm_spans = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        mm_spans: Option<Vec<MmSpanInput>>,
     ) -> PyResult<Self> {
         Ok(MatchParamsBinding {
-            key: py_array_to_vec_i64(py, key)?,
+            key: read_multimodal_key(py, key, mm_spans)?,
             extra_key,
             cache_salt,
         })
@@ -509,26 +583,61 @@ impl MatchParamsBinding {
 
 /// Python-visible insert params; converts into InsertParams. The value tensor
 /// stays a Python-held reference until the insert call unwraps it.
-#[pyclass(get_all, set_all)]
+#[pyclass]
 pub struct InsertParamsBinding {
-    pub key: Vec<i64>,
+    key: MultimodalKey<Vec<i64>>,
+    #[pyo3(get, set)]
     pub value: Py<PyAny>,
+    #[pyo3(get, set)]
     pub extra_key: Option<String>,
+    #[pyo3(get, set)]
     pub cache_salt: Option<String>,
+    #[pyo3(get, set)]
     pub session_id: Option<String>,
+    #[pyo3(get, set)]
     pub mamba_value: Option<Py<PyAny>>,
+    #[pyo3(get, set)]
     pub prev_prefix_len: usize,
+    #[pyo3(get, set)]
     pub swa_evicted_seqlen: usize,
+    #[pyo3(get, set)]
     pub swa_branching_seqlen: Option<usize>,
+    #[pyo3(get, set)]
     pub chunked: bool,
+    #[pyo3(get, set)]
     pub priority: i64,
+    #[pyo3(get, set)]
     pub track_adopted_ranges: bool,
 }
 
 #[pymethods]
 impl InsertParamsBinding {
+    #[getter]
+    fn key(&self) -> Vec<i64> {
+        self.key.tokens.clone()
+    }
+
+    #[setter]
+    fn set_key(&mut self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        let tokens = py_array_to_vec_i64(py, key)?;
+        validate_spans(&self.key.spans, tokens.len()).map_err(PyValueError::new_err)?;
+        self.key.tokens = tokens;
+        Ok(())
+    }
+
+    #[getter]
+    fn mm_spans(&self) -> Vec<MmSpanInput> {
+        mm_span_tuples(&self.key.spans)
+    }
+
+    #[setter]
+    fn set_mm_spans(&mut self, spans: Vec<MmSpanInput>) -> PyResult<()> {
+        self.key.spans = parse_mm_spans(spans, self.key.tokens.len())?;
+        Ok(())
+    }
+
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false, mm_spans = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -543,9 +652,10 @@ impl InsertParamsBinding {
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
+        mm_spans: Option<Vec<MmSpanInput>>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
-            key: py_array_to_vec_i64(py, key)?,
+            key: read_multimodal_key(py, key, mm_spans)?,
             value,
             extra_key,
             cache_salt,
@@ -809,6 +919,7 @@ pub struct BufferBackupSnapshotBinding {
     parent_is_root: bool,
     parent_last_hash: Option<String>,
     key_token_ids: Py<PyBytes>,
+    mm_spans: Vec<MmSpanInput>,
     extra_key: Option<String>,
     cache_salt: Option<String>,
     is_bigram: bool,
@@ -828,6 +939,7 @@ impl BufferBackupSnapshotBinding {
             parent_is_root: snapshot.parent_is_root,
             parent_last_hash: snapshot.parent_last_hash,
             key_token_ids: PyBytes::new_bound(py, &token_bytes).unbind(),
+            mm_spans: mm_span_tuples(&snapshot.mm_spans),
             extra_key: snapshot.extra_key,
             cache_salt: snapshot.cache_salt,
             is_bigram: snapshot.is_bigram,
@@ -987,7 +1099,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         params: &MatchParamsBinding,
     ) -> PyResult<MatchResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = K::key_from_multimodal(&params.key);
         let key = key.as_ref();
         let params = MatchPrefixParams {
             key,
@@ -1006,7 +1118,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         params: &MatchParamsBinding,
     ) -> (usize, NodeId, usize) {
-        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = K::key_from_multimodal(&params.key);
         let key = key.as_ref();
         let namespace =
             KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
@@ -1025,7 +1137,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         params: &InsertParamsBinding,
     ) -> PyResult<InsertResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = K::key_from_multimodal(&params.key);
         let key = key.as_ref();
         let value: PyTensor = params.value.bind(py).extract()?;
         // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
@@ -1062,7 +1174,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         params: &InsertParamsBinding,
     ) -> PyResult<InsertStepResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = K::key_from_multimodal(&params.key);
         let key = key.as_ref();
         let value: PyTensor = params.value.bind(py).extract()?;
         // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
@@ -1437,8 +1549,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         host_value: PyTensor,
         hash_value: Vec<String>,
         cache_salt: Option<String>,
+        mm_spans: Option<Vec<MmSpanInput>>,
     ) -> PyResult<InsertResultBinding> {
-        let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+        let raw_key = read_multimodal_key(py, key, mm_spans)?;
+        let key = K::key_from_multimodal(&raw_key).into_owned();
         let host_value = host_value.0;
         if host_value.kind() != Kind::Int64 {
             return Err(PyValueError::new_err(format!(
@@ -1857,6 +1971,8 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 KvCacheEvent::BlockStored {
                     block_hashes,
                     parent_block_hash,
+                    block_hashes_sha256,
+                    parent_block_hash_sha256,
                     token_ids,
                     block_size,
                     medium,
@@ -1872,16 +1988,24 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
                         session_id.map(|session_id| session_id.to_string()),
+                        block_hashes_sha256,
+                        parent_block_hash_sha256,
                     )
                         .into_py(py);
                     list.append(item)?;
                 }
                 KvCacheEvent::BlockRemoved {
                     block_hashes,
+                    block_hashes_sha256,
                     medium,
                 } => {
-                    let item: Py<PyAny> =
-                        ("block_removed", block_hashes, medium.as_str()).into_py(py);
+                    let item: Py<PyAny> = (
+                        "block_removed",
+                        block_hashes,
+                        medium.as_str(),
+                        block_hashes_sha256,
+                    )
+                        .into_py(py);
                     list.append(item)?;
                 }
                 KvCacheEvent::AllBlocksCleared => {
@@ -2346,9 +2470,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         cache_salt: Option<String>,
         value_chunks: Vec<PyTensor>,
         best_value_len: usize,
+        mm_spans: Option<Vec<MmSpanInput>>,
     ) -> PyResult<MatchResultBinding> {
         let component_type = parse_component_type(component_type)?;
-        let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+        let raw_key = read_multimodal_key(py, key, mm_spans)?;
+        let key = K::key_from_multimodal(&raw_key).into_owned();
         let InspectionMatchResultInput {
             device_indices,
             last_device_node: last_device_node_id,
@@ -2745,7 +2871,7 @@ macro_rules! tree_core_binding {
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
-            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None))]
+            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None, mm_spans = None))]
             fn insert_host(
                 &self,
                 py: Python<'_>,
@@ -2755,6 +2881,7 @@ macro_rules! tree_core_binding {
                 host_value: PyTensor,
                 hash_value: Vec<String>,
                 cache_salt: Option<String>,
+                mm_spans: Option<Vec<MmSpanInput>>,
             ) -> PyResult<InsertResultBinding> {
                 self.inner.insert_host(
                     py,
@@ -2764,6 +2891,7 @@ macro_rules! tree_core_binding {
                     host_value,
                     hash_value,
                     cache_salt,
+                    mm_spans,
                 )
             }
 
@@ -3481,7 +3609,7 @@ macro_rules! tree_core_binding {
 
             #[cfg(feature = "inspection")]
             #[allow(clippy::too_many_arguments)]
-            #[pyo3(signature = (component_type, result, key, extra_key, cache_salt, value_chunks, best_value_len))]
+            #[pyo3(signature = (component_type, result, key, extra_key, cache_salt, value_chunks, best_value_len, mm_spans = None))]
             fn inspect_finalize_component_match_result(
                 &self,
                 py: Python<'_>,
@@ -3492,6 +3620,7 @@ macro_rules! tree_core_binding {
                 cache_salt: Option<String>,
                 value_chunks: Vec<PyTensor>,
                 best_value_len: usize,
+                mm_spans: Option<Vec<MmSpanInput>>,
             ) -> PyResult<MatchResultBinding> {
                 self.inner.inspect_finalize_component_match_result(
                     py,
@@ -3502,6 +3631,7 @@ macro_rules! tree_core_binding {
                     cache_salt,
                     value_chunks,
                     best_value_len,
+                    mm_spans,
                 )
             }
 
@@ -3528,27 +3658,29 @@ macro_rules! tree_core_binding {
 tree_core_binding!(
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
-    Vec<i64>
+    MultimodalKey<Vec<i64>>
 );
 
 tree_core_binding!(
     /// The UnifiedTreeCore Python adapter over bigram (EAGLE) child keys; keys
     /// cross the boundary as raw token ids and pair up rust-side.
     RustBigramUnifiedTreeCoreBinding,
-    Vec<(i64, i64)>
+    MultimodalKey<Vec<(i64, i64)>>
 );
 
 /// Per-page chained hashes over raw token ids.
 #[pyfunction]
-#[pyo3(signature = (token_ids, prior_hash, page_size, is_bigram = false))]
+#[pyo3(signature = (token_ids, prior_hash, page_size, is_bigram = false, mm_spans = None))]
 fn get_hash_str(
     py: Python<'_>,
     token_ids: &Bound<'_, PyAny>,
     prior_hash: Option<String>,
     page_size: usize,
     is_bigram: bool,
+    mm_spans: Option<Vec<MmSpanInput>>,
 ) -> PyResult<Vec<String>> {
-    let raw = py_array_to_vec_i64(py, token_ids)?;
+    let raw_key = read_multimodal_key(py, token_ids, mm_spans)?;
+    let raw = &raw_key.tokens;
     if page_size == 0 {
         return Err(PyValueError::new_err("page_size must be positive"));
     }
@@ -3559,20 +3691,23 @@ fn get_hash_str(
             "prior_hash must be a 64-character hexadecimal digest",
         ));
     }
-    if let Some(token_id) = raw
-        .iter()
-        .find(|token_id| u32::try_from(**token_id).is_err())
-    {
+    if let Some((_, token_id)) = raw.iter().enumerate().find(|(position, token_id)| {
+        u32::try_from(**token_id).is_err()
+            && !raw_key
+                .spans
+                .iter()
+                .any(|span| span.start <= *position && *position < span.end)
+    }) {
         return Err(PyValueError::new_err(format!(
             "token id {token_id} does not fit in uint32"
         )));
     }
     Ok(py.allow_threads(move || {
         if is_bigram {
-            let key = <Vec<(i64, i64)> as ChildKeyType>::key_from(Cow::Owned(raw)).into_owned();
-            crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, prior_hash.as_deref(), page_size)
+            let key = <MultimodalKey<Vec<(i64, i64)>>>::key_from_multimodal(&raw_key);
+            key_hash_strings(key.as_ref(), prior_hash.as_deref(), page_size)
         } else {
-            crate::node::get_hash_str::<Vec<i64>>(&raw, prior_hash.as_deref(), page_size)
+            key_hash_strings(&raw_key, prior_hash.as_deref(), page_size)
         }
     }))
 }

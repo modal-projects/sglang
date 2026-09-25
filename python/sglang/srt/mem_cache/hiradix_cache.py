@@ -49,6 +49,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.multimodal_key import (
+    MultimodalKeySpan,
+    shift_mm_spans,
+    slice_mm_spans,
+)
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -971,20 +976,25 @@ class HiRadixCache(RadixCache):
         )
         chain.reverse()  # parent-first
         top = chain[0]
-        if top.key.is_bigram:
-            # Bigram segments share boundary tokens; drop overlap after first.
-            token_ids = list(chain[0].key.token_ids)
-            for n in chain[1:]:
-                token_ids.extend(n.key.token_ids[1:])
-        else:
-            token_ids = []
-            for n in chain:
-                token_ids.extend(n.key.token_ids)
+        token_ids = []
+        mm_spans = []
+        for index, segment in enumerate(chain):
+            raw_tokens = segment.key.raw_token_ids()
+            # Bigram segments share one raw boundary token.
+            start = int(top.key.is_bigram and index > 0)
+            mm_spans.extend(
+                shift_mm_spans(
+                    slice_mm_spans(segment.key.mm_spans, start, len(raw_tokens)),
+                    len(token_ids),
+                )
+            )
+            token_ids.extend(raw_tokens[start:])
         key = RadixKey(
             token_ids,
             top.key.extra_key,
             top.key.is_bigram,
             cache_salt=top.key.cache_salt,
+            mm_spans=tuple(mm_spans),
         )
 
         if all(n.hash_value is not None for n in chain):
@@ -1491,6 +1501,7 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ) -> int:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
             return 0
@@ -1500,6 +1511,7 @@ class HiRadixCache(RadixCache):
             extra_key=extra_key,
             is_bigram=self.is_eagle,
             cache_salt=cache_salt,
+            mm_spans=slice_mm_spans(mm_spans, 0, len(new_input_tokens)),
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1783,13 +1795,27 @@ class HiRadixCache(RadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
+        matched_prefix_mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ):
         req_id = handle.rid
+        storage_start = len(matched_prefix_tokens or [])
+        boundary_tokens = int(self.is_eagle)
+        if (
+            storage_hit_end is not None
+            and storage_start
+            < storage_hit_end
+            <= storage_start + len(new_input_tokens) - boundary_tokens
+        ):
+            new_input_tokens = new_input_tokens[
+                : storage_hit_end - storage_start + boundary_tokens
+            ]
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
             is_bigram=self.is_eagle,
             cache_salt=cache_salt,
+            mm_spans=slice_mm_spans(mm_spans, 0, len(new_input_tokens)),
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)

@@ -301,6 +301,33 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         if len(start_indices) != len(end_indices):
             return input_ids
 
+        if not start_indices:
+            return list(input_ids)
+
+        # Some precomputed inputs repeat the full range list for every item.
+        provided_offsets = sorted(
+            offset for item in mm_inputs.mm_items for offset in item.offsets or ()
+        )
+        if (
+            mm_inputs.mm_items
+            and all(item.offsets for item in mm_inputs.mm_items)
+            and all(
+                left[1] < right[0]
+                for left, right in zip(provided_offsets, provided_offsets[1:])
+            )
+        ):
+            # Processor offsets also identify per-patch owners and absolute session positions.
+            mm_inputs.data_offsets = sorted(
+                start - 1
+                for item in mm_inputs.mm_items
+                for start, _end in item.offsets
+                if start > 0 and input_ids[start - 1] in self.data_start_token_ids
+            )
+            return MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids, mm_inputs.mm_items
+            )
+
+        item_offsets = [[] for _item in mm_inputs.mm_items]
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
@@ -314,12 +341,16 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             num_tokens = end_idx - start_idx - 1
             pad_value = pad_values[data_idx]
             padded_ids.extend([pad_value] * num_tokens)
+            if num_tokens > 0:
+                item_offsets[data_idx].append((start_idx + 1, end_idx - 1))
 
             last_idx = end_idx
 
         padded_ids.extend(input_ids[last_idx:])
 
         assert len(input_ids) == len(padded_ids), "Length validation fails"
+        for item, offsets in zip(mm_inputs.mm_items, item_offsets):
+            item.offsets = offsets
         return padded_ids
 
 
@@ -1285,7 +1316,9 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    def __init__(
+        self, tensor: torch.Tensor, precomputed_hash: Optional[int | str] = None
+    ):
         self._shm_handle = None
         self.tensor = None
         self._materialization_error = None
@@ -1412,7 +1445,9 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
-def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+def _wrap_shm_or_inline(
+    tensor: torch.Tensor, precomputed_hash: Optional[int | str] = None
+):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
     under a burst of multimodal requests."""
@@ -1427,7 +1462,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
         return tensor
 
 
-def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int | str] = None):
     """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
 
     ``precomputed_hash`` is only forwarded for the single-tensor case.

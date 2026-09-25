@@ -37,6 +37,7 @@ def prepare_kimi_k3_encoder_inputs(
     assigned to the local vision rank.
     """
     from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
     from sglang.srt.multimodal.encoder_preprocessing import (
         EncoderPreprocessOutput,
         hash_raw_encoder_item,
@@ -129,8 +130,15 @@ def prepare_kimi_k3_encoder_inputs(
             feature=to_chw_uint8(image) if use_gpu_preprocessing else image,
             model_specific_data=model_specific_data,
         )
-        if not use_gpu_preprocessing:
-            item.set_hash(hash_raw_encoder_item(image))
+        item.set_content_hash(
+            resolve_multimodal_item_hash(
+                existing_hash=hash_raw_encoder_item(image),
+                model_specific_data={
+                    "grid_thw": grid_thw,
+                    "preprocessing": model_specific_data[DEFERRED_PREPROCESSING_KEY],
+                },
+            )
+        )
         items.append(item)
         grids.append(grid_thw)
         original_image_sizes.append([width, height])

@@ -52,6 +52,10 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model as load_model
+from sglang.srt.multimodal.cache import (
+    build_processor_fingerprint,
+    resolve_multimodal_item_hash,
+)
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
@@ -65,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_serving,
     publish,
 )
 from sglang.srt.server_args import ServerArgs
@@ -641,6 +646,7 @@ class MMEncoder:
         self._embedding_dims = self._infer_embedding_dims()
 
         if get_mm().enable_mm_global_cache:
+            self._global_cache_namespace = self._build_global_cache_namespace()
             from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
@@ -957,10 +963,42 @@ class MMEncoder:
             )
         return slices
 
+    def _build_global_cache_namespace(self) -> str:
+        """Scope shared embeddings to the resolved model and preprocessing setup."""
+        return build_processor_fingerprint(
+            self.preprocessor,
+            self.model_config.hf_config,
+            extra={
+                "encoder_model": get_serving().served_model_name,
+                "encoder_model_path": get_model().model_path,
+                "encoder_revision": self.model_config.revision,
+                "encoder_quantization": self.model_config.quantization,
+                "encoder_dtype": self._embedding_dtype,
+                "vision_config": self.preprocessor.vision_config,
+                "gpu_preprocessing": self.preprocessor.use_image_processor_gpu,
+                "media_config": self.preprocessor.encoder_media_processor_config,
+                "audio_sampling_rate": self.preprocessor.model_audio_sr,
+            },
+        )
+
+    @staticmethod
+    def _item_cache_identity(item: MultimodalDataItem) -> str:
+        if (
+            item.cache_identity is None
+            and item.feature is None
+            and item.precomputed_embeddings is None
+        ):
+            raise InternalError(
+                "Encoder cache lookup requires features or a processor content identity"
+            )
+        item.set_pad_value()
+        assert item.cache_identity is not None
+        return item.cache_identity
+
     def _calculate_hashes_from_features(
         self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
-    ) -> List[int]:
-        """CPU Task: Compute hashes based on processed feature patches."""
+    ) -> List[str]:
+        """Resolve content identities in encoder-grid order before cache lookup."""
         preprocessed_items = (
             get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
         )
@@ -970,29 +1008,38 @@ class MMEncoder:
                     "Encoder preprocess item/grid mismatch: "
                     f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
                 )
-            hashes = []
-            for item in preprocessed_items:
-                item.set_pad_value()
-                hashes.append(item.hash)
-            return hashes
+            return [self._item_cache_identity(item) for item in preprocessed_items]
+
+        # Match the auxiliary inputs forwarded by _build_model_mm_items. Grid
+        # metadata is per item; other metadata remains as the processor supplied it.
+        metadata = {
+            key: _convert(value)
+            for key, value in (mm_inputs or {}).items()
+            if key not in _mm_feature_attrs.get(modality, [])
+        }
+        if modality == Modality.AUDIO and len(mm_feature) != len(grid_thw):
+            raise ValueError("Encoder audio feature/grid mismatch")
 
         hashes = []
-        if modality == Modality.AUDIO and isinstance(mm_feature, list):
-            for feature in mm_feature:
-                tmp_item = MultimodalDataItem(modality=modality, feature=feature)
-                tmp_item.set_pad_value()
-                hashes.append(tmp_item.hash)
-            return hashes
-
         offset = 0
-        logger.info(f"{mm_feature.shape=} with {modality=}")
-        for grid in grid_thw:
-            num_patches = self.preprocessor.get_num_patches(grid, modality)
-            feature_slice = mm_feature[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
-            tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
-            offset += num_patches
+        for index, grid in enumerate(grid_thw):
+            if modality == Modality.AUDIO:
+                feature = mm_feature[index]
+            else:
+                num_patches = self.preprocessor.get_num_patches(grid, modality)
+                feature = mm_feature[offset : offset + num_patches]
+                offset += num_patches
+            item_metadata = {
+                key: value[index : index + 1]
+                if key in _mm_grid_attrs.get(modality, [])
+                else value
+                for key, value in metadata.items()
+            }
+            item_metadata["encoder_grid"] = _convert(grid)
+            item = MultimodalDataItem(
+                modality=modality, feature=feature, model_specific_data=item_metadata
+            )
+            hashes.append(self._item_cache_identity(item))
         return hashes
 
     def _encode_missing(
@@ -1171,27 +1218,29 @@ class MMEncoder:
 
         str_mm_hashes = None
         if use_global_cache:
-            # Hashes must be grid-space per request (a leaf-space list would
-            # size-mismatch rank>0's mask and deadlock TP); validate on every
-            # rank so a bad request fails symmetrically before any collective.
-            per_req_hashes = [req.get("hashes") for req in requests]
-            mm_hashes = None
-            if all(h is not None for h in per_req_hashes):
-                for req, hashes, n in zip(requests, per_req_hashes, items_per_req):
-                    if len(hashes) != n:
-                        raise BadRequestError(
-                            f"User-supplied hashes length {len(hashes)} != grid "
-                            f"count {n} for req {req['req_id']}; hashes must be "
-                            f"grid-space (1 per encoder grid entry)."
-                        )
-                mm_hashes = [h for hashes in per_req_hashes for h in hashes]
-            if self.rank == 0:
-                if mm_hashes is None:
-                    mm_hashes = self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality, mm_inputs
+            # Routing hints retain their grid-space request contract. Validate
+            # every supplied count on all ranks before cache/model collectives.
+            for req, n in zip(requests, items_per_req):
+                hashes = req.get("hashes")
+                hint_count = len(hashes) if isinstance(hashes, (list, tuple)) else 1
+                if hashes is not None and hint_count != n:
+                    raise BadRequestError(
+                        f"User-supplied hashes length {hint_count} != grid "
+                        f"count {n} for req {req['req_id']}; hashes must be "
+                        f"grid-space (1 per encoder grid entry)."
                     )
-                # Embedding stores use string cache keys.
-                str_mm_hashes = [str(h) for h in mm_hashes]
+            if self.rank == 0:
+                # Caller hashes remain routing hints. Shared-cache authority is
+                # derived from actual processor content and model configuration.
+                identities = self._calculate_hashes_from_features(
+                    mm_feature, grid_thw, modality, mm_inputs
+                )
+                str_mm_hashes = [
+                    resolve_multimodal_item_hash(
+                        existing_hash=identity, namespace=self._global_cache_namespace
+                    )
+                    for identity in identities
+                ]
 
         return EncodeContext(
             req_id=requests[0]["req_id"],
@@ -1730,9 +1779,7 @@ class MMEncoder:
                 and len(ctx.items_per_req) == 1
             )
             if use_mm_cache:
-                for mm_item in mm_items:
-                    mm_item.set_pad_value()
-                mm_hashes = [mm_item.hash for mm_item in mm_items]
+                mm_hashes = [self._item_cache_identity(item) for item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
                     mm_cache = self.mm_cache.get(mm_hashes)

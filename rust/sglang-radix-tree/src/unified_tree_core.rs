@@ -391,6 +391,7 @@ pub struct BufferBackupSnapshot {
     pub parent_is_root: bool,
     pub parent_last_hash: Option<String>,
     pub token_ids: Vec<i64>,
+    pub mm_spans: Vec<crate::multimodal_key::MultimodalSpan>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
     pub is_bigram: bool,
@@ -915,8 +916,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node(parent_id).namespace.clone()
         };
         let retired = self.arena.node(parent_id).retired;
+        let emit_full_hashes =
+            self.arena.node(parent_id).emit_full_hashes || !key.mm_spans().is_empty();
         let new_node = self.arena.node_mut(new_node_id);
         new_node.retired = retired;
+        new_node.emit_full_hashes = emit_full_hashes;
         new_node.key = key;
         new_node.parent = Some(parent_id);
         new_node.namespace = ns;
@@ -1185,10 +1189,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut offset = 0;
         let mut pinned_len = 0;
         while offset < aligned_key_len {
-            let Some(child_id) = self.arena.child_on_page_in_namespace(
+            let Some(child_id) = self.arena.child_on_key_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(offset, self.page_size),
+                key.page_view(offset, self.page_size),
             ) else {
                 break;
             };
@@ -1295,10 +1299,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         while offset < aligned_key_len {
-            let Some(child_id) = self.arena.child_on_page_in_namespace(
+            let Some(child_id) = self.arena.child_on_key_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(offset, self.page_size),
+                key.page_view(offset, self.page_size),
             ) else {
                 break;
             };
@@ -1597,7 +1601,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
             node_id: root_id,
-            key: K::from(params.key.as_ref()[..aligned_key_len].to_vec()),
+            key: params.key.slice_key(0, aligned_key_len),
             aligned_key_len,
             value: params.value.narrow(0, 0, aligned_key_len as i64),
             namespace: params.namespace.to_owned(),
@@ -1696,10 +1700,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Walk cursor: atoms of `key` already matched (also the running prefix length).
         let cursor = state.total_prefix_length;
         let child_id = if cursor < state.aligned_key_len {
-            self.arena.child_on_page_in_namespace(
+            self.arena.child_on_key_page_in_namespace(
                 state.node_id,
                 state.namespace.as_ref(),
-                state.key.page_at(cursor, self.page_size),
+                state.key.page_view(cursor, self.page_size),
             )
         } else {
             None
@@ -1855,9 +1859,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             );
             self.add_new_node_in_namespace_(
                 state.node_id,
-                K::from(
-                    state.key.as_ref()[state.total_prefix_length..state.aligned_key_len].to_vec(),
-                ),
+                state
+                    .key
+                    .slice_key(state.total_prefix_length, state.aligned_key_len),
                 &leaf_value,
                 state.priority,
                 state.namespace.as_ref(),
@@ -1979,6 +1983,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let published_tiers = child.published_kv_tiers;
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
+        let child_emit_full_hashes = child.emit_full_hashes;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
         let parent_map_key = key_head.child_key(page_size);
@@ -1993,6 +1998,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.arena.node_mut(new_node_id).retired = retired;
         self.arena.node_mut(new_node_id).published_kv_tiers = published_tiers;
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
+        self.arena.node_mut(new_node_id).emit_full_hashes = child_emit_full_hashes;
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
@@ -2961,16 +2967,26 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             (
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
+                    block_hashes_sha256: tail_full_hashes,
                     medium: tail_medium,
                 }),
                 KvCacheEvent::BlockRemoved {
                     mut block_hashes,
+                    mut block_hashes_sha256,
                     medium,
                 },
-            ) if *tail_medium == medium => tail_hashes.append(&mut block_hashes),
+            ) if *tail_medium == medium
+                && tail_full_hashes.is_some() == block_hashes_sha256.is_some() =>
+            {
+                tail_hashes.append(&mut block_hashes);
+                if let (Some(tail), Some(next)) = (tail_full_hashes, &mut block_hashes_sha256) {
+                    tail.append(next);
+                }
+            }
             (
                 Some(KvCacheEvent::BlockStored {
                     block_hashes: tail_hashes,
+                    block_hashes_sha256: tail_full_hashes,
                     token_ids: tail_token_ids,
                     block_size: tail_block_size,
                     medium: tail_medium,
@@ -2980,7 +2996,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 }),
                 KvCacheEvent::BlockStored {
                     mut block_hashes,
+                    mut block_hashes_sha256,
                     parent_block_hash,
+                    parent_block_hash_sha256,
                     mut token_ids,
                     block_size,
                     medium,
@@ -2992,10 +3010,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 && *tail_cache_salt == cache_salt
                 && *tail_session_id == session_id
                 && !tail_hashes.is_empty()
-                && parent_block_hash == tail_hashes.last().copied() =>
+                && parent_block_hash == tail_hashes.last().copied()
+                && tail_full_hashes.is_some() == block_hashes_sha256.is_some()
+                && (tail_full_hashes.is_none()
+                    || parent_block_hash_sha256.as_ref()
+                        == tail_full_hashes.as_ref().and_then(|values| values.last())) =>
             {
                 tail_hashes.append(&mut block_hashes);
                 tail_token_ids.append(&mut token_ids);
+                if let (Some(tail), Some(next)) = (tail_full_hashes, &mut block_hashes_sha256) {
+                    tail.append(next);
+                }
             }
             (_, event) => self.kv_event_queue.push(event),
         }
@@ -3042,8 +3067,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 let node = self.arena.node(id);
                 (
                     node.id,
-                    crate::node::get_hash_digests::<K>(
-                        node.key.as_ref(),
+                    crate::multimodal_key::key_hash_digests(
+                        &node.key,
                         prior.as_ref(),
                         self.page_size,
                     ),
@@ -3091,12 +3116,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         .map(crate::node::hash_str_to_int64)
                 }
             });
+            let emit_full_hashes = node.emit_full_hashes;
+            let mut parent_block_hash_sha256 = if emit_full_hashes {
+                node.parent.and_then(|parent_id| {
+                    let parent = self.arena.node(parent_id);
+                    if namespaced {
+                        self.namespaced_event_hashes
+                            .get(&parent.id)
+                            .and_then(|hashes| hashes.last())
+                            .map(crate::node::digest_to_hex)
+                    } else {
+                        parent.get_last_hash_value().map(str::to_owned)
+                    }
+                })
+            } else {
+                None
+            };
             let num_pages = node.key.atom_len().div_ceil(self.page_size);
             let mut events = Vec::with_capacity(num_pages);
-            let mut append_event = |page: &[K::Atom], block_hash| {
+            let mut append_event = |page: &[K::Atom], block_hash, full_hash: Option<String>| {
                 events.push(KvCacheEvent::BlockStored {
                     block_hashes: vec![block_hash],
                     parent_block_hash,
+                    block_hashes_sha256: full_hash.as_ref().map(|hash| vec![hash.clone()]),
+                    parent_block_hash_sha256: parent_block_hash_sha256.clone(),
                     token_ids: page.to_vec(),
                     block_size: page.len(),
                     medium,
@@ -3104,6 +3147,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     session_id: session_id.clone(),
                 });
                 parent_block_hash = Some(block_hash);
+                parent_block_hash_sha256 = full_hash;
             };
             if namespaced {
                 let hashes = &self.namespaced_event_hashes[&node.id];
@@ -3113,7 +3157,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     hashes.len()
                 );
                 for (page, digest) in node.key.as_ref().chunks(self.page_size).zip(hashes) {
-                    append_event(page, crate::node::hash_digest_to_int64(digest));
+                    append_event(
+                        page,
+                        crate::node::hash_digest_to_int64(digest),
+                        emit_full_hashes.then(|| crate::node::digest_to_hex(digest)),
+                    );
                 }
             } else {
                 let hashes = node.hash_value.as_ref().expect("hashed above");
@@ -3123,7 +3171,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     hashes.len()
                 );
                 for (page, hash) in node.key.as_ref().chunks(self.page_size).zip(hashes) {
-                    append_event(page, crate::node::hash_str_to_int64(hash));
+                    append_event(
+                        page,
+                        crate::node::hash_str_to_int64(hash),
+                        emit_full_hashes.then(|| hash.clone()),
+                    );
                 }
             }
             events
@@ -3160,9 +3212,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .map(|hash| crate::node::hash_str_to_int64(hash))
                 .collect()
         };
+        let block_hashes_sha256 = node.emit_full_hashes.then(|| {
+            if namespaced {
+                self.namespaced_event_hashes[&node.id][..num_pages]
+                    .iter()
+                    .map(crate::node::digest_to_hex)
+                    .collect()
+            } else {
+                node.hash_value.as_ref().expect("hashed above")[..num_pages].to_vec()
+            }
+        });
         if !block_hashes.is_empty() {
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
+                block_hashes_sha256,
                 medium,
             });
         }
@@ -3237,10 +3300,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut matched_length = 0;
         let mut cache_actions: Vec<CacheAction> = Vec::new();
         while matched_length < total_len {
-            let Some(child_id) = self.arena.child_on_page_in_namespace(
+            let Some(child_id) = self.arena.child_on_key_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(matched_length, self.page_size),
+                key.page_view(matched_length, self.page_size),
             ) else {
                 break;
             };
@@ -3640,6 +3703,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             parent_is_root: parent.is_root(),
             parent_last_hash: parent.get_last_hash_value().map(str::to_string),
             token_ids: K::raw_token_ids(node.key.as_ref()).into_owned(),
+            mm_spans: node.key.mm_spans().to_vec(),
             extra_key: node.namespace.extra_key().map(str::to_string),
             cache_salt: node.namespace.cache_salt().map(str::to_string),
             is_bigram: K::IS_BIGRAM,
@@ -5291,6 +5355,8 @@ pub enum KvCacheEvent<A> {
     BlockStored {
         block_hashes: Vec<i64>,
         parent_block_hash: Option<i64>,
+        block_hashes_sha256: Option<Vec<String>>,
+        parent_block_hash_sha256: Option<String>,
         token_ids: Vec<A>,
         block_size: usize,
         medium: StorageMedium,
@@ -5299,6 +5365,7 @@ pub enum KvCacheEvent<A> {
     },
     BlockRemoved {
         block_hashes: Vec<i64>,
+        block_hashes_sha256: Option<Vec<String>>,
         medium: StorageMedium,
     },
     AllBlocksCleared,

@@ -35,10 +35,10 @@ pub struct OutputItem {
     pub feature: crate::pipeline::Tensor,
     pub aux: crate::pipeline::NamedTensors,
     /// [`common::content_hash_u64`] of the raw encoded source bytes — the same
-    /// identity role as the Python path's `hash_feature`, but a different
-    /// algorithm, so hashes are consistent within the server pipeline and
-    /// never comparable across the two paths.
+    /// routing role as Python's externally supplied `mm_hashes`.
     pub hash: u64,
+    /// Full worker-computed identity, independent of caller routing hashes.
+    pub cache_identity: String,
 }
 
 /// The per-request result parked for the scheduler drain.
@@ -130,10 +130,19 @@ pub fn process(
         input_ids: expanded.input_ids,
         items: processed
             .into_iter()
-            .map(|(item, hash)| OutputItem {
-                feature: item.feature,
-                aux: item.aux,
-                hash,
+            .zip(fetched)
+            .map(|((item, hash), source)| {
+                let cache_identity = crate::identity::content_identity(
+                    &source,
+                    family.cache_identity_config(),
+                    &item,
+                );
+                OutputItem {
+                    feature: item.feature,
+                    aux: item.aux,
+                    hash,
+                    cache_identity,
+                }
             })
             .collect(),
         offsets: expanded.offsets,
@@ -172,6 +181,7 @@ mod tests {
         let item = &out.items[0];
         assert_eq!(item.feature.shape, [16, 3 * 2 * 2 * 2]);
         assert_eq!(item.aux[0].0, "image_grid_thw");
+        assert_eq!(item.cache_identity.len(), 71);
         let crate::pipeline::PositionOutput::MRope { positions, .. } = &out.positions else {
             panic!("qwen emits mrope")
         };
@@ -227,7 +237,40 @@ mod tests {
         // Identical source bytes → identical content hashes.
         assert_eq!(out.items[0].hash, out.items[1].hash);
         assert_eq!(out.items[1].hash, out.items[2].hash);
+        assert_eq!(out.items[0].cache_identity, out.items[1].cache_identity);
+        assert_eq!(out.items[1].cache_identity, out.items[2].cache_identity);
         assert_eq!(out.input_ids.len(), 5 + 3 * 3); // each placeholder → 4 tokens
+    }
+
+    #[test]
+    fn authoritative_identity_covers_effective_configuration() {
+        let encode = |spec: &str| {
+            let family = pipeline_from_spec(spec).unwrap();
+            process(
+                family.as_ref(),
+                MmInput {
+                    text: None,
+                    input_ids: Some(vec![1]),
+                    images: vec![ImageSource::Bytes(png(8, 8))],
+                },
+                |_| unreachable!(),
+            )
+            .unwrap()
+            .items
+            .remove(0)
+        };
+        let original = encode(SPEC);
+        let mut config: serde_json::Value = serde_json::from_str(SPEC).unwrap();
+        config["resample"] = "aten_u8".into();
+        let equivalent = encode(&config.to_string());
+        assert_eq!(original.cache_identity, equivalent.cache_identity);
+        config["image_mean"] = serde_json::json!([0.25, 0.0, 0.0]);
+        let changed = encode(&config.to_string());
+        assert_eq!(original.hash, changed.hash);
+        assert_ne!(original.cache_identity, changed.cache_identity);
+        config["merge_size"] = 1.into();
+        let different_layout = encode(&config.to_string());
+        assert_ne!(changed.cache_identity, different_layout.cache_identity);
     }
 
     #[test]

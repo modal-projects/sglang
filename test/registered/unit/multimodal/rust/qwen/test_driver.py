@@ -12,6 +12,7 @@ rejection class.
 """
 
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -103,6 +104,28 @@ class TestNativeDriverErrorPaths(CustomTestCase):
 
     def test_image_free_request_rejected(self):
         self.assert_rejected(IMAGE_IDS, [], "image sources")
+
+    def test_worker_identity_is_additive_and_covers_configuration(self):
+        """The legacy tuple stays compatible while effective config scopes reuse."""
+        source = image_bytes(80, 80)
+        legacy = QWEN_CORE.process_mm(IMAGE_IDS, [source], SPEC)
+        self.assertEqual(len(legacy), 7)
+        native = QWEN_CORE.process_mm(
+            IMAGE_IDS, [source], SPEC, include_cache_identities=True
+        )
+        self.assertEqual(len(native), 8)
+        self.assertEqual(native[3], legacy[3])
+        self.assertRegex(native[7][0], r"^sha256:[0-9a-f]{64}$")
+        config = json.loads(SPEC)
+        config["image_mean"] = [0.25, 0.5, 0.5]
+        changed = QWEN_CORE.process_mm(
+            IMAGE_IDS,
+            [source],
+            json.dumps(config),
+            include_cache_identities=True,
+        )
+        self.assertEqual(native[3], changed[3])
+        self.assertNotEqual(native[7], changed[7])
 
 
 if __name__ == "__main__":

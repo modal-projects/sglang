@@ -289,11 +289,15 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
+    # Complete content identities supplement the legacy routing identifiers.
+    block_hashes_sha256: Optional[list[str]] = None
+    parent_block_hash_sha256: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    block_hashes_sha256: Optional[list[str]] = None
 
 
 class AllBlocksCleared(KVCacheEvent):

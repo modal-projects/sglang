@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1144,14 +1145,14 @@ fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     assert_eq!(
         children.get(&ChildEdgeRef::<Vec<i64>> {
             namespace: first,
-            page: &page,
+            page: KeyPageRef::new(&page, &[], 0),
         }),
         Some(&NodeIdx_(1))
     );
     assert_eq!(
         children.get(&ChildEdgeRef::<Vec<i64>> {
             namespace: second,
-            page: &page,
+            page: KeyPageRef::new(&page, &[], 0),
         }),
         Some(&NodeIdx_(2))
     );

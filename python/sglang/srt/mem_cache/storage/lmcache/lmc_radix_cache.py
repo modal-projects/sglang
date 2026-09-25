@@ -197,6 +197,15 @@ class LMCRadixCache(RadixCache):
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
+        if params.key.mm_spans:
+            # The external connector cannot authenticate multimodal spans.
+            # Local radix matching above still uses their complete identities.
+            if params.key.is_bigram:
+                return base_res
+            key = key[: params.key.mm_spans[0].start].page_aligned(self.page_size)
+            if len(key) <= value.numel():
+                return base_res
+
         if self._mode is LMCacheMode.MP:
             if params.req is None:
                 return base_res
@@ -234,6 +243,7 @@ class LMCRadixCache(RadixCache):
                 key.extra_key,
                 key.is_bigram,
                 cache_salt=key.cache_salt,
+                mm_spans=key.mm_spans,
             ),
             value_numel=int(value.numel()),
         )
@@ -467,6 +477,17 @@ class LMCRadixCache(RadixCache):
             )
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        if req.mm_cache_spans:
+            # External token-to-KV counts do not represent the bigram boundary.
+            text_end = 0 if self.is_eagle else req.mm_cache_spans[0].start
+            text_end = text_end // self.page_size * self.page_size
+            token_ids = token_ids[:text_end]
+            kv_committed_len = len(token_ids)
+            if not token_ids:
+                if self._mode is LMCacheMode.MP:
+                    self._mp_load_back_markers.pop(req.rid, None)
+                    self.lmcache_connector.end_session(req.rid)
+                return
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :kv_committed_len
         ]
@@ -478,6 +499,7 @@ class LMCRadixCache(RadixCache):
                     token_ids,
                     req.extra_key,
                     cache_salt=req.cache_salt,
+                    mm_spans=req.mm_cache_spans,
                 )
             )
         )

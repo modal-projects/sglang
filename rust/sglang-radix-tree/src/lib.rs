@@ -17,6 +17,7 @@
 )]
 
 mod components;
+mod multimodal_key;
 mod node;
 mod prefix_ref;
 #[cfg(feature = "python-extension")]

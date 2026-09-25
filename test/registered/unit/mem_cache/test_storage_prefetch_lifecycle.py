@@ -11,6 +11,11 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCachePreallocMixin,
+    DecodePrefixMatch,
+)
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -20,17 +25,22 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     _StagedPrefetch,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.multimodal_key import MultimodalKeySpan, slice_mm_spans
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.components import BASE_COMPONENT_TYPE
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -347,6 +357,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     [0, 1],
                     None,
                     None,
+                    (),
                 )
                 self.assertEqual(
                     pipeline.try_lock_anchor(req.cache_request_handle, 0), ("locked", 2)
@@ -492,6 +503,303 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+
+class TestMultimodalStorageIdentity(CustomTestCase):
+    _A = "sha256:" + "a" * 64
+    _B = "sha256:" + "b" * 64
+    _C = "sha256:" + "c" * 64
+
+    def test_decode_prefetch_retains_confirmed_bigram_endpoint(self):
+        """A confirmed logical hit includes its final raw media token in bigram mode."""
+        tokens = array("q", range(11))
+        spans = (
+            MultimodalKeySpan(1, 3, self._A),
+            MultimodalKeySpan(6, 7, self._B),
+        )
+        for cache_type in (HiRadixCache, UnifiedRadixCache):
+            for bigram in (False, True):
+                with self.subTest(cache=cache_type.__name__, bigram=bigram):
+                    key = RadixKey(tokens, is_bigram=bigram, mm_spans=spans)
+                    last_hash = get_storage_hash_str(key[:2])
+                    if cache_type is UnifiedRadixCache:
+                        cache, pipeline, _ = _staged_fixture()
+                        pipeline.staged_prefetches.clear()
+                        cache.tree_core.is_eagle = bigram
+                        host = 0
+                    else:
+                        cache = HiRadixCache.__new__(HiRadixCache)
+                        cache.page_size = 2
+                        cache.is_eagle = bigram
+                        cache.enable_storage = True
+                        cache.prefetch_threshold = 2
+                        cache.ongoing_prefetch = {}
+                        cache._get_extra_pools = lambda: {}
+                        controller = HiCacheController.__new__(HiCacheController)
+                        controller.prefetch_rate_limited = lambda: False
+                        controller.prefetch_queue = Queue()
+                        controller.prefetch_tokens_occupied = 0
+                        cache.cache_controller = controller
+                        host = SimpleNamespace(protect_host=lambda: None)
+                    cache.get_last_hash_value = lambda _: last_hash
+                    cache.hicache_storage_pass_prefix_keys = False
+                    req = SimpleNamespace(
+                        rid="r",
+                        cache_request_handle=_REQ,
+                        origin_input_ids=tokens,
+                        extra_key=None,
+                        cache_salt=None,
+                        mm_cache_spans=spans,
+                    )
+                    match = DecodePrefixMatch(
+                        prefix_indices=torch.arange(2),
+                        l2_host_hit_length=0,
+                        l3_storage_hit_length=4,
+                        last_device_node=host,
+                        last_host_node=host,
+                    )
+                    DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                        SimpleNamespace(tree_cache=cache), req, match
+                    )
+                    self.assertTrue(match.prefetch_registered)
+                    operation = cache.cache_controller.prefetch_queue.get_nowait()
+                    fetched = operation.token_ids
+                    expected = key[2:6]
+                    self.assertEqual(len(fetched), 4)
+                    self.assertEqual(fetched.raw_token_ids(), expected.raw_token_ids())
+                    self.assertEqual(fetched.mm_spans, expected.mm_spans)
+                    self.assertEqual(
+                        get_storage_hash_str(fetched, last_hash, page_size=2),
+                        get_storage_hash_str(expected, last_hash, page_size=2),
+                    )
+
+    def test_storage_probe_keeps_text_and_earlier_media_hits(self):
+        """A later one-token media change must not alias the stored suffix or salt its prefix."""
+        tokens = array("q", [1, 2, 99, 3, 4, 5, 99, 6, 7, 8])
+        stored_spans = (
+            MultimodalKeySpan(2, 3, self._A),
+            MultimodalKeySpan(6, 7, self._A),
+        )
+        stored = RadixKey(tokens, mm_spans=stored_spans)
+        hashes = get_storage_hash_str(stored, page_size=2)
+
+        def exists(keys, _extra_info):
+            for index, key in enumerate(keys):
+                if key not in hashes:
+                    return index
+            return len(keys)
+
+        for cache_type in (HiRadixCache, UnifiedRadixCache):
+            with self.subTest(cache=cache_type.__name__):
+                cache = cache_type.__new__(cache_type)
+                cache.tree_core = SimpleNamespace(
+                    enable_storage=True, page_size=2, is_eagle=False
+                )
+                cache.enable_storage = True
+                cache.page_size = 2
+                cache.is_eagle = False
+                cache.prefetch_threshold = 2
+                cache._all_reduce_attn_groups = lambda *_: None
+                controller = HiCacheController.__new__(HiCacheController)
+                controller.page_size = 2
+                controller.prefetch_rate_limited = lambda: False
+                controller.storage_backend = SimpleNamespace(batch_exists=exists)
+                cache.cache_controller = controller
+                suffix = tokens[2:]
+                for second_identity, expected_hit in ((self._A, 8), (self._B, 4)):
+                    spans = (
+                        stored_spans[0],
+                        MultimodalKeySpan(6, 7, second_identity),
+                    )
+                    hit = cache.query_storage_hit_length(
+                        0,
+                        suffix,
+                        last_hash=hashes[0],
+                        mm_spans=slice_mm_spans(spans, 2, len(tokens)),
+                    )
+                    self.assertEqual(hit, expected_hit)
+                changed_first = (
+                    MultimodalKeySpan(2, 3, self._B),
+                    stored_spans[1],
+                )
+                self.assertEqual(
+                    cache.query_storage_hit_length(0, tokens, mm_spans=changed_first),
+                    2,
+                )
+                host = SimpleNamespace(protect_host=lambda: None)
+                cache.is_backuped = lambda _: True
+                cache.get_last_hash_value = lambda _: hashes[0]
+                cache.hicache_storage_pass_prefix_keys = False
+                req = SimpleNamespace(
+                    rid="r",
+                    cache_request_handle=_REQ,
+                    origin_input_ids=tokens,
+                    extra_key=None,
+                    cache_salt=None,
+                    mm_cache_spans=spans,
+                )
+                harness = SimpleNamespace(
+                    scheduler=SimpleNamespace(enable_decode_hicache=True),
+                    tree_cache=cache,
+                )
+                match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                    harness,
+                    req,
+                    SimpleNamespace(
+                        device_indices=torch.arange(2),
+                        host_hit_length=0,
+                        last_device_node=host,
+                        last_host_node=host,
+                    ),
+                )
+                self.assertEqual(match.l3_storage_hit_length, 4)
+                if cache_type is HiRadixCache:
+                    cache.ongoing_prefetch = {}
+                    cache._get_extra_pools = lambda: {}
+                    controller.prefetch_queue = Queue()
+                    controller.prefetch_tokens_occupied = 0
+                    DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                        harness, req, match
+                    )
+                    self.assertTrue(match.prefetch_registered)
+                    operation = controller.prefetch_queue.get_nowait()
+                    self.assertEqual(len(operation.token_ids), 4)
+                    self.assertEqual(controller._storage_hit_query(operation)[1], 4)
+
+    def test_trim_stage_and_admission_preserve_media_offsets(self):
+        """Trimmed fetches and retries retain media at shared bigram boundaries."""
+        for bigram in (False, True):
+            for trims in ((2, 2), (8,)):
+                with self.subTest(bigram=bigram, trims=trims):
+                    cache, pipeline, req = _staged_fixture()
+                    pipeline.staged_prefetches.clear()
+                    cache.tree_core.is_eagle = bigram
+                    tokens = array("q", range(10 + int(bigram)))
+                    spans = (
+                        MultimodalKeySpan(1, 3, self._A),
+                        MultimodalKeySpan(4, 5, self._B),
+                        MultimodalKeySpan(6, 9, self._A),
+                    )
+                    if bigram:
+                        spans += (MultimodalKeySpan(10, 11, self._B),)
+                    expected = RadixKey(tokens, is_bigram=bigram, mm_spans=spans)
+                    cache.prefetch_from_storage(
+                        req.cache_request_handle,
+                        0,
+                        tokens[2:],
+                        matched_prefix_tokens=tokens[:2],
+                        mm_spans=slice_mm_spans(spans, 2, len(tokens)),
+                        matched_prefix_mm_spans=slice_mm_spans(spans, 0, 2),
+                        storage_hit_end=10,
+                    )
+                    info = cache.ongoing_prefetch[req.cache_request_handle]
+                    operation = info.operation
+                    operation.hash_value = get_storage_hash_str(
+                        info.prefetch_key, page_size=2
+                    )
+                    operation.storage_hit_count = 8
+                    matched, hit = 2, 8
+                    for trim in trims:
+                        matched += trim
+                        info, hit, _ = cache._trim_buffer_prefetch_full_head(
+                            req.cache_request_handle, info, operation, matched, hit
+                        )
+                    cache.tree_core.match_full_device_prefix.side_effect = lambda key: (
+                        min(matched, key.match(expected)),
+                        1,
+                        min(matched, key.match(expected)),
+                    )
+                    cache.tree_core.collect_full_device_indices.return_value = (
+                        torch.arange(10)
+                    )
+                    pipeline.anchor_lock_cap_tokens = 100
+                    self.assertEqual(
+                        pipeline.try_lock_anchor(req.cache_request_handle, hit),
+                        ("locked", matched),
+                    )
+                    anchor_key = (
+                        cache.tree_core.match_full_device_prefix.call_args.args[0]
+                    )
+                    self.assertEqual(anchor_key.match(expected), 10)
+                    pipeline.release_anchor_lock(req.cache_request_handle)
+                    swa = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(4))
+                    operation.pool_transfers = [swa]
+                    operation.host_indices = torch.arange(hit)
+                    cache.ongoing_prefetch[req.cache_request_handle] = info._replace(
+                        host_indices=operation.host_indices, comp_xfers={"swa": [swa]}
+                    )
+                    cache.cache_controller.prefetch_tokens_occupied = hit
+                    cache.storage_existence_cache = Mock()
+                    pipeline.stage_completed_prefetch(
+                        req.cache_request_handle, hit, operation.hash_value
+                    )
+                    req.prefix_indices = torch.arange(0)
+                    self.assertTrue(pipeline.prepare_staged_prefetch(req))
+                    restored_key = req.staged_prefetch_plan.key
+                    self.assertEqual(restored_key.raw_token_ids(), tokens)
+                    self.assertEqual(restored_key.match(expected), 10)
+                    self.assertEqual(
+                        get_storage_hash_str(restored_key, page_size=2),
+                        get_storage_hash_str(expected, page_size=2),
+                    )
+
+    def test_split_backup_and_snapshot_keep_short_and_repeated_media(self):
+        """Backup snapshots must preserve identities after live node splits."""
+        for bigram in (False, True):
+            with self.subTest(bigram=bigram):
+                tokens = array("q", range(12 + int(bigram)))
+                spans = (
+                    MultimodalKeySpan(2, 3, self._A),
+                    MultimodalKeySpan(4, 9, self._B),
+                    MultimodalKeySpan(10, 11, self._A),
+                )
+                key = RadixKey(tokens, is_bigram=bigram, mm_spans=spans)
+                hashes = get_storage_hash_str(key, page_size=2)
+                root = SimpleNamespace(id=0, get_last_hash_value=lambda: None)
+                top = SimpleNamespace(
+                    id=1,
+                    parent=root,
+                    key=key[:6],
+                    hash_value=hashes[:3],
+                    host_value=torch.arange(6),
+                )
+                leaf = SimpleNamespace(
+                    id=2,
+                    parent=top,
+                    key=key[6:],
+                    hash_value=hashes[3:],
+                    host_value=torch.arange(6, 12),
+                )
+                cache = HiRadixCache.__new__(HiRadixCache)
+                cache.root_node = root
+                _, joined, joined_hashes, host = cache._concat_split_chain(leaf, 12)
+                self.assertEqual(list(joined.token_ids), list(tokens))
+                self.assertEqual(joined_hashes, hashes)
+                self.assertEqual(get_storage_hash_str(joined, page_size=2), hashes)
+                torch.testing.assert_close(host, torch.arange(12))
+
+                node = SimpleNamespace(
+                    id=3,
+                    parent=root,
+                    key=key,
+                    hash_value=hashes,
+                    component_data={BASE_COMPONENT_TYPE: SimpleNamespace(value=host)},
+                )
+                core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+                core.root_node = root
+                core._node_arena = {node.id: node}
+                snapshot = core.snapshot_buffer_backup(node.id, False)
+                node.key = key[6:]
+                self.assertEqual(snapshot.key.match(key), 12)
+                self.assertEqual(
+                    get_storage_hash_str(snapshot.key, page_size=2), hashes
+                )
+                changed = RadixKey(
+                    tokens,
+                    is_bigram=bigram,
+                    mm_spans=spans[:2] + (MultimodalKeySpan(10, 11, self._C),),
+                )
+                self.assertEqual(snapshot.key.match(changed), 10 - int(bigram))
 
 
 if __name__ == "__main__":

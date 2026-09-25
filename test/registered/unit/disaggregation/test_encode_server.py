@@ -43,7 +43,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
     MultiModalStaticCache,
@@ -528,7 +528,9 @@ class TestEncoderDelivery(CustomTestCase):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.mm_cache = MultiModalStaticCache(1024 * 1024)
         encoder.mm_cache_lock = asyncio.Lock()
-        item = SimpleNamespace(hash=123, set_pad_value=lambda: None)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, hash=123, feature=torch.ones(2, 3)
+        )
         encoder._build_model_mm_items = Mock(return_value=[item])
         ctx = SimpleNamespace(
             req_id="req",
@@ -592,7 +594,10 @@ class TestEncoderDelivery(CustomTestCase):
         async def run():
             get_feature_fn = Mock()
             encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
-            mm_hash = MultiModalStaticCache.combine_hashes([123])
+            item = encoder._build_model_mm_items.return_value[0]
+            mm_hash = MultiModalStaticCache.combine_hashes(
+                [encoder._item_cache_identity(item)]
+            )
             encoder.mm_cache.set(
                 mm_hash,
                 EmbeddingResult(embedding=torch.zeros((1, 4))),

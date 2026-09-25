@@ -45,6 +45,7 @@ class TestWrapEncoded(CustomTestCase):
 
     GRIDS = [(1, 2, 2), (1, 1, 1)]
     HASHES = [101, 202]
+    CACHE_IDENTITIES = ["sha256:" + "a" * 64, "sha256:" + "b" * 64]
     OFFSETS = [(2, 5), (8, 8)]
 
     def transport(self, features):
@@ -58,6 +59,7 @@ class TestWrapEncoded(CustomTestCase):
             SimpleNamespace(  # the shape of Rust's MmEncodedResult
                 grids=self.GRIDS,
                 hashes=self.HASHES,
+                cache_identities=self.CACHE_IDENTITIES,
                 offsets=self.OFFSETS,
                 mrope=np.arange(30, dtype=np.int64),
                 mrope_delta=-3,
@@ -72,6 +74,9 @@ class TestWrapEncoded(CustomTestCase):
             [tuple(item.feature.shape) for item in output.mm_items], [(4, 6), (1, 6)]
         )
         self.assertEqual([item.hash for item in output.mm_items], [101, 202])
+        self.assertEqual(
+            [item.cache_key for item in output.mm_items], self.CACHE_IDENTITIES
+        )
         self.assertEqual(
             [item.offsets for item in output.mm_items], [[(2, 5)], [(8, 8)]]
         )
@@ -91,7 +96,7 @@ class TestWrapEncoded(CustomTestCase):
         with (
             patch.dict(os.environ, {"SGLANG_MM_PRECOMPUTE_HASH": "1"}),
             patch(
-                "sglang.srt.managers.mm_utils.hash_feature",
+                "sglang.srt.multimodal.cache.resolve_multimodal_item_hash",
                 side_effect=AssertionError("scheduler loop must not hash features"),
             ),
         ):
@@ -99,6 +104,40 @@ class TestWrapEncoded(CustomTestCase):
         self.assertEqual(
             [item.pad_value for item in output.mm_items],
             [_compute_pad_value(101), _compute_pad_value(202)],
+        )
+
+    def test_routing_override_does_not_replace_worker_identity(self):
+        """An opaque router key cannot make different worker items share a cache key."""
+        self.HASHES = [101, 101]
+        with patch.dict(os.environ, {"SGLANG_MM_PRECOMPUTE_HASH": "1"}):
+            output, _ = self.build()
+        self.assertEqual(output.mm_items[0].pad_value, output.mm_items[1].pad_value)
+        self.assertEqual(
+            [item.cache_key for item in output.mm_items], self.CACHE_IDENTITIES
+        )
+
+    def test_identity_count_must_match_worker_items(self):
+        """An incomplete worker handoff must not silently drop trailing media."""
+        self.CACHE_IDENTITIES = self.CACHE_IDENTITIES[:1]
+        with self.assertRaises(ValueError):
+            self.build()
+
+    def test_native_identity_reaches_exact_cache_spans_without_hashing(self):
+        """Native handoffs must satisfy the scheduler's full-identity span contract."""
+        from array import array
+
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+
+        with patch(
+            "sglang.srt.multimodal.cache.resolve_multimodal_item_hash",
+            side_effect=AssertionError("scheduler loop must not hash features"),
+        ):
+            output, _ = self.build()
+            inputs = MultimodalInputs.from_processor_output(output)
+            spans = inputs.cache_spans(array("q", [0] * 10))
+        self.assertEqual(
+            [(span.start, span.end, span.identity) for span in spans],
+            [(2, 6, self.CACHE_IDENTITIES[0]), (8, 9, self.CACHE_IDENTITIES[1])],
         )
 
 

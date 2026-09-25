@@ -3,6 +3,18 @@
 This document describes how to use LMCache as KV Cache Management Backend for SGLang engine.
 For more details about LMCache, please refer to: https://lmcache.ai
 
+## Multimodal prefix reuse
+
+The local radix cache compares full multimodal content identities. The LMCache
+SGLang connector accepts token IDs without per-span content identities, so external
+loads and stores stop at the last complete page before the first media token.
+Text after that token also depends on the media and stays in the local cache.
+Text-only requests and exact local multimodal matches retain their usual reuse.
+
+Multimodal EAGLE bigram requests use local caching only: the external connector's
+token-to-KV counts do not represent the shared bigram boundary. No configuration
+change is required.
+
 ## Install LMCache
 
 ### Method 1: with pip

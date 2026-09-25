@@ -22,12 +22,16 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.utils import storage_namespace_seed
+from sglang.srt.mem_cache.multimodal_key import slice_mm_spans
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
     get_serving,
+    get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -48,6 +52,9 @@ class DecodeKVCacheOffloadManager:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = get_schedule().page_size
+        self.is_bigram = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_eagle()
         self.request_counter = 0
         self.tree_cache = tree_cache
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
@@ -118,7 +125,8 @@ class DecodeKVCacheOffloadManager:
 
     def _prefill_offloaded_len(self, req: Req) -> int:
         # Page-aligned prompt length; the prefill instance offloaded this part.
-        return len(req.origin_input_ids) // self.page_size * self.page_size
+        logical_length = max(0, len(req.origin_input_ids) - int(self.is_bigram))
+        return logical_length // self.page_size * self.page_size
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -135,18 +143,23 @@ class DecodeKVCacheOffloadManager:
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        key = RadixKey(
+            all_tokens,
+            extra_key=req.extra_key,
+            is_bigram=self.is_bigram,
+            cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
+        )
         prefill_offloaded_len = self._prefill_offloaded_len(req)
         state = self.offloaded_state.get(req)
         if state is None:
-            prefill_hashes = self._compute_prefix_hash(
-                req, req.origin_input_ids[:prefill_offloaded_len]
-            )
+            prefill_hashes = self._compute_prefix_hash(req, key[:prefill_offloaded_len])
             last_prefill_hash = (
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
             )
             state = OffloadedState(last_hash=last_prefill_hash)
             self.offloaded_state[req] = state
-        incremental_total = len(all_tokens) - prefill_offloaded_len
+        incremental_total = len(key) - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
@@ -158,7 +171,8 @@ class DecodeKVCacheOffloadManager:
         # Extract incremental tokens and indices for the newly available chunk
         start = prefill_offloaded_len + state.inc_len
         end = start + incremental_aligned_len
-        incremental_tokens = all_tokens[start:end]
+        # The async backup must outlive request-side media feature cleanup.
+        incremental_tokens = key[start:end]
         incremental_indices = token_indices[start:end]
 
         # Prefill-aligned GPU slots are freed at request finish in
@@ -281,15 +295,21 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
-    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
+    def _compute_prefix_hash(self, req: Req, tokens, prior_hash=None, *, token_start=0):
         """Match prefill storage hashes."""
-        page_hashes = []
-        last_hash = prior_hash or storage_namespace_seed(req.extra_key, req.cache_salt)
-        for offset in range(0, len(tokens), self.page_size):
-            page_tokens = tokens[offset : offset + self.page_size]
-            last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
-            page_hashes.append(last_hash)
-        return page_hashes
+        if not isinstance(tokens, RadixKey):
+            tokens = RadixKey(
+                tokens,
+                extra_key=req.extra_key,
+                is_bigram=self.is_bigram,
+                cache_salt=req.cache_salt,
+                mm_spans=slice_mm_spans(
+                    req.mm_cache_spans, token_start, token_start + len(tokens)
+                ),
+            )
+        return get_storage_hash_str(
+            tokens, prior_hash or None, page_size=self.page_size
+        )
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""

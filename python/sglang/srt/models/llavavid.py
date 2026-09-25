@@ -26,9 +26,11 @@ from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalInputs, flatten_nested_list
+from sglang.srt.mem_cache.multimodal_key import MultimodalKeySpan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.utils import add_prefix
 
 
@@ -77,6 +79,19 @@ class LlavaVidForCausalLM(nn.Module):
             + input_ids[offset + 1 :]
         )
         image_inputs.image_offsets = [offset]
+        # Cycling placeholders route one aggregate video block; they are not frame boundaries.
+        identity = resolve_multimodal_item_hash(
+            existing_hash=0,
+            model_specific_data={
+                "llava_video_items": [item.cache_key for item in image_inputs.mm_items],
+                "feature_length": new_image_feature_len,
+            },
+        )
+        image_inputs.cache_span_overrides = (
+            (MultimodalKeySpan(offset, offset + new_image_feature_len, identity),)
+            if new_image_feature_len
+            else ()
+        )
         return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:

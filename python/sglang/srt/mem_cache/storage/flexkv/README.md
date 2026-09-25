@@ -10,6 +10,18 @@ Remote offload). Same integration pattern as
 
 ---
 
+## Multimodal prefix reuse
+
+The local radix cache compares full multimodal content identities. FlexKV's
+sequence namespace does not provide per-span identity matching, so this adapter
+limits external loads and stores to complete pages before the first media token.
+Prefetches after an already matched media span are also skipped. Healthy earlier
+text, text-only requests, and exact local multimodal matches retain their reuse.
+
+Multimodal EAGLE bigram requests use local caching only: the external connector's
+token-to-KV counts do not represent the shared bigram boundary. No configuration
+change is required.
+
 ## Quick start (single H20, single GPU, Qwen3-8B)
 
 This walks through everything the verification on H20-GPU-11 actually

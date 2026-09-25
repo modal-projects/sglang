@@ -1104,8 +1104,9 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     composed_item = processor.compose_request([1, 99, 2], [artifact]).mm_items[0]
 
     expected_hash = resolve_multimodal_item_hash(
-        existing_hash=direct_item.hash,
+        existing_hash=0,
         namespace=artifact.artifact_key,
+        model_specific_data={"grid_thw": artifact.grid_thw},
     )
     expected_item = MultimodalDataItem(modality=Modality.IMAGE, hash=expected_hash)
     expected_item.set_pad_value()

@@ -522,6 +522,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
+            mm_cache_spans=(),
             priority=0,
             last_node=cache.root_node,
         )
@@ -565,6 +566,7 @@ class TestRadixCache(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
+            mm_cache_spans=(),
             priority=0,
             last_node=cache.root_node,
         )

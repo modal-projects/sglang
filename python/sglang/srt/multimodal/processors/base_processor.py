@@ -1599,6 +1599,7 @@ class BaseMultimodalProcessor(ABC):
                 "format",
                 "modality",
                 "hash",
+                "cache_identity",
                 "pad_value",
                 "offsets",
             ):
@@ -1642,7 +1643,12 @@ class BaseMultimodalProcessor(ABC):
             if hash_value is not None:
                 if isinstance(hash_value, torch.Tensor):
                     hash_value = hash_value.item()
-                item.hash = int(hash_value)
+                item.hash = (
+                    hash_value
+                    if isinstance(hash_value, str)
+                    and hash_value.startswith(("sha256:", "int:"))
+                    else int(hash_value)
+                )
                 pad_value = get_data_value("pad_value")
                 if pad_value is not None:
                     if isinstance(pad_value, torch.Tensor):

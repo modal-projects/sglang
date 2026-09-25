@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.rust_tree_core.adapter import (
     _fill_evict_result,
     _match_result_from_binding,
     _radix_key_buffer,
+    _radix_key_mm_spans,
 )
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.unified_cache.components import ComponentType, EvictLayer
@@ -222,6 +223,7 @@ class RustUnifiedTreeCoreInspector(
             params.key.cache_salt,
             value_chunks,
             best_value_len,
+            mm_spans=_radix_key_mm_spans(params.key),
         )
         return _match_result_from_binding(binding_result)._replace(
             cache_protected_len=result.cache_protected_len,

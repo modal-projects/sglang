@@ -241,6 +241,7 @@ def test_full_deferred_ipc_item_is_marked_for_borrow():
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         hash=1000,
+        cache_identity="sha256:" + "ab" * 32,
         pad_value=1000,
         feature=proxy,
         offsets=[ITEM_OFFSETS[0]],

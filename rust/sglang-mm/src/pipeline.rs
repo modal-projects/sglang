@@ -103,6 +103,12 @@ pub enum PositionOutput {
 /// runtime spec JSON (resolved from the HF config on the Python side);
 /// nothing is hardcoded per model.
 pub trait MmFamilyProcessor: Send + Sync {
+    /// Versioned effective configuration for deterministic preprocessing.
+    /// Without this contract, cache identities include the full output bytes.
+    fn cache_identity_config(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Modalities beyond images this family accepts. Default: images only.
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()

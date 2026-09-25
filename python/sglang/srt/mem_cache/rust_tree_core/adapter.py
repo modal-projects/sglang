@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.multimodal_key import MultimodalKeySpan, slice_mm_spans
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -79,6 +80,13 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
+def _radix_key_mm_spans(key: RadixKey) -> list[tuple[int, int, str, int]]:
+    if not key.mm_spans:
+        return []
+    spans = slice_mm_spans(key.mm_spans, 0, key._raw_len())
+    return [(span.start, span.end, span.identity, span.offset) for span in spans]
+
+
 def _kv_event_from_tagged(event: tuple):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
@@ -92,9 +100,15 @@ def _kv_event_from_tagged(event: tuple):
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
             session_id=event[7],
+            block_hashes_sha256=event[8],
+            parent_block_hash_sha256=event[9],
         )
     if tag == "block_removed":
-        return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
+        return BlockRemoved(
+            block_hashes=event[1],
+            medium=StorageMedium(event[2]),
+            block_hashes_sha256=event[3],
+        )
     if tag == "all_blocks_cleared":
         return AllBlocksCleared()
     raise ValueError(f"unknown kv event tag: {tag}")
@@ -604,6 +618,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 key=_radix_key_buffer(key),
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                mm_spans=_radix_key_mm_spans(key),
             )
         )
         return _match_result_from_binding(result)
@@ -614,6 +629,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 key=_radix_key_buffer(key),
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                mm_spans=_radix_key_mm_spans(key),
             )
         )
 
@@ -649,6 +665,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                mm_spans=_radix_key_mm_spans(key),
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
@@ -771,6 +788,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             host_value,
             list(hash_value),
             key.cache_salt,
+            mm_spans=_radix_key_mm_spans(key),
         )
         return InsertResult(
             prefix_len=result.prefix_len,
@@ -881,6 +899,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 extra_key=snapshot.extra_key,
                 is_bigram=snapshot.is_bigram,
                 cache_salt=snapshot.cache_salt,
+                mm_spans=tuple(MultimodalKeySpan(*span) for span in snapshot.mm_spans),
             ),
             prefix_keys=snapshot.prefix_keys,
         )

@@ -140,17 +140,20 @@ class TestDeferredCudaIpcOwnership(CustomTestCase):
         )
 
     def _item(self, proxy):
-        return MultimodalDataItem(
+        item = MultimodalDataItem(
             modality=Modality.IMAGE,
             hash=11,
             pad_value=1001,
             offsets=[(0, 1)],
-            feature=pickle.loads(pickle.dumps(proxy)),
+            feature=self.expected.clone(),
             model_specific_data={
                 cuda_ipc.DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True,
                 "image_grid_thw": torch.tensor([[1, 1, 2]]),
             },
         )
+        item.set_pad_value()
+        item.feature = pickle.loads(pickle.dumps(proxy))
+        return item
 
     def _recycle(self):
         with self.pool._lock:
@@ -168,10 +171,32 @@ class TestDeferredCudaIpcOwnership(CustomTestCase):
             [[(0, 1)]],
         )
 
+    def test_lazy_reconstruction_requires_content_identity(self):
+        """A routing hint alone cannot authorize deferred feature ownership."""
+        proxy = self._publish(self.expected)
+        item = self._item(proxy)
+        identity = item.cache_key
+        self.assertRegex(identity, r"^sha256:[0-9a-f]{64}$")
+        self.assertTrue(item.can_defer_cuda_ipc_feature_reconstruction())
+        item.cache_identity = None
+        self.assertFalse(item.can_defer_cuda_ipc_feature_reconstruction())
+        item.materialize_deferred_cuda_ipc_feature()
+        self.assertIsInstance(item.feature, cuda_ipc.CudaIpcTensorTransportProxy)
+        self.assertEqual(self.writes, [])
+
+        item.cache_identity = identity
+        item = pickle.loads(pickle.dumps(item))
+        self.assertEqual(item.cache_key, identity)
+        item.materialize_deferred_cuda_ipc_feature()
+        torch.testing.assert_close(item.feature, self.expected)
+        self.assertEqual(item.cache_key, identity)
+        self.assertEqual(self.writes, [(1, 1)])
+
     def test_prefix_resident_features_drain_and_survive_pool_reuse(self):
         """A skipped prefix must retain features before reuse and later retraction."""
         proxy = self._publish(self.expected)
         items = [self._item(proxy), self._item(proxy)]
+        identities = [item.cache_key for item in items]
         for rank, item in enumerate(items):
             self._select_rank(rank)
             embedding, mask, ids = self._embed(
@@ -199,6 +224,7 @@ class TestDeferredCudaIpcOwnership(CustomTestCase):
             )
             torch.testing.assert_close(embedding, self.expected * 3 + 7)
             torch.testing.assert_close(item.feature, self.expected)
+            self.assertEqual(item.cache_key, identities[rank])
             self.assertTrue(mask.all())
         self.assertEqual(self.writes, [(1, 1), (2, 1)])
 

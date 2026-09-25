@@ -46,6 +46,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.multimodal_key import (
+    MultimodalKeySpan,
+    mm_identity_at,
+    mm_segment_at,
+    slice_mm_spans,
+    validate_mm_spans,
+)
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -59,7 +66,14 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
+    __slots__ = (
+        "token_ids",
+        "extra_key",
+        "cache_salt",
+        "is_bigram",
+        "limit",
+        "mm_spans",
+    )
 
     def __init__(
         self,
@@ -68,6 +82,7 @@ class RadixKey:
         is_bigram: bool = False,
         limit: Optional[int] = None,
         cache_salt: Optional[str] = None,
+        mm_spans: tuple[MultimodalKeySpan, ...] = (),
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -80,6 +95,8 @@ class RadixKey:
         # Optional cap on raw tokens: behave as if token_ids were sliced to
         # token_ids[:limit], without the O(n) copy. None = use all tokens.
         self.limit = limit
+        validate_mm_spans(mm_spans)
+        self.mm_spans = mm_spans
 
     def _raw_len(self) -> int:
         n = len(self.token_ids)
@@ -133,11 +150,17 @@ class RadixKey:
                 self.extra_key,
                 is_bigram=True,
                 cache_salt=self.cache_salt,
+                mm_spans=(
+                    slice_mm_spans(self.mm_spans, start, stop + 1)
+                    if stop > start
+                    else ()
+                ),
             )
         return RadixKey(
             self.token_ids[start:stop],
             self.extra_key,
             cache_salt=self.cache_salt,
+            mm_spans=slice_mm_spans(self.mm_spans, start, stop),
         )
 
     def __repr__(self) -> str:
@@ -193,8 +216,24 @@ class RadixKey:
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
         # holding the divergence -- no per-token Python loop on long shared prefixes.
+        if self.mm_spans or other.mm_spans:
+            matched_tokens = self._match_mm_tokens(other, offset, n)
+        else:
+            matched_tokens = self._match_text_tokens(t0, t1, 0, offset, n)
+
+        if self.is_bigram:
+            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
+            return (matched // page_size) * page_size if page_size > 1 else matched
+
+        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
+        if page_size == 1:
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
+
+    @staticmethod
+    def _match_text_tokens(t0, t1, start: int, offset: int, n: int) -> int:
         matched_tokens = n
-        lo = 0
+        lo = start
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
@@ -210,14 +249,31 @@ class RadixKey:
             lo = hi
             step *= 2
 
-        if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
-            return (matched // page_size) * page_size if page_size > 1 else matched
+        return matched_tokens
 
-        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
-        if page_size == 1:
-            return matched_tokens
-        return (matched_tokens // page_size) * page_size
+    def _match_mm_tokens(self, other: RadixKey, offset: int, n: int) -> int:
+        position = 0
+        while position < n:
+            left, left_end = mm_segment_at(self.mm_spans, position, n)
+            right, right_end = mm_segment_at(
+                other.mm_spans, offset + position, offset + n
+            )
+            end = min(left_end, right_end - offset)
+            if left != right:
+                return position
+            if left is None:
+                matched = self._match_text_tokens(
+                    self.token_ids, other.token_ids, position, offset, end
+                )
+                if matched < end:
+                    return matched
+            position = end
+        return n
+
+    def _token_key(self, position: int):
+        identity = mm_identity_at(self.mm_spans, position)
+        # A three-part media key cannot alias (namespace, text_token).
+        return ("mm", *identity) if identity is not None else self.token_ids[position]
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -231,6 +287,20 @@ class RadixKey:
                 f"page_size={page_size}, len={len(self)}"
             )
         t = self.token_ids
+        if self.mm_spans:
+            if self.is_bigram:
+                values = tuple(
+                    (self._token_key(j), self._token_key(j + 1))
+                    for j in range(offset, offset + page_size)
+                )
+            else:
+                values = tuple(
+                    self._token_key(j) for j in range(offset, offset + page_size)
+                )
+            plain = values[0] if page_size == 1 else values
+            if self.cache_salt is not None:
+                return ((self.extra_key, self.cache_salt), plain)
+            return plain if self.extra_key is None else (self.extra_key, plain)
         if self.is_bigram:
             if page_size == 1:
                 plain = (t[offset], t[offset + 1])
@@ -276,6 +346,7 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[List[str]] = None
+        self.emit_full_hashes = False
         # priority for priority-aware eviction
         self.priority = priority
 
@@ -510,6 +581,7 @@ class RadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
@@ -530,6 +602,7 @@ class RadixCache(BasePrefixCache):
                 req.extra_key,
                 is_bigram=self.is_eagle,
                 cache_salt=req.cache_salt,
+                mm_spans=req.mm_cache_spans,
             ).page_aligned(self.page_size)
             if 0 < len(prompt_key) < key_len:
                 self.insert(
@@ -579,6 +652,7 @@ class RadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.is_eagle,
             cache_salt=req.cache_salt,
+            mm_spans=req.mm_cache_spans,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
@@ -762,6 +836,7 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
+        new_node.emit_full_hashes = child.emit_full_hashes
         new_node.value = child.value[:split_len].clone()
         child.parent = new_node
         child.key = child.key[split_len:]

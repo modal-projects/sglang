@@ -1,6 +1,6 @@
 //! A radix-tree node, owned by the `NodeArena` and referenced by `NodeIdx_`.
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::fmt::Debug;
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tch::Tensor;
 
 use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
+use crate::multimodal_key::{KeyPageRef, MultimodalKey, MultimodalSpan, key_hash_strings};
 
 /// The two independent dimensions that partition a radix tree.
 #[derive(Debug)]
@@ -154,7 +155,7 @@ type ChildMap<K> = HashBrownMap<ChildEdge<K>, NodeIdx_, RandomState>;
 /// Borrowed view of a namespaced child edge used for allocation-free lookup.
 struct ChildEdgeRef<'a, K: ChildKeyType> {
     namespace: KeyNamespaceRef<'a>,
-    page: &'a [K::Atom],
+    page: KeyPageRef<'a, K>,
 }
 
 impl<K: ChildKeyType> Hash for ChildEdgeRef<'_, K> {
@@ -168,7 +169,8 @@ impl<K: ChildKeyType> Equivalent<ChildEdge<K>> for ChildEdgeRef<'_, K> {
     fn equivalent(&self, edge: &ChildEdge<K>) -> bool {
         match edge {
             ChildEdge::Live(namespace, key) => {
-                self.namespace == namespace.as_ref() && self.page == key.as_ref()
+                self.namespace == namespace.as_ref()
+                    && self.page.equivalent(&key.page_view(0, key.atom_len()))
             }
             ChildEdge::Retired(_) => false,
         }
@@ -193,6 +195,8 @@ pub struct Node<K: ChildKeyType> {
     /// The logical key span; its first page labels a live edge from the parent.
     /// Empty for the root.
     pub key: K,
+    /// Preserve full event identities once a node or its ancestry contains media.
+    pub emit_full_hashes: bool,
     /// Per-(component × tier) value state, indexed by `ValueSlotIdx` (device
     /// slots first, host after); device states also sit at plain component
     /// indices.
@@ -425,6 +429,7 @@ impl<K: ChildKeyType> Node<K> {
             retired: false,
             published_kv_tiers: 0,
             key: K::default(),
+            emit_full_hashes: false,
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
@@ -449,6 +454,7 @@ impl<K: ChildKeyType> Node<K> {
             children: ChildMap::with_hasher(RandomState::new()),
             retired: false,
             published_kv_tiers: 0,
+            emit_full_hashes: !key.mm_spans().is_empty(),
             key,
             values: Default::default(),
             swa_uuid: None,
@@ -500,6 +506,7 @@ impl<K: ChildKeyType> Node<K> {
             Entry::Vacant(slot) => {
                 slot.insert(child.idx);
                 child.parent = Some(parent_idx);
+                child.emit_full_hashes |= self.emit_full_hashes;
                 Ok(())
             }
         }
@@ -822,17 +829,10 @@ pub enum TreeCoreRuntimeError {
 // Unigram and bigram child keys.
 
 /// An owned child key (one radix page); `Atom` is the per-position token (`i64` single,
-/// `(i64, i64)` bigram/EAGLE). `Borrow<[Atom]>` lets a borrowed page slice
-/// query a `HashMap` keyed by owned keys.
+/// `(i64, i64)` bigram/EAGLE). A borrowed page view includes sparse media
+/// spans when it queries the child map; raw token storage remains compact.
 pub trait ChildKeyType:
-    Clone
-    + Eq
-    + Hash
-    + Default
-    + Debug
-    + AsRef<[Self::Atom]>
-    + Borrow<[Self::Atom]>
-    + From<Vec<Self::Atom>>
+    Clone + Eq + Hash + Default + Debug + AsRef<[Self::Atom]> + From<Vec<Self::Atom>>
 {
     type Atom: Copy + Eq + Hash + Send + Sync;
 
@@ -843,6 +843,30 @@ pub trait ChildKeyType:
     /// The key over the boundary's raw token ids; ownership passes straight
     /// through, so the unigram key never copies.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self>;
+
+    fn key_from_multimodal(key: &MultimodalKey<Vec<i64>>) -> Cow<'_, Self> {
+        assert!(
+            key.spans.is_empty(),
+            "key type does not support multimodal spans"
+        );
+        Self::key_from(Cow::Borrowed(&key.tokens))
+    }
+
+    fn mm_spans(&self) -> &[MultimodalSpan] {
+        &[]
+    }
+
+    fn atom_token(atom: &Self::Atom, index: usize) -> i64 {
+        Self::raw_token_ids(std::slice::from_ref(atom))[index]
+    }
+
+    fn slice_key(&self, start: usize, end: usize) -> Self {
+        self.as_ref()[start..end].to_vec().into()
+    }
+
+    fn page_view(&self, start: usize, page_size: usize) -> KeyPageRef<'_, Self> {
+        KeyPageRef::new(self.page_at(start, page_size), self.mm_spans(), start)
+    }
 
     /// The atom's token ids as u32 storage-hash words.
     fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32>;
@@ -865,7 +889,7 @@ pub trait ChildKeyType:
             atom_len >= page_size,
             "child_key: key of {atom_len} atoms is shorter than a page ({page_size})"
         );
-        self.as_ref()[..page_size].to_vec().into()
+        self.slice_key(0, page_size)
     }
 
     /// The single page starting at `start`, zero-copy.
@@ -886,6 +910,14 @@ pub trait ChildKeyType:
             start <= atom_len,
             "match_len: start {start} beyond the key length {atom_len}"
         );
+        if !self.mm_spans().is_empty() || !other.mm_spans().is_empty() {
+            let left = self.page_view(start, atom_len - start);
+            let right = other.page_view(0, other.atom_len());
+            let common = (0..left.atoms.len().min(right.atoms.len()))
+                .take_while(|&index| left.equal_atom(index, &right, index))
+                .count();
+            return common / page_size * page_size;
+        }
         let common = self.as_ref()[start..]
             .iter()
             .zip(other.as_ref())
@@ -901,13 +933,13 @@ pub trait ChildKeyType:
             start <= atom_len,
             "suffix: start {start} beyond the key length {atom_len}"
         );
-        self.as_ref()[start..].to_vec().into()
+        self.slice_key(start, atom_len)
     }
 
     /// The key truncated to a whole number of pages.
     fn page_aligned(&self, page_size: usize) -> Self {
         let aligned_len = self.atom_len() / page_size * page_size;
-        self.as_ref()[..aligned_len].to_vec().into()
+        self.slice_key(0, aligned_len)
     }
 
     /// Split into (head, tail) owned keys at `split_idx`; panics on a boundary
@@ -918,8 +950,10 @@ pub trait ChildKeyType:
             0 < split_idx && split_idx < atom_len,
             "split_at: split_idx {split_idx} out of range (0, {atom_len})"
         );
-        let (head, tail) = self.as_ref().split_at(split_idx);
-        (head.to_vec().into(), tail.to_vec().into())
+        (
+            self.slice_key(0, split_idx),
+            self.slice_key(split_idx, atom_len),
+        )
     }
 }
 
@@ -934,6 +968,10 @@ impl ChildKeyType for Vec<i64> {
 
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
         token_ids
+    }
+
+    fn atom_token(atom: &i64, _index: usize) -> i64 {
+        *atom
     }
 
     fn hash_words(atom: &i64) -> impl Iterator<Item = u32> {
@@ -952,6 +990,10 @@ impl ChildKeyType for Vec<(i64, i64)> {
     /// N+1 raw token ids become N overlapping (t_i, t_{i+1}) bigram atoms.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
         Cow::Owned(token_ids.windows(2).map(|w| (w[0], w[1])).collect())
+    }
+
+    fn atom_token(atom: &(i64, i64), index: usize) -> i64 {
+        if index == 0 { atom.0 } else { atom.1 }
     }
 
     fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u32> {
@@ -993,7 +1035,7 @@ pub(crate) fn hash_page<K: ChildKeyType>(
 }
 
 /// Lowercase-hex encoding of a digest.
-fn digest_to_hex(digest: &HashDigest) -> String {
+pub(crate) fn digest_to_hex(digest: &HashDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(DIGEST_LEN * 2);
     for byte in digest {
@@ -1004,7 +1046,7 @@ fn digest_to_hex(digest: &HashDigest) -> String {
 }
 
 /// Decode a chained-in hex hash back to its raw digest.
-fn parse_prior_hash(prior_hash: &str) -> HashDigest {
+pub(crate) fn parse_prior_hash(prior_hash: &str) -> HashDigest {
     let bytes = prior_hash.as_bytes();
     assert_eq!(
         bytes.len(),
@@ -1210,7 +1252,7 @@ impl<K: ChildKeyType> NodeArena<K> {
             }
             Some(digest_to_hex(&hasher.finalize().into()))
         });
-        crate::node::get_hash_str::<K>(node.key.as_ref(), prior.as_deref(), page_size)
+        key_hash_strings(&node.key, prior.as_deref(), page_size)
     }
 
     /// The ancestor chain's hash values ending at `node_id`, in root-to-node
@@ -1268,6 +1310,15 @@ impl<K: ChildKeyType> NodeArena<K> {
         id: NodeIdx_,
         namespace: KeyNamespaceRef<'_>,
         page: &[K::Atom],
+    ) -> Option<NodeIdx_> {
+        self.child_on_key_page_in_namespace(id, namespace, KeyPageRef::<K>::new(page, &[], 0))
+    }
+
+    pub fn child_on_key_page_in_namespace(
+        &self,
+        id: NodeIdx_,
+        namespace: KeyNamespaceRef<'_>,
+        page: KeyPageRef<'_, K>,
     ) -> Option<NodeIdx_> {
         self.node(id)
             .children

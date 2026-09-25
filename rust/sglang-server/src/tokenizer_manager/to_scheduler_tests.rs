@@ -802,6 +802,7 @@ fn abort_cancels_parked_mm_request() {
             offsets: vec![],
             mrope: vec![],
             mrope_delta: 0,
+            cache_identities: vec![],
         },
     );
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));

@@ -34,11 +34,12 @@ RadixTree::RadixTree(bool disabled, std::optional<std::size_t> host_size, std::s
 RadixTree::~RadixTree() = default;
 
 std::tuple<std::vector<at::Tensor>, std::size_t, NodeHandle, NodeHandle>
-RadixTree::match_prefix(const token_vec_t& _key) {
+RadixTree::match_prefix(const token_vec_t& _key, const mm_span_input_t& _mm_spans) {
   if (m_impl->disabled) return {};
 
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
-  const auto [host_node, _] = m_impl->tree_walk(key);
+  const auto mm_spans = parse_mm_spans(_mm_spans, _key.size());
+  const auto [host_node, _] = m_impl->tree_walk(key, mm_spans);
 
   // walk up to the first non-evicted node
   std::size_t host_hit_length = 0;
@@ -76,7 +77,7 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
 }
 
 std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
-RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
+RadixTree::writing_through(const token_vec_t& _key, at::Tensor value, const mm_span_input_t& _mm_spans) {
   if (m_impl->disabled) return {};
   _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
 
@@ -84,14 +85,16 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
   // walk the tree to find the right place to insert
-  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
+  const auto mm_spans = parse_mm_spans(_mm_spans, _key.size());
+  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key, mm_spans);
 
   // insert and create a new node if the remaining part of the key is not empty
   if (host_prefix_length != key.size()) {
     m_impl->create_device_node(
         host_node,
         {key.begin() + host_prefix_length, key.end()},
-        value.slice(/*dim=*/0, host_prefix_length, key.size()));
+        value.slice(/*dim=*/0, host_prefix_length, key.size()),
+        slice_mm_spans(mm_spans, host_prefix_length, key.size()));
   }
 
   // add the hit count for the device node

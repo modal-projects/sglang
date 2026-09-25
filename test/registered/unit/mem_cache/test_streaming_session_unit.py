@@ -1,7 +1,9 @@
 import time
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 import zmq
 
@@ -11,9 +13,11 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, MatchResult
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -616,7 +620,12 @@ def _controller_with_deferred_session():
 
 
 def _make_single_rank_receiver(
-    controller, skipper, pp_rank=0, pp_size=1, plan_session_reap=None
+    controller,
+    skipper,
+    pp_rank=0,
+    pp_size=1,
+    plan_session_reap=None,
+    input_blocker=None,
 ):
     """Receiver wired as the scheduler wires it, with the collective plumbing
     faked for one non-dp rank (broadcast is the identity at tp_size=1)."""
@@ -624,7 +633,7 @@ def _make_single_rank_receiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=skipper,
-        input_blocker=None,
+        input_blocker=input_blocker,
         mm_receiver=None,
         ps=SimpleNamespace(
             pp_rank=pp_rank,
@@ -652,6 +661,87 @@ def _make_single_rank_receiver(
             plan_session_reap if plan_session_reap is not None else controller.plan_reap
         ),
     )
+
+
+@pytest.mark.parametrize("waiting_for_global_unblock", [False, True])
+def test_session_reap_bypasses_blocked_input(waiting_for_global_unblock):
+    """Long batch tokenization must not delay resource cleanup or reorder its requests."""
+    controller, tree_cache = _controller_with_deferred_session()
+    timed_out = Session(16, "timed-out", timeout=1)
+    timed_out.last_active_time = time.monotonic() - 2
+    controller.sessions[timed_out.session_id] = timed_out
+    blocker = SchedulerInputBlocker(noop=False)
+    receiver = _make_single_rank_receiver(
+        controller, skipper=None, input_blocker=blocker
+    )
+
+    def request(rid):
+        return io_struct.TokenizedGenerateReqInput(
+            rid=rid,
+            input_text=None,
+            input_ids=array("q", [1]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+        )
+
+    first, second = request("first"), request("second")
+    # Only the distributed collective's arrival result is controlled; the
+    # blocker and barrier state machines execute their ordinary public methods.
+    with patch.object(
+        blocker._global_unblock_barrier, "_compute_global_arrived", return_value=False
+    ) as global_arrived:
+        assert (
+            blocker.handle(
+                [io_struct.BlockReqInput(req_type=io_struct.BlockReqType.BLOCK), first]
+            )
+            == []
+        )
+        if waiting_for_global_unblock:
+            assert (
+                blocker.handle(
+                    [io_struct.BlockReqInput(req_type=io_struct.BlockReqType.UNBLOCK)]
+                )
+                == []
+            )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.sock_recv",
+                side_effect=[second, zmq.ZMQError(), zmq.ZMQError()],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                return_value=SimpleNamespace(enable_dp_attention=False, pp_rank=0),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_disagg",
+                return_value=SimpleNamespace(
+                    language_only=False, encoder_transfer_backend=None
+                ),
+            ),
+        ):
+            received = receiver.recv_requests()
+        assert received == [
+            io_struct.SessionReapPlan(deferred=["deferred"], timed_out=["timed-out"])
+        ]
+        controller.apply_reap(received[0])
+        assert tree_cache.released == ["deferred", "timed-out"]
+        assert controller.sessions == {}
+
+        global_arrived.return_value = True
+        unblock = (
+            []
+            if waiting_for_global_unblock
+            else [io_struct.BlockReqInput(req_type=io_struct.BlockReqType.UNBLOCK)]
+        )
+        assert blocker.handle(unblock) == [first, second]
+        assert blocker.handle([]) == []
 
 
 def test_skipped_receive_cycle_still_reaps_deferred_close():
@@ -774,7 +864,5 @@ def test_skipped_receive_cycle_relays_reap_plan_across_pp_stages():
 
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))

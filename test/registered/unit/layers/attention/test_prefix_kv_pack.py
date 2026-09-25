@@ -209,20 +209,69 @@ class TestPrefixKVPack(CustomTestCase):
         self.assertTrue(projection_dtypes)
         self.assertEqual(set(projection_dtypes), {dtype})
 
-    def test_non_fp8_backend_declines_packing(self):
-        backend = SimpleNamespace(data_type=torch.bfloat16)
-        with envs.SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.override(True):
-            result = trtllm_mla_backend.TRTLLMMLABackend.pack_prefix_chunk_kv(
-                backend, None, None, None, None
-            )
-        self.assertIsNone(result)
+    def test_disabled_or_non_fp8_backend_declines_packing(self):
+        for enabled, dtype in ((False, FP8), (True, torch.bfloat16)):
+            backend = SimpleNamespace(data_type=dtype)
+            with envs.SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.override(enabled):
+                result = trtllm_mla_backend.TRTLLMMLABackend.pack_prefix_chunk_kv(
+                    backend, None, None, None, None
+                )
+            self.assertIsNone(result)
+
+    def test_fused_packing_requires_a_large_prefix_chunk(self):
+        backend = SimpleNamespace(data_type=FP8)
+        packed = (object(), object())
+        for tokens in (0, 2048, 32767, 32768, 32769):
+            for enabled in (False, True):
+                for k_scale, v_scale in ((1.0, 1.0), (2.0, 0.5)):
+                    with self.subTest(
+                        tokens=tokens, enabled=enabled, scales=(k_scale, v_scale)
+                    ):
+                        # Meta tensors exercise host shape dispatch without storage
+                        # or a device readback, including the exact boundary.
+                        k_nope = torch.empty(
+                            tokens, 12, 128, dtype=torch.bfloat16, device="meta"
+                        )
+                        k_pe = torch.empty(
+                            tokens, 1, 64, dtype=torch.bfloat16, device="meta"
+                        )
+                        v = torch.empty_like(k_nope)
+                        layer = SimpleNamespace(
+                            k_scale_float=k_scale, v_scale_float=v_scale
+                        )
+                        with (
+                            envs.SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.override(
+                                enabled
+                            ),
+                            patch.object(
+                                trtllm_mla_backend,
+                                "mla_kv_pack_quantize_fp8",
+                                return_value=packed,
+                            ) as pack,
+                        ):
+                            result = trtllm_mla_backend.TRTLLMMLABackend.pack_prefix_chunk_kv(
+                                backend, layer, k_nope, k_pe, v
+                            )
+                        if enabled and tokens >= 32768:
+                            self.assertIs(result, packed)
+                            pack.assert_called_once_with(
+                                k_nope,
+                                k_pe,
+                                v,
+                                k_scale_inv=1.0 / k_scale,
+                                v_scale_inv=1.0 / v_scale,
+                                enable_pdl=trtllm_mla_backend._ENABLE_PDL,
+                            )
+                        else:
+                            self.assertIsNone(result)
+                            pack.assert_not_called()
 
     def test_unsupported_pack_layout_keeps_the_fallback(self):
         backend = SimpleNamespace(data_type=FP8)
         for dtype, rope_dim, tokens in (
-            (torch.float32, 2, 1),
-            (torch.bfloat16, 0, 1),
-            (torch.bfloat16, 3, 1),
+            (torch.float32, 2, 32768),
+            (torch.bfloat16, 0, 32768),
+            (torch.bfloat16, 3, 32768),
             (torch.bfloat16, 2, 0),
         ):
             with (

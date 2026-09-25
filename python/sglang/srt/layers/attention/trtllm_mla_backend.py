@@ -94,6 +94,9 @@ TRTLLM_BLOCK_CONSTRAINT = 128
 
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
 
+# Keep ordinary preparation for small materialized prefix chunks.
+_MIN_FUSED_PREFIX_KV_TOKENS = 32 * 1024
+
 
 def _multi_ctas_kv_counter_bytes(
     device: torch.device, num_q_heads: int, batch_size: int
@@ -1149,13 +1152,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not envs.SGLANG_OPT_TRTLLM_MLA_FUSED_CHUNK_KV_PACK.get()
             or self.data_type != torch.float8_e4m3fn
+            or k_nope.shape[0] < _MIN_FUSED_PREFIX_KV_TOKENS
         ):
             return None
         head_dims = (k_nope.shape[-1], k_pe.shape[-1], v.shape[-1])
-        if (
-            k_nope.dtype not in (torch.bfloat16, torch.float16)
-            or k_nope.shape[0] == 0
-            or any(dim <= 0 or dim & (dim - 1) for dim in head_dims)
+        if k_nope.dtype not in (torch.bfloat16, torch.float16) or any(
+            dim <= 0 or dim & (dim - 1) for dim in head_dims
         ):
             return None
         k_scale, v_scale = _layer_kv_scales(layer)

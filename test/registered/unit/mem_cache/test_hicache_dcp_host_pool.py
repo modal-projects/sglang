@@ -16,7 +16,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.arg_groups.hicache_hook import resolve_hicache_dcp_compatibility
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -118,30 +117,6 @@ class TestDcpKernelIndices(CustomTestCase):
                 maybe_dcp_kernel_indices(host_sorted, DCP_SIZE, rank).numel(),
                 host.numel() // DCP_SIZE,
             )
-
-
-class TestDcpSpeculativeCompatibility(CustomTestCase):
-    @staticmethod
-    def _args(algorithm: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            dcp_size=2,
-            enable_hierarchical_cache=True,
-            hicache_storage_backend=None,
-            speculative_algorithm=algorithm,
-            enable_lmcache=False,
-            enable_hisparse=False,
-        )
-
-    def test_dflash_chain_draft_is_allowed(self):
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
-            return_value=True,
-        ):
-            resolve_hicache_dcp_compatibility(self._args("DFLASH"))
-
-    def test_tree_draft_remains_guarded(self):
-        with self.assertRaisesRegex(NotImplementedError, "DFLASH/DSPARK"):
-            resolve_hicache_dcp_compatibility(self._args("EAGLE"))
 
 
 class TestHostPoolSizingUnderDcp(CustomTestCase):

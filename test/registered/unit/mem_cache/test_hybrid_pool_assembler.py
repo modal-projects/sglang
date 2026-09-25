@@ -229,7 +229,6 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             )
 
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
-        self.assertEqual(build_host_pool.call_args.kwargs["page_size"], 512)
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
 

@@ -118,9 +118,7 @@ def speculative_sampling_classic_kernel(
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # Reduction and prefix scan can round differently at the endpoint.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -147,15 +145,49 @@ def speculative_sampling_classic_kernel(
             block_cumsum = tl.cumsum(val, axis=0)
             total_cumsum = cum_sum + block_cumsum
 
-            candidates_mask = total_cumsum > target_u
-            has_match = tl.max(candidates_mask, axis=0)
+            candidates_mask = mask & (val > 0.0) & (total_cumsum > target_u)
+            match_idx = tl.min(tl.where(candidates_mask, v_offsets, VOCAB_SIZE), axis=0)
 
-            if has_match:
-                match_idx = tl.argmax(candidates_mask.to(tl.int32), axis=0)
-                final_token = v_start + match_idx
+            if match_idx < VOCAB_SIZE:
+                final_token = match_idx
                 found = 1
 
             cum_sum += tl.sum(val)
+
+    # Assign a rounding gap only to positive support of a valid distribution.
+    if (
+        (found == 0)
+        & (norm_sum > 0.0)
+        & (norm_sum < float("inf"))
+        & (coin_final >= 0.0)
+        & (coin_final < 1.0)
+    ):
+        last_positive = -1
+        valid_probs = 1
+        for block_idx in range(tl.cdiv(VOCAB_SIZE, BLOCK_V) - 1, -1, -1):
+            v_offsets = block_idx * BLOCK_V + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+            p_val = tl.load(tp_base_ptr + v_offsets * stride_tp_v, mask=mask, other=0.0)
+            valid = (p_val >= 0.0) & (p_val < float("inf"))
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_val = tl.load(
+                    dp_base_ptr_safe + v_offsets * stride_dp_v, mask=mask, other=0.0
+                )
+                # Keep the residual identical to both forward passes.
+                q_val = tl.where(q_val == q_val, q_val, 0.0)
+                diff = p_val - q_val
+                val = tl.where(diff > 0.0, diff, 0.0)
+            valid_probs = valid_probs & tl.min(
+                tl.where(mask, valid, True).to(tl.int32), axis=0
+            )
+            if last_positive < 0:
+                last_positive = tl.max(
+                    tl.where(mask & (val > 0.0), v_offsets, -1), axis=0
+                )
+        if valid_probs & (last_positive >= 0):
+            final_token = last_positive
 
     tl.store(Predicts + last_accepted_global_idx, final_token)
 
@@ -176,6 +208,9 @@ def chain_speculative_sampling_triton(
     threshold_acc,
     deterministic,  # not used
 ):
+    """Final draws require finite nonnegative p, positive finite sampling mass,
+    and a uniform in [0, 1). Malformed inputs are unsupported.
+    """
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
 

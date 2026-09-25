@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    is_user_abort,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
@@ -411,7 +412,7 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.retire_unadmitted_request(req)
             return True
         return False
 
@@ -1001,8 +1002,13 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    self._release_dropped_waiting_req_mm_inputs(req)
                 self.tree_cache.finish(
-                    req.cache_request_handle, CacheRequestOutcome.SUCCESS
+                    req.cache_request_handle,
+                    CacheRequestOutcome.ABORT
+                    if isinstance(req.finished_reason, FINISH_ABORT)
+                    else CacheRequestOutcome.SUCCESS,
                 )
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
@@ -1063,25 +1069,32 @@ class SchedulerDisaggregationPrefillMixin:
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
+        user_aborted = is_user_abort(req)
+        # failure_exception() also clears the sender's transfer records; always
+        # run it, and only report the exception for non-user failures.
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
-            exc = e
-            error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
+            if not user_aborted:
+                exc = e
+                error_message += f" with exception {e}"
+        if not user_aborted:
+            # Mute error message for propagated exceptions to avoid duplicate logging
+            if getattr(exc, "is_from_another_rank", False):
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        # Session release must see the terminal outcome before saving a checkpoint.
-        if not isinstance(req.finished_reason, FINISH_ABORT):
+        # Stamp the abort before releasing so the streaming-session hook sees a
+        # terminal state instead of committing the failed turn as a finish.
+        if not user_aborted:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
         release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self._release_dropped_waiting_req_mm_inputs(req)
         self._release_aborted_request(req)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not user_aborted:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
@@ -1121,6 +1134,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_dropped_waiting_req_mm_inputs(req)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1129,31 +1143,35 @@ class SchedulerDisaggregationPrefillMixin:
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
+        user_aborted = is_user_abort(req)
         is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
-            error_message += f" with exception {e}"
-            is_propagated = getattr(e, "is_from_another_rank", False)
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if is_propagated:
-            logger.debug(error_message)
-        else:
-            logger.warning(error_message)
+            if not user_aborted:
+                error_message += f" with exception {e}"
+                is_propagated = getattr(e, "is_from_another_rank", False)
+        if not user_aborted:
+            # Mute error message for propagated exceptions to avoid duplicate logging
+            if is_propagated:
+                logger.debug(error_message)
+            else:
+                logger.warning(error_message)
+            # Stamp the abort before releasing so the streaming-session hook
+            # sees a terminal state instead of committing the failed turn.
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
-        # Failure before allocation never reaches the session cache hook.
-        if req.session is not None:
-            req.session.abort_req(req.rid)
+        self._release_dropped_waiting_req_mm_inputs(req)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not user_aborted:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self._release_aborted_request(req)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""

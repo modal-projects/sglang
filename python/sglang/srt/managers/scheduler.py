@@ -2984,6 +2984,7 @@ class Scheduler(
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
+                _release_request_owned_mm_inputs(req, detach=True)
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
@@ -3004,6 +3005,7 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
+            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3030,6 +3032,7 @@ class Scheduler(
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
+            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3048,6 +3051,7 @@ class Scheduler(
                 "output logprobs."
             )
             req.logprob_start_len = -1
+            _release_request_owned_mm_inputs(req, detach=True)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -3069,6 +3073,7 @@ class Scheduler(
 
             if error_msg is not None:
                 req.routed_experts_start_len = 0
+                _release_request_owned_mm_inputs(req, detach=True)
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
@@ -3235,7 +3240,7 @@ class Scheduler(
         logger.error(f"{error_msg}, {req.rid=}")
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self.output_streamer.stream_output([req], req.return_logprob)
+        self.retire_unadmitted_request(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3249,13 +3254,23 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
+            message = (
+                "Using priority is disabled for this server. Please send a "
+                "new request without a priority."
+            )
+            if req.finished_reason is None:
+                if req.to_finish is not None:
+                    req.update_finish_state(new_accepted_len=0)
+                else:
+                    prepare_abort(
+                        req, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+            self._release_dropped_waiting_req_mamba_slot(req)
+            self._release_dropped_waiting_req_mm_inputs(req)
+            self.beam_coordinator.retire_group(req)
             abort_req = _make_abort_req(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
-                },
+                finished_reason=req.finished_reason.to_json(),
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
@@ -3265,6 +3280,57 @@ class Scheduler(
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+
+    def _prepare_queue_abort(self, req: Req, recv_req: AbortReq) -> None:
+        if req.finished_reason is not None:
+            return
+        if req.to_finish is not None:
+            req.update_finish_state(new_accepted_len=0)
+        else:
+            req.user_aborted = True
+            reason = recv_req.finished_reason or {}
+            prepare_abort(
+                req,
+                recv_req.abort_message or reason.get("message") or "Aborted",
+                status_code=reason.get(
+                    "status_code",
+                    HTTPStatus.SERVICE_UNAVAILABLE if recv_req.abort_message else None,
+                ),
+                err_type=reason.get("err_type"),
+            )
+
+    def retire_unadmitted_request(self, req: Req) -> None:
+        """Finalize a rejected request before returning its session resources."""
+        req.update_finish_state(new_accepted_len=0)
+        assert req.finished()
+        if req.kv.retraction_backup is not None:
+            retraction_discard(
+                req,
+                self.tree_cache,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._release_dropped_waiting_req_mm_inputs(req)
+        self._release_aborted_request(req)
+        self.beam_coordinator.retire_group(req)
+        req.time_stats.set_quick_finish_time()
+        self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _release_dropped_waiting_req_mm_inputs(self, req: Req) -> None:
+        """Release request-owned media and clear only the matching session turn."""
+        _release_request_owned_mm_inputs(req)
+        if req.session is not None:
+            req.session.abort_req(req.rid)
+
+    def _release_dropped_waiting_req_mamba_slot(self, req: Req) -> None:
+        # A restored row's Mamba state remains owned by the session slot.
+        kv = req.kv
+        if kv.mamba_pool_idx is None or kv.req_pool_idx is not None:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3292,24 +3358,33 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
+        if req_to_abort.finished_reason is None:
+            if req_to_abort.to_finish is not None:
+                req_to_abort.update_finish_state(new_accepted_len=0)
+            else:
+                prepare_abort(
+                    req_to_abort, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        if req_to_abort is not recv_req:
+            self._release_aborted_request(req_to_abort)
+        self._release_dropped_waiting_req_mamba_slot(req_to_abort)
+        self._release_dropped_waiting_req_mm_inputs(req_to_abort)
+
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
                 req_to_abort,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": message,
-                },
+                finished_reason=req_to_abort.finished_reason.to_json(),
             ),
             req_to_abort,
         )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        req_to_abort.time_stats.trace_ctx.abort(
+            abort_info=req_to_abort.finished_reason.to_json()
+        )
         return req_to_abort.rid == recv_req.rid
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -3960,16 +4035,18 @@ class Scheduler(
                     else:
                         running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
+                # A slot restored from a session (req_pool_idx set) is slot-owned
+                # and freed with the session; a fresh early alloc from
+                # init_next_round_input (req_pool_idx is None) is req-owned and
+                # must be returned here. Non-session reqs always have
+                # req_pool_idx None when rejected here.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
+                    if req.kv.holds_mamba and req.kv.req_pool_idx is None:
                         self.tree_cache.req_to_token_pool.mamba_allocator.free(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
@@ -5247,16 +5324,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._prepare_queue_abort(req, recv_req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
-            # Without the initiator's reason the tokenizer falls back to a
-            # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
-            )
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
@@ -5271,24 +5341,52 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
-            # For mamba radix cache
-            if (
-                req.kv.holds_mamba
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
+            if req.kv.holds_kv or req.kv.holds_mamba:
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._release_dropped_waiting_req_mm_inputs(req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+            )
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
+            # Reqs whose forward result is still queued (overlap) must be
+            # finished by process_batch_result_dllm, which releases KV once.
+            pending_result_reqs = (
+                {r for b, _ in self.result_queue for r in b.reqs}
+                if self.enable_overlap
+                else set()
+            )
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # A req that finished in the last forward stays queued until
+                # filter_finished_reqs(); its result is already committed.
+                if req.finished():
+                    continue
+                if req in pending_result_reqs:
+                    if req.to_finish is None:
+                        req.user_aborted = True
+                        req.to_finish = FINISH_ABORT(
+                            recv_req.abort_message or "Aborted",
+                            HTTPStatus.SERVICE_UNAVAILABLE
+                            if recv_req.abort_message
+                            else None,
+                        )
+                    self.dllm_manager.add_staging_reqs(req)
+                    continue
+                self._prepare_queue_abort(req, recv_req)
                 self._release_aborted_request(req)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
-                )
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
+                # After KV release so a session slot is never reusable while
+                # the turn's KV is still held; before the IPC send so a send
+                # failure cannot strand already-popped requests.
+                self._release_dropped_waiting_req_mm_inputs(req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=req.finished_reason.to_json()),
+                    req,
+                )
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -5303,17 +5401,19 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    self._prepare_queue_abort(req, recv_req)
                     self._release_aborted_request(req)
+                    if not (req.kv.holds_kv or req.kv.holds_mamba):
+                        self._release_dropped_waiting_req_mm_inputs(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    self._prepare_queue_abort(req, recv_req)
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -5323,8 +5423,7 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    self._prepare_queue_abort(decode_req.req, recv_req)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -5332,6 +5431,7 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
+                    self._prepare_queue_abort(decode_req.req, recv_req)
                     # Arm drain-ack accounting once the ABORT is sent, so acks
                     # arriving before this req is deferred (e.g. during the next
                     # forward step) are captured. A fresh set also drops stale acks
@@ -5346,27 +5446,56 @@ class Scheduler(
                             decode_req.req.bootstrap_room
                         )
 
+            # Abort requests held for rebootstrap (KV already freed by retract)
+            held_rebootstrap = self.disagg_decode_prealloc_queue.held_rebootstrap_reqs
+            idx = 0
+            while idx < len(held_rebootstrap):
+                req = held_rebootstrap[idx]
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                self._prepare_queue_abort(req, recv_req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=req.finished_reason.to_json()),
+                    req,
+                )
+                # Keep session and media ownership while a failed send is retryable.
+                self._release_dropped_waiting_req_mm_inputs(req)
+                held_rebootstrap.pop(idx)
+
             # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        retraction_discard(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+            retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+            idx = 0
+            while idx < len(retracted_queue):
+                decode_req = retracted_queue[idx]
+                if not (recv_req.abort_all or decode_req.rid.startswith(recv_req.rid)):
+                    idx += 1
+                    continue
+                self._prepare_queue_abort(decode_req, recv_req)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(
+                        decode_req, finished_reason=decode_req.finished_reason.to_json()
+                    ),
+                    decode_req,
+                )
+                # Discard the backup only after send_output succeeds so a
+                # failed send leaves the entry queued and retryable; commit
+                # the removal in place so a retry never re-trips cleanup on
+                # an already-discarded entry.
+                retraction_discard(
+                    decode_req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                self._release_dropped_waiting_req_mm_inputs(decode_req)
+                retracted_queue.pop(idx)
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            if (
+                not req.finished()
+                and req.to_finish is None
+                and (recv_req.abort_all or req.rid.startswith(recv_req.rid))
             ):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
@@ -5899,6 +6028,44 @@ def _release_unadmitted_mm_inputs(recv_req: TokenizedGenerateReqInput) -> None:
         # reconstructing them, then omit the abandoned payload from PP relay.
         MultimodalInputs(mm_items=raw_mm_inputs.mm_items).release_features()
     recv_req.mm_inputs = None
+
+
+def _release_request_owned_mm_inputs(req: Req, *, detach: bool = False) -> None:
+    # A request whose media pointer will be cleared cannot retain its own inputs.
+    if req.session is not None:
+        mm = req.multimodal_inputs
+        if mm is not None:
+            own_start = 0
+            retained = False
+            for node in req.session.req_nodes.values():
+                if detach and node.req is req:
+                    continue
+                other = node.req.multimodal_inputs
+                if other is None:
+                    continue
+                if other is mm:
+                    # The session retains this exact object (a committed
+                    # turn's shared history or this req's own node):
+                    # every item is session-owned.
+                    retained = True
+                    break
+                inherited = other.mm_items
+                if len(inherited) <= len(mm.mm_items) and all(
+                    mm.mm_items[i] is inherited[i] for i in range(len(inherited))
+                ):
+                    own_start = max(own_start, len(inherited))
+            if not retained:
+                if own_start == 0:
+                    # A first turn that never committed owns all of its
+                    # multimodal inputs; session close only scans
+                    # req_nodes, so nothing else would release them.
+                    mm.release_features()
+                    req.multimodal_inputs = None
+                else:
+                    mm.release_features(mm.mm_items[own_start:])
+    elif req.multimodal_inputs is not None:
+        req.multimodal_inputs.release_features()
+        req.multimodal_inputs = None
 
 
 def _make_abort_req(

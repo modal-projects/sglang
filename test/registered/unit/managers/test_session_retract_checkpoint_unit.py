@@ -30,6 +30,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     release_req,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -580,6 +581,12 @@ class TestSessionRetractCheckpoint(CustomTestCase):
             )
         )
 
+        scheduler._release_dropped_waiting_req_mm_inputs = (
+            Scheduler._release_dropped_waiting_req_mm_inputs.__get__(scheduler)
+        )
+        scheduler._release_aborted_request = Scheduler._release_aborted_request.__get__(
+            scheduler
+        )
         SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
 
         self.assertTrue(req.finished())
@@ -784,6 +791,9 @@ class TestSessionRetractCheckpoint(CustomTestCase):
                     output_streamer=SimpleNamespace(stream_output=Mock()),
                     metrics_reporter=SimpleNamespace(enable_metrics=False),
                     enable_hicache_storage=False,
+                )
+                scheduler._release_dropped_waiting_req_mm_inputs = (
+                    Scheduler._release_dropped_waiting_req_mm_inputs.__get__(scheduler)
                 )
                 getattr(SchedulerDisaggregationPrefillMixin, method)(scheduler, req)
                 self.assertEqual(set(session.req_nodes), {"turn-1"})

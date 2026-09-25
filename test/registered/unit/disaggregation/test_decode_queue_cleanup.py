@@ -105,6 +105,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="abort-prealloc",
             bootstrap_room=42,
             finished_reason=None,
+            user_aborted=False,
             return_logprob=False,
         )
         decode_req = SimpleNamespace(
@@ -202,6 +203,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             origin_input_ids=[1, 2, 3],
             output_ids=[],
             finished_reason=None,
+            user_aborted=False,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=1),
         )
@@ -337,6 +339,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="failed-transfer",
             bootstrap_room=7,
             return_logprob=False,
+            finished_reason=None,
+            user_aborted=False,
         )
         decode_req = SimpleNamespace(
             req=req,

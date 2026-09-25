@@ -500,8 +500,9 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        # Unresolved dLLM blocks own KV beyond the known tokens; free that tail too.
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(

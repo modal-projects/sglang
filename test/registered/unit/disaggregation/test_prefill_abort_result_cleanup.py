@@ -7,6 +7,7 @@ import torch
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -24,6 +25,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class _Req:
     def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
         self.rid = "aborted-prefill"
+        self.session = None
+        self.multimodal_inputs = None
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
         self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
@@ -57,6 +60,10 @@ class _Req:
 
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
+    _release_dropped_waiting_req_mm_inputs = (
+        Scheduler._release_dropped_waiting_req_mm_inputs
+    )
+
     def __init__(self):
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),

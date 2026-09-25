@@ -1179,21 +1179,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return
 
-        forward_batch.attn_dcp_metadata = (
-            model_runner.model.prepare_context_parallel_metadata_for_dcp(
-                forward_batch.seq_lens,
-                forward_batch.extend_prefix_lens,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens,
-                forward_batch.req_pool_indices,
-                model_runner.req_to_token_pool.req_to_token,
-                forward_batch.seq_lens_sum,
-                model_runner.token_to_kv_pool.get_kv_buffer_shape()[0],
-                model_runner.kv_cache_dtype,
-                model_runner.device,
-                create_chunked_prefix_cache_kv_indices,
+        # The shared DCP planner obtains its rank-aware KV index translator
+        # from the active attention backend. Graph preparation runs before the
+        # ordinary model-forward context exists, so provide the runner-owned
+        # backend explicitly for this metadata-only step.
+        with forward_context(ForwardContext(attn_backend=model_runner.attn_backend)):
+            forward_batch.attn_dcp_metadata = (
+                model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens,
+                    forward_batch.req_pool_indices,
+                    model_runner.req_to_token_pool.req_to_token,
+                    forward_batch.seq_lens_sum,
+                    model_runner.token_to_kv_pool.get_kv_buffer_shape()[0],
+                    model_runner.kv_cache_dtype,
+                    model_runner.device,
+                    create_chunked_prefix_cache_kv_indices,
+                )
             )
-        )
 
     def _prepare_forward_metadata_for_replay(
         self,

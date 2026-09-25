@@ -11,6 +11,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_pp_proxy_dspark_hidden_size,
 )
@@ -57,19 +58,23 @@ def _make_pp_buffers_and_registry():
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
     def test_prepare_dcp_metadata_attaches_live_metadata_to_graph_batch(self):
         marker = object()
+        attn_backend = object()
         captured_args = None
 
         class Model:
             def prepare_context_parallel_metadata_for_dcp(self, *args):
                 nonlocal captured_args
+                self.attn_backend_seen = get_attn_backend()
                 captured_args = args
                 return marker
 
+        model = Model()
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = SimpleNamespace(
             ps=SimpleNamespace(attn_dcp_size=2),
             is_draft_worker=False,
-            model=Model(),
+            model=model,
+            attn_backend=attn_backend,
             kv_cache_dtype=torch.bfloat16,
             device=torch.device("cpu"),
             req_to_token_pool=SimpleNamespace(
@@ -90,6 +95,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner._prepare_dcp_metadata(batch)
 
         self.assertIs(batch.attn_dcp_metadata, marker)
+        self.assertIs(model.attn_backend_seen, attn_backend)
         self.assertIsNotNone(captured_args)
         self.assertIs(
             captured_args[5], runner.model_runner.req_to_token_pool.req_to_token

@@ -98,6 +98,43 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+def _sync_dflash_selector_draft(
+    draft_next: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    q_rows: torch.Tensor,
+    *,
+    tp_sync: SpecTpSync,
+    pack_buffer: torch.Tensor,
+) -> None:
+    if not tp_sync.enabled(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE):
+        return
+    bs, num_pred, top_k = candidate_ids.shape
+    if draft_next.shape != (bs, num_pred) or q_rows.shape != candidate_ids.shape:
+        raise ValueError("DFlash selector tokens and q rows must match the candidates")
+    if draft_next.dtype != torch.int64 or candidate_ids.dtype != torch.int64:
+        raise ValueError("DFlash selector tokens and candidate IDs must be int64")
+    if q_rows.dtype != torch.float32:
+        raise ValueError("DFlash selector q rows must be float32")
+    if (
+        pack_buffer.dtype != torch.int64
+        or pack_buffer.shape[0] < bs
+        or pack_buffer.shape[1:] != (num_pred, 1 + 2 * top_k)
+    ):
+        raise ValueError(
+            "DFlash selector pack buffer must be int64 [max_bs, slots, 1+2*K]"
+        )
+
+    # Keep int64 IDs intact and transport q as integer bits in the same collective.
+    packet = pack_buffer[:bs]
+    packet[:, :, 0].copy_(draft_next)
+    packet[:, :, 1 : 1 + top_k].copy_(candidate_ids)
+    packet[:, :, 1 + top_k :].copy_(q_rows.view(torch.int32))
+    tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE, packet)
+    draft_next.copy_(packet[:, :, 0])
+    candidate_ids.copy_(packet[:, :, 1 : 1 + top_k])
+    q_rows.view(torch.int32).copy_(packet[:, :, 1 + top_k :])
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -529,6 +566,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._selector_sync_buf: Optional[torch.Tensor] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
@@ -2165,6 +2203,61 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._warned_sampling_fallback = True
 
+    def _sync_selector_draft(self, draft_next: torch.Tensor) -> None:
+        if not self._tp_sync.enabled(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE):
+            return
+        candidate_ids, q_rows = self._selector_sample
+        bs, num_pred, top_k = candidate_ids.shape
+        packet_shape = (num_pred, 1 + 2 * top_k)
+        if (
+            self._selector_sync_buf is None
+            or self._selector_sync_buf.shape[0] < bs
+            or self._selector_sync_buf.shape[1:] != packet_shape
+        ):
+            self._selector_sync_buf = torch.empty(
+                (bs, *packet_shape), dtype=torch.int64, device=draft_next.device
+            )
+        _sync_dflash_selector_draft(
+            draft_next,
+            candidate_ids,
+            q_rows,
+            tp_sync=self._tp_sync,
+            pack_buffer=self._selector_sync_buf,
+        )
+
+    def _sync_greedy_draft(
+        self, draft_next: torch.Tensor, sampling_info
+    ) -> torch.Tensor:
+        if not self._tp_sync.enabled(SpecTpSyncSite.DFLASH_DRAFT_GREEDY):
+            return draft_next
+        # Domino, plain (no selector), and all-greedy proposals are rank-local
+        # argmax; peers take rank 0's rows. The sampled selector block (T>0)
+        # is not covered by this site.
+        if self._is_domino or self.selector is None or _is_all_greedy(sampling_info):
+            return self._tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next)
+        if not self._selector_sampling_enabled:
+            # Selector sampling is disabled on this device, so every proposal
+            # is a rank-local argmax regardless of the requested top_k: sync
+            # the whole tensor the same way as an all-greedy batch.
+            return self._tp_sync.sync(
+                SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next.clone()
+            )
+        if not sampling_info.is_any_greedy:
+            return draft_next
+        # Mixed selector batch: greedy rows are still a rank-local argmax over
+        # the selector lattice, so broadcast rank 0's proposal and take only
+        # those rows. The sampled-draft site separately synchronizes selector state.
+        greedy_mask = resolve_greedy_mask(
+            bs=draft_next.shape[0],
+            sampling_info=sampling_info,
+            device=draft_next.device,
+        )
+        # Filtering can leave is_any_greedy true; the device mask remains authoritative.
+        synced = self._tp_sync.sync(
+            SpecTpSyncSite.DFLASH_DRAFT_GREEDY, draft_next.clone()
+        )
+        return torch.where(greedy_mask.unsqueeze(-1), synced, draft_next)
+
     def _make_next_draft_input_prefill(
         self,
         *,
@@ -2574,6 +2667,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     ),
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
+
+        if self._selector_sample is not None:
+            # Runs after either eager sampling or graph replay, before verify reads q.
+            self._sync_selector_draft(draft_next)
+        draft_next = self._sync_greedy_draft(draft_next, batch.sampling_info)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])

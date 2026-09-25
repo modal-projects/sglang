@@ -4,6 +4,7 @@ import unittest
 from array import array
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import prometheus_client
 import torch
@@ -262,9 +263,11 @@ class TestMambaCacheMissAdmission(CustomTestCase):
             _histogram_cls = partial(prometheus_client.Histogram, registry=registry)
             _summary_cls = partial(prometheus_client.Summary, registry=registry)
 
-        return Collector(
-            labels={"moe_ep_rank": 0}, server_args=self.server_args
-        ), registry
+        # GaugeHistogram imports Gauge directly; keep its series in this registry.
+        with patch.object(prometheus_client, "Gauge", Collector._gauge_cls):
+            return Collector(
+                labels={"moe_ep_rank": 0}, server_args=self.server_args
+            ), registry
 
     def _reporter(self, collector, ps):
         pool_stats = PoolStats(

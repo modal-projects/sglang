@@ -489,6 +489,10 @@ def _make_tm_for_generate(case) -> TokenizerManager:
     tm._set_default_priority = Mock()
     tm.request_logger = Mock()
     tm.tokenizer = None
+    tm.model_config = SimpleNamespace(
+        vocab_size=32000,
+        hf_text_config=SimpleNamespace(vocab_size=32000),
+    )
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
     tm.model_update_lock = Mock()

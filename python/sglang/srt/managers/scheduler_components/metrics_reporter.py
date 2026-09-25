@@ -14,6 +14,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability.hicache_pool_stats import collect_host_pool_stats
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -1156,6 +1158,17 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_hierarchical_cache:
             return
 
+        tree_cache = self.scheduler.tree_cache
+        self.stats.hicache_host_pools = []
+        if (
+            isinstance(tree_cache, UnifiedRadixCache)
+            and tree_cache.host_pool_group is not None
+        ):
+            self.stats.hicache_host_pools = collect_host_pool_stats(
+                host_pool_group=tree_cache.host_pool_group,
+                sidecar_pool_specs=tree_cache.sidecar_pool_specs,
+            )
+
         host_pool = getattr(
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
@@ -1357,4 +1370,5 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
+        self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)

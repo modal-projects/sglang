@@ -75,6 +75,7 @@ class TestPipelineQueueMetrics(CustomTestCase):
         s.chunked_req = None
         s.grammar_manager = []
         s.enable_priority_scheduling = False
+        s.enable_hierarchical_cache = False
         s.disaggregation_mode = mode
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
         s.disagg_prefill_inflight_queue = [object()]

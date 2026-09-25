@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
@@ -222,6 +223,7 @@ class TestCollectorGauges(CustomTestCase):
         # exports_expert_balancedness_to_prometheus(); neither is published in
         # a pure unit test, so stub both at the module import site.
         schedule = types.SimpleNamespace(
+            max_queued_requests=None,
             prefill_delayer_max_delay_passes=30,
             prefill_delayer_forward_passes_buckets=None,
             prefill_delayer_wait_seconds_buckets=None,
@@ -268,6 +270,7 @@ class TestCollectorGauges(CustomTestCase):
         )
         scheduler = types.SimpleNamespace(
             device="cpu",
+            ps=ParallelState.trivial(),
             disaggregation_mode=DisaggregationMode.NULL,
             waiting_queue=[],
             chunked_req=None,
@@ -402,7 +405,6 @@ class TestCollectorGauges(CustomTestCase):
                 scheduler.running_batch.is_empty = lambda: True
                 scheduler.last_batch = None
                 scheduler.enable_overlap = False
-                scheduler.ps = types.SimpleNamespace(pp_size=1)
                 scheduler.dllm_manager = types.SimpleNamespace(
                     any_staging_reqs=lambda: False
                 )

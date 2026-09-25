@@ -1181,31 +1181,25 @@ class SchedulerBatchResultProcessor:
         mask = output.next_token_sampling_mask_idx
         logprobs = output.next_token_sampling_logprobs
         if speculative:
-            req.output_token_sampling_mask.extend(
-                [None] * num_tokens if mask is None else mask[i][:num_tokens]
-            )
-            req.output_token_sampling_logprobs.extend(
-                [None] * num_tokens if logprobs is None else logprobs[i][:num_tokens]
-            )
+            for token_ids, token_logprobs in zip(
+                mask[i][:num_tokens], logprobs[i][:num_tokens], strict=True
+            ):
+                req.sampling_mask_rows.append(token_ids, token_logprobs)
         else:
-            req.output_token_sampling_mask.append(None if mask is None else mask[i])
-            req.output_token_sampling_logprobs.append(
-                None if logprobs is None else logprobs[i]
-            )
+            req.sampling_mask_rows.append(mask[i], logprobs[i])
 
     @staticmethod
     def materialize_sampling_mask_output(
         reqs: List[Req],
         output: Optional[LogitsProcessorOutput],
     ) -> None:
-        """Convert opted-in tensor rows to batch-aligned Python results."""
+        """Convert opted-in tensor rows to batch-aligned host rows."""
         if output is None or output.sampling_mask_output is None:
             return
 
         sampling_output = output.sampling_mask_output
         batch_indices = [i for i, req in enumerate(reqs) if req.return_sampling_mask]
         lengths = sampling_output.lengths.tolist()
-        selected_logprobs = sampling_output.selected_logprobs.tolist()
         statuses = sampling_output.statuses.tolist()
         assert len(batch_indices) == len(lengths)
 
@@ -1213,11 +1207,12 @@ class SchedulerBatchResultProcessor:
         masks = [None] * batch_size
         logprobs = [None] * batch_size
         status_by_batch = [None] * batch_size
-        token_ids = sampling_output.token_ids.cpu()
+        token_ids = sampling_output.token_ids.cpu().numpy()
+        selected_logprobs = sampling_output.selected_logprobs.cpu().numpy()
         support_logprobs = (
             None
             if sampling_output.support_logprobs is None
-            else sampling_output.support_logprobs.cpu()
+            else sampling_output.support_logprobs.cpu().numpy()
         )
         output_lens = (
             None
@@ -1259,21 +1254,21 @@ class SchedulerBatchResultProcessor:
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
                 if row_output_len is None:
-                    masks[batch_index] = token_ids[row, : row_lengths[0]].tolist()
+                    masks[batch_index] = token_ids[row, : row_lengths[0]]
                     if returns_support_logprobs:
                         logprobs[batch_index] = support_logprobs[
                             support_row, : row_lengths[0]
-                        ].tolist()
+                        ]
                     else:
-                        logprobs[batch_index] = float(selected_logprobs[row])
+                        logprobs[batch_index] = selected_logprobs[row : row + 1]
                 else:
                     masks[batch_index] = [
-                        token_ids[row, token, :length].tolist()
+                        token_ids[row, token, :length]
                         for token, length in enumerate(row_lengths)
                     ]
                     logprobs[batch_index] = [
-                        float(value)
-                        for value in selected_logprobs[row][:row_output_len]
+                        selected_logprobs[row, token : token + 1]
+                        for token in range(row_output_len)
                     ]
             if returns_support_logprobs:
                 support_row += 1

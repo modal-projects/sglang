@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -231,10 +232,10 @@ class LogitsProcessorOutput:
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
     next_token_sampling_mask_idx: Optional[
-        List[Optional[Union[List[int], List[List[int]]]]]
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
     ] = None
     next_token_sampling_logprobs: Optional[
-        List[Optional[Union[float, List[float]]]]
+        List[Optional[Union[np.ndarray, List[np.ndarray]]]]
     ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 

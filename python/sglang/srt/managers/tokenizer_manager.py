@@ -3753,9 +3753,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        # Validate the complete batch before reserving any request ID.
+        new_rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in new_rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            new_rids.add(rid)
+
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state

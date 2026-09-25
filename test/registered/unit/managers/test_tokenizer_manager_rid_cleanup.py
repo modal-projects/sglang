@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     BatchTokenizedGenerateReqInput,
+    EmbeddingReqInput,
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -420,6 +421,104 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
+
+    def test_rejected_batch_does_not_register_or_modify_any_owner(self):
+        for request_type, collision in product(
+            (GenerateReqInput, EmbeddingReqInput), ("batch", "existing")
+        ):
+            with self.subTest(request_type=request_type.__name__, collision=collision):
+                tm = _make_tm_for_generate(self)
+                tm._dispatch_to_scheduler = Mock()
+                tm._tokenize_one_request = AsyncMock()
+                tm._batch_tokenize_and_process = AsyncMock()
+                existing = request_type(input_ids=[9], rid="occupied")
+                existing.normalize_batch_and_arguments()
+                tm._init_req_state(existing)
+                owner = tm.rid_to_state["occupied"]
+                owner.dispatched = True
+                ready = owner.encoder_dispatch_ready = threading.Event()
+                tm.encoder_dispatch_ready["occupied"] = ready
+                rids = (
+                    ["fresh-a", "fresh-b", "fresh-b"]
+                    if collision == "batch"
+                    else ["fresh-a", "fresh-b", "occupied"]
+                )
+                request = request_type(input_ids=[[1], [2], [3]], rid=rids)
+                callback = (
+                    tm.create_abort_task(request)
+                    if request_type is GenerateReqInput
+                    else None
+                )
+
+                async def reject():
+                    generator = tm.generate_request(request)
+                    with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+                        await generator.__anext__()
+                    await generator.aclose()
+                    if callback is not None:
+                        with patch(
+                            "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                            AsyncMock(),
+                        ):
+                            await callback()
+
+                with (
+                    patch(
+                        "sglang.srt.managers.tokenizer_manager.ReqState",
+                        wraps=ReqState,
+                    ) as make_state,
+                    patch(
+                        "sglang.srt.managers.tokenizer_manager.APIServerReqTimeStats",
+                        wraps=APIServerReqTimeStats,
+                    ) as make_time_stats,
+                ):
+                    asyncio.run(reject())
+                self.assertEqual(set(tm.rid_to_state), {"occupied"})
+                self.assertIs(tm.rid_to_state["occupied"], owner)
+                self.assertTrue(owner.dispatched)
+                self.assertFalse(owner.abort_sent)
+                self.assertFalse(ready.is_set())
+                self.assertIs(tm.encoder_dispatch_ready["occupied"], ready)
+                self.assertFalse(tm._request_state_bindings)
+                make_state.assert_not_called()
+                make_time_stats.assert_not_called()
+                tm._dispatch_to_scheduler.assert_not_called()
+                tm._tokenize_one_request.assert_not_awaited()
+                tm._batch_tokenize_and_process.assert_not_awaited()
+                tm.request_logger.log_received_request.assert_not_called()
+
+                retry = request_type(input_ids=[4], rid="fresh-a")
+                retry.normalize_batch_and_arguments()
+                tm._init_req_state(retry)
+                self.assertIs(tm.rid_to_state["fresh-a"].obj, retry)
+
+    def test_unique_batch_registers_each_normalized_request(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(request_type=request_type.__name__):
+                tm = _make_tokenizer_manager(self)
+                request = request_type(
+                    input_ids=[[1], [2], [3]], rid=["first", "second", "third"]
+                )
+                request.normalize_batch_and_arguments()
+                tm._init_req_state(request)
+                self.assertEqual(set(tm.rid_to_state), set(request.rid))
+                for index, rid in enumerate(request.rid):
+                    self.assertIs(tm.rid_to_state[rid].obj, request[index])
+                    self.assertFalse(tm.rid_to_state[rid].dispatched)
+
+    def test_registration_checks_duplicate_ids_after_normalization(self):
+        """Internal registration must validate all IDs even after normalization."""
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(request_type=request_type.__name__):
+                tm = _make_tokenizer_manager(self)
+                request = request_type(
+                    input_ids=[[1], [2], [3]], rid=["first", "second", "third"]
+                )
+                request.normalize_batch_and_arguments()
+                request.rid[-1] = "second"
+                with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+                    tm._init_req_state(request)
+                self.assertFalse(tm.rid_to_state)
 
 
 class TestResubmitAfterCompletion(CustomTestCase):

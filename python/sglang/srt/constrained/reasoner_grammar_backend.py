@@ -13,6 +13,7 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
+import copy
 import logging
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -229,6 +230,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
         return new_obj
+
+    def fork(self):
+        forked = copy.copy(self)
+        forked.grammar = self.grammar.fork() if self.grammar is not None else None
+        forked._thinking_match_history = list(self._thinking_match_history)
+        return forked
 
     @property
     def finished(self):

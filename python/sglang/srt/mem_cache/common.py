@@ -21,6 +21,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.cache_verification import CacheVerificationAttempt
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
@@ -38,6 +39,7 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    cache_validation_source: Optional[CacheVerificationAttempt] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -227,6 +229,9 @@ def retraction_backup(
     aborts the request since its KV cannot be preserved."""
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        req.kv.retraction_backup = tree_cache.record_retraction_backup(
+            req, req.kv.retraction_backup
+        )
         return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
@@ -234,7 +239,9 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    req.kv.retraction_backup = tree_cache.record_retraction_backup(
+        req, unified_cache.retraction_backup(req)
+    )
     return req.kv.retraction_backup is not None
 
 
@@ -246,7 +253,9 @@ def retraction_restore(
     backend: str,
 ) -> None:
     if backend == "cpu_tensor":
+        backup = req.kv.retraction_backup
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        tree_cache.record_retraction_backup_restore(req, backup)
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
@@ -255,7 +264,9 @@ def retraction_restore(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    backup = req.kv.retraction_backup
+    unified_cache.retraction_restore(req, backup)
+    tree_cache.record_retraction_backup_restore(req, backup)
     req.kv.retraction_backup = None
 
 
@@ -293,12 +304,17 @@ def release_kv_cache(
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
+        tree_cache.close_verification_attempt(req)
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        is_insert=(
+            is_insert
+            and not getattr(req, "skip_radix_cache_insert", False)
+            and not req.cache_invalid
+        ),
         kv_len_to_handle=effective_kv_committed_len,
         is_retract=is_retract,
     )

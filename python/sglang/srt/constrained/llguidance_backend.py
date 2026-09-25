@@ -13,6 +13,7 @@
 # ==============================================================================
 """Constrained decoding with llguidance backend."""
 
+import copy
 import json
 import logging
 from functools import cache
@@ -203,6 +204,11 @@ class GuidanceGrammar(BaseGrammarObject):
             serialized_grammar=self.serialized_grammar,
             ll_matcher=self.ll_matcher.deep_copy(),
         )
+
+    def fork(self):
+        forked = copy.copy(self)
+        forked.ll_matcher = self.ll_matcher.deep_copy()
+        return forked
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         ff_tokens = self.ll_matcher.compute_ff_tokens()

@@ -1,4 +1,4 @@
-"""Unit tests for Spec V2 grammar truncation in _resolve_spec_v2_tokens.
+"""Unit tests for Spec V2 metrics and grammar truncation in _resolve_spec_v2_tokens.
 
 The grammar-constrained spec path stops accepting at the grammar-terminating
 token, so the over-drafted suffix is never committed to KV nor emitted.
@@ -149,6 +149,34 @@ def _commit_disagg_handoff(
     )
 
     queue._commit_transfer_to_req(decode_req)
+
+
+class TestSpecV2Metrics(CustomTestCase):
+    def test_healthy_rows_preserve_block_acceptance_and_cap_metrics(self):
+        reqs = [_make_req(terminate_after=99) for _ in range(2)]
+        for req in reqs:
+            req.grammar = None
+        proc = _make_processor()
+        result = _make_result(5, [3, 2], [101, 102, 103, 0, 0, 201, 202, 0, 0, 0])
+        # The first row trims two accepted tokens at its cap. The second row
+        # accepts fewer tokens than its planned verification cap.
+        result.block_accept_lens = torch.tensor([5, 2])
+        result.cap_lens = torch.tensor([3, 5])
+
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch(reqs))
+
+        self.assertEqual(predict_tokens, [[101, 102, 103], [201, 202]])
+        self.assertEqual([req.kv.kv_committed_len for req in reqs], [3, 2])
+        self.assertEqual(result.num_generated_tokens, 5)
+        self.assertEqual(result.num_correct_drafts_per_req_cpu, [2, 1])
+        self.assertEqual(result.num_spec_verify_rows, 2)
+        self.assertEqual([req.spec_verify_ct for req in reqs], [1, 1])
+        self.assertEqual([req.spec_num_block_accept_tokens for req in reqs], [5, 2])
+        self.assertEqual(result.num_block_accept_tokens, 7)
+        self.assertEqual([req.spec_num_cap_tokens for req in reqs], [3, 5])
+        self.assertEqual(result.num_cap_tokens, 8)
+        self.assertEqual(reqs[0].spec_cap_lens_histogram, [0, 0, 0, 1])
+        self.assertEqual(reqs[1].spec_cap_lens_histogram, [0, 0, 0, 0, 0, 1])
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):

@@ -56,6 +56,10 @@ class SessionSlot:
     lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
     # Whether the first request already released its SWA lock.
     swa_prefix_lock_released: bool = False
+    invalidated: bool = False
+    # Queue-time matching shares the KV record before the scheduler admits it.
+    matched_req: Optional[Req] = None
+    admitted: bool = False
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -71,12 +75,17 @@ class SessionSlot:
             assert kv is self.kv
 
         req.swa_branching_seqlen = None
+        self.matched_req = None
+        self.admitted = False
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.kv = self.kv
         req.lock_receipt = self.lock_receipt
         req.swa_prefix_lock_released = self.swa_prefix_lock_released
+        if self.matched_req is not req:
+            self.matched_req = req
+            self.admitted = False
 
         # NOTE: the slot keeps sharing the record it just handed out. During
         # chunked prefill, a request may be rejected by
@@ -153,6 +162,57 @@ class StreamingSession(BasePrefixCache):
     def any_holding_kv(self) -> bool:
         return any(s.kv.holds_kv for s in self.slots.values())
 
+    def request_slot(self, req: Req) -> Optional[SessionSlot]:
+        if not _is_streaming(req):
+            return None
+        return self.slots.get(req.session.session_id)
+
+    def record_prefix_admission(self, req: Req) -> None:
+        slot = self.request_slot(req)
+        if slot is not None and req.kv is slot.kv:
+            slot.matched_req = req
+            slot.admitted = True
+
+    def invalidate_slot(self, session_id: str, slot: SessionSlot) -> None:
+        """Retire this saved generation without freeing an admitted reader."""
+        slot.invalidated = True
+        if self.slots.get(session_id) is not slot:
+            return
+        req = slot.matched_req
+        if req is not None and req.kv is slot.kv:
+            if slot.admitted:
+                req.cache_invalid = True
+                return
+            # A queue-time match is a borrowed view. Detach every restored
+            # reference before release mutates/frees the shared slot record.
+            req.kv = ReqKvInfo()
+            req.lock_receipt = DecLockRefParams()
+            req.swa_prefix_lock_released = False
+            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            req.last_node = req.last_host_node = req.best_match_node = None
+            req.host_hit_length = req.swa_host_hit_length = (
+                req.mamba_host_hit_length
+            ) = 0
+            req.host_loaded_length = 0
+            req.swa_branching_seqlen = req.mamba_branching_seqlen = None
+            req.cache_validation_state = None
+        self.release_session(session_id)
+        if (
+            req is not None
+            and req.session is not None
+            and req.to_finish is None
+            and not req.finished()
+        ):
+            # The scheduler may already have matched this queued candidate in
+            # the current pass. Refresh it now, before any admission budget.
+            req.init_next_round_input(tree_cache=self.inner, cow_mamba=False)
+
+    def _request_cache_invalid(self, req: Req) -> bool:
+        slot = self.request_slot(req)
+        return self.inner.request_cache_invalid(req) or (
+            slot is not None and slot.invalidated
+        )
+
     # -- Try-handle entries for composition (see class docstring) --
 
     def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
@@ -184,11 +244,18 @@ class StreamingSession(BasePrefixCache):
                 # A queued prefix lookup may have borrowed this record without
                 # admitting the turn. Ordinary abort cleanup must not own it.
                 req.detach_kv()
+            if slot is not None and slot.matched_req is req and not slot.admitted:
+                slot.matched_req = None
             req.session.abort_req(req.rid)
             req.session = None
             return None
         slot = self.slots.get(req.session.session_id)
         if slot is None or not slot.kv.holds_kv:
+            return None
+        if slot.invalidated:
+            if slot.admitted and slot.matched_req is req:
+                return slot
+            self.invalidate_slot(req.session.session_id, slot)
             return None
         return slot
 
@@ -292,6 +359,21 @@ class StreamingSession(BasePrefixCache):
             req.session.abort_req(req.rid)
             return True
 
+        if self._request_cache_invalid(req):
+            if not is_retract:
+                finished_len = (
+                    req.finished_len
+                    if req.finished_len is not None
+                    else len(req.output_ids)
+                )
+                self._trim_overshoot(req, finished_len)
+            self._release_turn_kv(slot, req, session_id)
+            if not is_retract:
+                # A natural finish before the invalid row keeps its response
+                # checkpoint, while all computed KV/SSM is discarded.
+                req.session.finish_req(req)
+            return True
+
         # Retract (release_kv_cache(is_retract=True)): same nuke, but the turn
         # stays inflight and req_nodes retains the last finished turn.
         # Re-admission re-prefills from scratch; is_insert=False alone also
@@ -311,6 +393,10 @@ class StreamingSession(BasePrefixCache):
         self._trim_overshoot(req, finished_len)
 
         slot.save_from_req(req, is_first=is_first)
+        state = req.cache_validation_state
+        if state is not None:
+            state.session_id = session_id
+            state.session_slot = slot
         # Inherit the authoritative finished length on the slot, not the lagging
         # req clock (under overlap + honest committed the clock lags the in-flight
         # verify by ~1, which would short-change inheritance). Clamp to allocated
@@ -354,6 +440,11 @@ class StreamingSession(BasePrefixCache):
         insert to set up the initial tree lock)."""
         if not _is_streaming(req):
             return False
+        if self._request_cache_invalid(req):
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : len(req.get_fill_ids())
+            ].to(dtype=torch.int64, copy=True)
+            return True
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, : req.extend_range.end
@@ -392,6 +483,24 @@ class StreamingSession(BasePrefixCache):
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         self.inner.release_aborted_request(handle)
 
+    def capture_verification_attempt(self, req: Req):
+        return self.inner.capture_verification_attempt(req)
+
+    def invalidate_verification_attempt(self, attempt) -> None:
+        self.inner.invalidate_verification_attempt(attempt)
+
+    def release_verification_attempt(self, attempt) -> None:
+        self.inner.release_verification_attempt(attempt)
+
+    def close_verification_attempt(self, req: Req) -> None:
+        self.inner.close_verification_attempt(req)
+
+    def record_retraction_backup(self, req: Req, backup):
+        return self.inner.record_retraction_backup(req, backup)
+
+    def record_retraction_backup_restore(self, req: Req, backup) -> None:
+        self.inner.record_retraction_backup_restore(req, backup)
+
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
@@ -418,6 +527,8 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
+        slot.matched_req = None
+        slot.admitted = False
         protected_len = slot.kv.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (

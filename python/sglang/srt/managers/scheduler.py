@@ -4329,6 +4329,34 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _forward_generation_with_validation(
+        self, batch: ScheduleBatch, *, validation_results=None, **kwargs
+    ):
+        attempts = None
+        cache_attempts = None
+        try:
+            if batch.spec_algorithm.is_dflash() and batch.forward_mode.is_decode():
+                attempts = [
+                    (req.cache_request_handle, req.retraction_count)
+                    for req in batch.reqs
+                ]
+                cache_attempts = []
+                for req in batch.reqs:
+                    cache_attempts.append(
+                        self.tree_cache.capture_verification_attempt(req)
+                    )
+            result = self.model_worker.forward_batch_generation(batch, **kwargs)
+        except BaseException:
+            if cache_attempts is not None:
+                for attempt in cache_attempts:
+                    self.tree_cache.release_verification_attempt(attempt)
+            raise
+        result.spec_request_attempts = attempts
+        result.cache_verification_attempts = cache_attempts
+        if validation_results is not None:
+            validation_results.append(result)
+        return result
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4336,6 +4364,15 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        validation_results = []
+        try:
+            return self._run_batch(batch, pp_proxy_tensors, validation_results)
+        except BaseException:
+            for result in validation_results:
+                result.release_verification_attempts(self.tree_cache)
+            raise
+
+    def _run_batch(self, batch, pp_proxy_tensors, validation_results):
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4403,8 +4440,8 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
+                        batch_result = self._forward_generation_with_validation(
+                            batch, validation_results=validation_results, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -4475,8 +4512,10 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    batch_result = self._forward_generation_with_validation(
+                        batch,
+                        validation_results=validation_results,
+                        pp_proxy_tensors=pp_proxy_tensors,
                     )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
@@ -4503,8 +4542,8 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
+                batch_result = self._forward_generation_with_validation(
+                    batch, validation_results=validation_results, **kwargs
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
@@ -4684,6 +4723,13 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        try:
+            self._process_batch_result(batch, result)
+        finally:
+            if isinstance(result, GenerationBatchResult):
+                result.release_verification_attempts(self.tree_cache)
+
+    def _process_batch_result(self, batch, result):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)

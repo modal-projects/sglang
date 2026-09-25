@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -741,80 +742,135 @@ class SchedulerBatchResultProcessor:
             logprob_pt += num_input_logprobs
         return logprob_pt
 
+    @staticmethod
+    def _matches_spec_attempt(result: GenerationBatchResult, i: int, req: Req) -> bool:
+        return result.spec_request_attempts is None or result.spec_request_attempts[
+            i
+        ] == (
+            req.cache_request_handle,
+            req.retraction_count,
+        )
+
+    def _settle_invalid_spec_tokens(self, req: Req, tokens: List[int]) -> List[int]:
+        if req.to_finish is not None:
+            return []
+        abort_reason = FINISH_ABORT(
+            "Invalid target distribution during speculative verification",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+        )
+        if not tokens:
+            req.to_finish = abort_reason
+            return []
+        probe = copy.copy(req)
+        probe.output_ids = req.output_ids[:]
+        probe.grammar = req.grammar.fork() if req.grammar is not None else None
+        old_len = len(probe.output_ids)
+        for token in tokens:
+            probe.output_ids.append(token)
+            if probe.grammar is not None:
+                self._accept_grammar_tokens(probe, [token])
+            probe.update_finish_state(1)
+            if probe.finished():
+                if not isinstance(probe.finished_reason, FINISH_ABORT):
+                    retained = list(probe.output_ids[old_len:])
+                    if req.grammar is not None:
+                        self._accept_grammar_tokens(req, retained)
+                    req.to_finish = probe.finished_reason
+                    req.finished_len = probe.finished_len
+                    return retained
+                break
+        req.to_finish = (
+            probe.finished_reason
+            or probe.to_finish
+            or FINISH_ABORT(
+                "Invalid target distribution during speculative verification",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
+        )
+        return []
+
     def _resolve_spec_v2_tokens(
         self,
         result: GenerationBatchResult,
         batch: ScheduleBatch,
     ) -> List[List[int]]:
-        """Resolve the padded next token ids for spec-v2 (overlap and non-overlap)."""
+        """Resolve valid tokens and settle only the attempt that produced them."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
-
+        assert result.first_invalid_rows is None or result.first_invalid_rows.is_cpu
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
+        invalid_rows = (
+            result.first_invalid_rows.tolist()
+            if result.first_invalid_rows is not None
+            else [-1] * len(batch.reqs)
+        )
         stride = _get_speculative_output_stride(result)
-        num_non_draft = result.num_non_draft_tokens_per_req
-        result.num_correct_drafts_per_req_cpu = [
-            length - num_non_draft for length in accept_lens
-        ]
-        result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
-
-        block_accept_lens = (
+        block_lens = (
             result.block_accept_lens.tolist()
             if result.block_accept_lens is not None
             else None
         )
-        result.num_block_accept_tokens = (
-            sum(block_accept_lens) if block_accept_lens else 0
-        )
         cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
-        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
-
-        # Feed the adaptive controller now that accept_lens is on CPU,
-        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
-        # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
-
-        # Advance the grammar FSM over this batch's committed tokens (idempotent):
-        # the EAGLE overlap path already did this inside verify() via the grammar
-        # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
-        # grammar (the queued batch.copy() does not carry has_grammar) and consumes
-        # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
-
         predict_tokens = []
+        correct_per_req = []
+        observations = []
+        result.num_block_accept_tokens = 0
+        result.num_cap_tokens = 0
         for i, req in enumerate(batch.reqs):
-            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
-
-            if req.is_retracted or req.finished():
-                # Nothing to settle: no worker pre-claims the bonus, so
-                # kv_committed_len already holds the committed prefix.
-                pass
-            else:
-                if req.grammar is not None:
-                    # FSM already advanced + truncated by advance_grammar_fsm; reuse
-                    # the retained (grammar-legal) run instead of advancing again.
-                    accept_tokens = result.grammar_retained_tokens[i]
-
-                # Commit the full accepted run (drafts + bonus).
-                num_accept_tokens = len(accept_tokens)
-                req.kv.kv_committed_len += num_accept_tokens
+            invalid = invalid_rows[i]
+            if invalid >= 0 and result.cache_verification_attempts is not None:
+                self.tree_cache.invalidate_verification_attempt(
+                    result.cache_verification_attempts[i]
+                )
+            if (
+                not self._matches_spec_attempt(result, i, req)
+                or req.is_retracted
+                or req.finished()
+            ):
+                predict_tokens.append([])
+                correct_per_req.append(0)
+                continue
+            tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            if invalid >= 0:
+                req.cache_invalid = True
+                tokens = self._settle_invalid_spec_tokens(req, tokens[:invalid])
+            elif req.grammar is not None:
+                tokens = result.grammar_retained_tokens[i]
+            count = len(tokens)
+            correct = max(0, count - result.num_non_draft_tokens_per_req)
+            if count:
+                req.kv.kv_committed_len += count
                 req.spec_verify_ct += 1
-
-                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-                req.spec_num_correct_drafts += num_correct_drafts
-                req.update_spec_correct_drafts_histogram(num_correct_drafts)
-
-                if block_accept_lens is not None:
-                    req.spec_num_block_accept_tokens += block_accept_lens[i]
+                req.spec_num_correct_drafts += correct
+                req.update_spec_correct_drafts_histogram(correct)
+                observations.append(correct)
+                # DSpark reports uncapped block acceptance and the planned cap.
+                # Only invalid-result settlement clips those observations.
+                if block_lens is not None:
+                    block_count = (
+                        min(block_lens[i], count) if invalid >= 0 else block_lens[i]
+                    )
+                    req.spec_num_block_accept_tokens += block_count
+                    result.num_block_accept_tokens += block_count
                 if cap_lens is not None:
-                    req.spec_num_cap_tokens += cap_lens[i]
-                    req.update_spec_cap_lens_histogram(cap_lens[i])
-
-            predict_tokens.append(accept_tokens)
-
+                    cap_count = min(cap_lens[i], count) if invalid >= 0 else cap_lens[i]
+                    req.spec_num_cap_tokens += cap_count
+                    req.update_spec_cap_lens_histogram(cap_count)
+                    result.num_cap_tokens += cap_count
+            predict_tokens.append(tokens)
+            correct_per_req.append(correct)
+        result.num_correct_drafts_per_req_cpu = correct_per_req
+        result.num_correct_drafts = sum(correct_per_req)
+        result.num_generated_tokens = sum(map(len, predict_tokens))
+        result.num_spec_verify_rows = len(observations)
+        if observations:
+            self.model_worker.on_verify_complete_cpu(
+                observations, batch_size=len(observations)
+            )
         return predict_tokens
 
     def _accept_grammar_tokens(
@@ -896,7 +952,16 @@ class SchedulerBatchResultProcessor:
         stride = _get_speculative_output_stride(result)
         retained = [None] * len(batch.reqs)
         for i, req in enumerate(batch.reqs):
-            if req.grammar is None or req.is_retracted or req.finished():
+            if (
+                req.grammar is None
+                or req.is_retracted
+                or req.finished()
+                or not self._matches_spec_attempt(result, i, req)
+                or (
+                    result.first_invalid_rows is not None
+                    and int(result.first_invalid_rows[i]) >= 0
+                )
+            ):
                 continue
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
             # Stop accepting once the grammar terminates so the over-drafted suffix
@@ -918,6 +983,16 @@ class SchedulerBatchResultProcessor:
         )
 
     def process_batch_result_decode(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        try:
+            self._process_batch_result_decode(batch, result)
+        finally:
+            result.release_verification_attempts(self.tree_cache)
+
+    def _process_batch_result_decode(
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
@@ -952,7 +1027,7 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch_size,
+                result.num_spec_verify_rows,
                 result.num_correct_drafts,
                 num_accept_tokens=num_generated_tokens,
                 num_block_accept_tokens=result.num_block_accept_tokens,
@@ -987,9 +1062,14 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if (
+                (
+                    self.enable_overlap
+                    or self.enable_overlap_mlx
+                    or not batch.spec_algorithm.is_none()
+                )
+                and (req.finished() or req.is_retracted)
+            ) or not self._matches_spec_attempt(result, i, req):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
@@ -1261,45 +1341,46 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
-        known_mamba_boundary = None
-        completed_mamba_boundary = None
-        lookahead = 0
-        if batch.mamba_track_mask_cpu is not None:
-            completed_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
-            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
-            assert lookahead in (0, 1), (
-                f"mamba result lookahead={lookahead} for req {req.rid}; "
-                "overlap advanced more than one decode batch"
-            )
-            if lookahead == 0:
-                known_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
-            else:
-                known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
+        if not req.cache_invalid:
+            lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+            known_mamba_boundary = None
+            completed_mamba_boundary = None
+            lookahead = 0
+            if batch.mamba_track_mask_cpu is not None:
+                completed_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
+                lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
+                assert lookahead in (0, 1), (
+                    f"mamba result lookahead={lookahead} for req {req.rid}; "
+                    "overlap advanced more than one decode batch"
+                )
+                if lookahead == 0:
+                    known_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
+                else:
+                    known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
-            if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
-            elif (
-                req.finished()
-                and lazy
-                and lookahead == 1
-                and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-            ):
-                req.mamba_lazy_is_insert = False
+                if completed_mamba_boundary and not lazy:
+                    req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                    req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
+                elif (
+                    req.finished()
+                    and lazy
+                    and lookahead == 1
+                    and known_mamba_boundary
+                    and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                ):
+                    req.mamba_lazy_is_insert = False
 
-        # Called here (after update_finish_state) so req.finished() is valid
-        # for mamba_lazy_post_decode_at_boundary inside.
-        should_update = completed_mamba_boundary if lazy else known_mamba_boundary
-        if should_update is None or should_update:
-            self._mamba_prefix_cache_update(
-                req,
-                batch,
-                result,
-                i,
-                known_boundary=not lazy and known_mamba_boundary is True,
-            )
+            # Called here (after update_finish_state) so req.finished() is valid
+            # for mamba_lazy_post_decode_at_boundary inside.
+            should_update = completed_mamba_boundary if lazy else known_mamba_boundary
+            if should_update is None or should_update:
+                self._mamba_prefix_cache_update(
+                    req,
+                    batch,
+                    result,
+                    i,
+                    known_boundary=not lazy and known_mamba_boundary is True,
+                )
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache

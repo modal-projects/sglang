@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -61,7 +61,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
-                retraction_backup=None,
+                kv=ReqKvInfo(),
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)

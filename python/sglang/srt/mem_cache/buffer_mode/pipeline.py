@@ -1110,6 +1110,7 @@ class BufferModePipeline:
         key = plan.key
         span_end = f.matched_len + f.num_tokens
         load_tokens = plan.full_tokens
+        restored_start = splice_base if load_tokens else span_end
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
@@ -1207,6 +1208,11 @@ class BufferModePipeline:
                 ):
                     cache._apply_cache_action(action)
             if bool(missing.any()):
+                restored_start = min(
+                    restored_start,
+                    tail_start,
+                    *(start for start, _ in repair_ranges),
+                )
                 cache._apply_cache_action(
                     RebuildFullToSWAMapping(
                         [full_window[missing]],
@@ -1257,6 +1263,9 @@ class BufferModePipeline:
             )
         # Canonical ownership: return the post-insert tree slice, never the
         # raw cc.load allocation (torch.equal here; the tree slice is truth).
+        cache.record_committed_host_restore(
+            req, match.last_device_node, restored_start, span_end
+        )
         return canonical, match.last_device_node
 
     def try_finish_load_back(self, ack_id: int) -> bool:

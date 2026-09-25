@@ -37,6 +37,10 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
+from sglang.srt.mem_cache.cache_verification import (
+    CacheVerificationAttempt,
+    request_attempt_identity,
+)
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -555,6 +559,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            self._record_prefix_match(params.req, result)
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -568,7 +573,200 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if params.req is not None:
+            self._record_prefix_match(params.req, result)
         return result
+
+    def _verification_state(self, req: Req) -> CacheVerificationAttempt:
+        identity = request_attempt_identity(req)
+        state = req.cache_validation_state
+        if state is None or state.identity != identity:
+            if state is not None:
+                state.closed = True
+                self._drain_verification_attempt(state)
+            state = CacheVerificationAttempt(identity)
+            req.cache_validation_state = state
+        return state
+
+    def _record_prefix_match(self, req: Req, result: MatchResult) -> None:
+        state = self._verification_state(req)
+        if state.start is None:
+            # Queue-time matching can repeat before admission. It neither owns
+            # a tree receipt nor advances the boundary of an admitted request.
+            state.matched_device_end = len(result.device_indices)
+            state.host_start = None
+            state.host_sources.clear()
+
+    def record_prefix_admission(self, req: Req) -> None:
+        state = self._verification_state(req)
+        if state.start is None:
+            state.start = (state.matched_device_end // self.page_size) * self.page_size
+        if state.host_start is not None:
+            state.start = min(state.start, state.host_start)
+        for node, end in state.host_sources:
+            state.host_refs.append(self.tree_core.capture_prefix_ref(node, end))
+        state.host_sources.clear()
+        self.session.record_prefix_admission(req)
+        self._capture_request_prefix(req, state)
+
+    def record_committed_host_restore(
+        self, req: Req, node: NodeId, start: int, end: int
+    ) -> None:
+        """Capture the source only after a host transfer has been committed.
+
+        Component slots are not token counts: an auxiliary-only restore still
+        records its checkpoint/window interval even with no new FULL indices.
+        """
+        if start >= end:
+            return
+        start = (start // self.page_size) * self.page_size
+        state = self._verification_state(req)
+        state.host_start = (
+            start if state.host_start is None else min(state.host_start, start)
+        )
+        if state.start is None:
+            # Admission can still reject an auxiliary-only load. The transfer
+            # lock pins this identity until the immediate admission decision;
+            # a queue-time candidate must not own a registry entry.
+            state.host_sources.append((node, end))
+        else:
+            state.host_refs.append(self.tree_core.capture_prefix_ref(node, end))
+            state.start = min(state.start, start)
+
+    def _capture_request_prefix(self, req: Req, state=None) -> None:
+        state = self._verification_state(req) if state is None else state
+        node = req.last_node
+        end = req.kv.cache_protected_len
+        slot = self.session.request_slot(req)
+        if slot is not None:
+            node = slot.last_node
+            end = slot.kv.cache_protected_len
+            state.session_id = req.session.session_id
+            state.session_slot = slot
+        self._capture_verification_prefix(state, node, end)
+
+    def _capture_verification_prefix(self, state, node, end: int) -> None:
+        if (
+            (not state.verification_started and not state.upstream_holds)
+            or state.closed
+            or state.invalid
+            or not isinstance(node, int)
+            or end <= 0
+        ):
+            return
+        identity = (node, end)
+        if state.prefix_identity == identity or self.tree_core.is_invalidated(node):
+            return
+        ref = self.tree_core.capture_prefix_ref(node, end)
+        # Keep earlier identities even if a later insert shortens or changes
+        # the attached path. A delayed result still describes the whole attempt.
+        state.prefix_refs.append(ref)
+        state.prefix_identity = identity
+
+    def capture_verification_attempt(self, req: Req) -> CacheVerificationAttempt:
+        state = self._verification_state(req)
+        if state.start is None:
+            self.record_prefix_admission(req)
+        # Before the first verify, chunked prefill owns its current prefix lock
+        # and cannot have a delayed invalid result. Capture once at dispatch,
+        # rather than retaining every growing chunk prefix.
+        state.verification_started = True
+        self._capture_request_prefix(req, state)
+        state.pending += 1
+        return state
+
+    def invalidate_verification_attempt(self, state: CacheVerificationAttempt) -> None:
+        if state is None or state.invalid:
+            return
+        start = (
+            (state.start // self.page_size) * self.page_size
+            if state.start is not None
+            else 0
+        )
+        refs = [*state.prefix_refs, *state.host_refs]
+        for ref in refs:
+            self._apply_cache_actions(self.tree_core.invalidate_prefix_ref(ref, start))
+        if state.session_slot is not None:
+            self.session.invalidate_slot(state.session_id, state.session_slot)
+        for dependent in state.dependents:
+            self.invalidate_verification_attempt(dependent)
+        state.invalid = True
+
+    def release_verification_attempt(self, state: CacheVerificationAttempt) -> None:
+        if state is None:
+            return
+        if state.pending <= 0:
+            raise RuntimeError(
+                "verification attempt released without a retained result"
+            )
+        state.pending -= 1
+        self._drain_verification_attempt(state)
+
+    def close_verification_attempt(self, req: Req) -> None:
+        state = req.cache_validation_state
+        if state is not None:
+            state.closed = True
+            self._drain_verification_attempt(state)
+
+    def _drain_verification_attempt(self, state: CacheVerificationAttempt) -> None:
+        if not state.closed or state.pending or state.upstream_holds:
+            return
+        for ref in state.prefix_refs:
+            self.tree_core.release_prefix_ref(ref)
+        state.prefix_refs.clear()
+        for ref in state.host_refs:
+            self.tree_core.release_prefix_ref(ref)
+        state.host_refs.clear()
+        state.host_sources.clear()
+        state.session_slot = None
+        for dependent in state.dependents:
+            dependent.upstream_holds -= 1
+            self._drain_verification_attempt(dependent)
+        state.dependents.clear()
+
+    def record_retraction_backup(
+        self, req: Req, backup: Optional[RetractionBackup]
+    ) -> Optional[RetractionBackup]:
+        if backup is None:
+            return None
+        state = self._verification_state(req)
+        if self.request_cache_invalid(req):
+            self.invalidate_verification_attempt(state)
+        return backup._replace(cache_validation_source=state)
+
+    def record_retraction_backup_restore(
+        self, req: Req, backup: RetractionBackup
+    ) -> None:
+        source = backup.cache_validation_source
+        if source is None:
+            return
+        state = self._verification_state(req)
+        if source.invalid:
+            self.invalidate_verification_attempt(state)
+            req.cache_invalid = True
+        elif source is not state and (
+            not source.closed or source.pending or source.upstream_holds
+        ):
+            if not any(dependent is state for dependent in source.dependents):
+                source.dependents.append(state)
+                state.upstream_holds += 1
+            # A restored request may finish before its own first verification;
+            # its published generation still depends on the unresolved source.
+            self._capture_request_prefix(req, state)
+
+    def request_cache_invalid(self, req: Req) -> bool:
+        state = req.cache_validation_state
+        slot = self.session.request_slot(req)
+        node = slot.last_node if slot is not None else req.last_node
+        invalid = (
+            req.cache_invalid
+            or (state is not None and state.invalid)
+            or (slot is not None and slot.invalidated)
+            or (isinstance(node, int) and self.tree_core.is_invalidated(node))
+        )
+        if invalid:
+            req.cache_invalid = True
+        return bool(invalid)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -967,15 +1165,20 @@ class UnifiedRadixCache(BasePrefixCache):
         is_retract: bool = False,
         **kwargs,
     ) -> None:
+        state = self._verification_state(req)
+        self._capture_request_prefix(req, state)
+        is_insert = is_insert and not self.request_cache_invalid(req)
         if self.session.try_cache_finished_req(
             req, is_insert=is_insert, is_retract=is_retract, **kwargs
         ):
+            self.close_verification_attempt(req)
             return
 
         if self.disable:
             self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
+            self.close_verification_attempt(req)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -1027,6 +1230,10 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            if not result.rotation_tail_declined:
+                self._capture_verification_prefix(
+                    state, result.last_device_node, page_aligned_len
+                )
 
             # Keep the prompt as an independent radix node. Finished requests
             # append a short, request-specific output to a much longer prompt;
@@ -1103,9 +1310,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+        self.close_verification_attempt(req)
 
     @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        if self.request_cache_invalid(req):
+            # Keep ownership on the request: no deduplication, donation or
+            # component preparation may publish state from an invalid reader.
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : len(req.get_fill_ids())
+            ].to(dtype=torch.int64, copy=True)
+            return
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -1238,6 +1453,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req.lock_receipt = lock_result.to_dec_params()
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
+        self._capture_request_prefix(req)
 
         # cleanup
         for comp in self._components_tuple:
@@ -1770,6 +1986,30 @@ class UnifiedRadixCache(BasePrefixCache):
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
+
+        if req is not None:
+            restored = [(ComponentType.FULL, kv_xfer)]
+            restored.extend(
+                (component, transfer)
+                for component, transfers in comp_xfers.items()
+                for transfer in transfers
+            )
+            restored_start = None
+            for component, transfer in restored:
+                if transfer.host_indices is None or not len(transfer.host_indices):
+                    continue
+                for source in transfer.nodes_to_load or [node_id]:
+                    start, end = self.tree_core.prefix_node_span(source)
+                    if component == ComponentType.MAMBA:
+                        # A recurrent slot represents the checkpoint at end,
+                        # not a one-token host interval at the start of a node.
+                        start = max(start, end - self.page_size)
+                    restored_start = (
+                        start if restored_start is None else min(restored_start, start)
+                    )
+            if restored_start is not None:
+                _, end = self.tree_core.prefix_node_span(node_id)
+                self.record_committed_host_restore(req, node_id, restored_start, end)
 
         return True
 

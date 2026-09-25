@@ -212,6 +212,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def prefix_node_span(self, node_id: NodeId) -> tuple[int, int]:
+        """Absolute [start, end) occupied by this exact node identity.
+
+        Bounds use logical radix-key units (bigram atoms for an eagle tree)
+        and follow the node's current ancestry after splits. Retired nodes
+        remain addressable until deleted; missing or reset IDs raise KeyError.
+        The root spans (0, 0). This does not rematch the node's token key.
+        """
+        ...
+
+    @abstractmethod
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId -- the tree-node identity the Controller passes
         across the boundary (e.g. MatchResult fields, lock-ref args) -- back to

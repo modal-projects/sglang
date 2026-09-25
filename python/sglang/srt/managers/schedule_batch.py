@@ -987,6 +987,8 @@ class Req(ReqDllmMixin):
         # Input and output info
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
+        self.cache_validation_state = None
+        self.cache_invalid = False
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1892,6 +1894,8 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        self.cache_validation_state = None
+        self.cache_invalid = False
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None

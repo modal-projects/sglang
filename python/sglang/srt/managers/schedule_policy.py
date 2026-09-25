@@ -1078,6 +1078,7 @@ class PrefillAdder:
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
+        self.tree_cache.record_prefix_admission(req)
         self.can_run_list.append(req)
 
         self._update_prefill_budget(
@@ -1109,6 +1110,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        self.tree_cache.record_prefix_admission(req)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -1168,6 +1170,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        self.tree_cache.record_prefix_admission(req)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -1304,6 +1307,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
+            self.tree_cache.record_prefix_admission(req)
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -1329,6 +1333,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
+            self.tree_cache.record_prefix_admission(req)
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
@@ -1546,6 +1551,7 @@ class PrefillAdder:
             admission.prefix_len, admission.prefix_len + admission.extend_len
         )
         self._req_inc_lock_ref(req)
+        self.tree_cache.record_prefix_admission(req)
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req

@@ -86,6 +86,9 @@ class _FakeInnerCache:
     def supports_mamba(self):
         return False
 
+    def request_cache_invalid(self, req):
+        return req.cache_invalid
+
     def sanity_check(self):
         return None
 
@@ -113,6 +116,8 @@ class _FakeReq:
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
         self.rid = session_id
+        self.cache_validation_state = None
+        self.cache_invalid = False
         self.session = SimpleNamespace(
             session_id=session_id,
             streaming=True,

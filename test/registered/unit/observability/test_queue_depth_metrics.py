@@ -12,7 +12,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -27,7 +27,11 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.scheduler import Scheduler
 
 
 class _FakeReq:
@@ -380,6 +384,80 @@ class TestCollectorGauges(CustomTestCase):
         collector.last_log_time = 0
         reporter._maybe_log_idle_metrics()
         self.assertEqual(self._value(collector.decode_queue_depth), 0)
+
+    def test_stalled_pd_queues_publish_without_a_forward_at_bounded_cadence(self):
+        """Pending handshakes must remain visible when no model batch can run."""
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                collector = self._collector()
+                reporter = self._reporting_reporter(collector)
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.__dict__.update(vars(reporter.scheduler))
+                reporter.scheduler = scheduler
+                scheduler.metrics_reporter = reporter
+                scheduler.scheduler_stage_metrics = None
+                scheduler.disaggregation_mode = mode
+                scheduler.enable_priority_scheduling = False
+                scheduler.running_batch.reqs.clear()
+                scheduler.running_batch.is_empty = lambda: True
+                scheduler.last_batch = None
+                scheduler.enable_overlap = False
+                scheduler.ps = types.SimpleNamespace(pp_size=1)
+                scheduler.dllm_manager = types.SimpleNamespace(
+                    any_staging_reqs=lambda: False
+                )
+                scheduler.grammar_manager = MagicMock()
+                scheduler.grammar_manager.grammar_queue = []
+                scheduler.enable_hisparse = False
+                scheduler.decode_offload_manager = None
+                scheduler.maybe_send_health_check_signal = lambda: None
+                scheduler.publish_load_snapshot = lambda **kwargs: None
+                scheduler.load_publisher = MagicMock()
+                scheduler.load_inquirer = MagicMock()
+                scheduler._last_stall_publish_ts = float("-inf")
+                scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+                    queue=[]
+                )
+                scheduler.disagg_prefill_inflight_queue = []
+                scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+                    queue=[], retracted_queue=[], held_rebootstrap_reqs=[]
+                )
+                scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(queue=[])
+                if mode == DisaggregationMode.PREFILL:
+                    pending = scheduler.disagg_prefill_bootstrap_queue.queue
+                    gauge = collector.prefill_queue_depth
+                    request = _FakeReq()
+                else:
+                    pending = scheduler.disagg_decode_prealloc_queue.retracted_queue
+                    gauge = collector.decode_queue_depth
+                    request = _FakeReq(is_retracted=True, retracted_stain=True)
+                pending.extend([request, request])
+                self.assertFalse(scheduler.is_fully_idle())
+                collector.log_stats(SchedulerStats())
+                collector.last_log_time = 0
+                with (
+                    patch("time.monotonic", return_value=100.0) as monotonic,
+                    patch("time.perf_counter", return_value=100.0) as perf_counter,
+                    patch.object(
+                        reporter,
+                        "_update_queue_depths",
+                        wraps=reporter._update_queue_depths,
+                    ) as update_depths,
+                ):
+                    scheduler.on_idle()
+                    self.assertEqual(self._value(gauge), 2)
+                    pending.append(request)
+                    monotonic.return_value = 101.0
+                    perf_counter.return_value = 101.0
+                    for _ in range(100):
+                        scheduler.on_idle()
+                    self.assertEqual(self._value(gauge), 2)
+                    self.assertEqual(update_depths.call_count, 1)
+                    monotonic.return_value = 131.0
+                    perf_counter.return_value = 131.0
+                    scheduler.on_idle()
+                    self.assertEqual(self._value(gauge), 3)
+                    self.assertEqual(update_depths.call_count, 2)
 
     def test_metrics_disabled_does_not_scan_waiting_requests(self):
         """Disabled reporting must not require queue-depth request fields."""

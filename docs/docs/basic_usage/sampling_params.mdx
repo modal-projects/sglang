@@ -221,7 +221,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>repetition_penalty</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`float = 1.0`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Scales the logits of previously generated tokens to discourage (values > 1) or encourage (values < 1) repetition. Valid range is `(0, 2]`; `1.0` leaves probabilities unchanged.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Scales the logits of previously generated tokens to discourage (values > 1) or encourage (values < 1) repetition. Valid range is `[1e-6, 2]`; `1.0` leaves probabilities unchanged.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>min_new_tokens</td>
@@ -230,6 +230,8 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
     </tr>
   </tbody>
 </table>
+
+You can also supply `logit_bias`, a mapping from token IDs to additive biases. Each value must be finite and in `[-1e30, 1e30]`. Large finite negative values such as `-1e9` remain supported for suppressing a token.
 
 ### Constrained decoding
 

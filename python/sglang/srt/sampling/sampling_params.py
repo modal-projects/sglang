@@ -37,6 +37,10 @@ CustomParamValue = Union[
 ]
 
 _SAMPLING_EPS = 1e-6
+# Leave float32 headroom when biases are divided by the minimum temperature.
+_LOGIT_BIAS_MAX_ABS = 1e30
+# Positive logits are divided by this penalty before temperature scaling.
+_REPETITION_PENALTY_MIN = 1e-6
 TOP_K_ALL = 1 << 30
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
@@ -244,10 +248,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
-        if not 0.0 < self.repetition_penalty <= 2.0:
+        if not _REPETITION_PENALTY_MIN <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in (0, 2] (1.0 = no penalty), "
-                f"got {self.repetition_penalty}."
+                f"repetition_penalty must be in [{_REPETITION_PENALTY_MIN:g}, 2] "
+                f"(1.0 = no penalty), got {self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
@@ -265,11 +269,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
-            for token_id in self.logit_bias:
+            for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
+                    )
+                try:
+                    in_range = math.isfinite(bias) and abs(bias) <= _LOGIT_BIAS_MAX_ABS
+                except (TypeError, OverflowError):
+                    in_range = False
+                if not in_range:
+                    raise ValueError(
+                        "logit_bias values must be finite numbers with |value| <= "
+                        f"{_LOGIT_BIAS_MAX_ABS:g}, got {bias!r} for token {token_id}."
                     )
 
         get_request_reasoning_end_token_ids(

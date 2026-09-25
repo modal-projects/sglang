@@ -7,6 +7,7 @@ register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
+import math
 import re
 import unittest
 from pathlib import Path
@@ -238,7 +239,7 @@ class TestSamplingParamsVerify(CustomTestCase):
 
     # --- repetition_penalty ---
     def test_repetition_penalty_negative_raises(self):
-        """Test that verify() rejects negative repetition_penalty (valid range is (0, 2])."""
+        """Test that verify() rejects negative repetition_penalty."""
         sp = self._make(repetition_penalty=-0.1)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
@@ -267,6 +268,29 @@ class TestSamplingParamsVerify(CustomTestCase):
     def test_repetition_penalty_small_positive_valid(self):
         """Test that a small positive repetition_penalty (e.g. 1e-3) is accepted."""
         self._make(repetition_penalty=1e-3).verify(self.VOCAB_SIZE)
+
+    def test_repetition_penalty_below_numeric_floor_raises(self):
+        """Reject positive penalties below the numeric contract's lower bound."""
+        for penalty in (1e-8, math.nextafter(1e-6, 0.0)):
+            with self.subTest(penalty=penalty):
+                with self.assertRaisesRegex(ValueError, r"repetition_penalty.*1e-06"):
+                    self._make(repetition_penalty=penalty).verify(self.VOCAB_SIZE)
+
+    def test_repetition_penalty_numeric_boundaries_remain_valid(self):
+        """The new floor remains inclusive across greedy and sampled requests."""
+        for temperature in (0.0, 1e-6, 1.0):
+            for penalty in (1e-6, 1e-3, 1.0, 2.0):
+                with self.subTest(temperature=temperature, penalty=penalty):
+                    self._make(
+                        temperature=temperature, repetition_penalty=penalty
+                    ).verify(self.VOCAB_SIZE)
+
+    def test_repetition_penalty_nonfinite_raises(self):
+        """Reject nonfinite penalties while retaining the existing upper bound."""
+        for penalty in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(penalty=penalty):
+                with self.assertRaisesRegex(ValueError, "repetition_penalty"):
+                    self._make(repetition_penalty=penalty).verify(self.VOCAB_SIZE)
 
     # --- min_new_tokens / max_new_tokens ---
     def test_negative_min_new_tokens_raises(self):
@@ -314,6 +338,38 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_outside_numeric_bounds_raises(self):
+        """Reject biases beyond the numeric bounds before batch construction."""
+        above_bound = math.nextafter(1e30, math.inf)
+        for bias in (above_bound, -above_bound, 1e31, -1e31, 10**310):
+            with self.subTest(bias=bias):
+                with self.assertRaisesRegex(ValueError, r"logit_bias values.*1e\+30"):
+                    self._make(logit_bias={"5": bias}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_nonfinite_or_nonnumeric_raises(self):
+        """Invalid bias values receive a validation error naming the token."""
+        for bias in (float("nan"), float("inf"), float("-inf"), "1.0", None):
+            with self.subTest(bias=bias):
+                with self.assertRaisesRegex(ValueError, "logit_bias values.*token 5"):
+                    self._make(logit_bias={"5": bias}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_numeric_boundaries_remain_valid(self):
+        """Keep inclusive bounds and finite token biases beyond [-100, 100]."""
+        for temperature in (0.0, 1e-6, 0.5, 1.0):
+            with self.subTest(temperature=temperature):
+                self._make(
+                    temperature=temperature,
+                    logit_bias={
+                        "0": -1e30,
+                        "1": 1e30,
+                        "2": -1e9,
+                        "3": 100,
+                        "4": -100,
+                        "5": 0.0,
+                        "6": True,
+                    },
+                ).verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
         """Reject structural_tag combined with any other grammar constraint.

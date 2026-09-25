@@ -36,6 +36,8 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_SAMPLE = 14
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
+    DFLASH_DRAFT_SAMPLE = 17  # selector proposal tokens, candidate IDs and q rows
+    DFLASH_DRAFT_GREEDY = 18  # greedy draft proposal (block minus anchor) from the selector / vocab-parallel head
 
     @property
     def slug(self) -> str:
@@ -55,6 +57,7 @@ _RNG = frozenset(
         SpecTpSyncSite.DFLASH_SELECTOR,
         SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE,
         SpecTpSyncSite.DFLASH_TARGET,
+        SpecTpSyncSite.DFLASH_DRAFT_SAMPLE,
     }
 )
 

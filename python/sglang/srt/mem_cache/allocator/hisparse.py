@@ -13,6 +13,9 @@ from sglang.srt.utils.common import get_num_new_pages
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def _forward_fence_children(self):
+        return (self.logical_attn_allocator, self.hisparse_attn_allocator)
+
     def __init__(
         self,
         size: int,
@@ -262,6 +265,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def _forward_fence_children(self):
+        return (self.logical_attn_allocator, self.hisparse_attn_allocator)
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,

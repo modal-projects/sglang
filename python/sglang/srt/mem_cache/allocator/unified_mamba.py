@@ -47,6 +47,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     sub-allocators own independent virtual-id spaces.
     """
 
+    def _forward_fence_children(self):
+        return (self.full_attn_allocator, self.mamba_allocator)
+
     def __init__(
         self,
         *,

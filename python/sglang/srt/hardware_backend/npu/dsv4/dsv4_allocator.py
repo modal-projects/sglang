@@ -104,6 +104,9 @@ def alloc_paged_token_slots_reserve_extend(
 class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """SWA allocator + C128 KV allocator and full-derived C4 locations."""
 
+    def _forward_fence_children(self):
+        return (*super()._forward_fence_children(), self.c128_attn_allocator)
+
     def __init__(
         self,
         size: int,

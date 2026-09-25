@@ -2143,6 +2143,12 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+            if (
+                isinstance(token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+                and not self.is_hybrid_swa
+                and token_to_kv_pool.size == token_to_kv_pool_allocator.size
+            ):
+                token_to_kv_pool_allocator.register_zero_pages_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:

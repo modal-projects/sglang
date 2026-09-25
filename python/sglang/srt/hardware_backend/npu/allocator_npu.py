@@ -94,7 +94,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages_item:]
+        self._pop_free_pages(num_new_pages_item)
         return out_indices.int()
 
     def alloc_decode(
@@ -133,19 +133,8 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._pop_free_pages(num_new_pages)
         return out_indices.int()
 
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-
-        if self.free_group is None:
-            device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            self._release_page_ids(free_page_indices.to(device))
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
-
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+    def _unique_page_ids(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return torch.unique(page_ids.cpu()).to(page_ids.device)

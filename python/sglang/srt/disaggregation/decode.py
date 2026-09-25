@@ -2609,6 +2609,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
+                if batch:
+                    self.token_to_kv_pool_allocator.carry_frees_into_next_launch()
 
             # Launch the current batch
             if batch:

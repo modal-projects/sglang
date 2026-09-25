@@ -36,6 +36,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
 
+    def _forward_fence_children(self):
+        if self.full_attn_allocator is self.swa_attn_allocator:
+            return (self.full_attn_allocator,)
+        return (self.full_attn_allocator, self.swa_attn_allocator)
+
     def __init__(
         self,
         size: int,

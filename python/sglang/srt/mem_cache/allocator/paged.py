@@ -132,6 +132,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._zero_pages_pools = [kvcache] if self._can_zero_pages(kvcache) else []
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -170,8 +171,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_pages > len(self.free_pages):
             return None
 
-        out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
+        out_pages = self._pop_free_pages(num_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -225,7 +225,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._pop_free_pages(num_new_pages)
         return out_indices
 
     def alloc_decode(
@@ -264,15 +264,44 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._pop_free_pages(num_new_pages)
         return out_indices
+
+    def _can_zero_pages(self, kvcache: KVCache) -> bool:
+        # A subclass with a different layout must opt in with its own implementation.
+        # Widened virtual pages (DCP) do not share the pool's physical row space.
+        return (
+            kvcache is not None
+            and kvcache.supports_zero_pages()
+            and kvcache.page_size == self.page_size
+        )
+
+    def register_zero_pages_pool(self, kvcache: KVCache) -> None:
+        if (
+            self._zero_pages_pools
+            and self._can_zero_pages(kvcache)
+            and all(pool is not kvcache for pool in self._zero_pages_pools)
+        ):
+            self._zero_pages_pools.append(kvcache)
+
+    def _pop_free_pages(self, num_pages: int) -> torch.Tensor:
+        pages = self.free_pages[:num_pages]
+        if num_pages:
+            self._page_allocated[pages] = True
+            if self._zero_pages_pools:
+                # A redundant overlap forward may still write a finished owner's pages.
+                self._fence_recycled_pages()
+                for pool in self._zero_pages_pools:
+                    pool.zero_pages(pages)
+        self.free_pages = self.free_pages[num_pages:]
+        return pages
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.free_group is None:
-            self._release_page_ids(torch.unique(free_index // self.page_size))
+            self._release_page_ids(free_index // self.page_size)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
@@ -281,7 +310,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Fixed-shape free(): page-aligned start plus contiguous per-page tokens
-        make ``free_index[::page_size]`` hit each page once; no torch.unique sync."""
+        make ``free_index[::page_size]`` hit each page once."""
         if free_index.numel() == 0:
             return
 
@@ -299,7 +328,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_ids(reps // ps)
 
     def free_page_ids(self, page_ids: torch.Tensor):
-        """Free exactly these pages; no page twice, no dedup."""
+        """Release page IDs without expanding them into token locations."""
         if page_ids.numel() == 0:
             return
 
@@ -314,12 +343,32 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         pages = self.get_all_free_pages()
         assert len(torch.unique(pages)) == len(pages)
 
+    def _unique_page_ids(self, page_ids: torch.Tensor) -> torch.Tensor:
+        return torch.unique(page_ids)
+
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        released = []
+        for ids in page_ids:
+            ids = self._unique_page_ids(ids)
+            in_pool = (ids > 0) & (ids <= self.num_pages)
+            allocated = self._page_allocated[ids.clamp(0, self.num_pages)]
+            valid = in_pool & allocated
+            if self.debug_mode:
+                assert torch.all(valid), (
+                    "free of a reserved, out-of-pool or unallocated page"
+                )
+            ids = ids[valid]
+            self._page_allocated[ids] = False
+            if ids.numel():
+                released.append(ids)
+        if not released:
+            return
+        self._freed_since_forward_launch = True
         if self.need_sort:
-            self.staged_pages.extend(page_ids)
-            self.num_staged_pages += sum(ids.numel() for ids in page_ids)
+            self.staged_pages.extend(released)
+            self.num_staged_pages += sum(ids.numel() for ids in released)
         else:
-            self.free_pages = torch.cat((*page_ids, self.free_pages))
+            self.free_pages = torch.cat((*released, self.free_pages))
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -344,6 +393,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        self._page_allocated = torch.zeros(
+            self.num_pages + 1, dtype=torch.bool, device=self.device
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

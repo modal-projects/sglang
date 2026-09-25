@@ -74,6 +74,11 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
 
     Records are written to files in the directory specified by `--export-metrics-to-file-dir`
     server launch flag. File names are of the form `"sglang-request-metrics-{hour_suffix}.log"`.
+
+    Each record includes a bounded `finish_reason_type` (stop, length, abort,
+    unknown) and `finish_reason_status_code`: 200 for stop/length, a valid integer
+    status from abort metadata, or null. These describe finish metadata, not the
+    HTTP transport status or request success; raw `finish_reason` is retained.
     """
 
     def __init__(
@@ -93,6 +98,37 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self._current_file_handler = None
         self._current_file_lock = asyncio.Lock()
         self._current_hour_suffix = None
+
+    def _format_output_data(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], out_dict: dict
+    ) -> dict:
+        record = super()._format_output_data(obj, out_dict)
+        finish_reason = record.get("finish_reason")
+        reason_type = (
+            finish_reason.get("type") if isinstance(finish_reason, dict) else None
+        )
+        if reason_type not in ("stop", "length", "abort"):
+            reason_type = "unknown"
+
+        status_code = None
+        if reason_type in ("stop", "length"):
+            status_code = 200
+        elif reason_type == "abort":
+            code = finish_reason.get("status_code")
+            if (
+                isinstance(code, int)
+                and not isinstance(code, bool)
+                and 100 <= code <= 599
+            ):
+                status_code = int(code)
+
+        for name, value in (
+            ("finish_reason_type", reason_type),
+            ("finish_reason_status_code", status_code),
+        ):
+            if name not in self.out_skip_names:
+                record[name] = value
+        return record
 
     def _ensure_file_handler(self, hour_suffix: str):
         """Ensure the file handler is open for the current hour suffix."""

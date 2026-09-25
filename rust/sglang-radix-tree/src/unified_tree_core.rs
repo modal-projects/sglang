@@ -504,7 +504,29 @@ impl Default for CacheInitParams {
     }
 }
 
-/// Radix tree of cached token prefixes; each node carries its KV per component.
+/// Pool containing the tensor identified by an eviction free cause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvictionFreeTier {
+    Device,
+    Host,
+}
+
+/// A cause supplied by the producer for an individual freed tensor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvictionCause {
+    Other,
+}
+
+/// Cause metadata for one tensor in a component's device or host free list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvictionFreeCause {
+    pub component_type: ComponentType,
+    pub tier: EvictionFreeTier,
+    /// Position within this component's free list for the selected tier.
+    pub index: usize,
+    pub cause: EvictionCause,
+}
+
 /// A single eviction step's outputs: this step's per-component evicted
 /// counts (deltas, for the Controller to accumulate) and freed tensors.
 #[derive(Default, Debug)]
@@ -512,6 +534,7 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
+    pub free_causes: Vec<EvictionFreeCause>,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -519,6 +542,8 @@ pub struct EvictionStepResult {
 /// plus `reset()`.
 pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) arena: NodeArena<K>,
+    /// Per-free causes captured only while an eviction result is being built.
+    eviction_free_causes: Option<Vec<EvictionFreeCause>>,
     /// Ordered component registry; each driver reports its own type.
     components: Vec<Arc<dyn TreeComponent<K> + Send + Sync>>,
     /// Prebuilt per-type driver lookup, indexed by `ComponentType::idx`.
@@ -719,6 +744,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
             arena,
+            eviction_free_causes: None,
             components: Vec::new(),
             components_by_type: Default::default(),
             component_states: Default::default(),
@@ -1096,16 +1122,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         tail_node_id: NodeId,
     ) -> Result<EvictionStepResult, NodeAccessError> {
-        let tail_node_id = self.arena.resolve(tail_node_id)?;
-        let mut result = EvictionStepResult::default();
-        let component = self.component_by_type_(MAMBA);
-        component.evict_excess_path_states(
-            self,
-            tail_node_id,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        Ok(result)
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let tail_node_id = core.arena.resolve(tail_node_id)?;
+            let component = core.component_by_type_(MAMBA);
+            component.evict_excess_path_states(
+                core,
+                tail_node_id,
+                &mut result.device_frees,
+                &mut result.host_frees,
+            );
+            Ok(())
+        });
+        output.map(|()| result)
     }
 
     /// Bump the reference count on a node's host-side component locks.
@@ -2261,6 +2289,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.components_by_type[component_type.idx()].clone()
     }
 
+    /// Isolate each operation's free-list indexes, restoring the outer recorder
+    /// after nested calls and after operations that return an error.
+    fn with_eviction_free_causes_<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, &mut EvictionStepResult) -> T,
+    ) -> (T, EvictionStepResult) {
+        let previous = self.eviction_free_causes.replace(Vec::new());
+        let mut result = EvictionStepResult::default();
+        let output = operation(self, &mut result);
+        result.free_causes = std::mem::replace(&mut self.eviction_free_causes, previous)
+            .expect("eviction operation must retain its cause recorder");
+        (output, result)
+    }
+
     /// Begin a component's device-eviction walk for up to request_cnt tokens.
     pub fn evict_device_start(&mut self, component_type: ComponentType, request_cnt: usize) {
         self.component_by_type_(component_type)
@@ -2273,25 +2315,26 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         baseline: &HashMap<ComponentType, usize>,
     ) -> (Option<NodeId>, EvictionStepResult) {
-        let mut tracker = baseline.clone();
-        // The walk gates on the walked component's entry, so seed it.
-        tracker.entry(component_type).or_insert(0);
-        let mut result = EvictionStepResult::default();
-        let node_id = self
-            .component_by_type_(component_type)
-            .evict_device_next_node(
-                self,
-                &mut tracker,
-                &mut result.device_frees,
-                &mut result.host_frees,
-            );
-        for (ct, total) in tracker {
-            let delta = total - baseline.get(&ct).copied().unwrap_or(0);
-            if delta > 0 {
-                result.tracker.insert(ct, delta);
+        self.with_eviction_free_causes_(|core, result| {
+            let mut tracker = baseline.clone();
+            // The walk gates on the walked component's entry, so seed it.
+            tracker.entry(component_type).or_insert(0);
+            let node_id = core
+                .component_by_type_(component_type)
+                .evict_device_next_node(
+                    core,
+                    &mut tracker,
+                    &mut result.device_frees,
+                    &mut result.host_frees,
+                );
+            for (ct, total) in tracker {
+                let delta = total - baseline.get(&ct).copied().unwrap_or(0);
+                if delta > 0 {
+                    result.tracker.insert(ct, delta);
+                }
             }
-        }
-        (node_id.map(|idx| self.arena.node(idx).id), result)
+            node_id.map(|idx| core.arena.node(idx).id)
+        })
     }
 
     /// Finish a component's device-eviction walk.
@@ -2308,38 +2351,42 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         is_write_back: bool,
     ) -> Result<(Option<BackupKV>, EvictionStepResult), NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let mut result = EvictionStepResult::default();
-        {
-            let node = self.arena.node(node_id);
-            assert!(
-                self.is_evictable_device_leaf_(node),
-                "node {node_id} is not a D-leaf"
-            );
-        }
-        if self.arena.node(node_id).backuped() {
-            self.demote_(
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let node_id = core.arena.resolve(node_id)?;
+            {
+                let node = core.arena.node(node_id);
+                assert!(
+                    core.is_evictable_device_leaf_(node),
+                    "node {node_id} is not a D-leaf"
+                );
+            }
+            if core.arena.node(node_id).backuped() {
+                core.demote_(
+                    node_id,
+                    &mut result.tracker,
+                    &mut result.device_frees,
+                    &mut result.host_frees,
+                );
+                return Ok(None);
+            }
+            if is_write_back {
+                let backup = core.build_backup_kv_action_(
+                    core.arena.node(node_id),
+                    /* write_back = */ true,
+                );
+                return Ok(Some(backup));
+            }
+
+            // Write-through: node has no backup, delete entirely.
+            core.delete_unbacked_device_leaf_(
                 node_id,
                 &mut result.tracker,
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
-            return Ok((None, result));
-        }
-        if is_write_back {
-            let backup = self
-                .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ true);
-            return Ok((Some(backup), result));
-        }
-
-        // Write-through: node has no backup, delete entirely.
-        self.delete_unbacked_device_leaf_(
-            node_id,
-            &mut result.tracker,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        Ok((None, result))
+            Ok(None)
+        });
+        output.map(|value| (value, result))
     }
 
     /// Write-back fallback when a D-leaf's D->H backup fails under host
@@ -2350,64 +2397,66 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
     ) -> Result<(bool, EvictionStepResult), NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let mut result = EvictionStepResult::default();
-        {
-            let node = self.arena.node(node_id);
-            assert!(
-                self.is_evictable_device_leaf_(node),
-                "node {node_id} is not a D-leaf"
-            );
-            // A failed backup never issues the D->H copy, so the subtree root has
-            // no host state and no in-flight DMA reading its device slots.
-            assert!(!node.backuped() && node.write_through_pending_id.is_none());
-            if node.is_host_locked() {
-                return Ok((false, result));
-            }
-        }
-        let mut descendants: Vec<NodeIdx_> = Vec::new();
-        let mut stack: Vec<NodeIdx_> = self
-            .arena
-            .node(node_id)
-            .children
-            .values()
-            .copied()
-            .collect();
-        while let Some(cur_id) = stack.pop() {
-            let cur = self.arena.node(cur_id);
-            if cur.is_device_locked() || cur.is_host_locked() {
-                return Ok((false, result));
-            }
-            descendants.push(cur_id);
-            stack.extend(cur.children.values().copied());
-        }
-        for &desc_id in descendants.iter().rev() {
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let node_id = core.arena.resolve(node_id)?;
             {
-                let desc = self.arena.node(desc_id);
-                // Host-only by construction: a device descendant would contradict
-                // this node being a D-leaf, and D-leaves evict before ancestors.
+                let node = core.arena.node(node_id);
                 assert!(
-                    desc.evicted() && desc.backuped(),
-                    "node {desc_id} not host-only"
+                    core.is_evictable_device_leaf_(node),
+                    "node {node_id} is not a D-leaf"
                 );
-                assert!(desc.write_through_pending_id.is_none());
+                // A failed backup never issues the D->H copy, so the subtree root has
+                // no host state and no in-flight DMA reading its device slots.
+                assert!(!node.backuped() && node.write_through_pending_id.is_none());
+                if node.is_host_locked() {
+                    return Ok(false);
+                }
             }
-            self.release_all_component_layers_(
-                desc_id,
-                StorageMedium::Cpu,
+            let mut descendants: Vec<NodeIdx_> = Vec::new();
+            let mut stack: Vec<NodeIdx_> = core
+                .arena
+                .node(node_id)
+                .children
+                .values()
+                .copied()
+                .collect();
+            while let Some(cur_id) = stack.pop() {
+                let cur = core.arena.node(cur_id);
+                if cur.is_device_locked() || cur.is_host_locked() {
+                    return Ok(false);
+                }
+                descendants.push(cur_id);
+                stack.extend(cur.children.values().copied());
+            }
+            for &desc_id in descendants.iter().rev() {
+                {
+                    let desc = core.arena.node(desc_id);
+                    // Host-only by construction: a device descendant would contradict
+                    // this node being a D-leaf, and D-leaves evict before ancestors.
+                    assert!(
+                        desc.evicted() && desc.backuped(),
+                        "node {desc_id} not host-only"
+                    );
+                    assert!(desc.write_through_pending_id.is_none());
+                }
+                core.release_all_component_layers_(
+                    desc_id,
+                    StorageMedium::Cpu,
+                    &mut result.tracker,
+                    &mut result.device_frees,
+                    &mut result.host_frees,
+                );
+                core.remove_leaf_from_parent_(desc_id);
+            }
+            core.delete_unbacked_device_leaf_(
+                node_id,
                 &mut result.tracker,
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
-            self.remove_leaf_from_parent_(desc_id);
-        }
-        self.delete_unbacked_device_leaf_(
-            node_id,
-            &mut result.tracker,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        Ok((true, result))
+            Ok(true)
+        });
+        output.map(|value| (value, result))
     }
 
     /// Free every component layer on the node and detach it from the LRU
@@ -2463,28 +2512,29 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         num_tokens: usize,
     ) -> EvictionStepResult {
-        let mut result = EvictionStepResult::default();
-        if let Some(component) = self.try_component_by_type_(component_type) {
-            // The drive gates on the driven component's entry, so seed it.
-            result.tracker.insert(component_type, 0);
-            if self.is_write_back {
-                component.reclaim_coexisting_host_values(
-                    self,
+        self.with_eviction_free_causes_(|core, result| {
+            if let Some(component) = core.try_component_by_type_(component_type) {
+                // The drive gates on the driven component's entry, so seed it.
+                result.tracker.insert(component_type, 0);
+                if core.is_write_back {
+                    component.reclaim_coexisting_host_values(
+                        core,
+                        num_tokens,
+                        &mut result.tracker,
+                        &mut result.device_frees,
+                        &mut result.host_frees,
+                    );
+                }
+                component.drive_host_eviction(
+                    core,
                     num_tokens,
                     &mut result.tracker,
                     &mut result.device_frees,
                     &mut result.host_frees,
                 );
             }
-            component.drive_host_eviction(
-                self,
-                num_tokens,
-                &mut result.tracker,
-                &mut result.device_frees,
-                &mut result.host_frees,
-            );
-        }
-        result
+        })
+        .1
     }
 
     pub(crate) fn can_reclaim_coexisting_host_value_(
@@ -2570,29 +2620,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Release a node's device KV once its host copy exists; the node stays in the
     /// tree, now host-only.
     pub fn demote(&mut self, node_id: NodeId) -> Result<EvictionStepResult, TreeCoreRuntimeError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let mut result = EvictionStepResult::default();
-        // Skip a deferred demote when a load-back now pins the device indices.
-        if self.arena.node(node_id).is_load_back_pending() {
-            return Ok(result);
-        }
-        {
-            let node = self.arena.node(node_id);
-            if node.evicted() || !node.backuped() {
-                return Err(TreeCoreRuntimeError::InvalidDemoteState {
-                    node_id: node.id,
-                    evicted: node.evicted(),
-                    backuped: node.backuped(),
-                });
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let node_id = core.arena.resolve(node_id)?;
+            // Skip a deferred demote when a load-back now pins the device indices.
+            if core.arena.node(node_id).is_load_back_pending() {
+                return Ok(());
             }
-        }
-        self.demote_(
-            node_id,
-            &mut result.tracker,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        Ok(result)
+            {
+                let node = core.arena.node(node_id);
+                if node.evicted() || !node.backuped() {
+                    return Err(TreeCoreRuntimeError::InvalidDemoteState {
+                        node_id: node.id,
+                        evicted: node.evicted(),
+                        backuped: node.backuped(),
+                    });
+                }
+            }
+            core.demote_(
+                node_id,
+                &mut result.tracker,
+                &mut result.device_frees,
+                &mut result.host_frees,
+            );
+            Ok(())
+        });
+        output.map(|()| result)
     }
 
     /// Drop a backed-up node's device value, keeping the host copy.
@@ -2774,9 +2826,35 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target: EvictLayer,
         tracker: Option<&mut HashMap<ComponentType, usize>>,
     ) -> (usize, usize) {
+        let record_retired =
+            self.eviction_free_causes.is_some() && self.arena.node(node_id).retired;
+        let device_start = device_frees.get(&component_type).map_or(0, Vec::len);
+        let host_start = host_frees.get(&component_type).map_or(0, Vec::len);
         let component = self.component_by_type_(component_type);
         let (device_freed, host_freed) =
             component.evict_component(self, node_id, device_frees, host_frees, target);
+        if record_retired {
+            let causes = self.eviction_free_causes.as_mut().unwrap();
+            for (tier, start, end) in [
+                (
+                    EvictionFreeTier::Device,
+                    device_start,
+                    device_frees.get(&component_type).map_or(0, Vec::len),
+                ),
+                (
+                    EvictionFreeTier::Host,
+                    host_start,
+                    host_frees.get(&component_type).map_or(0, Vec::len),
+                ),
+            ] {
+                causes.extend((start..end).map(|index| EvictionFreeCause {
+                    component_type,
+                    tier,
+                    index,
+                    cause: EvictionCause::Other,
+                }));
+            }
+        }
         if let Some(tracker) = tracker {
             let freed = if target.contains(EvictLayer::Device) {
                 device_freed
@@ -4964,18 +5042,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         target: EvictLayer,
     ) -> Result<EvictionStepResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        self.assert_component_enabled_(component_type);
-        let mut result = EvictionStepResult::default();
-        self.evict_component_and_detach_lru_(
-            node_id,
-            component_type,
-            &mut result.device_frees,
-            &mut result.host_frees,
-            target,
-            Some(&mut result.tracker),
-        );
-        Ok(result)
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let node_id = core.arena.resolve(node_id)?;
+            core.assert_component_enabled_(component_type);
+            core.evict_component_and_detach_lru_(
+                node_id,
+                component_type,
+                &mut result.device_frees,
+                &mut result.host_frees,
+                target,
+                Some(&mut result.tracker),
+            );
+            Ok(())
+        });
+        output.map(|()| result)
     }
 
     /// Validate component locks for a cascade without mutating the tree.
@@ -5016,15 +5096,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         node_id: NodeId,
     ) -> Result<EvictionStepResult, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        let mut result = EvictionStepResult::default();
-        self.iteratively_delete_tombstone_leaf_(
-            node_id,
-            &mut result.tracker,
-            &mut result.device_frees,
-            &mut result.host_frees,
-        );
-        Ok(result)
+        let (output, result) = self.with_eviction_free_causes_(|core, result| {
+            let node_id = core.arena.resolve(node_id)?;
+            core.iteratively_delete_tombstone_leaf_(
+                node_id,
+                &mut result.tracker,
+                &mut result.device_frees,
+                &mut result.host_frees,
+            );
+            Ok(())
+        });
+        output.map(|()| result)
     }
 
     /// Run one component's real match-result finalizer.

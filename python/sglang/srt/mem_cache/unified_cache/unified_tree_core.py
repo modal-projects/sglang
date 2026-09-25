@@ -20,6 +20,7 @@ import logging
 import sys
 from array import array
 from collections import defaultdict
+from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
@@ -76,6 +77,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
+    EvictionFreeCause,
     InsertStepResult,
     NodeId,
     PrefixRef,
@@ -487,6 +489,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
         self._tracked_unbacked_tokens = 0
+        self._active_eviction_free_causes: Optional[list[EvictionFreeCause]] = None
         self._is_tracking_unbacked_tokens = False
 
         self.root_node = self._new_node()
@@ -853,24 +856,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
         result = DecSwaLockOnlyResult()
-        node = self.node_by_id(node_id)
-        self._assert_receipt_anchor(node, params)
-        swa_component = self.components_by_type.get(ComponentType.SWA)
-        if swa_component is None:
-            return result
-        swa_component.release_window_lock(
-            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
-        )
+        with self._capture_eviction_free_causes(result.free_causes):
+            node = self.node_by_id(node_id)
+            self._assert_receipt_anchor(node, params)
+            swa_component = self.components_by_type.get(ComponentType.SWA)
+            if swa_component is None:
+                return result
+            swa_component.release_window_lock(
+                node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
+            )
 
-        # Drop strictly-lower-priority locks co-located on the node, skipping
-        # any the paired inc never took (matters for FULL+SWA+MAMBA models).
-        swa_priority = swa_component.eviction_priority(is_leaf=False)
-        for comp in reversed(self.components):
-            if comp.component_type in params.skipped_lock_components:
-                continue
-            if comp.eviction_priority(is_leaf=False) < swa_priority:
-                comp.release_component_lock(node, params)
-        return result
+            # Drop strictly-lower-priority locks co-located on the node, skipping
+            # any the paired inc never took (matters for FULL+SWA+MAMBA models).
+            swa_priority = swa_component.eviction_priority(is_leaf=False)
+            for comp in reversed(self.components):
+                if comp.component_type in params.skipped_lock_components:
+                    continue
+                if comp.eviction_priority(is_leaf=False) < swa_priority:
+                    comp.release_component_lock(node, params)
+            return result
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
@@ -1658,6 +1662,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
         self.components_by_type[component_type].evict_device_start(request_cnt)
 
+    @contextmanager
+    def _capture_eviction_free_causes(self, free_causes):
+        previous = self._active_eviction_free_causes
+        self._active_eviction_free_causes = free_causes
+        try:
+            yield
+        finally:
+            self._active_eviction_free_causes = previous
+
     def _begin_tracking_unbacked_tokens(self) -> None:
         assert not self._is_tracking_unbacked_tokens
         assert self._tracked_unbacked_tokens == 0
@@ -1675,24 +1688,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> EvictDeviceNextNodeResult:
         """Advance one component eviction step and report whether it progressed."""
         result = EvictDeviceNextNodeResult()
-        # The walk reads running totals for its doneness check; the result
-        # carries only this step's delta.
-        updated_tracker = defaultdict(int, tracker)
-        self._begin_tracking_unbacked_tokens()
-        try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
-                updated_tracker, result.device_frees, result.host_frees
-            )
-        finally:
-            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
-        for ct, n in updated_tracker.items():
-            delta = n - tracker.get(ct, 0)
-            if delta:
-                result.tracker[ct] = delta
-        result.made_progress = result.node_id is not None or bool(result.tracker)
-        return result
+        with self._capture_eviction_free_causes(result.free_causes):
+            # The walk reads running totals for its doneness check; the result
+            # carries only this step's delta.
+            updated_tracker = defaultdict(int, tracker)
+            self._begin_tracking_unbacked_tokens()
+            try:
+                result.node_id = self.components_by_type[
+                    component_type
+                ].evict_device_next_node(
+                    updated_tracker, result.device_frees, result.host_frees
+                )
+            finally:
+                result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+            for ct, n in updated_tracker.items():
+                delta = n - tracker.get(ct, 0)
+                if delta:
+                    result.tracker[ct] = delta
+            result.made_progress = result.node_id is not None or bool(result.tracker)
+            return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
         """Finish a component's device-eviction walk."""
@@ -1705,33 +1719,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for an unbacked write-back node, the result carries the BackupKV for
         the cache to execute and then demote."""
         result = EvictDeviceLeafResult()
-        node = self.node_by_id(node_id)
-        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        self._begin_tracking_unbacked_tokens()
-        try:
-            if not node.backuped:
-                if is_write_back:
-                    result.backup_kv = self._build_backup_kv_action(
-                        node, write_back=True
+        with self._capture_eviction_free_causes(result.free_causes):
+            node = self.node_by_id(node_id)
+            assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+            self._begin_tracking_unbacked_tokens()
+            try:
+                if not node.backuped:
+                    if is_write_back:
+                        result.backup_kv = self._build_backup_kv_action(
+                            node, write_back=True
+                        )
+                        return result
+                    # Write-through: node has no backup, delete entirely.
+                    self._delete_unbacked_device_leaf(
+                        node,
+                        result.tracker,
+                        device_frees=result.device_frees,
+                        host_frees=result.host_frees,
                     )
                     return result
-                # Write-through: node has no backup, delete entirely.
-                self._delete_unbacked_device_leaf(
+                self._demote(
                     node,
                     result.tracker,
                     device_frees=result.device_frees,
                     host_frees=result.host_frees,
                 )
                 return result
-            self._demote(
-                node,
-                result.tracker,
-                device_frees=result.device_frees,
-                host_frees=result.host_frees,
-            )
-            return result
-        finally:
-            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+            finally:
+                result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
@@ -1739,44 +1754,45 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device eviction keeps making progress instead of leaving its KV
         unevictable until host space frees up."""
         result = DropSubtreeNoHostResult(is_dropped=False)
-        node = self.node_by_id(node_id)
-        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        # A failed backup never issues the D->H copy, so the subtree root has
-        # no host state and no in-flight DMA reading its device slots.
-        assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
-            return result
-        descendants: list[UnifiedTreeNode] = []
-        stack = list(node.children.values())
-        while stack:
-            cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
-            ):
+        with self._capture_eviction_free_causes(result.free_causes):
+            node = self.node_by_id(node_id)
+            assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+            # A failed backup never issues the D->H copy, so the subtree root has
+            # no host state and no in-flight DMA reading its device slots.
+            assert not node.backuped and node.write_through_pending_id is None
+            if any(cd.host_lock_ref > 0 for cd in node.component_data):
                 return result
-            descendants.append(cur)
-            stack.extend(cur.children.values())
-        for desc in reversed(descendants):
-            # Host-only by construction: a device descendant would contradict
-            # this node being a D-leaf, and D-leaves evict before ancestors.
-            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
-            assert desc.write_through_pending_id is None
-            self._release_all_component_layers(
-                desc,
-                StorageMedium.CPU,
+            descendants: list[UnifiedTreeNode] = []
+            stack = list(node.children.values())
+            while stack:
+                cur = stack.pop()
+                if any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                ):
+                    return result
+                descendants.append(cur)
+                stack.extend(cur.children.values())
+            for desc in reversed(descendants):
+                # Host-only by construction: a device descendant would contradict
+                # this node being a D-leaf, and D-leaves evict before ancestors.
+                assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
+                assert desc.write_through_pending_id is None
+                self._release_all_component_layers(
+                    desc,
+                    StorageMedium.CPU,
+                    result.tracker,
+                    result.device_frees,
+                    result.host_frees,
+                )
+                self._remove_leaf_from_parent(desc)
+            self._delete_unbacked_device_leaf(
+                node,
                 result.tracker,
-                result.device_frees,
-                result.host_frees,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
             )
-            self._remove_leaf_from_parent(desc)
-        self._delete_unbacked_device_leaf(
-            node,
-            result.tracker,
-            device_frees=result.device_frees,
-            host_frees=result.host_frees,
-        )
-        result.is_dropped = True
-        return result
+            result.is_dropped = True
+            return result
 
     def _release_all_component_layers(
         self,
@@ -1826,36 +1842,39 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         write_back, FULL pressure reclaims redundant Full host copies first
         (skipped if SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1)."""
         result = DriveHostEvictionResult()
-        comp = self.components_by_type.get(component_type)
-        if comp is not None:
-            if (
-                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
-                and self.is_write_back
-                and component_type == BASE_COMPONENT_TYPE
-            ):
-                self._reclaim_full_host_duplicates(
+        with self._capture_eviction_free_causes(result.free_causes):
+            comp = self.components_by_type.get(component_type)
+            if comp is not None:
+                if (
+                    not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+                    and self.is_write_back
+                    and component_type == BASE_COMPONENT_TYPE
+                ):
+                    self._reclaim_full_host_duplicates(
+                        num_tokens,
+                        result.tracker,
+                        result.device_frees,
+                        result.host_frees,
+                    )
+                comp.drive_host_eviction(
                     num_tokens,
                     result.tracker,
                     result.device_frees,
                     result.host_frees,
                 )
-            comp.drive_host_eviction(
-                num_tokens,
-                result.tracker,
-                result.device_frees,
-                result.host_frees,
-            )
-        return result
+            return result
 
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        free_causes: Optional[list[EvictionFreeCause]] = None,
     ) -> None:
-        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
-            self.node_by_id(tail_node_id), device_frees, host_frees
-        )
+        with self._capture_eviction_free_causes(free_causes):
+            self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+                self.node_by_id(tail_node_id), device_frees, host_frees
+            )
 
     def _reclaim_full_host_duplicates(
         self,
@@ -1956,13 +1975,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Release a node's device KV once its host copy exists; the node stays in the
         tree, now host-only."""
         result = DemoteResult()
-        self._demote(
-            self.node_by_id(node_id),
-            result.tracker,
-            result.device_frees,
-            result.host_frees,
-        )
-        return result
+        with self._capture_eviction_free_causes(result.free_causes):
+            self._demote(
+                self.node_by_id(node_id),
+                result.tracker,
+                result.device_frees,
+                result.host_frees,
+            )
+            return result
 
     def _demote(
         self,
@@ -2098,9 +2118,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
         had_host_copy = node.component_data[comp.component_type].host_value is not None
+        free_causes = self._active_eviction_free_causes
+        record_retired = node.retired and free_causes is not None
+        if record_retired:
+            device_start = len(device_frees.get(comp.component_type, ()))
+            host_start = len(host_frees.get(comp.component_type, ()))
         device_freed, host_freed = comp.evict_component(
             node, target=target, device_frees=device_frees, host_frees=host_frees
         )
+        if record_retired:
+            for index in range(
+                device_start, len(device_frees.get(comp.component_type, ()))
+            ):
+                free_causes.append(
+                    EvictionFreeCause(comp.component_type, "device", index)
+                )
+            for index in range(
+                host_start, len(host_frees.get(comp.component_type, ()))
+            ):
+                free_causes.append(
+                    EvictionFreeCause(comp.component_type, "host", index)
+                )
         if (
             self.ghost_tracker is not None
             and comp.component_type == BASE_COMPONENT_TYPE

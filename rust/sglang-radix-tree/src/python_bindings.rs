@@ -16,9 +16,9 @@ use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    DecLockRefParams, EvictLayer, EvictionCause, EvictionFreeCause, EvictionFreeTier,
+    EvictionStepResult, InsertParams, InsertResult, InsertStepResult, MatchPrefixParams,
+    MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
@@ -749,6 +749,27 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
         .collect()
 }
 
+fn free_causes_to_py(free_causes: Vec<EvictionFreeCause>) -> Vec<(u8, String, usize, String)> {
+    free_causes
+        .into_iter()
+        .map(|free_cause| {
+            let tier = match free_cause.tier {
+                EvictionFreeTier::Device => "device",
+                EvictionFreeTier::Host => "host",
+            };
+            let cause = match free_cause.cause {
+                EvictionCause::Other => "other",
+            };
+            (
+                component_type_to_u8(free_cause.component_type),
+                tier.to_string(),
+                free_cause.index,
+                cause.to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Next-eviction-node step result: the node to evict, whether the walk made
 /// progress, this step's per-component evicted counts, and this step's newly
 /// freed tensors.
@@ -759,6 +780,7 @@ pub struct EvictDeviceNextNodeResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    free_causes: Vec<(u8, String, usize, String)>,
 }
 
 /// Leaf-eviction step result: the backup action for an unbacked
@@ -770,6 +792,7 @@ pub struct EvictDeviceLeafResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    free_causes: Vec<(u8, String, usize, String)>,
 }
 
 /// Drop-subtree result: whether the drop happened, this step's
@@ -780,6 +803,7 @@ pub struct DropSubtreeResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    free_causes: Vec<(u8, String, usize, String)>,
 }
 
 /// Demote result: this step's per-component evicted counts and the
@@ -789,6 +813,7 @@ pub struct DemoteResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    free_causes: Vec<(u8, String, usize, String)>,
 }
 
 /// Python-visible device->storage backup spec.
@@ -870,6 +895,7 @@ pub struct HostEvictionResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    free_causes: Vec<(u8, String, usize, String)>,
 }
 
 impl HostEvictionResultBinding {
@@ -878,6 +904,7 @@ impl HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 }
@@ -1261,6 +1288,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 
@@ -1285,6 +1313,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 
@@ -1738,6 +1767,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 
@@ -1754,6 +1784,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 
@@ -1771,6 +1802,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 
@@ -1908,6 +1940,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            free_causes: free_causes_to_py(result.free_causes),
         })
     }
 

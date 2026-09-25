@@ -637,8 +637,8 @@ class TreeComponent(ABC):
     ) -> None:
         pass
 
-    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
-        """Free evicted host-tier values back to this component's host pool."""
+    def free_host_values(self, host_values: list[torch.Tensor]) -> Optional[int]:
+        """Return the freed slot count, or None if the component does not report it."""
         raise NotImplementedError(f"{self.component_type} must free its host values")
 
     # ---- HiCache Hooks ----

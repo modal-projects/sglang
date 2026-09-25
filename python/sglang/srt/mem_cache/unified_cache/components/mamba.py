@@ -907,24 +907,31 @@ class MambaComponent(TreeComponent):
         if enabled:
             host_lru.cursor_end()
 
-    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+    def free_host_values(self, host_values: list[torch.Tensor]) -> int:
         if self._mamba_pool_host is None:
-            return
+            return 0
         for host_value in host_values:
             self.cache.host_pool_group.free(host_value, pool=PoolName.MAMBA)
+        return sum(len(value) for value in host_values)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
             device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
             host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            free_causes = []
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
-                    action.tail_node_id, device_frees, host_frees
+                    action.tail_node_id, device_frees, host_frees, free_causes
                 )
             finally:
-                self.cache._free_values(device_frees, host_frees)
+                self.cache._free_values(
+                    device_frees,
+                    host_frees,
+                    cause="mamba_path_cap",
+                    free_causes=free_causes,
+                )
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

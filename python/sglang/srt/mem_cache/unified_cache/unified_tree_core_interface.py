@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Literal, Optional, Sequence
 
 import msgspec
 
@@ -28,6 +28,15 @@ class PrefixRef(msgspec.Struct, frozen=True):
     _id: int
 
 
+class EvictionFreeCause(msgspec.Struct, frozen=True):
+    """Override one freed value's operation cause before its node is detached."""
+
+    component_type: ComponentType
+    tier: Literal["device", "host"]
+    index: int
+    cause: Literal["other"] = "other"
+
+
 class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
@@ -43,6 +52,9 @@ class BaseEvictionResult(msgspec.Struct):
     tracker: dict[ComponentType, int] = msgspec.field(
         default_factory=lambda: defaultdict(int)
     )
+
+    # Missing entries inherit the Controller operation's bounded cause.
+    free_causes: list[EvictionFreeCause] = []
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
@@ -505,6 +517,7 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        free_causes: Optional[list[EvictionFreeCause]] = None,
     ) -> None:
         """Evict shallow Mamba device checkpoints beyond the per-path cap on the
         tail's root path, collecting freed values into the caller's dicts."""

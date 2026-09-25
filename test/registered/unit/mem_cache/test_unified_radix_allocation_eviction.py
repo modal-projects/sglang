@@ -41,12 +41,12 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         leaf_count = {"value": 0}
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if tracker[component_type] >= 70:
                 return None, False
             return leaf_count["value"] + 1, True
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             leaf_count["value"] += 1
             tracker[ComponentType.FULL] += 20
             tracker[ComponentType.MAMBA] += 1
@@ -152,10 +152,10 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         ]
         cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_allocator)
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             return (None, False) if tracker[component_type] >= 3 else (1, True)
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 20
             tracker[ComponentType.MAMBA] += 1
             capacity["available"] += 3
@@ -175,7 +175,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             free_ids=2, byte_slots=1
         )
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if (
                 component_type == ComponentType.FULL
                 and tracker[ComponentType.FULL] < 16
@@ -183,7 +183,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 return 1, True
             return None, False
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 4
             capacity["byte_slots"] += 1
             return None
@@ -208,7 +208,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             free_ids=0, byte_slots=1
         )
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if (
                 component_type == ComponentType.MAMBA
                 and tracker[ComponentType.MAMBA] < 1
@@ -216,7 +216,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 return 1, True
             return None, False
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.MAMBA] += 1
             capacity["free_ids"] += 1
             capacity["byte_slots"] += 1
@@ -239,12 +239,12 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             free_ids=0, byte_slots=10
         )
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if component_type == ComponentType.FULL and tracker[ComponentType.FULL] < 4:
                 return 1, True
             return None, False
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 4
             capacity["byte_slots"] += 1
             return None
@@ -266,7 +266,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             free_ids=0, byte_slots=10
         )
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if (
                 component_type == ComponentType.MAMBA
                 and tracker[ComponentType.MAMBA] < 1
@@ -276,7 +276,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 return 2, True
             return None, False
 
-        def evict_leaf(node_id, tracker):
+        def evict_leaf(node_id, tracker, *, cause):
             if node_id == 1:
                 tracker[ComponentType.MAMBA] += 1
                 capacity["free_ids"] += 1
@@ -303,7 +303,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             free_ids=3, byte_slots=2
         )
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if (
                 component_type == ComponentType.MAMBA
                 and tracker[ComponentType.MAMBA] < 1
@@ -313,7 +313,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 return 2, True
             return None, False
 
-        def evict_leaf(node_id, tracker):
+        def evict_leaf(node_id, tracker, *, cause):
             if node_id == 1:
                 tracker[ComponentType.MAMBA] += 1
                 capacity["free_ids"] += 1
@@ -345,7 +345,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         )
         leaf_count = 0
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if (
                 component_type == ComponentType.FULL
                 and tracker[ComponentType.FULL] < 16
@@ -353,7 +353,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 return tracker[ComponentType.FULL] // 4 + 1, True
             return None, False
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             nonlocal leaf_count
             leaf_count += 1
             tracker[ComponentType.FULL] += 4
@@ -387,7 +387,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         allocator.prepare_mamba_allocation = MagicMock(side_effect=prepare)
         cache._evict_device_next_node = MagicMock(return_value=(1, True))
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             nonlocal leaf_count
             leaf_count += 1
             tracker[ComponentType.FULL] += 4
@@ -410,7 +410,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         allocator.prepare_mamba_allocation = MagicMock()
         cache._evict_device_next_node = MagicMock(return_value=(1, True))
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 4
             tracker[ComponentType.MAMBA] += 1
             capacity["byte_slots"] = 2
@@ -441,7 +441,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         allocator.prepare_mamba_allocation = MagicMock(side_effect=prepare)
         cache._evict_device_next_node = MagicMock(return_value=(1, True))
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             nonlocal leaf_count
             leaf_count += 1
             tracker[ComponentType.FULL] += 4
@@ -462,14 +462,14 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         )
         cache.tree_core.full_evictable_size.return_value = 4
 
-        def next_node(component_type, tracker):
+        def next_node(component_type, tracker, *, cause):
             if component_type == ComponentType.FULL and tracker[component_type] < 4:
                 return 1, True
             if component_type == ComponentType.MAMBA and tracker[component_type] < 8:
                 return 2, True
             return None, False
 
-        def evict_leaf(node_id, tracker):
+        def evict_leaf(node_id, tracker, *, cause):
             if node_id == 1:
                 tracker[ComponentType.FULL] += 4
             else:
@@ -510,7 +510,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         cache._evict_device_next_node = MagicMock(return_value=(1, True))
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 4
             allocator.free(torch.tensor([1], dtype=torch.int64))
             return None
@@ -534,7 +534,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         cache._evict_device_next_node = MagicMock(return_value=(1, True))
 
-        def evict_leaf(_node_id, tracker):
+        def evict_leaf(_node_id, tracker, *, cause):
             tracker[ComponentType.FULL] += 4
             capacity["byte_slots"] += 1
             return None

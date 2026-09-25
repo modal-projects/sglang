@@ -1444,11 +1444,12 @@ class SWAComponent(TreeComponent):
         if enabled:
             host_lru.cursor_end()
 
-    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+    def free_host_values(self, host_values: list[torch.Tensor]) -> int:
         if self._swa_kv_pool_host is None:
-            return
+            return 0
         for host_value in host_values:
             self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
+        return sum(len(value) for value in host_values)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator

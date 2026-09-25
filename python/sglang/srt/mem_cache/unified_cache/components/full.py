@@ -495,11 +495,12 @@ class FullComponent(TreeComponent):
         assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
-    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+    def free_host_values(self, host_values: list[torch.Tensor]) -> int:
         if self._full_kv_pool_host is None:
-            return
+            return 0
         for host_value in host_values:
             self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
+        return sum(len(value) for value in host_values)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):

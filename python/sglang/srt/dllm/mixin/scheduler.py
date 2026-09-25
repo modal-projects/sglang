@@ -79,6 +79,19 @@ class SchedulerDllmMixin:
             "FDFO dLLM result is missing accept lengths."
         )
 
+        # Pending results own release until their transfer event has completed.
+        aborted = []
+        for req in batch.reqs:
+            if not req.finished() and req.to_finish is not None:
+                req.update_finish_state(new_accepted_len=0)
+                self._release_aborted_request(req)
+                release_kv_cache(req, self.tree_cache)
+                self._release_dropped_waiting_req_mm_inputs(req)
+                req.time_stats.set_completion_time()
+                aborted.append(req)
+        if aborted and not (fdfo_mode or result.next_token_ids):
+            self.output_streamer.stream_output(aborted, batch.return_logprob)
+
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
@@ -87,6 +100,8 @@ class SchedulerDllmMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
+                if req.finished():
+                    continue
 
                 if not fdfo_mode:
                     next_token_ids = result.next_token_ids[idx].tolist()

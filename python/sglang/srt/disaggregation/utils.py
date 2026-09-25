@@ -1710,3 +1710,8 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+def is_user_abort(req: Req) -> bool:
+    """Client cancellation has explicit origin; internal aborts can be statusless."""
+    return req.user_aborted

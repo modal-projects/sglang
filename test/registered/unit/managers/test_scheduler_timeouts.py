@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -30,10 +31,15 @@ class _FakeReq:
         self.rid = rid
         self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
+        self.kv = ReqKvInfo()
+        self.session = None
+        self.multimodal_inputs = None
         self.beam_group = None
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
+        self.finished_reason = None
+        self.return_logprob = False
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,

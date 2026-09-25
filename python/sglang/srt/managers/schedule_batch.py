@@ -685,9 +685,14 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
-    def release_features(self):
-        """Release feature tensors to free GPU memory."""
-        for item in self.mm_items:
+    def release_features(self, items: Optional[List[MultimodalDataItem]] = None):
+        """Release feature tensors to free GPU memory.
+
+        With items, release only that subset -- e.g. the media a dropped
+        session turn appended on top of the inherited history, which the
+        session does not own and would otherwise leak.
+        """
+        for item in self.mm_items if items is None else items:
             try:
                 # Release both deferred features that were never used and
                 # borrowed features retained for possible re-prefill.
@@ -1000,6 +1005,7 @@ class Req(ReqDllmMixin):
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
+        self.user_aborted = False
         self.session = session
         self.session_id = session_id
         # Used by the session radix cache to reject registration after a close/reopen.

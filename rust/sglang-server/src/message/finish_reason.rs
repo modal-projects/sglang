@@ -101,6 +101,36 @@ impl FinishReason {
         }
     }
 
+    /// Mirrors Python's `finished_outcome` engine-fault classification.
+    pub fn is_engine_fault(&self) -> bool {
+        match self {
+            FinishReason::Known(FinishKind::Stop { err_type, .. }) => {
+                err_type.as_deref().map(String::as_str) == Some("invalid_token")
+            }
+            FinishReason::Known(FinishKind::Abort(a)) => {
+                a.status_code
+                    .is_some_and(|code| (500..600).contains(&code) && code != 503)
+                    || (a.status_code == Some(408)
+                        && a.err_type.as_deref() == Some("encoder_timeout"))
+            }
+            _ => false,
+        }
+    }
+
+    /// OpenAI cannot represent a typed invalid-token stop as a successful completion.
+    pub fn openai_error(&self) -> Option<(u16, &str)> {
+        if let FinishReason::Known(FinishKind::Stop { matched, .. }) = self
+            && self.is_engine_fault()
+        {
+            let message = match matched {
+                Some(Matched::Str(message)) => message.as_str(),
+                _ => "Generation failed because the engine produced an invalid token",
+            };
+            return Some((500, message));
+        }
+        self.abort_status()
+    }
+
     /// `Some((status, message))` when this is an abort carrying a `status_code` —
     /// a scheduler-side request error the API surfaces as that HTTP status instead
     /// of as a normal completion. A plain abort (no code) reads as `None`.
@@ -208,6 +238,18 @@ mod tests {
             serde_json::json!({
                 "type": "abort", "message": "over the limit",
                 "status_code": 400, "err_type": "BadRequestError"
+            }),
+            serde_json::json!({
+                "type": "abort", "message": "encoder wait timed out",
+                "status_code": 408, "err_type": "encoder_timeout"
+            }),
+            serde_json::json!({
+                "type": "abort", "message": "engine failed",
+                "status_code": 500, "err_type": "InternalServerError"
+            }),
+            serde_json::json!({
+                "type": "abort", "message": "queue full",
+                "status_code": 503, "err_type": "ServiceUnavailable"
             }),
         ] {
             let parsed: FinishReason = serde_json::from_value(wire.clone()).unwrap();

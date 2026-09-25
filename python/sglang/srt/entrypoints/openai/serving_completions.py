@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
@@ -21,6 +20,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
+    get_generation_error,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
@@ -31,6 +31,7 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.metrics_collector import finished_outcome
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
@@ -255,7 +256,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                text = content["text"]
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
@@ -274,6 +274,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         content["meta_info"]
                     )
 
+                finish_reason = content["meta_info"].get("finish_reason")
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+                error = get_generation_error(finish_reason)
+                if error is not None:
+                    error_json = self.create_streaming_error_response(
+                        message=error.message,
+                        err_type=error.type,
+                        status_code=error.code,
+                    )
+                    yield f"data: {error_json}\n\n"
+                    if finished_outcome(finish_reason) == "engine_fault":
+                        yield "data: [DONE]\n\n"
+                        return
+                    break
+
+                text = content["text"]
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
@@ -343,27 +359,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 else:
                     delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
-
-                # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
-                # A graceful abort (no status_code, e.g. user-initiated via
-                # /abort_request or session lifecycle cleanup) falls through
-                # to the normal chunk path, matching the non-stream behavior
-                # in tokenizer_manager._handle_abort_finish_reason.
-                if finish_reason_type == "abort" and isinstance(
-                    finish_reason.get("status_code"), HTTPStatus
-                ):
-                    code = finish_reason["status_code"]
-                    error = self.create_streaming_error_response(
-                        finish_reason.get("message", "Generation aborted."),
-                        code.name,
-                        code.value,
-                    )
-                    yield f"data: {error}\n\n"
-                    break
-
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
@@ -527,8 +522,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         ret: List[Dict[str, Any]],
         created: int,
-    ) -> CompletionResponse:
+    ) -> Union[CompletionResponse, ORJSONResponse]:
         """Build completion response from generation results"""
+        for item in ret:
+            error = get_generation_error(item["meta_info"].get("finish_reason"))
+            if error is not None:
+                return ORJSONResponse(
+                    content=error.model_dump(), status_code=error.code
+                )
+
         choices = []
         echo = False
 

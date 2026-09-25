@@ -56,6 +56,117 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     }
 }
 
+pub(super) fn terminal_cases() -> Vec<(serde_json::Value, Option<u16>, bool)> {
+    vec![
+        (
+            json!({"type": "abort", "status_code": 500, "message": "engine failed"}),
+            Some(500),
+            true,
+        ),
+        (
+            json!({"type": "abort", "status_code": 502}),
+            Some(502),
+            true,
+        ),
+        (
+            json!({"type": "abort", "status_code": 599}),
+            Some(599),
+            true,
+        ),
+        (
+            json!({"type": "abort", "status_code": 408, "err_type": "encoder_timeout"}),
+            Some(408),
+            true,
+        ),
+        (
+            json!({"type": "stop", "matched": "invalid token", "err_type": "invalid_token"}),
+            Some(500),
+            true,
+        ),
+        (
+            json!({"type": "abort", "status_code": 503}),
+            Some(503),
+            false,
+        ),
+        (
+            json!({"type": "abort", "status_code": 429}),
+            Some(429),
+            false,
+        ),
+        (
+            json!({"type": "abort", "status_code": 400}),
+            Some(400),
+            false,
+        ),
+        (
+            json!({"type": "abort", "status_code": 400, "err_type": "cancelled"}),
+            Some(400),
+            false,
+        ),
+        (
+            json!({"type": "abort", "status_code": 408}),
+            Some(408),
+            false,
+        ),
+        (json!({"type": "abort"}), None, false),
+        (
+            json!({"type": "stop", "matched": "NaN happened"}),
+            None,
+            false,
+        ),
+        (json!({"type": "stop", "matched": 2}), None, false),
+        (json!({"type": "length", "length": 1}), None, false),
+    ]
+}
+
+pub(super) fn terminal_chunk(rid: &str, reason: serde_json::Value) -> ResponseItem {
+    let ResponseItem::Done(mut output) = chunk(rid, "terminal text", true) else {
+        unreachable!()
+    };
+    let packed = rmp_serde::to_vec_named(&reason).unwrap();
+    output.finish_reason = Some(rmp_serde::from_slice(&packed).unwrap());
+    ResponseItem::Done(output)
+}
+
+pub(super) fn assert_terminal_frames(frames: &[String], code: Option<u16>, engine_fault: bool) {
+    assert_eq!(frames.last().unwrap(), "[DONE]");
+    assert_eq!(frames.iter().filter(|frame| *frame == "[DONE]").count(), 1);
+    let values: Vec<serde_json::Value> = frames[..frames.len() - 1]
+        .iter()
+        .map(|frame| serde_json::from_str(frame).unwrap())
+        .collect();
+    let errors: Vec<_> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.get("error").is_some())
+        .collect();
+    if let Some(code) = code {
+        assert_eq!(errors.len(), 1, "{frames:?}");
+        assert_eq!(errors[0].1["error"]["code"], code);
+        assert!(errors[0].1.get("choices").is_none());
+        if engine_fault {
+            assert_eq!(errors[0].0, values.len() - 1, "{frames:?}");
+            assert!(
+                values.iter().all(|value| value
+                    .get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|choices| !choices.is_empty())),
+                "{frames:?}"
+            );
+        }
+    } else {
+        assert!(errors.is_empty(), "{frames:?}");
+        assert!(
+            values
+                .iter()
+                .any(|value| !value["choices"][0]["finish_reason"].is_null())
+        );
+    }
+    if !engine_fault {
+        assert!(values.last().unwrap()["usage"].is_object(), "{frames:?}");
+    }
+}
+
 /// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,

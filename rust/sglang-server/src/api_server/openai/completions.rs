@@ -544,7 +544,8 @@ pub(super) fn completion_event_stream(
         while let Some((index, item)) = events.next().await {
             let Some(item) = item else {
                 yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
-                continue;
+                yield "[DONE]".to_string();
+                return;
             };
             let output = match item {
                 ResponseItem::Frame(output) => output,
@@ -555,6 +556,10 @@ pub(super) fn completion_event_stream(
                 ResponseItem::Error(error) => {
                     guard.disarm(&rids[index]);
                     yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
+                    if (500..600).contains(&error.http_status()) && error.http_status() != 503 {
+                        yield "[DONE]".to_string();
+                        return;
+                    }
                     continue;
                 }
                 ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
@@ -563,9 +568,13 @@ pub(super) fn completion_event_stream(
             if let Some((code, message)) = output
                 .finish_reason
                 .as_ref()
-                .and_then(|reason| reason.abort_status())
+                .and_then(|reason| reason.openai_error())
             {
                 yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
+                if output.finish_reason.as_ref().is_some_and(|reason| reason.is_engine_fault()) {
+                    yield "[DONE]".to_string();
+                    return;
+                }
                 continue;
             }
 
@@ -878,5 +887,112 @@ mod tests {
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[3], "[DONE]");
+    }
+    /// Engine failures must end with error/DONE, including faults after partial output.
+    #[tokio::test]
+    async fn engine_fault_terminal_stream_contract() {
+        use super::super::test_utils::{assert_terminal_frames, terminal_cases, terminal_chunk};
+        for (reason, code, engine_fault) in terminal_cases() {
+            for partial in [false, true] {
+                for continuous_usage in [false, true] {
+                    let (choice, tx) = submitted(0, 0, "r0");
+                    if partial {
+                        tx.send(chunk("r0", "partial", false)).await.unwrap();
+                    }
+                    tx.send(terminal_chunk("r0", reason.clone())).await.unwrap();
+                    let frames: Vec<_> = completion_event_stream(
+                        vec![choice],
+                        AbortGuard::new_empty(senders()),
+                        "id".into(),
+                        "model".into(),
+                        1,
+                        false,
+                        false,
+                        true,
+                        continuous_usage,
+                    )
+                    .collect()
+                    .await;
+                    assert_terminal_frames(&frames, code, engine_fault);
+                }
+            }
+        }
+    }
+
+    /// Unary responses must reject typed invalid-token stops as well as abort faults.
+    #[tokio::test]
+    async fn engine_fault_terminal_unary_contract() {
+        use super::super::test_utils::{body_json, terminal_cases, terminal_chunk};
+        for (reason, code, _) in terminal_cases() {
+            let (choice, tx) = submitted(0, 0, "r0");
+            tx.send(chunk("r0", "partial", false)).await.unwrap();
+            tx.send(terminal_chunk("r0", reason)).await.unwrap();
+            let response = unary_completion(
+                vec![choice],
+                AbortGuard::new_empty(senders()),
+                "id".into(),
+                "model".into(),
+                1,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), code.unwrap_or(200));
+            let value = body_json(response).await;
+            if let Some(code) = code {
+                assert_eq!(value["error"]["code"], code);
+                assert!(value.get("usage").is_none());
+                assert!(value.get("choices").is_none());
+            } else {
+                assert!(value["usage"].is_object());
+            }
+        }
+    }
+
+    /// A fault in one choice must prevent later choices or buffered tool text from succeeding.
+    #[tokio::test]
+    async fn engine_fault_stops_all_choices_and_parser_flush() {
+        use super::super::test_utils::{assert_terminal_frames, terminal_chunk};
+        use crate::message::response::ResponseItem;
+        use crate::utils::error::Error;
+        for native_error in [false, true] {
+            let (choice0, tx0) = submitted(0, 0, "r0");
+            let (choice1, tx1) = submitted(1, 0, "r1");
+            tx0.send(chunk(
+                "r0",
+                "<tool_call>{\"name\":\"lookup\",\"arguments\":",
+                false,
+            ))
+            .await
+            .unwrap();
+            tx0.send(if native_error {
+                ResponseItem::Error(Error::Internal("engine failed".into()))
+            } else {
+                terminal_chunk(
+                    "r0",
+                    serde_json::json!({"type": "abort", "status_code": 500}),
+                )
+            })
+            .await
+            .unwrap();
+            for _ in 0..4 {
+                tx1.send(chunk("r1", "other choice", false)).await.unwrap();
+            }
+            tx1.send(chunk("r1", "finished", true)).await.unwrap();
+            let frames: Vec<_> = completion_event_stream(
+                vec![choice0, choice1],
+                AbortGuard::new_empty(senders()),
+                "id".into(),
+                "model".into(),
+                1,
+                false,
+                false,
+                true,
+                false,
+            )
+            .collect()
+            .await;
+            assert_terminal_frames(&frames, Some(500), true);
+        }
     }
 }

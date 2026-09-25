@@ -22,11 +22,13 @@ maybe_stub_sgl_kernel()
 
 import asyncio
 import json
+from http import HTTPStatus
 from typing import AsyncIterator
 from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_STR
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -143,6 +145,36 @@ def engine_chunk(text, completion_tokens=1, *, finish=False):
             "cached_tokens": 0,
             "reasoning_tokens": 0,
             "finish_reason": {"type": "stop"} if finish else None,
+        },
+    }
+
+
+def generation_fault_reasons():
+    for status in (HTTPStatus.INTERNAL_SERVER_ERROR, HTTPStatus.BAD_GATEWAY, 599):
+        reason = FINISH_ABORT("engine failed", status).to_json()
+        yield reason, int(status)
+        # JSON/MessagePack transport turns HTTPStatus into an ordinary integer.
+        if isinstance(status, HTTPStatus):
+            yield json.loads(json.dumps(reason)), int(status)
+        yield {**reason, "status_code": str(int(status))}, int(status)
+    yield FINISH_ABORT("encoder failed", 408, "encoder_timeout").to_json(), 408
+    yield FINISH_MATCHED_STR("invalid output", err_type="invalid_token").to_json(), 500
+
+
+def generation_error_chunk(reason=None, *, index=0):
+    return {
+        "text": "Partial",
+        "index": index,
+        "prompt_token_ids": [1, 2, 3],
+        "output_ids": [4, 5],
+        "meta_info": {
+            "id": "cmpl-fault-test",
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "cached_tokens": 1,
+            "reasoning_tokens": 0,
+            "hidden_states": [[0.5], [0.25]],
+            "finish_reason": reason,
         },
     }
 

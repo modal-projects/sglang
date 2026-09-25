@@ -152,7 +152,7 @@ async fn collect_output(
     if let Some((code, message)) = output
         .finish_reason
         .as_ref()
-        .and_then(|reason| reason.abort_status())
+        .and_then(|reason| reason.openai_error())
     {
         return Err((
             StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

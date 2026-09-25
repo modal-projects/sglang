@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, Callable, List, Optional
 
-from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
+from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType, SessionReapPlan
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,9 @@ class SchedulerInputBlocker:
             return output_reqs
 
     def _handle_recv_req(self, recv_req):
+        if isinstance(recv_req, SessionReapPlan):
+            # Internal cleanup must progress while tokenized inputs are held.
+            return [recv_req]
         if isinstance(recv_req, BlockReqInput):
             if recv_req.req_type == BlockReqType.BLOCK:
                 self._execute_block_req()

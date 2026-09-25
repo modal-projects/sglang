@@ -15,6 +15,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
@@ -81,6 +82,26 @@ class TestSessionTokenShare(CustomTestCase):
         req._refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
+
+    @patch(
+        "sglang.srt.managers.schedule_batch.get_parallel",
+        return_value=SimpleNamespace(tp_rank=0),
+    )
+    def test_rejected_turn_abort_preserves_active_turn(self, _parallel):
+        """Aborting a rejected sibling must not admit a third turn over live KV."""
+        active = self._create("active", [1, 2])
+        rejected = self._create("rejected", [3])
+        self.assertIsNotNone(rejected.to_finish)
+
+        self.session.abort_req(rejected.rid)
+        still_rejected = self._create("third", [4])
+        self.assertIsNotNone(still_rejected.to_finish)
+        self.assertTrue(self.session.has_unfinished_request())
+
+        self.session.abort_req(active.rid)
+        accepted = self._create("accepted", [5])
+        self.assertIsNone(accepted.to_finish)
+        self.assertEqual(self.session._inflight_rid, accepted.rid)
 
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]

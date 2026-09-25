@@ -31,10 +31,12 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    compact_dcp_sparse_page_table,
     prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -83,6 +85,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -3464,6 +3467,44 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        # TRTLLM-GEN requires packed sparse rows. Decode CP's cyclic ownership
+        # punches holes into the global top-k table, so filter + localize +
+        # compact it before preparing TRTLLM's dynamic sparse metadata. Regular
+        # prefill is different: gather the sharded prefix into a temporary
+        # full-KV buffer and remap the sparse table into that gathered layout.
+        dcp_local_topk_lens = None
+        dcp_merge_output = self.dcp_size > 1 and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        if self.dcp_size > 1:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                assert k is not None
+                kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
+                if kv_cache.shape[0] % self.real_page_size != 0:
+                    raise RuntimeError(
+                        "DCP prefill KV scratch capacity must be aligned to the "
+                        f"TRTLLM page size ({self.real_page_size}), got "
+                        f"{kv_cache.shape[0]} rows."
+                    )
+                kv_cache = kv_cache.view(
+                    -1, self.real_page_size, self.kv_cache_dim
+                ).unsqueeze(1)
+                kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
+                page_table_1 = torch.where(
+                    page_table_1 >= 0,
+                    kv_indices[page_table_1.clamp_min(0)],
+                    -1,
+                )
+            else:
+                parallel = get_parallel()
+                page_table_1, dcp_local_topk_lens = compact_dcp_sparse_page_table(
+                    page_table_1.contiguous(),
+                    parallel.attn_dcp_size,
+                    parallel.attn_dcp_rank,
+                )
+
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
@@ -3495,8 +3536,36 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        max_seq_len = metadata.max_seq_len_k
+        if (
+            self.dcp_size > 1
+            and not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # One global causal length per sparse query row, including each
+            # target-verify token. TRTLLM uses the rank-local lengths for
+            # paging/split-KV while sparse_mla_top_k_lens bounds the row.
+            global_seq_lens = metadata.dsa_seqlens_expanded
+            if global_seq_lens.numel() != batch_size:
+                global_seq_lens = seq_lens
+            parallel = get_parallel()
+            seq_lens = get_dcp_lens(
+                global_seq_lens,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            ).to(torch.int32)
+            # TRTLLM NoPE uses a valid dummy entry for empty rows. Retain the
+            # true sparse lengths and neutralize those outputs after the call.
+            seq_lens = seq_lens.clamp_min(1)
+            max_seq_len = max(
+                1,
+                metadata.max_seq_len_k // parallel.attn_dcp_size
+                + int(
+                    parallel.attn_dcp_rank
+                    < metadata.max_seq_len_k % parallel.attn_dcp_size
+                ),
+            )
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        result = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -3505,16 +3574,31 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=metadata.max_seq_len_k,
+            max_seq_len=max_seq_len,
             sparse_mla_top_k=sparse_mla_top_k,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            return_lse=dcp_merge_output,
         )
 
-        return out
+        if not dcp_merge_output:
+            return result
+
+        out, lse = result
+        out = out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        lse = lse.view(-1, layer.tp_q_head_num)
+        assert dcp_local_topk_lens is not None
+        fixup_zero_kv_rows(
+            out,
+            lse,
+            dcp_local_topk_lens,
+            metadata.dsa_cu_seqlens_q,
+            1,
+        )
+        return out.flatten(1), lse
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int

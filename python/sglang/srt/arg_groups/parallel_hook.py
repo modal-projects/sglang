@@ -203,21 +203,25 @@ def handle_decode_context_parallelism(server_args: Any):
         return
 
     model_config = model_config_of(server_args)
-    if is_deepseek_dsa(model_config.hf_config) and (
-        not get_platform().is_cuda
-        or model_config.qk_rope_head_dim != 0
-        or cfg.dsa_prefill_backend != "tilelang"
-        or cfg.dsa_decode_backend != "tilelang"
-        or cfg.dsa_topk_backend == "torch"
-        or not envs.SGLANG_DSA_FUSE_TOPK.get()
-        or cfg.enable_hisparse
-        or cfg.enable_prefill_cp
-    ):
-        raise ValueError(
-            "DSA decode context parallelism requires CUDA NoPE MLA, "
-            "tilelang prefill/decode, and fused top-k; "
-            "HiSparse and prefill CP cannot be combined with it."
+    if is_deepseek_dsa(model_config.hf_config):
+        dsa_dcp_backends_supported = (
+            cfg.dsa_prefill_backend == cfg.dsa_decode_backend
+            and cfg.dsa_decode_backend in ("tilelang", "trtllm")
         )
+        if (
+            not get_platform().is_cuda
+            or model_config.qk_rope_head_dim != 0
+            or not dsa_dcp_backends_supported
+            or cfg.dsa_topk_backend == "torch"
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or cfg.enable_hisparse
+            or cfg.enable_prefill_cp
+        ):
+            raise ValueError(
+                "DSA decode context parallelism requires CUDA NoPE MLA, "
+                "matching tilelang or trtllm prefill/decode backends, and "
+                "fused top-k; HiSparse and prefill CP cannot be combined with it."
+            )
 
 
 def handle_data_parallelism(server_args: Any):

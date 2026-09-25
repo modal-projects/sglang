@@ -298,7 +298,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
-def _trtllm_dcp_lse_workspace_size(num_q_heads: int) -> int:
+def _trtllm_dcp_lse_workspace_size(num_dcp_q_heads: int) -> int:
     """Cover FlashInfer's largest TRTLLM-GEN autotune profile with LSE.
 
     DCP decode requests LSE so partial attention results can be merged across
@@ -312,7 +312,8 @@ def _trtllm_dcp_lse_workspace_size(num_q_heads: int) -> int:
     softmax_stat_bytes = 2 * 4  # float2
     guard_bytes = 1024 * 1024
     return (
-        max_autotune_batch * num_q_heads * max_q_tile * softmax_stat_bytes + guard_bytes
+        max_autotune_batch * num_dcp_q_heads * max_q_tile * softmax_stat_bytes
+        + guard_bytes
     )
 
 
@@ -560,9 +561,13 @@ class DeepseekSparseAttnBackend(
         elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
             if self.dcp_size > 1 and self.dsa_decode_impl == "trtllm":
+                # DCP emits a full-head partial result on every rank so the
+                # online-softmax reduction can merge the rank-local KV
+                # shards. self.num_q_heads is rank-local, while TRTLLM sees
+                # the replicated full-head count here.
                 workspace_size = max(
                     workspace_size,
-                    _trtllm_dcp_lse_workspace_size(self.num_q_heads),
+                    _trtllm_dcp_lse_workspace_size(self.num_q_heads * self.dcp_size),
                 )
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",

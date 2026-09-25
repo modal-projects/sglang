@@ -86,6 +86,7 @@ class MemoryPoolConfig:
     # losses out of the buffer; the token counts stay boot labels / conserve
     # caps. None on the token-capped path -- a user token cap IS the budget.
     unified_total_bytes: Optional[int] = None
+    max_running_requests_cap_source: Optional[str] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:

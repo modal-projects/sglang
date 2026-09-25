@@ -1254,6 +1254,19 @@ class Scheduler(
             ),
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
+            max_running_requests=self.max_running_requests,
+            max_running_requests_cap_source=(
+                self.tp_worker.model_runner.memory_pool_config.max_running_requests_cap_source
+                if self.tp_worker.model_runner.memory_pool_config is not None
+                else None
+            ),
+            max_queued_requests=self.max_queued_requests,
+            device_type=self.device,
+            configured_device_count=(
+                self.ps.tp_size
+                * self.ps.pp_size
+                * (1 if self.enable_dp_attention else self.ps.dp_size)
+            ),
             page_size=self.page_size,
             num_pages=self.max_total_num_tokens // self.page_size,
             context_len=self.model_config.context_len,

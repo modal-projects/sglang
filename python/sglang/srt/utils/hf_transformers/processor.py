@@ -26,6 +26,7 @@ from transformers import (
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
+from sglang.srt.utils.patch_tokenizer import patch_mm_processor_tokenizer
 
 from .common import (
     AutoConfig,
@@ -389,4 +390,5 @@ def get_processor(
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+    patch_mm_processor_tokenizer(tokenizer)
     return processor

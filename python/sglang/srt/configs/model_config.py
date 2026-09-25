@@ -492,6 +492,28 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        # Retain the export identity before serving adds derived dimensions,
+        # context_len and RoPE aliases. Never reread a possibly replaced config
+        # file when a live draft update arrives. Hash overrides as well.
+        self.draft_update_config_sha256 = None
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "DFlashDraftModel",
+            "DFlash2DraftModel",
+        ):
+            from sglang.srt.weight_sync.draft_delta import config_hash
+
+            try:
+                source_config, _ = PretrainedConfig.get_config_dict(
+                    self.model_path,
+                    revision=getattr(self.hf_config, "_commit_hash", None) or revision,
+                    **kwargs,
+                )
+                source_config.update(self.model_override_args)
+                self.draft_update_config_sha256 = config_hash(source_config)
+            except Exception as exc:
+                # Optional hot updates must not break otherwise valid serving
+                # configurations (for example a custom config provider).
+                logger.warning("Draft delta config identity unavailable: %s", exc)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config

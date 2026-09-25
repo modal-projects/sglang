@@ -1907,6 +1907,27 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = False
 
 
+class UpdateDraftWeightsReqInput(BaseReq, kw_only=True):
+    """Internal control request; payload_path is created by the HTTP server."""
+
+    action: str = "status"
+    expected_draft_version: Optional[int] = None
+    manifest: Optional[Dict[str, Any]] = None
+    payload_path: Optional[str] = None
+
+
+class UpdateDraftWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    draft_version: Optional[int] = None
+    draft_weights_id: Optional[str] = None
+    initial_weights_id: Optional[str] = None
+    config_sha256: Optional[str] = None
+    tp_size: Optional[int] = None
+    draft_kv_policy: str = "preserve"
+    already_applied: bool = False
+
+
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str

@@ -142,6 +142,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateDraftWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1343,6 +1344,35 @@ async def destroy_weights_update_group(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.get("/draft_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_draft_weights_state():
+    """Read the draft-only update revision without changing target metadata."""
+    result = await _global_state.tokenizer_manager.update_draft_weights(
+        UpdateDraftWeightsReqInput()
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/update_draft_weights_from_delta")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_draft_weights_from_delta(request: Request):
+    """Upload a draft delta over HTTP; existing target and draft KV are retained."""
+    from sglang.srt.entrypoints.draft_weight_upload import upload_and_update
+
+    try:
+        result = await upload_and_update(_global_state.tokenizer_manager, request)
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=200 if result.success else HTTPStatus.CONFLICT,
     )
 
 

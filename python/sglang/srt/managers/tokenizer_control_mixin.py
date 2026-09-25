@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateDraftWeightsReqInput,
+    UpdateDraftWeightsReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -112,6 +114,7 @@ _COMMUNICATOR_SPECS = [
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+    ("update_draft_weights", UpdateDraftWeightsReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
     ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
@@ -165,6 +168,7 @@ class TokenizerControlMixin:
     """
 
     def init_communicators(self: TokenizerManager):
+        self.draft_delta_upload_lock = asyncio.Lock()
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
@@ -508,6 +512,20 @@ class TokenizerControlMixin:
         )
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
+
+    async def update_draft_weights(
+        self: TokenizerManager, obj: UpdateDraftWeightsReqInput
+    ) -> UpdateDraftWeightsReqOutput:
+        self.auto_create_handle_loop()
+        if get_parallel().dp_size != 1 or get_parallel().pp_size != 1:
+            return UpdateDraftWeightsReqOutput(
+                success=False, message="Draft delta updates support TP, but not DP/PP"
+            )
+        # Draft-only updates run at a scheduler boundary and fence device work.
+        # Do not acquire the target-model writer lock (which drains requests),
+        # retract requests, flush KV, or advance the target weight version.
+        results = await self.update_draft_weights_communicator(obj)
+        return next((result for result in results if not result.success), results[0])
 
     async def update_weights_from_tensor(
         self: TokenizerManager,

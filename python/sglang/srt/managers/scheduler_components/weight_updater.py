@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    UpdateDraftWeightsReqInput,
+    UpdateDraftWeightsReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -136,6 +138,20 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def update_draft_weights(self, recv_req: UpdateDraftWeightsReqInput):
+        # Look up the method on the class: DFlash's fallback __getattr__ routes
+        # unknown operations to the target worker, which must never happen here.
+        handler = getattr(type(self.draft_worker), "update_draft_weights", None)
+        if handler is None:
+            return UpdateDraftWeightsReqOutput(
+                success=False,
+                message="The active speculative worker does not support draft deltas",
+            )
+        if recv_req.action == "status":
+            return handler(self.draft_worker, recv_req)
+        with self._observe_weight_load("draft_delta", changes_target=False):
+            return handler(self.draft_worker, recv_req)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""

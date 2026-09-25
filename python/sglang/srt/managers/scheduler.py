@@ -180,6 +180,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateDraftWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1747,6 +1748,10 @@ class Scheduler(
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
+                ),
+                (
+                    UpdateDraftWeightsReqInput,
+                    self.weight_updater.update_draft_weights,
                 ),
                 (
                     InitWeightsUpdateGroupReqInput,

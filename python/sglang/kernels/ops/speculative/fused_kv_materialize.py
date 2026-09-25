@@ -337,6 +337,37 @@ class FusedKVMaterializeHelper:
         if self.max_position_hint is not None:
             self._ensure_rope_cache(self.max_position_hint)
 
+    @torch.no_grad()
+    def refresh_weights(self, layers: List) -> None:
+        """Refresh derived weights in place after a fixed-shape draft update.
+
+        Keep storage addresses stable for graph users. Copy slices directly;
+        refreshing must not allocate another GPU copy of the stacked weights.
+        The caller fences prior uses and refreshes all TP ranks together.
+        """
+        if len(layers) != self.n_layers:
+            raise ValueError("fused KV refresh cannot change layer count")
+        sources = []
+        for layer in layers:
+            attn = layer.self_attn
+            kv = attn.qkv_proj.weight[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            norm = attn.k_norm.weight
+            if (
+                tuple(kv.shape) != (self.layer_out_dim, self.flat_kv_weight_t.shape[0])
+                or tuple(norm.shape) != (self.head_dim,)
+                or kv.dtype != self.flat_kv_weight_t.dtype
+                or norm.dtype != self.k_norm_weights.dtype
+                or kv.device != self.flat_kv_weight_t.device
+                or norm.device != self.k_norm_weights.device
+            ):
+                raise ValueError("fused KV refresh cannot change weight layout")
+            sources.append((kv, norm))
+        for index, (kv, norm) in enumerate(sources):
+            self.flat_kv_weight_t[
+                :, index * self.layer_out_dim : (index + 1) * self.layer_out_dim
+            ].copy_(kv.T)
+            self.k_norm_weights[index].copy_(norm)
+
     def _ensure_rope_cache(self, max_position: int) -> torch.Tensor:
         if max_position + 1 > self._reserved_rope_cache_len:
             ensure_cos_sin_cache_length = getattr(

@@ -637,9 +637,15 @@ print(json.dumps({'rid': info['rid'], 'generation': generation, 'torch_imported'
             json.loads(result.stdout),
             {"rid": "external", "generation": 1, "torch_imported": False},
         )
-        self.assertEqual(
-            SLOT_HEADER.unpack_from(capture._mapping, capture._slot_offset(0))[0], FREE
-        )
+        # The publisher may already have preclaimed the released slot for the
+        # next generation. Read under its local lock to avoid a partial header.
+        with capture._lock:
+            state, length, generation = SLOT_HEADER.unpack_from(
+                capture._mapping, capture._slot_offset(0)
+            )
+        self.assertIn((state, generation), ((FREE, 1), (COPYING, 2)))
+        if state == COPYING:
+            self.assertEqual(length, 0)
 
     def test_cuda_graph_output_can_be_replayed_after_capture(self):
         capture = self.make_capture()

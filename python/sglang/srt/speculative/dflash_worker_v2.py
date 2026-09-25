@@ -1130,6 +1130,44 @@ class DFlashWorkerV2(BaseSpecWorker):
             (new_cap,), dtype=torch.int32, device="cpu"
         )
 
+    def update_draft_weights(self, request):
+        from sglang.srt.managers.io_struct import UpdateDraftWeightsReqOutput
+        from sglang.srt.speculative.dflash_weight_updater import DFlashWeightUpdater
+
+        if get_parallel().pp_size != 1 or get_parallel().dp_size != 1:
+            return UpdateDraftWeightsReqOutput(
+                success=False, message="Draft delta updates support TP, but not DP/PP"
+            )
+        # Shared CUDA IPC weight caches cannot be mutated independently.
+        from sglang.srt.runtime_context import get_model
+
+        if get_model().weight_cache_mode != "off":
+            return UpdateDraftWeightsReqOutput(
+                success=False, message="Draft updates require weight_cache_mode=off"
+            )
+        config_sha256 = getattr(
+            self.draft_model_runner.model_config, "draft_update_config_sha256", None
+        )
+        if config_sha256 is None:
+            return UpdateDraftWeightsReqOutput(
+                success=False, message="Draft checkpoint config identity is unavailable"
+            )
+        updater = self.__dict__.get("_draft_weight_updater")
+        if updater is None:
+
+            def refresh():
+                if self._fused_kv_helper is not None:
+                    self._fused_kv_helper.refresh_weights(self.draft_model.layers)
+
+            updater = self._draft_weight_updater = DFlashWeightUpdater(
+                self.draft_model,
+                self.draft_model_runner.tp_group.cpu_group,
+                refresh,
+                lambda: torch.get_device_module(self.device).synchronize(),
+                config_sha256=config_sha256,
+            )
+        return UpdateDraftWeightsReqOutput(**updater.handle(request))
+
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
         # the backing field so a lookup before __init__ sets it raises

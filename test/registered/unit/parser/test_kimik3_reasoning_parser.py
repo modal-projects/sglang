@@ -394,5 +394,73 @@ def test_fnc_stream_reasoning_off_skipped_think_recovers_content() -> None:
     assert content == "bare answer"
 
 
+@pytest.mark.parametrize("stream_reasoning", [False, True])
+@pytest.mark.parametrize("force_nonempty_content", [False, True])
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("thought<|open|>think", ("thought", "")),
+        (f"{THINK_OPEN}thought<|open|>think", ("thought", "")),
+        (f"{THINK_OPEN}thought<|open|>thin", ("thought<|open|>thin", "")),
+        (f"{THINK_OPEN}thought<|open|>think!", ("thought<|open|>think!", "")),
+        (
+            f"{THINK_OPEN}literal<|open|>think{THINK_CLOSE}{RESPONSE_OPEN}reply",
+            ("literal<|open|>think", "reply"),
+        ),
+        (
+            f"literal<|open|>think{_TOOLS_CHANNEL}",
+            ("literal<|open|>think", _TOOLS_CHANNEL),
+        ),
+        (
+            f'thought{TOOLS_OPEN}<|open|>call tool="python" index="1"<|sep|>'
+            '<|open|>argument key="code" type="string"<|sep|>literal<|open|>think',
+            (
+                "thought",
+                f'{TOOLS_OPEN}<|open|>call tool="python" index="1"<|sep|>'
+                '<|open|>argument key="code" type="string"<|sep|>literal<|open|>think',
+            ),
+        ),
+        (
+            f"{THINK_CLOSE}{RESPONSE_OPEN}reply<|open|>think",
+            ("", "reply"),
+        ),
+        (
+            f"{THINK_CLOSE}{RESPONSE_OPEN}literal<|open|>think"
+            f"{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
+            ("", "literal<|open|>think"),
+        ),
+        (
+            f"{THINK_CLOSE}literal<|open|>think{MESSAGE_CLOSE}",
+            ("", "literal<|open|>think"),
+        ),
+        (
+            f"{THINK_CLOSE}{RESPONSE_OPEN}literal<|open|>think{_TOOLS_CHANNEL}",
+            ("", f"literal<|open|>think{_TOOLS_CHANNEL}"),
+        ),
+    ],
+)
+def test_truncated_think_open_at_output_boundary(
+    text: str,
+    expected: tuple[str, str],
+    stream_reasoning: bool,
+    force_nonempty_content: bool,
+) -> None:
+    """Only a final truncated opener is removed, independently of chunk boundaries."""
+    options = dict(
+        stream_reasoning=stream_reasoning,
+        force_nonempty_content=force_nonempty_content,
+    )
+    result = KimiK3Detector(**options).detect_and_parse(text)
+    assert (result.reasoning_text, result.normal_text) == expected
+    partitions = [_chunks(text, 1)] + [
+        [text[:split], text[split:]] for split in range(len(text) + 1)
+    ]
+    for chunks in partitions:
+        detector = KimiK3Detector(**options)
+        assert _stream_with_finish(detector, chunks) == expected, chunks
+        result = detector.finish()
+        assert (result.reasoning_text, result.normal_text) == ("", "")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

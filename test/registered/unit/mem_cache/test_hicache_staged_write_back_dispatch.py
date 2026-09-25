@@ -176,7 +176,7 @@ class _FakeEvent:
     def record(self):
         pass
 
-    def wait(self, stream):
+    def wait(self, stream=None):
         pass
 
 
@@ -193,6 +193,56 @@ class _FakeDeviceModule:
         yield
 
 
+class _QueuedStream:
+    def __init__(self):
+        self.operations = []
+        self.position = 0
+
+    def enqueue(self, operation):
+        self.operations.append(operation)
+
+    def drain(self, stop=None):
+        stop = len(self.operations) if stop is None else stop
+        while self.position < stop:
+            operation = self.operations[self.position]
+            self.position += 1
+            operation()
+
+    def wait_stream(self, stream):
+        stop = len(stream.operations)
+        self.enqueue(lambda: stream.drain(stop))
+
+
+class _QueuedDeviceModule:
+    Stream = _QueuedStream
+
+    def __init__(self):
+        self.current = self.Stream()
+
+    def Event(self, **_):
+        device = self
+
+        class Event:
+            def record(self):
+                self.stream = device.current
+                self.stop = len(self.stream.operations)
+
+            def wait(self, stream=None):
+                stream = device.current if stream is None else stream
+                source, stop = self.stream, self.stop
+                stream.enqueue(lambda: source.drain(stop))
+
+        return Event()
+
+    @contextmanager
+    def stream(self, stream):
+        previous, self.current = self.current, stream
+        try:
+            yield
+        finally:
+            self.current = previous
+
+
 class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def setUp(self):
         transfer_module._timing_events_supported.cache_clear()
@@ -203,6 +253,76 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
             controller.start_writing()
+
+    def test_backup_precedes_later_forward_mutation(self):
+        """A later forward must not overwrite device state before backup reads it."""
+        for controller_type in (HiCacheController, HybridCacheController):
+            with self.subTest(controller=controller_type.__name__):
+                device = _QueuedDeviceModule()
+
+                class HostPool:
+                    layout = "page_first"
+                    can_use_write_back_jit = True
+                    size_per_token = 4
+
+                    def __init__(self):
+                        self.data = torch.full((4,), -1)
+
+                    def backup_from_device_all_layer(
+                        self, device_pool, host_indices, device_indices, io_backend
+                    ):
+                        device.current.enqueue(lambda: self.data.copy_(device_pool))
+
+                pools = [HostPool(), HostPool()]
+                sources = [torch.full((4,), 3), torch.full((4,), 5)]
+                controller = controller_type.__new__(controller_type)
+                controller.io_backend = "kernel"
+                controller.mem_pool_device = sources[0]
+                controller.mem_pool_host = pools[0]
+                extra_pools = None
+                if controller_type is HybridCacheController:
+                    entries = [
+                        PoolEntry(
+                            name=name,
+                            host_pool=pool,
+                            device_pool=source,
+                            layer_mapper=None,
+                        )
+                        for name, pool, source in zip(
+                            (PoolName.KV, PoolName.MAMBA), pools, sources
+                        )
+                    ]
+                    controller.mem_pool_host = SimpleNamespace(
+                        layout="page_first",
+                        can_use_write_back_jit=True,
+                        anchor_entry=entries[0],
+                        entry_map={entry.name: entry for entry in entries},
+                    )
+                    extra_pools = [
+                        PoolTransfer(PoolName.MAMBA, _indices(0, 4), _indices(0, 4))
+                    ]
+                controller.write_queue = [
+                    CacheOperation(
+                        _indices(0, 4), _indices(0, 4), 1, pool_transfers=extra_pools
+                    )
+                ]
+                controller.ack_write_queue = []
+                with mock.patch.object(transfer_module, "device_module", device):
+                    controller.l2_transfer_engine = L2TransferEngine("kernel")
+                    controller.start_writing()
+
+                self.assertTrue(torch.all(pools[0].data == -1))
+                forward = device.Stream()
+                forward.wait_stream(device.current)
+                for source in sources:
+                    forward.enqueue(lambda source=source: source.fill_(7))
+                forward.drain()
+                controller.l2_transfer_engine.device_to_host_stream.drain()
+
+                self.assertTrue(torch.all(pools[0].data == 3))
+                if extra_pools:
+                    self.assertTrue(torch.all(pools[1].data == 5))
+                self.assertTrue(all(torch.all(source == 7) for source in sources))
 
     def test_hybrid_load_forwards_merged_pool_transfers(self):
         transfer = PoolTransfer(

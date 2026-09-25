@@ -222,6 +222,11 @@ class SchedulerMetricsReporter:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
+        # Host wall seconds in the current decode-log window.
+        self.decode_step_time_acc = 0.0
+        self.decode_step_ct = 0
+        self.decode_gap_time_acc = 0.0
+        self._step_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -642,6 +647,27 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.decode_step_time_acc = 0.0
+        self.decode_step_ct = 0
+        self.decode_gap_time_acc = 0.0
+        self._step_tic = time.perf_counter()
+
+    def _account_step_time(self, is_decode: bool) -> None:
+        now = time.perf_counter()
+        elapsed = now - self._step_tic
+        self._step_tic = now
+        if is_decode:
+            self.decode_step_time_acc += elapsed
+        else:
+            self.decode_gap_time_acc += elapsed
+
+    def mark_decode(self, *, count_step: bool = True) -> None:
+        self._account_step_time(is_decode=True)
+        if count_step:
+            self.decode_step_ct += 1
+
+    def mark_idle(self) -> None:
+        self._account_step_time(is_decode=False)
 
     def report_prefill_stats(
         self,
@@ -649,6 +675,21 @@ class SchedulerMetricsReporter:
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
+    ):
+        # Reporting work belongs to the prefill gap, including failed reports.
+        try:
+            self._report_prefill_stats(
+                batch, prefill_stats, can_run_cuda_graph, dp_cooperation_info
+            )
+        finally:
+            self._account_step_time(is_decode=False)
+
+    def _report_prefill_stats(
+        self,
+        batch: Optional[ScheduleBatch],
+        prefill_stats: PrefillStats,
+        can_run_cuda_graph: bool,
+        dp_cooperation_info: Optional[DPCooperationInfo],
     ):
         if (
             not self.is_stats_logging_rank
@@ -827,6 +868,23 @@ class SchedulerMetricsReporter:
         running_batch: ScheduleBatch = None,
         num_generated_tokens: int = 0,
     ):
+        self.mark_decode()
+        try:
+            self._report_decode_stats(
+                can_run_cuda_graph=can_run_cuda_graph,
+                running_batch=running_batch,
+                num_generated_tokens=num_generated_tokens,
+            )
+        finally:
+            # Remaining reporting cost carries forward without adding a new step.
+            self.mark_decode(count_step=False)
+
+    def _report_decode_stats(
+        self,
+        can_run_cuda_graph: bool,
+        running_batch: ScheduleBatch,
+        num_generated_tokens: int,
+    ):
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
@@ -862,9 +920,16 @@ class SchedulerMetricsReporter:
         ):
             return
 
-        gap_latency = time.perf_counter() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.perf_counter()
+        # Close host accounting and throughput at the same timestamp.
+        self.mark_decode(count_step=False)
+        gap_latency = self._step_tic - self.last_decode_stats_tic
+        self.last_decode_stats_tic = self._step_tic
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        step_ms = self.decode_step_time_acc / self.decode_step_ct * 1000
+        gap_ms = self.decode_gap_time_acc * 1000
+        self.decode_step_time_acc = 0.0
+        self.decode_step_ct = 0
+        self.decode_gap_time_acc = 0.0
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -959,6 +1024,9 @@ class SchedulerMetricsReporter:
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            # Host wall milliseconds: average decode interval and total gap.
+            # These intervals include host overhead and are not GPU timings.
+            f"step-ms: {step_ms:.1f}, gap-ms: {gap_ms:.1f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
 

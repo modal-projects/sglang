@@ -2656,6 +2656,8 @@ class SchedulerDisaggregationDecodeMixin:
                 new_prebuilt_batch
             )
             new_prebuilt_batch.filter_batch()
+            if self._is_decode_worker_idle_for_metrics(running_batch):
+                self.metrics_reporter.mark_idle()
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
@@ -2675,6 +2677,19 @@ class SchedulerDisaggregationDecodeMixin:
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _is_decode_worker_idle_for_metrics(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> bool:
+        if any(not req.finished() for req in running_batch.reqs):
+            return False
+        if self.ps.pp_size == 1:
+            return True
+        # Finished requests can remain in processed PP slots until reuse;
+        # their finished flag alone cannot prove a pending result was consumed.
+        return not any(self._pp_decode_pending_results) and all(
+            req.finished() for batch in self.running_mbs for req in batch.reqs
+        )
 
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch

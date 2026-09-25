@@ -439,6 +439,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self._pp_decode_pending_results[
+                        mb_id
+                    ] = not cur_batch.forward_mode.is_prebuilt()
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -507,6 +510,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self._pp_decode_pending_results[next_mb_id] = False
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -553,6 +557,8 @@ class SchedulerPPMixin:
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         self.mbs = [None] * self.pp_loop_size
+        # Host timing distinguishes retained batches from unconsumed results.
+        self._pp_decode_pending_results = [False] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False)

@@ -34,22 +34,29 @@ def partial_suffix_len(text: str, markers: List[str]) -> int:
     return best
 
 
-def strip_partial_marker_suffix(text: str) -> str:
+def strip_partial_marker_suffix(text: str, *, end_of_output: bool = False) -> str:
+    # Intermediate channel recovery must preserve a literal opening-think prefix.
+    if end_of_output and text.endswith(THINK_OPEN.removesuffix("<|sep|>")):
+        return text[: -len(THINK_OPEN.removesuffix("<|sep|>"))]
     for suffix in _PARTIAL_MARKER_SUFFIXES:
         if text.endswith(suffix):
             return text[: -len(suffix)]
     return text
 
 
-def strip_response_wrappers(text: str) -> str:
+def strip_response_wrappers(text: str, *, end_of_output: bool = True) -> str:
+    truncated_think_open = end_of_output and text.endswith(
+        THINK_OPEN.removesuffix("<|sep|>")
+    )
     open_idx = text.find(RESPONSE_OPEN)
     if open_idx != -1:
         close_idx = text.find(RESPONSE_CLOSE, open_idx + len(RESPONSE_OPEN))
         if close_idx != -1:
+            truncated_think_open = False
             text = text[open_idx + len(RESPONSE_OPEN) : close_idx]
         else:
             text = text[open_idx + len(RESPONSE_OPEN) :]
     else:
         text = text.replace(RESPONSE_CLOSE, "")
     text = text.replace(MESSAGE_CLOSE, "")
-    return strip_partial_marker_suffix(text)
+    return strip_partial_marker_suffix(text, end_of_output=truncated_think_open)

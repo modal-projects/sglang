@@ -16,6 +16,7 @@ from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
+    THINK_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
     partial_suffix_len,
@@ -153,7 +154,7 @@ class KimiK3Detector(BaseFormatDetector):
         # Computed outside the try so the error path can reuse it instead of
         # falling back to raw text, which would ship the XTML tools markup to
         # the client.
-        before = strip_response_wrappers(text[:open_idx])
+        before = strip_response_wrappers(text[:open_idx], end_of_output=False)
         try:
             section_start = open_idx + len(self.bot_token)
             close_idx = text.find(self.eot_token, section_start)
@@ -230,13 +231,21 @@ class KimiK3Detector(BaseFormatDetector):
                 )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))
-        return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
+        return StreamingParseResult(
+            normal_text=strip_partial_marker_suffix(pending, end_of_output=True)
+        )
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:
             holdback = partial_suffix_len(
                 self._buffer,
-                [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
+                [
+                    self.bot_token,
+                    RESPONSE_OPEN,
+                    RESPONSE_CLOSE,
+                    MESSAGE_CLOSE,
+                    THINK_OPEN,
+                ],
             )
             limit = len(self._buffer) - holdback
         if limit <= self._sent_normal_idx:

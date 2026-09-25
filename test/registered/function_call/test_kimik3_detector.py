@@ -249,5 +249,69 @@ def test_detector_capabilities_and_registration() -> None:
     assert parser.get_structure_constraint("required") is not None
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("reply<|open|>think", "reply"),
+        ("literal<|open|>thin", "literal<|open|>thin"),
+        ("literal<|open|>think!", "literal<|open|>think!"),
+        (
+            "literal<|open|>think followed by text",
+            "literal<|open|>think followed by text",
+        ),
+        (
+            f"{RESPONSE_OPEN}literal<|open|>think{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
+            "literal<|open|>think",
+        ),
+        (f"literal<|open|>think{MESSAGE_CLOSE}", "literal<|open|>think"),
+    ],
+)
+def test_final_think_open_suffix_is_chunk_independent(text: str, expected: str) -> None:
+    """Final cleanup must not discard a literal prefix completed by a later chunk."""
+    tools = [_make_tool("python")]
+    result = KimiK3Detector().detect_and_parse(text, tools)
+    assert result.normal_text == expected
+    assert result.calls == []
+    partitions = [_chunks(text, 1)] + [
+        [text[:split], text[split:]] for split in range(len(text) + 1)
+    ]
+    for chunks in partitions:
+        detector = KimiK3Detector()
+        content, calls = _stream(detector, chunks, tools)
+        result = detector.finish(tools)
+        assert content + (result.normal_text or "") == expected, chunks
+        assert calls == result.calls == []
+        assert not detector.finish(tools).normal_text
+
+
+@pytest.mark.parametrize("call_state", ["complete", "unfinished", "missing-tool"])
+def test_think_open_literals_before_and_inside_tools(call_state: str) -> None:
+    """Suffix cleanup cannot rewrite text before tools or raw argument values."""
+    literal = "literal<|open|>think"
+    call = _call_block("python", 1, {"code": ("string", literal)})
+    complete_call = call_state == "complete"
+    if call_state == "unfinished":
+        call = call[: call.index("<|close|>argument")]
+    elif call_state == "missing-tool":
+        call = call.replace(' tool="python"', "")
+    text = literal + TOOLS_OPEN + call + (TOOLS_CLOSE if complete_call else "")
+    tools = [_make_tool("python")]
+    result = KimiK3Detector().detect_and_parse(text, tools)
+    assert result.normal_text == literal
+    assert len(result.calls) == int(complete_call)
+    partitions = [_chunks(text, 1)] + [
+        [text[:split], text[split:]] for split in range(len(text) + 1)
+    ]
+    for chunks in partitions:
+        detector = KimiK3Detector()
+        content, calls = _stream(detector, chunks, tools)
+        tail = detector.finish(tools)
+        assert content + (tail.normal_text or "") == literal, chunks
+        assert len(calls) == int(complete_call)
+        assert tail.calls == []
+        if complete_call:
+            assert json.loads(calls[0].parameters) == {"code": literal}
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

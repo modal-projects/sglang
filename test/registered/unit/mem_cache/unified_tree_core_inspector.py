@@ -30,6 +30,9 @@ register_cpu_ci(
 class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterface):
     """Python TreeCore variant used by the shared backend-conformance tests."""
 
+    def prefix_ref_counts(self) -> tuple[int, int]:
+        return self._prefix_refs.counts()
+
     def contains_node(self, node_id: NodeId) -> bool:
         """Whether the node id is live in the tree."""
         return node_id in self._node_arena

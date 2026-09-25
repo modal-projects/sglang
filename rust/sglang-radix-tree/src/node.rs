@@ -128,7 +128,28 @@ impl Hash for KeyNamespace {
     }
 }
 
-type ChildMap<K> = HashBrownMap<(KeyNamespace, K), NodeIdx_, RandomState>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildEdge<K> {
+    Live(KeyNamespace, K),
+    Retired(NodeId),
+}
+
+impl<K: Hash> Hash for ChildEdge<K> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Live(namespace, key) => {
+                namespace.hash(state);
+                key.hash(state);
+            }
+            Self::Retired(id) => {
+                255_u8.hash(state);
+                id.hash(state);
+            }
+        }
+    }
+}
+
+type ChildMap<K> = HashBrownMap<ChildEdge<K>, NodeIdx_, RandomState>;
 
 /// Borrowed view of a namespaced child edge used for allocation-free lookup.
 struct ChildEdgeRef<'a, K: ChildKeyType> {
@@ -143,9 +164,14 @@ impl<K: ChildKeyType> Hash for ChildEdgeRef<'_, K> {
     }
 }
 
-impl<K: ChildKeyType> Equivalent<(KeyNamespace, K)> for ChildEdgeRef<'_, K> {
-    fn equivalent(&self, edge: &(KeyNamespace, K)) -> bool {
-        self.namespace == edge.0.as_ref() && self.page == edge.1.as_ref()
+impl<K: ChildKeyType> Equivalent<ChildEdge<K>> for ChildEdgeRef<'_, K> {
+    fn equivalent(&self, edge: &ChildEdge<K>) -> bool {
+        match edge {
+            ChildEdge::Live(namespace, key) => {
+                self.namespace == namespace.as_ref() && self.page == key.as_ref()
+            }
+            ChildEdge::Retired(_) => false,
+        }
     }
 }
 
@@ -158,11 +184,14 @@ pub struct Node<K: ChildKeyType> {
     pub(crate) idx: NodeIdx_,
     /// The namespace this node belongs to.
     pub namespace: KeyNamespace,
-    /// Child edges keyed by (namespace, the child's page key); the namespace
-    /// component mirrors the child's namespace at every level.
+    /// Live token edges and retired ownership edges; both retain their children.
     pub children: ChildMap<K>,
-    /// The page key labelling the edge from the parent (also this node's key in the
-    /// parent's `children`); empty for the root.
+    /// Excluded from lookup while existing locks and transfers still own it.
+    pub retired: bool,
+    /// FULL tiers advertised through KV events; a pending copy may be unadvertised.
+    pub published_kv_tiers: u8,
+    /// The logical key span; its first page labels a live edge from the parent.
+    /// Empty for the root.
     pub key: K,
     /// Per-(component × tier) value state, indexed by `ValueSlotIdx` (device
     /// slots first, host after); device states also sit at plain component
@@ -393,6 +422,8 @@ impl<K: ChildKeyType> Node<K> {
             parent: None,
             namespace: KeyNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
+            retired: false,
+            published_kv_tiers: 0,
             key: K::default(),
             values: Default::default(),
             swa_uuid: None,
@@ -416,6 +447,8 @@ impl<K: ChildKeyType> Node<K> {
             parent: None,
             namespace: KeyNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
+            retired: false,
+            published_kv_tiers: 0,
             key,
             values: Default::default(),
             swa_uuid: None,
@@ -434,8 +467,12 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// The namespaced edge key for this node's own edge from its parent.
-    pub(crate) fn edge_key(&self, page_size: usize) -> (KeyNamespace, K) {
-        (self.namespace.clone(), self.key.child_key(page_size))
+    pub(crate) fn edge_key(&self, page_size: usize) -> ChildEdge<K> {
+        if self.retired {
+            ChildEdge::Retired(self.id)
+        } else {
+            ChildEdge::Live(self.namespace.clone(), self.key.child_key(page_size))
+        }
     }
 
     /// Link `child` under this node, keyed by its namespaced page key; errors on
@@ -454,6 +491,7 @@ impl<K: ChildKeyType> Node<K> {
             child.parent
         );
         let parent_idx = self.idx;
+        child.retired |= self.retired;
         match self.children.entry(child.edge_key(page_size)) {
             Entry::Occupied(_) => Err(TreeCoreRuntimeError::DuplicateChildKey {
                 parent: self.id,
@@ -470,7 +508,7 @@ impl<K: ChildKeyType> Node<K> {
     /// Unlink this node from `parent`: drop it from `parent.children` and clear its own
     /// parent link; panics on a broken parent<->child link (an internal invariant).
     pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K>, page_size: usize) {
-        // A live child is always registered under its namespaced page key.
+        // Ownership removal must also unlink retired edges by generation.
         match parent.children.remove(&self.edge_key(page_size)) {
             Some(idx) if idx == self.idx => self.parent = None,
             found => panic!(
@@ -719,6 +757,10 @@ pub enum TreeCoreRuntimeError {
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
+    #[error("prefix receipt operation during an insert transaction")]
+    PrefixRefDuringInsert,
+    #[error("prefix receipt boundary must be page-aligned and within the captured path")]
+    InvalidPrefixRefBoundary,
     /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
@@ -1259,7 +1301,7 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.node(self.root)
             .children
             .keys()
-            .any(|(stored, _)| stored.as_ref() == namespace)
+            .any(|edge| matches!(edge, ChildEdge::Live(stored, _) if stored.as_ref() == namespace))
     }
 
     /// Install `child` under `parent` on its namespaced `map_key`; returns the
@@ -1270,10 +1312,13 @@ impl<K: ChildKeyType> NodeArena<K> {
         map_key: K,
         child: NodeIdx_,
     ) -> Option<NodeIdx_> {
-        let namespace = self.node(child).namespace.clone();
-        self.node_mut(parent)
-            .children
-            .insert((namespace, map_key), child)
+        let child_node = self.node(child);
+        let edge = if child_node.retired {
+            ChildEdge::Retired(child_node.id)
+        } else {
+            ChildEdge::Live(child_node.namespace.clone(), map_key)
+        };
+        self.node_mut(parent).children.insert(edge, child)
     }
 
     /// Reserve a detached child and attach it under `parent`; `extra_key` names the

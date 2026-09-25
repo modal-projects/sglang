@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache.prefix_ref import PrefixRefRegistry
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -76,6 +77,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
     InsertStepResult,
     NodeId,
+    PrefixRef,
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
@@ -95,6 +97,7 @@ logger = logging.getLogger(__name__)
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
 # the TP consistency check can still all_reduce [digest, -digest] in int64.
 _RECLAIM_DIGEST_MASK = (1 << 42) - 1
+_KV_EVENT_TIER_BITS = {StorageMedium.GPU: 1, StorageMedium.CPU: 2}
 
 
 class StorageBackupSpec(NamedTuple):
@@ -107,6 +110,10 @@ class StorageBackupSpec(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _RetiredEdge(msgspec.Struct, frozen=True):
+    node_id: NodeId
+
+
 class UnifiedTreeNode:
     counter = 0
 
@@ -114,6 +121,9 @@ class UnifiedTreeNode:
         # Plain dict (not defaultdict): a missing-key read must raise, never
         # silently mint an unregistered node outside the TreeCore arena.
         self.children: dict[Any, UnifiedTreeNode] = {}
+        self.retired = False
+        # Pending copies own buffers before their tier is advertised.
+        self.published_kv_tiers = 0
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
         self.component_types = tree_components
@@ -152,6 +162,9 @@ class UnifiedTreeNode:
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
+
+    def _edge_key(self, page_size: int):
+        return _RetiredEdge(self.id) if self.retired else self.key.child_key(page_size)
 
     @property
     def backuped(self) -> bool:
@@ -448,6 +461,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             enabled=params.enable_kv_cache_events, page_size=self.page_size
         )
 
+        self._prefix_refs = PrefixRefRegistry()
         self.reset()
 
     # ==== Tree API ====
@@ -462,6 +476,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         match result."""
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        self._prefix_refs.clear()
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
@@ -514,6 +529,93 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=self.root_node.id,
             cache_actions=[],
         )
+
+    def capture_prefix_ref(self, node_id: NodeId, end: int) -> PrefixRef:
+        self._check_prefix_ref_boundary(end)
+        node = self.node_by_id(node_id)
+        path = []
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        depth = sum(len(node.key) for node in path)
+        if end > depth:
+            raise ValueError("prefix receipt end exceeds the node depth")
+        spans = {}
+        start = 0
+        for node in reversed(path):
+            if start >= end:
+                break
+            spans[node.id] = (start, min(end, start + len(node.key)))
+            start += len(node.key)
+        return self._prefix_refs.capture(spans)
+
+    def _check_prefix_ref_boundary(self, boundary: int):
+        if self._ongoing_insert_walk_state is not None:
+            raise RuntimeError("prefix receipt operation during an insert transaction")
+        if boundary < 0 or boundary % self.page_size:
+            raise ValueError(
+                "prefix receipt boundary must be nonnegative and page-aligned"
+            )
+
+    def invalidate_prefix_ref(
+        self, ref: PrefixRef, start: int
+    ) -> list[CacheAction | ComponentAction]:
+        self._check_prefix_ref_boundary(start)
+        actions = []
+        for span_start, node_id in self._prefix_refs.overlapping(ref, start):
+            node = self._node_arena.get(node_id)
+            if node is None or node.retired:
+                continue
+            if start > span_start:
+                _, action = self._split_node(node.key, node, start - span_start)
+                if action is not None:
+                    actions.append(action)
+            self._retire_subtree(node)
+        return actions
+
+    def _retire_subtree(self, node: UnifiedTreeNode):
+        pending = [node]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.children.values())
+            if node.retired:
+                continue
+            for medium, bit in _KV_EVENT_TIER_BITS.items():
+                if node.published_kv_tiers & bit:
+                    self._record_remove_event(node, medium=medium)
+            removed = node.parent.children.pop(node._edge_key(self.page_size))
+            assert removed is node
+            node.retired = True
+            node.parent.children[node._edge_key(self.page_size)] = node
+
+    def release_prefix_ref(self, ref: PrefixRef) -> None:
+        self._prefix_refs.release(ref)
+
+    def is_invalidated(self, node_id: NodeId) -> bool:
+        node = self._node_arena.get(node_id)
+        return node is None or node.retired
+
+    def _record_store_event(
+        self,
+        node: UnifiedTreeNode,
+        medium=StorageMedium.GPU,
+        *,
+        session_id: Optional[str] = None,
+    ) -> None:
+        if node.retired:
+            return
+        self.kv_events.record_store(node, medium=medium, session_id=session_id)
+        if self.kv_events.enabled:
+            node.published_kv_tiers |= _KV_EVENT_TIER_BITS[medium]
+
+    def _record_remove_event(
+        self, node: UnifiedTreeNode, medium=StorageMedium.GPU
+    ) -> None:
+        if node.retired:
+            return
+        self.kv_events.record_remove(node, medium=medium)
+        if self.kv_events.enabled:
+            node.published_kv_tiers &= ~_KV_EVENT_TIER_BITS[medium]
 
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         """Resolve a NodeId back to its tree node.
@@ -640,6 +742,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _unregister_node(self, node: UnifiedTreeNode) -> None:
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
+        self._prefix_refs.remove(node.id)
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -1348,8 +1451,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> tuple[UnifiedTreeNode, Optional[CacheAction | ComponentAction]]:
+        old_edge = child._edge_key(self.page_size)
         new_node = self._new_node(priority=child.priority)
-        new_node.children = {key[split_len:].child_key(self.page_size): child}
+        new_node.retired = child.retired
+        new_node.published_kv_tiers = child.published_kv_tiers
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
@@ -1363,6 +1468,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         child.parent = new_node
         child.key = child.key[split_len:]
+        new_node.children = {child._edge_key(self.page_size): child}
+        self._prefix_refs.split(child.id, new_node.id, split_len)
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
@@ -1372,7 +1479,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
-        new_node.parent.children[key.child_key(self.page_size)] = new_node
+        removed = new_node.parent.children.pop(old_edge)
+        assert removed is child
+        new_node.parent.children[new_node._edge_key(self.page_size)] = new_node
 
         # A split of a backuped node tells the cache to fix its publish list.
         action: Optional[CacheAction | ComponentAction] = None
@@ -1412,6 +1521,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
+        new_node.retired = parent.retired
         new_node.key = key
         # Chain-constant under sharding: the pre-flight decline in
         # begin_insert() guarantees this tail continues the matched prefix's
@@ -1419,14 +1529,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
-        parent.children[key.child_key(self.page_size)] = new_node
+        parent.children[new_node._edge_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node, session_id=session_id)
+        self._record_store_event(new_node, session_id=session_id)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1451,7 +1561,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(
+        self._record_store_event(
             node,
             medium=StorageMedium.GPU,
             session_id=session_id,
@@ -1645,7 +1755,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         """Free every component layer on the node and detach it from the LRU
         lists and evictable leaf sets."""
-        self.kv_events.record_remove(node, medium=medium)
+        self._record_remove_event(node, medium=medium)
         for comp in self.components:
             self._evict_component_and_detach_lru(
                 node,
@@ -1769,7 +1879,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
-        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
+        self._record_remove_event(node, medium=StorageMedium.CPU)
         self._evict_component_and_detach_lru(
             node,
             self.components_by_type[BASE_COMPONENT_TYPE],
@@ -1794,7 +1904,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
-        self.kv_events.record_remove(node, medium=StorageMedium.CPU)
+        self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self.components:
             _, hf = self._evict_component_and_detach_lru(
                 node,
@@ -1841,7 +1951,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._cascade_evict(
             node, trigger, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        self._record_remove_event(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -1938,7 +2048,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
-        key = node.key.child_key(self.page_size)
+        key = node._edge_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
         # Deleted nodes must not linger in duplicate tracking as ghosts.
@@ -2164,14 +2274,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
+        new_node.retired = node.retired
         new_node.key = key
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
-        node.children[child_key] = new_node
+        node.children[new_node._edge_key(self.page_size)] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
-        self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
+        self._record_store_event(new_node, medium=StorageMedium.CPU)
         return result
 
     def build_backup_spec(self, node_id: NodeId):
@@ -2251,9 +2362,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, req: Optional[Req] = None
     ) -> tuple[PoolTransfer, dict[ComponentType, list[PoolTransfer]]]:
         """Build the H->D load-back KV transfer plus per-component aux transfers."""
+        node = self.node_by_id(node_id)
+        if node.retired:
+            return PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                nodes_to_load=[],
+            ), {}
         # Component hooks take primitives, not Req: extract its fields here.
         mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
-        node = self.node_by_id(node_id)
         kv_xfer = self.components_by_type[BASE_COMPONENT_TYPE].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
         )[0]
@@ -2392,7 +2509,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=cache_actions,
         )
         for nid in kv_xfer.nodes_to_load or ():
-            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
+            self._record_store_event(self.node_by_id(nid), medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -2517,7 +2634,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
-            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+            self._record_store_event(node, medium=StorageMedium.CPU)
 
     def _walk_span(self, key: RadixKey, end: int):
         """Yield nodes and their matched spans along ``key`` through ``end``."""
@@ -2680,7 +2797,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             E("[Root] root has a parent pointer")
         # Parent ↔ child bidirectional consistency
         for node in all_nodes:
-            for child in node.children.values():
+            for edge, child in node.children.items():
+                if edge != child._edge_key(self.page_size):
+                    E(f"[Tree] child {child.id} filed under an incorrect edge")
+                if node.retired and not child.retired:
+                    E(f"[Tree] live child {child.id} under retired parent {node.id}")
                 if child.parent is not node:
                     pid = child.parent.id if child.parent else None
                     E(f"[Tree] child {child.id} parent={pid}, expected {node.id}")

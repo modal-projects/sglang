@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
     InsertStepResult,
     NodeId,
+    PrefixRef,
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
@@ -331,6 +332,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
+        self._prefix_ref_owner = object()
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -388,6 +390,36 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._bindings.RustUnifiedTreeCoreBinding
 
     # ==== Tree API ====
+
+    def capture_prefix_ref(self, node_id: NodeId, end: int) -> PrefixRef:
+        self._check_prefix_ref_boundary(end)
+        return PrefixRef(
+            self._prefix_ref_owner, self._binding.capture_prefix_ref(node_id, end)
+        )
+
+    def _check_prefix_ref_boundary(self, boundary: int):
+        if boundary < 0 or boundary % self.page_size:
+            raise ValueError(
+                "prefix receipt boundary must be nonnegative and page-aligned"
+            )
+
+    def _validate_prefix_ref_owner(self, ref: PrefixRef):
+        if ref._owner is not self._prefix_ref_owner:
+            raise ValueError("prefix receipt belongs to another tree core")
+
+    def invalidate_prefix_ref(self, ref: PrefixRef, start: int) -> list:
+        self._validate_prefix_ref_owner(ref)
+        self._check_prefix_ref_boundary(start)
+        return _cache_actions_from_tagged(
+            self._binding.invalidate_prefix_ref(ref._id, start)
+        )
+
+    def release_prefix_ref(self, ref: PrefixRef) -> None:
+        self._validate_prefix_ref_owner(ref)
+        self._binding.release_prefix_ref(ref._id)
+
+    def is_invalidated(self, node_id: NodeId) -> bool:
+        return self._binding.is_invalidated(node_id)
 
     def reset(self) -> None:
         self._binding.reset()

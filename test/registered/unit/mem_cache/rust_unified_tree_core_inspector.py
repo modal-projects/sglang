@@ -44,6 +44,9 @@ class RustUnifiedTreeCoreInspector(
 
     _bindings = _inspection_bindings
 
+    def prefix_ref_counts(self) -> tuple[int, int]:
+        return self._binding.inspect_prefix_ref_counts()
+
     def contains_node(self, node_id: NodeId) -> bool:
         return self._binding.inspect_contains_node(node_id)
 

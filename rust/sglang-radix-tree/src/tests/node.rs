@@ -123,9 +123,10 @@ fn attach_child_links_both_sides() {
     assert_eq!(child.parent, Some(NodeIdx_(0)));
     // The edge key mirrors the child's namespace.
     assert_eq!(
-        parent
-            .children
-            .get(&(KeyNamespace::new(Some("ns"), None), vec![7])),
+        parent.children.get(&ChildEdge::Live(
+            KeyNamespace::new(Some("ns"), None),
+            vec![7]
+        )),
         Some(&NodeIdx_(1))
     );
 }
@@ -190,7 +191,9 @@ fn attach_child_rejects_duplicate_key() {
     ));
     // b was rejected without mutation; a still holds key 7.
     assert_eq!(
-        parent.children.get(&(KeyNamespace::default(), vec![7])),
+        parent
+            .children
+            .get(&ChildEdge::Live(KeyNamespace::default(), vec![7])),
         Some(&NodeIdx_(1))
     );
     assert_eq!(b.parent, None);
@@ -1133,8 +1136,11 @@ fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
 
     let page = vec![1];
     let mut children: ChildMap<Vec<i64>> = ChildMap::with_hasher(RandomState::new());
-    children.insert((first.to_owned(), page.clone()), NodeIdx_(1));
-    children.insert((second.to_owned(), page.clone()), NodeIdx_(2));
+    children.insert(ChildEdge::Live(first.to_owned(), page.clone()), NodeIdx_(1));
+    children.insert(
+        ChildEdge::Live(second.to_owned(), page.clone()),
+        NodeIdx_(2),
+    );
     assert_eq!(
         children.get(&ChildEdgeRef::<Vec<i64>> {
             namespace: first,

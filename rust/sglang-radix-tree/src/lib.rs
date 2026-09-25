@@ -18,6 +18,7 @@
 
 mod components;
 mod node;
+mod prefix_ref;
 #[cfg(feature = "python-extension")]
 mod python_bindings;
 #[cfg(test)]

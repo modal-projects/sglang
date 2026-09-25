@@ -29,10 +29,10 @@ import threading
 import time
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache, partial
+from functools import cached_property, lru_cache, partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -45,6 +45,7 @@ from typing import (
     Tuple,
     Union,
 )
+from weakref import WeakValueDictionary
 
 import fastapi
 import numpy as np
@@ -324,6 +325,15 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+
+
+class _RequestStateBinding:
+    """Request-scoped owner shared with callbacks created before registration."""
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.started = False
+        self.states: Dict[str, ReqState] = {}
 
 
 def _slice_streaming_output_meta_info(
@@ -853,86 +863,116 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    @cached_property
+    def _request_state_bindings(self) -> WeakValueDictionary[int, _RequestStateBinding]:
+        # Scopes and callbacks own the bindings. The weak index must not keep
+        # abandoned callbacks alive or put runtime state in request payloads.
+        return WeakValueDictionary()
+
+    def _request_state_binding(self, obj) -> _RequestStateBinding:
+        binding = self._request_state_bindings.get(id(obj))
+        if binding is None or binding.obj is not obj:
+            # A shallow request copy must not inherit another request's owner.
+            binding = _RequestStateBinding(obj)
+            self._request_state_bindings[id(obj)] = binding
+        return binding
+
+    @contextmanager
+    def _request_state_scope(self, obj):
+        binding = self._request_state_binding(obj)
+        if binding.started:
+            # Reusing the same input object starts a new generation. Existing
+            # background tasks keep the previous binding they already captured.
+            binding = _RequestStateBinding(obj)
+            self._request_state_bindings[id(obj)] = binding
+        binding.started = True
+        try:
+            yield binding.states
+        finally:
+            if self._request_state_bindings.get(id(obj)) is binding:
+                self._request_state_bindings.pop(id(obj))
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        self.auto_create_handle_loop()
+        with self._request_state_scope(obj) as request_states:
+            self.auto_create_handle_loop()
 
-        # Normalize the request
-        obj.normalize_batch_and_arguments()
-        self._set_default_priority(obj)
-        if (
-            isinstance(obj, GenerateReqInput)
-            and obj.max_thinking_tokens is not None
-            and not get_serving().enable_strict_thinking
-        ):
-            raise ValueError(
-                "max_thinking_tokens requires the server to be launched with "
-                "--enable-strict-thinking"
-            )
-
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            # Normalize the request
+            obj.normalize_batch_and_arguments()
+            self._set_default_priority(obj)
+            if (
+                isinstance(obj, GenerateReqInput)
+                and obj.max_thinking_tokens is not None
+                and not get_serving().enable_strict_thinking
+            ):
                 raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                    "max_thinking_tokens requires the server to be launched with "
+                    "--enable-strict-thinking"
                 )
 
-        self._init_req_state(obj, request)
-        request_states = {
-            rid: self.rid_to_state[rid]
-            for rid in ([obj.rid] if obj.is_single else obj.rid)
-        }
-        try:
-            if get_disagg().language_only:
-                self._handle_epd_disaggregation_encode_request(obj)
+            if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+                dp_size = self.elastic_worker_count
+                if dp_size <= 1 and obj.routed_dp_rank == 0:
+                    logger.debug(
+                        f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                    )
+                elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                    raise ValueError(
+                        f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                    )
 
-            # Log the request
-            self.request_logger.log_received_request(obj, self.tokenizer, request)
+            self._init_req_state(obj, request)
+            request_states.update(
+                (rid, self.rid_to_state[rid])
+                for rid in ([obj.rid] if obj.is_single else obj.rid)
+            )
+            try:
+                if get_disagg().language_only:
+                    self._handle_epd_disaggregation_encode_request(obj)
 
-            async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                # Log the request
+                self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-            async with self.model_update_lock.reader_lock:
-                await self._validate_and_resolve_lora(obj)
+                async with self.is_pause_cond:
+                    await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-                # Tokenize the request and send it to the scheduler
-                if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
-                    try:
-                        state = self.rid_to_state[obj.rid]
-                        if obj.return_prompt_token_ids:
-                            state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        response_generator = self._wait_one_response(obj, request)
-                    except BaseException:
-                        cancel_undispatched_inputs(
-                            self._mm_feature_pool(), (tokenized_obj.mm_inputs,)
-                        )
-                        raise
-                    await self._send_one_request(tokenized_obj)
-                    async for response in response_generator:
-                        yield response
-                else:
-                    async for response in self._handle_batch_request(
-                        obj, request, request_states
-                    ):
-                        yield response
-        except BaseException:
-            # _init_req_state created a rid_to_state entry per (sub-)request up
-            # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop
-            # undelivered states, but abort dispatched requests for scheduler-side
-            # cleanup.
-            self._release_req_states_on_failure(request_states)
-            raise
+                async with self.model_update_lock.reader_lock:
+                    await self._validate_and_resolve_lora(obj)
+
+                    # Tokenize the request and send it to the scheduler
+                    if obj.is_single:
+                        tokenized_obj = await self._tokenize_one_request(obj)
+                        try:
+                            state = self.rid_to_state[obj.rid]
+                            if obj.return_prompt_token_ids:
+                                state.prompt_token_ids = list(tokenized_obj.input_ids)
+                            response_generator = self._wait_one_response(obj, request)
+                        except BaseException:
+                            cancel_undispatched_inputs(
+                                self._mm_feature_pool(), (tokenized_obj.mm_inputs,)
+                            )
+                            raise
+                        await self._send_one_request(tokenized_obj)
+                        async for response in response_generator:
+                            yield response
+                    else:
+                        async for response in self._handle_batch_request(
+                            obj, request, request_states
+                        ):
+                            yield response
+            except BaseException:
+                # _init_req_state created a rid_to_state entry per (sub-)request up
+                # front. The normal remover is the scheduler-response path
+                # (_handle_batch_output), so a failure *before* a request reaches the
+                # scheduler -- e.g. input-length validation rejecting an over-context
+                # request -- would otherwise leak those entries forever. Drop
+                # undelivered states, but abort dispatched requests for scheduler-side
+                # cleanup.
+                self._release_req_states_on_failure(request_states)
+                raise
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1926,7 +1966,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    self._release_req_states_on_failure({obj.rid: state})
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -2014,7 +2054,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    self._release_req_states_on_failure({obj.rid: state})
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -2377,13 +2417,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
-        # Abort the request if the client is disconnected.
+        # Native streaming creates this callback before generate_request starts;
+        # OpenAI streaming creates it after the first chunk has been produced.
+        binding = self._request_state_binding(obj)
+
         async def abort_request():
-            await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
-            for rid in rids:
-                if rid in self.rid_to_state:
-                    self.abort_request(rid)
+            try:
+                await asyncio.sleep(2)
+                self._release_req_states_on_failure(binding.states)
+            finally:
+                if (
+                    not binding.started
+                    and self._request_state_bindings.get(id(obj)) is binding
+                ):
+                    self._request_state_bindings.pop(id(obj))
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)

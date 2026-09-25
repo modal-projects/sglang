@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.hicache_pool_stats import HostPoolStats
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
 )
@@ -156,6 +157,7 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    hicache_host_pools: List[HostPoolStats] = field(default_factory=list)
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -649,6 +651,23 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
+            self.hicache_host_pool_used_slots = Gauge(
+                name="sglang:hicache_host_pool_used_slots",
+                documentation="Used logical slots per host pool; Mamba slots are "
+                "state checkpoints. A nonempty indices_from_pool labels derived "
+                "sidecar occupancy, not additional independent capacity.",
+                labelnames=list(dict.fromkeys([*labels, "pool", "indices_from_pool"])),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_pool_total_slots = Gauge(
+                name="sglang:hicache_host_pool_total_slots",
+                documentation="Logical slot capacity per host pool, not physical "
+                "memory. A nonempty indices_from_pool labels the shared source "
+                "index space; exclude these sidecars when summing capacity.",
+                labelnames=list(dict.fromkeys([*labels, "pool", "indices_from_pool"])),
                 multiprocess_mode="mostrecent",
             )
 
@@ -1441,6 +1460,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            for pool in stats.hicache_host_pools:
+                labels = dict(
+                    self.labels,
+                    pool=pool.pool,
+                    indices_from_pool=pool.indices_from_pool,
+                )
+                self.hicache_host_pool_used_slots.labels(**labels).set(pool.used_slots)
+                self.hicache_host_pool_total_slots.labels(**labels).set(
+                    pool.total_slots
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:

@@ -347,6 +347,7 @@ class TestIdleMetrics(unittest.TestCase):
             waiting_queue=[],
             grammar_manager=[],
             enable_priority_scheduling=False,
+            enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
                 get_pool_stats=lambda: types.SimpleNamespace(

@@ -60,6 +60,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.observability.fp8_range import Fp8RangeObserver
 from sglang.srt.runtime_context import (
     get_buffer,
     get_parallel,
@@ -237,6 +238,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.fp8_range_observer = None
+        fp8_range_every = envs.SGLANG_DEBUG_FP8_RANGE_EVERY.get()
+        if fp8_range_every < 0:
+            raise ValueError("SGLANG_DEBUG_FP8_RANGE_EVERY must be nonnegative")
+        if self.data_type == torch.float8_e4m3fn and fp8_range_every:
+            self.fp8_range_observer = Fp8RangeObserver(
+                num_layers=config.num_hidden_layers,
+                device=model_runner.device,
+                every=fp8_range_every,
+            )
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -1104,6 +1115,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
+            # Prefix passes reuse Q; only the final causal pass advances sampling.
+            if self.fp8_range_observer is not None and is_causal:
+                self.fp8_range_observer.observe(layer_id=layer.layer_id, q=q)
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
@@ -1126,6 +1140,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        if self.fp8_range_observer is None:
+            return []
+        return self.fp8_range_observer.drain()
 
     def _set_kv_and_concat_q_fused(
         self,

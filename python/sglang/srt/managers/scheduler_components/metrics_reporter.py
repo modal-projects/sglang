@@ -200,6 +200,8 @@ class SchedulerMetricsReporter:
         # Windowed rate for waiting-queue load estimation only; the exported
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
+        self._fp8_range_enabled = envs.SGLANG_DEBUG_FP8_RANGE_EVERY.get() > 0
+        self._fp8_range_last_warn: dict[int, float] = {}
 
     def _current_gen_throughput(self, now: float) -> float:
         """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
@@ -643,6 +645,32 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _report_fp8_range_observations(self) -> None:
+        events = self.scheduler.tp_worker.model_runner.attn_backend.drain_fp8_range_observations()
+        per_layer: dict[int, dict[str, int]] = {}
+        for layer_id, kind, count in events:
+            if self.enable_metrics:
+                self.metrics_collector.increment_fp8_range_rows(layer_id, kind, count)
+            kinds = per_layer.setdefault(layer_id, {})
+            kinds[kind] = kinds.get(kind, 0) + count
+        if not self.is_stats_logging_rank or not per_layer:
+            return
+        now = time.monotonic()
+        for layer_id, kinds in per_layer.items():
+            if now - self._fp8_range_last_warn.get(layer_id, -math.inf) < 60:
+                continue
+            self._fp8_range_last_warn[layer_id] = now
+            logger.warning(
+                "Sampled eager FP8 Q range observations: layer=%d rows=%s",
+                layer_id,
+                kinds,
+            )
+
+    def report_fp8_range_observations(self) -> None:
+        """Drain optional observations independently of prefill batch statistics."""
+        if self._fp8_range_enabled:
+            self._report_fp8_range_observations()
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -650,6 +678,8 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        if self._fp8_range_enabled:
+            self._report_fp8_range_observations()
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled

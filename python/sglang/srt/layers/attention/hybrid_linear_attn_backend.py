@@ -1097,6 +1097,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
+    def drain_fp8_range_observations(self) -> list[tuple[int, str, int]]:
+        events = self.full_attn_backend.drain_fp8_range_observations()
+        if self.linear_attn_backend is not self.full_attn_backend:
+            events.extend(self.linear_attn_backend.drain_fp8_range_observations())
+        return events
+
     @property
     def data_type(self):
         # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the

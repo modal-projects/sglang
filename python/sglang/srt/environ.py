@@ -351,6 +351,8 @@ class Envs:
     # ===================================================================
     # Logging
     # ===================================================================
+    # Zero disables eager TRT-LLM MLA Q observations; N samples every Nth call per layer.
+    SGLANG_DEBUG_FP8_RANGE_EVERY = EnvInt(0)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)

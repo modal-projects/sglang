@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
@@ -266,6 +267,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
         Summary = self._summary_cls or _PromSummary
 
+        self.fp8_range_rows = None
+        if envs.SGLANG_DEBUG_FP8_RANGE_EVERY.get() > 0:
+            if {"layer", "kind"} & labels.keys():
+                raise ValueError("FP8 observations reserve the layer and kind labels")
+            self.fp8_range_rows = Counter(
+                name="sglang:fp8_range_rows_total",
+                documentation="Sampled eager preconversion Q rows: fully finite row max abs >448 or >464, or any nonfinite element. Rank-local observations, not clamp counts.",
+                labelnames=list(labels) + ["layer", "kind"],
+            )
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -1157,6 +1167,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             enable_kv_cache_events=enable_kv_cache_events,
             collector=collector,
         )
+
+    def increment_fp8_range_rows(self, layer: int, kind: str, count: int) -> None:
+        if self.fp8_range_rows is not None:
+            self.fp8_range_rows.labels(**self.labels, layer=str(layer), kind=kind).inc(
+                count
+            )
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.

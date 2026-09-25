@@ -2282,6 +2282,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+    admission_stop_reason: Optional[str] = None
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None

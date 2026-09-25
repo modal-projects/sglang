@@ -51,6 +51,10 @@ class TestSchedulerAdmissionMetrics(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_cache_miss_tokens = 0
+        req.mamba_cache_miss_end = 0
+        req.mamba_cache_miss_cause = "unknown"
+        req._mamba_cache_miss_reported = False
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False

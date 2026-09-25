@@ -601,6 +601,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     Unified: wait_queue -> forward -> completion
     Prefill: bootstrap_queue -> wait_queue -> forward -> transfer_queue -> completion
     Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
+
+    first_token_generated_time marks the first nonempty output committed by the
+    host result processor, including a verified run or resolved diffusion block.
+    On PD decode workers it marks local processing of the received handoff token,
+    not sampling on the prefill worker. It survives retraction and remains unset
+    for requests that terminate before producing output. A later abort retains it.
+
+    Python native meta_info exposes this milestone and scheduler_completion_time as
+    Unix seconds when metrics are enabled. Their difference is scheduler wall
+    time after the first commit, including scheduling/transfer delays; it is not
+    GPU execution time. Only subtract present, ordered timestamps. These stamps
+    do not establish per-token latency or throughput, or indicate request success.
     """
 
     # Placeholder: not used currently
@@ -614,6 +626,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     forward_entry_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
+    first_token_generated_time: float = 0.0
 
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
@@ -658,9 +671,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "first_token_generated_time": self.first_token_generated_time,
+            "completion_time": self.completion_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
+
+    def set_first_token_generated_time(self, ts=None):
+        # Call only after a nonempty generated sequence is committed on the host.
+        # Retractions and PD rebootstrap retain the request's original milestone.
+        if self.first_token_generated_time == 0.0:
+            self.first_token_generated_time = (
+                ts if ts is not None else time.perf_counter()
+            )
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -1183,6 +1206,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.prefill_finished_time > 0.0:
             meta_data["prefill_finished_time"] = convert_time_to_realtime(
                 self.prefill_finished_time
+            )
+        if self.first_token_generated_time > 0.0:
+            meta_data["first_token_generated_time"] = convert_time_to_realtime(
+                self.first_token_generated_time
+            )
+        if self.completion_time > 0.0:
+            meta_data["scheduler_completion_time"] = convert_time_to_realtime(
+                self.completion_time
             )
         meta_data.update(
             {

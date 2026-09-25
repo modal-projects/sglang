@@ -84,6 +84,7 @@ class _PrefillReq:
         self.hidden_states = []
         self.is_retracted = False
         self.output_ids = []
+        self.finished_len = None
         self.time_stats = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False

@@ -120,6 +120,13 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
+            # On decode workers this marks local availability of the handoff token.
+            if (
+                req.output_ids
+                and req.sampling_params.max_new_tokens > 0
+                and not req.finished()
+            ):
+                req.time_stats.set_first_token_generated_time()
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
@@ -353,6 +360,8 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                        if req.beam_group.num_committed > 0:
+                            req.time_stats.set_first_token_generated_time()
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
@@ -360,6 +369,13 @@ class SchedulerBatchResultProcessor:
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
                         req.update_finish_state()
+                    if (
+                        sampling_mask_finish_reason is None
+                        and req.beam_group is None
+                        and req.output_ids
+                        and req.finished_len != 0
+                    ):
+                        req.time_stats.set_first_token_generated_time()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
@@ -982,6 +998,8 @@ class SchedulerBatchResultProcessor:
                 ):
                     continue
                 req.time_stats.set_last_decode_finish_time()
+                if req.beam_group.num_committed > 0:
+                    req.time_stats.set_first_token_generated_time()
                 self._handle_finish_state_updated_req(
                     req, batch, result, i, logits_output
                 )
@@ -1015,6 +1033,8 @@ class SchedulerBatchResultProcessor:
                 new_accept_len = len(next_token_id)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
+            if new_accept_len > 0 and req.finished_len != 0:
+                req.time_stats.set_first_token_generated_time()
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)

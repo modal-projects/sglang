@@ -563,11 +563,13 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         finished_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
+        prefill_has_requested_output=True,
         return_logprob=False,
         return_sampling_mask=False,
         grammar=None,
         time_stats=SimpleNamespace(
             set_prefill_finished_time=Mock(),
+            set_first_token_generated_time=Mock(),
             set_prefill_transfer_queue_entry_time=Mock(),
         ),
     )

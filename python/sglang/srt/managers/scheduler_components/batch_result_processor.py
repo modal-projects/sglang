@@ -1442,6 +1442,20 @@ class SchedulerBatchResultProcessor:
         the crossing state T > C into the same slot, mislabeling the newer
         state as C. The caller must skip the donation/insert while this holds;
         the first verify result repairs the request-side label.
+
+        Reads the req-side CPU plan captured by mamba_lazy_spec_prepare
+        (req.kv.mamba_lazy_spec_scatter_pos) instead of the device ping-pong
+        buffer: under the overlap loop this runs after the next batch's
+        verify is launched, so a .item() on the device buffer could stall on
+        the in-flight forward. The captured plan is exact here: between the
+        verify prepare (which records the scatter position after any
+        pending-slot allocation) and this prefill result pass, no writer can
+        touch the request's ping-pong buffer or mamba_next_track_idx.
+        Promotion and the boundary free run only in decode result processing,
+        which the overlap loop services in launch order after this pass;
+        donation for this request runs later in this same pass (after the
+        predicate) and writes only the keep position; the non-spec prealloc
+        path returns before running for a spec batch.
         """
         if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
             return False
@@ -1459,13 +1473,23 @@ class SchedulerBatchResultProcessor:
             # the replacement slot before any verify plan can capture the keep
             # slot, so the published slot is never the captured destination.
             return False
-        if buf[other_idx].item() != -1:
-            return False
-        return mamba_lazy_spec_in_window(
+        in_window = mamba_lazy_spec_in_window(
             req,
             mamba_track_grid(self.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
+        planned_pos = req.kv.mamba_lazy_spec_scatter_pos
+        if planned_pos is None:
+            # No verify plan was captured for this request (the overlapped
+            # batch was not a spec decode batch containing it, or a partial
+            # fixture). A just-prefilled lazy request always has an empty
+            # pending slot, so the in-window rule alone matches the buffer
+            # read and stays conservative.
+            return in_window
+        # The verify scatters into the keep slot exactly when the prepare
+        # recorded the keep position (pending slot empty and its allocation
+        # failed); any other plan means the scatter targets the pending slot.
+        return planned_pos == next_idx and in_window
 
     def _mamba_lazy_spec_update(
         self, req: Req, batch: ScheduleBatch, i: int, crossed: bool, track_seqlen: int

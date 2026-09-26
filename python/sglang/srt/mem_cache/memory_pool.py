@@ -1706,6 +1706,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
+            req.kv.mamba_lazy_spec_scatter_pos = None
             req.kv.mamba_cow_src_index = None
             req.kv.mamba_needs_clear = False
 

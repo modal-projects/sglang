@@ -899,6 +899,13 @@ class ReqKvInfo:
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
     mamba_last_track_seqlen: Optional[int] = None
+    # CPU mirror of the latest lazy-spec verify plan for this request: the
+    # ping-pong position mamba_lazy_spec_prepare recorded as the scatter
+    # destination (the keep position when the pending slot was empty and its
+    # allocation failed). Lets result processing read the captured plan
+    # without a synchronizing .item() on the device ping-pong buffer; None
+    # when no verify plan was captured since the last reset.
+    mamba_lazy_spec_scatter_pos: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1912,6 +1919,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
+        self.kv.mamba_lazy_spec_scatter_pos = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
@@ -3381,6 +3389,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # No crossing reachable: the scatter mask stays -1, the
                 # position is never written.
                 track_positions.append(req.kv.mamba_next_track_idx)
+                req.kv.mamba_lazy_spec_scatter_pos = req.kv.mamba_next_track_idx
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
             has_pending = buf[other_idx].item() != -1
@@ -3395,9 +3404,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True
             # On failure the verify scatters in place into the keep slot.
-            track_positions.append(
-                other_idx if has_pending else req.kv.mamba_next_track_idx
-            )
+            planned_pos = other_idx if has_pending else req.kv.mamba_next_track_idx
+            track_positions.append(planned_pos)
+            # Req-side CPU mirror of the recorded scatter position. The
+            # overlapped prefill result pass reads this instead of the device
+            # buffer (.item() would stall on the in-flight verify forward).
+            req.kv.mamba_lazy_spec_scatter_pos = planned_pos
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):

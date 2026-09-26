@@ -33,6 +33,15 @@ class TestRenormPolicy(CustomTestCase):
             self.assertTrue(renorm_deterministic(ranks_agree=False))
             self.assertFalse(renorm_deterministic(ranks_agree=True))
 
+    def test_context_parallel_counts_toward_the_agreement_group(self):
+        # tp 2 with cp 2 leaves attn_tp 1, but the two CP ranks still sample
+        # the same distribution redundantly: the policy must cover them.
+        with get_context().override_server_args(tp_size=2, attn_cp_size=2):
+            self.assertEqual(get_parallel().attn_tp_size, 1)
+            self.assertEqual(get_parallel().attn_cp_size, 2)
+            self.assertTrue(renorm_deterministic(ranks_agree=False))
+            self.assertFalse(renorm_deterministic(ranks_agree=True))
+
     def test_deterministic_inference_forces_on(self):
         with get_context().override_server_args(
             tp_size=1, enable_deterministic_inference=True

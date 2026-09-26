@@ -6,8 +6,9 @@ close that at 1.2x (top-p) to 5-40x (single-CTA top-k; GB300 is the worst) the
 cost. Consumers that already broadcast their decision from rank 0 (speculative
 verify: EAGLE always, DFlash/DSpark via SGLANG_SPEC_TP_SYNC) keep the fast
 kernels; the plain sampler has no broadcast and goes deterministic as soon as
-more than one attention-TP rank has to agree. SGLANG_RENORM_DETERMINISTIC=0/1
-overrides both; --enable-deterministic-inference forces both on.
+more than one attention rank (TP x CP, the sampler's own sync topology) has to
+agree. SGLANG_RENORM_DETERMINISTIC=0/1 overrides both;
+--enable-deterministic-inference forces both on.
 """
 
 from __future__ import annotations
@@ -38,7 +39,10 @@ def renorm_deterministic(*, ranks_agree: bool) -> bool:
         return True
     if ranks_agree:
         return False
-    return get_parallel().attn_tp_size > 1
+    # The sampler's own agreement groups are attn_tp x attn_cp (its
+    # tp_sync_group x cp_sync_group; decode CP rides inside attn_tp_size).
+    parallel = get_parallel()
+    return parallel.attn_tp_size * parallel.attn_cp_size > 1
 
 
 def _split_param(x: Union[torch.Tensor, float, int]):

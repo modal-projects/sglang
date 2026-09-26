@@ -369,6 +369,9 @@ class SchedulerBatchResultProcessor:
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
+                    keep_may_be_written_in_flight = (
+                        self._mamba_lazy_keep_may_be_written_in_flight(req, batch)
+                    )
                     if req.finished():
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
@@ -376,11 +379,15 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
+                            is_insert=(
+                                sampling_mask_finish_reason is None
+                                and not keep_may_be_written_in_flight
+                            ),
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        if not keep_may_be_written_in_flight:
+                            maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -1418,6 +1425,47 @@ class SchedulerBatchResultProcessor:
             req.kv.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
             )
+
+    def _mamba_lazy_keep_may_be_written_in_flight(
+        self, req: Req, batch: ScheduleBatch
+    ) -> bool:
+        """Whether a spec verify overlapping this prefill may scatter into the
+        keep slot of the request.
+
+        Prefill-side twin of the decode guard keep_may_be_written_in_flight
+        recompute in _mamba_lazy_spec_update. Under lazy extra-buffer + spec,
+        when the pending ping-pong position is empty while a track-interval
+        crossing is reachable, the verify plan (mamba_lazy_spec_prepare) fell
+        back -- or will fall back -- to the keep slot as its scatter
+        destination. Publishing that physical slot to the radix tree now would
+        record it under the prefill tracked depth C while the verify commits
+        the crossing state T > C into the same slot, mislabeling the newer
+        state as C. The caller must skip the donation/insert while this holds;
+        the first verify result repairs the request-side label.
+        """
+        if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
+            return False
+        # getattr: partial test fixtures model the batch without a spec bag.
+        spec_algorithm = getattr(batch, "spec_algorithm", None)
+        if spec_algorithm is None or spec_algorithm.is_none():
+            return False
+        buf = getattr(req.kv, "mamba_ping_pong_track_buffer", None)
+        next_idx = req.kv.mamba_next_track_idx
+        if buf is None or next_idx is None:
+            return False
+        other_idx = 1 - next_idx
+        if other_idx >= buf.numel():
+            # Single-slot buffer (non-overlap scheduler): donation substitutes
+            # the replacement slot before any verify plan can capture the keep
+            # slot, so the published slot is never the captured destination.
+            return False
+        if buf[other_idx].item() != -1:
+            return False
+        return mamba_lazy_spec_in_window(
+            req,
+            mamba_track_grid(self.tree_cache.page_size),
+            max_speculative_num_draft_tokens(),
+        )
 
     def _mamba_lazy_spec_update(
         self, req: Req, batch: ScheduleBatch, i: int, crossed: bool, track_seqlen: int

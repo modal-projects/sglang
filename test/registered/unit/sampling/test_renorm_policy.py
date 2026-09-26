@@ -10,7 +10,7 @@ forced.
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.sampling_renorm import renorm_deterministic
+from sglang.srt.layers.sampling_renorm import _spec_ranks_agree, renorm_deterministic
 from sglang.srt.runtime_context import get_context, get_parallel, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,6 +42,25 @@ class TestRenormPolicy(CustomTestCase):
             self.assertEqual(get_parallel().attn_cp_size, 2)
             self.assertTrue(renorm_deterministic(ranks_agree=False))
             self.assertFalse(renorm_deterministic(ranks_agree=True))
+
+    def test_spec_fast_when_dp_attention_off_even_with_cp(self):
+        # No DP attention: the accept broadcast runs on the full TP group,
+        # which includes the CP ranks, so verify keeps the fast kernels.
+        with get_context().override_server_args(tp_size=2, attn_cp_size=2):
+            self.assertTrue(_spec_ranks_agree())
+            self.assertFalse(renorm_deterministic(ranks_agree=_spec_ranks_agree()))
+
+    def test_spec_deterministic_when_dp_attention_hides_cp_peers(self):
+        # DP attention + CP: the broadcast spans only the attn-TP group, so
+        # the CP peers renorm redundantly without reconciliation and must
+        # agree by construction.
+        with get_context().override_server_args(
+            tp_size=4, dp_size=2, enable_dp_attention=True, attn_cp_size=2
+        ):
+            self.assertEqual(get_parallel().attn_tp_size, 1)
+            self.assertEqual(get_parallel().attn_cp_size, 2)
+            self.assertFalse(_spec_ranks_agree())
+            self.assertTrue(renorm_deterministic(ranks_agree=_spec_ranks_agree()))
 
     def test_deterministic_inference_forces_on(self):
         with get_context().override_server_args(

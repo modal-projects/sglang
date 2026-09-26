@@ -5,9 +5,12 @@ can disagree in the last bits on identical logits. The deterministic variants
 close that at 1.2x (top-p) to 5-40x (single-CTA top-k; GB300 is the worst) the
 cost. Consumers that already broadcast their decision from rank 0 (speculative
 verify: EAGLE always, DFlash/DSpark via SGLANG_SPEC_TP_SYNC) keep the fast
-kernels; the plain sampler has no broadcast and goes deterministic as soon as
-more than one attention rank (TP x CP, the sampler's own sync topology) has to
-agree. SGLANG_RENORM_DETERMINISTIC=0/1 overrides both;
+kernels as long as that broadcast covers every cooperating rank (under DP
+attention it spans only the attn-TP group, so attention-CP peers are not
+reconciled and must agree by construction instead). The plain sampler has no
+broadcast and goes deterministic as soon as more than one attention rank
+(TP x CP, the sampler's own sync topology) has to agree.
+SGLANG_RENORM_DETERMINISTIC=0/1 overrides both;
 --enable-deterministic-inference forces both on.
 """
 
@@ -112,7 +115,9 @@ def spec_top_p_renorm_prob(
 ) -> torch.Tensor:
     """Speculative verify: the accept decision is broadcast from rank 0."""
     return top_p_renorm_prob(
-        probs, top_p, deterministic=renorm_deterministic(ranks_agree=True)
+        probs,
+        top_p,
+        deterministic=renorm_deterministic(ranks_agree=_spec_ranks_agree()),
     )
 
 
@@ -120,8 +125,26 @@ def spec_top_k_renorm_prob(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
     return top_k_renorm_prob(
-        probs, top_k, deterministic=renorm_deterministic(ranks_agree=True)
+        probs,
+        top_k,
+        deterministic=renorm_deterministic(ranks_agree=_spec_ranks_agree()),
     )
+
+
+def _spec_ranks_agree() -> bool:
+    """Whether the verify accept broadcast covers every cooperating rank.
+
+    EAGLE broadcasts predict/accept_index through attn_tp_group under DP
+    attention (the full TP group otherwise), and DFlash/DSpark sync the accept
+    sample through SpecTpSync on the same group. With DP attention off the full
+    TP group includes the attention-CP ranks; under DP attention the broadcast
+    spans only the attn-TP group, so CP peers renorm redundantly without
+    reconciliation and must agree by construction (deterministic kernels).
+    """
+    parallel = get_parallel()
+    if not parallel.enable_dp_attention:
+        return True  # get_tp_group() spans the CP ranks too
+    return parallel.attn_cp_size == 1
 
 
 __all__ = [

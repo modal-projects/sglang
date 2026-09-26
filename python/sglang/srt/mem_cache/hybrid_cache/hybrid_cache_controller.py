@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
@@ -47,6 +47,48 @@ if TYPE_CHECKING:
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ReservedPoolIndices:
+    """One recorded pool-transfer mutation from a reservation."""
+
+    transfer: PoolTransfer
+    attribute: str
+    previous_indices: Optional[torch.Tensor]
+    indices: Optional[torch.Tensor]
+    free_fn: Optional[Callable[[torch.Tensor], Any]] = None
+
+
+@dataclass(frozen=True)
+class _PoolTransferReservation:
+    """Resolved side-pool transfers plus their rollback journal."""
+
+    transfers: Optional[list[PoolTransfer]]
+    reserved_indices: tuple[_ReservedPoolIndices, ...] = ()
+
+
+@dataclass(frozen=True)
+class HybridWriteReservation:
+    """Reversible host allocations for one hybrid D->H transfer."""
+
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+    node_id: int
+    priority: Optional[int]
+    pool_reservation: _PoolTransferReservation
+
+
+@dataclass(frozen=True)
+class HybridLoadReservation:
+    """Reversible device allocations for one hybrid H->D transfer."""
+
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+    node_id: int
+    priority: Optional[int]
+    pool_reservation: _PoolTransferReservation
+    primary_free_fn: Optional[Callable[[torch.Tensor], Any]]
 
 
 class StorageOperation(BaseStorageOperation):
@@ -388,6 +430,65 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    def reserve_write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> Optional[HybridWriteReservation]:
+        """Hold host indices for a D->H transfer without queueing it.
+
+        Reclaim-on-alloc stays live inside the reservation (the same
+        callbacks the fire-and-forget write path uses); a failed
+        reservation rolls every held allocation back, so it is
+        side-effect-free.
+        """
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        try:
+            pool_reservation = self._reserve_pool_transfers(
+                extra_pools,
+                alloc_host=True,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+            )
+        except Exception:
+            self.mem_pool_host.free(host_indices)
+            raise
+        if pool_reservation is None:
+            self.mem_pool_host.free(host_indices)
+            return None
+        return HybridWriteReservation(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+            priority=priority,
+            pool_reservation=pool_reservation,
+        )
+
+    def commit_write(self, reservation: HybridWriteReservation) -> torch.Tensor:
+        """Queue a reserved D->H transfer; the reservation is consumed."""
+        self.write_queue.append(
+            CacheOperation(
+                reservation.host_indices,
+                reservation.device_indices,
+                reservation.node_id,
+                reservation.priority,
+                pool_transfers=reservation.pool_reservation.transfers,
+            )
+        )
+        self.start_writing()
+        return reservation.host_indices
+
+    def abort_write(self, reservation: HybridWriteReservation) -> None:
+        """Roll a write reservation back: side pools first, primary last."""
+        try:
+            self._rollback_pool_reservation(reservation.pool_reservation)
+        finally:
+            self.mem_pool_host.free(reservation.host_indices)
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -395,29 +496,10 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
-        if host_indices is None:
+        reservation = self.reserve_write(device_indices, priority, node_id, extra_pools)
+        if reservation is None:
             return None
-        pool_transfers = self.mem_pool_host.resolve_host_transfers(
-            extra_pools,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
-        if pool_transfers is None and extra_pools:
-            self.mem_pool_host.free(host_indices)
-            return None
-
-        self.write_queue.append(
-            CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
-            )
-        )
-        self.start_writing()
-        return host_indices
+        return self.commit_write(reservation)
 
     def _move_op_indices(
         self, op: CacheOperation
@@ -655,13 +737,18 @@ class HybridCacheController(BaseHiCacheController):
             return transfer_layer_id
         return mapper(transfer_layer_id)
 
-    def load(
+    def reserve_load(
         self,
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[HybridLoadReservation]:
+        """Hold device indices for an H->D transfer without queueing it.
+
+        Same rollback contract as reserve_write; a zero-KV (sidecar-only)
+        op holds an empty device range and no primary free function.
+        """
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(
@@ -671,31 +758,69 @@ class HybridCacheController(BaseHiCacheController):
         )
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            primary_free_fn = None
         else:
             device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
+            primary_free_fn = full_allocator.free
 
-        pool_transfers = self._resolve_device_transfers(
-            extra_pools,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-        )
-        if pool_transfers is None and extra_pools:
-            if need_load_kv:
-                full_allocator.free(device_indices)
+        try:
+            pool_reservation = self._reserve_pool_transfers(
+                extra_pools,
+                alloc_host=False,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+            )
+        except Exception:
+            if primary_free_fn is not None:
+                primary_free_fn(device_indices)
+            raise
+        if pool_reservation is None:
+            if primary_free_fn is not None:
+                primary_free_fn(device_indices)
             return None
+        return HybridLoadReservation(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+            priority=priority,
+            pool_reservation=pool_reservation,
+            primary_free_fn=primary_free_fn,
+        )
 
+    def commit_load(self, reservation: HybridLoadReservation) -> torch.Tensor:
+        """Queue a reserved H->D transfer; the reservation is consumed."""
         self.load_queue.append(
             CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
+                reservation.host_indices,
+                reservation.device_indices,
+                reservation.node_id,
+                reservation.priority,
+                pool_transfers=reservation.pool_reservation.transfers,
             )
         )
-        return device_indices
+        return reservation.device_indices
+
+    def abort_load(self, reservation: HybridLoadReservation) -> None:
+        """Roll a load reservation back: side pools first, primary last."""
+        try:
+            self._rollback_pool_reservation(reservation.pool_reservation)
+        finally:
+            if reservation.primary_free_fn is not None:
+                reservation.primary_free_fn(reservation.device_indices)
+
+    def load(
+        self,
+        host_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> Optional[torch.Tensor]:
+        reservation = self.reserve_load(host_indices, priority, node_id, extra_pools)
+        if reservation is None:
+            return None
+        return self.commit_load(reservation)
 
     def prefetch(
         self,
@@ -1031,6 +1156,158 @@ class HybridCacheController(BaseHiCacheController):
                     ]
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
+
+    @staticmethod
+    def _rollback_pool_reservation(
+        reservation: _PoolTransferReservation,
+    ) -> None:
+        """Free held indices in reverse order and restore every transfer.
+
+        Every recorded mutation is reverted even when a free raises; the
+        first free error re-raises once the journal is fully replayed.
+        """
+        first_error = None
+        for reserved in reversed(reservation.reserved_indices):
+            try:
+                if reserved.free_fn is not None:
+                    assert reserved.indices is not None
+                    reserved.free_fn(reserved.indices)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                setattr(
+                    reserved.transfer,
+                    reserved.attribute,
+                    reserved.previous_indices,
+                )
+        if first_error is not None:
+            raise first_error
+
+    def _reserve_pool_transfers(
+        self,
+        extra_pools: Optional[list[PoolTransfer]],
+        alloc_host: bool,
+        kv_device_indices: Optional[torch.Tensor] = None,
+        kv_host_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[_PoolTransferReservation]:
+        """Reserve missing pool indices without queueing any transfer.
+
+        Every setattr is recorded in a rollback journal, so a failure (or a
+        later abort) returns each transfer to its unresolved state and frees
+        exactly the allocations this call made. Reclaim-on-alloc stays live:
+        the pool's evict callback fires once before the allocation is
+        declared failed, matching the fire-and-forget write/load paths.
+        """
+        if not extra_pools:
+            return _PoolTransferReservation(transfers=None)
+        reserved_indices: list[_ReservedPoolIndices] = []
+        derived_transfers: list[PoolTransfer] = []
+
+        def rollback_allocated() -> None:
+            rollback_indices = tuple(reserved_indices)
+            reserved_indices.clear()
+            self._rollback_pool_reservation(
+                _PoolTransferReservation(
+                    transfers=extra_pools,
+                    reserved_indices=rollback_indices,
+                )
+            )
+
+        try:
+            for pool in extra_pools:
+                entry = self.mem_pool_host.entry_map.get(pool.name)
+                if entry is None:
+                    # A transaction cannot skip a pool silently: fail the
+                    # whole reservation so every rank rejects identically.
+                    rollback_allocated()
+                    return None
+                if pool.indices_from_pool is not None:
+                    derived_transfers.append(pool)
+                    continue
+                if alloc_host:
+                    if pool.host_indices is not None or pool.device_indices is None:
+                        continue
+                    alloc_fn = entry.host_pool.alloc
+                    free_fn = entry.host_pool.free
+                    evict_fn = entry.host_evict_fn
+                    size = len(pool.device_indices)
+                else:
+                    if pool.device_indices is not None or pool.host_indices is None:
+                        continue
+                    # device_alloc_fn / device_free_fn override
+                    # entry.device_pool's methods for pools whose device_pool
+                    # is a raw KV pool (layout) rather than an allocator.
+                    alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                    free_fn = entry.device_free_fn or entry.device_pool.free
+                    evict_fn = entry.device_evict_fn
+                    size = len(pool.host_indices)
+                indices = alloc_fn(size)
+                if indices is None and evict_fn:
+                    evict_fn(size)
+                    indices = alloc_fn(size)
+                if indices is None:
+                    rollback_allocated()
+                    return None
+                attribute = "host_indices" if alloc_host else "device_indices"
+                previous_indices = getattr(pool, attribute)
+                setattr(pool, attribute, indices)
+                reserved_indices.append(
+                    _ReservedPoolIndices(
+                        transfer=pool,
+                        attribute=attribute,
+                        previous_indices=previous_indices,
+                        indices=indices,
+                        free_fn=free_fn,
+                    )
+                )
+
+            # Assign indices to deferred pools from their source.
+            for pool in derived_transfers:
+                if pool.indices_from_pool == PoolName.KV:
+                    source_indices = (
+                        ("host_indices", kv_host_indices),
+                        ("device_indices", kv_device_indices),
+                    )
+                else:
+                    source = next(
+                        (
+                            transfer
+                            for transfer in extra_pools
+                            if transfer.indices_from_pool is None
+                            and transfer.name == pool.indices_from_pool
+                        ),
+                        None,
+                    )
+                    if source is None:
+                        rollback_allocated()
+                        return None
+                    source_indices = (
+                        ("host_indices", source.host_indices),
+                        ("device_indices", source.device_indices),
+                    )
+                for attribute, indices in source_indices:
+                    previous_indices = getattr(pool, attribute)
+                    setattr(pool, attribute, indices)
+                    reserved_indices.append(
+                        _ReservedPoolIndices(
+                            transfer=pool,
+                            attribute=attribute,
+                            previous_indices=previous_indices,
+                            indices=indices,
+                        )
+                    )
+        except Exception:
+            try:
+                rollback_allocated()
+            except Exception:
+                logger.exception("Failed to fully roll back pool reservation")
+            raise
+
+        return _PoolTransferReservation(
+            transfers=extra_pools,
+            reserved_indices=tuple(reserved_indices),
+        )
 
     def _resolve_device_transfers(
         self,

@@ -3,7 +3,8 @@
 The fast kernels can leave TP ranks disagreeing in the last bits; the plain
 sampler has no rank-0 broadcast to hide that, speculative verify does. The
 policy must therefore turn deterministic on for the sampler exactly when more
-than one attention-TP rank is involved, and nowhere else unless forced.
+than one attention rank (TP x CP) shares its logits, and nowhere else unless
+forced.
 """
 
 import unittest

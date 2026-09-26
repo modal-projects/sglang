@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
@@ -254,6 +255,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.tp_group is None
             else torch.distributed.get_world_size(group=self.tp_group)
         )
+        # Depth of the in-flight dedup TP transaction on this thread. A
+        # reclaim callback re-entering the backup/load seams while it is
+        # non-zero must not join a second consensus gather.
+        self._dedup_transaction_depth = 0
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
@@ -1577,16 +1582,110 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        if self._dedup_tp_transactions_active():
+            if self._dedup_transaction_depth > 0:
+                # Re-entrant call from a reclaim callback running inside an
+                # outer dedup transaction (e.g. write-back eviction triggered
+                # by a load's evict_for_alloc). A nested consensus gather here
+                # can interleave with the outer rank's collectives; the nested
+                # op is a deterministic function of the replicated tree, so
+                # every rank runs the identical reservation — fall through to
+                # the local write and leave the outer gather as the only
+                # collective in flight on this thread.
+                logger.debug(
+                    "HiCache dedup nested write-back node=%s commits locally "
+                    "(outer TP transaction in flight)",
+                    node_id,
+                )
+            else:
+                return self._transact_kv_backup(node_id, device_value, aux_xfers)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
                 return None
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
+
+    def _transact_kv_backup(self, node_id, device_value, aux_xfers):
+        """Dedup write-back as a TP transaction: reserve, consensus, commit.
+
+        Under dedup the write records the only physical copy's placement
+        metadata, so the whole group commits or nobody does; a rejected
+        group aborts every rank's reservation before any queue or tree
+        mutation. The caller's tree commit and write-through tracking
+        already run only after this returns host indices, i.e. after the
+        group commits.
+        """
+        self._dedup_transaction_depth += 1
+        try:
+            kv_tokens = len(device_value)
+            # Prepare phase: host-capacity admission. Every rank enters the
+            # consensus below — a local admission failure is recorded as a
+            # vote, never an early return that would strand peers waiting in
+            # the gather. The reclamation stays symmetric (deterministic
+            # replicated tree, reclaim-digest asserts).
+            admission_failed = False
+            admission_error = None
+            try:
+                host_avail = self.cache_controller.mem_pool_host.available_size()
+                if host_avail < kv_tokens:
+                    needed = kv_tokens - host_avail
+                    if self.evict_host(needed) < needed:
+                        admission_failed = True
+            except Exception as error:
+                # An admission exception (e.g. a failing reclaim callback)
+                # must still reach the consensus: reduce it as error=1 so
+                # the group rejects together instead of stranding peers.
+                admission_failed = True
+                admission_error = error
+            reservation = None
+            reserve_error = admission_error
+            if not admission_failed:
+                try:
+                    reservation = self.cache_controller.reserve_write(
+                        device_value,
+                        node_id=node_id,
+                        extra_pools=aux_xfers or None,
+                    )
+                except Exception as error:
+                    reserve_error = error
+            mamba_tree_rows = sum(
+                len(t.device_indices)
+                for t in aux_xfers
+                if t.name == PoolName.MAMBA and t.device_indices is not None
+            )
+            try:
+                group_ok, peer_error = self._tp_transaction_consensus(
+                    local_ok=reservation is not None and reserve_error is None,
+                    local_error=reserve_error is not None,
+                    opcode=1,
+                    node_id=node_id,
+                    target_tokens=len(device_value),
+                    mamba_tree_rows=mamba_tree_rows,
+                    request_mamba_rows=0,
+                )
+            except Exception:
+                if reservation is not None:
+                    self.cache_controller.abort_write(reservation)
+                raise
+            if not group_ok:
+                if reservation is not None:
+                    self.cache_controller.abort_write(reservation)
+                if reserve_error is not None:
+                    raise reserve_error
+                if peer_error:
+                    raise RuntimeError(
+                        "A TP peer failed while preparing an MLA dedup HiCache "
+                        "write-back."
+                    )
+                return None
+            return self.cache_controller.commit_write(reservation)
+        finally:
+            self._dedup_transaction_depth -= 1
 
     def _track_write_through_node(
         self,
@@ -1675,6 +1774,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
+                preps=preps,
             )
             return success
         finally:
@@ -1690,6 +1790,7 @@ class UnifiedRadixCache(BasePrefixCache):
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
+        preps: dict[ComponentType, PrepareLoadBackResult],
     ) -> bool:
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
@@ -1710,43 +1811,62 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
-        c128_allocator = getattr(
-            self.token_to_kv_pool_allocator, "c128_attn_allocator", None
-        )
-        if c128_allocator is not None:
-            c128_num_pages = _c128_transfer_num_pages(
-                comp_xfers.get(ComponentType.C128, ()),
-                c128_allocator.page_size,
-            )
-            if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
-                self, c128_num_pages
-            ):
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
-
-        avail = self._component_available_size(ComponentType.FULL)
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            self.evict_for_alloc(EvictParams(num_tokens=needed))
-            if self._component_available_size(ComponentType.FULL) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
-
-        # Load H→D
+        # Load H→D. Under MLA host dedup the load commits an NCCL broadcast
+        # collective, so the whole TP group must commit or abort together:
+        # reserve, agree on a fixed-shape fingerprint, then commit.
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
-        )
+        if self._dedup_tp_transactions_active():
+            device_indices = None
+            try:
+                device_indices = self._transact_load_back(
+                    node_id,
+                    kv_xfer,
+                    comp_xfers,
+                    aux_xfers,
+                    preps=preps,
+                )
+            finally:
+                self.dec_lock_ref(node_id, ancestor_lock_params)
+                if device_indices is None:
+                    self.dec_host_lock_ref(node_id, host_anchor_params)
+            if device_indices is None:
+                return False
+        else:
+            c128_allocator = getattr(
+                self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+            )
+            if c128_allocator is not None:
+                c128_num_pages = _c128_transfer_num_pages(
+                    comp_xfers.get(ComponentType.C128, ()),
+                    c128_allocator.page_size,
+                )
+                if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
+                    self, c128_num_pages
+                ):
+                    self.dec_lock_ref(node_id, ancestor_lock_params)
+                    self.dec_host_lock_ref(node_id, host_anchor_params)
+                    return False
 
-        self.dec_lock_ref(node_id, ancestor_lock_params)
-        if device_indices is None:
-            self.dec_host_lock_ref(node_id, host_anchor_params)
-            return False
+            avail = self._component_available_size(ComponentType.FULL)
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                self.evict_for_alloc(EvictParams(num_tokens=needed))
+                if self._component_available_size(ComponentType.FULL) < kv_tokens:
+                    self.dec_lock_ref(node_id, ancestor_lock_params)
+                    self.dec_host_lock_ref(node_id, host_anchor_params)
+                    return False
+
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+            )
+
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            if device_indices is None:
+                self.dec_host_lock_ref(node_id, host_anchor_params)
+                return False
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
         self._apply_cache_actions(
@@ -1762,6 +1882,116 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return True
+
+    def _transact_load_back(
+        self,
+        node_id: NodeId,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        aux_xfers: list[PoolTransfer],
+        *,
+        preps: dict[ComponentType, PrepareLoadBackResult],
+    ) -> Optional[torch.Tensor]:
+        """Dedup load-back as a TP transaction: reserve, consensus, commit.
+
+        Returns the committed device indices, or None when the group
+        rejected the transaction; every rank aborts its reservation before
+        any broadcast collective is queued. The request mamba slot held by
+        prepare_load_back is recovered by load_back's finalize on the
+        failure path, so the abort covers it symmetrically.
+        """
+        self._dedup_transaction_depth += 1
+        try:
+            host_indices = kv_xfer.host_indices
+            kv_tokens = len(host_indices)
+            # Prepare phase: device-capacity admission (C128 ensure, FULL
+            # availability, eviction). Every rank enters the consensus
+            # below — a local admission failure is recorded as a vote,
+            # never an early return that would strand peers waiting in
+            # the gather.
+            admission_failed = False
+            admission_error = None
+            try:
+                c128_allocator = getattr(
+                    self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+                )
+                if c128_allocator is not None:
+                    c128_num_pages = _c128_transfer_num_pages(
+                        comp_xfers.get(ComponentType.C128, ()),
+                        c128_allocator.page_size,
+                    )
+                    if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
+                        self, c128_num_pages
+                    ):
+                        admission_failed = True
+                if not admission_failed:
+                    avail = self._component_available_size(ComponentType.FULL)
+                    if avail < kv_tokens:
+                        needed = kv_tokens - avail
+                        self.evict_for_alloc(EvictParams(num_tokens=needed))
+                        if (
+                            self._component_available_size(ComponentType.FULL)
+                            < kv_tokens
+                        ):
+                            admission_failed = True
+            except Exception as error:
+                # An admission exception (e.g. a nested write-back or
+                # allocator callback failing inside evict_for_alloc) must
+                # still reach the consensus: reduce it as error=1 so the
+                # group rejects together instead of stranding peers.
+                admission_failed = True
+                admission_error = error
+            reservation = None
+            reserve_error = admission_error
+            if not admission_failed:
+                try:
+                    reservation = self.cache_controller.reserve_load(
+                        host_indices=host_indices,
+                        node_id=node_id,
+                        extra_pools=aux_xfers or None,
+                    )
+                except Exception as error:
+                    reserve_error = error
+            mamba_tree_rows = sum(
+                len(t.host_indices)
+                for t in aux_xfers
+                if t.name == PoolName.MAMBA
+                and t.host_indices is not None
+                and t.nodes_to_load
+            )
+            request_mamba_rows = sum(
+                len(prep.allocated_mamba_slot)
+                for prep in preps.values()
+                if prep.allocated_mamba_slot is not None
+            )
+            try:
+                group_ok, peer_error = self._tp_transaction_consensus(
+                    local_ok=reservation is not None and reserve_error is None,
+                    local_error=reserve_error is not None,
+                    opcode=2,
+                    node_id=node_id,
+                    target_tokens=len(host_indices),
+                    mamba_tree_rows=mamba_tree_rows,
+                    request_mamba_rows=request_mamba_rows,
+                )
+            except Exception:
+                if reservation is not None:
+                    self.cache_controller.abort_load(reservation)
+                raise
+            if not group_ok:
+                if reservation is not None:
+                    self.cache_controller.abort_load(reservation)
+                if reserve_error is not None:
+                    raise reserve_error
+                if peer_error:
+                    raise RuntimeError(
+                        "A TP peer failed while preparing an MLA dedup HiCache "
+                        "load-back."
+                    )
+                return None
+            return self.cache_controller.commit_load(reservation)
+        finally:
+            self._dedup_transaction_depth -= 1
 
     def _build_sidecar_transfers(
         self,
@@ -3121,6 +3351,90 @@ class UnifiedRadixCache(BasePrefixCache):
             tuple(count_values[2:-2]),
             extra_pool_names,
         )
+
+    # ---- MLA dedup TP transaction consensus ----
+
+    def _dedup_tp_transactions_active(self) -> bool:
+        """Whether dedup write-back/load-back must be group-atomic.
+
+        The dedup broadcast made loads collective: without a transaction,
+        one rank's local failure while peers proceed leaves the group
+        waiting in (or skipping) an NCCL broadcast. Without dedup,
+        divergent outcomes degrade to the pre-existing tolerated model
+        (writing_check/loading_check MIN-drains), so non-dedup paths run
+        no extra collective.
+        """
+        controller = self.cache_controller
+        return controller is not None and getattr(
+            controller, "mla_broadcast_enabled", False
+        )
+
+    def _dedup_consensus_group(self):
+        """Process group the dedup broadcast spans (attn-TP under DP attention).
+
+        Mirrors MLAHostDedupBroadcaster.build's base-group selection so the
+        consensus covers exactly the ranks that join the broadcast: attn-TP
+        only when DP attention is enabled, otherwise the full TP group.
+        """
+        group = self.tp_group
+        if is_dp_attention_enabled() and self.attn_tp_group is not None:
+            group = self.attn_tp_group
+        if group is not None and torch.distributed.get_world_size(group=group) > 1:
+            return group
+        return None
+
+    def _tp_transaction_consensus(
+        self,
+        *,
+        local_ok: bool,
+        local_error: bool,
+        opcode: int,
+        node_id: int,
+        target_tokens: int,
+        mamba_tree_rows: int,
+        request_mamba_rows: int,
+    ) -> tuple[bool, bool]:
+        """One fixed-shape gather validates success and the full DMA shape.
+
+        Every rank contributes [ok, error, opcode, node_id, target_tokens,
+        mamba_tree_rows, request_mamba_rows]; the group commits only when
+        every rank is ok, no rank errored, and all shapes are identical.
+        Returns (group_ok, any_error). Runs on CPU tensors; scheduler
+        thread only.
+        """
+        group = self._dedup_consensus_group()
+        if group is None:
+            return local_ok and not local_error, local_error
+        local = torch.tensor(
+            [
+                int(local_ok),
+                int(local_error),
+                opcode,
+                node_id,
+                target_tokens,
+                mamba_tree_rows,
+                request_mamba_rows,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        world = torch.distributed.get_world_size(group=group)
+        gathered = [torch.empty_like(local) for _ in range(world)]
+        torch.distributed.all_gather(gathered, local, group=group)
+        reference = gathered[0]
+        any_error = any(state[1].item() == 1 for state in gathered)
+        group_ok = all(
+            state[0].item() == 1
+            and state[1].item() == 0
+            and torch.equal(state[2:], reference[2:])
+            for state in gathered
+        )
+        if not group_ok:
+            logger.warning(
+                "HiCache dedup TP transaction consensus rejected: states=%s",
+                [state.tolist() for state in gathered],
+            )
+        return group_ok, any_error
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None

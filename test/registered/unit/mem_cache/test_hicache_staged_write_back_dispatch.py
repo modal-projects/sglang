@@ -1852,6 +1852,90 @@ class TestMLAHostDedupDispatch(CustomTestCase):
             ],
         )
 
+    def test_mla_dedup_zero_kv_load_op_runs_sidecar_layerwise(self):
+        """A mamba-only (zero-KV) dedup load op runs to completion.
+
+        The anchor L2 transfer is dropped for the empty KV range, the mamba
+        sidecar still loads rank-locally on every layer, the per-layer
+        broadcast and completion events still fire so every rank stays
+        collective-aligned, and the ack reports zero KV tokens.
+        """
+        operations = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=torch.empty((0,), dtype=torch.int64),
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            node_id=23,
+            pool_transfers=[transfer],
+        )
+
+        class FakeTargetHostPool:
+            size_per_token = 2
+
+            def load_to_device_per_layer(self, *args, **kwargs):
+                raise AssertionError("zero-KV op must not H2D the target pool")
+
+        class FakeMambaHostPool:
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                is_draft=False,
+            ):
+                operations.append(("mamba", layer_id))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeTargetHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.MAMBA,
+                host_pool=FakeMambaHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            ),
+        ]
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=_dedup_broadcaster_stub(operations, is_src=True),
+            op=op,
+            layer_num=2,
+        )
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[_FakeProducerEvent(operations)]
+        )
+
+        self._run_start_loading(controller)
+
+        self.assertEqual(
+            operations,
+            [
+                ("mamba", 0),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("mamba", 1),
+                ("broadcast", 1),
+                ("complete", 1),
+            ],
+        )
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        ack = controller.ack_load_queue[0]
+        self.assertEqual(ack.node_ids, [23])
+        self.assertEqual(ack.num_tokens, 0)
+
     def test_mla_dedup_aggregate_host_budget_is_fail_closed(self):
         budget = mock.Mock(get=mock.Mock(return_value=1))
         with mock.patch(

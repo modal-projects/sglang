@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
     DraftSWATokenToKVPoolAllocator,
@@ -178,6 +181,57 @@ class TestSWA(unittest.TestCase):
                 draft_indices,
             )
         )
+
+    def test_dflash_dcp_idle_capacity_accounting_is_logical(self):
+        allocator = DraftSWATokenToKVPoolAllocator(
+            size=256,
+            size_swa=128,
+            page_size=64,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=SimpleNamespace(),
+            need_sort=False,
+            dcp_size=2,
+        )
+
+        (full_capacity, full_available), (swa_capacity, swa_available) = (
+            allocator.swa_capacity_and_available(
+                full_capacity=256,
+                swa_capacity=128,
+            )
+        )
+
+        # PoolStats and the idle leak checker must receive all four values in
+        # the same logical-id domain.  Before this regression fix the two
+        # capacities stayed physical while availability was exactly 2x.
+        self.assertEqual((full_capacity, full_available), (512, 512))
+        self.assertEqual((swa_capacity, swa_available), (256, 256))
+
+        tree_cache = mock.MagicMock()
+        tree_cache.full_evictable_size.return_value = 0
+        tree_cache.swa_evictable_size.return_value = 0
+        observer = SchedulerPoolStatsObserver(
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=mock.MagicMock(),
+            session_controller=mock.MagicMock(),
+            hisparse_coordinator=None,
+            is_hybrid_swa=True,
+            is_hybrid_ssm=False,
+            enable_hisparse=False,
+            full_tokens_per_layer=256,
+            swa_tokens_per_layer=128,
+            max_total_num_tokens=256,
+            get_last_batch=lambda: None,
+            get_running_batch=lambda: None,
+        )
+        stats = observer.get_pool_stats()
+        self.assertEqual(stats.full_capacity, 512)
+        self.assertEqual(stats.swa_capacity, 256)
+        self.assertEqual(stats.full_num_used, 0)
+        self.assertEqual(stats.swa_num_used, 0)
+        self.assertEqual(stats.full_token_usage, 0.0)
+        self.assertEqual(stats.swa_token_usage, 0.0)
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
         page_size = 4

@@ -951,6 +951,27 @@ class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Backends check this to detect a hybrid-SWA target.
         return self._kvcache.full_kv_pool
 
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        """Report capacities in the allocator's widened logical-id space.
+
+        ``KVCacheConfigResult`` retains the physical per-rank target and draft
+        row counts.  This allocator, however, widens both of those pools by
+        ``dcp_size`` so that the replicated DFLASH draft can consume the
+        target's logical locations directly.  Availability is consequently
+        already logical; scale the supplied physical capacities to the same
+        domain before pool utilization and conservation are computed.
+        """
+        return (
+            (
+                None if full_capacity is None else full_capacity * self.dcp_size,
+                self.full_available_size(),
+            ),
+            (
+                None if swa_capacity is None else swa_capacity * self.dcp_size,
+                self.swa_available_size(),
+            ),
+        )
+
     def resize(self, config) -> None:
         """Resize physical pool counts while preserving the DCP logical view."""
         size_full = int(config.full_max_total_num_tokens) * self.dcp_size

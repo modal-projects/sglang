@@ -6124,6 +6124,24 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, seq_b)
         return cache, req_to_token_pool, seq_a
 
+    def _drop_aux_host_copy(self, cache, node_id, component_type):
+        """Leave Full host-backed while making one auxiliary component
+        device-only, the incremental-backup state exercised in production."""
+        node = cache.tree_core.node_by_id(node_id)
+        tracker = defaultdict(int)
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        cache.tree_core._evict_component_and_detach_lru(
+            node,
+            cache.tree_core.components_by_type[component_type],
+            target=EvictLayer.HOST,
+            tracker=tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+        )
+        cache._drain_device_frees(device_frees)
+        cache._drain_host_frees(host_frees)
+
     def test_hicache_write_back_internal_mamba_evict_demotes_state(self):
         """write_back: an internal node's tombstoned mamba state is demoted
         to host, keeping the node a valid match boundary so the KV beneath
@@ -6205,6 +6223,33 @@ class UnifiedRadixCacheSuite:
             0,
             "write_through keeps the legacy drop: frontier capped at root",
         )
+        cache.sanity_check()
+
+    def test_hicache_write_back_internal_mamba_incremental_backup(self):
+        """An existing Full host copy must not suppress a later Mamba-only
+        write-back before the device state is tombstoned."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("internal-node state demote is Python-core only")
+        cache, _, seq_a = self._build_internal_mamba_fixture("write_back")
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+        )
+        node = match.best_match_node
+
+        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self._drop_aux_host_copy(cache, node, ComponentType.MAMBA)
+        self.assertIsNone(_host_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.MAMBA))
+
+        cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+        self.assertIsNone(_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
         cache.sanity_check()
 
     def _build_internal_swa_fixture(self, write_policy):
@@ -6301,6 +6346,33 @@ class UnifiedRadixCacheSuite:
                 _host_value(cache, node, ComponentType.SWA),
                 "write_through keeps the legacy drop: no host demote",
             )
+        cache.sanity_check()
+
+    def test_hicache_write_back_internal_swa_incremental_backup(self):
+        """An existing Full host copy must not suppress a later SWA-only
+        write-back before the internal device window is tombstoned."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("internal-node SWA demote is Python-core only")
+        cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_back")
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+        )
+        node = match.best_match_node
+
+        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self._drop_aux_host_copy(cache, node, ComponentType.SWA)
+        self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
+        self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.SWA))
         cache.sanity_check()
 
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):

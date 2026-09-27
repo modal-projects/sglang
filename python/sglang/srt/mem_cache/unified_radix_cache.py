@@ -1629,7 +1629,12 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        # A node may already have Full KV on host while an auxiliary component
+        # (SWA or Mamba) is still device-only. Such an incremental backup has
+        # zero Full-KV rows but does register an in-flight write under node_id.
+        # Treat that as successful work and drain it before the component
+        # eviction frees the source slots.
+        if written == 0 and node_id not in self.ongoing_write_through:
             return False
         self.writing_check(write_back=True)
         return True

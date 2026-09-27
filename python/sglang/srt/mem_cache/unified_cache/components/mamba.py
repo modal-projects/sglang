@@ -439,7 +439,6 @@ class MambaComponent(TreeComponent):
             cache.cache_controller is None
             or not cache.is_write_back
             or cd.host_value is not None
-            or node.backuped
             or node.component_data[BASE_COMPONENT_TYPE].value is None
         ):
             return

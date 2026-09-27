@@ -787,7 +787,6 @@ class SWAComponent(TreeComponent):
             or not cache.is_write_back
             or not self.tree_core.has_swa_host_pool
             or cd.host_value is not None
-            or node.backuped
             or node.component_data[BASE_COMPONENT_TYPE].value is None
         ):
             return

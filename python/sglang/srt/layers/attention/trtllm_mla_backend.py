@@ -54,9 +54,6 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    is_in_breakable_cuda_graph,
-)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -712,10 +709,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
-            (self.disable_chunked_prefix_cache and has_prefix)
-            or is_in_tc_piecewise_cuda_graph()
-            or is_in_breakable_cuda_graph()
-        )
+            self.disable_chunked_prefix_cache and has_prefix
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
@@ -818,10 +813,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Also fallback to flashinfer MLA backend under a captured prefill graph
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
-                (self.disable_chunked_prefix_cache and has_prefix)
-                or is_in_tc_piecewise_cuda_graph()
-                or is_in_breakable_cuda_graph()
-            )
+                self.disable_chunked_prefix_cache and has_prefix
+            ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 

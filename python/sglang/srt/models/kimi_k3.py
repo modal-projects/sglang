@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.k3_dense_fp8 import K3DenseFP8Linear
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -441,6 +442,7 @@ class KimiK3MoE(nn.Module):
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
+        self._front_fp8: Optional[K3DenseFP8Linear] = None
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -767,6 +769,7 @@ class KimiK3MoE(nn.Module):
         bf16 in _forward_fused, which is bit-identical to the bf16 front."""
         return (
             not _is_hip
+            and self._front_fp8 is None
             and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
         )
@@ -1228,11 +1231,14 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(hidden_states)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -3032,6 +3038,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self._use_dense_fp8 = envs.SGLANG_ENABLE_K3_DENSE_FP8.get()
+        self._dense_fp8_ready = False
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3131,6 +3139,10 @@ class KimiK3LinearForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        if self._dense_fp8_ready:
+            raise RuntimeError(
+                "Dense FP8 weight reload requires a fresh model instance"
+            )
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
@@ -3315,6 +3327,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         return loaded_params
 
     def post_load_weights(self):
+        if self._dense_fp8_ready:
+            return
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get w_kc/w_vc and
@@ -3402,6 +3416,33 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+        if self._use_dense_fp8:
+            self._convert_dense_fp8()
+
+    def _convert_dense_fp8(self) -> None:
+        if _is_hip or _is_npu or self.pp_group.world_size != 1:
+            raise ValueError("K3 dense FP8 requires CUDA and pipeline parallel size 1")
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, KimiK3MoE):
+                mlp = layer.mlp
+                if not mlp._eligible_for_fused_front or mlp._dp_attention:
+                    raise ValueError(
+                        "K3 dense FP8 requires the ordinary TP fused front"
+                    )
+                mlp._front_fp8 = K3DenseFP8Linear(weight=mlp._front_w)
+                mlp.__dict__.pop("_front_fp32", None)
+                mlp.__dict__.pop("_routing_contract_ok", None)
+            if isinstance(layer.self_attn, KimiK3DeltaAttention):
+                attn = layer.self_attn
+                if not attn.do_fuse_qkvbfg or not attn.use_full_rank_gate:
+                    raise ValueError(
+                        "K3 dense FP8 requires the merged full-rank KDA gate"
+                    )
+                attn.fused_qkvg_proj = K3DenseFP8Linear(
+                    weight=attn.fused_qkvg_proj.weight, tuple_output=True
+                )
+        self._dense_fp8_ready = True
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

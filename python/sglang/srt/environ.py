@@ -1669,6 +1669,8 @@ class Envs:
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # Fuse cached-prefix concatenation and quantization in TRT MLA prefill.
     SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK = EnvBool(False)
+    # Quantize the merged MoE front and KDA q/k/v/g linears to static FP8.
+    SGLANG_ENABLE_K3_DENSE_FP8 = EnvBool(False)
     # Keep DP-sharded vision encoder collectives aligned across attention TP.
     SGLANG_MM_RANK_CONSISTENT_ENCODE = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over

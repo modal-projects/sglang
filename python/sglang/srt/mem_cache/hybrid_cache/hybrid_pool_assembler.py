@@ -31,7 +31,6 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     import torch
-
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1051,6 +1050,10 @@ def build_hybrid_mamba_stack(
     load_cache_event,
     storage_backend: Optional[str],
     use_mla: bool,
+    swa_kv_pool: Optional[Any] = None,
+    swa_layer_mapping: Optional[dict[int, int]] = None,
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
@@ -1058,9 +1061,12 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_id_max = (
-        max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
-    )
+    if (swa_kv_pool is None) != (swa_layer_mapping is None):
+        raise ValueError("swa_kv_pool and swa_layer_mapping must be set together")
+    transfer_layer_ids = full_layer_mapping.keys() | mamba_layer_mapping.keys()
+    if swa_layer_mapping is not None:
+        transfer_layer_ids |= swa_layer_mapping.keys()
+    transfer_layer_id_max = max(transfer_layer_ids) + 1
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -1068,11 +1074,18 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
         for pool in params.mtp_draft_device_pools
     )
-    kv_host_size, mamba_host_size = None, 0
+    kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        pools = (kv_pool, mamba_pool)
+        if swa_kv_pool is not None:
+            pools = (kv_pool, swa_kv_pool, mamba_pool)
+            kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, pools
+            )
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, pools
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1113,6 +1126,34 @@ def build_hybrid_mamba_stack(
             is_anchor=True,
             packed_draft_device_pools=mtp_draft_device_pools,
         ),
+    ]
+    if swa_kv_pool is not None:
+        swa_host_pool = _build_mha_mla_host_pool(
+            pool=swa_kv_pool,
+            host_to_device_ratio=get_memory().hicache_ratio,
+            host_size=swa_host_size or 0,
+            page_size=params.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="swa",
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=swa_kv_pool,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                **_swa_allocation_callbacks(
+                    params.token_to_kv_pool_allocator.swa_attn_allocator,
+                    None,
+                    None,
+                ),
+            )
+        )
+    entries.append(
         build_pool_entry(
             name=PoolName.MAMBA,
             host_pool=mamba_host_pool,
@@ -1123,8 +1164,8 @@ def build_hybrid_mamba_stack(
             device_evict_fn=device_mamba_evict_fn,
             device_alloc_fn=mamba_allocator.alloc,
             device_free_fn=mamba_allocator.free,
-        ),
-    ]
+        )
+    )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1350,6 +1391,7 @@ def _build_mha_mla_host_pool(
     layout: str,
     allocator_type: str,
     pool_label: str,
+    host_size: float = 0,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -1361,7 +1403,7 @@ def _build_mha_mla_host_pool(
 
     kwargs = dict(
         host_to_device_ratio=host_to_device_ratio,
-        host_size=0,
+        host_size=host_size,
         page_size=page_size,
         layout=layout,
         allocator_type=allocator_type,
@@ -1758,6 +1800,90 @@ class _MambaStrategy(StackStrategy):
         )
 
 
+class _BoundedDraftMambaSwaStrategy(StackStrategy):
+    """HiCache stack for a hybrid-linear target plus bounded DFLASH SWA KV."""
+
+    def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        return isinstance(kvcache, HybridLinearKVPool) and components == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        from sglang.srt.mem_cache.allocator.swa import (
+            DraftSWATokenToKVPoolAllocator,
+        )
+
+        allocator = params.token_to_kv_pool_allocator
+        if not isinstance(allocator, DraftSWATokenToKVPoolAllocator):
+            raise ValueError(
+                "Hybrid-linear FULL+SWA+MAMBA HiCache requires the bounded "
+                "DFLASH allocator."
+            )
+        draft_pool = allocator.get_attached_draft_kv_pool()
+        if draft_pool is None or draft_pool.swa_kv_pool is None:
+            raise RuntimeError("The bounded DFLASH draft SWA pool is not attached.")
+        draft_swa_pool = draft_pool.swa_kv_pool
+
+        full_layer_mapping = _stage_local_layer_mapping(
+            kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+        )
+        mamba_layer_mapping = _stage_local_layer_mapping(
+            params.req_to_token_pool.mamba_map, kvcache.start_layer
+        )
+        # Draft layers are independent from target layer IDs. Reusing the first
+        # transfer IDs lets the controller move them in the same per-layer pass
+        # without extending the target model's transfer span.
+        swa_layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
+        host_pool_group, cache_controller = build_hybrid_mamba_stack(
+            params=params,
+            kv_pool=kvcache.full_kv_pool,
+            mamba_pool=params.req_to_token_pool.mamba_pool,
+            swa_kv_pool=draft_swa_pool,
+            full_layer_mapping=full_layer_mapping,
+            swa_layer_mapping=swa_layer_mapping,
+            mamba_layer_mapping=mamba_layer_mapping,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            use_mla=kvcache.use_mla,
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+            device_mamba_evict_fn=lambda n: _evict_mamba_for_device_alloc(cache, n),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+            },
+            register_req_to_token_counter=True,
+            pools_desc="KV + bounded DFLASH SWA + MAMBA",
+        )
+
+
 def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
     full = {
         gid - kvcache.start_layer: lid
@@ -2086,6 +2212,7 @@ class _PlainKvStrategy(StackStrategy):
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
+    _BoundedDraftMambaSwaStrategy(),
     _MambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),

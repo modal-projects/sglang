@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -72,6 +71,13 @@ def _estimate_hicache_bytes(
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
         total += _pool_bytes(params.req_to_token_pool.mamba_pool)
     drafts = params.mtp_draft_device_pools
+    if draft_plan is not None and draft_plan.mode == "attached_swa":
+        # The bounded DFLASH pool is a first-class SWA component. Its device
+        # capacity already spans the replicated logical location space, so it
+        # is mirrored at the configured ratio without target-side scaling.
+        return total + sum(
+            _pool_bytes(draft.swa_kv_pool) for draft in draft_plan.device_pools
+        )
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)

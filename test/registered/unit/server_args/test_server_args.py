@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
-
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
     parallel_hook,
@@ -1072,6 +1071,7 @@ class TestKV4Compatibility(unittest.TestCase):
             device="cuda",
             tp_size=2,
             dcp_size=2,
+            enable_hierarchical_cache=True,
             speculative_algorithm="DFLASH",
             speculative_draft_model_path="dummy-draft",
             speculative_num_draft_tokens=8,
@@ -1083,9 +1083,7 @@ class TestKV4Compatibility(unittest.TestCase):
         ):
             _handle_dflash_draft_kv_ratio(args)
 
-        self.assertEqual(
-            resolution_result(args, "speculative_draft_window_size"), 4095
-        )
+        self.assertEqual(resolution_result(args, "speculative_draft_window_size"), 4095)
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_sm120_xqa_keeps_existing_speculative_support(self):

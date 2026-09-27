@@ -2,7 +2,6 @@ import logging
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -19,7 +18,6 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
-
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
@@ -945,6 +943,9 @@ class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def attach_draft_kv_pool(self, draft_kv_pool: BaseSWAKVPool) -> None:
         self._kvcache.attach_swa_kv_pool(draft_kv_pool)
+
+    def get_attached_draft_kv_pool(self) -> Optional[BaseSWAKVPool]:
+        return self._kvcache.swa_kv_pool
 
     def get_kvcache(self):
         # Backends check this to detect a hybrid-SWA target.

@@ -989,7 +989,7 @@ class DFlashDraftSWAPoolConfigurator(DefaultPoolConfigurator):
         self._draft_cap = compute_swa_request_cap(
             page_size=kvc.page_size,
             window=self._window,
-            attn_dp_size=kvc.attn_dp_size,
+            attn_dp_size=kvc.ps.attn_dp_size,
         )
         # On a mamba target a hit resumes at the last tracked state, so a cached
         # prefix keeps its window back from there.

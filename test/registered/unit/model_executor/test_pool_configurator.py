@@ -176,7 +176,6 @@ def _make_model_runner(
     )
     mr.ps = ParallelState.trivial()
     mr.attn_dp_size = 1
-    mr.ps = SimpleNamespace(attn_dcp_size=1)
     mr.pp_size = 1
     mr.draft_kv_ratio = speculative_draft_kv_ratio
     mr.pp_group = SimpleNamespace(rank_in_group=0)

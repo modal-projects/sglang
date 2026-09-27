@@ -909,7 +909,14 @@ class _DraftSWAKVPoolBinding(BaseSWAKVPool):
 
 
 class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
-    """Target allocator whose SWA side is a bounded speculative draft KV pool."""
+    """Target allocator whose SWA side is a bounded speculative draft KV pool.
+
+    Under DCP, the target KV buffers stay rank-local while allocator locations
+    remain in the widened logical token space. The DFLASH draft is replicated
+    and consumes those logical locations directly, so both allocator sides and
+    their page size must be widened by ``dcp_size``. The target KV pool itself
+    is deliberately left at its physical per-rank size.
+    """
 
     def __init__(
         self,
@@ -921,11 +928,14 @@ class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache: KVCache,
         need_sort: bool,
         req_to_token_pool=None,
+        dcp_size: int = 1,
     ):
+        assert dcp_size >= 1
+        self.dcp_size = dcp_size
         super().__init__(
-            size,
-            size_swa,
-            page_size,
+            size * dcp_size,
+            size_swa * dcp_size,
+            page_size * dcp_size,
             dtype,
             device,
             _DraftSWAKVPoolBinding(kvcache),
@@ -939,3 +949,29 @@ class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def get_kvcache(self):
         # Backends check this to detect a hybrid-SWA target.
         return self._kvcache.full_kv_pool
+
+    def resize(self, config) -> None:
+        """Resize physical pool counts while preserving the DCP logical view."""
+        size_full = int(config.full_max_total_num_tokens) * self.dcp_size
+        size_swa = int(config.swa_max_total_num_tokens) * self.dcp_size
+        self._size_full = size_full
+        self._size_swa = size_swa
+        for alloc, size in (
+            (self.full_attn_allocator, size_full),
+            (self.swa_attn_allocator, size_swa),
+        ):
+            alloc.size = size
+            if self.page_size > 1:
+                alloc.num_pages = size // self.page_size
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(
+                    size_full + self.page_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
+            ]
+        )
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+        self.clear()

@@ -402,7 +402,6 @@ def _handle_dflash_draft_kv_ratio(server_args: ServerArgs) -> None:
             ("--enable-unified-memory", cfg.enable_unified_memory),
             ("--enable-hisparse", cfg.enable_hisparse),
             ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
-            ("--dcp-size", cfg.dcp_size > 1),
         )
         if enabled
     ]

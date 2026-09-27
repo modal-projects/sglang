@@ -405,6 +405,7 @@ class TestGetDcpLens(CustomTestCase):
                 server_args=SimpleNamespace(),
                 hybrid_gdn_config=None,
                 is_hybrid_swa=False,
+                draft_kv_ratio=1.0,
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,

@@ -176,6 +176,7 @@ def _make_model_runner(
     )
     mr.ps = ParallelState.trivial()
     mr.attn_dp_size = 1
+    mr.ps = SimpleNamespace(attn_dcp_size=1)
     mr.pp_size = 1
     mr.draft_kv_ratio = speculative_draft_kv_ratio
     mr.pp_group = SimpleNamespace(rank_in_group=0)
@@ -1384,6 +1385,30 @@ class TestDFlashDraftKVRatioConfigurator(CustomTestCase):
         mr, cfg, _ = self._run(0.5)
         target_cell = _full_per_token(mr) * 4
         self.assertEqual(cfg._cell_size, target_cell + self.DRAFT_CELL // 2)
+
+    def test_dcp_shards_target_but_prices_replicated_draft(self):
+        mr = self._make(0.5, page_size=64)
+        mr.model_config.get_num_kv_heads = (
+            lambda tp_size, dcp_size=1: 4 // dcp_size
+        )
+        with mock_cpu_env(), get_parallel().override(attn_dcp_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(10_000_000, page_size=64)
+
+        target_bytes_per_logical_token = (_full_per_token(mr) * 4) // 2
+        draft_bytes_per_physical_target_token = self.DRAFT_CELL * 2 * 0.5
+        self.assertEqual(
+            cfg._cell_size,
+            target_bytes_per_logical_token + draft_bytes_per_physical_target_token,
+        )
+        self.assertEqual(
+            config.swa_max_total_num_tokens,
+            int(config.max_total_num_tokens * 0.5) // 64 * 64,
+        )
 
     def test_memory_utilization(self):
         available = 10_000_000

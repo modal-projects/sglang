@@ -8,6 +8,7 @@ import torch
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
+    DraftSWATokenToKVPoolAllocator,
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
@@ -146,6 +147,37 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_dflash_draft_allocator_widens_locations_under_dcp(self):
+        allocator = DraftSWATokenToKVPoolAllocator(
+            size=256,
+            size_swa=128,
+            page_size=64,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=SimpleNamespace(),
+            need_sort=False,
+            dcp_size=2,
+        )
+
+        self.assertEqual(allocator.page_size, 128)
+        self.assertEqual(allocator.size_full, 512)
+        self.assertEqual(allocator.size_swa, 256)
+        self.assertEqual(allocator.full_attn_allocator.num_pages, 4)
+        self.assertEqual(allocator.swa_attn_allocator.num_pages, 2)
+        self.assertEqual(allocator.full_to_swa_index_mapping.numel(), 512 + 128 + 1)
+
+        full_indices = allocator.full_attn_allocator.alloc(128)
+        draft_indices = allocator.swa_attn_allocator.alloc(128)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(draft_indices)
+        allocator.set_full_to_swa_mapping(full_indices, draft_indices)
+        self.assertTrue(
+            torch.equal(
+                allocator.translate_loc_from_full_to_swa(full_indices),
+                draft_indices,
+            )
+        )
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
         page_size = 4

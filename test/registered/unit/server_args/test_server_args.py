@@ -1058,6 +1058,35 @@ class TestKV4Compatibility(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, r"must be in \(0, 1\]"):
                     _handle_dflash(args)
 
+    def test_draft_kv_ratio_allows_dcp(self):
+        from sglang.srt.arg_groups.speculative_hook import (
+            _handle_dflash_draft_kv_ratio,
+        )
+
+        draft_config = SimpleNamespace(
+            layer_types=["sliding_attention"] * 6,
+            sliding_window=4096,
+        )
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            tp_size=2,
+            dcp_size=2,
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="dummy-draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_kv_ratio=0.25,
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=draft_config,
+        ):
+            _handle_dflash_draft_kv_ratio(args)
+
+        self.assertEqual(
+            resolution_result(args, "speculative_draft_window_size"), 4095
+        )
+
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_sm120_xqa_keeps_existing_speculative_support(self):
         args = self._make_nvfp4_args(speculative_algorithm="EAGLE")

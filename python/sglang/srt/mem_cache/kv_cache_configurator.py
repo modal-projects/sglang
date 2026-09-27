@@ -2223,6 +2223,7 @@ class KVCacheConfigurator:
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                         req_to_token_pool=req_to_token_pool,
+                        dcp_size=get_parallel().attn_dcp_size,
                     )
                 else:
                     if get_memory().enable_hisparse:

@@ -262,6 +262,19 @@ def build_kv_only_group(
     )
 
 
+def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
+    """Keep allocation and rollback in the same ID space for every SWA stack."""
+    if bind is not None:
+        assert free_bound is not None
+        return dict(
+            device_indices_from_anchor_fn=bind,
+            device_free_fn=free_bound,
+        )
+    if allocator is None:
+        return {}
+    return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
+
+
 def build_hybrid_swa_group(
     *,
     page_size: int,

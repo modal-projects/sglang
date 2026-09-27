@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
+    _swa_allocation_callbacks,
     _SwaStrategy,
     build_full_draft_pools,
     build_hybrid_swa_group,
@@ -53,6 +54,23 @@ class _Pool:
 
 
 class TestDeviceAllocEviction(CustomTestCase):
+    def test_swa_callbacks_use_the_component_allocator_id_space(self):
+        allocator = MagicMock()
+
+        callbacks = _swa_allocation_callbacks(allocator)
+
+        self.assertIs(callbacks["device_alloc_fn"], allocator.alloc)
+        self.assertIs(callbacks["device_free_fn"], allocator.free)
+
+    def test_bound_swa_callbacks_free_the_bound_id_space(self):
+        bind = MagicMock()
+        free_bound = MagicMock()
+
+        callbacks = _swa_allocation_callbacks(None, bind, free_bound)
+
+        self.assertIs(callbacks["device_indices_from_anchor_fn"], bind)
+        self.assertIs(callbacks["device_free_fn"], free_bound)
+
     def test_swa_evicts_only_allocation_shortfall(self):
         cache = MagicMock()
         cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8

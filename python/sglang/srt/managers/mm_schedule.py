@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -321,6 +322,27 @@ class PerImageRequestInfo:
     )
 
 
+def _mm_encode_sync_group():
+    """Ranks sharing an encoder collective must make the same cache decision."""
+    if not envs.SGLANG_MM_RANK_CONSISTENT_ENCODE.get():
+        return None
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    parallel = get_parallel()
+    return parallel.attn_tp_group if parallel.attn_tp_size > 1 else None
+
+
+def _rank_consistent_miss_keys(ordered_keys, local_misses, group, device):
+    # Float32 supports custom all-reduce; small integer miss counts stay exact.
+    flags = torch.tensor(
+        [key in local_misses for key in ordered_keys],
+        dtype=torch.float32,
+        device=device,
+    )
+    flags = group.all_reduce(flags)
+    return {key for key, flag in zip(ordered_keys, flags.tolist()) if flag > 0}
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -376,6 +398,26 @@ def _batch_encode_per_image_misses(
                 ):
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
+
+    sync_group = _mm_encode_sync_group()
+    if sync_group is not None:
+        # Use the same batch-derived order on every rank. Include token count,
+        # preserving upstream's protection against hash/span collisions.
+        ordered_items = {}
+        for req_info in per_image_requests:
+            for _idx, item, start, end in req_info.overlapping:
+                key = (item.hash, end - start + 1)
+                ordered_items.setdefault(key, (item, key[1]))
+        if ordered_items:
+            misses = _rank_consistent_miss_keys(
+                list(ordered_items), set(unique_misses), sync_group, device
+            )
+            for key in misses:
+                hash_to_embedding.pop(key, None)
+            # The encoder's image-to-rank assignment depends on this order.
+            unique_misses = {
+                key: item for key, item in ordered_items.items() if key in misses
+            }
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:

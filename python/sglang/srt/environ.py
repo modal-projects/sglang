@@ -1669,6 +1669,8 @@ class Envs:
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # Fuse cached-prefix concatenation and quantization in TRT MLA prefill.
     SGLANG_TRTLLM_MLA_FUSED_CHUNK_KV_PACK = EnvBool(False)
+    # Keep DP-sharded vision encoder collectives aligned across attention TP.
+    SGLANG_MM_RANK_CONSISTENT_ENCODE = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
     # TP8 GB300 configuration; set 0/1 to override. See

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,7 +41,7 @@ class GetK:
 
     @classmethod
     def slow(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         page_size = pool.index_kernel_page_size
         num_pages = (seq_len + page_size - 1) // page_size
@@ -59,7 +61,7 @@ class GetK:
 
     @classmethod
     def torch_fast(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
         :param page_indices: (num_pages,), int32
@@ -90,7 +92,7 @@ class GetK:
 
     @classmethod
     def triton(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
         Triton implementation for gathering K data from paged buffer.
@@ -114,7 +116,7 @@ class GetS:
 
     @classmethod
     def slow(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         page_size = pool.index_kernel_page_size
         num_pages = (seq_len + page_size - 1) // page_size
@@ -134,7 +136,7 @@ class GetS:
 
     @classmethod
     def torch_fast(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
         :param page_indices: (num_pages,), int32
@@ -162,7 +164,7 @@ class GetS:
 
     @classmethod
     def triton(
-        cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
+        cls, pool: DSATokenToKVPool, buf, seq_len: int, page_indices: torch.Tensor
     ):
         """
         Triton implementation for gathering S (scale) data from paged buffer.
@@ -193,7 +195,7 @@ class GetKAndS:
     @classmethod
     def aiter(
         cls,
-        pool: "DSATokenToKVPool",
+        pool: DSATokenToKVPool,
         buf: torch.Tensor,
         page_indices: torch.Tensor,
         seq_len_tensor: torch.Tensor,
@@ -235,7 +237,7 @@ class GetKAndS:
     @classmethod
     def triton(
         cls,
-        pool: "DSATokenToKVPool",
+        pool: DSATokenToKVPool,
         buf: torch.Tensor,
         page_indices: torch.Tensor,
         seq_len_tensor: torch.Tensor,

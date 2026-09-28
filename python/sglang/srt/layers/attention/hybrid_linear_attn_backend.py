@@ -943,7 +943,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     and conv_pool.shape[0] == ssm_pool.shape[0] == last_pool_idx + 1
                 ):
                     pools = (conv_pool, ssm_pool, last_pool_idx)
-            except (AttributeError, IndexError):
+            except AttributeError:
+                pools = None
+            except IndexError:
                 pools = None
             self._track_pools_cache = pools
             cached = pools

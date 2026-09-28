@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
+
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
     parallel_hook,

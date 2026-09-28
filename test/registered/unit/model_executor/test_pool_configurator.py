@@ -1388,9 +1388,7 @@ class TestDFlashDraftKVRatioConfigurator(CustomTestCase):
     def test_dcp_shards_target_but_prices_replicated_draft(self):
         mr = self._make(0.5, page_size=64)
         mr.ps = SimpleNamespace(attn_dp_size=2)
-        mr.model_config.get_num_kv_heads = (
-            lambda tp_size, dcp_size=1: 4 // dcp_size
-        )
+        mr.model_config.get_num_kv_heads = lambda tp_size, dcp_size=1: 4 // dcp_size
         with mock_cpu_env(), get_parallel().override(attn_dcp_size=2):
             from sglang.srt.model_executor.pool_configurator import (
                 compute_swa_request_cap,

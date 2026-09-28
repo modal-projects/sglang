@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -18,6 +19,7 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )

@@ -6235,9 +6235,7 @@ class UnifiedRadixCacheSuite:
         if _selected_tree_core_test_backend() == "rust":
             self.skipTest("internal-node state demote is Python-core only")
         cache, _, seq_a = self._build_internal_mamba_fixture("write_back")
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
-        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
         node = match.best_match_node
 
         self.assertGreater(_write_backup(cache, node, write_back=True), 0)
@@ -6358,9 +6356,7 @@ class UnifiedRadixCacheSuite:
         if _selected_tree_core_test_backend() == "rust":
             self.skipTest("internal-node SWA demote is Python-core only")
         cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_back")
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
-        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
         node = match.best_match_node
 
         self.assertGreater(_write_backup(cache, node, write_back=True), 0)
@@ -10633,7 +10629,9 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         violation and the operation never completes silently."""
         try:
             fn()
-        except (KeyboardInterrupt, SystemExit):
+        except KeyboardInterrupt:
+            raise
+        except SystemExit:
             raise
         except BaseException as exc:  # pyo3 PanicException derives from BaseException
             self.assertIn(fragment, str(exc))

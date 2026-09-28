@@ -169,15 +169,51 @@ def test_kpool_topk_transform_matches_reference(
 
 
 @torch.inference_mode()
-def test_kpool_topk_clamps_lengths_to_materialized_logits_row() -> None:
+def test_kpool_topk_uses_allocated_stride_for_packed_ragged_logits() -> None:
+    """DeepGEMM may pack live ragged logits beyond the tensor view's columns."""
+    torch.manual_seed(7)
+    rows = 2
+    visible_width = 1024
+    allocated_width = 1328
+    pool_size = 16
+    topk = 2048
+    storage = torch.randn(rows, allocated_width, dtype=torch.float32, device="cuda")
+    score = storage[:, :visible_width]
+    row_starts = torch.tensor([1024, 1000], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([304, 328], dtype=torch.int32, device="cuda")
+
+    expected = _reference(
+        storage,
+        lengths,
+        pool_size,
+        topk,
+        row_starts=row_starts,
+    )
+    actual = fast_kpool_topk_transform_fused(
+        score=score,
+        lengths=lengths,
+        pool_size=pool_size,
+        topk=topk,
+        row_starts=row_starts,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
+        atol=0,
+        rtol=0,
+    )
+
+
+@torch.inference_mode()
+def test_kpool_topk_clamps_lengths_to_allocated_logits_row() -> None:
     """Invalid runtime metadata must neither read nor translate out of bounds."""
     torch.manual_seed(0)
     width = 1024
     pool_size = 4
     topk = 2048
-    storage = torch.randn(3, width + 304, dtype=torch.float32, device="cuda")
-    score = storage[:, :width]
-    assert score.stride(0) > score.shape[1]
+    score = torch.randn(3, width, dtype=torch.float32, device="cuda")
     row_starts = torch.tensor([0, 200, 900], dtype=torch.int32, device="cuda")
     lengths = torch.full((3,), 4096, dtype=torch.int32, device="cuda")
     seq_lens = lengths * pool_size + 1

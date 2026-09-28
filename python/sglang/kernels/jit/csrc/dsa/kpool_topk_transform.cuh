@@ -38,7 +38,6 @@ struct FastTopKParams {
   int32_t* __restrict__ indices;           // unused here (kept for layout parity)
   const int32_t* __restrict__ lengths;     // [B]
   int64_t input_stride;
-  int64_t input_cols;
 };
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
@@ -253,16 +252,17 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
     const int32_t* __restrict__ page_table_row_index,
     const int32_t* __restrict__ topk_indices_offset,
     const int32_t* __restrict__ seq_lens) {
-  const auto& [input, row_starts, _, lengths, input_stride, input_cols] = params;
+  const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
-  // The logits row is the hard address boundary. Runtime metadata may describe
-  // a wider logical pooled range than the tensor view supplied to this fused
-  // operation, so top-k only over columns that were actually materialized.
+  // DeepGEMM's ragged logits use row_starts in the padded row allocation, not
+  // only in the tensor view's logical column count. The physical row stride is
+  // therefore the address boundary. Clamping to score.size(1) silently drops
+  // valid packed logits and collapses DFLASH acceptance on long contexts.
   const auto raw_row_start = row_starts == nullptr ? 0 : row_starts[bid];
   const auto row_start =
-      raw_row_start < 0 ? 0 : (raw_row_start > input_cols ? static_cast<int32_t>(input_cols) : raw_row_start);
-  const auto max_length = static_cast<int32_t>(input_cols - row_start);
+      raw_row_start < 0 ? 0 : (raw_row_start > input_stride ? static_cast<int32_t>(input_stride) : raw_row_start);
+  const auto max_length = static_cast<int32_t>(input_stride - row_start);
   const auto raw_length = lengths[bid];
   const auto length = raw_length < 0 ? 0 : (raw_length > max_length ? max_length : raw_length);
   const auto score = input + bid * input_stride;
@@ -358,13 +358,12 @@ struct KpoolTopKTransformKernel {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
-    auto C = SymbolicSize{"score_cols"};
     auto S = SymbolicSize{"score_stride"};
     auto out_cols_sym = SymbolicSize{"out_cols"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({B, C}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
     TensorMatcher({B, out_cols_sym}).with_dtype<int32_t>().with_device(device).verify(dst_token_indices);
 
@@ -428,7 +427,6 @@ struct KpoolTopKTransformKernel {
         .indices = nullptr,
         .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
         .input_stride = static_cast<int64_t>(S.unwrap()),
-        .input_cols = static_cast<int64_t>(C.unwrap()),
     };
 
     setup_kernel_smem_once<kernel, kSmem>();

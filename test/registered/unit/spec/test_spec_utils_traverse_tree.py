@@ -106,6 +106,30 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
 
+    def test_linear_chain_rejects_out_of_vocab_draft_tokens(self):
+        # Draft slots are proposals, not trusted vocabulary indices. Reject
+        # malformed or stale values before indexing the packed grammar mask
+        # (where Python would otherwise wrap negative indices).
+        for invalid_token in (-1, -(1 << 62), 128):
+            with self.subTest(invalid_token=invalid_token):
+                rnt, rns, draft_tokens = self._chain(
+                    torch.tensor([[100, 5, invalid_token, 9]])
+                )
+                bitmask = torch.full((4, 4), -1, dtype=torch.int32)
+                grammar, accept_calls, fill_calls = self._record_grammar()
+
+                traverse_tree(
+                    rnt,
+                    rns,
+                    draft_tokens,
+                    grammar,
+                    bitmask,
+                    vocab_size=128,
+                )
+
+                self.assertEqual(accept_calls, [5])
+                self.assertEqual(fill_calls, [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

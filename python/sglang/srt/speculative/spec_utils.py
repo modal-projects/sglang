@@ -491,8 +491,12 @@ def traverse_tree(
             is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
-            current_token = draft_tokens[curr]
-            if vocab_size and current_token >= vocab_size:
+            current_token = int(draft_tokens[curr])
+            # A speculative proposal is untrusted input to the grammar bitmask.
+            # Reject both ends of the token-id domain before using it as a packed
+            # bit index. A negative sentinel or stale draft slot would otherwise
+            # become a Python negative index and read the wrong word or fail.
+            if vocab_size is not None and not (0 <= current_token < vocab_size):
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
@@ -503,7 +507,7 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
+                grammar.accept_token(current_token)
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)

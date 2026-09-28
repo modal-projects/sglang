@@ -321,11 +321,18 @@ def test_many_fragments_share_one_sequential_blob_read(tmp_path):
     _write_delta(versions, 1, v0, v1, encoding="xor")
     cached = _checkpoint(tmp_path, v0)
     try:
-        with patch.object(
-            canonical_delta,
-            "read_file_into_tensor",
-            wraps=canonical_delta.read_file_into_tensor,
-        ) as read_source:
+        with (
+            patch.object(
+                canonical_delta,
+                "read_file_into_tensor",
+                wraps=canonical_delta.read_file_into_tensor,
+            ) as read_source,
+            patch.object(
+                canonical_delta.np,
+                "bitwise_xor",
+                wraps=canonical_delta.np.bitwise_xor,
+            ) as xor,
+        ):
             stats = CanonicalDeltaTransform(
                 cached,
                 checkpoint_source_dir=versions,
@@ -335,7 +342,9 @@ def test_many_fragments_share_one_sequential_blob_read(tmp_path):
 
         assert stats["delta_fragments"] == len(v0)
         assert stats["source_files"] == 1
+        assert stats["decompression_batches"] == 1
         assert read_source.call_count == 1
+        assert 0 < xor.call_count <= canonical_delta._MAX_DELTA_TRANSFORM_WORKERS
         for name, expected in v1.items():
             torch.testing.assert_close(cached.get_tensor(name), expected)
     finally:

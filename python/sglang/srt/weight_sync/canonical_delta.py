@@ -25,14 +25,10 @@ from sglang.srt.weight_sync.delta_checkpoint import (
     read_delta_checkpoint,
     version_dir,
 )
-from sglang.srt.weight_sync.file_io import (
-    read_file_into_tensor,
-    read_exact,
-)
+from sglang.srt.weight_sync.file_io import read_file_into_tensor
 
 logger = logging.getLogger(__name__)
 
-_STREAM_CHUNK_BYTES = 4 << 20
 _HOST_WORKING_MEMORY_BYTES = 8 << 30
 _MAX_DELTA_TRANSFORM_WORKERS = 8
 
@@ -240,6 +236,7 @@ class CanonicalDeltaTransform:
                 "folded_tensors": 0,
                 "source_files": 0,
                 "source_blob_bytes": 0,
+                "decompression_batches": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
                 "source_read_worker_s": 0.0,
@@ -358,6 +355,9 @@ class CanonicalDeltaTransform:
             "source_blob_bytes": sum(
                 value["source_blob_bytes"] for value in source_stats
             ),
+            "decompression_batches": sum(
+                value["decompression_batches"] for value in source_stats
+            ),
             "target_tensor_bytes": sum(
                 value["target_tensor_bytes"] for value in verify_stats
             ),
@@ -420,10 +420,7 @@ class CanonicalDeltaTransform:
         )
         source_view = memoryview(source.numpy())
 
-        def apply_operation(
-            item: tuple[str, _DeltaOperation],
-            decompressor: zstandard.ZstdDecompressor,
-        ) -> int:
+        def decompressed_nbytes(item: tuple[str, _DeltaOperation]) -> int:
             name, operation = item
             if operation.source_path != source_path:
                 raise ValueError(
@@ -437,85 +434,106 @@ class CanonicalDeltaTransform:
                     f"offset={operation.source_offset} "
                     f"bytes={operation.compressed_nbytes} file={source_nbytes}"
                 )
-            target = tensors[name].numpy()
-            working_nbytes = _STREAM_CHUNK_BYTES
-            if operation.encoding == "overwrite":
-                working_nbytes += 4 * target.size
-            with budget.reserve(working_nbytes):
-                payload = source_view[operation.source_offset : end]
-                with decompressor.stream_reader(payload, closefd=False) as reader:
-                    if operation.encoding == "xor":
-                        position = 0
-                        while position < target.size:
-                            block = reader.read(
-                                min(_STREAM_CHUNK_BYTES, target.size - position)
-                            )
-                            if not block:
-                                break
-                            delta = np.frombuffer(block, dtype=np.uint8)
-                            region = target[position : position + delta.size]
-                            np.bitwise_xor(region, delta, out=region)
-                            position += delta.size
-                        if position != target.size or reader.read(1):
-                            raise RuntimeError(
-                                "decompressed XOR size mismatch for "
-                                f"{name!r}: expected={target.size} actual={position}"
-                            )
-                    else:
-                        count = int.from_bytes(read_exact(reader, 4), "little")
-                        if count > target.size:
-                            raise RuntimeError(
-                                f"overwrite payload for {name!r} is invalid"
-                            )
-                        positions_payload = read_exact(reader, 4 * count)
-                        positions = np.frombuffer(
-                            positions_payload,
-                            dtype="<u4",
-                            count=count,
-                        )
-                        if count and (
-                            int(positions[-1]) >= target.size
-                            or np.any(positions[1:] <= positions[:-1])
-                        ):
-                            raise RuntimeError(
-                                f"overwrite payload for {name!r} is invalid"
-                            )
-                        position = 0
-                        while position < count:
-                            block_nbytes = min(
-                                _STREAM_CHUNK_BYTES,
-                                count - position,
-                            )
-                            values = np.frombuffer(
-                                read_exact(reader, block_nbytes),
-                                dtype=np.uint8,
-                            )
-                            target[positions[position : position + block_nbytes]] = (
-                                values
-                            )
-                            position += block_nbytes
-                        if reader.read(1):
-                            raise RuntimeError(
-                                f"overwrite payload for {name!r} is oversized"
-                            )
-            return operation.compressed_nbytes
+            if operation.encoding == "xor":
+                return tensors[name].numel()
+            size = zstandard.frame_content_size(
+                source_view[operation.source_offset : end]
+            )
+            if size < 0:
+                raise RuntimeError(
+                    f"overwrite payload for {name!r} has no content size"
+                )
+            return size
 
+        def apply_payload(
+            item: tuple[str, _DeltaOperation],
+            payload: Any,
+        ) -> None:
+            name, operation = item
+            target = tensors[name].numpy()
+            decoded = np.frombuffer(payload, dtype=np.uint8)
+            if operation.encoding == "xor":
+                if decoded.size != target.size:
+                    raise RuntimeError(
+                        "decompressed XOR size mismatch for "
+                        f"{name!r}: expected={target.size} actual={decoded.size}"
+                    )
+                np.bitwise_xor(target, decoded, out=target)
+                return
+
+            if decoded.size < 4:
+                raise RuntimeError(f"overwrite payload for {name!r} is invalid")
+            count = int.from_bytes(decoded[:4], "little")
+            if count > target.size or decoded.size != 4 + 5 * count:
+                raise RuntimeError(f"overwrite payload for {name!r} is invalid")
+            positions = decoded[4 : 4 + 4 * count].view("<u4")
+            if count and (
+                int(positions[-1]) >= target.size
+                or np.any(positions[1:] <= positions[:-1])
+            ):
+                raise RuntimeError(f"overwrite payload for {name!r} is invalid")
+            target[positions] = decoded[4 + 4 * count :]
+
+        encoding = operations[0][1].encoding
+        if any(operation.encoding != encoding for _, operation in operations):
+            raise ValueError(f"delta source {source_path} mixes encodings")
         work = sorted(operations, key=lambda item: item[1].source_offset)
         workers = self._worker_count(len(work))
+        sizes = [decompressed_nbytes(item) for item in work]
+        batch_limit = self.working_memory_budget_bytes
+        batches = []
+        batch = []
+        batch_nbytes = 0
+        for index, nbytes in enumerate(sizes):
+            if batch and batch_nbytes + nbytes > batch_limit:
+                batches.append((batch, batch_nbytes))
+                batch = []
+                batch_nbytes = 0
+            batch.append(index)
+            batch_nbytes += nbytes
+        if batch:
+            batches.append((batch, batch_nbytes))
 
-        def apply_partition(
-            partition: list[tuple[str, _DeltaOperation]],
-        ) -> int:
-            decompressor = zstandard.ZstdDecompressor()
-            return sum(apply_operation(item, decompressor) for item in partition)
-
-        partitions = [work[index::workers] for index in range(workers)]
+        compressed_nbytes = 0
         try:
             with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="weight-delta",
             ) as pool:
-                compressed_nbytes = sum(pool.map(apply_partition, partitions))
+                for indexes, output_nbytes in batches:
+                    frames = []
+                    for index in indexes:
+                        operation = work[index][1]
+                        begin = operation.source_offset
+                        frames.append(
+                            source_view[begin : begin + operation.compressed_nbytes]
+                        )
+                        compressed_nbytes += operation.compressed_nbytes
+                    output_sizes = np.asarray(
+                        [sizes[index] for index in indexes],
+                        dtype=np.uint64,
+                    )
+                    with budget.reserve(output_nbytes):
+                        decoded = (
+                            zstandard.ZstdDecompressor().multi_decompress_to_buffer(
+                                frames,
+                                decompressed_sizes=output_sizes,
+                                threads=workers,
+                            )
+                        )
+
+                        def apply_partition(partition: list[int]) -> None:
+                            for position in partition:
+                                apply_payload(
+                                    work[indexes[position]],
+                                    decoded[position],
+                                )
+
+                        partitions = [
+                            list(range(index, len(indexes), workers))
+                            for index in range(workers)
+                        ]
+                        list(pool.map(apply_partition, partitions))
         finally:
             source_view.release()
             del source
@@ -523,6 +541,7 @@ class CanonicalDeltaTransform:
             "delta_fragments": len(work),
             "compressed_bytes": compressed_nbytes,
             "source_blob_bytes": source_nbytes,
+            "decompression_batches": len(batches),
             "source_read_worker_s": read_stats.wall_s,
             "workers": workers,
         }
@@ -558,6 +577,7 @@ class CanonicalDeltaTransform:
                 "folded_tensors": 0,
                 "source_files": 0,
                 "source_blob_bytes": 0,
+                "decompression_batches": 0,
                 "target_tensor_bytes": 0,
                 "compressed_bytes": 0,
                 "source_read_worker_s": 0.0,
@@ -598,6 +618,9 @@ class CanonicalDeltaTransform:
             "source_files": len(source_stats),
             "source_blob_bytes": sum(
                 value["source_blob_bytes"] for value in source_stats
+            ),
+            "decompression_batches": sum(
+                value["decompression_batches"] for value in source_stats
             ),
             "target_tensor_bytes": verify_stats["target_tensor_bytes"],
             "compressed_bytes": sum(

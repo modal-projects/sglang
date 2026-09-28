@@ -19,6 +19,9 @@ namespace {
 #ifndef C10_LIKELY
 #define C10_LIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 1))
 #endif
+#ifndef C10_UNLIKELY
+#define C10_UNLIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 0))
+#endif
 
 #ifndef SGL_GROUP_TOPK
 #define SGL_GROUP_TOPK 256
@@ -110,7 +113,9 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < K)) {
+          index[pos] = idx;
+        }
       }
     }
     __syncthreads();
@@ -127,7 +132,9 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < K)) {
+          index[pos] = idx;
+        }
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
         if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
@@ -163,11 +170,16 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
     if (topk == 0) {
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
+        if (C10_UNLIKELY(idx < 0 || idx >= length)) {
+          continue;
+        }
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          if (C10_LIKELY(pos < K)) {
+            index[pos] = idx;
+          }
         }
       }
       __syncthreads();
@@ -180,12 +192,17 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
       __syncthreads();
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
+        if (C10_UNLIKELY(idx < 0 || idx >= length)) {
+          continue;
+        }
         const auto raw_input = input[idx + row_start];
         const auto offset = 24 - round * 8;
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          if (C10_LIKELY(pos < K)) {
+            index[pos] = idx;
+          }
         } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
@@ -238,14 +255,26 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
-  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
-  const auto length = lengths[bid];
+  // DeepGEMM's ragged logits use row_starts in the padded row allocation, not
+  // only in the tensor view's logical column count. The physical row stride is
+  // therefore the address boundary. Clamping to score.size(1) silently drops
+  // valid packed logits and collapses DFLASH acceptance on long contexts.
+  const auto raw_row_start = row_starts == nullptr ? 0 : row_starts[bid];
+  const auto row_start =
+      raw_row_start < 0 ? 0 : (raw_row_start > input_stride ? static_cast<int32_t>(input_stride) : raw_row_start);
+  const auto max_length = static_cast<int32_t>(input_stride - row_start);
+  const auto raw_length = lengths[bid];
+  const auto length = raw_length < 0 ? 0 : (raw_length > max_length ? max_length : raw_length);
   const auto score = input + bid * input_stride;
   const auto dst = dst_token_indices + bid * dst_stride;
   const auto page_table_row = page_table_row_index == nullptr ? bid : static_cast<uint64_t>(page_table_row_index[bid]);
   const auto page_table_entry = page_table == nullptr ? nullptr : page_table + page_table_row * page_table_stride;
   const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
-  const bool append_tail = seq_lens != nullptr;
+  const bool metadata_in_bounds = raw_row_start == row_start && raw_length == length;
+  // A clamped row cannot safely address its live tail in the logical page
+  // table. Drop that tail along with the unavailable history rather than
+  // silently translating it from the wrong group boundary.
+  const bool append_tail = seq_lens != nullptr && metadata_in_bounds;
   const auto full_pool_token_len = length * pool_size;
   const auto history_len = full_pool_token_len < token_topk ? full_pool_token_len : token_topk;
   const auto tail_count = append_tail ? seq_lens[bid] % pool_size : 0;
@@ -268,14 +297,25 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   }
 
   __shared__ int s_indices[K];
+  if (tid < K) {
+    // The radix selector's scratch counters are populated cooperatively. If a
+    // malformed row fails to produce K candidates, unused entries must not
+    // become indeterminate group IDs interpreted as page-table offsets.
+    s_indices[tid] = -1;
+  }
+  __syncthreads();
   fast_topk_cuda_tl_impl<K>(score, s_indices, row_start, length);
   for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
     if (col < history_len) {
       const auto group_rank = col / pool_size;
       const auto group_id = s_indices[group_rank];
       const auto slot = col % pool_size;
-      const auto raw_token = group_id * pool_size + slot;
-      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+      if (C10_LIKELY(group_id >= 0 && group_id < length)) {
+        const auto raw_token = group_id * pool_size + slot;
+        dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+      } else {
+        dst[col] = -1;
+      }
     } else if (append_tail && col < history_len + tail_count) {
       const auto raw_token = length * pool_size + (col - history_len);
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
@@ -287,8 +327,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
 
 template <auto* f, std::size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
-  [[maybe_unused]]
-  static const auto result = [] {
+  [[maybe_unused]] static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
   }();

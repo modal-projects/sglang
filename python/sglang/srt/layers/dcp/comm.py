@@ -210,6 +210,8 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
+    if prefix_k_pe is None:
+        prefix_k_pe = prefix_kv_a[..., :0]
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -285,6 +287,8 @@ def all_gather_kv_cache_for_mla_extend(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
+        if cache_k_rope is None:
+            cache_k_rope = cache_k_nope[..., :0]
         extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
         # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
         gathered_kv = all_gather_kv_cache_for_dcp(
@@ -296,13 +300,14 @@ def all_gather_kv_cache_for_mla_extend(
         dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    extend_end = dcp_extend_prefix_lens_sum + k_nope.shape[0]
     dcp_kv_buffer[
-        dcp_extend_prefix_lens_sum:,
+        dcp_extend_prefix_lens_sum:extend_end,
         ...,
         :kv_lora_rank,
     ] = k_nope
     dcp_kv_buffer[
-        dcp_extend_prefix_lens_sum:,
+        dcp_extend_prefix_lens_sum:extend_end,
         ...,
         kv_lora_rank:,
     ] = k_pe
@@ -390,7 +395,7 @@ def all_gather_kv_cache_for_dcp(
 _FI_A2A_STATE: Optional[dict] = None
 
 
-def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
+def init_fi_a2a_workspace(cp_group: GroupCoordinator) -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
     # the stream and barriers cross-rank, neither of which is capturable.
     global _FI_A2A_STATE
@@ -468,7 +473,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
-    cp_group: "GroupCoordinator",
+    cp_group: GroupCoordinator,
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
@@ -534,7 +539,7 @@ def dcp_a2a_lse_reduce(
 def _dcp_fi_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
-    cp_group: "GroupCoordinator",
+    cp_group: GroupCoordinator,
     is_lse_base_on_e: bool = True,
 ) -> torch.Tensor:
     """fi_a2a: delegate only the cross-rank exchange to FlashInfer's MNNVL kernel,

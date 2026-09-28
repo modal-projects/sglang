@@ -116,9 +116,13 @@ def prepare_decode_context_parallel_metadata(
     dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     )
+    # TRTLLM-GEN views the gathered prefill scratch as 64-token physical
+    # pages. Keep the shared DCP scratch page-aligned; token-indexed consumers
+    # are indifferent to the unused tail rows.
+    dcp_kv_buffer_capacity = ((seq_lens_sum + 63) // 64) * 64
     dcp_kv_buffer = torch.empty(
         (
-            seq_lens_sum,
+            dcp_kv_buffer_capacity,
             *kv_buffer_shape[1:],
         ),
         dtype=kv_cache_dtype,

@@ -31,10 +31,12 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    compact_dcp_sparse_page_table,
     prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -83,6 +85,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -295,6 +298,25 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def _trtllm_dcp_lse_workspace_size(num_dcp_q_heads: int) -> int:
+    """Cover FlashInfer's largest TRTLLM-GEN autotune profile with LSE.
+
+    DCP decode requests LSE so partial attention results can be merged across
+    ranks. FlashInfer 0.6.x autotunes TRTLLM-GEN MLA through batch size 8192
+    and reserves a float2 softmax-stat slot for a 256-query tile per
+    batch/head, plus a 1 MiB guard. The ordinary 384 MiB workspace is too small
+    for that profile even though live GLM decode batches need much less.
+    """
+    max_autotune_batch = 8192
+    max_q_tile = 256
+    softmax_stat_bytes = 2 * 4  # float2
+    guard_bytes = 1024 * 1024
+    return (
+        max_autotune_batch * num_dcp_q_heads * max_q_tile * softmax_stat_bytes
+        + guard_bytes
+    )
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -319,6 +341,7 @@ class DeepseekSparseAttnBackend(
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
+        self._init_dcp(model_runner.is_draft_worker)
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
@@ -348,11 +371,15 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.kv_address_space_size = allocator.size_full + allocator.page_size
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.supports_mha_one_shot: bool = True
+        # TODO(kpham-sgl): Evaluate whether to enable MHA one-shot with DCP;
+        # handle sharded target and replicated draft prefix KV if enabled.
+        self.supports_mha_one_shot: bool = not get_parallel().dcp_enabled
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -532,10 +559,20 @@ class DeepseekSparseAttnBackend(
             )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+            workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+            if self.dcp_size > 1 and self.dsa_decode_impl == "trtllm":
+                # DCP emits a full-head partial result on every rank so the
+                # online-softmax reduction can merge the rank-local KV
+                # shards. self.num_q_heads is rank-local, while TRTLLM sees
+                # the replicated full-head count here.
+                workspace_size = max(
+                    workspace_size,
+                    _trtllm_dcp_lse_workspace_size(self.num_q_heads * self.dcp_size),
+                )
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    workspace_size,
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -1045,16 +1082,11 @@ class DeepseekSparseAttnBackend(
                     f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
                 )
 
-                # Validate indices when logical tokens exceed physical capacity
-                # This is likely to be triggered by PP with high kv reuse & parallelism
-                kv_cache_capacity = (
-                    self.token_to_kv_pool.size + self.token_to_kv_pool.page_size
-                )
-                if forward_batch.seq_lens_sum > kv_cache_capacity:
+                if forward_batch.seq_lens_sum > self.kv_address_space_size:
                     max_idx = page_table_1_flattened.max().item()
-                    assert max_idx < kv_cache_capacity, (
+                    assert max_idx < self.kv_address_space_size, (
                         f"Invalid page table index: max={max_idx}, "
-                        f"kv_cache_capacity={kv_cache_capacity}"
+                        f"kv_address_space_size={self.kv_address_space_size}"
                     )
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1992,6 +2024,20 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
+        if self.dcp_size > 1:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                assert k is not None
+                kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
+                # NOTE(kpham-sgl): Map RAGGED offsets into gathered KV without reordering KV.
+                kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
+                page_table_1 = torch.where(
+                    page_table_1 >= 0,
+                    kv_indices[page_table_1.clamp_min(0)],
+                    -1,
+                )
+            elif forward_batch.forward_mode.is_target_verify():
+                page_table_1 = self._dcp_global_to_local_kv_indices(page_table_1)
+
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
@@ -2012,6 +2058,9 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=(
+                    self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2272,6 +2321,9 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        if self.dcp_size > 1:
+            page_table_1 = self._dcp_global_to_local_kv_indices(page_table_1)
+
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2321,6 +2373,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=self.dcp_size > 1,
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -2958,6 +3011,35 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
+    @staticmethod
+    def _dcp_global_to_local_kv_indices(page_table: torch.Tensor) -> torch.Tensor:
+        # TODO(kpham-sgl): Fuse the index conversion and masking into one GPU kernel.
+        parallel = get_parallel()
+        owned = (page_table >= 0) & (
+            page_table % parallel.attn_dcp_size == parallel.attn_dcp_rank
+        )
+        return torch.where(owned, page_table // parallel.attn_dcp_size, -1)
+
+    def _dcp_gather_extend_kv(
+        self, layer: RadixAttention, forward_batch: ForwardBatch, k: torch.Tensor
+    ) -> torch.Tensor:
+        from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_mla_extend
+
+        metadata = forward_batch.attn_dcp_metadata
+        k_nope = k.view(k.shape[0], 1, self.kv_lora_rank)
+        all_gather_kv_cache_for_mla_extend(
+            token_to_kv_pool=self.token_to_kv_pool,
+            attn_mqa=layer,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            dcp_local_prefix_kv_indices=metadata.dcp_local_prefix_kv_indices,
+            dcp_extend_prefix_lens_sum=metadata.dcp_extend_prefix_lens_sum,
+            dcp_kv_buffer=metadata.dcp_kv_buffer,
+            kv_lora_rank=self.kv_lora_rank,
+            k_nope=k_nope,
+            k_pe=k_nope[..., :0],
+        )
+        return metadata.dcp_kv_buffer
+
     def _forward_tilelang(
         self,
         q_all: torch.Tensor,
@@ -2965,7 +3047,8 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
@@ -2981,13 +3064,18 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
-        return tilelang_sparse_fwd(
+        result = tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            return_lse=return_lse,
         )
+        if return_lse:
+            out, lse = result
+            return out, lse.squeeze(0)
+        return result
 
     def _forward_triton_decode(
         self,
@@ -3408,6 +3496,44 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        # TRTLLM-GEN requires packed sparse rows. Decode CP's cyclic ownership
+        # punches holes into the global top-k table, so filter + localize +
+        # compact it before preparing TRTLLM's dynamic sparse metadata. Regular
+        # prefill is different: gather the sharded prefix into a temporary
+        # full-KV buffer and remap the sparse table into that gathered layout.
+        dcp_local_topk_lens = None
+        dcp_merge_output = self.dcp_size > 1 and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        if self.dcp_size > 1:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                assert k is not None
+                kv_cache = self._dcp_gather_extend_kv(layer, forward_batch, k)
+                if kv_cache.shape[0] % self.real_page_size != 0:
+                    raise RuntimeError(
+                        "DCP prefill KV scratch capacity must be aligned to the "
+                        f"TRTLLM page size ({self.real_page_size}), got "
+                        f"{kv_cache.shape[0]} rows."
+                    )
+                kv_cache = kv_cache.view(
+                    -1, self.real_page_size, self.kv_cache_dim
+                ).unsqueeze(1)
+                kv_indices = forward_batch.attn_dcp_metadata.dcp_kv_indices
+                page_table_1 = torch.where(
+                    page_table_1 >= 0,
+                    kv_indices[page_table_1.clamp_min(0)],
+                    -1,
+                )
+            else:
+                parallel = get_parallel()
+                page_table_1, dcp_local_topk_lens = compact_dcp_sparse_page_table(
+                    page_table_1.contiguous(),
+                    parallel.attn_dcp_size,
+                    parallel.attn_dcp_rank,
+                )
+
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
@@ -3439,8 +3565,36 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        max_seq_len = metadata.max_seq_len_k
+        if (
+            self.dcp_size > 1
+            and not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # One global causal length per sparse query row, including each
+            # target-verify token. TRTLLM uses the rank-local lengths for
+            # paging/split-KV while sparse_mla_top_k_lens bounds the row.
+            global_seq_lens = metadata.dsa_seqlens_expanded
+            if global_seq_lens.numel() != batch_size:
+                global_seq_lens = seq_lens
+            parallel = get_parallel()
+            seq_lens = get_dcp_lens(
+                global_seq_lens,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            ).to(torch.int32)
+            # TRTLLM NoPE uses a valid dummy entry for empty rows. Retain the
+            # true sparse lengths and neutralize those outputs after the call.
+            seq_lens = seq_lens.clamp_min(1)
+            max_seq_len = max(
+                1,
+                metadata.max_seq_len_k // parallel.attn_dcp_size
+                + int(
+                    parallel.attn_dcp_rank
+                    < metadata.max_seq_len_k % parallel.attn_dcp_size
+                ),
+            )
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        result = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -3449,16 +3603,31 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=metadata.max_seq_len_k,
+            max_seq_len=max_seq_len,
             sparse_mla_top_k=sparse_mla_top_k,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            return_lse=dcp_merge_output,
         )
 
-        return out
+        if not dcp_merge_output:
+            return result
+
+        out, lse = result
+        out = out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        lse = lse.view(-1, layer.tp_q_head_num)
+        assert dcp_local_topk_lens is not None
+        fixup_zero_kv_rows(
+            out,
+            lse,
+            dcp_local_topk_lens,
+            metadata.dsa_cu_seqlens_q,
+            1,
+        )
+        return out.flatten(1), lse
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -3548,12 +3717,15 @@ class DeepseekSparseAttnBackend(
                 self.dsa_prefill_impl = "flashmla_sparse"
 
     def get_topk_transform_method(
-        self, forward_mode: Optional[ForwardMode] = None
+        self, forward_mode: ForwardMode
     ) -> TopkTransformMethod:
         """
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
+        # Note(kpham-sgl): Gathered prefill KV uses sequence offsets, not cache slots.
+        if self.dcp_size > 1 and forward_mode.is_extend_without_speculative():
+            return TopkTransformMethod.RAGGED
         if (
             # disable for MTP
             self.dsa_kv_cache_store_fp8

@@ -30,6 +30,7 @@ class HiCacheDraftMode(str, Enum):
     NONE = "none"
     PACKED = "packed"
     SIDECAR = "sidecar"
+    ATTACHED_SWA = "attached_swa"
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +263,22 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        from sglang.srt.mem_cache.allocator.swa import (
+            DraftSWATokenToKVPoolAllocator,
+        )
+
+        if isinstance(
+            getattr(target_model_runner, "token_to_kv_pool_allocator", None),
+            DraftSWATokenToKVPoolAllocator,
+        ):
+            # A bounded all-SWA DFLASH pool is already attached to the target
+            # allocator and represented by the unified tree's SWA component.
+            # Keep the pool in the plan for staging and host-memory sizing, but
+            # do not register it again as a speculative sidecar.
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.ATTACHED_SWA,
+                device_pools=draft_pools[:1],
+            )
         if (
             "InklingForConditionalGenerationMTP"
             in draft_runners[0].model_config.hf_config.architectures

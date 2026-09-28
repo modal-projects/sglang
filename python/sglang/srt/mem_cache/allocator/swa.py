@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -866,3 +868,134 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
 def is_swa_req_ring(allocator) -> bool:
     return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring
+
+
+class _DraftSWAKVPoolBinding(BaseSWAKVPool):
+    """The target's pool with a speculative draft's pool as the SWA side."""
+
+    swa_req_ring_size = None
+
+    def __init__(self, full_kv_pool: KVCache):
+        self.full_kv_pool = full_kv_pool
+        self.swa_kv_pool: Optional[BaseSWAKVPool] = None
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+
+    def attach_swa_kv_pool(self, swa_kv_pool: BaseSWAKVPool) -> None:
+        self.swa_kv_pool = swa_kv_pool
+        swa_kv_pool.register_mapping(self.full_to_swa_index_mapping)
+
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+        self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        if self.swa_kv_pool is not None:
+            self.swa_kv_pool.register_mapping(full_to_swa_index_mapping)
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_swa_index_mapping[kv_indices]
+
+    def get_state_buf_infos(self):
+        raise NotImplementedError()
+
+    def get_key_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(self, *args, **kwargs):
+        return self.full_kv_pool.set_kv_buffer(*args, **kwargs)
+
+
+class DraftSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Target allocator whose SWA side is a bounded speculative draft KV pool.
+
+    Under DCP, the target KV buffers stay rank-local while allocator locations
+    remain in the widened logical token space. The DFLASH draft is replicated
+    and consumes those logical locations directly, so both allocator sides and
+    their page size must be widened by ``dcp_size``. The target KV pool itself
+    is deliberately left at its physical per-rank size.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+        req_to_token_pool=None,
+        dcp_size: int = 1,
+    ):
+        assert dcp_size >= 1
+        self.dcp_size = dcp_size
+        super().__init__(
+            size * dcp_size,
+            size_swa * dcp_size,
+            page_size * dcp_size,
+            dtype,
+            device,
+            _DraftSWAKVPoolBinding(kvcache),
+            need_sort,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+    def attach_draft_kv_pool(self, draft_kv_pool: BaseSWAKVPool) -> None:
+        self._kvcache.attach_swa_kv_pool(draft_kv_pool)
+
+    def get_attached_draft_kv_pool(self) -> Optional[BaseSWAKVPool]:
+        return self._kvcache.swa_kv_pool
+
+    def get_kvcache(self):
+        # Backends check this to detect a hybrid-SWA target.
+        return self._kvcache.full_kv_pool
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        """Report capacities in the allocator's widened logical-id space.
+
+        ``KVCacheConfigResult`` retains the physical per-rank target and draft
+        row counts.  This allocator, however, widens both of those pools by
+        ``dcp_size`` so that the replicated DFLASH draft can consume the
+        target's logical locations directly.  Availability is consequently
+        already logical; scale the supplied physical capacities to the same
+        domain before pool utilization and conservation are computed.
+        """
+        return (
+            (
+                None if full_capacity is None else full_capacity * self.dcp_size,
+                self.full_available_size(),
+            ),
+            (
+                None if swa_capacity is None else swa_capacity * self.dcp_size,
+                self.swa_available_size(),
+            ),
+        )
+
+    def resize(self, config) -> None:
+        """Resize physical pool counts while preserving the DCP logical view."""
+        size_full = int(config.full_max_total_num_tokens) * self.dcp_size
+        size_swa = int(config.swa_max_total_num_tokens) * self.dcp_size
+        self._size_full = size_full
+        self._size_swa = size_swa
+        for alloc, size in (
+            (self.full_attn_allocator, size_full),
+            (self.swa_attn_allocator, size_swa),
+        ):
+            alloc.size = size
+            if self.page_size > 1:
+                alloc.num_pages = size // self.page_size
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(
+                    size_full + self.page_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
+            ]
+        )
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+        self.clear()

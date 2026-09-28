@@ -5,6 +5,7 @@ import torch
 
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    compact_dcp_sparse_page_table,
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
 )
@@ -44,6 +45,38 @@ class TestDSATransformIndex(CustomTestCase):
             topk[:, 1] = context_length - 1
             topk[:, 257::257] = -1
         return topk
+
+    def test_compact_dcp_sparse_page_table(self):
+        global_table = torch.tensor(
+            [
+                [13, -1, 8, 5, 14, -1, 2, 9],
+                [-1, -1, -1, -1, -1, -1, -1, -1],
+                [6, 7, 8, 9, 10, 11, 12, 13],
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                actual, actual_lens = compact_dcp_sparse_page_table(
+                    global_table, dcp_size=2, dcp_rank=rank
+                )
+                expected_rows = []
+                expected_lens = []
+                for row in global_table.cpu().tolist():
+                    owned = [
+                        value // 2 for value in row if value >= 0 and value % 2 == rank
+                    ]
+                    expected_lens.append(len(owned))
+                    expected_rows.append(owned + [-1] * (len(row) - len(owned)))
+                expected = torch.tensor(
+                    expected_rows, dtype=torch.int32, device=self.device
+                )
+                expected_lens = torch.tensor(
+                    expected_lens, dtype=torch.int32, device=self.device
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(actual_lens, expected_lens, rtol=0, atol=0)
 
     def _expected(
         self,

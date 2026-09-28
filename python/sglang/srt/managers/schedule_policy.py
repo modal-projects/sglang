@@ -61,14 +61,12 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (  # noqa: F401  re-exported; tests import it here
-    get_mamba_cache_miss_tokens,
-)
-from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     get_mamba_cache_miss_cause,
+    get_mamba_cache_miss_tokens,
     zero_match_result,
 )
 from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget

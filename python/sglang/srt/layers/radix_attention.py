@@ -64,9 +64,11 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
         and actual_tokens is not None
         and pcg_static_tokens > actual_tokens
     ):
-        first_dim = buf.shape[0]
-        elems_per_token = buf.numel() // first_dim
-        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+        # Some DCP attention backends return a strided view (for example after
+        # head sharding), so flattening with ``view`` is not always legal.  The
+        # first dimension is the token dimension; slicing it preserves the
+        # original storage and lets ``zero_`` handle either layout in place.
+        buf[actual_tokens:].zero_()
 
 
 def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:

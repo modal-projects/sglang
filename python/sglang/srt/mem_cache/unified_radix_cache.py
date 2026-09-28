@@ -1620,6 +1620,25 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+        """Synchronously back up one node (Full KV plus any unbacked component
+        state) and drain the ack -- the deferred-demote shape the eviction
+        loop runs for leaves, reusable by component evictors ahead of an
+        internal-state tombstone. Returns True once the backup is committed.
+        """
+        written = self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        # A node may already have Full KV on host while an auxiliary component
+        # (SWA or Mamba) is still device-only. Such an incremental backup has
+        # zero Full-KV rows but does register an in-flight write under node_id.
+        # Treat that as successful work and drain it before the component
+        # eviction frees the source slots.
+        if written == 0 and node_id not in self.ongoing_write_through:
+            return False
+        self.writing_check(write_back=True)
+        return True
+
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:

@@ -66,6 +66,82 @@ def prepare_trtllm_nope_sparse_metadata(
     return topk_lens
 
 
+@triton.jit
+def compact_dcp_sparse_page_table_kernel(
+    page_table_ptr: torch.Tensor,
+    result_ptr: torch.Tensor,
+    local_topk_lens_ptr: torch.Tensor,
+    row_stride,
+    result_row_stride,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Filter, localize, and stably compact one sparse table row per program."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    in_bounds = offsets < TOPK
+    indices = tl.load(
+        page_table_ptr + row * row_stride + offsets,
+        mask=in_bounds,
+        other=-1,
+    )
+    owned = in_bounds & (indices >= 0) & (indices % DCP_SIZE == DCP_RANK)
+    destinations = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    tl.store(
+        result_ptr + row * result_row_stride + destinations,
+        indices // DCP_SIZE,
+        mask=owned,
+    )
+    local_topk_len = tl.sum(owned.to(tl.int32), axis=0)
+    tl.store(local_topk_lens_ptr + row, local_topk_len)
+
+
+def compact_dcp_sparse_page_table(
+    page_table: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a global sparse table into TRTLLM's packed rank-local layout.
+
+    TileLang accepts holes anywhere in a sparse table, whereas TRTLLM-GEN
+    requires all valid entries to precede the ``-1`` padding. DCP ownership
+    creates holes, so filter by cyclic owner, divide global cache locations by
+    ``dcp_size``, and compact each row while preserving its original order.
+
+    Returns the packed table and the *true* local top-k lengths. The latter may
+    contain zeros; callers that install TRTLLM's dummy entry for empty rows must
+    retain these lengths to neutralize the corresponding output/LSE afterward.
+    """
+    assert page_table.ndim == 2
+    assert page_table.dtype == torch.int32
+    assert page_table.is_contiguous()
+    assert dcp_size > 1
+    assert 0 <= dcp_rank < dcp_size
+
+    num_rows, topk = page_table.shape
+    result = torch.full_like(page_table, -1)
+    local_topk_lens = torch.empty(num_rows, dtype=torch.int32, device=page_table.device)
+    if num_rows == 0:
+        return result, local_topk_lens
+
+    block_topk = triton.next_power_of_2(topk)
+    compact_dcp_sparse_page_table_kernel[(num_rows,)](
+        page_table,
+        result,
+        local_topk_lens,
+        page_table.stride(0),
+        result.stride(0),
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        TOPK=topk,
+        BLOCK_TOPK=block_topk,
+        num_warps=8,
+    )
+    return result, local_topk_lens
+
+
 def _allocate_prefill_result(
     topk_indices: torch.Tensor,
     real_num_tokens: int,

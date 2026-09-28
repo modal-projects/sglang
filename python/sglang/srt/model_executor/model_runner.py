@@ -376,6 +376,9 @@ class ModelRunner:
         self.mtp_draft_device_pools = ()
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        # Below 1 the DFLASH draft's KV is the SWA side of the allocator.
+        # See KVCacheConfigurator.draft_kv_ratio.
+        self.draft_kv_ratio = 1.0
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
@@ -921,7 +924,8 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
-        if self.is_hybrid_swa:
+        self.draft_kv_ratio = self.kv_cache_configurator.draft_kv_ratio
+        if self.is_hybrid_swa or self.draft_kv_ratio < 1:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
         # Keep a reference so the shared byte buffer is not GC'd.
@@ -1398,6 +1402,22 @@ class ModelRunner:
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
+
+    @property
+    def logical_max_total_num_tokens(self):
+        """Request-token capacity in logical tokens, not per-rank DCP rows."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.kv_cache_configurator.logical_token_capacity(
+                max_total_num_tokens=self.max_total_num_tokens
+            )
+        )
+
+    @property
+    def effective_logical_max_total_num_tokens(self):
+        """Logical request limit, preserving hybrid SWA's separate pool bounds."""
+        if self.is_hybrid_swa:
+            return self.effective_max_total_num_tokens
+        return self.logical_max_total_num_tokens
 
     @property
     def effective_max_total_num_tokens(self):

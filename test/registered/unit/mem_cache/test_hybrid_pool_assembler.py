@@ -4,15 +4,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _BoundedDraftMambaSwaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
+    _swa_allocation_callbacks,
     _SwaStrategy,
     build_full_draft_pools,
     build_hybrid_swa_group,
@@ -50,6 +55,23 @@ class _Pool:
 
 
 class TestDeviceAllocEviction(CustomTestCase):
+    def test_swa_callbacks_use_the_component_allocator_id_space(self):
+        allocator = MagicMock()
+
+        callbacks = _swa_allocation_callbacks(allocator)
+
+        self.assertIs(callbacks["device_alloc_fn"], allocator.alloc)
+        self.assertIs(callbacks["device_free_fn"], allocator.free)
+
+    def test_bound_swa_callbacks_free_the_bound_id_space(self):
+        bind = MagicMock()
+        free_bound = MagicMock()
+
+        callbacks = _swa_allocation_callbacks(None, bind, free_bound)
+
+        self.assertIs(callbacks["device_indices_from_anchor_fn"], bind)
+        self.assertIs(callbacks["device_free_fn"], free_bound)
+
     def test_swa_evicts_only_allocation_shortfall(self):
         cache = MagicMock()
         cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8
@@ -179,6 +201,57 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     )
                     self.assertEqual(kvcache.layers_mapping, layers_mapping)
                     self.assertEqual(req_pool.mamba_map, global_maps.get("mamba", {}))
+
+    def test_bounded_dflash_uses_attached_draft_as_swa_component(self):
+        kvcache = object.__new__(HybridLinearKVPool)
+        kvcache.start_layer = 4
+        kvcache.full_attention_layer_id_mapping = {7: 0}
+        kvcache.full_kv_pool = object()
+        kvcache.use_mla = True
+
+        allocator = DraftSWATokenToKVPoolAllocator(
+            size=16,
+            size_swa=8,
+            page_size=4,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=kvcache,
+            need_sort=False,
+            dcp_size=2,
+        )
+        draft_swa = SimpleNamespace(layer_num=6)
+        allocator.attach_draft_kv_pool(
+            SimpleNamespace(
+                swa_kv_pool=draft_swa,
+                register_mapping=lambda mapping: None,
+            )
+        )
+        req_pool = SimpleNamespace(mamba_map={4: 0}, mamba_pool=object())
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=req_pool,
+        )
+        host_group = MagicMock()
+
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_hybrid_mamba_stack",
+            return_value=(host_group, MagicMock()),
+        ) as build_stack:
+            result = _BoundedDraftMambaSwaStrategy().build(
+                cache=MagicMock(),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+
+        kwargs = build_stack.call_args.kwargs
+        self.assertIs(kwargs["swa_kv_pool"], draft_swa)
+        self.assertEqual(kwargs["full_layer_mapping"], {3: 0})
+        self.assertEqual(kwargs["mamba_layer_mapping"], {0: 0})
+        self.assertEqual(kwargs["swa_layer_mapping"], {i: i for i in range(6)})
+        self.assertIs(result.host_pool_group, host_group)
 
 
 class TestDraftSidecarPoolDispatch(CustomTestCase):

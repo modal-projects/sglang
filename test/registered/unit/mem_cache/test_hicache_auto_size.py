@@ -53,6 +53,29 @@ class TestHiCacheAutoSize(CustomTestCase):
                     4096 + 1024 + expected_sidecar_bytes,
                 )
 
+    def test_attached_swa_draft_is_counted_once_at_its_replicated_capacity(self):
+        target = Mock(
+            spec=MHATokenToKVPool,
+            size=128,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=4096),
+        )
+        draft_swa = Mock(
+            size=64,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=(1024, 1024)),
+        )
+        draft = Mock(spec=BaseSWAKVPool, swa_kv_pool=draft_swa)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=2,
+        )
+        plan = Mock(mode="attached_swa", device_pools=(draft,))
+
+        self.assertEqual(sizing._estimate_hicache_bytes(params, plan), 4096 + 2048)
+
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the
         per-rank budget, pools book one snapshot, and an explicit ratio opts out."""

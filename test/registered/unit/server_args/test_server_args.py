@@ -52,9 +52,11 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    _dcp_comm_backend_default,
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
     resolution_result,
+    run_post_process_pass,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -1037,6 +1039,52 @@ class TestKV4Compatibility(unittest.TestCase):
                 args = self._make_nvfp4_args(speculative_algorithm=algorithm)
                 with self.assertRaisesRegex(ValueError, algorithm):
                     handle_kv4_compatibility(args)
+
+    def test_draft_kv_ratio_range(self):
+        """The draft pool is indexed by target slot, so a ratio above 1 would
+        hold slots the target cannot address."""
+        from sglang.srt.arg_groups.speculative_hook import _handle_dflash
+
+        for ratio in (0, -0.5, 1.5):
+            with self.subTest(ratio=ratio):
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="cuda",
+                    speculative_algorithm="DFLASH",
+                    speculative_draft_model_path="dummy-draft",
+                    speculative_num_draft_tokens=8,
+                    speculative_draft_kv_ratio=ratio,
+                )
+                with self.assertRaisesRegex(ValueError, r"must be in \(0, 1\]"):
+                    _handle_dflash(args)
+
+    def test_draft_kv_ratio_allows_dcp(self):
+        from sglang.srt.arg_groups.speculative_hook import (
+            _handle_dflash_draft_kv_ratio,
+        )
+
+        draft_config = SimpleNamespace(
+            layer_types=["sliding_attention"] * 6,
+            sliding_window=4096,
+        )
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            tp_size=2,
+            dcp_size=2,
+            enable_hierarchical_cache=True,
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="dummy-draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_kv_ratio=0.25,
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=draft_config,
+        ):
+            _handle_dflash_draft_kv_ratio(args)
+
+        self.assertEqual(resolution_result(args, "speculative_draft_window_size"), 4095)
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_sm120_xqa_keeps_existing_speculative_support(self):
@@ -3965,7 +4013,7 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 class TestDcpCommBackendDefault(CustomTestCase):
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)
-        parallel_hook.handle_decode_context_parallelism(args)
+        run_post_process_pass(args, _dcp_comm_backend_default)
         return resolution_result(args, "dcp_comm_backend")
 
     def test_no_dcp_is_ag_rs(self):
@@ -3974,28 +4022,32 @@ class TestDcpCommBackendDefault(CustomTestCase):
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=True,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_a2a_on_cuda_without_mnnvl(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=False,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
     @override_platform(is_cuda=False, is_hip=False)
     def test_ag_rs_off_cuda(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=False,
         ):
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
         with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+            "sglang.srt.arg_groups.model_override_base.is_fi_a2a_supported",
+            return_value=True,
         ):
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"

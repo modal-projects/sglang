@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _STREAM_CHUNK_BYTES = 4 << 20
 _HOST_WORKING_MEMORY_BYTES = 8 << 30
+_MAX_DELTA_TRANSFORM_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class CanonicalDeltaTransform:
             expected_base_version = checkpoint.version
             for version in range(checkpoint.version + 1, target_version + 1):
                 root = version_dir(checkpoint_source_dir, version)
+                resolved_root = root.resolve()
                 delta = read_delta_checkpoint(
                     root,
                     expected_version=version,
@@ -167,7 +169,7 @@ class CanonicalDeltaTransform:
                                 operation.encoding,
                                 operation.checksum_algorithm,
                                 operation.expected_checksum,
-                                str(tensor.source_path.relative_to(root.resolve())),
+                                str(tensor.source_path.relative_to(resolved_root)),
                                 operation.source_offset,
                                 operation.compressed_nbytes,
                             ),
@@ -350,6 +352,7 @@ class CanonicalDeltaTransform:
                 if envs.SGLANG_SET_CPU_AFFINITY.get()
                 else max(1, available_cpus // self.world_size)
             ),
+            _MAX_DELTA_TRANSFORM_WORKERS,
             len(operations_by_name),
         )
         budget = _ByteBudget(self.working_memory_budget_bytes)

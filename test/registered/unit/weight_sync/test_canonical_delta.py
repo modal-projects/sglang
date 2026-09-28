@@ -284,6 +284,34 @@ def test_caller_owned_transform_does_not_advance_checkpoint(tmp_path):
         cached.close()
 
 
+def test_transform_workers_are_bounded_on_large_cpu_hosts(tmp_path):
+    versions = tmp_path / "updates"
+    v0 = {f"tensor_{i}": torch.arange(16, dtype=torch.uint8) for i in range(16)}
+    v1 = {name: tensor.roll(1) for name, tensor in v0.items()}
+    _write_delta(versions, 1, v0, v1, encoding="xor")
+    cached = _checkpoint(tmp_path, v0)
+    try:
+        transform = CanonicalDeltaTransform(
+            cached,
+            checkpoint_source_dir=versions,
+            target_version=1,
+            host_group=None,
+        )
+        with patch.object(
+            canonical_delta.os, "sched_getaffinity", return_value=set(range(64))
+        ):
+            stats = transform._transform_tensors(
+                {
+                    name: torch.from_numpy(_bytes(tensor).copy())
+                    for name, tensor in v0.items()
+                },
+                description="test",
+            )
+        assert stats["workers"] == canonical_delta._MAX_DELTA_TRANSFORM_WORKERS
+    finally:
+        cached.close()
+
+
 def test_checksum_failure_invalidates_mutated_checkpoint(tmp_path):
     versions = tmp_path / "updates"
     v0 = {"a": torch.arange(16, dtype=torch.uint8)}

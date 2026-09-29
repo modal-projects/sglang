@@ -34,6 +34,24 @@ def _storage_key(tensor: torch.Tensor) -> tuple[int | None, int, int]:
     return tensor.device.index, storage.data_ptr(), storage.nbytes()
 
 
+def _postprocess_device(model: torch.nn.Module) -> torch.device:
+    device = torch.device("cpu")
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        get_device = getattr(quant_method, "weight_staging_postprocess_device", None)
+        method_device = get_device(module) if callable(get_device) else "cuda"
+        if method_device not in {"cpu", "cuda"}:
+            raise ValueError(
+                "weight staging postprocess device must be 'cpu' or 'cuda', "
+                f"got {method_device!r} from {type(quant_method).__name__}"
+            )
+        if method_device == "cuda":
+            device = torch.device("cuda")
+    return device
+
+
 def _checkpoint_name_mapper(model: torch.nn.Module) -> WeightsMapper | None:
     """Return the model's raw-checkpoint to runtime-module name mapping."""
 
@@ -329,11 +347,14 @@ class RankWeightCompiler:
 
         phase_started = time.perf_counter()
         processed_shadow = prepared.shadow
-        device_stage_bytes = 0
+        postprocess_device = _postprocess_device(prepared.shadow)
         if self._stream is None:
+            postprocess_device = torch.device("cpu")
+        device_stage_bytes = 0
+        if postprocess_device.type == "cpu":
             DefaultModelLoader.postprocess_weights(
                 processed_shadow,
-                self.image.device,
+                postprocess_device,
             )
         else:
             # Post-load transforms are GPU kernels. Stage the bounded group as
@@ -378,6 +399,7 @@ class RankWeightCompiler:
             "path": prepared.group.path,
             "checkpoint_tensors": len(prepared.checkpoint_names),
             "bytes": group_bytes,
+            "postprocess_device": postprocess_device.type,
             "device_stage_bytes": device_stage_bytes,
             "cpu_image_copy_bytes": cpu_copy_bytes,
             "device_image_copy_bytes": device_copy_bytes,

@@ -124,11 +124,15 @@ class RankWeightCompiler:
                 "rank weight compilation does not support secondary checkpoints"
             )
         self.model = model
-        self.groups = build_weight_load_groups(
-            model,
-            max_group_bytes=max_group_bytes,
-        )
         self.image = RankWeightImage(model)
+        self.postprocess_device = _postprocess_device(model)
+        if self.postprocess_device.type == "cpu":
+            self.groups = [WeightLoadGroup(path="", nbytes=self.image.weight_nbytes)]
+        else:
+            self.groups = build_weight_load_groups(
+                model,
+                max_group_bytes=max_group_bytes,
+            )
         self._stream = (
             torch.cuda.Stream(device=self.image.device)
             if self.image.device.type == "cuda"
@@ -139,10 +143,11 @@ class RankWeightCompiler:
         self._ignored_checkpoint_names: frozenset[str] = frozenset()
         logger.info(
             "Rank weight compiler layout: groups=%d storages=%d bytes=%d "
-            "max_group_bytes=%d",
+            "postprocess_device=%s max_group_bytes=%d",
             len(self.groups),
             len(self.image.segments),
             self.image.weight_nbytes,
+            self.postprocess_device.type,
             max_group_bytes,
         )
 

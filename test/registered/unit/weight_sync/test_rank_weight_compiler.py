@@ -11,6 +11,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.weight_sync.rank_weight_compiler import (
     RankWeightCompiler,
     _checkpoint_groups,
+    _postprocess_device,
 )
 from sglang.srt.weight_sync.rank_weight_image import (
     build_rank_weight_image_plan,
@@ -176,6 +177,36 @@ def _use_plain_loader(monkeypatch):
         "postprocess_weights",
         lambda _model, _device: None,
     )
+
+
+class _PostprocessMethod:
+    def __init__(self, device):
+        self.device = device
+
+    def weight_staging_postprocess_device(self, _layer):
+        return self.device
+
+
+def test_postprocess_device_is_cpu_only_when_every_method_is_cpu_safe():
+    model = torch.nn.Module()
+    model.first = torch.nn.Module()
+    model.first.quant_method = _PostprocessMethod("cpu")
+    model.second = torch.nn.Module()
+    model.second.quant_method = _PostprocessMethod("cpu")
+
+    assert _postprocess_device(model).type == "cpu"
+
+    model.second.quant_method = _PostprocessMethod("cuda")
+    assert _postprocess_device(model).type == "cuda"
+
+
+def test_postprocess_device_rejects_an_unknown_device():
+    model = torch.nn.Module()
+    model.layer = torch.nn.Module()
+    model.layer.quant_method = _PostprocessMethod("xpu")
+
+    with pytest.raises(ValueError, match="must be 'cpu' or 'cuda'"):
+        _postprocess_device(model)
 
 
 def test_checkpoint_groups_use_checkpoint_mapper_and_explicit_exclusions():

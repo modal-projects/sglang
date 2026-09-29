@@ -50,6 +50,10 @@ class QuantizeMethodBase(ABC):
         """Restore checkpoint-facing state before an in-place weight reload."""
         return
 
+    def weight_staging_postprocess_device(self, layer: nn.Module) -> str:
+        """Return the device required for post-load transforms during staging."""
+        return "cuda"
+
     def get_derived_weight_tensors(
         self, layer: nn.Module
     ) -> Iterable[tuple[str, torch.Tensor]]:

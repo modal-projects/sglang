@@ -114,6 +114,20 @@ class TestPreparedWeightUpdates(CustomTestCase):
         self.assertEqual(manager._served_weight_version, 3)
         self.assertIsNone(manager._prepared_weight_version)
 
+    def test_pending_prepare_yields_scheduler_thread(self):
+        manager = self._manager()
+        thread = Mock()
+        thread.is_alive.return_value = True
+        manager._pending_weight_preparation = (Mock(), thread)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.time.sleep"
+        ) as sleep:
+            manager.check_pending_weight_preparation()
+
+        sleep.assert_called_once_with(0)
+        thread.join.assert_not_called()
+
     def test_prepare_requires_rank_consensus_before_starting_thread(self):
         worker = Mock()
         manager = self._manager(worker=worker)

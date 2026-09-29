@@ -403,6 +403,7 @@ class SchedulerWeightUpdaterManager:
             return
         recv_req, thread = pending
         if thread.is_alive():
+            time.sleep(0)
             return
         thread.join()
         self._pending_weight_preparation = None

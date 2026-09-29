@@ -6,6 +6,7 @@ import gc
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,18 @@ def _postprocess_device(model: torch.nn.Module) -> torch.device:
         if method_device == "cuda":
             device = torch.device("cuda")
     return device
+
+
+def _cuda_postprocess_methods(model: torch.nn.Module) -> Counter[str]:
+    methods: Counter[str] = Counter()
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        get_device = getattr(quant_method, "weight_staging_postprocess_device", None)
+        if not callable(get_device) or get_device(module) == "cuda":
+            methods[type(quant_method).__name__] += 1
+    return methods
 
 
 def _checkpoint_name_mapper(model: torch.nn.Module) -> WeightsMapper | None:
@@ -126,6 +139,7 @@ class RankWeightCompiler:
         self.model = model
         self.image = RankWeightImage(model)
         self.postprocess_device = _postprocess_device(model)
+        cuda_methods = _cuda_postprocess_methods(model)
         if self.postprocess_device.type == "cpu":
             self.groups = [WeightLoadGroup(path="", nbytes=self.image.weight_nbytes)]
         else:
@@ -150,6 +164,8 @@ class RankWeightCompiler:
             self.postprocess_device.type,
             max_group_bytes,
         )
+        if cuda_methods:
+            logger.info("CUDA weight postprocess methods: %s", dict(cuda_methods))
 
     def initialize_from_active(self) -> dict[str, Any]:
         """Seed and register the host image from the serving weights."""

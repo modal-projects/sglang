@@ -1338,6 +1338,8 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Omit a redundant processor ID list after copying canonical request IDs.
+    SGLANG_MM_STRIP_PROCESSOR_INPUT_IDS = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
@@ -1349,6 +1351,9 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Raise instead of cropping when final multimodal embedding rows do not
+    # match the placeholder tokens in the extend window.
+    SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH = EnvBool(False)
 
     # ===================================================================
     # Multimodal CUDA IPC transport

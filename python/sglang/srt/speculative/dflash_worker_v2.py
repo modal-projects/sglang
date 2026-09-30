@@ -77,6 +77,9 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    SpeculativeSamplingMaskCapture,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -2711,6 +2714,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=int(self.block_size),
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+                out_tokens=out_tokens,
+                commit_lens=commit_lens,
+            )
 
         if batch.return_logprob:
             compute_spec_logprobs(

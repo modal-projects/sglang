@@ -5,7 +5,7 @@ The fused kernel replaces the fp8 decode path's aten chain
 BIT-equal to that chain: the conversion is round-to-nearest bf16 -> e4m3 with
 satfinite semantics (finite |x|>448 -> +-448, 0x7E/0xFE), bit-equal to
 clamp(+-448).to(float8_e4m3fn), and everything else is byte movement.
-Covers production-like strided views (k halves sliced from one latent row,
+Covers engine-shaped strided views (k halves sliced from one latent row,
 q halves sliced from one [B, H, 576] projection), int32/int64 locs, CUDA
 graph capture/replay with refilled buffers, and the covered_fp8() alignment
 guards (base + stride, the PR #208 failure class).

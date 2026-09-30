@@ -583,12 +583,12 @@ class TestTokenizerInputContracts(CustomTestCase):
             image_data=["image"],
             mm_hashes=["07"],
             mm_content_hashes=[content_hash],
-            cache_salt="workspace-a",
+            cache_salt="salt-a",
         )
         tokenized = self._generate(request, output)
         self.assertEqual(tokenized.mm_inputs.mm_items[0].hash, 7)
         self.assertEqual(request.mm_content_hashes, [content_hash])
-        self.assertEqual(tokenized.cache_salt, "workspace-a")
+        self.assertEqual(tokenized.cache_salt, "salt-a")
 
 
 if __name__ == "__main__":

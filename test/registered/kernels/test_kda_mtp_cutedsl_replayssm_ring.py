@@ -330,7 +330,7 @@ def test_cutedsl_multiple_padding_outputs_and_states(
     )
     real_tokens = real_requests * width
     kwargs["ssm_state_indices"][real_requests:] = -1
-    # Production graph padding repeats the last real cumulative sequence length.
+    # CUDA-graph padding repeats the last real cumulative sequence length.
     # Input/output storage still has a dense fixed-width block for every request.
     kwargs["cu_seqlens"][real_requests + 1 :] = real_tokens
     persistent_names = ("cs_q", "cs_k", "cs_v", "recurrent_state")

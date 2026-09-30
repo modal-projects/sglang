@@ -1,6 +1,6 @@
 """CPU checks for saturating bf16 -> fp8 casts in ``_quantize_fp8_qkv``.
 
-torch <= 2.12 (prod pins torch==2.11.0) implements ``Tensor.to(torch.float8)``
+torch <= 2.12 (including torch 2.11) implements ``Tensor.to(torch.float8)``
 as NaN for every |x| >= 480 instead of saturating to the finite max (+-448 for
 e4m3fn).  These tests patch ``torch.Tensor.to`` to emulate that legacy cast so
 they fail on code that still uses the plain ``.to()`` and pass once the casts

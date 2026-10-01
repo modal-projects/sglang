@@ -285,6 +285,15 @@ class AiterRunnerCore(MoeRunnerCore):
 
         from sglang.srt.environ import envs
 
+        if envs.SGLANG_HK_MOE.get():
+            from sglang.srt.layers.moe.moe_runner import hk_moe
+
+            hk_output = hk_moe.maybe_forward(
+                runner_input=runner_input, quant_info=quant_info, config=self.config
+            )
+            if hk_output is not None:
+                return AiterRunnerOutput(hidden_states=hk_output)
+
         a1_scale = (
             runner_input.a1_scale
             if runner_input.a1_scale is not None

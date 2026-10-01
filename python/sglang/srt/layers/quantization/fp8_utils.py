@@ -1801,6 +1801,25 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     weight_scale_inv.data = new_weight_scale_inv
 
 
+@torch.no_grad()
+def requant_moe_weight_ue8m0_float_scale_(
+    weight: torch.Tensor, weight_scale_inv: torch.Tensor
+) -> None:
+    """In place: 128x128 block-FP8 experts [E, N, K] -> power-of-two (UE8M0) scales kept as fp32 [E, N/128, K/128].
+
+    Same values as requant_weight_ue8m0, but without DeepGEMM's packed scale layout, for kernels that read float
+    scales (aiter / HipKittens on ROCm). One expert at a time bounds the fp32 dequant buffer.
+    """
+    for e in range(weight.shape[0]):
+        w, s = per_block_cast_to_fp8(
+            block_quant_dequant(
+                weight[e], weight_scale_inv[e], [128, 128], torch.float32
+            )
+        )
+        weight[e].copy_(w)
+        weight_scale_inv[e].copy_(s)
+
+
 def requant_block_scale_ue8m0_for_deepgemm(
     weight: torch.nn.Parameter,
     weight_scale: torch.nn.Parameter,

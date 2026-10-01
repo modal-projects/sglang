@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    requant_moe_weight_ue8m0_float_scale_,
     resolve_block_fp8_mxfp8_backend,
     resolve_mxfp8_dense_gemm_backend,
     torch_w8a8_block_fp8_linear,
@@ -1989,6 +1990,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.is_shuffled = True
                 layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
+            if envs.SGLANG_HK_MOE.get() and self.block_quant:
+                # The HipKittens MoE applies block scales in hardware, which needs power-of-two scales.
+                requant_moe_weight_ue8m0_float_scale_(
+                    weight=layer.w13_weight.data,
+                    weight_scale_inv=layer.w13_weight_scale_inv.data,
+                )
+                requant_moe_weight_ue8m0_float_scale_(
+                    weight=layer.w2_weight.data,
+                    weight_scale_inv=layer.w2_weight_scale_inv.data,
+                )
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
             layer.w13_weight.copy_(t)

@@ -895,6 +895,9 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # Route block-FP8 MoE calls of >= 2048 tokens to the HipKittens grouped MoE (gfx950, GLM-5.3 TP2 shard);
+    # also requantizes MoE expert weights to power-of-two (UE8M0) block scales at load, which that kernel needs.
+    SGLANG_HK_MOE = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

@@ -335,6 +335,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "triton",
     "trtllm",
     "intel_xpu",
+    "hk",
 ]
 
 
@@ -407,6 +408,8 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        if "hk" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            self._init_hk_sparse_mla(model_runner)
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -2095,14 +2098,17 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
+        if dsa_impl in ("tilelang", "hk"):
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
                 # already handed us the concatenated form and q_all is a
                 # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            sparse_mla_fwd = (
+                self._forward_hk if dsa_impl == "hk" else self._forward_tilelang
+            )
+            return sparse_mla_fwd(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -2410,14 +2416,17 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif dsa_impl == "tilelang":
+        elif dsa_impl in ("tilelang", "hk"):
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
             # has already been set to a zero-copy view of q in the else branch
             # above and we can reuse it directly. The `not _is_hip` clause keeps
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            sparse_mla_fwd = (
+                self._forward_hk if dsa_impl == "hk" else self._forward_tilelang
+            )
+            return sparse_mla_fwd(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -3061,6 +3070,43 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
+    def _init_hk_sparse_mla(self, model_runner: ModelRunner) -> None:
+        """Fall back to TileLang when aiter lacks the HK op, the GPU is not gfx950 or the model is outside its contract."""
+        from aiter import get_gfx
+
+        try:
+            from aiter.ops import hk_sparse_mla
+        except ImportError:
+            hk_sparse_mla = None
+        available = hk_sparse_mla is not None and get_gfx() == "gfx950"
+
+        # KPool appends up to index_kpool - 1 tail tokens to the index_topk columns.
+        max_topk = self.dsa_index_topk + self.dsa_index_kpool - 1
+        if (
+            available
+            and self.num_q_heads == hk_sparse_mla.HEADS
+            and self.kv_lora_rank == hk_sparse_mla.DIM
+            and self.qk_rope_head_dim == 0
+            and max_topk <= hk_sparse_mla.MAX_TOPK
+            and model_runner.kv_cache_dtype
+            in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            return
+        logger.warning(
+            "HK sparse MLA is unavailable for this build or model (aiter op %s, q heads %d, "
+            "latent %d, rope %d, kv %s, top-k %d); using TileLang",
+            "available" if available else "unavailable",
+            self.num_q_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            model_runner.kv_cache_dtype,
+            max_topk,
+        )
+        if self.dsa_prefill_impl == "hk":
+            self.dsa_prefill_impl = "tilelang"
+        if self.dsa_decode_impl == "hk":
+            self.dsa_decode_impl = "tilelang"
+
     def _forward_tilelang(
         self,
         q_all: torch.Tensor,
@@ -3091,6 +3137,19 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_hk(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        # Shapes were validated once in _init_hk_sparse_mla; the op pads the index table to 128-key blocks.
+        from aiter.ops.hk_sparse_mla import hk_sparse_mla_fwd
+
+        return hk_sparse_mla_fwd(q_all, kv_cache, page_table_1, sm_scale)
 
     def _forward_triton_decode(
         self,

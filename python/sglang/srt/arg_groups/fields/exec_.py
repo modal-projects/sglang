@@ -210,7 +210,7 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. 'hk': HipKittens sparse MLA (ROCm gfx950; models other than 32 heads x 512 latent dims use TileLang).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -222,6 +222,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "hk",
             ],
             resolvable=True,
         ),
@@ -252,6 +253,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "hk",
             ],
             resolvable=True,
         ),

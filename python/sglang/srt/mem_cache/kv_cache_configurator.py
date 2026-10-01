@@ -2625,11 +2625,11 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
-    # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
+    # On HIP, the TileLang, Triton, AITER and HK DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter", "hk")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter", "hk")
     ):
         return kv_cache_dim
 

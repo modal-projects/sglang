@@ -912,6 +912,81 @@ class Glm47MoeDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return _glm47_native_structural_tag_available()
 
+    def get_response_format_grammar(
+        self,
+        tools: List[Tool],
+        response_schema: dict,
+        thinking_mode: bool,
+        parallel_tool_calls: bool,
+    ) -> str:
+        """Constrain a full turn to reasoning followed by tools OR a JSON answer."""
+        from xgrammar import Grammar
+        from xgrammar.structural_tag import (
+            AnyTextFormat,
+            JSONSchemaFormat,
+            OrFormat,
+            SequenceFormat,
+            TagFormat,
+            TagsWithSeparatorFormat,
+        )
+
+        if not self.supports_structural_tag():
+            raise ValueError(
+                "GLM tool calls with response_format require XGrammar's glm_4_7 support"
+            )
+
+        # A required-tool format permits arbitrary text before/between calls.
+        # Use individual named-tool tags instead, so that branch cannot bypass
+        # the answer schema by emitting free text followed by a tool call.
+        tags = []
+        for tool in tools:
+            tag = self.get_structural_tag(
+                tools=[tool],
+                tool_choice=ToolChoice(function={"name": tool.function.name}),
+                thinking_mode=False,
+                parallel_tool_calls=False,
+            )
+            if tag is None or not isinstance(tag.format, TagFormat):
+                raise ValueError("Expected a native GLM named-tool tag")
+            tags.append(tag.format)
+
+        suffix = OrFormat(
+            elements=[
+                JSONSchemaFormat(json_schema=response_schema),
+                TagsWithSeparatorFormat(
+                    tags=tags,
+                    separator="",
+                    at_least_one=True,
+                    stop_after_first=not parallel_tool_calls,
+                ),
+            ]
+        )
+        if thinking_mode:
+            # The GLM chat template already supplies <think>. Own the complete
+            # generated turn, like the existing full_assistant_ebnf path, so the
+            # reasoner backend must not add a second reasoning wrapper.
+            suffix = SequenceFormat(
+                elements=[
+                    TagFormat(
+                        begin="",
+                        content=AnyTextFormat(
+                            excludes=[
+                                "<think>",
+                                "<tool_call>",
+                                "</tool_call>",
+                                "<arg_key>",
+                                "</arg_key>",
+                                "<arg_value>",
+                                "</arg_value>",
+                            ]
+                        ),
+                        end="</think>",
+                    ),
+                    suffix,
+                ]
+            )
+        return str(Grammar.from_structural_tag(StructuralTag(format=suffix)))
+
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,

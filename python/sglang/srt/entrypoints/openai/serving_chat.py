@@ -1310,20 +1310,33 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        response_schema = None
+        if (
+            self.tool_call_parser == "glm47"
+            and effective_tools
+            and request.tool_choice == "auto"
+            and request.response_format is not None
+        ):
+            if request.response_format.type == "json_schema":
+                response_schema = request.response_format.json_schema.schema_
+            elif request.response_format.type == "json_object":
+                response_schema = {"type": "object"}
+        glm_constraint = self.tool_call_parser == "glm47" and (
+            response_schema is not None
+            or not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
                 "enable_thinking"
             )
-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+            parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
+                response_schema=response_schema,
             )
 
         # Apply chat template and its stop strings

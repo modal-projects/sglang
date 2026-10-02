@@ -264,6 +264,7 @@ class FunctionCallParser:
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
         thinking_mode: bool = False,
+        response_schema: Optional[dict] = None,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -276,6 +277,30 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
+        if response_schema is not None:
+            if tool_choice != "auto" or not isinstance(self.detector, Glm47MoeDetector):
+                raise ValueError(
+                    "Combined response schemas require glm47 and auto tools"
+                )
+            tools = self.tools
+            if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+                tools = [
+                    tool.model_copy(
+                        update={
+                            "function": tool.function.model_copy(
+                                update={"strict": True}
+                            )
+                        }
+                    )
+                    for tool in tools
+                ]
+            return (
+                "response_format_ebnf",
+                self.detector.get_response_format_grammar(
+                    tools, response_schema, thinking_mode, parallel_tool_calls
+                ),
+            )
+
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)

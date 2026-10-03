@@ -144,3 +144,87 @@ def test_sparse_filtering_matches_flashinfer_at_cutoff_ties(filter_order, top_p)
         ).squeeze(1)
         assert torch.equal(actual > 0, expected > 0)
         torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("verifier", ["target_only", "rejection"])
+@pytest.mark.parametrize(
+    "accept_proposal", [False, True], ids=["rejection-bonus", "all-accepted-bonus"]
+)
+def test_qwen_vocabulary_bonus_cdf_boundaries(verifier, accept_proposal):
+    """Pin bonus CDF traversal across tiles and the final partial vocabulary tile.
+
+    Binary-exact masses and stratified midpoint uniforms make every output
+    deterministic. The largest case uses about 1 GiB for target/draft matrices.
+    """
+    batch_size, block_size, vocab_size = 256, 2, 248320
+    device = "cuda"
+    proposal = 17  # Outside the bonus distribution's support.
+    support = torch.tensor(
+        [0, 4095, 4096, 8191, 8192, 131072, vocab_size - 2, vocab_size - 1],
+        device=device,
+    )
+    weights = (
+        torch.tensor([1, 2, 3, 4, 5, 6, 7, 4], dtype=torch.float32, device=device) / 32
+    )
+    target_probs = torch.zeros(batch_size, block_size, vocab_size, device=device)
+    target_probs[:, 1, support] = weights
+    if accept_proposal:
+        target_probs[:, 0, proposal] = 1.0
+    else:
+        target_probs[:, 0, support] = weights
+    draft_probs = torch.zeros(
+        batch_size,
+        block_size if verifier == "target_only" else block_size - 1,
+        vocab_size,
+        device=device,
+    )
+    if verifier == "rejection":
+        draft_probs[:, 0, proposal] = 1.0
+    candidates = (
+        torch.tensor([0, proposal], device=device).expand(batch_size, -1).contiguous()
+    )
+    retrieve_index = torch.arange(batch_size * block_size, device=device).view(
+        batch_size, block_size
+    )
+    retrieve_next_token = (
+        torch.tensor([1, -1], device=device).expand(batch_size, -1).contiguous()
+    )
+    retrieve_next_sibling = torch.full_like(retrieve_index, -1)
+    predicts = torch.full(
+        (batch_size * block_size,), -1, dtype=torch.int32, device=device
+    )
+    accept_index = torch.full(
+        (batch_size, block_size), -1, dtype=torch.int32, device=device
+    )
+    accept_count = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    final_coins = (
+        torch.arange(batch_size, dtype=torch.float32, device=device) + 0.5
+    ) / batch_size
+    kernel = (
+        tree_speculative_sampling_target_only
+        if verifier == "target_only"
+        else chain_speculative_sampling_triton
+    )
+    kernel(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_count,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=torch.full((batch_size, block_size), 0.5, device=device),
+        uniform_samples_for_final_sampling=final_coins,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+    assert torch.all(accept_count == int(accept_proposal))
+    row_ids = torch.arange(batch_size, device=device)
+    bonus = predicts[accept_index[row_ids, accept_count.long()].long()]
+    expected = support[torch.searchsorted(weights.cumsum(0), final_coins, right=True)]
+    torch.testing.assert_close(bonus.long(), expected, rtol=0, atol=0)
+    if accept_proposal:
+        assert torch.all(predicts[accept_index[:, 0].long()] == proposal)

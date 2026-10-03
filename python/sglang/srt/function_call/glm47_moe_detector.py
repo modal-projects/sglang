@@ -5,7 +5,13 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import (
+    ResponseFormat,
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -933,3 +939,98 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "glm_4_7"
+
+
+def get_glm_response_format_constraint(
+    tools: List[Tool],
+    response_format: ResponseFormat,
+    *,
+    parallel_tool_calls: bool,
+    chat_template_kwargs: Optional[dict] = None,
+) -> ToolCallConstraint:
+    """Constrain a GLM auto-tool turn to reasoning followed by calls OR JSON.
+
+    Own the entire generated turn, including the template-prefilled reasoning
+    block. The backend must not add another reasoning wrapper.
+    """
+    from xgrammar import Grammar
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        JSONSchemaFormat,
+        OrFormat,
+        SequenceFormat,
+        TagFormat,
+        TagsWithSeparatorFormat,
+    )
+
+    if response_format.type == "json_schema":
+        response_schema = response_format.json_schema.schema_
+    elif response_format.type == "json_object":
+        response_schema = {"type": "object"}
+    else:
+        raise ValueError("GLM combined output requires a JSON response format")
+
+    detector = Glm47MoeDetector()
+    if not detector.supports_structural_tag():
+        raise ValueError(
+            "GLM tool calls with response_format require XGrammar's glm_4_7 support"
+        )
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() >= ToolStrictLevel.PARAMETER:
+        tools = [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in tools
+        ]
+
+    # Required/auto native formats admit surrounding prose. Named-tool tags
+    # give us only the calls, so free text cannot bypass the answer schema.
+    tags = []
+    for tool in tools:
+        tag = detector.get_structural_tag(
+            tools=[tool],
+            tool_choice=ToolChoice(function={"name": tool.function.name}),
+            thinking_mode=False,
+            parallel_tool_calls=False,
+        )
+        if tag is None or not isinstance(tag.format, TagFormat):
+            raise ValueError("Expected a native GLM named-tool tag")
+        tags.append(tag.format)
+    response = OrFormat(
+        elements=[
+            JSONSchemaFormat(json_schema=response_schema),
+            TagsWithSeparatorFormat(
+                tags=tags,
+                separator="",
+                at_least_one=True,
+                stop_after_first=not parallel_tool_calls,
+            ),
+        ]
+    )
+    # Mirror GLM's existing full-assistant grammar: the chat template supplies
+    # <think>, and enable_thinking defaults to True (including an explicit None).
+    enable_thinking = (chat_template_kwargs or {}).get("enable_thinking")
+    if enable_thinking is None or bool(enable_thinking):
+        response = SequenceFormat(
+            elements=[
+                TagFormat(
+                    begin="",
+                    content=AnyTextFormat(
+                        excludes=[
+                            "<think>",
+                            "<tool_call>",
+                            "</tool_call>",
+                            "<arg_key>",
+                            "</arg_key>",
+                            "<arg_value>",
+                            "</arg_value>",
+                        ]
+                    ),
+                    end="</think>",
+                ),
+                response,
+            ]
+        )
+    return "format_ebnf", str(
+        Grammar.from_structural_tag(StructuralTag(format=response))
+    )

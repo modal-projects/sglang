@@ -2230,6 +2230,175 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
 
+    def test_non_glm_auto_response_format_keeps_existing_behavior(self):
+        self.chat.tool_call_parser = "hermes"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Search"}],
+            input_ids=[1],
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+            tool_choice="auto",
+            response_format={"type": "json_object"},
+        )
+        processed = self.chat._process_messages(req, False)
+        params = req.to_sampling_params([], {}, processed.tool_call_constraint)
+        self.assertEqual(json.loads(params["json_schema"]), {"type": "object"})
+        self.assertFalse(params.get("ebnf_full_assistant", False))
+
+    def test_glm_auto_tools_with_response_format(self):
+        """An answer schema must not mask native tool calls or allow free text."""
+        import xgrammar as xgr
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        self.chat.tool_call_parser = "glm47"
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "queries": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["queries"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        call = (
+            "<tool_call>web_search<arg_key>queries</arg_key>"
+            '<arg_value>["Tour de France 2026"]</arg_value></tool_call>'
+        )
+        answer = '{"answer":"A result"}'
+        for thinking in (False, True):
+            prefix = "Checking the result.</think>" if thinking else ""
+            for parallel in (False, True):
+                for strict in (False, True):
+                    for json_object in (False, True):
+                        with self.subTest(
+                            thinking=thinking,
+                            parallel=parallel,
+                            strict=strict,
+                            json_object=json_object,
+                        ):
+                            tool["function"]["strict"] = strict
+                            req = ChatCompletionRequest(
+                                model="x",
+                                messages=[{"role": "user", "content": "Search"}],
+                                input_ids=[1],
+                                tools=[tool],
+                                tool_choice="auto",
+                                parallel_tool_calls=parallel,
+                                chat_template_kwargs={"enable_thinking": thinking},
+                                response_format=(
+                                    {"type": "json_object"}
+                                    if json_object
+                                    else {
+                                        "type": "json_schema",
+                                        "json_schema": {
+                                            "name": "answer",
+                                            "strict": True,
+                                            "schema": schema,
+                                        },
+                                    }
+                                ),
+                            )
+                            processed = self.chat._process_messages(req, False)
+                            params = req.to_sampling_params(
+                                stop=[],
+                                model_generation_config={},
+                                tool_call_constraint=processed.tool_call_constraint,
+                            )
+                            self.assertNotIn("json_schema", params)
+                            self.assertTrue(params["ebnf_full_assistant"])
+                            compiled = compiler.compile_grammar(
+                                xgr.Grammar.from_ebnf(params["ebnf"])
+                            )
+
+                            def accepts(text):
+                                matcher = xgr.GrammarMatcher(compiled)
+                                return (
+                                    matcher.accept_string(prefix + text)
+                                    and matcher.is_completed()
+                                )
+
+                            self.assertTrue(accepts(call))
+                            self.assertTrue(accepts(answer))
+                            self.assertEqual(accepts(call + call), parallel)
+                            self.assertEqual(accepts("{}"), json_object)
+                            self.assertEqual(accepts('{"answer":42}'), json_object)
+                            for invalid in (
+                                "",
+                                "Hello",
+                                "Hello" + call,
+                                answer + call,
+                                call + answer,
+                            ):
+                                self.assertFalse(accepts(invalid), invalid)
+                            if strict:
+                                self.assertFalse(
+                                    accepts(
+                                        call.replace('["Tour de France 2026"]', "42")
+                                    )
+                                )
+                                self.assertFalse(
+                                    accepts("<tool_call>web_search</tool_call>")
+                                )
+
+        calls, remaining, finish = self.chat._process_tool_calls(
+            text=call,
+            tools=req.tools,
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice="auto",
+        )
+        self.assertEqual(calls[0].function.name, "web_search")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"queries": ["Tour de France 2026"]},
+        )
+        self.assertEqual(remaining, "")
+        self.assertEqual(finish["type"], "tool_calls")
+
+        for chunk_size in (1, 7, len(call)):
+            for text in (call, answer):
+                parser = FunctionCallParser(req.tools, "glm47")
+                normal_text, deltas = "", []
+                for start in range(0, len(text), chunk_size):
+                    normal, calls = parser.parse_stream_chunk(
+                        text[start : start + chunk_size]
+                    )
+                    normal_text += normal
+                    deltas.extend(calls)
+                normal, calls = parser.parse_stream_end()
+                normal_text += normal
+                deltas.extend(calls)
+                if text == answer:
+                    self.assertEqual(normal_text, answer)
+                    self.assertEqual(deltas, [])
+                else:
+                    self.assertEqual(normal_text, "")
+                    self.assertEqual(
+                        next(delta.name for delta in deltas if delta.name), "web_search"
+                    )
+                    self.assertEqual(
+                        json.loads("".join(delta.parameters for delta in deltas)),
+                        {"queries": ["Tour de France 2026"]},
+                    )
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 

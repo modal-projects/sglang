@@ -90,6 +90,9 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm47_moe_detector import (
+    get_glm_response_format_constraint,
+)
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
@@ -1372,6 +1375,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+
+        if (
+            self.tool_call_parser == "glm47"
+            and effective_tools
+            and request.tool_choice == "auto"
+            and request.response_format is not None
+            and request.response_format.type in ("json_schema", "json_object")
+        ):
+            tool_call_constraint = get_glm_response_format_constraint(
+                effective_tools,
+                request.response_format,
+                parallel_tool_calls=request.parallel_tool_calls,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.

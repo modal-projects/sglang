@@ -891,6 +891,10 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    # Keep top_logprobs out of the OpenAI logprobs for a caller that reads them from
+    # meta_info (``output_top_logprobs``): rendering every candidate as an OpenAI
+    # object costs far more than computing it.
+    top_logprobs_in_meta_info_only: bool = False
     return_input_ids_in_sglext: bool = False
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False

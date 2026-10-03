@@ -1871,7 +1871,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     ]
                     if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
-                            content, n_prev_token, total_output_logprobs
+                            content,
+                            n_prev_token,
+                            total_output_logprobs,
+                            with_top_logprobs=not request.top_logprobs_in_meta_info_only,
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
 
@@ -2186,7 +2189,10 @@ class OpenAIServingChat(OpenAIServingBase):
             # Process logprobs
             choice_logprobs = None
             if request.logprobs:
-                choice_logprobs = self._process_response_logprobs(ret_item)
+                choice_logprobs = self._process_response_logprobs(
+                    ret_item,
+                    with_top_logprobs=not request.top_logprobs_in_meta_info_only,
+                )
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
@@ -2350,11 +2356,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return token_logprobs
 
-    def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
+    def _process_response_logprobs(
+        self, ret_item: Dict[str, Any], with_top_logprobs: bool = True
+    ) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-            output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
+            output_top_logprobs=(
+                ret_item["meta_info"].get("output_top_logprobs", None)
+                if with_top_logprobs
+                else None
+            ),
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
@@ -2511,10 +2523,15 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         n_prev_token: int,
         total_output_logprobs: int,
+        with_top_logprobs: bool = True,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         output_token_logprobs = content["meta_info"]["output_token_logprobs"]
-        output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
+        output_top_logprobs = (
+            content["meta_info"].get("output_top_logprobs", [])
+            if with_top_logprobs
+            else []
+        )
         if not get_serving().incremental_streaming_output:
             output_token_logprobs = output_token_logprobs[
                 n_prev_token:total_output_logprobs

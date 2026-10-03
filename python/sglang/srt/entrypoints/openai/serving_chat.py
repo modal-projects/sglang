@@ -1310,20 +1310,8 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        response_schema = None
-        if (
-            self.tool_call_parser == "glm47"
-            and effective_tools
-            and request.tool_choice == "auto"
-            and request.response_format is not None
-        ):
-            if request.response_format.type == "json_schema":
-                response_schema = request.response_format.json_schema.schema_
-            elif request.response_format.type == "json_object":
-                response_schema = {"type": "object"}
-        glm_constraint = self.tool_call_parser == "glm47" and (
-            response_schema is not None
-            or not any(tool.function.strict for tool in effective_tools)
+        glm_constraint = self.tool_call_parser == "glm47" and not any(
+            tool.function.strict for tool in effective_tools
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
@@ -1336,7 +1324,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 thinking_mode=(
                     True if enable_thinking is None else bool(enable_thinking)
                 ),
-                response_schema=response_schema,
             )
 
         # Apply chat template and its stop strings
@@ -1385,6 +1372,29 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+
+        # Composition is capability-driven, independent of parser/model names.
+        # Unsupported detectors keep their existing output-constraint behavior.
+        if (
+            effective_tools
+            and self.tool_call_parser
+            and request.tool_choice == "auto"
+            and request.response_format is not None
+            and request.response_format.type in ("json_schema", "json_object")
+        ):
+            response_schema = (
+                request.response_format.json_schema.schema_
+                if request.response_format.type == "json_schema"
+                else {"type": "object"}
+            )
+            combined_constraint = parser.get_response_format_constraint(
+                response_schema,
+                parallel_tool_calls=request.parallel_tool_calls,
+                thinking_mode=xgrammar_reasoning,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
+            if combined_constraint is not None:
+                tool_call_constraint = combined_constraint
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.

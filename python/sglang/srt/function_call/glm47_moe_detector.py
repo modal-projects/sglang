@@ -16,6 +16,9 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.response_format_grammar import (
+    ResponseFormatGrammarAdapter,
+)
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
@@ -912,80 +915,8 @@ class Glm47MoeDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return _glm47_native_structural_tag_available()
 
-    def get_response_format_grammar(
-        self,
-        tools: List[Tool],
-        response_schema: dict,
-        thinking_mode: bool,
-        parallel_tool_calls: bool,
-    ) -> str:
-        """Constrain a full turn to reasoning followed by tools OR a JSON answer."""
-        from xgrammar import Grammar
-        from xgrammar.structural_tag import (
-            AnyTextFormat,
-            JSONSchemaFormat,
-            OrFormat,
-            SequenceFormat,
-            TagFormat,
-            TagsWithSeparatorFormat,
-        )
-
-        if not self.supports_structural_tag():
-            raise ValueError(
-                "GLM tool calls with response_format require XGrammar's glm_4_7 support"
-            )
-
-        # A required-tool format permits arbitrary text before/between calls.
-        # Use individual named-tool tags instead, so that branch cannot bypass
-        # the answer schema by emitting free text followed by a tool call.
-        tags = []
-        for tool in tools:
-            tag = self.get_structural_tag(
-                tools=[tool],
-                tool_choice=ToolChoice(function={"name": tool.function.name}),
-                thinking_mode=False,
-                parallel_tool_calls=False,
-            )
-            if tag is None or not isinstance(tag.format, TagFormat):
-                raise ValueError("Expected a native GLM named-tool tag")
-            tags.append(tag.format)
-
-        suffix = OrFormat(
-            elements=[
-                JSONSchemaFormat(json_schema=response_schema),
-                TagsWithSeparatorFormat(
-                    tags=tags,
-                    separator="",
-                    at_least_one=True,
-                    stop_after_first=not parallel_tool_calls,
-                ),
-            ]
-        )
-        if thinking_mode:
-            # The GLM chat template already supplies <think>. Own the complete
-            # generated turn, like the existing full_assistant_ebnf path, so the
-            # reasoner backend must not add a second reasoning wrapper.
-            suffix = SequenceFormat(
-                elements=[
-                    TagFormat(
-                        begin="",
-                        content=AnyTextFormat(
-                            excludes=[
-                                "<think>",
-                                "<tool_call>",
-                                "</tool_call>",
-                                "<arg_key>",
-                                "</arg_key>",
-                                "<arg_value>",
-                                "</arg_value>",
-                            ]
-                        ),
-                        end="</think>",
-                    ),
-                    suffix,
-                ]
-            )
-        return str(Grammar.from_structural_tag(StructuralTag(format=suffix)))
+    def get_response_format_adapter(self) -> ResponseFormatGrammarAdapter:
+        return Glm47ResponseFormatAdapter(self)
 
     def get_structural_tag(
         self,
@@ -1008,3 +939,68 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "glm_4_7"
+
+
+class Glm47ResponseFormatAdapter(ResponseFormatGrammarAdapter):
+    """GLM XML calls and its template-prefilled <think> reasoning prefix."""
+
+    owns_reasoning = True
+
+    def __init__(self, detector: Glm47MoeDetector):
+        self.detector = detector
+
+    def tool_call_format(self, tools: List[Tool], parallel_tool_calls: bool):
+        from xgrammar.structural_tag import TagFormat, TagsWithSeparatorFormat
+
+        if not self.detector.supports_structural_tag():
+            raise ValueError(
+                "GLM tool calls with response_format require XGrammar's glm_4_7 support"
+            )
+        # Required/auto native formats admit surrounding prose. Named-tool tags
+        # give us only the calls, so free text cannot bypass the answer schema.
+        tags = []
+        for tool in tools:
+            tag = self.detector.get_structural_tag(
+                tools=[tool],
+                tool_choice=ToolChoice(function={"name": tool.function.name}),
+                thinking_mode=False,
+                parallel_tool_calls=False,
+            )
+            if tag is None or not isinstance(tag.format, TagFormat):
+                raise ValueError("Expected a native GLM named-tool tag")
+            tags.append(tag.format)
+        return TagsWithSeparatorFormat(
+            tags=tags,
+            separator="",
+            at_least_one=True,
+            stop_after_first=not parallel_tool_calls,
+        )
+
+    def wrap_response(self, response, *, thinking_mode, chat_template_kwargs):
+        from xgrammar.structural_tag import AnyTextFormat, SequenceFormat, TagFormat
+
+        # Mirror GLM's existing full-assistant grammar: the chat template
+        # supplies <think>, and enable_thinking defaults to True.
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        if enable_thinking is not None and not bool(enable_thinking):
+            return response
+        return SequenceFormat(
+            elements=[
+                TagFormat(
+                    begin="",
+                    content=AnyTextFormat(
+                        excludes=[
+                            "<think>",
+                            "<tool_call>",
+                            "</tool_call>",
+                            "<arg_key>",
+                            "</arg_key>",
+                            "<arg_value>",
+                            "</arg_value>",
+                        ]
+                    ),
+                    end="</think>",
+                ),
+                response,
+            ]
+        )

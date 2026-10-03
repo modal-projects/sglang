@@ -2230,6 +2230,125 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
 
+    def test_response_format_adapter_is_model_independent(self):
+        """A new detector can opt in without changing serving or protocol code."""
+        import xgrammar as xgr
+        from xgrammar.structural_tag import (
+            JSONSchemaFormat,
+            TagFormat,
+            TagsWithSeparatorFormat,
+        )
+
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.function_call.hermes_detector import HermesDetector
+        from sglang.srt.function_call.response_format_grammar import (
+            ResponseFormatGrammarAdapter,
+        )
+
+        class TestAdapter(ResponseFormatGrammarAdapter):
+            def tool_call_format(self, tools, parallel_tool_calls):
+                return TagsWithSeparatorFormat(
+                    tags=[
+                        TagFormat(
+                            begin='<tool_call>{"name": '
+                            + json.dumps(tool.function.name)
+                            + ', "arguments": ',
+                            content=JSONSchemaFormat(
+                                json_schema=tool.function.parameters
+                            ),
+                            end="}</tool_call>",
+                        )
+                        for tool in tools
+                    ],
+                    separator="",
+                    at_least_one=True,
+                    stop_after_first=not parallel_tool_calls,
+                )
+
+        class TestDetector(HermesDetector):
+            def get_response_format_adapter(self):
+                return TestAdapter()
+
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        self.chat.tool_call_parser = "test_response_format_adapter"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Search"}],
+            input_ids=[1],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "strict": True,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        )
+        with patch.dict(
+            FunctionCallParser.ToolCallParserEnum,
+            {self.chat.tool_call_parser: TestDetector},
+        ):
+            processed = self.chat._process_messages(req, False)
+        params = req.to_sampling_params([], {}, processed.tool_call_constraint)
+        self.assertNotIn("json_schema", params)
+        # The shared suffix leaves reasoning to the existing reasoner backend.
+        self.assertFalse(params["ebnf_full_assistant"])
+        compiled = compiler.compile_grammar(xgr.Grammar.from_ebnf(params["ebnf"]))
+        call = (
+            '<tool_call>{"name": "lookup", "arguments": {"query":"race"}}</tool_call>'
+        )
+        answer = '{"answer":"result"}'
+        for text, expected in [
+            (call, True),
+            (answer, True),
+            (call + call, False),
+            ("Hello" + call, False),
+            (answer + call, False),
+            ("{}", False),
+            (call.replace('"race"', "42"), False),
+        ]:
+            with self.subTest(text=text):
+                matcher = xgr.GrammarMatcher(compiled)
+                self.assertEqual(
+                    matcher.accept_string(text) and matcher.is_completed(), expected
+                )
+
+        # An adapter is opt-in: ordinary Hermes retains its previous behavior.
+        self.chat.tool_call_parser = "hermes"
+        processed = self.chat._process_messages(req, False)
+        params = req.to_sampling_params([], {}, processed.tool_call_constraint)
+        self.assertEqual(
+            json.loads(params["json_schema"]), req.response_format.json_schema.schema_
+        )
+        self.assertFalse(params.get("ebnf_full_assistant", False))
+
     def test_glm_auto_tools_with_response_format(self):
         """An answer schema must not mask native tool calls or allow free text."""
         import xgrammar as xgr

@@ -260,6 +260,8 @@ ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["full_assistant_ebnf"], str],
     # Full assistant grammar that already incorporates the response schema.
     Tuple[Literal["response_format_ebnf"], str],
+    # Combined suffix grammar; ReasonerGrammarBackend still owns reasoning.
+    Tuple[Literal["response_format_suffix_ebnf"], str],
 ]
 
 
@@ -1177,14 +1179,19 @@ class ChatCompletionRequest(BaseModel):
             or sampling_params.get("json_schema")
         )
 
-        if tool_call_constraint and tool_call_constraint[0] == "response_format_ebnf":
+        if tool_call_constraint and tool_call_constraint[0] in (
+            "response_format_ebnf",
+            "response_format_suffix_ebnf",
+        ):
             if self.regex or self.ebnf:
                 raise ValueError(
                     "Combined tool/response schemas cannot include regex or ebnf"
                 )
             sampling_params.pop("json_schema", None)
             sampling_params["ebnf"] = tool_call_constraint[1]
-            sampling_params["ebnf_full_assistant"] = True
+            sampling_params["ebnf_full_assistant"] = (
+                tool_call_constraint[0] == "response_format_ebnf"
+            )
         elif tool_call_constraint and has_existing_constraints:
             if tool_call_constraint[0] != "full_assistant_ebnf" and (
                 self.tool_choice == "required"

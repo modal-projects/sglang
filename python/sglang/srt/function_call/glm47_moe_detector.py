@@ -944,8 +944,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 class Glm47ResponseFormatAdapter(ResponseFormatGrammarAdapter):
     """GLM XML calls and its template-prefilled <think> reasoning prefix."""
 
-    owns_reasoning = True
-
     def __init__(self, detector: Glm47MoeDetector):
         self.detector = detector
 

@@ -16,10 +16,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool, ToolCallConstraint
 class ResponseFormatGrammarAdapter(ABC):
     """Model-specific framing around a model-independent answer/tool choice."""
 
-    # False leaves reasoning to ReasonerGrammarBackend. An adapter that handles
-    # the entire generated turn must set this and wrap both alternatives once.
-    owns_reasoning: bool = False
-
     @abstractmethod
     def tool_call_format(self, tools: list[Tool], parallel_tool_calls: bool) -> Format:
         """Match >=1 native calls, no free text or empty output.
@@ -29,6 +25,7 @@ class ResponseFormatGrammarAdapter(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
     def wrap_response(
         self,
         response: Format,
@@ -36,8 +33,13 @@ class ResponseFormatGrammarAdapter(ABC):
         thinking_mode: bool,
         chat_template_kwargs: dict[str, Any],
     ) -> Format:
-        """Add any shared model framing; by default the backend owns reasoning."""
-        return response
+        """Frame the complete turn, including reasoning when enabled.
+
+        The backend will not add a reasoning wrapper. A non-thinking adapter
+        may return response unchanged; thinking adapters must frame both
+        alternatives together according to their model's chat template.
+        """
+        raise NotImplementedError
 
 
 def compose_response_format_grammar(
@@ -61,11 +63,6 @@ def compose_response_format_grammar(
         thinking_mode=thinking_mode,
         chat_template_kwargs=chat_template_kwargs,
     )
-    constraint_type = (
-        "response_format_ebnf"
-        if adapter.owns_reasoning
-        else "response_format_suffix_ebnf"
-    )
-    return constraint_type, str(
+    return "format_ebnf", str(
         Grammar.from_structural_tag(StructuralTag(format=response))
     )

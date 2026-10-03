@@ -1390,7 +1390,7 @@ class OpenAIServingChat(OpenAIServingBase):
             combined_constraint = parser.get_response_format_constraint(
                 response_schema,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=xgrammar_reasoning,
+                thinking_mode=thinking_mode,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
             if combined_constraint is not None:

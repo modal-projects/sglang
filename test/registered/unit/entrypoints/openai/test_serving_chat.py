@@ -2265,6 +2265,13 @@ class ServingChatTestCase(unittest.TestCase):
                     stop_after_first=not parallel_tool_calls,
                 )
 
+            def wrap_response(self, response, *, thinking_mode, chat_template_kwargs):
+                if thinking_mode:
+                    raise ValueError(
+                        "This test adapter supports non-thinking turns only"
+                    )
+                return response
+
         class TestDetector(HermesDetector):
             def get_response_format_adapter(self):
                 return TestAdapter()
@@ -2318,8 +2325,8 @@ class ServingChatTestCase(unittest.TestCase):
             processed = self.chat._process_messages(req, False)
         params = req.to_sampling_params([], {}, processed.tool_call_constraint)
         self.assertNotIn("json_schema", params)
-        # The shared suffix leaves reasoning to the existing reasoner backend.
-        self.assertFalse(params["ebnf_full_assistant"])
+        # Adapters frame the full turn; the backend must not wrap it again.
+        self.assertTrue(params["ebnf_full_assistant"])
         compiled = compiler.compile_grammar(xgr.Grammar.from_ebnf(params["ebnf"]))
         call = (
             '<tool_call>{"name": "lookup", "arguments": {"query":"race"}}</tool_call>'

@@ -1,7 +1,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -25,11 +25,6 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.function_call.response_format_grammar import (
-        ResponseFormatGrammarAdapter,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -388,14 +383,6 @@ class BaseFormatDetector(ABC):
 
     def get_structural_tag_name(self) -> Optional[str]:
         """Return the XGrammar model name for native structural tags, if supported."""
-        return None
-
-    def get_response_format_adapter(self) -> Optional["ResponseFormatGrammarAdapter"]:
-        """Opt in to auto tools + structured answers with a tool-only grammar.
-
-        Returning None preserves existing behavior for unsupported parsers.
-        Do not reuse a grammar that admits arbitrary text around tool calls.
-        """
         return None
 
     def get_structural_tag(

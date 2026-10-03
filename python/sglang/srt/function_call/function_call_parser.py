@@ -259,41 +259,6 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
-    def get_response_format_constraint(
-        self,
-        response_schema: dict,
-        *,
-        parallel_tool_calls: bool = True,
-        thinking_mode: bool = False,
-        chat_template_kwargs: Optional[dict] = None,
-    ) -> Optional[ToolCallConstraint]:
-        """Compose an auto-tool answer constraint when the detector opts in."""
-        from sglang.srt.function_call.response_format_grammar import (
-            compose_response_format_grammar,
-        )
-
-        adapter = self.detector.get_response_format_adapter()
-        if adapter is None or not self.tools:
-            return None
-        tools = self.tools
-        if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-            tools = [
-                tool.model_copy(
-                    update={
-                        "function": tool.function.model_copy(update={"strict": True})
-                    }
-                )
-                for tool in tools
-            ]
-        return compose_response_format_grammar(
-            adapter,
-            tools,
-            response_schema,
-            parallel_tool_calls=parallel_tool_calls,
-            thinking_mode=thinking_mode,
-            chat_template_kwargs=chat_template_kwargs or {},
-        )
-
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],

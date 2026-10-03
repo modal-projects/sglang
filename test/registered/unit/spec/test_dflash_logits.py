@@ -407,6 +407,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     sync_sites = []
     worker = SimpleNamespace(
         _selector_sample=None,
+        sampling_verify_available=lambda: False,
         _selector_sampling_accept=lambda **kwargs: pytest.fail(
             "selector sampling must not run without a staged sample"
         ),

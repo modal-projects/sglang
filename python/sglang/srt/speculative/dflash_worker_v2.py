@@ -82,6 +82,9 @@ from sglang.srt.speculative.lilicorr_utils import (
     target_input_embeddings,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    SpeculativeSamplingMaskCapture,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -2159,6 +2162,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
+            if not _is_all_greedy(sampling_info) and self.sampling_verify_available():
+                raise RuntimeError(
+                    "DFLASH sampling verification was enabled, but the sampled "
+                    "draft distribution is missing. Refusing greedy fallback."
+                )
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
@@ -2202,6 +2210,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+
+    def sampling_verify_available(self) -> bool:
+        """Whether this worker can verify stochastic requests without argmax fallback.
+
+        Selector and LiLiCorr drafts carry proposal probabilities into the
+        rejection sampler. Other drafts require the target-only sampling kernel.
+        This describes the loaded worker, independently of acceptance thresholds
+        and simulated acceptance, which callers must check separately.
+        """
+        return bool(
+            (self.selector is not None and self._selector_sampling_enabled)
+            or (self.lilicorr is not None and self._lilicorr_sampling_enabled)
+            or is_dflash_sampling_verify_available()
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2835,6 +2857,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=int(self.block_size),
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+                out_tokens=out_tokens,
+                commit_lens=commit_lens,
+            )
 
         if batch.return_logprob:
             compute_spec_logprobs(

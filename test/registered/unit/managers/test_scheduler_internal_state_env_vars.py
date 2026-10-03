@@ -17,7 +17,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerInternalStateEnvVars(unittest.TestCase):
-    def _get_internal_state(self) -> dict:
+    def _get_internal_state(self, draft_worker=None) -> dict:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.metrics_reporter = SimpleNamespace(
             last_gen_throughput=1.0,
@@ -38,10 +38,11 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
         scheduler.swa_tokens_per_layer = None
         scheduler.max_running_requests = 8
         scheduler.spec_algorithm = SimpleNamespace(
-            is_none=lambda: True,
+            is_none=lambda: draft_worker is None,
+            is_dflash=lambda: draft_worker is not None,
             is_dspark=lambda: False,
         )
-        scheduler.draft_worker = None
+        scheduler.draft_worker = draft_worker
         # Set by maybe_init_rust_server in a real boot; None = no embedded Rust server.
         scheduler.rust_server = None
 
@@ -49,6 +50,19 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
             output = scheduler.get_internal_state(recv_req=GetInternalStateReq())
 
         return output.internal_state
+
+    def test_dflash_reports_loaded_worker_sampling_capability(self):
+        for available in (False, True):
+            with self.subTest(available=available):
+                worker = SimpleNamespace(
+                    graph_memory_usage=None,
+                    sampling_verify_available=lambda: available,
+                )
+                state = self._get_internal_state(draft_worker=worker)
+                self.assertIs(state["dflash_sampling_verify_available"], available)
+
+    def test_non_speculative_server_has_no_dflash_capability(self):
+        self.assertNotIn("dflash_sampling_verify_available", self._get_internal_state())
 
     def test_the_gate_is_declared_off(self):
         """Nothing is exposed unless an operator opts in, so the declared default is the safety net."""

@@ -8,10 +8,11 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_dflash_verify_target_probs,
+    build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.utils import is_npu
@@ -104,13 +105,14 @@ def _accept_sampling_core(
             rows_per_request=verify_num_draft_tokens,
         ).view(bs, verify_num_draft_tokens, -1)
     else:
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits,
             sampling_info=sampling_info,
             draft_token_num=verify_num_draft_tokens,
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+            filter_apply_order=get_exec().kernel.sampling_filter_order,
         )
     (
         retrieve_index,

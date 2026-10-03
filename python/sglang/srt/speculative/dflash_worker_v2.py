@@ -2162,6 +2162,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
+            if not _is_all_greedy(sampling_info) and self.sampling_verify_available():
+                raise RuntimeError(
+                    "DFLASH sampling verification was enabled, but the sampled "
+                    "draft distribution is missing. Refusing greedy fallback."
+                )
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
@@ -2205,6 +2210,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+
+    def sampling_verify_available(self) -> bool:
+        """Whether this worker can verify stochastic requests without argmax fallback.
+
+        Selector and LiLiCorr drafts carry proposal probabilities into the
+        rejection sampler. Other drafts require the target-only sampling kernel.
+        This describes the loaded worker, independently of acceptance thresholds
+        and simulated acceptance, which callers must check separately.
+        """
+        return bool(
+            (self.selector is not None and self._selector_sampling_enabled)
+            or (self.lilicorr is not None and self._lilicorr_sampling_enabled)
+            or is_dflash_sampling_verify_available()
+        )
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info

@@ -1169,7 +1169,9 @@ def build_speculative_verify_target_probs(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        # Compute exponentials on the head, then restore cutoff ties before
+        # top-p. FlashInfer top-k retains every probability at the kth cutoff;
+        # scattering exactly k entries would silently change that policy.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
@@ -1180,14 +1182,22 @@ def build_speculative_verify_target_probs(
                 topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
             topk_probs = F.softmax(topk_logits, dim=-1)
+            cutoff_positions = (repeated_top_ks - 1).unsqueeze(1)
+            cutoff_logits = topk_logits.gather(1, cutoff_positions)
+            cutoff_probs = topk_probs.gather(1, cutoff_positions)
+            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+            target_probs.scatter_(1, topk_indices, topk_probs)
+            target_probs = torch.where(
+                (scaled_logits == cutoff_logits) & (repeated_top_ks[:, None] > 1),
+                cutoff_probs,
+                target_probs,
+            )
+            target_probs.div_(target_probs.sum(dim=-1, keepdim=True))
             if need_top_p:
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
-
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
-            target_probs.scatter_(1, topk_indices, topk_probs)
+                target_probs = _dflash_top_p_renorm_prob(target_probs, repeated_top_ps)
             sparse_topk_applied = True
 
     if not sparse_topk_applied:

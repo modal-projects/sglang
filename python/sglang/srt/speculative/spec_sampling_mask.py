@@ -58,7 +58,7 @@ def validate_spec_sampling_mask_request(
 class SpeculativeSamplingMaskCapture(msgspec.Struct):
     target_probs: torch.Tensor | None
     batch_indices: torch.Tensor
-    max_top_k: int
+    max_tokens: int
     greedy_mask: torch.Tensor | None = None
     support_capture_indices: torch.Tensor | None = None
 
@@ -91,7 +91,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         return cls(
             target_probs=target_probs,
             batch_indices=sampling_info.sampling_mask_batch_indices,
-            max_top_k=max(sampling_info.sampling_mask_top_ks),
+            max_tokens=get_exec().features.sampling_mask_max_tokens,
             greedy_mask=greedy_mask,
             support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
         )
@@ -121,17 +121,19 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                     0, self.support_capture_indices
                 ).unsqueeze(-1)
         else:
-            max_top_k = min(int(self.max_top_k), self.target_probs.shape[-1])
-            if max_top_k <= 0:
+            packed_size = min(int(self.max_tokens), self.target_probs.shape[-1])
+            if packed_size <= 0:
                 raise ValueError(
-                    "Sampling-mask capture requires a positive finite top_k."
+                    "Sampling-mask capture requires a positive token capacity."
                 )
             target_probs = self.target_probs.index_select(0, batch_indices)
             support_probs, support_tokens = torch.topk(
-                target_probs, k=max_top_k, dim=-1
+                target_probs, k=packed_size, dim=-1
             )
             support_tokens = support_tokens.to(torch.int32)
-            support_lens = (support_probs > 0).sum(dim=-1, dtype=torch.int32)
+            # Cutoff ties can make the realized support larger than top_k.
+            # Count before packing so an incomplete support is never marked OK.
+            support_lens = (target_probs > 0).sum(dim=-1, dtype=torch.int32)
             selected_logprobs = torch.log(
                 target_probs.gather(-1, output_tokens.unsqueeze(-1)).squeeze(-1)
             )
@@ -167,12 +169,16 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
 
         statuses = torch.where(
             torch.isfinite(selected_logprobs),
-            int(SamplingMaskStatus.OK),
+            torch.where(
+                support_lens > self.max_tokens,
+                int(SamplingMaskStatus.OVERFLOW),
+                int(SamplingMaskStatus.OK),
+            ),
             int(SamplingMaskStatus.INVALID),
         ).to(torch.int8)
         return SamplingMaskOutput(
             token_ids=support_tokens,
-            lengths=support_lens,
+            lengths=support_lens.clamp(max=support_tokens.shape[-1]),
             selected_logprobs=selected_logprobs,
             support_logprobs=support_logprobs,
             statuses=statuses,

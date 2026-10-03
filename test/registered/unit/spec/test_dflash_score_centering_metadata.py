@@ -1,5 +1,7 @@
 """Model-independent contracts required by score-centering clients."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -23,6 +26,39 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("filter_order", ["top_k_first", "joint"])
+@pytest.mark.parametrize("disabled_top_p", [1.0, 1.1])
+def test_disabled_top_p_preserves_rows_when_backend_truncates_them(
+    filter_order, disabled_top_p
+):
+    fixture_path = (
+        Path(__file__).parents[2] / "kernels/ops/speculative/top_p_one_roundoff.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    probs = torch.zeros(2, fixture["vocab_size"], dtype=torch.float32)
+    probs[:, fixture["ids"]] = torch.tensor(fixture["probabilities_float32"])
+    thresholds = torch.tensor([disabled_top_p, 0.9])
+
+    def truncating_backend(values, top_ps):
+        # Model a backend which prunes a positive tail even on a p=1 row.
+        assert torch.equal(top_ps, thresholds)
+        result = values.masked_fill(values < 1e-4, 0.0)
+        return result / result.sum(-1, keepdim=True)
+
+    actual = renorm_top_k_top_p(
+        probs,
+        None,
+        thresholds,
+        filter_order,
+        top_k_renorm=None,
+        top_p_renorm=truncating_backend,
+    )
+    assert actual.dtype == probs.dtype
+    assert torch.equal(actual[0], probs[0])
+    assert torch.equal(actual[1], truncating_backend(probs, thresholds)[1])
+    assert (actual[0] > 0).sum() == len(fixture["ids"])
 
 
 @pytest.mark.parametrize("width", [32, 128])

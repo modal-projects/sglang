@@ -19,7 +19,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p
+from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p, renorm_top_p
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -1197,19 +1197,27 @@ def build_speculative_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                target_probs = _dflash_top_p_renorm_prob(target_probs, repeated_top_ps)
+                target_probs = renorm_top_p(
+                    target_probs,
+                    repeated_top_ps,
+                    top_p_renorm=_dflash_top_p_renorm_prob,
+                )
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         target_probs = renorm_top_k_top_p(
             target_probs,
-            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
-            if need_top_k
-            else None,
-            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
-            if need_top_p
-            else None,
+            (
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+                if need_top_k
+                else None
+            ),
+            (
+                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
+                if need_top_p
+                else None
+            ),
             filter_apply_order,
             top_k_renorm=_dflash_top_k_renorm_prob,
             top_p_renorm=_dflash_top_p_renorm_prob,

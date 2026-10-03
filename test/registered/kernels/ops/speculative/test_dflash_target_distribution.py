@@ -1,5 +1,7 @@
 """Both DFlash verifier families must preserve the target categorical law."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +13,79 @@ from sglang.kernels.ops.speculative.reject_sampling import (
 from sglang.kernels.ops.speculative.sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+
+def _top_p_roundoff_fixture():
+    fixture = json.loads(
+        Path(__file__).with_name("top_p_one_roundoff.json").read_text()
+    )
+    probs = torch.zeros(1, fixture["vocab_size"], device="cuda", dtype=torch.float32)
+    probs[0, fixture["ids"]] = torch.tensor(
+        fixture["probabilities_float32"], device="cuda", dtype=torch.float32
+    )
+    return probs
+
+
+@pytest.mark.parametrize("filter_order", ["top_k_first", "joint"])
+def test_top_p_one_preserves_real_float32_roundoff_row(filter_order):
+    """AIR top-p in FlashInfer 0.6.18 pruned 11/33 tokens on this real row."""
+    from flashinfer.sampling import top_p_renorm_probs
+
+    probs = _top_p_roundoff_fixture().repeat(2, 1)
+    top_ps = torch.tensor([1.0, 0.9], device="cuda")
+    actual = renorm_top_k_top_p(
+        probs,
+        None,
+        top_ps,
+        filter_order,
+        top_k_renorm=None,
+        top_p_renorm=top_p_renorm_probs,
+    )
+    assert actual.dtype == probs.dtype
+    assert torch.equal(actual[0], probs[0])
+    assert (actual[0] > 0).sum() == 33
+    torch.testing.assert_close(
+        actual[1], top_p_renorm_probs(probs[1:], top_ps[1:])[0], rtol=1e-6, atol=1e-7
+    )
+
+
+@pytest.mark.parametrize("filter_order", ["top_k_first", "joint"])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_dflash_mixed_batch_keeps_top_p_one_support(filter_order, sparse):
+    """Other requests enabling top-p must not change an unfiltered row."""
+    probs = _top_p_roundoff_fixture()
+    logits = probs.log().repeat(4, 1)
+    info = SimpleNamespace(
+        temperatures=torch.ones(2, 1, device="cuda"),
+        top_ks=torch.tensor([32, 32], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([1.0, 0.9], device="cuda"),
+        need_top_k_sampling=True,
+        need_top_p_sampling=True,
+    )
+    options = dict(
+        next_token_logits=logits,
+        sampling_info=info,
+        draft_token_num=2,
+        bs=2,
+        max_top_k=32,
+        use_sparse_topk=sparse,
+        filter_apply_order=filter_order,
+    )
+    actual = build_speculative_verify_target_probs(**options)
+    info.need_top_p_sampling = False
+    without_top_p = build_speculative_verify_target_probs(**options)
+    assert actual.dtype == probs.dtype
+    # Joint filtering uses dense full-vocabulary softmax while disabling top-p
+    # can enable sparse top-k, so tolerate their floating-point roundoff only.
+    torch.testing.assert_close(actual[0], without_top_p[0], rtol=1e-6, atol=1e-7)
+    assert torch.equal(actual[0] > 0, without_top_p[0] > 0)
+    assert (actual[0] > 0).sum(-1).tolist() == [33, 33]
+    assert (actual[1] > 0).sum() < (without_top_p[1] > 0).sum()
 
 
 @pytest.mark.parametrize("verifier", ["target_only", "rejection"])

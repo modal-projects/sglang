@@ -450,6 +450,7 @@ class KimiK3MoE(nn.Module):
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
+        self._front_fp8 = None  # k3_rocm_dense_fp8.StaticFP8Weight on ROCm
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -730,6 +731,19 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
+        if _is_hip and not self._front_is_ep_pair:
+            from sglang.srt.layers import k3_rocm_dense_fp8
+
+            if k3_rocm_dense_fp8.front_enabled():
+                # One E4M3 copy of the merged front; the bf16 component weights
+                # become row views of it (the fused front is their only reader).
+                fp8 = k3_rocm_dense_fp8.StaticFP8Weight(self._front_w)
+                off = 0
+                for mod, rows in zip(mods, self._front_sizes):
+                    mod.weight.data = fp8.weight[off : off + rows]
+                    off += rows
+                self._front_w = fp8.weight
+                self._front_fp8 = fp8
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
@@ -1345,11 +1359,17 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(
+                hidden_states,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -1842,6 +1862,13 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if _is_hip:
+            from sglang.srt.layers import k3_rocm_dense_fp8
+
+            if k3_rocm_dense_fp8.qkvg_enabled():
+                # E4M3 q/k/v/g like the CUDA "wide" scope; f_a/b stay bf16, so the
+                # whole-in-proj merge below no longer applies (dtype mismatch).
+                k3_rocm_dense_fp8.convert_linear(self.fused_qkvg_proj)
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.

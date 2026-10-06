@@ -447,20 +447,35 @@ class RotaryEmbedding(BaseFusedOp):
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
                 if _is_hip:
+                    # The fp32 cache stays the master copy on HIP (the fused QSA
+                    # indexer reads it); the fallback kernel needs query's dtype.
                     self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = self._hip_cos_sin_cache_as(query.dtype)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key
+
+    def _hip_cos_sin_cache_as(self, dtype: torch.dtype) -> torch.Tensor:
+        """A cached copy of the fp32 cos/sin cache in ``dtype`` (no per-call cast)."""
+        cache = self.cos_sin_cache
+        if cache.dtype == dtype:
+            return cache
+        cast = getattr(self, "_hip_cos_sin_cast", None)
+        if cast is None or cast.dtype != dtype or cast.device != cache.device:
+            cast = cache.to(dtype)
+            self._hip_cos_sin_cast = cast
+        return cast
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

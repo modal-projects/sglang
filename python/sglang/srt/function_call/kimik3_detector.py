@@ -13,6 +13,9 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -40,6 +43,8 @@ _ARG_RE = re.compile(
     re.DOTALL,
 )
 _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
+_ARGUMENT_OPEN = "<|open|>argument"
+_SEP = "<|sep|>"
 
 
 def _unescape_attr(value: str) -> str:
@@ -75,6 +80,17 @@ class KimiK3Detector(BaseFormatDetector):
         self.bot_token = TOOLS_OPEN
         self.eot_token = TOOLS_CLOSE
         self._sent_normal_idx = 0
+        self._reset_stream_state()
+
+    def _reset_stream_state(self) -> None:
+        # Cursor into _buffer past the tools-channel opener; None until it arrives.
+        self._section_pos: Optional[int] = None
+        self._section_done = False
+        self._in_call = False
+        self._completed_calls = 0
+        self._call_args: dict = {}
+        # Open argument: (key, type, value start index into _buffer).
+        self._arg: Optional[tuple] = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -180,32 +196,17 @@ class KimiK3Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         self._buffer += new_text
         try:
-            open_idx = self._buffer.find(self.bot_token)
-            if open_idx == -1:
-                return StreamingParseResult(normal_text=self._emit_normal_text())
-
-            normal_text = self._emit_normal_text(limit=open_idx)
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            calls = []
-            parsed = self._parse_calls(section)
-            for call in parsed[self.current_tool_id + 1 :]:
-                self.current_tool_id += 1
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": call["name"],
-                    "arguments": json.loads(call["arguments"]),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = call["arguments"]
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=call["name"],
-                        parameters=call["arguments"],
-                    )
-                )
+            if self._section_pos is None:
+                open_idx = self._buffer.find(self.bot_token)
+                if open_idx == -1:
+                    return StreamingParseResult(normal_text=self._emit_normal_text())
+                normal_text = self._emit_normal_text(limit=open_idx)
+                self._section_pos = open_idx + len(self.bot_token)
+            else:
+                normal_text = ""
+            calls: List[ToolCallItem] = []
+            while not self._section_done and self._advance_section(calls):
+                pass
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(
@@ -216,17 +217,147 @@ class KimiK3Detector(BaseFormatDetector):
             # and silently drops the rest of the response.
             self._buffer = ""
             self._sent_normal_idx = 0
+            self._reset_stream_state()
             return StreamingParseResult()
 
+    def _advance_section(self, calls: List[ToolCallItem]) -> bool:
+        """Consume one step of the tools section; False when more text is needed.
+
+        Arguments stream as an exact prefix of ``json.dumps(arguments,
+        ensure_ascii=False)``, the string the serving layer reconciles against
+        at end of stream.
+        """
+        buf = self._buffer
+        pos = self._section_pos
+        if self._arg is not None:
+            return self._advance_argument(calls)
+        if self._in_call:
+            arg_idx = buf.find(_ARGUMENT_OPEN, pos)
+            close_idx = buf.find(CALL_CLOSE, pos)
+            if close_idx != -1 and (arg_idx == -1 or close_idx < arg_idx):
+                streamed = self.streamed_args_for_tool[self.current_tool_id]
+                self._emit_args(calls, "}" if streamed else "{}")
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = dict(
+                    self._call_args
+                )
+                self._in_call = False
+                self._completed_calls += 1
+                self._section_pos = close_idx + len(CALL_CLOSE)
+                return True
+            if arg_idx == -1:
+                return False
+            sep_idx = buf.find(_SEP, arg_idx + len(_ARGUMENT_OPEN))
+            if sep_idx == -1:
+                return False
+            attrs = _parse_attrs(buf[arg_idx + len(_ARGUMENT_OPEN) : sep_idx])
+            key = attrs.get("key", "")
+            arg_type = attrs.get("type", "string")
+            self._arg = (key, arg_type, sep_idx + len(_SEP))
+            self._section_pos = sep_idx + len(_SEP)
+            if arg_type == "string":
+                self._emit_args(calls, self._arg_prefix(key) + '"')
+            return True
+
+        tools_close_idx = buf.find(self.eot_token, pos)
+        call_idx = buf.find(CALL_OPEN, pos)
+        if tools_close_idx != -1 and (call_idx == -1 or tools_close_idx < call_idx):
+            self._section_done = True
+            return False
+        if call_idx == -1:
+            return False
+        sep_idx = buf.find(_SEP, call_idx + len(CALL_OPEN))
+        if sep_idx == -1:
+            return False
+        tool_name = _parse_attrs(buf[call_idx + len(CALL_OPEN) : sep_idx]).get(
+            "tool", ""
+        )
+        if not tool_name:
+            close_idx = buf.find(CALL_CLOSE, sep_idx)
+            if close_idx == -1:
+                return False
+            self._section_pos = close_idx + len(CALL_CLOSE)
+            return True
+        self.current_tool_id += 1
+        self.current_tool_name_sent = True
+        self.prev_tool_call_arr.append({"name": tool_name, "arguments": {}})
+        self.streamed_args_for_tool.append("")
+        self._in_call = True
+        self._call_args = {}
+        self._section_pos = sep_idx + len(_SEP)
+        calls.append(
+            ToolCallItem(tool_index=self.current_tool_id, name=tool_name, parameters="")
+        )
+        return True
+
+    def _advance_argument(self, calls: List[ToolCallItem]) -> bool:
+        key, arg_type, value_start = self._arg
+        buf = self._buffer
+        pos = self._section_pos
+        close_idx = buf.find(ARGUMENT_CLOSE, pos)
+        if arg_type == "string":
+            end = (
+                close_idx
+                if close_idx != -1
+                else len(buf) - partial_suffix_len(buf[pos:], [ARGUMENT_CLOSE])
+            )
+            if end > pos:
+                self._emit_args(
+                    calls, json.dumps(buf[pos:end], ensure_ascii=False)[1:-1]
+                )
+                self._section_pos = end
+            if close_idx == -1:
+                return False
+            self._emit_args(calls, '"')
+            self._call_args[key] = buf[value_start:close_idx]
+        else:
+            if close_idx == -1:
+                return False
+            raw_value = buf[value_start:close_idx]
+            try:
+                value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                value = raw_value
+            self._emit_args(
+                calls, self._arg_prefix(key) + json.dumps(value, ensure_ascii=False)
+            )
+            self._call_args[key] = value
+        self._arg = None
+        self._section_pos = close_idx + len(ARGUMENT_CLOSE)
+        return True
+
+    def _arg_prefix(self, key: str) -> str:
+        separator = ", " if self.streamed_args_for_tool[self.current_tool_id] else "{"
+        return separator + json.dumps(key, ensure_ascii=False) + ": "
+
+    def _emit_args(self, calls: List[ToolCallItem], delta: str) -> None:
+        self.streamed_args_for_tool[self.current_tool_id] += delta
+        last = calls[-1] if calls else None
+        if last is not None and last.tool_index == self.current_tool_id:
+            last.parameters += delta
+        else:
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id, name=None, parameters=delta
+                )
+            )
+
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        open_idx = self._buffer.find(self.bot_token)
-        if open_idx != -1:
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            if not self._parse_calls(section):
+        if self._section_pos is not None:
+            if self._in_call:
+                # Keep what was streamed; finish_reason reports the truncation.
+                streamed = self.streamed_args_for_tool[self.current_tool_id]
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = streamed
+                logger.warning(
+                    "Kimi K3 tool call %r ended before its closing tag; "
+                    "leaving %d streamed argument chars incomplete",
+                    self.prev_tool_call_arr[self.current_tool_id]["name"],
+                    len(streamed),
+                )
+            elif not self._completed_calls:
                 logger.warning(
                     "Kimi K3 tools section ended with no complete tool call; "
                     "dropping %d buffered chars",
-                    len(section),
+                    len(self._buffer) - self._section_pos,
                 )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))

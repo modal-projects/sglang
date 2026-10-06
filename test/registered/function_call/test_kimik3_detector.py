@@ -60,6 +60,39 @@ def _stream(
     return text, calls
 
 
+def _reassemble(calls: list[ToolCallItem]) -> list[tuple[str, str]]:
+    """Fold streamed deltas into one (name, arguments) pair per tool index."""
+    merged: dict[int, list[str]] = {}
+    for call in calls:
+        if call.name:
+            assert call.tool_index not in merged, "name sent twice"
+            merged[call.tool_index] = [call.name, ""]
+        else:
+            assert call.tool_index in merged, "arguments before name"
+        merged[call.tool_index][1] += call.parameters
+    assert sorted(merged) == list(range(len(merged)))
+    return [(name, args) for name, args in (merged[i] for i in sorted(merged))]
+
+
+def _assert_stream_matches_full_parse(text: str, chunk_size: int) -> None:
+    tools = [_make_tool("python")]
+    expected = KimiK3Detector().detect_and_parse(text, tools)
+    detector = KimiK3Detector()
+    normal_text, calls = _stream(detector, _chunks(text, chunk_size), tools)
+    end = detector.finish(tools)
+    assert normal_text + (end.normal_text or "") == expected.normal_text
+    assert _reassemble(calls) == [
+        (call.name, call.parameters) for call in expected.calls
+    ]
+    # The serving layer reconciles against these at end of stream.
+    for index, call in enumerate(expected.calls):
+        assert detector.streamed_args_for_tool[index] == call.parameters
+        assert detector.prev_tool_call_arr[index] == {
+            "name": call.name,
+            "arguments": json.loads(call.parameters),
+        }
+
+
 def test_detect_and_parse_single_call() -> None:
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
@@ -162,9 +195,7 @@ def test_streaming_split_markers(chunk_size: int) -> None:
     )
     normal_text, calls = _stream(detector, _chunks(text, chunk_size), tools)
     assert normal_text == "Hello!"
-    assert len(calls) == 1
-    assert calls[0].name == "python"
-    assert json.loads(calls[0].parameters) == {"code": "print(2)"}
+    assert _reassemble(calls) == [("python", '{"code": "print(2)"}')]
 
 
 def test_streaming_two_calls() -> None:
@@ -177,10 +208,9 @@ def test_streaming_two_calls() -> None:
         + TOOLS_CLOSE
     )
     _, calls = _stream(detector, _chunks(text, 7), tools)
-    assert [call.tool_index for call in calls] == [0, 1]
-    assert [json.loads(call.parameters) for call in calls] == [
-        {"code": "a"},
-        {"code": "b"},
+    assert _reassemble(calls) == [
+        ("python", '{"code": "a"}'),
+        ("python", '{"code": "b"}'),
     ]
 
 
@@ -209,11 +239,11 @@ def test_streaming_bookkeeping_for_serving_layer() -> None:
 
 
 def test_stream_end_reports_truncated_tools_section(caplog) -> None:
-    """A tools section cut off before its closing tag used to vanish at
-    end-of-stream: no call, no text, no log. It must at least be reported."""
+    """A tools section cut off before any call header must be reported, not
+    silently dropped or leaked as text."""
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
-    truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+    truncated = TOOLS_OPEN + '<|open|>call tool="pyth'
     text, calls = _stream(detector, _chunks(truncated, 7), tools)
     assert calls == []
     with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
@@ -221,6 +251,119 @@ def test_stream_end_reports_truncated_tools_section(caplog) -> None:
     assert result.calls == []
     assert TOOLS_OPEN not in (result.normal_text or "")
     assert "no complete tool call" in caplog.text
+
+
+def test_stream_end_keeps_truncated_call_arguments(caplog) -> None:
+    """A call cut off mid-argument keeps what was streamed; the serving layer
+    must not append a reconciliation tail that contradicts it."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    truncated = (
+        TOOLS_OPEN
+        + '<|open|>call tool="python" index="1"<|sep|>'
+        + '<|open|>argument key="code" type="string"<|sep|>print(1'
+        + "<|close|>argu"
+    )
+    _, calls = _stream(detector, _chunks(truncated, 5), tools)
+    assert _reassemble(calls) == [("python", '{"code": "print(1')]
+    with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
+        result = detector.finish(tools)
+    assert result.calls == [] and not result.normal_text
+    assert "ended before its closing tag" in caplog.text
+    assert detector.prev_tool_call_arr[0]["arguments"] == '{"code": "print(1'
+    assert detector.streamed_args_for_tool[0] == '{"code": "print(1'
+
+
+def test_streaming_emits_name_and_string_args_before_call_closes() -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    _, calls = _stream(
+        detector,
+        [
+            TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>',
+            '<|open|>argument key="code" type="string"<|sep|>print(',
+            '"hi")\n<|close|>',
+        ],
+        tools,
+    )
+    assert _reassemble(calls) == [("python", '{"code": "print(\\"hi\\")\\n')]
+    _, more = _stream(detector, ["argument<|sep|><|close|>call<|sep|>"], tools)
+    assert _reassemble(calls + more) == [
+        ("python", json.dumps({"code": 'print("hi")\n'}))
+    ]
+
+
+def test_streaming_holds_non_string_args_until_closed() -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    _, calls = _stream(
+        detector,
+        [
+            TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>',
+            '<|open|>argument key="opts" type="object"<|sep|>{"a": [1,',
+        ],
+        tools,
+    )
+    assert _reassemble(calls) == [("python", "")]
+    _, more = _stream(detector, [" 2]}<|close|>argument<|sep|>"], tools)
+    assert _reassemble(calls + more) == [("python", '{"opts": {"a": [1, 2]}')]
+
+
+_STREAM_CASES = {
+    "mixed_types": (
+        f"{RESPONSE_OPEN}Running.{RESPONSE_CLOSE}{TOOLS_OPEN}"
+        + _call_block(
+            "python",
+            1,
+            {
+                "code": ("string", 'print("a\\tb")\n\tx = {"k": 1}'),
+                "n": ("number", "42"),
+                "flag": ("boolean", "true"),
+                "opts": ("object", '{"a": [1, 2], "b": null}'),
+                "bad": ("object", "{not json"),
+            },
+        )
+        + TOOLS_CLOSE
+    ),
+    "unicode_and_escaped_attrs": (
+        TOOLS_OPEN
+        + '<|open|>call tool="a&amp;b" index="1"<|sep|>'
+        + '<|open|>argument key="q&quot;k" type="string"<|sep|>'
+        + "héllo 世界 🚀 \u0001 </ &quot;<|close|>argument<|sep|>"
+        + "<|close|>call<|sep|>"
+        + TOOLS_CLOSE
+    ),
+    "parallel_and_empty": (
+        TOOLS_OPEN
+        + "\n"
+        + _call_block("python", 1, {"code": ("string", "a")})
+        + "\n"
+        + _call_block("noop", 2, {})
+        + _call_block("python", 3, {"code": ("string", ""), "x": ("integer", "-1")})
+        + TOOLS_CLOSE
+        + MESSAGE_CLOSE
+    ),
+    "string_contains_marker_prefixes": (
+        TOOLS_OPEN
+        + _call_block("python", 1, {"code": ("string", "<|close|>arg <| x <|sep")})
+        + TOOLS_CLOSE
+    ),
+    "nameless_call_skipped": (
+        TOOLS_OPEN
+        + '<|open|>call index="1"<|sep|><|close|>call<|sep|>'
+        + _call_block("python", 2, {"code": ("string", "z")})
+        + TOOLS_CLOSE
+    ),
+    "unclosed_tools_section": (
+        TOOLS_OPEN + _call_block("python", 1, {"code": ("string", "x")})
+    ),
+}
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 23, 10_000])
+@pytest.mark.parametrize("case", sorted(_STREAM_CASES))
+def test_streaming_matches_detect_and_parse(case: str, chunk_size: int) -> None:
+    _assert_stream_matches_full_parse(_STREAM_CASES[case], chunk_size)
 
 
 def test_stream_end_releases_held_back_text() -> None:

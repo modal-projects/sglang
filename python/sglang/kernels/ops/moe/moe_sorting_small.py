@@ -296,6 +296,13 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
+@functools.cache
+def _triton_route_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ROCM_TRITON_ROUTE.get()
+
+
 def _small_sort_supported(topk_ids, block_size, expert_mask, num_local_tokens):
     m, topk = topk_ids.shape
     return (
@@ -338,6 +345,26 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
+    if emit_mx and _triton_route_on():
+        from sglang.kernels.ops.moe import k3_route_sort
+
+        if k3_route_sort.sort_quant_supported(m, topk, block_size, n_cols) and (
+            moe_buf.numel() in (0, m * n_cols)
+        ):
+            k3_route_sort.sort_quant(
+                topk_ids,
+                topk_weights,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                block_size,
+                mx_quant_input,
+                qout,
+                qscale,
+            )
+            return qout, qscale.view(torch.float8_e8m0fnu)
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
@@ -495,11 +522,12 @@ def apply_aiter_small_moe_sort_patch() -> None:
         output_aux=False,
         **orig_kwargs,
     ):
-        # newer aiter passes a caller-owned moe_buf as output=; leave that to aiter
+        # a caller-owned moe_buf (output=) is zeroed by the sort kernel like ours
+        output = orig_kwargs.get("output")
         if (
             not output_aux
             and not return_local_topk_ids
-            and orig_kwargs.get("output") is None
+            and (output is None or accumulate)
             and _small_sort_supported(
                 topk_ids, int(block_size), expert_mask, num_local_tokens
             )
@@ -522,7 +550,9 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 max_num_m_blocks, dtype=dtypes.i32, device=device
             )
             num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-            if accumulate:
+            if output is not None:
+                moe_buf = output
+            elif accumulate:
                 moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
             else:
                 moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)

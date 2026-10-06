@@ -939,6 +939,16 @@ class Envs:
     # Static per-tensor FP8 for K3 dense target linears on ROCm (layers/k3_rocm_dense_fp8.py):
     # off | front (merged MoE front) | wide (front + KDA q/k/v/g). Same knob as the CUDA engine.
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # ROCm: Triton sigmoid+bias top-k and one-block-per-expert sort+mxfp8 quant (decode)
+    SGLANG_ROCM_TRITON_ROUTE = EnvBool(True)
+    # ROCm K3: run the shared expert on a side stream, overlapping the routed experts
+    SGLANG_ROCM_K3_SHARED_OVERLAP = EnvBool(False)
+    # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
+    SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
+    # Online-FP8 draft activation scheme (B300 engine: --speculative-draft-fp8-activation-scheme)
+    SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
+    SGLANG_ROCM_K3_UPPROJ_AG_MAX_TOKENS = EnvInt(128)
+    SGLANG_ROCM_K3_UPPROJ_AG_CHECK = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

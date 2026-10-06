@@ -3936,7 +3936,19 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            from sglang.srt.managers import short_prefill
+
+            if short_prefill.THRESHOLD > 0 and adder.chunked_req_limit is None:
+                self.chunked_req = short_prefill.add_chunk_with_short_prefill_budget(
+                    adder,
+                    self.chunked_req,
+                    self.waiting_queue,
+                    threshold=short_prefill.THRESHOLD,
+                    chunk_size=short_prefill.CHUNK_SIZE,
+                    batch_size=short_prefill.MAX_TOKENS,
+                )
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {

@@ -90,6 +90,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    check_greedy_verify_fallback_allowed,
     draft_pp_context,
     draft_tp_context,
 )
@@ -2211,6 +2212,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.selector is not None:
             if self._selector_sampling_enabled:
                 return
+            check_greedy_verify_fallback_allowed()
             if not self._warned_sampling_fallback and self.model_runner.tp_rank == 0:
                 logger.warning(
                     "DFLASH non-greedy verification is unavailable on this "
@@ -2225,11 +2227,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.lilicorr is not None and self._lilicorr_sampling_enabled:
             return
 
-        if (
-            not is_dflash_sampling_verify_available()
-            and not self._warned_sampling_fallback
-            and self.model_runner.tp_rank == 0
-        ):
+        if is_dflash_sampling_verify_available():
+            return
+        check_greedy_verify_fallback_allowed()
+        if not self._warned_sampling_fallback and self.model_runner.tp_rank == 0:
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "
                 "falling back to greedy argmax verification."

@@ -83,7 +83,6 @@ class KimiK3Detector(BaseFormatDetector):
         self._reset_stream_state()
 
     def _reset_stream_state(self) -> None:
-        # Cursor into _buffer past the tools-channel opener; None until it arrives.
         self._section_pos: Optional[int] = None
         self._section_done = False
         self._in_call = False
@@ -221,12 +220,7 @@ class KimiK3Detector(BaseFormatDetector):
             return StreamingParseResult()
 
     def _advance_section(self, calls: List[ToolCallItem]) -> bool:
-        """Consume one step of the tools section; False when more text is needed.
-
-        Arguments stream as an exact prefix of ``json.dumps(arguments,
-        ensure_ascii=False)``, the string the serving layer reconciles against
-        at end of stream.
-        """
+        """Consume one step of the tools section; False when more text is needed."""
         buf = self._buffer
         pos = self._section_pos
         if self._arg is not None:

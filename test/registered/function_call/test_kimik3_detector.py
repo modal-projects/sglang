@@ -61,7 +61,6 @@ def _stream(
 
 
 def _reassemble(calls: list[ToolCallItem]) -> list[tuple[str, str]]:
-    """Fold streamed deltas into one (name, arguments) pair per tool index."""
     merged: dict[int, list[str]] = {}
     for call in calls:
         if call.name:
@@ -84,7 +83,6 @@ def _assert_stream_matches_full_parse(text: str, chunk_size: int) -> None:
     assert _reassemble(calls) == [
         (call.name, call.parameters) for call in expected.calls
     ]
-    # The serving layer reconciles against these at end of stream.
     for index, call in enumerate(expected.calls):
         assert detector.streamed_args_for_tool[index] == call.parameters
         assert detector.prev_tool_call_arr[index] == {
@@ -254,8 +252,6 @@ def test_stream_end_reports_truncated_tools_section(caplog) -> None:
 
 
 def test_stream_end_keeps_truncated_call_arguments(caplog) -> None:
-    """A call cut off mid-argument keeps what was streamed; the serving layer
-    must not append a reconciliation tail that contradicts it."""
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
     truncated = (

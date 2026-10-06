@@ -1899,8 +1899,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
     def _stream_kimi_k3_tool_args(self, chunks):
-        """Drive kimi_k3 parsing the way _generate_chat_stream does; return the
-        concatenated tool-call argument deltas and the tool-call delta count."""
+        """Return (joined tool-call argument deltas, tool-call delta count)."""
         self.chat.tool_call_parser = "kimi_k3"
         request = ChatCompletionRequest(
             model="x",

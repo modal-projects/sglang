@@ -296,9 +296,19 @@ def _aggregate_hip(
     pre-norm mixture instead. Returns (result, prefix)."""
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
+    from sglang.srt.layers import k3_rocm_dense_fp8
+
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
     out = torch.empty_like(prefix_sum)
+    # The normalized row feeds a static-FP8 GEMM (MoE front / KDA q,k,v,g) when
+    # SGLANG_K3_TARGET_DENSE_FP8 is on: emit its E4M3 copy here instead of a
+    # separate quant launch in that GEMM.
+    out_fp8 = (
+        torch.empty(out.shape, dtype=torch.float8_e4m3fn, device=out.device)
+        if out_norm is not None and k3_rocm_dense_fp8.front_enabled()
+        else None
+    )
     attn_res_hip(
         prefix_sum,
         bank,
@@ -311,7 +321,10 @@ def _aggregate_hip(
         addend=addend,
         prefix_out=prefix,
         write_prefix=write_bank_row,
+        out_fp8=out_fp8,
     )
+    if out_fp8 is not None:
+        k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
     return out, prefix
 
 

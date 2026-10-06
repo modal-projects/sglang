@@ -1376,9 +1376,15 @@ class KimiK3MoE(nn.Module):
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
-            # off an fp32 front the cast allocates the dense buffer, so the
-            # contiguous() behind it is free; off a bf16 front it is the copy
-            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
+                # ROCm aiter runner: the fused small-batch sort+quant reads the
+                # strided front slice directly and the patched fused_moe densifies
+                # it only when it falls back to aiter's own quant, so skip the copy.
+                pass
+            else:
+                # off an fp32 front the cast allocates the dense buffer, so the
+                # contiguous() behind it is free; off a bf16 front it is the copy
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a

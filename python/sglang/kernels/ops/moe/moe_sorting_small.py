@@ -38,7 +38,8 @@ def _moe_sorting_small_kernel(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
+    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -104,7 +105,7 @@ def _moe_sorting_small_kernel(
                 + (dest_p % 16) * 4
                 + (dest_p % 32) // 16
             )
-            x = tl.load(qx_ptr + token_p * N_COLS + c0 + offs_q).to(tl.float32)
+            x = tl.load(qx_ptr + token_p * stride_qx + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
             amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
             sf = amax * (1.0 / 448.0)
@@ -171,7 +172,8 @@ def _moe_sorting_small_kernel_distributed(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
+    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -274,7 +276,7 @@ def _moe_sorting_small_kernel_distributed(
         )
         for cc in tl.static_range(N_COLS // QCHUNK):
             c0 = cc * QCHUNK
-            x = tl.load(qx_ptr + token_p * N_COLS + c0 + offs_q).to(tl.float32)
+            x = tl.load(qx_ptr + token_p * stride_qx + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
             amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
             sf = amax * (1.0 / 448.0)
@@ -339,7 +341,7 @@ def _run_small_sort(
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
-        num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
+        num_quant = (p * (n_cols // _mx_quant_chunk(n_cols))) if emit_mx else 0
         grid = (1 + num_buf + num_quant,)
         _moe_sorting_small_kernel[grid](
             topk_ids,
@@ -351,6 +353,7 @@ def _run_small_sort(
             moe_buf,
             moe_buf.numel(),
             mx_quant_input if emit_mx else moe_buf,
+            mx_quant_input.stride(0) if emit_mx else 0,
             qout,
             qscale,
             m,
@@ -362,7 +365,7 @@ def _run_small_sort(
             num_buf=num_buf,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
-            QCHUNK=min(2048, n_cols),
+            QCHUNK=_mx_quant_chunk(n_cols) if emit_mx else 32,
             SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
@@ -384,6 +387,7 @@ def _run_small_sort(
         moe_buf,
         moe_buf.numel(),
         mx_quant_input if emit_mx else moe_buf,
+        mx_quant_input.stride(0) if emit_mx else 0,
         qout,
         qscale,
         m,
@@ -398,12 +402,24 @@ def _run_small_sort(
         num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
-        QCHUNK=min(2048, n_cols),
+        QCHUNK=_mx_quant_chunk(n_cols) if emit_mx else 32,
         SCALEN_PAD=scalen_pad,
         num_warps=8,
     )
     if emit_mx:
         return qout, qscale.view(torch.float8_e8m0fnu)
+    return None
+
+
+def _mx_quant_chunk(n_cols: int) -> int | None:
+    """Largest power-of-two column chunk (32..2048) that tiles n_cols exactly.
+
+    The quant loop needs N_COLS % QCHUNK == 0 and a power-of-two tl.arange; K3's
+    3584-wide latent tiles with 512 (7 chunks), which the old min(2048, n_cols)
+    choice could not express."""
+    for chunk in (2048, 1024, 512, 256, 128, 64, 32):
+        if chunk <= n_cols and n_cols % chunk == 0:
+            return chunk
     return None
 
 
@@ -443,10 +459,15 @@ def apply_aiter_small_moe_sort_patch() -> None:
             quant_type == fm.QuantType.per_1x32
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
-            and hidden_states.is_contiguous()
-            and hidden_states.shape[-1] % 2048 == 0
+            and hidden_states.dim() == 2
+            and hidden_states.stride(-1) == 1
+            and _mx_quant_chunk(hidden_states.shape[-1]) is not None
             and topk_ids.numel() <= 256
         )
+        if not emit and not hidden_states.is_contiguous():
+            # Only the fused sort+quant reads strided rows; aiter's own path
+            # wants a dense activation (callers may hand in a column slice).
+            hidden_states = hidden_states.contiguous()
         input_token = _pending_quant_input.set(hidden_states if emit else None)
         emitted_token = _emitted_quant.set(None)
         try:

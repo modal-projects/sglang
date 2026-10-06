@@ -52,6 +52,40 @@ def quantize_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale.to(torch.float32)
 
 
+# One-slot producer -> consumer handoff for a pre-quantized activation. A kernel
+# that already holds the normalized row (attn_res aggregation) can emit its E4M3
+# copy; the next StaticFP8Weight call consumes it only if it receives that very
+# tensor (or a same-sized view of it; see _same_data), so a stale or reused buffer
+# can never be picked up. Anything else falls back to quantizing in the GEMM wrapper.
+_prequant_slot: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def offer_prequantized(x: torch.Tensor, xq: torch.Tensor) -> None:
+    global _prequant_slot
+    _prequant_slot = (x, xq)
+
+
+def _same_data(src: torch.Tensor, x: torch.Tensor) -> bool:
+    """x is src, or a same-sized view of it. The slot holds a strong reference
+    to src, so its storage cannot be freed and reused while offered: any tensor
+    with the same address, element count and dtype must alias src's data."""
+    return x is src or (
+        x.dtype == src.dtype
+        and x.numel() == src.numel()
+        and x.data_ptr() == src.data_ptr()
+        and x.is_contiguous()
+        and src.is_contiguous()
+    )
+
+
+def _take_prequantized(x: torch.Tensor) -> torch.Tensor | None:
+    global _prequant_slot
+    slot, _prequant_slot = _prequant_slot, None
+    if slot is not None and _same_data(slot[0], x):
+        return slot[1]
+    return None
+
+
 class StaticFP8Weight:
     """An E4M3 [N, K] weight with one scale; ``__call__`` computes x @ W^T.
 
@@ -99,8 +133,12 @@ class StaticFP8Weight:
         if m == 0:
             y = x2.new_empty((0, self.n), dtype=dtype)
         else:
-            xq = torch.empty(x2.shape, dtype=_FP8, device=x2.device)
-            aiter.static_per_tensor_quant(xq, x2.contiguous(), self.unit)
+            xq = _take_prequantized(x)
+            if xq is None:
+                xq = torch.empty(x2.shape, dtype=_FP8, device=x2.device)
+                aiter.static_per_tensor_quant(xq, x2.contiguous(), self.unit)
+            else:
+                xq = xq.reshape(x2.shape)
             y = aiter.gemm_a8w8_bpreshuffle(
                 xq, self.weight, self.x_scale[:m], self.w_scale, dtype=dtype
             )

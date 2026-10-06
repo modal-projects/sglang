@@ -43,6 +43,7 @@ def _agg_kernel(
     cw_ptr,  # [H] fp32; score_norm weight * score_proj weight
     ow_ptr,  # [H]; out RMSNorm weight, unread when not APPLY_OUT_NORM
     out_ptr,  # [T, H]
+    out8_ptr,  # [T, H] E4M3 copy of out (unit scale, saturating), written when HAS_OUT8
     score_eps,
     out_eps,
     stride_pm,
@@ -51,6 +52,7 @@ def _agg_kernel(
     stride_bm,
     stride_bb,
     stride_o,
+    stride_o8,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NVB: tl.constexpr,
@@ -58,6 +60,7 @@ def _agg_kernel(
     HAS_ADD: tl.constexpr,
     WRITE_BANK: tl.constexpr,
     APPLY_OUT_NORM: tl.constexpr,
+    HAS_OUT8: tl.constexpr,
 ):
     """One CTA per token: score the NVB+1 rows, softmax, mix, apply the output
     RMSNorm, all in one launch.
@@ -130,7 +133,13 @@ def _agg_kernel(
         scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
         ow = tl.load(ow_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         acc = acc * scale * ow
-    tl.store(out_ptr + t * stride_o + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    ob = acc.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + t * stride_o + offs, ob, mask=mask)
+    if HAS_OUT8:
+        # Same value the next static-FP8 GEMM would quantize: the rounded output,
+        # saturated to the E4M3 range (unit activation scale).
+        q = tl.minimum(tl.maximum(ob.to(tl.float32), -448.0), 448.0)
+        tl.store(out8_ptr + t * stride_o8 + offs, q.to(out8_ptr.dtype.element_ty), mask=mask)
 
 
 def attn_res_hip(
@@ -146,6 +155,7 @@ def attn_res_hip(
     addend: Optional[torch.Tensor] = None,
     prefix_out: Optional[torch.Tensor] = None,
     write_prefix: bool = False,
+    out_fp8: Optional[torch.Tensor] = None,
 ) -> None:
     """Single-kernel attention-residual aggregation for ROCm.
 
@@ -166,6 +176,8 @@ def attn_res_hip(
     addend     : fold a pending residual add in, so the aggregated prefix is
                  prefix_sum + addend; requires prefix_out
     prefix_out : [T, H] bf16 buffer receiving that materialized prefix
+    out_fp8    : optional [T, H] float8_e4m3fn buffer receiving the saturating
+                 E4M3 cast of out (unit scale), for a static-FP8 consumer GEMM
     write_prefix : also snapshot the prefix row into bank[:, nvb, :] (bit-exact
                  copy, fused into the score pass which already has the row in
                  registers); requires NB > nvb
@@ -184,6 +196,7 @@ def attn_res_hip(
     addend_arg = addend if has_add else prefix_sum
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
+    out8_arg = out_fp8 if out_fp8 is not None else out
 
     _agg_kernel[(T,)](
         prefix_sum,
@@ -193,6 +206,7 @@ def attn_res_hip(
         cw,
         ow_arg,
         out,
+        out8_arg,
         score_eps,
         out_eps,
         prefix_sum.stride(0),
@@ -201,6 +215,7 @@ def attn_res_hip(
         bank.stride(0),
         bank.stride(1),
         out.stride(0),
+        out8_arg.stride(0),
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
@@ -208,5 +223,6 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
+        HAS_OUT8=out_fp8 is not None,
         num_warps=4,
     )

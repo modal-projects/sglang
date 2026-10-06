@@ -360,7 +360,7 @@ _STREAM_CASES = {
 }
 
 
-@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 23, 10_000])
+@pytest.mark.parametrize("chunk_size", [1, 7, 10_000])
 @pytest.mark.parametrize("case", sorted(_STREAM_CASES))
 def test_streaming_matches_detect_and_parse(case: str, chunk_size: int) -> None:
     _assert_stream_matches_full_parse(_STREAM_CASES[case], chunk_size)

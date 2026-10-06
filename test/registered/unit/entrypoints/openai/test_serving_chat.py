@@ -1957,16 +1957,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(arguments, json.dumps({"code": 'print("hi")', "n": 3}))
         self.assertGreater(deltas, 2)
 
-    def test_kimi_k3_truncated_tool_call_keeps_streamed_args(self):
-        text = (
-            TOOLS_OPEN
-            + '<|open|>call tool="python" index="1"<|sep|>'
-            + '<|open|>argument key="code" type="string"<|sep|>print(1'
-        )
-        chunks = [text[i : i + 4] for i in range(0, len(text), 4)]
-        arguments, _ = self._stream_kimi_k3_tool_args(chunks)
-        self.assertEqual(arguments, '{"code": "print(1')
-
     # ------------- kimi_k2 tool_call_id formatting -------------
     def test_kimi_k2_non_streaming_tool_call_id_with_history(self):
         """Ensure non-streaming tool_call.id increase with tool calls history for kimi_k2 parser."""

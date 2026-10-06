@@ -27,22 +27,8 @@ def _walk(scores, greedy):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestDFlashSelectorWalkNanRow(CustomTestCase):
-    def test_all_nan_greedy_row_stays_inside_its_candidate_row(self):
-        batch, slots, top_k = 2, 3, 4
-        scores = torch.randn(batch, slots, top_k, top_k, device="cuda")
-        scores[0] = float("nan")
-        candidate_ids, tokens, q_rows = _walk(scores, greedy=True)
-
-        for slot in range(slots):
-            self.assertIn(int(tokens[0, slot]), candidate_ids[0, slot].tolist())
-            self.assertEqual(float(q_rows[0, slot].sum()), 1.0)
-        # Matches torch.argmax on the same rows (index 0 for all-NaN).
-        self.assertEqual(tokens[0].tolist(), candidate_ids[0, :, 0].tolist())
-
-    def test_finite_greedy_row_matches_torch_argmax(self):
-        batch, slots, top_k = 3, 4, 8
-        scores = torch.randn(batch, slots, top_k, top_k, device="cuda")
-        scores[1, 2, :, :] = 0.0  # ties break to the left
+    def _assert_greedy_walk_matches_torch_argmax(self, scores):
+        batch, slots, top_k, _ = scores.shape
         candidate_ids, tokens, q_rows = _walk(scores, greedy=True)
         scores = scores.cpu()
 
@@ -58,6 +44,28 @@ class TestDFlashSelectorWalkNanRow(CustomTestCase):
                 q_rows[:, slot], torch.nn.functional.one_hot(expected, top_k).float()
             )
             previous = expected
+
+    def test_all_nan_greedy_row_stays_inside_its_candidate_row(self):
+        batch, slots, top_k = 2, 3, 4
+        scores = torch.randn(batch, slots, top_k, top_k, device="cuda")
+        scores[0] = float("nan")
+        candidate_ids, tokens, q_rows = _walk(scores, greedy=True)
+
+        for slot in range(slots):
+            self.assertIn(int(tokens[0, slot]), candidate_ids[0, slot].tolist())
+            self.assertEqual(float(q_rows[0, slot].sum()), 1.0)
+        self._assert_greedy_walk_matches_torch_argmax(scores)
+
+    def test_mixed_nan_greedy_row_matches_torch_argmax(self):
+        torch.manual_seed(5)
+        scores = torch.randn(3, 6, 8, 8, device="cuda")
+        scores[torch.rand_like(scores) < 0.3] = float("nan")
+        self._assert_greedy_walk_matches_torch_argmax(scores)
+
+    def test_finite_greedy_row_matches_torch_argmax(self):
+        scores = torch.randn(3, 4, 8, 8, device="cuda")
+        scores[1, 2, :, :] = 0.0  # ties break to the left
+        self._assert_greedy_walk_matches_torch_argmax(scores)
 
 
 if __name__ == "__main__":

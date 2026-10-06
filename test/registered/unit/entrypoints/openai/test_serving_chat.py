@@ -1898,6 +1898,74 @@ class ServingChatTestCase(unittest.TestCase):
             result, "Should return None when parser has no tool call data"
         )
 
+    def _stream_kimi_k3_tool_args(self, chunks):
+        """Return (joined tool-call argument deltas, tool-call delta count)."""
+        self.chat.tool_call_parser = "kimi_k3"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "run it"}],
+            tools=[{"type": "function", "function": {"name": "python"}}],
+            stream=True,
+        )
+        content = {"meta_info": {"id": "chatcmpl-test"}}
+        parser_dict = {}
+
+        async def collect():
+            lines = []
+            for i, chunk in enumerate(chunks):
+                is_last = i == len(chunks) - 1
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=chunk,
+                    parser_dict=parser_dict,
+                    content=content,
+                    request=request,
+                    has_tool_calls={},
+                    flush=is_last,
+                ):
+                    lines.append(line)
+            remaining = self.chat._check_for_unstreamed_tool_args(
+                parser_dict[0], content, request, 0
+            )
+            if remaining:
+                lines.append(remaining)
+            return lines
+
+        lines = get_or_create_event_loop().run_until_complete(collect())
+        arguments = ""
+        deltas = 0
+        for line in lines:
+            delta = json.loads(line[len("data: ") :])["choices"][0]["delta"]
+            for tool_call in delta.get("tool_calls") or []:
+                deltas += 1
+                arguments += tool_call["function"]["arguments"] or ""
+        return arguments, deltas
+
+    def test_kimi_k3_streams_tool_args_without_reconciliation_tail(self):
+        text = (
+            TOOLS_OPEN
+            + '<|open|>call tool="python" index="1"<|sep|>'
+            + '<|open|>argument key="code" type="string"<|sep|>'
+            + 'print("hi")<|close|>argument<|sep|>'
+            + '<|open|>argument key="n" type="number"<|sep|>3<|close|>argument<|sep|>'
+            + "<|close|>call<|sep|>"
+            + TOOLS_CLOSE
+        )
+        chunks = [text[i : i + 4] for i in range(0, len(text), 4)]
+        arguments, deltas = self._stream_kimi_k3_tool_args(chunks)
+        self.assertEqual(arguments, json.dumps({"code": 'print("hi")', "n": 3}))
+        self.assertGreater(deltas, 2)
+
+    def test_kimi_k3_truncated_tool_call_keeps_streamed_args(self):
+        text = (
+            TOOLS_OPEN
+            + '<|open|>call tool="python" index="1"<|sep|>'
+            + '<|open|>argument key="code" type="string"<|sep|>print(1'
+        )
+        chunks = [text[i : i + 4] for i in range(0, len(text), 4)]
+        arguments, _ = self._stream_kimi_k3_tool_args(chunks)
+        self.assertEqual(arguments, '{"code": "print(1')
+
     # ------------- kimi_k2 tool_call_id formatting -------------
     def test_kimi_k2_non_streaming_tool_call_id_with_history(self):
         """Ensure non-streaming tool_call.id increase with tool calls history for kimi_k2 parser."""

@@ -79,7 +79,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket_on_host,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import Watchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -900,36 +900,49 @@ def run_data_parallel_controller_process(
         controller = DataParallelController(
             server_args, port_args, run_scheduler_process_func, prelaunched_schedulers
         )
+        # Prelaunched schedulers are owned and monitored by the launcher, so
+        # the controller only watches the processes it started itself.
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=controller.scheduler_procs,
+            process_names=[
+                f"scheduler_{rank}" for rank in range(len(controller.scheduler_procs))
+            ],
+        )
+        subprocess_watchdog.start()
         scheduler_pids = (
             [pid for pid, _ in prelaunched_schedulers.values()]
             if prelaunched_schedulers is not None
             else [proc.pid for proc in controller.scheduler_procs if proc is not None]
         )
-        init_info = {
-            "status": "ready",
-            "max_total_num_tokens": controller.max_total_num_tokens,
-            "max_req_input_len": controller.max_req_input_len,
-            "startup_time": controller.startup_time,
-            SCHEDULER_PIDS_ARG: scheduler_pids,
-        }
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
-            init_info["kv_event_sources"] = sorted(
-                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
-            )
-        pipe_writer.send(init_info)
-        # The primary owns routing for the expanded scheduler set.
-        if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
-            controller.event_loop()
-        if prelaunched_schedulers is not None:
-            # The launcher owns these processes. Their pipes close when they exit.
-            wait([pipe for _, pipe in prelaunched_schedulers.values()])
-        for proc in controller.scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+        try:
+            init_info = {
+                "status": "ready",
+                "max_total_num_tokens": controller.max_total_num_tokens,
+                "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
+                SCHEDULER_PIDS_ARG: scheduler_pids,
+            }
+            if get_serving().grpc_port is not None and not (
+                get_serving().smg_grpc_mode or get_serving().grpc_mode
+            ):
+                init_info["kv_event_sources"] = sorted(
+                    controller.local_kv_event_sources,
+                    key=lambda source: source["dp_rank"],
+                )
+            pipe_writer.send(init_info)
+            # The primary owns routing for the expanded scheduler set.
+            if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+                controller.event_loop()
+            if prelaunched_schedulers is not None:
+                # The launcher owns these processes. Their pipes close when they exit.
+                wait([pipe for _, pipe in prelaunched_schedulers.values()])
+            for proc in controller.scheduler_procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
+        finally:
+            subprocess_watchdog.stop()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")

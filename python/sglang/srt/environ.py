@@ -1010,6 +1010,10 @@ class Envs:
     # (kernels/ops/attention/k3_mla_verify_v2.py). Takes precedence over the
     # split-4 / Gluon verify paths when enabled.
     SGLANG_ROCM_K3_MLA_VERIFY_V2 = EnvBool(False)
+    # Batches below this size keep the previous verify path (bf16 Gluon, or
+    # split-4 when enabled and bs >= its MIN_BS). Gluon wins at bs 1 for
+    # contexts <= ~20k; v2 wins at long context / larger batches.
+    SGLANG_ROCM_K3_MLA_VERIFY_V2_MIN_BS = EnvInt(1)
     # ROCm K3 (NoPE MLA, aiter backend) decode / target verify: one Triton launch
     # builds q = [q_nope_out | q_pe] and writes the latent row into the MLA KV
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x

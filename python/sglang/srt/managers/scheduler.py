@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import signal
+import socket
 import sys
 import time
 from array import array
@@ -105,6 +106,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    create_custom_parallel_group,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -133,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -163,6 +166,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -456,6 +460,9 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Staged weight-update destination ("disk" or "cpu"), set by
+    # init_weight_updater; the class default keeps polling off until then.
+    weight_update_staging: Optional[str] = None
 
     def __init__(
         self,
@@ -1760,6 +1767,14 @@ class Scheduler(
                     self.weight_updater.update_weights_from_disk,
                 ),
                 (
+                    PrepareWeightUpdateReqInput,
+                    self.weight_updater.prepare_weight_update,
+                ),
+                (
+                    CommitWeightUpdateReqInput,
+                    self.weight_updater.commit_weight_update,
+                ),
+                (
                     InitWeightsUpdateGroupReqInput,
                     self.weight_updater.init_weights_update_group,
                 ),
@@ -2095,6 +2110,15 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
+    def send_control_output(self, recv_req, output) -> None:
+        if self.rust_server is not None:
+            self.rust_server.push_control_output(recv_req, output)
+        elif isinstance(output, RpcReqOutput):
+            if self.ipc_channels.recv_from_rpc is not None:
+                sock_send(self.ipc_channels.recv_from_rpc, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
     def ingest_requests(self, stop_at_pause: bool = False) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
@@ -2166,18 +2190,11 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                self.send_control_output(recv_req, output)
 
         self.flush_wrapper.check_pending()
+        if self.weight_update_staging is not None:
+            self.weight_updater.check_pending_weight_preparation()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2287,15 +2304,59 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        backend = get_model().weight_update_staging
+        weight_stage_cpu_group = self.tp_cpu_group
+        host_cpu_group = self.tp_cpu_group
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if backend is not None and tp_size > 1:
+            # Background preparation has an independent collective sequence
+            # from scheduler request broadcasts.
+            weight_stage_cpu_group = create_custom_parallel_group(
+                group_ranks=self.tp_group.ranks,
+                backend="gloo",
+            )
+            host_cpu_group = weight_stage_cpu_group
+            if backend == "cpu":
+                hosts = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    hosts,
+                    socket.gethostname(),
+                    group=self.tp_cpu_group,
+                )
+                hostname = socket.gethostname()
+                host_cpu_group = create_custom_parallel_group(
+                    group_ranks=[
+                        rank
+                        for rank, host in zip(self.tp_group.ranks, hosts, strict=True)
+                        if host == hostname
+                    ],
+                    backend="gloo",
+                )
+
+        self.weight_update_staging = backend
+        initial_version = int(get_serving().weight_version) if backend else 0
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
+            weight_stage_cpu_group=weight_stage_cpu_group,
+            host_cpu_group=host_cpu_group,
+            weight_update_staging=backend,
+            weight_update_local_checkpoint_dir=(
+                get_model().weight_update_local_checkpoint_dir
+            ),
+            weight_update_base_checkpoint_dir=self.model_config.model_path,
+            weight_update_base_version=initial_version,
+            weight_update_max_compile_group_bytes=int(
+                get_model().weight_update_max_compile_group_gb * (1 << 30)
+            ),
+            send_control_output=self.send_control_output,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+        self.weight_updater.initialize_weight_staging()
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:
@@ -5413,6 +5474,14 @@ class Scheduler(
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
+        if self.weight_updater.weight_update_staging is not None:
+            return UpdateWeightVersionReqOutput(
+                success=False,
+                message=(
+                    "update_weight_version is unavailable while staged weight "
+                    "updates are enabled; commit the prepared version instead"
+                ),
+            )
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 

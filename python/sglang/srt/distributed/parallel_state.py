@@ -531,7 +531,15 @@ class GroupCoordinator:
                     # complement to custom allreduce.
                     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
                     if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
+                        qr_cls = QuickAllReduce
+                        if envs.SGLANG_ROCM_AITER_QUICK_REDUCE.get():
+                            # aiter's quick-reduce (FP8/INT6/INT4 codecs,
+                            # AITER_QUICK_REDUCE_QUANTIZATION) is faster than
+                            # sglang's on gfx950 at prefill sizes
+                            from aiter.dist.device_communicators.quick_all_reduce import (
+                                QuickAllReduce as qr_cls,
+                            )
+                        self.qr_comm = qr_cls(
                             group=self.cpu_group, device=self.device
                         )
                 except Exception as e:

@@ -124,6 +124,24 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    # ROCm K3 verify fusion (SGLANG_ROCM_K3_KDA_VERIFY_FUSE). DEFER_F_B: `a` is
+    # the low-rank f_a [seq_len, F] and the kernel applies the f_b projection
+    # (f_b_w [HV*K, F]) itself, rounding the product to the activation dtype
+    # like the separate GEMM it replaces. FUSE_ONORM: the last V-tile program
+    # of each (request, v-head) to finish applies the output gated RMSNorm
+    # (sigmoid gate) in place over the head's T rows.
+    f_b_w=None,  # [HV*K, F] activation dtype
+    onorm_gate=None,  # [seq_len, HV*V] (row stride stride_gate_tok)
+    onorm_w=None,  # [V]
+    onorm_eps=1e-5,
+    onorm_counters=None,  # [>= B*HV] int32, zero between launches
+    stride_gate_tok=0,
+    F: tl.constexpr = 0,
+    TP: tl.constexpr = 16,
+    BVN: tl.constexpr = 1,
+    NV: tl.constexpr = 1,
+    DEFER_F_B: tl.constexpr = False,
+    FUSE_ONORM: tl.constexpr = False,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -217,6 +235,24 @@ def fused_kda_conv_gating_verify_kernel(
 
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
+    if DEFER_F_B:
+        # Forget gates of all T steps up front, one MFMA product
+        # [TP, F] @ [F, K] (f_a rows x this head's f_b slice), fp32 accumulate;
+        # each step then extracts its row and rounds it to the activation dtype
+        # like the separate f_b GEMM's bf16 output.
+        o_tp = tl.arange(0, TP)
+        o_f = tl.arange(0, F)
+        b_fa_all = tl.load(
+            a + (bos + o_tp)[:, None] * stride_a_tok + o_f[None, :],
+            mask=(o_tp < T)[:, None],
+            other=0.0,
+        )
+        b_fbw_t = tl.load(
+            f_b_w + (i_hv * K + o_k)[None, :] * F + o_f[:, None],
+            mask=mask_k[None, :],
+            other=0.0,
+        )
+        b_g_all = tl.dot(b_fa_all, b_fbw_t, out_dtype=tl.float32)  # [TP, K]
 
     for t in tl.static_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
@@ -312,9 +348,15 @@ def fused_kda_conv_gating_verify_kernel(
 
         # ---- sigmoid-gating delta rule step (mirrors the reference kernel) ----
         b_b = tl.load(b_gate + (bos + t) * stride_b_tok + i_hv).to(tl.float32)
-        b_a = tl.load(
-            a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
-        ).to(tl.float32)
+        if DEFER_F_B:
+            # forget gate = f_a @ f_b^T for this head, fp32 accumulate, rounded
+            # to the activation dtype (the separate GEMM's bf16 output).
+            b_a = tl.sum(tl.where((o_tp == t)[:, None], b_g_all, 0.0), axis=0)
+            b_a = b_a.to(o.dtype.element_ty).to(tl.float32)
+        else:
+            b_a = tl.load(
+                a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
+            ).to(tl.float32)
 
         gx = b_a + b_dt_bias
         if USE_LOWER_BOUND:
@@ -409,6 +451,58 @@ def fused_kda_conv_gating_verify_kernel(
     # No conv-state writeback: every V tile reads the same Q/K history, so a
     # tile in a later wave would read what i_v == 0 had overwritten.
 
+    if FUSE_ONORM:
+        # Last-arriver gated RMSNorm: each V-tile program bumps the per-(request,
+        # v-head) counter after storing its o slice (release); the program that
+        # sees NV - 1 (acquire) owns the full V rows, normalizes them in place
+        # and re-arms the counter for the next launch. The math mirrors
+        # layer_norm_gated_fwd_kernel (RMS, sigmoid gate) on the same bf16 o.
+        tl.debug_barrier()
+        cnt = tl.atomic_add(onorm_counters + i_nh, 1, sem="acq_rel", scope="gpu")
+        if cnt == NV - 1:
+            tl.store(onorm_counters + i_nh, 0)
+            o_vv = tl.arange(0, BVN)
+            m_vv = o_vv < V
+            b_nw = tl.load(onorm_w + o_vv, mask=m_vv, other=0.0).to(tl.float32)
+            for t in tl.static_range(T):
+                p_row = o + ((bos + t) * HV + i_hv) * V + o_vv
+                b_x = tl.load(p_row, mask=m_vv, other=0.0).to(tl.float32)
+                b_xbar = tl.where(m_vv, b_x, 0.0)
+                b_var = tl.sum(b_xbar * b_xbar, axis=0) / V
+                b_rstd = 1 / tl.sqrt(b_var + onorm_eps)
+                b_y = b_x * b_rstd
+                b_y = b_y * b_nw
+                b_gt = tl.load(
+                    onorm_gate + (bos + t) * stride_gate_tok + i_hv * V + o_vv,
+                    mask=m_vv,
+                    other=0.0,
+                ).to(tl.float32)
+                b_y = b_y * tl.sigmoid(b_gt)
+                tl.store(p_row, b_y.to(o.dtype.element_ty), mask=m_vv)
+
+
+_ONORM_COUNTERS: dict = {}
+_ONORM_COUNTERS_MIN = 64 * 1024
+
+
+def get_onorm_counters(device: torch.device, n: int = 0) -> torch.Tensor:
+    """Zeroed int32 arrival counters for the FUSE_ONORM epilogue, one per
+    (request, v-head) of a launch; shared by every layer (launches serialize on
+    the stream and the last arriver re-arms each counter). Call once outside
+    graph capture so the allocation and its fill are not captured."""
+    device = torch.device(device)
+    key = (device.type, device.index)
+    buf = _ONORM_COUNTERS.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("KDA verify onorm counters must be allocated before capture")
+        # Fixed size, never reallocated: captured graphs keep its address.
+        buf = torch.zeros(_ONORM_COUNTERS_MIN, dtype=torch.int32, device=device)
+        _ONORM_COUNTERS[key] = buf
+    if n > buf.numel():
+        raise ValueError(f"KDA verify onorm counters: need {n} > {buf.numel()}")
+    return buf
+
 
 def fused_kda_conv_gating_verify(
     mixed_qkv: torch.Tensor,
@@ -451,6 +545,17 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    # ROCm K3 verify fusion (SGLANG_ROCM_K3_KDA_VERIFY_FUSE), see the kernel.
+    # f_b_weight given -> ``a`` is f_a [seq_len, F] and f_b is applied in-kernel.
+    # onorm_gate given -> o is returned already o_norm'd (gated RMSNorm,
+    # sigmoid), needs onorm_weight and an onorm_counters buffer from
+    # get_onorm_counters (allocated before graph capture).
+    f_b_weight: Optional[torch.Tensor] = None,
+    onorm_gate: Optional[torch.Tensor] = None,
+    onorm_weight: Optional[torch.Tensor] = None,
+    onorm_eps: float = 1e-5,
+    onorm_counters: Optional[torch.Tensor] = None,
+    block_v: Optional[int] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -493,11 +598,30 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
+    if block_v is not None:
+        BV = min(triton.next_power_of_2(V), block_v)
     NV = triton.cdiv(V, BV)
 
-    a2 = a.reshape(seq_len, HV * K)
+    defer_f_b = f_b_weight is not None
+    if defer_f_b:
+        F = f_b_weight.shape[1]
+        assert tuple(f_b_weight.shape) == (HV * K, F) and f_b_weight.is_contiguous()
+        assert F == triton.next_power_of_2(F), "f_b rank must be a power of two"
+        assert f_b_weight.dtype == mixed_qkv.dtype
+        a2 = a.reshape(seq_len, F)
+    else:
+        F = 0
+        a2 = a.reshape(seq_len, HV * K)
     b2 = b.reshape(seq_len, HV)
     assert a2.stride(-1) == 1 and b2.stride(-1) == 1
+    fuse_onorm = onorm_gate is not None
+    if fuse_onorm:
+        gate2 = onorm_gate.reshape(seq_len, -1) if onorm_gate.dim() != 2 else onorm_gate
+        assert gate2.shape[-1] == HV * V and gate2.stride(-1) == 1
+        assert onorm_weight is not None and tuple(onorm_weight.shape) == (V,)
+        assert onorm_weight.is_contiguous()
+        assert onorm_counters is not None and onorm_counters.numel() >= B * HV
+        assert onorm_counters.dtype == torch.int32
 
     o = mixed_qkv.new_empty(seq_len, HV, V)
 
@@ -618,6 +742,18 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        f_b_w=f_b_weight if defer_f_b else None,
+        onorm_gate=gate2 if fuse_onorm else None,
+        onorm_w=onorm_weight if fuse_onorm else None,
+        onorm_eps=float(onorm_eps),
+        onorm_counters=onorm_counters if fuse_onorm else None,
+        stride_gate_tok=gate2.stride(0) if fuse_onorm else 0,
+        F=F,
+        TP=max(16, triton.next_power_of_2(T)),
+        BVN=triton.next_power_of_2(V),
+        NV=NV,
+        DEFER_F_B=defer_f_b,
+        FUSE_ONORM=fuse_onorm,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,
@@ -625,3 +761,62 @@ def fused_kda_conv_gating_verify(
         **pdl_kwargs,
     )
     return o.view(1, seq_len, HV, V)
+
+
+@triton.jit
+def _kda_onorm_gated_strided_kernel(
+    x,  # [rows = seq_len * HV, D] contiguous, normalized in place
+    g,  # [seq_len, HV * D] gate, row stride stride_g_tok
+    w,  # [D]
+    eps,
+    stride_g_tok,
+    R,
+    HV: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # Same tile shape and math as layer_norm_gated_fwd_kernel (RMS, sigmoid
+    # gate, weight, no bias/residual) but reads the gate through its row stride,
+    # so the strided [q,k,v,g] slice needs no contiguous copy first.
+    i_t = tl.program_id(0)
+    o_r = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_r = o_r < R
+    m_d = o_d < D
+    m = m_r[:, None] & m_d[None, :]
+    p_x = x + o_r[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m, other=0.0).to(tl.float32)
+    b_xbar = tl.where(m_d[None, :], b_x, 0.0)
+    b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
+    b_rstd = 1 / tl.sqrt(b_var + eps)
+    b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
+    b_y = b_x * b_rstd[:, None]
+    b_y = b_y * b_w[None, :]
+    tok = o_r // HV
+    head = o_r % HV
+    p_g = g + tok[:, None].to(tl.int64) * stride_g_tok + head[:, None] * D + o_d[None, :]
+    b_g = tl.load(p_g, mask=m, other=0.0).to(tl.float32)
+    b_y = b_y * tl.sigmoid(b_g)
+    tl.store(p_x, b_y.to(p_x.dtype.element_ty), mask=m)
+
+
+def kda_onorm_gated_strided(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """In-place gated RMSNorm (sigmoid gate) of the KDA output ``x`` [.., HV, D]
+    with ``gate`` [seq_len, HV*D] read through its row stride. Equivalent to
+    FusedRMSNormGated(activation="sigmoid")(x, gate.unflatten(-1, (HV, D))),
+    minus the contiguous copy of the strided gate that call makes."""
+    D = x.shape[-1]
+    HV = x.shape[-2]
+    assert x.is_contiguous() and gate.dim() == 2 and gate.stride(-1) == 1
+    assert gate.shape[-1] == HV * D and weight.shape == (D,)
+    R = x.numel() // D
+    assert gate.shape[0] * HV == R
+    BT = 32
+    _kda_onorm_gated_strided_kernel[(triton.cdiv(R, BT),)](
+        x, gate, weight, float(eps), gate.stride(0), R,
+        HV=HV, D=D, BT=BT, BD=triton.next_power_of_2(D), num_warps=4,
+    )
+    return x

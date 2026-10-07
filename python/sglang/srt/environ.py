@@ -936,13 +936,54 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # ROCm K3 KDA target-verify fusion: the verify step skips the unused
+    # intermediate-row mask and applies o_norm with a strided-gate kernel (no
+    # gate copy); implies the fused chain-verify kernel (SGLANG_OPT_FUSED_KDA_VERIFY)
+    # on ROCm. -2 launches per KDA layer, bit-identical output.
+    SGLANG_ROCM_K3_KDA_VERIFY_FUSE = EnvBool(False)
+    # Experimental sub-options (numerically validated, but slower on gfx950 as
+    # of 2026-10: the chain kernel is latency bound and these lengthen it more
+    # than the launch they save). FB_MAX_BS > 0: fold the f_b projection into
+    # the chain kernel for verify batches up to this many requests.
+    # ONORM_INKERNEL: apply the gated o_norm in the chain kernel's epilogue
+    # (last-arriver over V tiles; agent-scope atomics flush L2).
+    SGLANG_ROCM_K3_KDA_VERIFY_FUSE_FB_MAX_BS = EnvInt(0)
+    SGLANG_ROCM_K3_KDA_VERIFY_FUSE_ONORM_INKERNEL = EnvBool(False)
+    # Under SGLANG_ROCM_K3_KDA_VERIFY_FUSE: 16-wide V tiles in the fused
+    # chain-verify kernel from this many verify requests up (default 4-wide).
+    SGLANG_ROCM_K3_KDA_VERIFY_BV16_MIN_BS = EnvInt(8)
+    # ROCm: let the fused KDA chain-verify kernel (SGLANG_OPT_FUSED_KDA_VERIFY)
+    # run with the ReplaySSM spec ring (--enable-linear-replayssm-spec); it writes
+    # the rawv/rawk/g/beta ring entries itself, bit-identical to the unfused
+    # causal_conv1d_update + fused_sigmoid_gating_delta_rule_update(cache_ring).
+    # Also picks 16-wide V tiles from SGLANG_ROCM_K3_KDA_VERIFY_BV16_MIN_BS up.
+    SGLANG_ROCM_K3_KDA_FUSED_VERIFY_RING = EnvBool(False)
+    # Bisect switches for the default pieces of SGLANG_ROCM_K3_KDA_VERIFY_FUSE.
+    SGLANG_ROCM_K3_KDA_VERIFY_SKIP_ROWMASK = EnvBool(True)
+    SGLANG_ROCM_K3_KDA_VERIFY_STRIDED_ONORM = EnvBool(True)
     # Static per-tensor FP8 for K3 dense target linears on ROCm (layers/k3_rocm_dense_fp8.py):
     # off | front (merged MoE front) | wide (front + KDA q/k/v/g). Same knob as the CUDA engine.
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     # ROCm: Triton sigmoid+bias top-k and one-block-per-expert sort+mxfp8 quant (decode)
     SGLANG_ROCM_TRITON_ROUTE = EnvBool(True)
+    # ROCm: use aiter QuickAllReduce (configured by AITER_QUICK_REDUCE_*) for large all-reduces
+    SGLANG_ROCM_AITER_QUICK_REDUCE = EnvBool(False)
     # ROCm K3: run the shared expert on a side stream, overlapping the routed experts
     SGLANG_ROCM_K3_SHARED_OVERLAP = EnvBool(False)
+    # ROCm K3 MoE (fused front, single-collective tail): fuse SiTU into the shared
+    # down GEMM (same launch as the router top-k) and the latent RMSNorm + up_proj +
+    # add3 into one skinny GEMM (kernels/ops/moe/k3_moe_epi.py)
+    SGLANG_ROCM_K3_MOE_EPI_FUSE = EnvBool(False)
+    SGLANG_ROCM_K3_MOE_EPI_FUSE_MAX_TOKENS = EnvInt(256)
+    # ROCm + aiter: let the breakable prefill CUDA graph replay EXTEND batches
+    # with a cached prefix (MLA models with an MHA companion, e.g. K3). The
+    # prefix gather + kv_b_proj expansion + attention already run inside the
+    # attention eager break with live metadata; batches whose sum(seq_lens)
+    # exceeds SGLANG_MAX_KV_CHUNK_CAPACITY (eager switches to chunked KV) stay eager.
+    SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
+    # Log (tp rank 0, aggregated every ~10s) why the prefill CUDA graph rejects
+    # batches, plus how many replayed with / without a cached prefix.
+    SGLANG_DEBUG_PREFILL_GRAPH_REJECT = EnvBool(False)
     # ROCm K3 MLA target_verify (8 drafts, h12->qh16, fp8 KV): FP8 query, each
     # request split into two causal qseqlen-4 pseudo-requests on the persistent
     # ASM decode kernel instead of the bf16 Gluon qlen-8 kernel.
@@ -950,6 +991,8 @@ class Envs:
     SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4_MIN_BS = EnvInt(5)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
+    # ROCm: avoid host<->device syncs on the extend path (pinned non-blocking copies, CPU chunk indices)
+    SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)
     # Online-FP8 draft activation scheme (B300 engine: --speculative-draft-fp8-activation-scheme)
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     SGLANG_ROCM_K3_UPPROJ_AG_MAX_TOKENS = EnvInt(128)

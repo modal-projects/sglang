@@ -19,6 +19,8 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+
+_PINNED_KEEPALIVE = __import__("collections").deque(maxlen=64)
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -2291,10 +2293,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+            if envs.SGLANG_ROCM_NO_EXTEND_SYNC.get() and __import__("os").environ.get("K3_SYNC_PART", "both") in ("both", "dflash"):
+                # pinned + non_blocking: a pageable H2D copy would block the host
+                # until the GPU drains, desynchronizing TP ranks at every extend
+                pinned = (
+                    torch.tensor(batch.extend_lens, dtype=torch.int32, pin_memory=True),
+                    torch.tensor(batch.prefix_lens, dtype=torch.int32, pin_memory=True),
+                )
+                # keep the pinned sources alive until their async copies have run
+                _PINNED_KEEPALIVE.append(pinned)
+                ctx_lens = pinned[0].to(device, non_blocking=True)
+                draft_seq_lens = pinned[1].to(device, non_blocking=True)
+            else:
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(

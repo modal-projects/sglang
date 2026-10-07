@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 from typing import Optional, Tuple, Union
 
@@ -17,6 +18,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -436,8 +438,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             "the fused kernel does not cover."
         )
         self._fused_chain_verify_fn = None
+        # ROCm K3: SGLANG_ROCM_K3_KDA_VERIFY_FUSE folds f_b and o_norm into
+        # the fused chain-verify kernel, so it implies that kernel.
+        self._k3_verify_fuse = is_hip() and envs.SGLANG_ROCM_K3_KDA_VERIFY_FUSE.get()
         if (
-            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            (envs.SGLANG_OPT_FUSED_KDA_VERIFY.get() or self._k3_verify_fuse)
             # nv_cutedsl resolves to the Triton verify kernel off CUDA
             and (
                 verify_backend.is_triton()
@@ -909,7 +914,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
+        hint = contextlib.nullcontext()
+        lens_cpu = forward_batch.extend_seq_lens_cpu
+        if (
+            envs.SGLANG_ROCM_NO_EXTEND_SYNC.get()
+            and __import__("os").environ.get("K3_SYNC_PART", "both") in ("both", "chunk")
+            and lens_cpu is not None
+            and query_start_loc is not None
+            and query_start_loc.numel() == len(lens_cpu) + 1
+            and sum(lens_cpu) == q.shape[1]
+        ):
+            from sglang.kernels.ops.attention.fla.index import cpu_seqlens_hint
+
+            hint = cpu_seqlens_hint(query_start_loc, lens_cpu)
+        with hint:
+          core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -1032,15 +1051,82 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        if (
+            self._k3_verify_fuse
+            and envs.SGLANG_ROCM_K3_KDA_VERIFY_SKIP_ROWMASK.get()
+            and not pp_spec_stable_rows_enabled()
+        ):
+            # The row mask below is only read with PP spec; building it
+            # eagerly costs one elementwise launch per layer.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+        else:
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+
+        # ROCm K3 verify fusion handoff (kimi_k3.py): `a` may be the low-rank
+        # f_a (f_b deferred) and the o_norm gate may be offered. Only the
+        # fused chain-verify kernel consumes them; every other path gets the
+        # materialized forget gate and leaves the norm to the model.
+        k3_fuse_args = getattr(layer, "_k3_verify_fuse_args", None)
+        deferred_f_b = bool(getattr(layer, "_k3_verify_deferred_f_b", False))
+        onorm_gate = (
+            getattr(layer, "_k3_onorm_gate", None)
+            if self._k3_verify_fuse and k3_fuse_args is not None
+            else None
+        )
+        if deferred_f_b and k3_fuse_args is None:
+            raise RuntimeError("K3 deferred verify f_b is missing its weights")
+        fuse_kwargs = {}
+        if (deferred_f_b or onorm_gate is not None) and ragged_layout is None:
+            batch_size = seq_len // draft_token_num
+            if self._can_run_fused_chain_verify(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                draft_token_num=draft_token_num,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                cache_indices=cache_indices[:batch_size],
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+                a_is_f_a=deferred_f_b,
+            ):
+                f_b_w, norm_w, norm_eps, counters = k3_fuse_args
+                if deferred_f_b and self._k3_verify_fb_covered(
+                    layer, a, f_b_w, seq_len, batch_size
+                ):
+                    fuse_kwargs["f_b_weight"] = f_b_w
+                if onorm_gate is not None and self._k3_verify_onorm_covered(
+                    layer, onorm_gate, norm_w, counters, seq_len, batch_size
+                ):
+                    fuse_kwargs.update(
+                        onorm_gate=onorm_gate,
+                        onorm_weight=norm_w,
+                        onorm_eps=norm_eps,
+                        onorm_counters=counters,
+                    )
+        if deferred_f_b and "f_b_weight" not in fuse_kwargs:
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+            a = kimi_k3_tiny_gemm(a.reshape(seq_len, -1), k3_fuse_args[0]).view(
+                1, seq_len, layer.num_v_heads, layer.head_k_dim
+            )
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1078,8 +1164,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
-            # the reference kernels.
-            if self._can_run_fused_chain_verify(
+            # the reference kernels. fuse_kwargs non-empty means the K3 verify
+            # fusion above already validated this launch (with `a` = f_a when
+            # f_b is deferred, which the generic check would reject).
+            if fuse_kwargs or self._can_run_fused_chain_verify(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -1099,7 +1187,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             ):
-                return self._fused_chain_verify_fn(
+                out = self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
                     conv_weight=layer.conv_weights,
                     conv_bias=layer.bias,
@@ -1129,7 +1217,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
                     **ring_kwargs,
+                    **fuse_kwargs,
+                    **(
+                        {"block_v": self._k3_verify_block_v(layer, batch_size)}
+                        if self._k3_verify_fuse
+                        or (
+                            replayssm_on
+                            and is_hip()
+                            and envs.SGLANG_ROCM_K3_KDA_FUSED_VERIFY_RING.get()
+                        )
+                        else {}
+                    ),
                 )
+                if "onorm_gate" in fuse_kwargs:
+                    layer._k3_onorm_consumed = True
+                return out
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1249,7 +1351,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor],
         replayssm_g: Optional[torch.Tensor],
         replayssm_beta: Optional[torch.Tensor],
+        a_is_f_a: bool = False,
     ) -> bool:
+        """a_is_f_a: `a` is the K3 low-rank f_a [.., head_k_dim] whose f_b
+        projection the kernel applies (SGLANG_ROCM_K3_KDA_VERIFY_FUSE)."""
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
             return False
         if any(
@@ -1280,8 +1385,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        hip_ring = (
+            replayssm_on and is_hip() and envs.SGLANG_ROCM_K3_KDA_FUSED_VERIFY_RING.get()
+        )
+        if (
+            replayssm_on
+            and not hip_ring
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1359,8 +1472,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
+        a_width = layer.head_k_dim * (1 if a_is_f_a else layer.num_v_heads)
         if (
-            a.numel() != seq_len * layer.num_v_heads * layer.head_k_dim
+            a.numel() != seq_len * a_width
             or b.numel() != seq_len * layer.num_v_heads
             or layer.A_log.numel() != layer.num_v_heads
             or layer.dt_bias.numel() != layer.num_v_heads * layer.head_k_dim
@@ -1412,6 +1526,66 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not replayssm_on:
             tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _k3_verify_block_v(layer: RadixLinearAttention, batch_size: int):
+        """V-tile width for the fused chain-verify kernel on gfx950 at the K3
+        TP8 shard (12 heads of 128): narrow tiles win at small batch (more CTAs
+        per serial T-step chain), 16-wide tiles from 8 requests up, where the
+        per-tile duplicated q/k conv work dominates. Bit-exact across widths
+        (the V tiling never touches the K-axis reduction order)."""
+        if (
+            layer.head_v_dim == 128
+            and batch_size >= envs.SGLANG_ROCM_K3_KDA_VERIFY_BV16_MIN_BS.get()
+        ):
+            return 16
+        return None
+
+    @staticmethod
+    def _k3_verify_fb_covered(
+        layer: RadixLinearAttention,
+        a: torch.Tensor,
+        f_b_w: torch.Tensor,
+        seq_len: int,
+        batch_size: int,
+    ) -> bool:
+        """In-kernel f_b for the fused chain-verify (ROCm K3). Above the batch
+        cap the per-V-tile recompute of the f_b product outweighs the GEMM launch
+        it saves, so the backend runs the GEMM instead."""
+        if batch_size > envs.SGLANG_ROCM_K3_KDA_VERIFY_FUSE_FB_MAX_BS.get():
+            return False
+        F = layer.head_k_dim
+        if tuple(f_b_w.shape) != (layer.num_v_heads * layer.head_k_dim, F):
+            return False
+        if F & (F - 1) or not f_b_w.is_contiguous() or f_b_w.dtype != a.dtype:
+            return False
+        try:
+            a2 = a.view(seq_len, F)
+        except RuntimeError:
+            return False
+        return a2.stride(-1) == 1 and f_b_w.device == a.device
+
+    @staticmethod
+    def _k3_verify_onorm_covered(
+        layer: RadixLinearAttention,
+        gate: torch.Tensor,
+        norm_w: torch.Tensor,
+        counters: torch.Tensor,
+        seq_len: int,
+        batch_size: int,
+    ) -> bool:
+        """Fused gated o_norm epilogue (ROCm K3): gate rows of HV*V channels,
+        unit inner stride; a per-(request, v-head) arrival counter each."""
+        V = layer.head_v_dim
+        return (
+            gate.dim() == 2
+            and tuple(gate.shape) == (seq_len, layer.num_v_heads * V)
+            and gate.stride(-1) == 1
+            and tuple(norm_w.shape) == (V,)
+            and norm_w.is_contiguous()
+            and counters.numel() >= batch_size * layer.num_v_heads
+            and gate.device == norm_w.device == counters.device
+        )
 
     @staticmethod
     def _replayssm_ring_ok(

@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import inspect
 import logging
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -138,6 +140,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidde
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -434,6 +437,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
+        self._init_rocm_bcg_prefix_extend(model_runner)
+        self._debug_graph_reject = envs.SGLANG_DEBUG_PREFILL_GRAPH_REJECT.get()
+        self._graph_reject_stats: Dict[str, int] = {}
+        self._graph_reject_samples: Dict[str, str] = {}
+        self._graph_reject_last_log = time.monotonic()
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -1225,6 +1233,57 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    def _init_rocm_bcg_prefix_extend(self, model_runner: ModelRunner) -> None:
+        """SGLANG_ROCM_BCG_PREFIX_EXTEND: replay prefix-carrying EXTEND batches
+        through the breakable prefill graph on ROCm + aiter.
+
+        Under BCG, handle_attention_aiter pins the MHA method, so an MLA layer
+        captures forward_normal_rocm_prepare (new-token q/k/v + latent KV write
+        at out_cache_loc, all fixed-shape) and calls attn_mha through
+        breakable_unified_attention_with_output. Everything prefix-dependent
+        -- the latent-KV gather over kv_indices, kv_b_proj expansion, the
+        varlen attention over prefix+new tokens -- lives in
+        AiterAttnBackend.forward_extend inside that eager break, reading the
+        live ForwardBatch and the forward_metadata rebuilt by
+        init_forward_metadata at replay. That is the same code the eager
+        MHA_ROCM dispatch runs when sum(seq_lens) <= max KV chunk capacity;
+        above it eager switches to chunked KV, so those batches stay eager.
+        """
+        prefill_attn_backend = getattr(
+            model_runner, "prefill_attention_backend_str", None
+        )
+        if prefill_attn_backend is None:
+            from sglang.srt.runtime_context import attention_backends
+
+            prefill_attn_backend = attention_backends()[0]
+        self._rocm_bcg_prefix_extend = bool(
+            envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get()
+            and is_hip()
+            and self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and prefill_attn_backend == "aiter"
+        )
+        # Eager handle_attention_aiter keeps the one-pass MHA path (the one
+        # the break runs) only while sum(seq_lens) fits the KV chunk capacity.
+        self._rocm_bcg_prefix_max_kv_tokens = envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+        if self._rocm_bcg_prefix_extend and get_parallel().tp_rank == 0:
+            logger.info(
+                "SGLANG_ROCM_BCG_PREFIX_EXTEND: breakable prefill graph will "
+                "replay prefix EXTEND batches (aiter MHA-companion path) with "
+                "sum(seq_lens) <= %d",
+                self._rocm_bcg_prefix_max_kv_tokens,
+            )
+        elif envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get() and get_parallel().tp_rank == 0:
+            logger.warning(
+                "SGLANG_ROCM_BCG_PREFIX_EXTEND set but inactive (is_hip=%s, "
+                "prefill_graph_backend=%s, has_mha_companion_layers=%s, "
+                "prefill_attention_backend=%s)",
+                is_hip(),
+                self.prefill_backend_name,
+                self.has_mha_companion_layers,
+                prefill_attn_backend,
+            )
+
     def can_replay_locally(
         self,
         *,
@@ -1247,20 +1306,56 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        return (
+            self._replay_locally_reject_reason(
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                input_embeds=input_embeds,
+                replace_embeds=replace_embeds,
+                prefix_lens=prefix_lens,
+                is_target_verify=is_target_verify,
+                capture_hidden_mode=capture_hidden_mode,
+                return_logprob=return_logprob,
+                lora_ineligible=lora_ineligible,
+                is_mixed=is_mixed,
+                batch_max_context_len=batch_max_context_len,
+            )
+            is None
+        )
+
+    def _replay_locally_reject_reason(
+        self,
+        *,
+        batch_size: int,
+        num_tokens: Optional[int],
+        input_embeds,
+        replace_embeds,
+        prefix_lens,
+        is_target_verify: bool,
+        capture_hidden_mode,
+        return_logprob: bool,
+        lora_ineligible: bool = False,
+        is_mixed: bool = False,
+        batch_max_context_len: Optional[int] = None,
+    ) -> Optional[str]:
+        """``can_replay_locally`` body: None when replayable, else a short
+        reason tag (used by SGLANG_DEBUG_PREFILL_GRAPH_REJECT)."""
         if self._is_full_backend and batch_size > self._capture_req_slots:
-            return False
+            return "full_cg_batch_size_over_req_slots"
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
-            return False
+            return "lora"
         if is_mixed and getattr(self, "prefer_eager_mixed_prefill", False):
-            return False
+            return "mixed_prefer_eager"
         if input_embeds is not None:
-            return False
+            return "input_embeds"
         if replace_embeds is not None:
-            return False
-        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
+            return "replace_embeds"
+        # Off CUDA, BCG takes the MHA companion. Its prefix work runs inside
+        # the attention eager break; it is enabled (aiter only) by
+        # SGLANG_ROCM_BCG_PREFIX_EXTEND, see _init_rocm_bcg_prefix_extend.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
@@ -1268,51 +1363,104 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and prefix_lens is not None
             and any(prefix_lens)
         ):
-            return False
+            if not self._rocm_bcg_prefix_extend:
+                return "prefix_on_mha_companion"
+            if (
+                num_tokens is not None
+                and int(sum(prefix_lens)) + int(num_tokens)
+                > self._rocm_bcg_prefix_max_kv_tokens
+            ):
+                # Eager would take MHA_CHUNKED_KV here; keep it eager rather
+                # than materialize the whole expanded prefix in the break.
+                return "prefix_over_kv_chunk_capacity"
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
-            return False
+            return "full_cg_uncapturable_chunked_prefix"
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
-            return False
+            return "target_verify"
         if (
             capture_hidden_mode is not None
             and self.capture_hidden_mode < capture_hidden_mode
         ):
-            return False
+            return "capture_hidden_mode"
         if return_logprob and not self._uses_eager_prefill_tail():
-            return False
+            return "return_logprob"
         if self.max_context_size is not None:
             if (
                 batch_max_context_len is None
                 or batch_max_context_len > self.max_context_size
             ):
-                return False
+                return "max_context_size"
         if num_tokens is None:
-            return True
+            return None
         if num_tokens > self.max_num_tokens:
-            return False
+            return "num_tokens_over_max_bucket"
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
-        return True
+            return "padding_factor"
+        return None
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        reason = self._run_graph_reject_reason(forward_batch)
+        if self._debug_graph_reject:
+            self._record_graph_decision(forward_batch, reason)
+        return reason is None
+
+    def _record_graph_decision(
+        self, forward_batch: ForwardBatch, reason: Optional[str]
+    ) -> None:
+        """SGLANG_DEBUG_PREFILL_GRAPH_REJECT: count decisions per reason and
+        log an aggregate on tp rank 0 at most every 10 seconds."""
+        try:
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            has_prefix = prefix_lens is not None and any(prefix_lens)
+            key = (
+                ("replay_with_prefix" if has_prefix else "replay_no_prefix")
+                if reason is None
+                else f"reject:{reason}"
+            )
+            self._graph_reject_stats[key] = self._graph_reject_stats.get(key, 0) + 1
+            if reason is not None:
+                self._graph_reject_samples[key] = (
+                    f"bs={forward_batch.batch_size} "
+                    f"num_tokens={len(forward_batch.input_ids)} "
+                    f"sum_prefix={int(sum(prefix_lens)) if prefix_lens is not None else None} "
+                    f"max_prefix={int(max(prefix_lens)) if prefix_lens else None} "
+                    f"mode={forward_batch.forward_mode.name}"
+                )
+            now = time.monotonic()
+            if now - self._graph_reject_last_log < 10.0:
+                return
+            self._graph_reject_last_log = now
+            stats, samples = self._graph_reject_stats, self._graph_reject_samples
+            self._graph_reject_stats, self._graph_reject_samples = {}, {}
+            if get_parallel().tp_rank != 0:
+                return
+            logger.info(
+                "[prefill-graph] decisions (last ~10s): %s | reject samples: %s",
+                ", ".join(f"{k}={v}" for k, v in sorted(stats.items())),
+                "; ".join(f"{k}: {v}" for k, v in sorted(samples.items())) or "-",
+            )
+        except Exception as e:  # debug-only; never break the forward
+            logger.warning("[prefill-graph] decision logging failed: %r", e)
+
+    def _run_graph_reject_reason(self, forward_batch: ForwardBatch) -> Optional[str]:
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
             forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_prefill_cuda_graph
         ):
-            return False
+            return "dp_group_vote"
 
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
-            return False
+            return "dp_inactive_rank"
 
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
@@ -1320,7 +1468,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.max_context_size is not None
             else None
         )
-        if not self.can_replay_locally(
+        reason = self._replay_locally_reject_reason(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),
             input_embeds=forward_batch.input_embeds,
@@ -1345,8 +1493,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             ),
             batch_max_context_len=batch_max_context_len,
-        ):
-            return False
+        )
+        if reason is not None:
+            return reason
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
             forward_batch
         ):
@@ -1360,15 +1509,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 is None
             ):
-                return False
+                return "cp_no_replay_bucket"
         backend_can_run = self._backend_can_run_prefill_cuda_graph
         if backend_can_run is not None and not backend_can_run(forward_batch):
-            return False
+            return "attn_backend_can_run_prefill_cuda_graph"
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
-        return True
+        return None
 
     def _build_capture_spec_info(self, num_tokens: int):
         if self.static_draft_hidden_states is None:

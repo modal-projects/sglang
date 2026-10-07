@@ -292,6 +292,57 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
+def _rocm_up_ag_fits(num_tokens: int, hidden_size: int) -> bool:
+    if not (_is_hip and envs.SGLANG_ROCM_K3_UPPROJ_AG.get()):
+        return False
+    if not 0 < num_tokens <= envs.SGLANG_ROCM_K3_UPPROJ_AG_MAX_TOKENS.get():
+        return False
+    group = get_parallel().tp_group
+    ca = group.ca_comm
+    return (
+        group.world_size > 1
+        and hidden_size % (group.world_size * 8) == 0
+        and ca is not None
+        and not getattr(ca, "disabled", True)
+        and hasattr(ca, "all_gather_lastdim_add")
+    )
+
+
+_ROCM_COMM_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _rocm_comm_stream() -> torch.cuda.Stream:
+    global _ROCM_COMM_STREAM
+    if _ROCM_COMM_STREAM is None:
+        _ROCM_COMM_STREAM = torch.cuda.Stream(priority=-1)
+    return _ROCM_COMM_STREAM
+
+
+def _rocm_pipe_chunks(num_tokens: int) -> int:
+    """Token chunks for the pipelined prefill tail; 1 = do not pipeline
+    (small batches, and anything under graph capture)."""
+    if num_tokens < envs.SGLANG_ROCM_K3_AR_PIPE_MIN_TOKENS.get():
+        return 1
+    if torch.cuda.is_current_stream_capturing() or is_in_breakable_cuda_graph():
+        return 1
+    return max(1, min(envs.SGLANG_ROCM_K3_AR_PIPE_CHUNKS.get(), num_tokens // 512))
+
+
+_ROCM_SHARED_STREAM: Optional[torch.cuda.Stream] = None
+# k3_moe_epi.shared_down_topk beats situ + hipBLASLt + top-k only at small M (MI355X)
+_K3_EPI_SHARED_TOPK_MAX_TOKENS = 16
+
+
+def _rocm_shared_stream() -> Optional[torch.cuda.Stream]:
+    """One side stream (per process) for the ROCm shared-expert overlap."""
+    global _ROCM_SHARED_STREAM
+    if not (_is_hip and envs.SGLANG_ROCM_K3_SHARED_OVERLAP.get()):
+        return None
+    if _ROCM_SHARED_STREAM is None:
+        _ROCM_SHARED_STREAM = torch.cuda.Stream()
+    return _ROCM_SHARED_STREAM
+
+
 class KimiK3MLP(nn.Module):
     """K3 MLP; SiLU or SiTU activation."""
 
@@ -750,8 +801,11 @@ class KimiK3MoE(nn.Module):
             "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_rocm_epi_fuse_ok",
         ):
             self.__dict__.pop(prop, None)
+        if self._rocm_epi_fuse_ok:
+            self._fold_latent_norm_into_up_proj()
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1358,6 +1412,10 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
+        if self._rocm_epi_fuse_ok and self._rocm_epi_fuse_fits(
+            hidden_states, prefix_sum
+        ):
+            return self._forward_fused_rocm_epi(hidden_states, prefix_sum=prefix_sum)
         num_tokens, hidden_size = hidden_states.shape
         if self._front_fp8 is not None:
             fused = self._front_fp8(
@@ -1460,8 +1518,19 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            side = _rocm_shared_stream()
+            if side is not None:
+                # ROCm: the shared expert overlaps the routed chain on a side
+                # stream; the join orders the pair before the collective.
+                current_stream = torch.cuda.current_stream()
+                side.wait_stream(current_stream)
+                with torch.cuda.stream(side):
+                    self._forward_shared(gate_up, shared_output)
+                self._forward_routed(hidden_states, router_logits, routed_input, latent)
+                current_stream.wait_stream(side)
+            else:
+                self._forward_shared(gate_up, shared_output)
+                self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
@@ -1478,11 +1547,283 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if not fused_norm:
             latent = self._latent_norm(latent)
+        if (
+            _rocm_up_ag_fits(num_tokens, hidden_size)
+            and latent.is_contiguous()
+            and (prefix_sum is None or prefix_sum.is_contiguous())
+        ):
+            return self._rocm_up_proj_all_gather(latent, shared_output, prefix_sum)
         out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    @cached_property
+    def _rocm_epi_fuse_ok(self) -> bool:
+        """Static eligibility for the ROCm fused MoE prologue/epilogue
+        (SGLANG_ROCM_K3_MOE_EPI_FUSE, kernels/ops/moe/k3_moe_epi.py):
+          * SiTU + shared down GEMM + router top-k in one launch
+          * latent RMSNorm + up_proj + add3 in one launch
+        Only the plain single-collective tail of _forward_fused is replaced."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_MOE_EPI_FUSE.get()):
+            return False
+        if not self._eligible_for_fused_front or self._front_fp32:
+            return False
+        if _rocm_shared_stream() is not None:
+            return False
+        shared = self.shared_experts
+        act = getattr(shared, "act_fn", None)
+        down_w = getattr(shared.down_proj, "weight", None)
+        up = self.routed_expert_up_proj
+        up_w = getattr(up, "weight", None)
+
+        def _plain_bf16(w):
+            return (
+                isinstance(w, torch.Tensor)
+                and w.dtype == torch.bfloat16
+                and w.dim() == 2
+                and w.is_contiguous()
+            )
+
+        if not (isinstance(act, SituAndMul) and _plain_bf16(down_w)):
+            return False
+        if not (_plain_bf16(up_w) and type(up.quant_method).__name__ == "UnquantizedLinearMethod"):
+            return False
+        if up_w.shape != (down_w.shape[0], self.moe_hidden_size):
+            return False
+        norm = self.routed_expert_norm
+        if norm is None or (
+            norm.weight.shape != (self.moe_hidden_size,)
+            or type(norm).forward is not RMSNorm.forward
+            or getattr(norm, "cast_x_before_out_mul", False)
+        ):
+            return False
+        if self._front_sizes[0] != 2 * down_w.shape[1]:
+            return False
+        # the kernel emits (weights, ids) itself: same contract as the aiter
+        # STANDARD top-k path (sigmoid + bias, one group, renormalized weights)
+        cfg = self.topk.topk_config
+        backend = get_moe_runner_backend()
+        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
+            return False
+        if (
+            backend.is_triton_kernels()
+            or backend.is_flashinfer_trtllm()
+            or backend.is_flashinfer_mxfp4()
+        ):
+            return False
+        if cfg.scoring_func != "sigmoid" or cfg.correction_bias is None:
+            return False
+        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
+            return False
+        if cfg.num_fused_shared_experts != 0 or cfg.custom_routing_function is not None:
+            return False
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if cfg.routed_scaling_factor not in (None, 1.0):
+            return False
+        if cfg.top_k & (cfg.top_k - 1) or self._front_sizes[1] >= 0xFFFF:
+            return False
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            or get_exec().deterministic.enable_deterministic_inference
+        ):
+            return False
+        return True
+
+    def _rocm_epi_fuse_fits(self, hidden_states, prefix_sum) -> bool:
+        n = hidden_states.shape[0]
+        return (
+            0 < n <= envs.SGLANG_ROCM_K3_MOE_EPI_FUSE_MAX_TOKENS.get()
+            and getattr(self, "_up_norm_folded", False)
+            and not k3_ar_fusion.enabled()
+            and (
+                prefix_sum is None
+                or (prefix_sum.is_contiguous() and prefix_sum.shape == hidden_states.shape)
+            )
+        )
+
+    def _forward_fused_rocm_epi(
+        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """_forward_fused (single-collective tail) with 3 fewer launches:
+
+          front GEMM -> [SiTU+shared down GEMM | router top-k] (1 launch)
+          -> routed experts (sort+quant, stage1, stage2) -> all-reduce
+          -> [latent RMSNorm + up_proj + add3] (1 launch)
+
+        Numerically equal to the unfused chain up to bf16 rounding: the up
+        GEMM consumes bf16(x * norm_w) and applies the per-row rstd in its
+        fp32 epilogue instead of rounding bf16(x * rstd * norm_w)."""
+        from sglang.kernels.ops.moe import k3_moe_epi
+
+        num_tokens, hidden_size = hidden_states.shape
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(hidden_states)
+        else:
+            fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if self._moe_front_needs_dense_bf16 and not (
+            _aiter_k3_opt and routed_input.dtype == hidden_states.dtype
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        latent_numel = num_tokens * self.moe_hidden_size
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+
+        if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS:
+            # SiTU + shared down GEMM + router top-k in one launch
+            cfg = self.topk.topk_config
+            topk_ids = torch.empty(
+                (num_tokens, cfg.top_k), dtype=torch.int32, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, cfg.top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            act = self.shared_experts.act_fn
+            k3_moe_epi.shared_down_topk(
+                gate_up,
+                self.shared_experts.down_proj.weight,
+                shared_output,
+                act.beta,
+                act.linear_beta,
+                router_logits,
+                cfg.correction_bias,
+                topk_ids,
+                topk_weights,
+                renormalize=cfg.renormalize,
+                routed_scale=1.0,
+            )
+            topk_output = build_precomputed_topk_output(
+                topk_weights, topk_ids, cfg, self.layer_idx
+            )
+        else:  # larger batches: the tuned hipBLASLt GEMM wins
+            self._forward_shared(gate_up, shared_output)
+            topk_output = self.topk(hidden_states, router_logits)
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+        buf = tensor_model_parallel_all_reduce(buf)
+
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if _rocm_up_ag_fits(num_tokens, hidden_size):
+            # column-shard up_proj + fused all-gather/add3 (SGLANG_ROCM_K3_UPPROJ_AG)
+            # already folds add3 into its collective; it takes the normed latent
+            return self._rocm_up_proj_all_gather(
+                self._latent_norm(latent), shared_output, prefix_sum
+            )
+        # norm weight folded into w_up (see _fold_latent_norm_into_up_proj): the
+        # tuned up GEMM reads the raw latent and one tail kernel applies the
+        # per-row rstd and the 3-way add
+        up, _ = self.routed_expert_up_proj(latent)
+        return k3_moe_epi.norm_add3(
+            up, latent, self._up_norm_eps, shared_output, prefix_sum
+        )
+
+    @torch.no_grad()
+    def _fold_latent_norm_into_up_proj(self) -> None:
+        """w_up <- bf16(w_up * norm_w), norm_w <- 1, so rmsnorm(x) @ w_up^T ==
+        rstd(x) * (x @ w_up'^T) (up to bf16 rounding). Every other consumer
+        (unfused norm + up_proj, the column-shard all-gather tail) stays exact
+        with the unit norm weight. Done once after loading."""
+        if getattr(self, "_up_norm_folded", False):
+            return
+        norm = self.routed_expert_norm
+        w = self.routed_expert_up_proj.weight
+        if norm is not None:
+            g = norm.weight.data.float()
+            for r in range(0, w.shape[0], 1024):
+                w.data[r : r + 1024] = (w.data[r : r + 1024].float() * g).to(w.dtype)
+            norm.weight.data.fill_(1.0)
+            self._up_norm_eps = norm.variance_epsilon
+        else:
+            self._up_norm_eps = None
+        self.__dict__.pop("_up_shard_w", None)
+        self._up_norm_folded = True
+
+    def rocm_pipe_eligible(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            hidden_states.shape[0] > 0
+            and self._eligible_for_fused_front
+            and not self._dp_attention
+            and not k3_ar_fusion.enabled()
+        )
+
+    def rocm_pipe_pre(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """_forward_fused up to (excluding) its collective: returns the flat
+        TP-partial [latent | shared] buffer for the caller to all-reduce."""
+        num_tokens, hidden_size = hidden_states.shape
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(hidden_states, out_dtype=None)
+        else:
+            fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if self._moe_front_needs_dense_bf16 and not (
+            _aiter_k3_opt and routed_input.dtype == hidden_states.dtype
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        latent_numel = num_tokens * self.moe_hidden_size
+        buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        self._forward_shared(gate_up, shared_output)
+        self._forward_routed(hidden_states, router_logits, routed_input, latent)
+        return buf
+
+    def rocm_pipe_post(self, buf, num_tokens, hidden_size, prefix_sum, out):
+        """_forward_fused after its collective, writing into out (a row slice)."""
+        latent_numel = num_tokens * self.moe_hidden_size
+        latent = self._latent_norm(
+            buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+        )
+        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        up, _ = self.routed_expert_up_proj(latent)
+        out.copy_(_add3(up, shared_output, prefix_sum))
+
+    def _rocm_up_proj_all_gather(self, latent, shared_output, prefix_sum):
+        """ROCm decode: each rank computes only its hidden/tp output columns of
+        the replicated up_proj (1/tp of the weight read), and one fused
+        all-gather + add3 assembles bf16(bf16(up + shared) + prefix)."""
+        from aiter.tuned_gemm import tgemm
+
+        group = get_parallel().tp_group
+        ca = group.ca_comm
+        w = self.__dict__.get("_up_shard_w")
+        if w is None:
+            full = self.routed_expert_up_proj.weight  # [hidden, latent]
+            n = full.shape[0] // group.world_size
+            w = full[group.rank_in_group * n : (group.rank_in_group + 1) * n]
+            self.__dict__["_up_shard_w"] = w
+        y = tgemm.mm(latent, w, None, otype=latent.dtype)
+        if getattr(ca, "_IS_CAPTURING", False) and not torch.cuda.is_current_stream_capturing():
+            # graph warm-up: no collective (ranks may warm up unevenly)
+            out = torch.empty_like(shared_output)
+            return _add3(out.zero_(), shared_output, prefix_sum)
+        out = ca.all_gather_lastdim_add(y, shared_output, prefix_sum)
+        if envs.SGLANG_ROCM_K3_UPPROJ_AG_CHECK.get() and not torch.cuda.is_current_stream_capturing():
+            ref_up, _ = self.routed_expert_up_proj(latent)
+            ref = _add3(ref_up, shared_output, prefix_sum)
+            logger.info(
+                "up_proj all-gather check: rows=%d max|diff|=%.3e (ref max %.3e)",
+                ref.shape[0],
+                (out.float() - ref.float()).abs().max().item(),
+                ref.float().abs().max().item(),
+            )
+        return out
 
     def forward(
         self,
@@ -1842,6 +2183,9 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        # ROCm target-verify fusion (SGLANG_ROCM_K3_KDA_VERIFY_FUSE), set by
+        # _prepare_verify_fuse_hip().
+        self._kda_hip_verify_fuse_ready = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1970,6 +2314,7 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_hip:
             from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
+            self._prepare_verify_fuse_hip()
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
@@ -2058,6 +2403,39 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def _prepare_verify_fuse_hip(self) -> None:
+        """ROCm SGLANG_ROCM_K3_KDA_VERIFY_FUSE: static inputs for the fused
+        chain-verify kernel's f_b prologue and gated-o_norm epilogue (bf16 f_b
+        weight [HV*K, K], o_norm weight/eps, shared arrival counters). Called
+        once after weight loading, before graph capture."""
+        if not envs.SGLANG_ROCM_K3_KDA_VERIFY_FUSE.get() or not self.use_full_rank_gate:
+            return
+        f_b_w = self._bfa_f_b_w if self._bfa_f_b_w is not None else self.f_b_proj.weight
+        norm_w = self.o_norm.weight
+        hv, d = self.local_num_heads, self.head_dim
+        if (
+            f_b_w is None
+            or type(f_b_w.data) is not torch.Tensor
+            or f_b_w.dtype != torch.bfloat16
+            or tuple(f_b_w.shape) != (hv * d, d)
+            or norm_w is None
+            or tuple(norm_w.shape) != (self.head_v_dim,)
+            or self.attn.lower_bound is None
+        ):
+            rank0_log("K3 ROCm KDA verify fusion disabled: unexpected f_b/o_norm layout")
+            return
+        from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+            get_onorm_counters,
+        )
+
+        self.attn._k3_verify_fuse_args = (
+            f_b_w.data.contiguous(),
+            norm_w.data.contiguous(),
+            float(self.o_norm.eps),
+            get_onorm_counters(f_b_w.device),
+        )
+        self._kda_hip_verify_fuse_ready = True
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2143,9 +2521,25 @@ class KimiK3DeltaAttention(nn.Module):
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
+        # ROCm SGLANG_ROCM_K3_KDA_VERIFY_FUSE at target verify: o_norm runs
+        # as one strided-gate kernel below (no gate copy). Experimental
+        # sub-options hand the KDA backend f_a instead of the forget gate (it
+        # applies f_b in the fused chain-verify kernel, or runs the same tiny
+        # GEMM itself when that kernel does not cover the batch) and/or offer
+        # the o_norm gate to the chain kernel's epilogue.
+        verify_fuse = (
+            self._kda_hip_verify_fuse_ready
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        verify_defer_f_b = (
+            verify_fuse and envs.SGLANG_ROCM_K3_KDA_VERIFY_FUSE_FB_MAX_BS.get() > 0
+        )
+        verify_onorm_inkernel = (
+            verify_fuse and envs.SGLANG_ROCM_K3_KDA_VERIFY_FUSE_ONORM_INKERNEL.get()
+        )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states, defer_f_b=defer_f_b
+                hidden_states, defer_f_b=defer_f_b or verify_defer_f_b
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
@@ -2166,7 +2560,9 @@ class KimiK3DeltaAttention(nn.Module):
         # into the recurrence kernel. If the backend leaves the stash
         # unconsumed (env off or shape not covered), apply o_norm here as
         # before.
-        fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
+        fused_onorm = (
+            self._kda_fused_decode_ready or defer_f_b or verify_onorm_inkernel
+        ) and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
@@ -2175,6 +2571,8 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_onorm_consumed = False
         if defer_f_b:
             self.attn._k3_deferred_f_b = True
+        if verify_defer_f_b:
+            self.attn._k3_verify_deferred_f_b = True
 
         core_attn_out = self.attn(
             forward_batch,
@@ -2188,6 +2586,25 @@ class KimiK3DeltaAttention(nn.Module):
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False
+        if verify_defer_f_b:
+            self.attn._k3_verify_deferred_f_b = False
+        if (
+            not fused_onorm
+            and verify_fuse
+            and envs.SGLANG_ROCM_K3_KDA_VERIFY_STRIDED_ONORM.get()
+            and core_attn_out.is_contiguous()
+            and g_proj_states.dim() == 2
+            and g_proj_states.stride(-1) == 1
+        ):
+            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+                kda_onorm_gated_strided,
+            )
+
+            # One launch instead of the gate's contiguous copy + gated norm.
+            core_attn_out = kda_onorm_gated_strided(
+                core_attn_out, g_proj_states, self.o_norm.weight, self.o_norm.eps
+            )
+            fused_onorm = True
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -2509,6 +2926,25 @@ class KimiK3DecoderLayer(nn.Module):
         # caller-owned storage; the layer's own AR call-site must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
+        # ROCm prefill: o_proj emits TP-partial sums so large eager prefill
+        # batches can pipeline the attention/MoE all-reduces against compute
+        # over token chunks (_rocm_pipelined_tail); everything else reduces
+        # right after attention, as o_proj would have.
+        o_proj = getattr(self.self_attn, "o_proj", None)
+        self._rocm_ar_pipe = (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_AR_PIPE.get()
+            and self._is_moe_layer
+            and not self._sp_moe
+            and not self.all_reduce_fusion
+            and config.attn_res_block_size is not None
+            and o_proj is not None
+            and get_parallel().attn_tp_size > 1
+            and get_parallel().attn_tp_size == get_parallel().tp_size
+        )
+        if self._rocm_ar_pipe:
+            o_proj.reduce_results = False
+
         # MLP / MoE
         if self._is_moe_layer:
             self.mlp = KimiK3MoE(
@@ -2586,6 +3022,74 @@ class KimiK3DecoderLayer(nn.Module):
                     return _sp_inner_o_proj_forward(x, *args, **kwargs)
 
                 o_proj.forward = _sp_o_proj_forward
+
+    def _rocm_pipelined_tail(self, attn_partial, prefix_sum, attn_res, keep_sharded):
+        """Attention all-reduce -> MLP-side aggregation -> MoE (with its
+        [latent | shared] all-reduce) -> up_proj tail, over K token chunks.
+        Collectives run in a fixed order on a high-priority comm stream
+        (A0 A1 M0 A2 M1 ...), so chunk c's communication overlaps chunk
+        c+-1's compute. Every op is token-wise, so results equal the
+        unchunked path."""
+        num_tokens, hidden_size = attn_partial.shape
+        k = _rocm_pipe_chunks(num_tokens)
+        step = -(-num_tokens // k)
+        bounds = [(i, min(i + step, num_tokens)) for i in range(0, num_tokens, step)]
+        k = len(bounds)
+        group = get_parallel().attn_tp_group
+        cur = torch.cuda.current_stream()
+        comm = _rocm_comm_stream()
+        out = torch.empty_like(attn_partial)
+        attn_partial.record_stream(comm)
+
+        comm.wait_stream(cur)  # o_proj partials are ready
+        reduced, ev_attn = [None] * k, [None] * k
+        bufs, moe_red, ev_moe = [None] * k, [None] * k, [None] * k
+        prefixes = [None] * k
+
+        def issue_attn(c):
+            lo, hi = bounds[c]
+            with torch.cuda.stream(comm):
+                reduced[c] = group.all_reduce(attn_partial[lo:hi])
+                ev_attn[c] = comm.record_event()
+            reduced[c].record_stream(cur)
+
+        def issue_moe(c):
+            comm.wait_event(ev_pre[c])
+            bufs[c].record_stream(comm)
+            with torch.cuda.stream(comm):
+                moe_red[c] = group.all_reduce(bufs[c])
+                ev_moe[c] = comm.record_event()
+            moe_red[c].record_stream(cur)
+
+        def post(c):
+            lo, hi = bounds[c]
+            cur.wait_event(ev_moe[c])
+            self.mlp.rocm_pipe_post(
+                moe_red[c], hi - lo, hidden_size, prefixes[c], out[lo:hi]
+            )
+
+        ev_pre = [None] * k
+        issue_attn(0)
+        for c in range(k):
+            lo, hi = bounds[c]
+            if c + 1 < k:
+                issue_attn(c + 1)
+            cur.wait_event(ev_attn[c])
+            normed, prefixes[c] = attn_res.forward(
+                reduced[c],
+                None if prefix_sum is None else prefix_sum[lo:hi],
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+                rows=slice(lo, hi),
+            )
+            bufs[c] = self.mlp.rocm_pipe_pre(normed)
+            ev_pre[c] = cur.record_event()
+            issue_moe(c)
+            if c >= 1:
+                post(c - 1)
+        post(k - 1)
+        return out, None, False
 
     def _finish_attn_reduce(
         self,
@@ -2800,6 +3304,14 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
+        if self._rocm_ar_pipe:
+            if _rocm_pipe_chunks(hidden_states.shape[0]) > 1 and self.mlp.rocm_pipe_eligible(
+                hidden_states
+            ):
+                return self._rocm_pipelined_tail(
+                    hidden_states, prefix_sum, attn_res, keep_sharded
+                )
+            hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);

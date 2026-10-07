@@ -102,6 +102,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 if TYPE_CHECKING:
@@ -167,6 +168,21 @@ class _DflashDraftSampler:
             self.selected_ids = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
+        # Packed-key path: one custom all-gather of int32 keys (carried in an
+        # fp32-typed buffer, 16B-aligned rows) instead of two NCCL gathers.
+        self.packed = bool(
+            self.tp_size > 1
+            and envs.SGLANG_ROCM_K3_DRAFT_ARGMAX_AG.get()
+            and weight.dtype == torch.bfloat16
+            and self.num_org <= 65536
+            and self.org_vocab_start == tp_group.rank_in_group * self.num_org
+        )
+        if self.packed:
+            n_pad_max = (max_tokens + 3) // 4 * 4
+            self.keys = torch.zeros((n_pad_max,), dtype=torch.float32, device=device)
+            self.gathered_keys = torch.zeros(
+                (self.tp_size * n_pad_max,), dtype=torch.float32, device=device
+            )
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -183,6 +199,26 @@ class _DflashDraftSampler:
             if self.org_vocab_start:
                 tokens += self.org_vocab_start
             self.out[:n].copy_(tokens)
+            return
+        if self.packed:
+            from sglang.kernels.ops.speculative.k3_draft_argmax import (
+                pack_row_argmax,
+                select_from_gathered,
+            )
+
+            n_pad = (n + 3) // 4 * 4
+            keys = self.keys[:n_pad]
+            gathered = self.gathered_keys[: self.tp_size * n_pad]
+            pack_row_argmax(logits, keys.view(torch.int32))
+            self.tp_group.all_gather_into_tensor(gathered, keys)
+            select_from_gathered(
+                gathered.view(torch.int32),
+                self.out,
+                n,
+                n_pad,
+                self.num_org,
+                self.tp_size,
+            )
             return
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
@@ -1185,10 +1221,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
         block_size: int,
+        suffix_start: Optional[torch.Tensor] = None,
     ) -> None:
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
-        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        if suffix_start is None:
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1887,12 +1927,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                kv_fuse = envs.SGLANG_ROCM_K3_DFLASH_KV_FUSE.get()
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
+                    if kv_fuse and self._kv_fuse_store(
+                        attn, k, v, positions, cache_loc_2d, commit_lens
+                    ):
+                        continue
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1930,6 +1975,66 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
             )
+
+    def _kv_fuse_store(
+        self, attn, k, v, positions, cache_loc_2d, commit_lens
+    ) -> bool:
+        """SGLANG_ROCM_K3_DFLASH_KV_FUSE: k-norm straight from the strided K
+        slice (same AITER kernel, no .contiguous() copy) + one fused bf16-exact
+        RoPE / prefix-valid KV write. Returns False (did nothing) if ineligible."""
+        from sglang.srt.layers import layernorm as _ln
+
+        rope = getattr(attn, "rotary_emb", None)
+        pool = self.draft_model_runner.token_to_kv_pool
+        hd = int(attn.head_dim)
+        norm = attn.k_norm
+        if not (
+            _is_hip
+            and getattr(_ln, "_use_aiter", False)
+            and getattr(norm, "_forward_method", None) is not None
+            and getattr(norm._forward_method, "__func__", None)
+            is _ln.RMSNorm.forward_aiter
+            and not getattr(norm, "_fused_pad_kernel", None)
+            and norm.weight.dtype == torch.bfloat16
+            and int(attn.num_kv_heads) == 1
+            and k.dtype == torch.bfloat16
+            and v.dtype == torch.bfloat16
+            and k.dim() == 2
+            and k.shape[1] == hd
+            and k.stride(1) == 1
+            and v.stride(1) == 1
+            and rope is not None
+            and getattr(rope, "use_fallback_kernel", False)
+            and getattr(rope, "is_neox_style", False)
+            and int(getattr(rope, "rotary_dim", -1)) == hd
+            and int(getattr(rope, "head_size", -1)) == hd
+            and hasattr(rope, "_hip_cos_sin_cache_as")
+            and getattr(pool, "store_dtype", None) == torch.bfloat16
+            and getattr(pool, "dtype", None) == torch.bfloat16
+            and not getattr(pool, "use_hnd", False)
+        ):
+            return False
+        from sglang.kernels.ops.speculative.k3_dflash_kv_store import (
+            rope_store_prefix_valid,
+        )
+
+        if getattr(_ln, "is_batch_invariant_mode_enabled", lambda: False)():
+            return False
+        k_normed = _ln.rms_norm(k, norm.weight.data, norm.variance_epsilon)
+        rope.cos_sin_cache = rope.cos_sin_cache.to(k.device)
+        cos_sin = rope._hip_cos_sin_cache_as(torch.bfloat16)
+        layer_id = attn.attn.layer_id
+        rope_store_prefix_valid(
+            k_normed.view(-1, 1, hd),
+            v.view(-1, 1, hd),
+            positions,
+            cos_sin,
+            cache_loc_2d,
+            commit_lens,
+            pool.k_buffer[layer_id - pool.start_layer],
+            pool.v_buffer[layer_id - pool.start_layer],
+        )
+        return True
 
     def _append_target_hidden_sequential(
         self,
@@ -2026,10 +2131,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
-        mamba_steps_to_track = None
+        if envs.SGLANG_ROCM_K3_DFLASH_TRACK_FUSE.get() and commit_lens.is_cuda:
+            from sglang.kernels.ops.speculative.k3_dflash_post import (
+                mamba_track_steps,
+            )
 
-        if batch.mamba_track_indices is not None:
+            has_track = batch.mamba_track_indices is not None
+            last_correct_step_indices, mamba_steps_to_track = mamba_track_steps(
+                commit_lens,
+                seq_lens_pre_verify,
+                seq_lens_post_verify,
+                (
+                    mamba_track_grid(batch.tree_cache.page_size)
+                    if has_track
+                    else 1
+                ),
+                has_track,
+            )
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
+            mamba_steps_to_track = None
+
+        if (
+            batch.mamba_track_indices is not None
+            and mamba_steps_to_track is None
+        ):
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
@@ -2149,9 +2275,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if (
+                envs.SGLANG_ROCM_K3_DFLASH_VERIFY_ARGMAX.get()
+                and next_token_logits.is_cuda
+                and next_token_logits.dtype == torch.float32
+                and next_token_logits.dim() == 2
+                and next_token_logits.stride(1) == 1
+            ):
+                from sglang.kernels.ops.speculative.k3_dflash_post import (
+                    verify_argmax,
+                )
+
+                target_predict = verify_argmax(next_token_logits).view(
+                    bs, int(self.block_size)
+                )
+            else:
+                target_predict = torch.argmax(next_token_logits, dim=-1).view(
+                    bs, int(self.block_size)
+                )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
@@ -2504,7 +2645,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            suffix_start = None
+            if (
+                envs.SGLANG_ROCM_K3_DFLASH_PREP_FUSE.get()
+                and prefix_lens.is_cuda
+                and self._use_triton_compact_rebuild
+            ):
+                from sglang.kernels.ops.speculative.k3_dflash_post import (
+                    compact_draft_lens,
+                )
+
+                draft_prefix_lens, suffix_start = compact_draft_lens(
+                    prefix_lens,
+                    int(self.draft_window_size),
+                    self.page_size if self.page_size > 1 else 1,
+                )
+            else:
+                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
@@ -2518,6 +2675,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
                 block_size=block_size,
+                suffix_start=suffix_start,
             )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
@@ -2853,6 +3011,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
+        # SGLANG_ROCM_K3_DFLASH_EARLY_PUBLISH: publish the new seq lens (the
+        # event the scheduler host-waits on) before the mamba-state commit, so
+        # that commit overlaps the scheduler's host work instead of delaying
+        # it. The commit stays on this stream, ahead of the next step's work.
+        published = False
+        if on_publish is not None and envs.SGLANG_ROCM_K3_DFLASH_EARLY_PUBLISH.get():
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            on_publish(new_seq_lens)
+            published = True
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             if new_seq_lens is None:
@@ -2866,7 +3035,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-        if on_publish is not None:
+        if on_publish is not None and not published:
             on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.

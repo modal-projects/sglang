@@ -981,6 +981,12 @@ class Envs:
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     # ROCm: Triton sigmoid+bias top-k and one-block-per-expert sort+mxfp8 quant (decode)
     SGLANG_ROCM_TRITON_ROUTE = EnvBool(True)
+    # ROCm K3 aiter MoE, 16 < M <= MAX_TOKENS (DFlash verify): sigmoid top-k + MoE sort +
+    # stage-1 mxfp8 quant in 2 launches instead of topk_reg + opus sort (2) + quant
+    # (kernels/ops/moe/k3_route_sort_mid.py); same sorted layout / a1 bytes as aiter.
+    SGLANG_ROCM_K3_ROUTE_SORT_MID = EnvBool(False)
+    # kernel limit 512; measured slower than aiter at M >= 256 (MI355X)
+    SGLANG_ROCM_K3_ROUTE_SORT_MID_MAX_TOKENS = EnvInt(128)
     # ROCm: use aiter QuickAllReduce (configured by AITER_QUICK_REDUCE_*) for large all-reduces
     SGLANG_ROCM_AITER_QUICK_REDUCE = EnvBool(False)
     # ROCm K3: run the shared expert on a side stream, overlapping the routed experts
@@ -990,11 +996,24 @@ class Envs:
     # add3 into one skinny GEMM (kernels/ops/moe/k3_moe_epi.py)
     SGLANG_ROCM_K3_MOE_EPI_FUSE = EnvBool(False)
     SGLANG_ROCM_K3_MOE_EPI_FUSE_MAX_TOKENS = EnvInt(256)
+    # K3 routed-expert decode configs (kernels/ops/moe/k3_moe_cfg.py): override aiter's
+    # tuned A8W4 stage1/stage2 kernels for the small padded-M tiers, retuned on real
+    # (correlated) DFlash verify routing; e.g. drops the xcd4 stage1 swizzle at M=16.
+    SGLANG_ROCM_K3_MOE_DECODE_CFG = EnvBool(False)
     # Under SGLANG_ROCM_K3_MOE_EPI_FUSE: compute the shared expert's SiTU
     # activation in its own small launch before the fused shared-down + top-k
     # kernel instead of in every GEMM CTA's prologue (kernels/ops/moe/k3_moe_epi.py).
     # +1 launch, bit-identical outputs, 7.6 vs 10.2 us at M=8; also takes M<=64 (vs the 3-launch fallback).
     SGLANG_ROCM_K3_SHARED_PREACT = EnvBool(False)
+    # ROCm K3 attention residuals at decode/verify sizes (T <= ..._MAX_T): run each
+    # aggregation point as one HIP kernel (kernels/jit/csrc/kimi_k3/attn_res_smallm.cuh,
+    # registers + 2 block reductions instead of the Triton _agg_kernel's per-row LDS
+    # round trips), and fold each dspark aux capture (its aggregate_stream launch +
+    # packer copy) into the next layer's attention-side aggregation. Same formulas;
+    # fp32 reduction order differs (~1.5e-4 of bf16 outputs flip by 1 ulp vs _agg_kernel).
+    SGLANG_ROCM_K3_AGG_SMALLM = EnvBool(False)
+    # Largest token count routed to the HIP kernel under SGLANG_ROCM_K3_AGG_SMALLM.
+    SGLANG_ROCM_K3_AGG_SMALLM_MAX_T = EnvInt(128)
     # ROCm + aiter: let the breakable prefill CUDA graph replay EXTEND batches
     # with a cached prefix (MLA models with an MHA companion, e.g. K3). The
     # prefix gather + kv_b_proj expansion + attention already run inside the
@@ -1036,8 +1055,37 @@ class Envs:
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x
     # torch.cat + the cache cast + index_put. Bit-identical; -3 launches per MLA layer.
     SGLANG_ROCM_K3_MLA_CAT_CACHE = EnvBool(False)
+    # ROCm K3 (aiter backend) extend with a cached prefix: build the prefix K/V
+    # for the MHA without torch.cat. One Triton launch gathers + casts the FP8
+    # latent rows and writes k_pe (broadcast to all heads) into its final slot;
+    # the kv_b GEMM then runs unchanged followed by one Triton k_nope copy
+    # (mode "copy", default, bit-identical) or writes [v | k_nope] per head
+    # straight into the strided buffer as a batched GEMM (mode "bmm", zero copy
+    # but the batched GEMM is ~30% slower and only bf16-rounding-equal).
+    # Replaces gather + 2 strided casts + CatArrayBatchedCopy: 2.67 -> 1.45 ms
+    # per layer at 3x(90k+9k), 0.90 -> 0.50 ms at 1x(90k+9k)
+    # (kernels/ops/attention/k3_mla_prefix_nocat.py).
+    SGLANG_ROCM_K3_MLA_PREFIX_NOCAT = EnvBool(False)
+    SGLANG_ROCM_K3_MLA_PREFIX_NOCAT_MODE = EnvStr("copy")
+    # ROCm K3 (aiter backend, MHA d192/v128 extend, with or without a cached
+    # prefix): run the attention on AITER's FP8 persistent-scheduled ASM
+    # prefill kernel (mla_prefill_ps_asm_fwd + mla_reduce_v1, 12 heads via a
+    # 4-head reduce view) instead of the bf16 opus gqa_d192_v128 kernel. Q/K/V
+    # are cast to E4M3 with unit scales (saturating) like B300's trtllm FP8
+    # ragged prefill; the prefix K/V come out of the kv_b GEMM through one
+    # fused split + cast kernel (no torch.cat). Attention 5.2 -> 3.0 ms per
+    # layer at 9k new + 90k cached, 3.5-4x on short extends over long prefixes
+    # (opus has no split-KV). Takes precedence over PREFIX_NOCAT.
+    # See kernels/ops/attention/k3_mla_prefill_fp8.py.
+    SGLANG_ROCM_K3_MLA_PREFILL_FMHA = EnvBool(False)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
+    # ROCm K3 decode (with SGLANG_ROCM_K3_UPPROJ_AG): the up_proj all-gather +
+    # add3 drops AITER's trailing barrier (bit-identical output, -1 cross-GPU
+    # sync per MoE layer); the gathered input is kept alive past the next
+    # collective's start barrier instead. Graph capture only.
+    # See kernels/ops/communication/k3_ag_one_barrier_hip.py.
+    SGLANG_ROCM_K3_AG_ONE_BARRIER = EnvBool(False)
     # ROCm: avoid host<->device syncs on the extend path (pinned non-blocking copies, CPU chunk indices)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)
     # Online-FP8 draft activation scheme (B300 engine: --speculative-draft-fp8-activation-scheme)
@@ -1048,6 +1096,35 @@ class Envs:
     SGLANG_ROCM_K3_AR_PIPE = EnvBool(False)
     SGLANG_ROCM_K3_AR_PIPE_MIN_TOKENS = EnvInt(1024)
     SGLANG_ROCM_K3_AR_PIPE_CHUNKS = EnvInt(4)
+    # ROCm DFlash draft (Triton backend): split-KV, GQA-packed sliding-window
+    # attention for the draft block (TARGET_VERIFY) instead of the serial
+    # extend kernel; reads strided q/k/v (no .contiguous() copies).
+    # See kernels/ops/attention/k3_draft_swa_verify.py.
+    SGLANG_ROCM_K3_DRAFT_SWA_SPLITKV = EnvBool(False)
+    # Override the split count (0 = auto by batch size).
+    SGLANG_ROCM_K3_DRAFT_SWA_SPLITS = EnvInt(0)
+    # ROCm DFlash draft greedy head: pack (bf16 max, local argmax) into one
+    # 32-bit key per row and gather it with the custom all-gather instead of
+    # two NCCL all-gathers + argmax + gather (tie-break identical).
+    SGLANG_ROCM_K3_DRAFT_ARGMAX_AG = EnvBool(False)
+    # DFlash greedy accept: split-vocab two-stage argmax over the verify logits
+    # (NaN/tie semantics identical to torch.argmax).
+    SGLANG_ROCM_K3_DFLASH_VERIFY_ARGMAX = EnvBool(False)
+    # DFlash mamba commit: one kernel for last_correct_step_indices and
+    # mamba_steps_to_track (replaces ~15 int64 elementwise launches).
+    SGLANG_ROCM_K3_DFLASH_TRACK_FUSE = EnvBool(False)
+    # DFlash draft KV materialization: k-norm read straight from the strided
+    # K slice + one fused bf16-exact RoPE / prefix-valid KV write per draft
+    # layer (replaces copy/rope/copy/store; bit-identical).
+    SGLANG_ROCM_K3_DFLASH_KV_FUSE = EnvBool(False)
+    # DFlash draft prep (host-latency-bound eager path): one kernel for the
+    # compact window lengths + suffix start, and one kernel for the draft
+    # runner's TARGET_VERIFY attention metadata (replaces ~25 small launches).
+    SGLANG_ROCM_K3_DFLASH_PREP_FUSE = EnvBool(False)
+    # DFlash verify: publish the new seq lens (the event the overlap scheduler
+    # host-waits on each step) before the mamba/KDA state commit instead of
+    # after it, so the commit overlaps the scheduler's host work.
+    SGLANG_ROCM_K3_DFLASH_EARLY_PUBLISH = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

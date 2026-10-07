@@ -31,6 +31,7 @@ _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
+_SMALLM_MAX_T = None  # SGLANG_ROCM_K3_AGG_SMALLM: 0 = off, else the max token count
 
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
@@ -61,6 +62,29 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+def smallm_max_t() -> int:
+    """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
+    global _SMALLM_MAX_T
+    if _SMALLM_MAX_T is None:
+        from sglang.srt.environ import envs
+
+        _SMALLM_MAX_T = (
+            envs.SGLANG_ROCM_K3_AGG_SMALLM_MAX_T.get()
+            if is_hip() and envs.SGLANG_ROCM_K3_AGG_SMALLM.get()
+            else 0
+        )
+    return _SMALLM_MAX_T
+
+
+def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:
+    """Whether an aggregation point of this shape takes attn_res_smallm_hip."""
+    return (
+        0 < num_tokens <= smallm_max_t()
+        and nvb >= 1
+        and _use_hip_fused(hidden_size, nvb)
+    )
 
 
 def get_cw(
@@ -289,11 +313,16 @@ def _aggregate_hip(
     score_norm: RMSNorm,
     out_norm: Optional[RMSNorm],
     write_bank_row: bool = False,
+    stream_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single ROCm Triton kernel: the bank stays in registers so scoring and
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
-    pre-norm mixture instead. Returns (result, prefix)."""
+    pre-norm mixture instead. Returns (result, prefix).
+
+    Small token counts under SGLANG_ROCM_K3_AGG_SMALLM take the single HIP
+    kernel instead (attn_res_smallm_hip), which can also emit the pre-norm
+    mixture into stream_out (only valid on that path; see use_hip_smallm)."""
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     from sglang.srt.layers import k3_rocm_dense_fp8
@@ -309,7 +338,18 @@ def _aggregate_hip(
         if out_norm is not None and k3_rocm_dense_fp8.front_enabled()
         else None
     )
-    attn_res_hip(
+    kernel = attn_res_hip
+    extra = {}
+    if use_hip_smallm(prefix_sum.shape[0], prefix_sum.shape[1], nvb):
+        from sglang.kernels.ops.attention.attn_res_smallm_hip import (
+            attn_res_smallm_hip,
+        )
+
+        kernel = attn_res_smallm_hip
+        extra["stream_out"] = stream_out
+    else:
+        assert stream_out is None, "stream_out needs the small-M kernel"
+    kernel(
         prefix_sum,
         bank,
         cw,
@@ -322,6 +362,7 @@ def _aggregate_hip(
         prefix_out=prefix,
         write_prefix=write_bank_row,
         out_fp8=out_fp8,
+        **extra,
     )
     if out_fp8 is not None:
         k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
@@ -418,6 +459,7 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    stream_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
@@ -448,7 +490,9 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            stream_out=stream_out,
         )[0]
+    assert stream_out is None
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
@@ -473,6 +517,8 @@ class AttnResidual:
             (num_tokens, block_num, hidden_size)
         )
         self.num_valid_blocks = 0
+        # Deferred dspark capture (SGLANG_ROCM_K3_AGG_SMALLM): see defer_stream.
+        self._stream_pending = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -486,6 +532,41 @@ class AttnResidual:
         bank = self.block_residual if rows is None else self.block_residual[rows]
         bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
         self.num_valid_blocks += 1
+
+    def can_defer_stream(self, hidden_states: torch.Tensor, nvb: int) -> bool:
+        """Whether a dspark capture of the stream value over `nvb` rows can
+        ride the next aggregation of the same rows (small-M ROCm kernel)."""
+        return nvb == self.num_valid_blocks and use_hip_smallm(
+            hidden_states.shape[0], hidden_states.shape[1], nvb
+        )
+
+    def defer_stream(
+        self,
+        slot: torch.Tensor,
+        hidden_states: torch.Tensor,
+        nvb: int,
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+    ) -> None:
+        """Record a capture of aggregate_stream(hidden_states, bank, nvb,
+        score_proj, score_norm) into `slot` (a [T, H] view of the packed aux
+        buffer). The next forward() aggregating the same stream head with the
+        same weights writes it as a by-product (same pre-norm mixture its own
+        output norm consumes): one launch and one copy fewer per capture. Any
+        other next call materializes it first (flush_stream)."""
+        assert self._stream_pending is None
+        self._stream_pending = (slot, hidden_states, nvb, score_proj, score_norm)
+
+    def flush_stream(self) -> None:
+        """Materialize a deferred capture with a standalone aggregation."""
+        pending, self._stream_pending = self._stream_pending, None
+        if pending is not None:
+            slot, hidden_states, nvb, score_proj, score_norm = pending
+            slot.copy_(
+                aggregate_stream(
+                    hidden_states, self.block_residual, nvb, score_proj, score_norm
+                )
+            )
 
     def forward(
         self,
@@ -502,6 +583,22 @@ class AttnResidual:
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
         nvb = self.num_valid_blocks
+        stream_out = None
+        if self._stream_pending is not None:
+            slot, p_hidden, p_nvb, p_proj, p_norm = self._stream_pending
+            if (
+                prefix_sum is None
+                and rows is None
+                and hidden_states is p_hidden
+                and nvb == p_nvb
+                and score_proj is p_proj
+                and score_norm is p_norm
+                and use_hip_smallm(hidden_states.shape[0], hidden_states.shape[1], nvb)
+            ):
+                stream_out = slot
+                self._stream_pending = None
+            else:
+                self.flush_stream()
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None
@@ -531,6 +628,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                stream_out=stream_out,
             )
             prefix = hidden_states
         else:
@@ -562,6 +660,7 @@ class AttnResidual:
         write: bool = False,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Fuse a local aggregation point and the following row all-gather."""
+        self.flush_stream()
         nvb = self.num_valid_blocks
         if nvb == 0:
             return None
@@ -598,6 +697,7 @@ class AttnResidual:
         rows: slice,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Fuse o_proj RS, the pending local prefix add, and aggregation."""
+        self.flush_stream()
         nvb = self.num_valid_blocks
         if nvb == 0:
             return None

@@ -1354,9 +1354,17 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            with zero_copy_context.set_moe_output(latent):
-                expert_output = self.experts(routed_input, topk_output)
+            mid = self._rocm_route_mid(router_logits, routed_input)
+            if mid is not None:
+                from sglang.kernels.ops.moe import k3_route_sort_mid
+
+                topk_output, mid_state = mid
+                with k3_route_sort_mid.pending(mid_state), zero_copy_context.set_moe_output(latent):
+                    expert_output = self.experts(routed_input, topk_output)
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
+                with zero_copy_context.set_moe_output(latent):
+                    expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
@@ -1646,6 +1654,76 @@ class KimiK3MoE(nn.Module):
             )
         )
 
+    @cached_property
+    def _rocm_route_mid_ok(self) -> bool:
+        """Static eligibility for the 2-launch top-k + sort + quant routing glue
+        (SGLANG_ROCM_K3_ROUTE_SORT_MID, kernels/ops/moe/k3_route_sort_mid.py):
+        the same routing contract the aiter STANDARD top-k path implements
+        (sigmoid + bias, one group, renormalized weights, scale 1)."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_ROUTE_SORT_MID.get()):
+            return False
+        if not get_moe_runner_backend().is_aiter():
+            return False
+        cfg = self.topk.topk_config
+        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
+            return False
+        if cfg.scoring_func != "sigmoid" or cfg.correction_bias is None:
+            return False
+        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
+            return False
+        if cfg.num_fused_shared_experts != 0 or cfg.custom_routing_function is not None:
+            return False
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if cfg.routed_scaling_factor not in (None, 1.0):
+            return False
+        if cfg.top_k & (cfg.top_k - 1) or cfg.top_k > 64:
+            return False
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            or get_exec().deterministic.enable_deterministic_inference
+        ):
+            return False
+        return True
+
+    def _rocm_route_mid(self, router_logits, routed_input):
+        """Launch A of k3_route_sort_mid (aiter-exact top-k + expert counts +
+        mxfp8 quant) for 16 < M <= SGLANG_ROCM_K3_ROUTE_SORT_MID_MAX_TOKENS;
+        returns (topk_output, state) or None. The patched
+        aiter sort consumes the state (launch B) inside self.experts; run the
+        experts under k3_route_sort_mid.pending(state)."""
+        if not self._rocm_route_mid_ok:
+            return None
+        from sglang.kernels.ops.moe import k3_route_sort_mid
+
+        cfg = self.topk.topk_config
+        m = router_logits.shape[0]
+        e = router_logits.shape[1]
+        if not (
+            m * cfg.top_k > 256
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.stride(1) == 1
+            and routed_input.dtype == torch.bfloat16
+            and routed_input.dim() == 2
+            and routed_input.stride(1) == 1
+            and k3_route_sort_mid.supported(m, cfg.top_k, e, 32, routed_input.shape[1])
+        ):
+            return None
+        topk_ids = torch.empty((m, cfg.top_k), dtype=torch.int32, device=router_logits.device)
+        topk_weights = torch.empty((m, cfg.top_k), dtype=torch.float32, device=router_logits.device)
+        st = k3_route_sort_mid.route_quant(
+            routed_input,
+            k3_route_sort_mid.counts_buffer(router_logits.device, self.layer_idx, e),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            logits=router_logits,
+            correction_bias=cfg.correction_bias,
+            renormalize=cfg.renormalize,
+            routed_scale=1.0,
+        )
+        return build_precomputed_topk_output(topk_weights, topk_ids, cfg, self.layer_idx), st
+
     def _forward_fused_rocm_epi(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -1680,6 +1758,7 @@ class KimiK3MoE(nn.Module):
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
+        mid = None
         if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS or (
             # pre-activated variant beats the situ + GEMM + top-k fallback up
             # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
@@ -1715,9 +1794,19 @@ class KimiK3MoE(nn.Module):
             )
         else:  # larger batches: the tuned hipBLASLt GEMM wins
             self._forward_shared(gate_up, shared_output)
-            topk_output = self.topk(hidden_states, router_logits)
-        with zero_copy_context.set_moe_output(latent):
-            expert_output = self.experts(routed_input, topk_output)
+            mid = self._rocm_route_mid(router_logits, routed_input)
+            if mid is not None:
+                topk_output, mid_state = mid
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
+        if mid is not None:
+            from sglang.kernels.ops.moe import k3_route_sort_mid
+
+            with k3_route_sort_mid.pending(mid_state), zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
+        else:
+            with zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
         buf = tensor_model_parallel_all_reduce(buf)
@@ -1819,7 +1908,20 @@ class KimiK3MoE(nn.Module):
             # graph warm-up: no collective (ranks may warm up unevenly)
             out = torch.empty_like(shared_output)
             return _add3(out.zero_(), shared_output, prefix_sum)
-        out = ca.all_gather_lastdim_add(y, shared_output, prefix_sum)
+        if (
+            envs.SGLANG_ROCM_K3_AG_ONE_BARRIER.get()
+            and getattr(ca, "_IS_CAPTURING", False)
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # same kernel minus its trailing barrier; y is kept alive past the
+            # next collective instead (graph capture only)
+            from sglang.kernels.ops.communication.k3_ag_one_barrier_hip import (
+                all_gather_lastdim_add_1sync,
+            )
+
+            out = all_gather_lastdim_add_1sync(ca, y, shared_output, prefix_sum)
+        else:
+            out = ca.all_gather_lastdim_add(y, shared_output, prefix_sum)
         if envs.SGLANG_ROCM_K3_UPPROJ_AG_CHECK.get() and not torch.cuda.is_current_stream_capturing():
             ref_up, _ = self.routed_expert_up_proj(latent)
             ref = _add3(ref_up, shared_output, prefix_sum)
@@ -3582,9 +3684,15 @@ class KimiK3LinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
-                )
+                if not self._dspark_defer_capture(
+                    i, hidden_states, residual, attn_res, aux_hidden_states, sp_sharded
+                ):
+                    aux_hidden_states.append(
+                        self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                    )
+
+        if attn_res is not None:
+            attn_res.flush_stream()
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3652,6 +3760,41 @@ class KimiK3LinearModel(nn.Module):
         return (
             self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
         )
+
+    def _dspark_defer_capture(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        attn_res: Optional[AttnResidual],
+        aux_hidden_states,
+        sp_sharded: bool,
+    ) -> bool:
+        """SGLANG_ROCM_K3_AGG_SMALLM: instead of a standalone aggregate_stream
+        launch plus the packer's copy, claim the packed aux slot and let the
+        next layer's attention-side aggregation (same stream head, same
+        weights, same rows) write the pre-norm mixture into it in place.
+        Returns False when the capture must run eagerly."""
+        if (
+            attn_res is None
+            or residual is not None
+            or sp_sharded
+            or layer_idx + 1 >= self.end_layer
+            or not isinstance(aux_hidden_states, AuxHiddenStatePacker)
+        ):
+            return False
+        next_layer = self.layers[layer_idx + 1]
+        nvb = next_layer.prev_valid_blocks
+        if not attn_res.can_defer_stream(hidden_states, nvb):
+            return False
+        attn_res.defer_stream(
+            aux_hidden_states.reserve(hidden_states),
+            hidden_states,
+            nvb,
+            next_layer.self_attention_res_proj,
+            next_layer.self_attention_res_norm,
+        )
+        return True
 
     def _dspark_capture_stream(
         self,

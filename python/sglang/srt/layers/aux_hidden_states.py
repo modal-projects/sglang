@@ -50,6 +50,13 @@ class AuxHiddenStatePacker:
         return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
 
     def append(self, hidden: torch.Tensor) -> None:
+        self.reserve(hidden).copy_(hidden)
+
+    def reserve(self, like: torch.Tensor) -> torch.Tensor:
+        """Claim the next capture slot and return it as a (row-strided) view
+        shaped like `like`, for a producer that writes the value in place
+        later in the same forward (no intermediate tensor, no copy)."""
+        hidden = like
         feature_size = int(hidden.shape[-1])
         if self._feature_size is None:
             self._feature_size = feature_size
@@ -62,8 +69,8 @@ class AuxHiddenStatePacker:
                     f"{self._buffer.dtype}, captures need {shape} {hidden.dtype}"
                 )
         start = self._idx * self._feature_size
-        self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
+        return self._buffer[..., start : start + self._feature_size]
 
     def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
         """Write directly to the final packed buffer, without an intermediate copy."""

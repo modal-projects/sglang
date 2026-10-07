@@ -1052,8 +1052,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         if (
-            self._k3_verify_fuse
-            and envs.SGLANG_ROCM_K3_KDA_VERIFY_SKIP_ROWMASK.get()
+            (
+                (self._k3_verify_fuse and envs.SGLANG_ROCM_K3_KDA_VERIFY_SKIP_ROWMASK.get())
+                or envs.SGLANG_ROCM_K3_KDA_SKIP_ROWMASK.get()
+            )
             and not pp_spec_stable_rows_enabled()
         ):
             # The row mask below is only read with PP spec; building it
@@ -1441,10 +1443,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
+        # ReplaySSM ring (no intermediate-ssm cache): the kernel only reads
+        # ssm_states (h0, upcast to fp32 in-kernel, as the unfused
+        # fused_sigmoid_gating_delta_rule_update does), so a bf16 state pool
+        # (--mamba-ssm-dtype bfloat16) is fine there behind
+        # SGLANG_ROCM_K3_KDA_RING_BF16_STATE.
+        ssm_dtype_ok = ssm_states.dtype == torch.float32 or (
+            replayssm_on
+            and hip_ring
+            and ssm_states.dtype in (torch.bfloat16, torch.float16)
+            and envs.SGLANG_ROCM_K3_KDA_RING_BF16_STATE.get()
+        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or ssm_states.dtype != torch.float32
+            or not ssm_dtype_ok
         ):
             return False
         if replayssm_on:

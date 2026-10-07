@@ -958,9 +958,24 @@ class Envs:
     # causal_conv1d_update + fused_sigmoid_gating_delta_rule_update(cache_ring).
     # Also picks 16-wide V tiles from SGLANG_ROCM_K3_KDA_VERIFY_BV16_MIN_BS up.
     SGLANG_ROCM_K3_KDA_FUSED_VERIFY_RING = EnvBool(False)
+    # With SGLANG_ROCM_K3_KDA_FUSED_VERIFY_RING: also take the fused chain-verify
+    # kernel when the SSM state pool is bf16/fp16 (--mamba-ssm-dtype bfloat16, as
+    # every K3 MI355 lane runs). Without it the ring flag is a no-op there: the
+    # dtype gate rejects every launch and verify stays on conv + gating + glue.
+    SGLANG_ROCM_K3_KDA_RING_BF16_STATE = EnvBool(False)
     # Bisect switches for the default pieces of SGLANG_ROCM_K3_KDA_VERIFY_FUSE.
     SGLANG_ROCM_K3_KDA_VERIFY_SKIP_ROWMASK = EnvBool(True)
     SGLANG_ROCM_K3_KDA_VERIFY_STRIDED_ONORM = EnvBool(True)
+    # ROCm K3 target verify: KDA gated o_norm reads the strided g slice of the
+    # in-proj output directly (kda_onorm_gated_strided, in place) instead of a
+    # contiguous gate copy + layer_norm_gated. Only that piece of
+    # SGLANG_ROCM_K3_KDA_VERIFY_FUSE; bit-identical, -1 launch per KDA layer.
+    SGLANG_ROCM_K3_KDA_STRIDED_ONORM = EnvBool(False)
+    # KDA target verify: skip building the `cache_indices >= 0` row mask, whose
+    # result select_verify_intermediate_state_indices discards unless PP spec
+    # stable rows are on (the SKIP_ROWMASK piece of SGLANG_ROCM_K3_KDA_VERIFY_FUSE,
+    # standalone). Identical output by construction; -1 launch per KDA layer.
+    SGLANG_ROCM_K3_KDA_SKIP_ROWMASK = EnvBool(False)
     # Static per-tensor FP8 for K3 dense target linears on ROCm (layers/k3_rocm_dense_fp8.py):
     # off | front (merged MoE front) | wide (front + KDA q/k/v/g). Same knob as the CUDA engine.
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
@@ -989,6 +1004,17 @@ class Envs:
     # ASM decode kernel instead of the bf16 Gluon qlen-8 kernel.
     SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4 = EnvBool(False)
     SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4_MIN_BS = EnvInt(5)
+    # ROCm K3 MLA target_verify v2 (gfx950, 8 drafts, 12 heads, fp8 KV): one
+    # Gluon program per (request, KV split) covers all 8 q_pos x 12 heads, so
+    # the KV is read once; FP8 MFMA (per-row FP8 Q) + LSE-merge reduce
+    # (kernels/ops/attention/k3_mla_verify_v2.py). Takes precedence over the
+    # split-4 / Gluon verify paths when enabled.
+    SGLANG_ROCM_K3_MLA_VERIFY_V2 = EnvBool(False)
+    # ROCm K3 (NoPE MLA, aiter backend) decode / target verify: one Triton launch
+    # builds q = [q_nope_out | q_pe] and writes the latent row into the MLA KV
+    # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x
+    # torch.cat + the cache cast + index_put. Bit-identical; -3 launches per MLA layer.
+    SGLANG_ROCM_K3_MLA_CAT_CACHE = EnvBool(False)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
     # ROCm: avoid host<->device syncs on the extend path (pinned non-blocking copies, CPU chunk indices)

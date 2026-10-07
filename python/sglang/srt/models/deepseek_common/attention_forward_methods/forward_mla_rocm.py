@@ -378,6 +378,53 @@ def _fused_rope_cat_and_cache(
     )
 
 
+_K3_MLA_CAT_CACHE = envs.SGLANG_ROCM_K3_MLA_CAT_CACHE.get()
+
+
+def _k3_mla_cat_cache(
+    attn: DeepseekV2AttentionMLA,
+    q_nope_out: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> Optional[torch.Tensor]:
+    """SGLANG_ROCM_K3_MLA_CAT_CACHE: NoPE MLA (rotary_emb None, e.g. Kimi-K3)
+    decode / target verify on the aiter backend. One Triton launch builds
+    q = [q_nope_out | q_pe] and writes the latent row into the MLA KV cache,
+    replacing two torch.cat + set_kv_buffer's cast + index_put (bit-identical).
+    Returns q, or None when not covered (the caller keeps the unfused path)."""
+    if not (
+        _K3_MLA_CAT_CACHE
+        and attn.rotary_emb is None
+        and attn.current_attention_backend == "aiter"
+        and not get_parallel().dcp_enabled
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+    ):
+        return None
+    from sglang.kernels.ops.attention import k3_mla_cat_cache_hip as cc
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    pool = get_token_to_kv_pool()
+    inner = getattr(pool, "full_kv_pool", pool)
+    if type(inner) is not MLATokenToKVPool or getattr(
+        inner, "dsa_kv_cache_store_fp8", False
+    ):
+        return None
+    if getattr(inner, "requires_physical_write_loc", False) and not getattr(
+        forward_batch, "out_cache_loc_is_physical", False
+    ):
+        return None  # the write door would refuse this loc; keep its error path
+    loc = forward_batch.out_cache_loc
+    kv = pool.get_key_buffer(attn.attn_mqa.layer_id)
+    if not cc.covered(q_nope_out, q_pe, k_nope, k_pe, kv, loc):
+        return None
+    return cc.k3_mla_cat_cache(q_nope_out, q_pe, k_nope, k_pe, kv, loc)
+
+
 def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
@@ -930,6 +977,15 @@ class DeepseekMLARocmForwardMixin:
                     positions,
                     forward_batch.out_cache_loc,
                 )
+                save_kv_cache = False
+            elif (
+                q := _k3_mla_cat_cache(
+                    self, q_nope_out, q_pe, k_nope, k_pe, forward_batch
+                )
+            ) is not None:
+                # KV row already written; the backend only reads k's shape
+                # (qk head dim) on this path, so hand it a [M, 1, D] view.
+                k = q[:, :1, :]
                 save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)

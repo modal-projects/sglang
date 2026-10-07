@@ -2590,8 +2590,19 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_verify_deferred_f_b = False
         if (
             not fused_onorm
-            and verify_fuse
-            and envs.SGLANG_ROCM_K3_KDA_VERIFY_STRIDED_ONORM.get()
+            and (
+                (verify_fuse and envs.SGLANG_ROCM_K3_KDA_VERIFY_STRIDED_ONORM.get())
+                # standalone switch: only the strided-gate o_norm, without the
+                # rest of SGLANG_ROCM_K3_KDA_VERIFY_FUSE
+                or (
+                    _is_hip
+                    and envs.SGLANG_ROCM_K3_KDA_STRIDED_ONORM.get()
+                    and forward_batch.forward_mode.is_target_verify()
+                    and self.o_norm.activation == "sigmoid"
+                    and self.o_norm.weight is not None
+                    and self.o_norm.weight.shape == (core_attn_out.shape[-1],)
+                )
+            )
             and core_attn_out.is_contiguous()
             and g_proj_states.dim() == 2
             and g_proj_states.stride(-1) == 1

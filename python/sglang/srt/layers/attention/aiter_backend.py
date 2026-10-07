@@ -166,6 +166,244 @@ class ForwardMetadata:
     asm_ctx_cu_k: Optional[torch.Tensor] = None
     # (page_indptr, page_ids, last_page_len); None means use the token-level table
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    # MLA target_verify via FP8-Q qseqlen-4 pseudo-requests; see MlaVerifySplit4Planner.
+    mla_verify_split4: Optional["MlaVerifySplit4Metadata"] = None
+
+
+# MLA target_verify split-4: a request with KV length L and 8 query rows becomes
+# two causal pseudo-requests of 4 rows, (rows 0..3, KV L-4) and (rows 4..7, KV L).
+# The kernel's causal mask is anchored at the end of the KV, so row j of the
+# original request sees KV[0 : L - 8 + j + 1] either way. The persistent ASM
+# kernel has FP8-Q/FP8-KV qh16 instantiations for qseqlen 4 but none for 8.
+_MLA_VERIFY_SPLIT4_DRAFT = 8
+_MLA_VERIFY_SPLIT4_QLEN = 4
+_MLA_VERIFY_SPLIT4_NUM_HEAD = 16
+_MLA_VERIFY_SPLIT4_MAX_SPLITS = 32
+
+
+@dataclass
+class MlaVerifySplit4Metadata:
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    kv_last_page_len: torch.Tensor
+    work_metadata: torch.Tensor
+    work_info_set: torch.Tensor
+    work_indptr: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+    num_kv_splits: int
+
+
+class MlaVerifySplit4Planner:
+    """Owns the pseudo-request buffers and persistent metadata for split-4 verify.
+
+    ``growable=False`` keeps every buffer at a fixed address (CUDA graph
+    capture/replay); the eager planner reallocates when a batch outgrows it.
+    """
+
+    def __init__(
+        self,
+        max_bs: int,
+        kv_indices_numel: int,
+        device: torch.device,
+        growable: bool,
+    ):
+        self.device = device
+        self.growable = growable
+        self.max_bs = 0
+        self.kv_indices = torch.zeros(
+            (max(kv_indices_numel, 1),), dtype=torch.int32, device=device
+        )
+        self._alloc(max_bs)
+
+    def _alloc(self, max_bs: int):
+        n = 2 * max_bs
+        self.max_bs = max_bs
+        self.qo_indptr = torch.arange(
+            0,
+            n * _MLA_VERIFY_SPLIT4_QLEN + 1,
+            _MLA_VERIFY_SPLIT4_QLEN,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.kv_indptr = torch.zeros((n + 1,), dtype=torch.int32, device=self.device)
+        self.kv_last_page_len = torch.ones((n,), dtype=torch.int32, device=self.device)
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            n,
+            _MLA_VERIFY_SPLIT4_QLEN,
+            _MLA_VERIFY_SPLIT4_NUM_HEAD,
+            fp8_dtype,
+            fp8_dtype,
+            is_sparse=False,
+            fast_mode=True,
+            num_kv_splits=_MLA_VERIFY_SPLIT4_MAX_SPLITS,
+            intra_batch_mode=False,
+        )
+        dev = self.device
+        self.work_metadata = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=dev
+        )
+        self.work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=dev
+        )
+        self.work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=dev
+        )
+        self.reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=dev
+        )
+        self.reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=dev
+        )
+        self.reduce_partial_map = torch.empty(
+            reduce_partial_map_size, dtype=reduce_partial_map_type, device=dev
+        )
+
+    def plan(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        kv_lens: torch.Tensor,
+        bs: int,
+        kv_lens_sum: Optional[int] = None,
+        num_token_blocks: int = 1,
+    ) -> MlaVerifySplit4Metadata:
+        """kv_lens: per-request KV length including the 8 draft tokens.
+        kv_lens_sum (host) is None at graph capture, where seq_lens are dummies."""
+        if bs > self.max_bs:
+            assert self.growable, (
+                f"split-4 verify planner sized for bs {self.max_bs}, got {bs}"
+            )
+            self._alloc(bs)
+        n = 2 * bs
+        if kv_lens_sum is not None:
+            needed = 2 * kv_lens_sum - _MLA_VERIFY_SPLIT4_QLEN * bs
+            if self.growable and needed > self.kv_indices.numel():
+                self.kv_indices = torch.zeros(
+                    (needed,), dtype=torch.int32, device=self.device
+                )
+            assert_buffer_fits(
+                needed,
+                self.kv_indices.numel(),
+                "aiter split-4 target_verify kv_indices",
+                bs=bs,
+                seq_lens_sum=kv_lens_sum,
+            )
+
+        kv_lens = kv_lens[:bs].to(torch.int32)
+        pseudo_kv_lens = torch.stack(
+            (kv_lens - _MLA_VERIFY_SPLIT4_QLEN, kv_lens), dim=1
+        ).view(-1)
+        kv_indptr = self.kv_indptr[: n + 1]
+        kv_indptr[1:] = torch.cumsum(pseudo_kv_lens, dim=0)
+        create_flashinfer_kv_indices_triton[(n, num_token_blocks)](
+            req_to_token,
+            req_pool_indices[:bs].repeat_interleave(2),
+            pseudo_kv_lens,
+            kv_indptr,
+            None,
+            self.kv_indices,
+            req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+        )
+
+        qo_indptr = self.qo_indptr[: n + 1]
+        kv_last_page_len = self.kv_last_page_len[:n]
+        get_mla_metadata_v1(
+            qo_indptr,
+            kv_indptr,
+            kv_last_page_len,
+            _MLA_VERIFY_SPLIT4_NUM_HEAD,
+            1,
+            True,
+            self.work_metadata,
+            self.work_info_set,
+            self.work_indptr,
+            self.reduce_indptr,
+            self.reduce_final_map,
+            self.reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=_MLA_VERIFY_SPLIT4_QLEN,
+            uni_seqlen_qo=_MLA_VERIFY_SPLIT4_QLEN,
+            fast_mode=True,
+            max_split_per_batch=_MLA_VERIFY_SPLIT4_MAX_SPLITS,
+            intra_batch_mode=False,
+            dtype_q=fp8_dtype,
+            dtype_kv=fp8_dtype,
+        )
+        return MlaVerifySplit4Metadata(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=self.kv_indices,
+            kv_last_page_len=kv_last_page_len,
+            work_metadata=self.work_metadata,
+            work_info_set=self.work_info_set,
+            work_indptr=self.work_indptr,
+            reduce_indptr=self.reduce_indptr,
+            reduce_final_map=self.reduce_final_map,
+            reduce_partial_map=self.reduce_partial_map,
+            num_kv_splits=_MLA_VERIFY_SPLIT4_MAX_SPLITS,
+        )
+
+
+def mla_verify_split4_decode(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    meta: MlaVerifySplit4Metadata,
+    *,
+    num_head: int,
+    v_head_dim: int,
+    sm_scale: float,
+    kv_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """q: [8 * bs, num_head, 576] bf16 in request-major order (also pseudo-major).
+    Returns [8 * bs, num_head, v_head_dim]."""
+    qk_head_dim = k_buffer.shape[-1]
+    q = q.view(-1, num_head, qk_head_dim)
+    num_tokens = q.shape[0]
+    q_pad = q.new_zeros((num_tokens, _MLA_VERIFY_SPLIT4_NUM_HEAD, qk_head_dim))
+    q_pad[:, :num_head, :] = q
+    # Dynamic per-tensor scale (amax / fp8 max) stays on device.
+    q_fp8, q_scale = scaled_fp8_quant(q_pad.view(-1, qk_head_dim))
+    o = q.new_empty(
+        (num_tokens, _MLA_VERIFY_SPLIT4_NUM_HEAD, v_head_dim), dtype=out_dtype
+    )
+    mla_decode_fwd(
+        q_fp8.view(num_tokens, _MLA_VERIFY_SPLIT4_NUM_HEAD, qk_head_dim),
+        k_buffer.view(-1, 1, 1, qk_head_dim),
+        o,
+        meta.qo_indptr,
+        meta.kv_indptr,
+        meta.kv_indices,
+        meta.kv_last_page_len,
+        _MLA_VERIFY_SPLIT4_QLEN,
+        page_size=1,
+        nhead_kv=1,
+        sm_scale=sm_scale,
+        num_kv_splits=meta.num_kv_splits,
+        work_meta_data=meta.work_metadata,
+        work_indptr=meta.work_indptr,
+        work_info_set=meta.work_info_set,
+        reduce_indptr=meta.reduce_indptr,
+        reduce_final_map=meta.reduce_final_map,
+        reduce_partial_map=meta.reduce_partial_map,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        intra_batch_mode=False,
+        causal=True,
+    )
+    return o[:, :num_head, :]
 
 
 def _build_paged_kv_view(
@@ -493,6 +731,11 @@ class AiterAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
+        self.use_mla_verify_split4 = False
+        self._mla_verify_split4_eager: Optional[MlaVerifySplit4Planner] = None
+        self._mla_verify_split4_graph: Optional[MlaVerifySplit4Planner] = None
+        self._mla_verify_split4_graph_max_bs = 0
+
         if self.use_mla:
             _mla_low_head_repeat = (4, 8)
             _mla_low_head_zero_pad = (12,)
@@ -587,6 +830,22 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+            # Independent of _use_mla_ps_kernel, which the Gluon preference
+            # turns off for this exact topology.
+            self.use_mla_verify_split4 = (
+                envs.SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4.get()
+                and is_gfx95_supported()
+                and self.dcp_world_size <= 1
+                and self.head_pad_mode == "zero"
+                and self.mla_kernel_num_head_padded == _MLA_VERIFY_SPLIT4_NUM_HEAD
+                and self.kv_cache_dtype == fp8_dtype
+                and self.num_draft_tokens == _MLA_VERIFY_SPLIT4_DRAFT
+            )
+            if self.use_mla_verify_split4:
+                logger.info(
+                    "aiter MLA target_verify: FP8-Q split-4 persistent ASM path enabled"
+                )
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -1158,6 +1417,63 @@ class AiterAttnBackend(AttentionBackend):
             )
         return self._kv_indices_scratch[:required_tokens]
 
+    def _plan_mla_verify_split4(
+        self,
+        req_pool_indices: torch.Tensor,
+        kv_lens: torch.Tensor,
+        bs: int,
+        kv_lens_sum: Optional[int],
+        draft_num: int,
+        for_graph: bool,
+    ) -> Optional[MlaVerifySplit4Metadata]:
+        """Split-4 metadata for an MLA target_verify batch, or None when the
+        path does not apply. kv_lens include the draft tokens."""
+        if not self.use_mla_verify_split4 or draft_num != _MLA_VERIFY_SPLIT4_DRAFT:
+            return None
+        if bs < envs.SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4_MIN_BS.get():
+            # small batches: the bf16 Gluon kernel wins (23us vs 60us at 1x20k)
+            return None
+        if for_graph:
+            # Allocated on the first verify capture so draft-side backends
+            # that never verify do not pay for the 2x kv_indices buffer.
+            if self._mla_verify_split4_graph is None:
+                max_bs = self._mla_verify_split4_graph_max_bs
+                self._mla_verify_split4_graph = MlaVerifySplit4Planner(
+                    max_bs,
+                    2 * max_bs * (self.max_context_len + _MLA_VERIFY_SPLIT4_DRAFT),
+                    self.device,
+                    growable=False,
+                )
+            planner = self._mla_verify_split4_graph
+        else:
+            if self._mla_verify_split4_eager is None:
+                self._mla_verify_split4_eager = MlaVerifySplit4Planner(
+                    bs, 0, self.device, growable=True
+                )
+            planner = self._mla_verify_split4_eager
+        return planner.plan(
+            self.req_to_token,
+            req_pool_indices,
+            kv_lens,
+            bs,
+            kv_lens_sum=kv_lens_sum,
+            num_token_blocks=self._kv_index_blocks(2 * bs),
+        )
+
+    def _forward_mla_verify_split4(
+        self, q: torch.Tensor, layer: RadixAttention, k_descale
+    ) -> torch.Tensor:
+        return mla_verify_split4_decode(
+            q,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.forward_metadata.mla_verify_split4,
+            num_head=layer.tp_q_head_num,
+            v_head_dim=layer.v_head_dim,
+            sm_scale=layer.scaling,
+            kv_scale=k_descale if k_descale is not None else self.k_scale,
+            out_dtype=self.input_dtype,
+        )
+
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
     ):
@@ -1329,6 +1645,9 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         k_descale,
     ):
+        if self.forward_metadata.mla_verify_split4 is not None:
+            return self._forward_mla_verify_split4(q, layer, k_descale)
+
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
@@ -1953,7 +2272,22 @@ class AiterAttnBackend(AttentionBackend):
                         (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
                     )
 
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                mla_verify_split4 = None
+                if self.dcp_world_size <= 1:
+                    mla_verify_split4 = self._plan_mla_verify_split4(
+                        forward_batch.req_pool_indices,
+                        kv_lens,
+                        bs,
+                        kv_lens_sum,
+                        draft_num,
+                        for_graph=False,
+                    )
+
+                if (
+                    _use_mla_ps_kernel
+                    and self.dcp_world_size <= 1
+                    and mla_verify_split4 is None
+                ):
                     max_seqlen_qo = draft_num
                     (
                         work_metadata,
@@ -2000,6 +2334,7 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    mla_verify_split4=mla_verify_split4,
                 )
             else:
                 draft_num = forward_batch.input_ids.shape[0] // bs
@@ -2352,6 +2687,9 @@ class AiterAttnBackend(AttentionBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
+        # Split-4 verify buffers are created at the first verify capture.
+        self._mla_verify_split4_graph = None
+        self._mla_verify_split4_graph_max_bs = max_bs
         if self.use_mla and self.dcp_world_size > 1:
             if self.num_draft_tokens:
                 # Target-verify flattens the window into single-token rows, so it
@@ -2735,7 +3073,26 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and self.dcp_world_size <= 1:
+                mla_verify_split4 = None
+                if self.dcp_world_size <= 1:
+                    # Static planner: refreshed in place here before each replay.
+                    mla_verify_split4 = self._plan_mla_verify_split4(
+                        req_pool_indices,
+                        kv_lens,
+                        bs,
+                        (
+                            None
+                            if seq_lens_sum is None
+                            else seq_lens_sum + self.num_draft_tokens * bs
+                        ),
+                        self.num_draft_tokens,
+                        for_graph=True,
+                    )
+                if (
+                    _use_mla_ps_kernel
+                    and self.dcp_world_size <= 1
+                    and mla_verify_split4 is None
+                ):
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2778,6 +3135,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                     local_kv_lens=local_kv_lens,
                     verify_token_table=verify_token_table,
+                    mla_verify_split4=mla_verify_split4,
                 )
             else:
                 max_q_len = verify_tokens_per_req
@@ -3344,6 +3702,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.forward_metadata.mla_verify_split4 is not None:
+                    return self._forward_mla_verify_split4(q, layer, k_descale)
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),

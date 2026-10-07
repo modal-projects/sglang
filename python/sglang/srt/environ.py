@@ -943,12 +943,21 @@ class Envs:
     SGLANG_ROCM_TRITON_ROUTE = EnvBool(True)
     # ROCm K3: run the shared expert on a side stream, overlapping the routed experts
     SGLANG_ROCM_K3_SHARED_OVERLAP = EnvBool(False)
+    # ROCm K3 MLA target_verify (8 drafts, h12->qh16, fp8 KV): FP8 query, each
+    # request split into two causal qseqlen-4 pseudo-requests on the persistent
+    # ASM decode kernel instead of the bf16 Gluon qlen-8 kernel.
+    SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4 = EnvBool(False)
+    SGLANG_ROCM_K3_MLA_VERIFY_FP8Q_SPLIT4_MIN_BS = EnvInt(5)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
     # Online-FP8 draft activation scheme (B300 engine: --speculative-draft-fp8-activation-scheme)
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     SGLANG_ROCM_K3_UPPROJ_AG_MAX_TOKENS = EnvInt(128)
     SGLANG_ROCM_K3_UPPROJ_AG_CHECK = EnvBool(False)
+    # ROCm K3 prefill: pipeline attention/MoE all-reduces against compute over token chunks
+    SGLANG_ROCM_K3_AR_PIPE = EnvBool(False)
+    SGLANG_ROCM_K3_AR_PIPE_MIN_TOKENS = EnvInt(1024)
+    SGLANG_ROCM_K3_AR_PIPE_CHUNKS = EnvInt(4)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

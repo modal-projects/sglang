@@ -1046,7 +1046,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update the layer with the new values.
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer.input_scale = None
+                # Online-quantized draft with a static activation scheme: a
+                # fixed 1.0 activation scale (saturating cast), as the B300
+                # engine's --speculative-draft-fp8-activation-scheme static.
+                layer.input_scale = (
+                    Parameter(
+                        torch.ones(1, device=layer.weight.device, dtype=torch.float32),
+                        requires_grad=False,
+                    )
+                    if getattr(self.quant_config, "online_static_input", False)
+                    and weight_scale.numel() == 1
+                    else None
+                )
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module

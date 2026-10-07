@@ -438,7 +438,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
-            and verify_backend.is_triton()
+            # nv_cutedsl resolves to the Triton verify kernel off CUDA
+            and (
+                verify_backend.is_triton()
+                or (not is_cuda() and verify_backend.is_nv_cutedsl())
+            )
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
             from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (

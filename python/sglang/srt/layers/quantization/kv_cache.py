@@ -81,3 +81,9 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+    def process_weights_after_weight_commit(self, layer) -> None:
+        self.process_weights_after_loading(layer)
+
+    def weight_staging_postprocess_device(self, layer: torch.nn.Module) -> str:
+        return "cpu"

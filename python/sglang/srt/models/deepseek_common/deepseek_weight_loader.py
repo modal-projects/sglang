@@ -41,6 +41,8 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
+    STABLE_WEIGHT_SOURCE_ATTR,
+    DeferredWeightCopyBatch,
     maybe_executor_submit,
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
@@ -70,6 +72,26 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
+def _normalize_modelopt_fp4_expert_weight(
+    name: str,
+    weight: torch.Tensor,
+) -> Tuple[str, torch.Tensor]:
+    if name.endswith(".weight_scale_inv"):
+        name = name.removesuffix("weight_scale_inv") + "weight_scale"
+    elif name.endswith(".weight_scale_global"):
+        name = name.removesuffix("weight_scale_global") + "weight_scale_2"
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None and weight.dtype == fp4_dtype:
+        packed_weight = weight.view(torch.uint8)
+        for attr in (STABLE_WEIGHT_SOURCE_ATTR, RUNAI_STREAMER_TENSOR_ATTR):
+            if getattr(weight, attr, False):
+                setattr(packed_weight, attr, True)
+        weight = packed_weight
+
+    return name, weight
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -249,6 +271,9 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -264,6 +289,31 @@ class DeepseekV2WeightLoaderMixin:
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
+            deferred_copies = DeferredWeightCopyBatch()
+
+            def submit_weight_load(
+                *,
+                use_async: bool,
+                func,
+                func_args,
+                func_kwargs=None,
+            ) -> None:
+                if func_kwargs is None:
+                    func_kwargs = {}
+                if deferred_copies.defer(func, *func_args, **func_kwargs):
+                    return
+                # Preserve native loader order when stable canonical tensors and
+                # ephemeral streamed tensors occur in the same load sequence.
+                deferred_copies.execute(executor=executor)
+                maybe_executor_submit(
+                    executor=executor,
+                    futures=futures,
+                    use_async=use_async,
+                    func=func,
+                    func_args=func_args,
+                    func_kwargs=func_kwargs,
+                )
+
             params_dict = dict(self.named_parameters())
             indexer_present_prefixes = {
                 n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
@@ -286,6 +336,14 @@ class DeepseekV2WeightLoaderMixin:
                     name = name.replace(
                         "mlp.shared_experts",
                         f"mlp.experts.{self.config.n_routed_experts}",
+                    )
+                if (
+                    self.quant_config is not None
+                    and self.quant_config.get_name() == "modelopt_fp4"
+                    and ".mlp.experts." in name
+                ):
+                    name, loaded_weight = _normalize_modelopt_fp4_expert_weight(
+                        name, loaded_weight
                     )
 
                 weight_names.append(name)
@@ -363,16 +421,18 @@ class DeepseekV2WeightLoaderMixin:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    maybe_executor_submit(
-                        executor=executor,
-                        futures=futures,
+                    submit_weight_load(
                         use_async=use_async_loading,
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in FusedMoE.get_expert_params_mapping_candidates(
+                        name,
+                        expert_params_mapping,
+                        expert_params_mapping_by_expert,
+                    ):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -383,9 +443,7 @@ class DeepseekV2WeightLoaderMixin:
                             continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
+                        submit_weight_load(
                             use_async=use_async_loading,
                             func=weight_loader,
                             func_args=(
@@ -466,9 +524,7 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                maybe_executor_submit(
-                                    executor=executor,
-                                    futures=futures,
+                                submit_weight_load(
                                     use_async=use_async_loading,
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
@@ -496,9 +552,7 @@ class DeepseekV2WeightLoaderMixin:
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            maybe_executor_submit(
-                                executor=executor,
-                                futures=futures,
+                            submit_weight_load(
                                 use_async=use_async_loading,
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
@@ -507,6 +561,7 @@ class DeepseekV2WeightLoaderMixin:
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+            deferred_copies.execute(executor=executor)
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
@@ -682,7 +737,12 @@ class DeepseekV2WeightLoaderMixin:
                         w, scale = block_quant_to_tensor_quant(
                             weight, weight_scale, weight_block_size
                         )
-                        self_attn.w_scale = scale
+                        self_attn.w_scale = bind_or_assign(
+                            self_attn.w_scale
+                            if isinstance(self_attn.w_scale, torch.Tensor)
+                            else None,
+                            scale,
+                        )
                 else:
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -699,7 +759,12 @@ class DeepseekV2WeightLoaderMixin:
                             weight_scale = weight_scale.view(-1, 1)
 
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    self_attn.w_scale = bind_or_assign(
+                        self_attn.w_scale
+                        if isinstance(self_attn.w_scale, torch.Tensor)
+                        else None,
+                        scale,
+                    )
 
             if w.dtype == torch.int8:
                 weight_block_size = (

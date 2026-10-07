@@ -131,6 +131,9 @@ class Glm4MoeLiteModelNextN(nn.Module):
 
 
 class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
+    # The draft loads the NextN tensors excluded by the target.
+    checkpoint_name_mapper = None
+
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "Glm4MoeLiteForCausalLMNextN"
 

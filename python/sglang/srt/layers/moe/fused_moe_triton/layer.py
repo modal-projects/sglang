@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import concurrent.futures
 import logging
+import os
 from enum import Enum
 from functools import cached_property
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -99,6 +101,27 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
 _deferred_finalize_info_logged = False
+
+
+def _deferred_weight_copy_workers() -> int:
+    """Divide host CPUs among local model workers unless affinity already does."""
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available_cpus = os.cpu_count() or 1
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        return available_cpus
+    if not torch.distributed.is_initialized():
+        return available_cpus
+
+    parallel = get_parallel()
+    world_group = parallel.world_group
+    local_model_workers = world_group.local_size or (
+        world_group.world_size // parallel.nnodes
+    )
+    if not parallel.enable_dp_attention:
+        local_model_workers *= parallel.dp_size
+    return max(available_cpus // local_model_workers, 1)
 
 
 def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
@@ -646,6 +669,126 @@ class FusedMoE(torch.nn.Module):
 
         return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
 
+    def _copy_loaded_weight(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+    ) -> None:
+        pending = getattr(self, "_deferred_weight_copies", None)
+        if pending is None:
+            target.copy_(source)
+        else:
+            pending.append((target, source))
+
+    def supports_deferred_weight_copies(self) -> bool:
+        method = self.scheme if self.scheme is not None else self.quant_method
+        supports_deferral = getattr(method, "supports_deferred_weight_copies", None)
+        return callable(supports_deferral) and supports_deferral()
+
+    @staticmethod
+    def _execute_weight_copies(
+        copies: List[Tuple[torch.Tensor, torch.Tensor]],
+        *,
+        executor: concurrent.futures.Executor | None,
+    ) -> None:
+        ranges_by_storage: Dict[Tuple[Any, int, int], List[Tuple[bool, int, int]]] = {}
+        for target, _ in copies:
+            storage = target.untyped_storage()
+            key = (target.device, storage.data_ptr(), storage.nbytes())
+            ranges_by_storage.setdefault(key, []).append(
+                (
+                    target.is_contiguous(),
+                    target.data_ptr(),
+                    target.data_ptr() + target.numel() * target.element_size(),
+                )
+            )
+
+        ordered_storage = set()
+        for key, entries in ranges_by_storage.items():
+            if any(not contiguous for contiguous, _, _ in entries):
+                ordered_storage.add(key)
+                continue
+            ranges = sorted((begin, end) for _, begin, end in entries if begin < end)
+            if any(
+                current[0] < previous[1]
+                for previous, current in zip(ranges, ranges[1:])
+            ):
+                ordered_storage.add(key)
+
+        independent = []
+        ordered = []
+        for target, source in copies:
+            storage = target.untyped_storage()
+            key = (target.device, storage.data_ptr(), storage.nbytes())
+            (ordered if key in ordered_storage else independent).append(
+                (target, source)
+            )
+
+        def copy_group(group: List[Tuple[torch.Tensor, torch.Tensor]]) -> None:
+            compatible: Dict[
+                Tuple[torch.device, torch.device, torch.dtype, torch.dtype],
+                Tuple[List[torch.Tensor], List[torch.Tensor]],
+            ] = {}
+            for target, source in group:
+                key = (target.device, source.device, target.dtype, source.dtype)
+                targets, sources = compatible.setdefault(key, ([], []))
+                targets.append(target)
+                sources.append(source)
+            for targets, sources in compatible.values():
+                torch._foreach_copy_(targets, sources)
+
+        if independent:
+            workers = (
+                1
+                if executor is None
+                else min(_deferred_weight_copy_workers(), len(independent))
+            )
+            if workers == 1:
+                copy_group(independent)
+            else:
+                chunks: List[List[Tuple[torch.Tensor, torch.Tensor]]] = [
+                    [] for _ in range(workers)
+                ]
+                chunk_bytes = [0] * workers
+                by_size = sorted(
+                    independent,
+                    key=lambda pair: pair[0].numel() * pair[0].element_size(),
+                    reverse=True,
+                )
+                for pair in by_size:
+                    chunk_index = min(range(workers), key=chunk_bytes.__getitem__)
+                    chunks[chunk_index].append(pair)
+                    chunk_bytes[chunk_index] += pair[0].numel() * pair[0].element_size()
+                futures = [
+                    executor.submit(copy_group, chunk) for chunk in chunks if chunk
+                ]
+                for future in futures:
+                    future.result()
+
+        for target, source in ordered:
+            target.copy_(source)
+
+    def load_weights_batched(
+        self,
+        calls: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+        *,
+        executor: concurrent.futures.Executor | None = None,
+    ) -> None:
+        """Run native loader decisions, then batch independent physical copies."""
+        if not self.supports_deferred_weight_copies():
+            raise RuntimeError("deferred FusedMoE weight copies are not supported")
+        if getattr(self, "_deferred_weight_copies", None) is not None:
+            raise RuntimeError("nested deferred FusedMoE copies are not supported")
+
+        pending: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._deferred_weight_copies = pending
+        try:
+            for args, kwargs in calls:
+                self.weight_loader(*args, **kwargs)
+            self._execute_weight_copies(pending, executor=executor)
+        finally:
+            self._deferred_weight_copies = None
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -660,12 +803,12 @@ class FusedMoE(torch.nn.Module):
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
             if self.moe_runner_config.is_gated:
-                param_data[expert_id][idx] = loaded_weight
+                self._copy_loaded_weight(param_data[expert_id][idx], loaded_weight)
             else:
-                param_data[expert_id] = loaded_weight
+                self._copy_loaded_weight(param_data[expert_id], loaded_weight)
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
-            param_data[expert_id] = loaded_weight
+            self._copy_loaded_weight(param_data[expert_id], loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -707,8 +850,9 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
-            expert_data.copy_(loaded_weight)
+            if expert_data.device.type != "cpu":
+                loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+            self._copy_loaded_weight(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -786,7 +930,8 @@ class FusedMoE(torch.nn.Module):
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
 
-        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+        if expert_data.device.type != "cpu":
+            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
         # the buffer is padded.  Copy into the leading slice and leave the
         # trailing padding as zeros.  Rank-mismatched tensors (bias / scalar
@@ -796,11 +941,10 @@ class FusedMoE(torch.nn.Module):
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            expert_data = expert_data.narrow(
+                shard_dim, 0, loaded_weight.shape[shard_dim]
             )
-        else:
-            expert_data.copy_(loaded_weight)
+        self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -873,7 +1017,8 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+        if expert_data.device.type != "cpu":
+            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
         # the buffer is padded.  Copy into the leading slice only.  See the
         # rank-mismatch note in _load_w13.
@@ -882,11 +1027,10 @@ class FusedMoE(torch.nn.Module):
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            expert_data = expert_data.narrow(
+                shard_dim, 0, loaded_weight.shape[shard_dim]
             )
-        else:
-            expert_data.copy_(loaded_weight)
+        self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -981,7 +1125,7 @@ class FusedMoE(torch.nn.Module):
         param_data = param.data
 
         # Input scales can be loaded directly and should be equal.
-        param_data[expert_id] = loaded_weight
+        self._copy_loaded_weight(param_data[expert_id], loaded_weight)
 
     def _load_g_idx(
         self,
@@ -1001,7 +1145,7 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             assert shard_id in ("w1", "w3")
-            expert_data.copy_(loaded_weight)
+            self._copy_loaded_weight(expert_data, loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         start_idx = self._expert_storage_rank * self._num_local_routed
@@ -1031,11 +1175,11 @@ class FusedMoE(torch.nn.Module):
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                self._copy_loaded_weight(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                self._copy_loaded_weight(param.data[:, :dim1, :dim2], loaded_weight)
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
@@ -1673,6 +1817,38 @@ class FusedMoE(torch.nn.Module):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
+
+    @staticmethod
+    def index_expert_params_mapping(
+        mappings: List[Tuple[str, str, int, str]],
+    ) -> Dict[int, List[Tuple[str, str, int, str]]]:
+        """Index checkpoint mappings so one expert does not scan every expert."""
+
+        result: Dict[int, List[Tuple[str, str, int, str]]] = {}
+        for mapping in mappings:
+            result.setdefault(mapping[2], []).append(mapping)
+        return result
+
+    @staticmethod
+    def get_expert_params_mapping_candidates(
+        name: str,
+        mappings: List[Tuple[str, str, int, str]],
+        mappings_by_expert: Dict[int, List[Tuple[str, str, int, str]]],
+    ) -> List[Tuple[str, str, int, str]]:
+        """Return only mappings for the explicit expert in a checkpoint name."""
+
+        marker = ".experts."
+        marker_start = name.find(marker)
+        if marker_start >= 0:
+            expert_start = marker_start + len(marker)
+        elif name.startswith("experts."):
+            expert_start = len("experts.")
+        else:
+            return mappings
+        expert = name[expert_start:].partition(".")[0]
+        if not expert.isdigit():
+            return mappings
+        return mappings_by_expert.get(int(expert), [])
 
     @classmethod
     def make_expert_params_mapping_fused(

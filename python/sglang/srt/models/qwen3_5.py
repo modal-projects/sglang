@@ -16,6 +16,7 @@
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -95,6 +96,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_loader.utils import DeferredWeightCopyBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -2245,9 +2247,24 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+_QWEN3_5_CHECKPOINT_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "attn.qkv.": "attn.qkv_proj.",
+    },
+    orig_to_new_prefix={
+        "mtp.": None,
+        "model.language_model.mtp.": None,
+        "model.mtp.": None,
+        "model.language_model.": "model.",
+        "model.visual.": "visual.",
+    },
+)
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    checkpoint_name_mapper = _QWEN3_5_CHECKPOINT_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -2411,6 +2428,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    checkpoint_name_mapper = _QWEN3_5_CHECKPOINT_NAME_MAPPER
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -2563,6 +2581,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 ),
             ]
 
+        deferred_copies = DeferredWeightCopyBatch()
+
+        def load_weight(weight_loader, *args, **kwargs) -> None:
+            if not deferred_copies.defer(weight_loader, *args, **kwargs):
+                deferred_copies.execute()
+                weight_loader(*args, **kwargs)
+
         def load_fused_expert_weights(
             name: str,
             params_dict: dict,
@@ -2577,7 +2602,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
                 curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
+                load_weight(
+                    weight_loader,
                     param,
                     curr_expert_weight,
                     name,
@@ -2657,7 +2683,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                load_weight(weight_loader, param, loaded_weight, shard_id)
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -2713,7 +2739,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 # split into w1 and w3
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
                                 # load to experts.w13_weight, shard_id = w1, expert_id = 512
-                                weight_loader(
+                                load_weight(
+                                    weight_loader,
                                     param,
                                     loaded_weight[0],
                                     name_mapped,
@@ -2721,7 +2748,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     expert_id,
                                 )
                                 # load to experts.w13_weight, shard_id = w3, expert_id = 512
-                                weight_loader(
+                                load_weight(
+                                    weight_loader,
                                     param,
                                     loaded_weight[1],
                                     name_mapped,
@@ -2731,7 +2759,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             else:
                                 # load down_proj to experts.w2_weight, shard_id = w2, expert_id = 512
                                 # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = 512
-                                weight_loader(
+                                load_weight(
+                                    weight_loader,
                                     param,
                                     loaded_weight,
                                     name_mapped,
@@ -2750,7 +2779,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
                         weight_loader = param.weight_loader
-                        weight_loader(
+                        load_weight(
+                            weight_loader,
                             param,
                             loaded_weight,
                             name_mapped,
@@ -2778,10 +2808,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight)
+                        load_weight(weight_loader, param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+
+        with ThreadPoolExecutor() as executor:
+            deferred_copies.execute(executor=executor)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {

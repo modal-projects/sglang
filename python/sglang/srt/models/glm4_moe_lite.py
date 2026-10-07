@@ -75,6 +75,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
@@ -842,6 +843,20 @@ class Glm4MoeLiteModel(nn.Module):
 class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
     packed_modules_mapping = {}
+
+    @property
+    def checkpoint_name_mapper(self) -> WeightsMapper:
+        """Exclude NextN tensors that the target's native loader skips."""
+        return WeightsMapper(
+            orig_to_new_prefix={
+                f"model.layers.{layer_id}.": None
+                for layer_id in range(
+                    self.config.num_hidden_layers,
+                    self.config.num_hidden_layers
+                    + getattr(self.config, "num_nextn_predict_layers", 0),
+                )
+            }
+        )
 
     def __init__(
         self,

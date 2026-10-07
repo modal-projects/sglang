@@ -76,6 +76,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_weight_update_staging,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
@@ -286,6 +287,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_hook(validate_weight_update_staging, server_args)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 

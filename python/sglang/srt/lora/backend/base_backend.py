@@ -219,9 +219,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        if moe_layer._lora_runner_backend.is_marlin():
+            N = 2 * base.intermediate_size_per_partition
+            hidden_dim = base.hidden_size
+        else:
+            _, N, _ = qinfo.w13_weight.shape
+            hidden_dim = qinfo.w2_weight.shape[1]
+        device = self.device
         dtype = compute_dtype
         num_experts = base.num_experts
 

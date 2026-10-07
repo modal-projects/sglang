@@ -1024,6 +1024,13 @@ class Envs:
     # 4-warp stage 1 above; 128-token min split. Takes precedence over v2.
     SGLANG_ROCM_K3_MLA_VERIFY_V3 = EnvBool(False)
     SGLANG_ROCM_K3_MLA_VERIFY_V3_W8_MAX_BS = EnvInt(2)
+    # ROCm K3 MLA target_verify auto (kernels/ops/attention/k3_mla_verify_auto.py):
+    # one graph-capturable op = one stage-1 launch whose programs run either the
+    # bf16 Gluon qlen-8 body (copied from aiter mla_gluon) or the v2 body, plus
+    # one shared reduce. The regime (Gluon at short context / small batch, v2
+    # otherwise) is picked on the GPU from bs * max(kv_len) at replay time, so
+    # the cost is min(gluon, v2) + ~0-2us. Takes precedence over v2/v3.
+    SGLANG_ROCM_K3_MLA_VERIFY_AUTO = EnvBool(False)
     # ROCm K3 (NoPE MLA, aiter backend) decode / target verify: one Triton launch
     # builds q = [q_nope_out | q_pe] and writes the latent row into the MLA KV
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x

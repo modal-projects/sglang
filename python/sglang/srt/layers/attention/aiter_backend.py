@@ -733,6 +733,8 @@ class AiterAttnBackend(AttentionBackend):
 
         self.use_mla_verify_split4 = False
         self.use_mla_verify_v2 = False
+        self.use_mla_verify_v3 = False
+        self.mla_verify_v3_w8_max_bs = 2
         self.mla_verify_v2_min_bs = 1
         self._mla_verify_split4_eager: Optional[MlaVerifySplit4Planner] = None
         self._mla_verify_split4_graph: Optional[MlaVerifySplit4Planner] = None
@@ -848,8 +850,10 @@ class AiterAttnBackend(AttentionBackend):
                 logger.info(
                     "aiter MLA target_verify: FP8-Q split-4 persistent ASM path enabled"
                 )
+            self.use_mla_verify_v3 = envs.SGLANG_ROCM_K3_MLA_VERIFY_V3.get()
+            self.mla_verify_v3_w8_max_bs = envs.SGLANG_ROCM_K3_MLA_VERIFY_V3_W8_MAX_BS.get()
             self.use_mla_verify_v2 = (
-                envs.SGLANG_ROCM_K3_MLA_VERIFY_V2.get()
+                (envs.SGLANG_ROCM_K3_MLA_VERIFY_V2.get() or self.use_mla_verify_v3)
                 and is_gfx95_supported()
                 and self.dcp_world_size <= 1
                 and self.kv_cache_dtype == fp8_dtype
@@ -857,9 +861,11 @@ class AiterAttnBackend(AttentionBackend):
                 and getattr(self, "num_head", None) == 12
             )
             self.mla_verify_v2_min_bs = envs.SGLANG_ROCM_K3_MLA_VERIFY_V2_MIN_BS.get()
+            self.use_mla_verify_v3 = self.use_mla_verify_v3 and self.use_mla_verify_v2
             if self.use_mla_verify_v2:
                 logger.info(
-                    "aiter MLA target_verify: k3_mla_verify_v2 (read-KV-once FP8) enabled"
+                    "aiter MLA target_verify: k3_mla_verify_%s (read-KV-once FP8) enabled",
+                    "v3" if self.use_mla_verify_v3 else "v2",
                 )
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -1480,19 +1486,28 @@ class AiterAttnBackend(AttentionBackend):
     def _forward_mla_verify_v2(
         self, q: torch.Tensor, layer: RadixAttention, k_descale
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.k3_mla_verify_v2 import k3_mla_verify_v2
-
-        return k3_mla_verify_v2(
+        args = (
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             layer.scaling,
             k_descale if k_descale is not None else self.k_scale,
+        )
+        kwargs = dict(
             num_heads=layer.tp_q_head_num,
             qlen=self.num_draft_tokens,
             v_head_dim=layer.v_head_dim,
         )
+        if getattr(self, "use_mla_verify_v3", False):
+            from sglang.kernels.ops.attention.k3_mla_verify_v3 import k3_mla_verify_v3
+
+            return k3_mla_verify_v3(
+                *args, w8_max_bs=self.mla_verify_v3_w8_max_bs, **kwargs
+            )
+        from sglang.kernels.ops.attention.k3_mla_verify_v2 import k3_mla_verify_v2
+
+        return k3_mla_verify_v2(*args, **kwargs)
 
     def _forward_mla_verify_split4(
         self, q: torch.Tensor, layer: RadixAttention, k_descale

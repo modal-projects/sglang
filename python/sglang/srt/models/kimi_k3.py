@@ -331,6 +331,7 @@ def _rocm_pipe_chunks(num_tokens: int) -> int:
 _ROCM_SHARED_STREAM: Optional[torch.cuda.Stream] = None
 # k3_moe_epi.shared_down_topk beats situ + hipBLASLt + top-k only at small M (MI355X)
 _K3_EPI_SHARED_TOPK_MAX_TOKENS = 16
+_K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS = 64
 
 
 def _rocm_shared_stream() -> Optional[torch.cuda.Stream]:
@@ -1679,7 +1680,12 @@ class KimiK3MoE(nn.Module):
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
-        if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS:
+        if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS or (
+            # pre-activated variant beats the situ + GEMM + top-k fallback up
+            # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
+            envs.SGLANG_ROCM_K3_SHARED_PREACT.get()
+            and num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS
+        ):
             # SiTU + shared down GEMM + router top-k in one launch
             cfg = self.topk.topk_config
             topk_ids = torch.empty(

@@ -990,6 +990,11 @@ class Envs:
     # add3 into one skinny GEMM (kernels/ops/moe/k3_moe_epi.py)
     SGLANG_ROCM_K3_MOE_EPI_FUSE = EnvBool(False)
     SGLANG_ROCM_K3_MOE_EPI_FUSE_MAX_TOKENS = EnvInt(256)
+    # Under SGLANG_ROCM_K3_MOE_EPI_FUSE: compute the shared expert's SiTU
+    # activation in its own small launch before the fused shared-down + top-k
+    # kernel instead of in every GEMM CTA's prologue (kernels/ops/moe/k3_moe_epi.py).
+    # +1 launch, bit-identical outputs, 7.6 vs 10.2 us at M=8; also takes M<=64 (vs the 3-launch fallback).
+    SGLANG_ROCM_K3_SHARED_PREACT = EnvBool(False)
     # ROCm + aiter: let the breakable prefill CUDA graph replay EXTEND batches
     # with a cached prefix (MLA models with an MHA companion, e.g. K3). The
     # prefix gather + kv_b_proj expansion + attention already run inside the
@@ -1014,6 +1019,11 @@ class Envs:
     # split-4 when enabled and bs >= its MIN_BS). Gluon wins at bs 1 for
     # contexts <= ~20k; v2 wins at long context / larger batches.
     SGLANG_ROCM_K3_MLA_VERIFY_V2_MIN_BS = EnvInt(1)
+    # ROCm K3 MLA target_verify v3 (kernels/ops/attention/k3_mla_verify_v3.py):
+    # v2 contract; 8-warp (2 waves/SIMD) stage 1 for bs <= W8_MAX_BS, v2's
+    # 4-warp stage 1 above; 128-token min split. Takes precedence over v2.
+    SGLANG_ROCM_K3_MLA_VERIFY_V3 = EnvBool(False)
+    SGLANG_ROCM_K3_MLA_VERIFY_V3_W8_MAX_BS = EnvInt(2)
     # ROCm K3 (NoPE MLA, aiter backend) decode / target verify: one Triton launch
     # builds q = [q_nope_out | q_pe] and writes the latent row into the MLA KV
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x

@@ -45,6 +45,40 @@ def _score_key(s, idx):
     return (k << 32) | (0xFFFF - idx).to(tl.int64)
 
 
+@triton.jit
+def _situ(g, u, beta, inv_beta, lin_beta, inv_lin_beta, HAS_LIN: tl.constexpr):
+    gate = beta * libdevice.tanh(g * inv_beta) * (1.0 / (1.0 + tl.exp(-g)))
+    if HAS_LIN:
+        u = lin_beta * libdevice.tanh(u * inv_lin_beta)
+    return gate * u
+
+
+@triton.jit(do_not_specialize=["M", "stride_gu"])
+def _k3_situ_kernel(
+    gu_ptr,  # [M, 2*I] bf16 (gate | up)
+    stride_gu,
+    act_ptr,  # [M, I] bf16 out
+    M,
+    beta,
+    inv_beta,
+    lin_beta,
+    inv_lin_beta,
+    I: tl.constexpr,
+    HAS_LIN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # SGLANG_ROCM_K3_SHARED_PREACT: the SiTU activation once per element,
+    # instead of once per down-GEMM CTA (224 CTAs at M=8 each recomputed all
+    # M x I of it; that, not the 11 MB weight stream, bounded the fused kernel)
+    m = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mk = offs < I
+    g = tl.load(gu_ptr + m * stride_gu + offs, mask=mk, other=0.0).to(tl.float32)
+    u = tl.load(gu_ptr + m * stride_gu + I + offs, mask=mk, other=0.0).to(tl.float32)
+    a = _situ(g, u, beta, inv_beta, lin_beta, inv_lin_beta, HAS_LIN)
+    tl.store(act_ptr + m * I + offs, a.to(act_ptr.dtype.element_ty), mask=mk)
+
+
 @triton.jit(do_not_specialize=["M", "stride_gu", "stride_out", "stride_lg"])
 def _k3_shared_topk_kernel(
     gu_ptr,  # [M, 2*I] bf16 (gate | up), row stride stride_gu
@@ -74,6 +108,7 @@ def _k3_shared_topk_kernel(
     E_POW2: tl.constexpr,
     TOPK: tl.constexpr,
     RENORM: tl.constexpr,
+    PRE_ACT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     NT_N: tl.constexpr = N // BN
@@ -88,13 +123,16 @@ def _k3_shared_topk_kernel(
         for k0 in tl.range(0, I, BK):
             offs_k = k0 + tl.arange(0, BK)
             row = gu_ptr + offs_m[:, None] * stride_gu + offs_k[None, :]
-            g = tl.load(row, mask=mm[:, None], other=0.0).to(tl.float32)
-            u = tl.load(row + I, mask=mm[:, None], other=0.0).to(tl.float32)
             w = tl.load(wd_ptr + offs_n[:, None] * I + offs_k[None, :])
-            gate = beta * libdevice.tanh(g * inv_beta) * (1.0 / (1.0 + tl.exp(-g)))
-            if HAS_LIN:
-                u = lin_beta * libdevice.tanh(u * inv_lin_beta)
-            a = (gate * u).to(wd_ptr.dtype.element_ty)
+            if PRE_ACT:
+                # gu_ptr is the [M, I] activation from _k3_situ_kernel
+                a = tl.load(row, mask=mm[:, None], other=0.0)
+            else:
+                g = tl.load(row, mask=mm[:, None], other=0.0).to(tl.float32)
+                u = tl.load(row + I, mask=mm[:, None], other=0.0).to(tl.float32)
+                a = _situ(g, u, beta, inv_beta, lin_beta, inv_lin_beta, HAS_LIN).to(
+                    wd_ptr.dtype.element_ty
+                )
             acc = tl.dot(a, tl.trans(w), acc)
         tl.store(
             out_ptr + offs_m[:, None] * stride_out + offs_n[None, :],
@@ -141,6 +179,27 @@ def _shared_cfg(m: int):
 _SHARED_CFG_OVERRIDE: Optional[tuple] = None
 
 
+def _shared_preact_cfg(m: int):
+    # (BM, BN, BK, num_warps, num_stages) for the pre-activated GEMM; MI355X sweep
+    if m <= 16:
+        return 16, 32, 256, 4, 3
+    if m <= 32:
+        return 32, 16, 256, 4, 2
+    return 64, 32, 256, 8, 2
+
+
+_PREACT: Optional[bool] = None
+
+
+def _preact_on() -> bool:
+    global _PREACT
+    if _PREACT is None:
+        from sglang.srt.environ import envs
+
+        _PREACT = envs.SGLANG_ROCM_K3_SHARED_PREACT.get()
+    return _PREACT
+
+
 def shared_down_topk(
     gate_up: torch.Tensor,  # [M, 2I] bf16, row-strided ok
     w_down: torch.Tensor,  # [N, I] bf16
@@ -154,13 +213,44 @@ def shared_down_topk(
     renormalize: bool = True,
     routed_scale: float = 1.0,
     cfg: Optional[tuple] = None,
+    pre_act: Optional[bool] = None,
 ) -> None:
+    """pre_act (default: env SGLANG_ROCM_K3_SHARED_PREACT): run the SiTU
+    activation as its own small launch first, so the GEMM CTAs only stream
+    weights (2 launches instead of 1, but ~2x faster at decode sizes). The
+    activation values, GEMM tiling/reduction order and top-k code are the
+    same, so outputs are bit-identical to the single-launch kernel."""
     M, two_i = gate_up.shape
     I = two_i // 2
     N = w_down.shape[0]
     assert w_down.shape[1] == I and w_down.is_contiguous()
     assert gate_up.stride(1) == 1 and out.stride(1) == 1
-    bm, bn, bk, nw, *rest = cfg or _SHARED_CFG_OVERRIDE or _shared_cfg(M)
+    if pre_act is None:
+        pre_act = _preact_on()
+    lin = linear_beta is not None
+    if pre_act:
+        act = torch.empty((M, I), dtype=w_down.dtype, device=gate_up.device)
+        blk = 256
+        _k3_situ_kernel[(M, triton.cdiv(I, blk))](
+            gate_up,
+            gate_up.stride(0),
+            act,
+            M,
+            float(beta),
+            1.0 / float(beta),
+            float(linear_beta) if lin else 1.0,
+            1.0 / float(linear_beta) if lin else 1.0,
+            I=I,
+            HAS_LIN=lin,
+            BLOCK=blk,
+            num_warps=2,
+        )
+        gate_up = act
+    bm, bn, bk, nw, *rest = (
+        cfg
+        or _SHARED_CFG_OVERRIDE
+        or (_shared_preact_cfg(M) if pre_act else _shared_cfg(M))
+    )
     ns = rest[0] if rest else 2
     assert N % bn == 0 and I % bk == 0
     do_topk = router_logits is not None
@@ -172,7 +262,6 @@ def shared_down_topk(
         E, topk = 1, 1
         router_logits = correction_bias = topk_ids = topk_weights = gate_up
     grid = ((N // bn) * triton.cdiv(M, bm) + (M if do_topk else 0),)
-    lin = linear_beta is not None
     _k3_shared_topk_kernel[grid](
         gate_up,
         gate_up.stride(0),
@@ -201,6 +290,7 @@ def shared_down_topk(
         E_POW2=triton.next_power_of_2(E),
         TOPK=topk,
         RENORM=renormalize,
+        PRE_ACT=pre_act,
         num_warps=nw,
         num_stages=ns,
     )

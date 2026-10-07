@@ -61,6 +61,7 @@ runtime_base = [
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
+  "tokenizers==0.23.2",
   "tqdm",
   "transformers==5.17.0",
   "uvicorn",
@@ -114,6 +115,7 @@ tracing = [
 # in its compressed-tensors and torch pins. A dependency added here has to be
 # added there too; nothing enforces that.
 srt_hip = [
+  "decord==0.6.0",
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
@@ -125,6 +127,7 @@ srt_hip_rocm724 = [
   # ROCm 7.2.4 uses torch 2.11. compressed-tensors 0.15.0 requires
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
+  "decord==0.6.0",
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch==2.11.0",

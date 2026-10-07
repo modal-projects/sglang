@@ -82,6 +82,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # ampere and up
         return 80
 
+    def supports_deferred_weight_copies(self) -> bool:
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import gc
 import logging
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -25,6 +25,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.rank_weight_stager import RankWeightStager
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -164,6 +165,16 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _assert_direct_update_allowed(self, operation: str) -> None:
+        """Reject direct writes while an inactive rank image owns the weights."""
+        self._assert_weight_cache_inactive(operation)
+        if getattr(self.get_model_runner(), "rank_weight_stager", None) is not None:
+            raise RuntimeError(
+                f"{operation} is unavailable while rank weight staging is active: "
+                "an out-of-band mutation would make its canonical checkpoint "
+                "and prepared image stale"
+            )
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -172,7 +183,7 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        self._assert_weight_cache_inactive("update_weights_from_disk")
+        self._assert_direct_update_allowed("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
@@ -183,47 +194,81 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        model = self.get_model()
+        runner = self.get_model_runner()
+        original_model_path = self.model_config.model_path
+        original_load_config = runner.load_config
 
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
-            return False, message
-
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.get_model())
+        if (
+            weight_name_filter is not None
+            and self.model_config.quantization is not None
+        ):
+            return False, (
+                "weight_name_filter is not supported for quantized models: "
+                "post-load processing requires every checkpoint-facing weight."
             )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
+
+        self.model_config.model_path = model_path
+        load_config = replace(original_load_config, load_format=load_format)
+
+        try:
+            loader = get_model_loader(load_config, self.model_config)
+        except Exception as e:
+            self.model_config.model_path = original_model_path
+            return False, f"Failed to get model loader: {e}."
+        if not isinstance(loader, DefaultModelLoader):
+            self.model_config.model_path = original_model_path
+            return False, f"Failed to get model loader: {loader}."
+
+        def load_checkpoint(
+            active_loader: DefaultModelLoader,
+            weight_filter: Optional[Callable[[str], bool]],
+        ) -> None:
+            active_loader.restore_weights_before_loading(model, target_device)
+            weights = active_loader._get_all_weights(self.model_config, model)
+            if weight_filter is not None:
+                weights = (
+                    (name, weight) for name, weight in weights if weight_filter(name)
                 )
+            active_loader.load_weights_and_postprocess(model, weights, target_device)
 
-            return iter
-
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
+        def rollback() -> None:
+            self.model_config.model_path = original_model_path
+            original_loader = get_model_loader(original_load_config, self.model_config)
+            if not isinstance(original_loader, DefaultModelLoader):
+                raise TypeError(
+                    "Original model loader does not support in-place rollback: "
+                    f"{original_loader}."
+                )
+            load_checkpoint(original_loader, None)
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.get_model(), iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
+                load_checkpoint(loader, weight_name_filter)
+            except Exception as load_error:
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
-                return False, message
+                if os.path.realpath(original_model_path) == os.path.realpath(
+                    model_path
+                ):
+                    raise RuntimeError(
+                        "Weight reload failed after mutating the active checkpoint "
+                        "path; terminating the engine because the previous weights "
+                        f"are unavailable for rollback. Reload error: {load_error}."
+                    ) from load_error
+                try:
+                    rollback()
+                except Exception as rollback_error:
+                    logger.exception("Failed to roll back model weights")
+                    raise RuntimeError(
+                        "Weight reload and rollback both failed; terminating the "
+                        "engine to avoid serving a partially updated model. "
+                        f"Reload error: {load_error}. "
+                        f"Rollback error: {rollback_error}."
+                    ) from rollback_error
+                return False, (
+                    f"Failed to update weights: {load_error}. "
+                    "Rolled back to the original weights."
+                )
 
         self.update_model_fields(
             model,
@@ -244,6 +289,99 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    @torch.no_grad()
+    def initialize_rank_weight_stager(
+        self,
+        *,
+        checkpoint_dir: str,
+        version: int,
+        host_group: torch.distributed.ProcessGroup | None,
+        max_compile_group_bytes: int,
+        canonical_checkpoint_dir: str | None,
+    ) -> dict[str, Any]:
+        """Create the inactive host image from the currently served checkpoint."""
+
+        runner = self.get_model_runner()
+        if self.device != "cuda":
+            raise RuntimeError("rank weight staging requires a CUDA model runner")
+        if runner.is_draft_worker:
+            raise RuntimeError(
+                "rank weight staging must be initialized on the target model runner"
+            )
+        if runner.rank_weight_stager is not None:
+            raise RuntimeError("rank weight staging is already initialized")
+        if os.path.realpath(checkpoint_dir) != os.path.realpath(
+            self.model_config.model_path
+        ):
+            raise ValueError(
+                "the staging base must be the checkpoint that produced the "
+                "currently served model"
+            )
+        self._assert_direct_update_allowed("initialize_rank_weight_stager")
+        error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is not None:
+            raise RuntimeError(error)
+
+        stager = None
+        try:
+            with torch.cuda.device(self.gpu_id):
+                stager = RankWeightStager(
+                    self.get_model(),
+                    max_compile_group_bytes=max_compile_group_bytes,
+                    host_group=host_group,
+                    canonical_checkpoint_dir=canonical_checkpoint_dir,
+                )
+                stats = stager.initialize(checkpoint_dir, version=version)
+        except Exception:
+            if stager is not None:
+                stager.close()
+            raise
+        runner.rank_weight_stager = stager
+        return stats
+
+    @torch.no_grad()
+    def stage_rank_weight_update(
+        self,
+        *,
+        checkpoint_source_dir: str,
+        target_version: int,
+    ) -> dict[str, Any]:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        with torch.cuda.device(self.gpu_id):
+            return stager.stage(
+                checkpoint_source_dir=checkpoint_source_dir,
+                target_version=target_version,
+            )
+
+    def validate_rank_weight_commit(self, target_version: int) -> None:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        stager.validate_commit(target_version)
+
+    @torch.no_grad()
+    def commit_rank_weight_update(self, target_version: int) -> dict[str, Any]:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is None:
+            raise RuntimeError("rank weight staging is not initialized")
+        with torch.cuda.device(self.gpu_id):
+            torch.cuda.synchronize(self.gpu_id)
+            return stager.commit(target_version)
+
+    def discard_prepared_rank_weights(self, reason: str) -> None:
+        stager = self.get_model_runner().rank_weight_stager
+        if stager is not None:
+            stager.discard_prepared(reason)
+
+    def close_rank_weight_stager(self) -> None:
+        runner = self.get_model_runner()
+        stager = runner.rank_weight_stager
+        runner.rank_weight_stager = None
+        if stager is not None:
+            stager.close()
 
     def receive_weights_from_distributed(
         self: WeightUpdater,
@@ -306,11 +444,16 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        self._assert_direct_update_allowed("begin_weight_update")
+        error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is not None:
+            raise RuntimeError(error)
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+        self._assert_direct_update_allowed("end_weight_update")
         if run_post_load:
             post_load_weights(self.get_model())
         DefaultModelLoader.postprocess_weights(
@@ -320,7 +463,7 @@ class WeightUpdater:
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
     ) -> Tuple[bool, str]:
-        self._assert_weight_cache_inactive("update_weights_from_distributed")
+        self._assert_direct_update_allowed("update_weights_from_distributed")
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
@@ -346,7 +489,7 @@ class WeightUpdater:
             return False, error
 
         monkey_patch_torch_reductions()
-        self._assert_weight_cache_inactive("update_weights_from_tensor")
+        self._assert_direct_update_allowed("update_weights_from_tensor")
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -406,7 +549,7 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
-        self._assert_weight_cache_inactive("update_weights_from_ipc")
+        self._assert_direct_update_allowed("update_weights_from_ipc")
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error

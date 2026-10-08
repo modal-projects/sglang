@@ -27,7 +27,14 @@ VRING = 256 - 8 * VSLOTS
 PDV = int(os.environ.get("GEN_PDV", "3"))
 ROWLIN = os.environ.get("GEN_ROWLIN", "1") == "1"  # LDS tile = token-major 576 B rows (chunk c at c ^ ((t>>2)&3))
 LSUM8 = os.environ.get("GEN_LSUM8", "1") == "1"
-QROT = os.environ.get("GEN_QROT", "0") == "1"  # CTA-rotated Q load order
+QROT = os.environ.get("GEN_QROT", "0") == "1"
+QZO = os.environ.get("GEN_QZO", "1") == "1"  # zero O inside the Q-load wait (q_load_lds_asm)
+QHI = os.environ.get("GEN_QHI", "0") == "1"
+QDOT = os.environ.get("GEN_QDOT", "1") == "1"
+QSF = os.environ.get("GEN_QSF", "0") == "1"
+QM3 = os.environ.get("GEN_QM3", "1") == "1"  # Q amax via v_pk_maximum3_f16 (2 dwords / instruction)
+QTEST = os.environ.get("GEN_QTEST", "")
+QBATCH = os.environ.get("GEN_QBATCH", "1") == "1"  # dependency-free batching of the Q amax / quant VALU  # bf16 -> scaled f32 via v_dot2_f32_bf16  # quantize the high bf16 halves in place (no mask)  # CTA-rotated Q load order
 DELTA = float(os.environ.get("GEN_DELTA", "3"))  # rescale headroom (log2 units) added to a new running max   # l = sum of the fp8-rounded P (via an MFMA with A = ones)
 
 out = []
@@ -372,6 +379,9 @@ def q_prologue(lds=False, part=0):
                 continue
             l.append(f"v_add_u32_e32 v192, {1024*k}, %[v16]")
             l += [f"s_add_u32 m0, %[sl], {1024*k}", "s_nop 0", "buffer_load_dwordx4 v192, %[rs], 0 offen lds"]
+        if QZO and part == 1:
+            # zero O (AGPRs) while the Q loads are in flight (off the critical path)
+            l += [f"v_accvgpr_write_b32 a{i}, 0" for i in range(256)]
         l.append("s_waitcnt vmcnt(0)")
         for ks in range(9):
             for jj in range(4):
@@ -392,7 +402,40 @@ def q_prologue(lds=False, part=0):
         return l + ["v_mov_b32_e32 %[am], 1.0"]
     acc = [192, 193, 194, 195]
     tmp = [196, 197, 198, 199]
-    for i in range(144):
+    if QM3:
+        # |x| max via packed f16 maximum3 on the raw bf16 bits (same ordering for finite
+        # values; bf16 |x| >= 2^121 would read as f16 inf/nan -- never in Q): chains of max(x)
+        # (v192..195) and max(-x) (v196..199), two dwords per instruction
+        A, Bn = [192, 193, 194, 195], [196, 197, 198, 199]
+        for p0 in range(0, 72, 4):
+            for j in range(4):
+                x, y = 48 + 2 * (p0 + j), 49 + 2 * (p0 + j)
+                src = f"v{x}, v{y}, v{x}" if p0 == 0 else f"v{A[j]}, v{x}, v{y}"
+                l.append(f"v_pk_maximum3_f16 v{A[j]}, {src}")
+            for j in range(4):
+                x, y = 48 + 2 * (p0 + j), 49 + 2 * (p0 + j)
+                if p0 == 0:
+                    l.append(f"v_pk_maximum3_f16 v{Bn[j]}, v{x}, v{y}, v{x} neg_lo:[1,1,1] neg_hi:[1,1,1]")
+                else:
+                    l.append(f"v_pk_maximum3_f16 v{Bn[j]}, v{Bn[j]}, v{x}, v{y} neg_lo:[0,1,1] neg_hi:[0,1,1]")
+        for j in range(4):
+            l.append(f"v_pk_maximum3_f16 v{A[j]}, v{A[j]}, v{Bn[j]}, 0")
+    elif QBATCH:
+        # 8 independent chains, batched so back-to-back VALU ops never depend on each other
+        # (1 wave / SIMD: nothing else hides the VALU latency)
+        acc8 = acc + [200, 201, 202, 203]
+        tmp8 = tmp + [204, 205, 206, 207]
+        for j in range(8):
+            l.append(f"v_and_b32_e32 v{acc8[j]}, 0x7fff7fff, v{48 + j}")
+        for i0 in (range(8, 144, 8) if QTEST != "noamax" else []):
+            for j in range(8):
+                l.append(f"v_and_b32_e32 v{tmp8[j]}, 0x7fff7fff, v{48 + i0 + j}")
+            for j in range(8):
+                l.append(f"v_pk_max_u16 v{acc8[j]}, v{acc8[j]}, v{tmp8[j]}")
+        for j in range(4):
+            l.append(f"v_pk_max_u16 v{acc8[j]}, v{acc8[j]}, v{acc8[j + 4]}")
+    else:
+      for i in range(144):
         a = acc[i % 4] if i < 4 else tmp[i % 4]
         l.append(f"v_and_b32_e32 v{a}, 0x7fff7fff, v{48 + i}")
         if i >= 4:
@@ -409,6 +452,56 @@ def q_prologue(lds=False, part=0):
     l.append("v_permlane32_swap_b32_e32 v192, v193")
     l.append("v_max_f32_e32 v192, v192, v193")
     l.append("v_max_f32_e32 v192, 0x1e3ce508, v192")     # amax >= 1e-20
+    if QSF:
+        # probe: exact (non power-of-two) scale through v_cvt_scalef32_pk_fp8_bf16
+        l.append("v_mul_f32_e32 v192, 0x3b124925, v192")     # amax / 448
+        l.append("v_mov_b32_e32 %[am], v192")
+        for idx in range(72):
+            r0, d = 48 + 2 * idx, 48 + idx
+            l += [f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0}, v192",
+                  f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0+1}, v192 op_sel:[0,0,1]"]
+        return l
+    if QDOT:
+        # c = 448 / amax truncated to bf16 (so max |q c| <= 448); q * c exactly via v_dot2_f32_bf16
+        # with (c, 0) / (0, c): one instruction per element, no bf16 -> f32 unpacking.
+        # qscale = 1 / c (consistent with the rounded c).
+        l.append("v_rcp_f32_e32 v194, v192")
+        l.append("s_nop 1")
+        l.append("v_mul_f32_e32 v194, 0x43e00000, v194")     # 448 / amax
+        l.append("v_and_b32_e32 v195, 0xffff0000, v194")     # (0, c): c in the high half
+        l.append("v_rcp_f32_e32 v193, v195")
+        l.append("v_lshrrev_b32_e32 v194, 16, v195")         # (c, 0)
+        l.append("s_nop 1")
+        l.append("v_mov_b32_e32 %[am], v193")
+        if QBATCH:
+            for g0 in range(0, 72, 4):
+                for idx in range(g0, g0 + 4):
+                    r0, t = 48 + 2 * idx, 196 + 4 * (idx % 4)
+                    if QTEST != "nodot":
+                        l += [f"v_dot2_f32_bf16 v{t}, v{r0}, v194, 0", f"v_dot2_f32_bf16 v{t+1}, v{r0}, v195, 0"]
+                for idx in range(g0, g0 + 4):
+                    r0, t = 48 + 2 * idx, 196 + 4 * (idx % 4)
+                    if QTEST != "nodot":
+                        l += [f"v_dot2_f32_bf16 v{t+2}, v{r0+1}, v194, 0", f"v_dot2_f32_bf16 v{t+3}, v{r0+1}, v195, 0"]
+                for idx in (range(g0, g0 + 4) if QTEST != "nocvt" else []):
+                    t = 196 + 4 * (idx % 4)
+                    l.append(f"v_cvt_pk_fp8_f32 v{48 + idx}, v{t}, v{t+1}")
+                for idx in (range(g0, g0 + 4) if QTEST != "nocvt" else []):
+                    t = 196 + 4 * (idx % 4)
+                    l.append(f"v_cvt_pk_fp8_f32 v{48 + idx}, v{t+2}, v{t+3} op_sel:[0,0,1]")
+            return l
+        for ks in range(9):
+            for k in range(8):
+                r0 = 48 + 16 * ks + 2 * k
+                t = 196 + 4 * ((8 * ks + k) % 4)
+                d = 48 + 8 * ks + k
+                l += [f"v_dot2_f32_bf16 v{t}, v{r0}, v194, 0",
+                      f"v_dot2_f32_bf16 v{t+1}, v{r0}, v195, 0",
+                      f"v_dot2_f32_bf16 v{t+2}, v{r0+1}, v194, 0",
+                      f"v_dot2_f32_bf16 v{t+3}, v{r0+1}, v195, 0",
+                      f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{t+1}",
+                      f"v_cvt_pk_fp8_f32 v{d}, v{t+2}, v{t+3} op_sel:[0,0,1]"]
+        return l
     if os.environ.get("GEN_QEXACT", "1") == "1":
         # exact per-row scale (amax -> 448), like v2: q8 = fp8(q * 448 / amax)
         l.append("v_mul_f32_e32 v193, 0x3b124925, v192")     # amax / 448 (= qscale)
@@ -422,6 +515,17 @@ def q_prologue(lds=False, part=0):
                 r0 = 48 + 16 * ks + 2 * k
                 t = 196 + 4 * ((8 * ks + k) % 4)
                 d = 48 + 8 * ks + k
+                if QHI:
+                    # odd (high-half) bf16 elements used in place as f32: the other element's
+                    # 16 bits only perturb the value below 1 bf16 ulp (fp8 rounding unaffected
+                    # except within 2^-8 of a tie)
+                    l += [f"v_lshlrev_b32_e32 v{t}, 16, v{r0}",
+                          f"v_lshlrev_b32_e32 v{t+1}, 16, v{r0+1}",
+                          f"v_pk_mul_f32 v[{t}:{t+1}], v[{t}:{t+1}], v[194:195]",
+                          f"v_pk_mul_f32 v[{r0}:{r0+1}], v[{r0}:{r0+1}], v[194:195]",
+                          f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{r0}",
+                          f"v_cvt_pk_fp8_f32 v{d}, v{t+1}, v{r0+1} op_sel:[0,0,1]"]
+                    continue
                 l += [f"v_lshlrev_b32_e32 v{t}, 16, v{r0}",
                       f"v_and_b32_e32 v{t+1}, 0xffff0000, v{r0}",
                       f"v_lshlrev_b32_e32 v{t+2}, 16, v{r0+1}",
@@ -462,7 +566,8 @@ w("__device__ __forceinline__ void q_load_lds_asm(v4u_ rs, uint32_t sl, uint32_t
 w("  uint32_t t0, t1;")
 w(asm_block(q_prologue(True, 1), outs='[t0] "=&s"(t0), [t1] "=&s"(t1)',
             ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la), [rot] "s"(rot)',
-            clob=ALL_V + ', "m0", "scc", "memory"'))
+            clob=ALL_V + (", " + ALL_A if QZO else "") + ', "m0", "scc", "memory"'))
+w(f"#define K3HK_QZO {int(QZO)}")
 w("}")
 w("__device__ __forceinline__ float q_quant_asm() {")
 w("  float am;")

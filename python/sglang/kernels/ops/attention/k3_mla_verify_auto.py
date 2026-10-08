@@ -2015,9 +2015,12 @@ def k3_mla_verify_auto(
         if hk:
             from sglang.kernels.ops.attention.k3_mla_verify_hk import hk_stage1, merger_rows
 
+            from sglang.kernels.ops.attention.k3_mla_verify_hk import hip_reduce_enabled, part8_min_splits
+
             v_done = merger_rows(bs, nsplit)
+            hk_p8 = part8_min_splits() if (v_done == 0 and hip_reduce_enabled(nsplit)) else 0
             hk_stage1(q, kv, sel, kv_indices, kv_scale, o_part, lse_part, out, nsplit, min_chunk, sm_scale,
-                      v_done)
+                      v_done, hk_p8)
         elif w8:
             _k3_mla_verify_v3_fwd[(nsplit, bs)](
                 q, kv, sel, kv_indices, kv_scale, o_part, lse_part,
@@ -2039,6 +2042,13 @@ def k3_mla_verify_auto(
             )
 
     # ---------------- regime-aware reduce
+    if hk and v_done == 0:
+        from sglang.kernels.ops.attention.k3_mla_verify_hk import hip_reduce_enabled, hk_reduce
+
+        if hip_reduce_enabled(nsplit):
+            hk_reduce(o_part, lse_part, kv_indptr, out, nsplit, min_chunk, kv_scale, hk_p8, regime=flag,
+                      g_logits=g_logits, g_lse=g_lse, g_ns=g_ns, g_block_n=_GLUON_BLOCK_N)
+            return out
     g_lse_arg = g_lse if g_lse is not None else lse_part
     _k3_auto_reduce[(bs, rows, v_head_dim // 128)](
         flag, kv_indptr, o_part, lse_part, g_logits, g_lse_arg, out,

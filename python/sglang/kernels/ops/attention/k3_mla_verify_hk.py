@@ -58,7 +58,7 @@ def _module():
         "kimi_k3_mla_verify_hk",
         _src_hash(),
         cuda_files=["kimi_k3/k3_mla_verify_hk.cuh"],
-        cuda_wrappers=[("run", "K3MlaVerifyHK::run")],
+        cuda_wrappers=[("run", "K3MlaVerifyHK::run"), ("reduce", "K3MlaVerifyHK::reduce")],
         extra_cuda_cflags=["-O3", "-mllvm", "-amdgpu-spill-vgpr-to-agpr=0"],
     )
 
@@ -90,13 +90,42 @@ def merger_rows(bs: int, nsplit: int) -> int:
     return u if bs * 96 // u <= _MAX_MERGERS else 0
 
 
+def part8_min_splits() -> int:
+    """fp8 partials (O / kv_scale as e4m3, half the partial traffic) for requests with at least this
+    many active splits; 0 disables. Only with the HIP reduce (it reads them)."""
+    return int(os.environ.get("SGLANG_ROCM_K3_MLA_VERIFY_HK_PART8", "96"))
+
+
 def hk_stage1(q, kv, kv_indptr, kv_indices, kv_scale, o_part, lse_part, out, nsplit: int, min_chunk: int,
-              sm_scale: float, mrg_rows: int = 0) -> None:
+              sm_scale: float, mrg_rows: int = 0, part8_min: int = 0) -> None:
     """Stage 1 (partials into o_part / lse_part with the v2 split formula); with mrg_rows > 0
-    the kernel also merges the splits into out (no separate reduce needed)."""
+    the kernel also merges the splits into out (no separate reduce needed). part8_min > 0: requests
+    with >= part8_min active splits store fp8 partials (merge with hk_reduce(part8_min=...) only)."""
     flags = _flags(q.device, torch.cuda.current_stream(q.device).cuda_stream) if mrg_rows > 0 else kv_scale
     _module().run(q, kv.view(torch.uint8), kv_indptr, kv_indices, kv_scale, o_part, lse_part, out, flags,
-                  nsplit, min_chunk, float(sm_scale) * _LOG2E, mrg_rows)
+                  nsplit, min_chunk, float(sm_scale) * _LOG2E, mrg_rows, part8_min if mrg_rows == 0 else 0)
+
+
+def hip_reduce_enabled(nsplit: int) -> bool:
+    """One-round-trip HIP split merge (k3_mla_verify_hk_reduce1, also merges fp8 partials) instead
+    of v2's Triton reduce. Default ("auto"): for nsplit >= 128 (bs <= 2), where it is faster
+    (graph replay, MI355X); the Triton reduce is ~0.5-1 us faster at bs 4-8.
+    SGLANG_ROCM_K3_MLA_VERIFY_HK_RED = auto | hip (always) | triton (never)."""
+    mode = os.environ.get("SGLANG_ROCM_K3_MLA_VERIFY_HK_RED", "auto")
+    if mode == "triton" or nsplit > 256:
+        return False
+    return mode == "hip" or nsplit >= 128
+
+
+def hk_reduce(o_part, lse_part, kv_indptr, out, nsplit: int, min_chunk: int, kv_scale, part8_min: int = 0,
+              regime=None, g_logits=None, g_lse=None, g_ns: int = 1, g_block_n: int = 128) -> None:
+    """Merge the HK splits (o_part / lse_part, base-2 LSE) into out (part8_min: as passed to
+    hk_stage1). With regime (int32 [1], auto path): regime == 0 -> merge the Gluon splits
+    (g_logits / g_lse, natural-log LSE) instead."""
+    use = regime is not None
+    _module().reduce(o_part, lse_part, kv_indptr, out, regime if use else lse_part,
+                     g_logits if (use and g_ns > 1) else o_part, g_lse if (use and g_ns > 1) else lse_part,
+                     kv_scale, nsplit, min_chunk, int(use), g_ns, g_block_n, part8_min)
 
 
 def default_num_splits(bs: int) -> int:
@@ -147,9 +176,14 @@ def k3_mla_verify_hk(
         o_part = out
         lse_part = kv_scale
     mrg = merger_rows(bs, nsplit)
-    hk_stage1(q, kv, kv_indptr, kv_indices, kv_scale.float(), o_part, lse_part, out, nsplit, _MIN_CHUNK,
-              sm_scale, mrg)
-    if nsplit > 1 and mrg == 0:
+    hip_red = nsplit > 1 and mrg == 0 and hip_reduce_enabled(nsplit)
+    p8 = part8_min_splits() if hip_red else 0
+    kvs = kv_scale.float()
+    hk_stage1(q, kv, kv_indptr, kv_indices, kvs, o_part, lse_part, out, nsplit, _MIN_CHUNK,
+              sm_scale, mrg, p8)
+    if hip_red:
+        hk_reduce(o_part, lse_part, kv_indptr, out, nsplit, _MIN_CHUNK, kvs, p8)
+    elif nsplit > 1 and mrg == 0:
         _k3_mla_verify_reduce[(bs, rows, v_head_dim // 128)](
             o_part, lse_part, kv_indptr, out, out.stride(0), out.stride(1),
             H=num_heads, QLEN=qlen, D_V=v_head_dim, NSPLIT=nsplit,

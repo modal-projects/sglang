@@ -1843,6 +1843,9 @@ class KimiK3MoE(nn.Module):
             k3_moe_epi.flush_shared_gemm()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
+        fused = self._rocm_moe_ar_norm(buf, num_tokens, hidden_size, prefix_sum)
+        if fused is not None:
+            return fused
         buf = tensor_model_parallel_all_reduce(buf)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
@@ -1923,10 +1926,55 @@ class KimiK3MoE(nn.Module):
         up, _ = self.routed_expert_up_proj(latent)
         out.copy_(_add3(up, shared_output, prefix_sum))
 
-    def _rocm_up_proj_all_gather(self, latent, shared_output, prefix_sum):
+    def _rocm_moe_ar_norm(self, buf, num_tokens, hidden_size, prefix_sum):
+        """SGLANG_ROCM_K3_MOE_AR_NORM_FUSED: the flat [latent | shared]
+        all-reduce + latent RMSNorm in one kernel, then the column-shard up_proj
+        + fused all-gather/add3/next-layer-aggregation tail. The shared half is
+        only reduce-scattered (that tail reads this rank's columns only), so it
+        runs only where the tail is known to take its fused kernel. Returns
+        None (caller takes the AITER all-reduce + norm path) otherwise."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_MOE_AR_NORM_FUSED.get()):
+            return None
+        ctx = getattr(self, "_ag_agg_ctx", None)
+        norm = self.routed_expert_norm
+        if (
+            ctx is None
+            or norm is None
+            or not _rocm_up_ag_fits(num_tokens, hidden_size)
+            or (prefix_sum is not None and not prefix_sum.is_contiguous())
+            or norm.weight.dtype != buf.dtype
+            or type(norm).forward is not RMSNorm.forward
+            or getattr(norm, "cast_x_before_out_mul", False)
+        ):
+            return None
+        from sglang.kernels.ops.communication import k3_moe_ar_norm_hip
+
+        group = get_parallel().tp_group
+        ca = group.ca_comm
+        L = self.moe_hidden_size
+        attn_res, nxt = ctx
+        if (
+            not k3_moe_ar_norm_hip.usable(ca, num_tokens, L, hidden_size)
+            # the kernel replaces AITER's custom all-reduce only
+            or group._resolve_outplace_all_reduce_method(buf) != "ca"
+            or not attn_res.ag_fused_ready(
+                ca, num_tokens, hidden_size, nxt.is_block_write_layer
+            )
+        ):
+            return None
+        latent, shared_output = k3_moe_ar_norm_hip.moe_ar_norm(
+            ca, buf, norm.weight, norm.variance_epsilon, num_tokens, L, full_shared=False
+        )
+        return self._rocm_up_proj_all_gather(
+            latent, shared_output, prefix_sum, scatter_shared=True
+        )
+
+    def _rocm_up_proj_all_gather(self, latent, shared_output, prefix_sum, scatter_shared=False):
         """ROCm decode: each rank computes only its hidden/tp output columns of
         the replicated up_proj (1/tp of the weight read), and one fused
-        all-gather + add3 assembles bf16(bf16(up + shared) + prefix)."""
+        all-gather + add3 assembles bf16(bf16(up + shared) + prefix).
+        scatter_shared: shared_output holds only this rank's hidden/tp columns
+        (SGLANG_ROCM_K3_MOE_AR_NORM_FUSED); the ag_agg kernel must take it."""
         from aiter.tuned_gemm import tgemm
 
         group = get_parallel().tp_group
@@ -1957,6 +2005,8 @@ class KimiK3MoE(nn.Module):
             )
             if out is not None:
                 return out
+        if scatter_shared:
+            raise RuntimeError("moe_ar_norm (scatter-only shared) without the ag_agg tail")
         if (
             envs.SGLANG_ROCM_K3_AG_ONE_BARRIER.get()
             and getattr(ca, "_IS_CAPTURING", False)
@@ -2151,6 +2201,11 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_bs_limit = (
                     envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
+                # SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE: E4M3 [q,k,v,g | f_a | b]
+                # (k3_rocm_dense_fp8.MergedTailFP8Weight) and its output split.
+                self._k3_inproj_fp8 = None
+                self._k3_inproj_fp8_fb = False
+                self._k3_inproj_fp8_sizes: Optional[list[int]] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -2375,7 +2430,9 @@ class KimiK3DeltaAttention(nn.Module):
             if k3_rocm_dense_fp8.qkvg_enabled():
                 # E4M3 q/k/v/g like the CUDA "wide" scope; f_a/b stay bf16, so the
                 # whole-in-proj merge below no longer applies (dtype mismatch).
-                k3_rocm_dense_fp8.convert_linear(self.fused_qkvg_proj)
+                fp8 = k3_rocm_dense_fp8.convert_linear(self.fused_qkvg_proj)
+                if envs.SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE.get():
+                    self._build_kda_inproj_fp8_merge(fp8)
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
@@ -2401,6 +2458,70 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _build_kda_inproj_fp8_merge(self, fp8) -> None:
+        """ROCm SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE (with the E4M3 [q,k,v,g]):
+        append E4M3 [f_a | b] rows (one scale per row) to the pre-shuffled
+        [q,k,v,g] weight so small-M decode/verify runs one GEMM for the whole
+        in-proj instead of FP8 GEMM + bf16 [f_a|b] skinny GEMM.
+
+        Numerics: q/k/v/g columns are bit-identical (same kernel and weight
+        bytes); f_a and b become FP8xFP8 products of the same E4M3 activation
+        q/k/v/g already use (relative error ~3%, the same as q/k/v/g; on real
+        weights the KDA output moves by ~0.5% vs the bf16-gate path, against
+        the ~4-6% the FP8 q/k/v/g already introduce). The bf16 [f_a|b] weights
+        stay for the uncovered M (prefill, M > MAX_M)."""
+        from sglang.srt.layers import k3_rocm_dense_fp8
+
+        mods = (self.f_a_proj, self.b_proj)
+        ws = [getattr(m, "weight", None) for m in mods]
+        if (
+            self._bfa_uses_block_fp8
+            or any(w is None or type(w.data) is not torch.Tensor for w in ws)
+            or not _is_unquantized_mergeable(ws)
+            or any(w.dim() != 2 or w.shape[1] != fp8.k for w in ws)
+        ):
+            rank0_log("K3 ROCm KDA in-proj FP8 merge disabled: unexpected f_a/b layout")
+            return
+        tail = [w.data.float() for w in ws]
+        with_fb = envs.SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE_FB.get()
+        f_b_w = self.f_b_proj.weight
+        if with_fb and (
+            type(f_b_w.data) is not torch.Tensor
+            or f_b_w.dtype not in (torch.bfloat16, torch.float16)
+            or tuple(f_b_w.shape) != (self.split_sizes[1], ws[0].shape[0])
+        ):
+            rank0_log("K3 ROCm KDA in-proj FP8 merge: f_b rows skipped (unexpected f_b)")
+            with_fb = False
+        if with_fb:
+            # forget-gate pre-activation = x @ (f_b . f_a)^T, composed in fp32
+            tail.append(f_b_w.data.float() @ tail[0])
+        try:
+            merged = k3_rocm_dense_fp8.MergedTailFP8Weight(
+                fp8,
+                torch.cat(tail),
+                envs.SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE_MAX_M.get(),
+            )
+        except Exception as e:  # noqa: BLE001
+            rank0_log(f"K3 ROCm KDA in-proj FP8 merge disabled: {type(e).__name__}: {e}")
+            return
+        if not merged.configs:
+            rank0_log("K3 ROCm KDA in-proj FP8 merge disabled: no FlyDSL config")
+            return
+        # The layer's placeholder weight must follow the base view, or it pins
+        # the pre-merge buffer.
+        self.fused_qkvg_proj.weight.data = fp8.weight
+        n_fa, n_b = ws[0].shape[0], ws[1].shape[0]
+        n_fg = tail[2].shape[0] if with_fb else 0
+        self._k3_inproj_fp8 = merged
+        self._k3_inproj_fp8_fb = with_fb
+        self._k3_inproj_fp8_sizes = [
+            *self.split_sizes,
+            n_fa,
+            n_b,
+            n_fg,
+            merged.n - fp8.n - n_fa - n_b - n_fg,
+        ]
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2594,13 +2715,37 @@ class KimiK3DeltaAttention(nn.Module):
         self._kda_hip_verify_fuse_ready = True
 
     def forward_qkvbfg_fused(
-        self, hidden_states: torch.Tensor, defer_f_b: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        defer_f_b: bool = False,
+        is_verify: bool = False,
     ):
         if self.use_full_rank_gate:
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+                if (
+                    _is_hip
+                    and self._k3_inproj_fp8 is not None
+                    and self._k3_inproj_fp8.covers(hidden_states.shape[0])
+                ):
+                    # ROCm SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE: one E4M3 GEMM
+                    # for [q,k,v,g | f_a | b].
+                    fused_states = self._k3_inproj_fp8(hidden_states)
+                    qkv, g_proj_states, f_a, beta, f_g, _pad = torch.split(
+                        fused_states, self._k3_inproj_fp8_sizes, dim=-1
+                    )
+                    if defer_f_b:
+                        forget_gate = f_a
+                    elif self._k3_inproj_fp8_fb and is_verify:
+                        # composed f_b.f_a rows (_FB); strided, which the
+                        # verify kernels take through their token stride
+                        forget_gate = f_g
+                    else:
+                        forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     _is_hip
@@ -2696,7 +2841,9 @@ class KimiK3DeltaAttention(nn.Module):
         )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states, defer_f_b=defer_f_b or verify_defer_f_b
+                hidden_states,
+                defer_f_b=defer_f_b or verify_defer_f_b,
+                is_verify=forward_batch.forward_mode.is_target_verify(),
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(

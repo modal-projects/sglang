@@ -658,6 +658,20 @@ class AttnResidual:
             k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
         return out, prefix
 
+    def ag_fused_ready(self, ca, num_tokens: int, hidden_size: int, write: bool) -> bool:
+        """Whether forward_ag_fused(ca, y [num_tokens, hidden_size / tp], ...,
+        write) takes the fused kernel right now (callers that prepare an input
+        only that kernel can consume ask first)."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        return not (
+            num_tokens > fused_max_t(all_gather=True)
+            or not k3_ar_agg_hip.usable(ca, num_tokens, hidden_size, nvb)
+            or (write and self.block_residual.shape[1] <= nvb)
+            or self._stream_pending is not None
+        )
+
     def forward_ag_fused(
         self,
         ca,
@@ -680,12 +694,7 @@ class AttnResidual:
         nvb = self.num_valid_blocks
         T = y.shape[0]
         H = add_b.shape[1]
-        if (
-            T > fused_max_t(all_gather=True)
-            or not k3_ar_agg_hip.usable(ca, T, H, nvb)
-            or (write and self.block_residual.shape[1] <= nvb)
-            or self._stream_pending is not None
-        ):
+        if not self.ag_fused_ready(ca, T, H, write):
             return None
         out, h, out_fp8 = self._fused_outputs(add_b)
         k3_ar_agg_hip.ag_agg(

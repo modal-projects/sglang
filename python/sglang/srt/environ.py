@@ -936,6 +936,19 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # ROCm K3 with SGLANG_K3_TARGET_DENSE_FP8=wide: append the KDA [f_a|b] rows
+    # (E4M3, per-row scales) to the E4M3 [q,k,v,g] GEMM for M <= MAX_M, so the
+    # bf16 [f_a|b] skinny GEMM launch goes away (same AITER FlyDSL kernel the
+    # qkvg shape is tuned to; q/k/v/g columns bit-identical). f_a/b become
+    # FP8xFP8 like q/k/v/g (see kimi_k3.py _build_kda_inproj_fp8_merge). Only M
+    # with a FlyDSL tuned row for the [q,k,v,g] shape are covered (gfx950: 1-32,
+    # 56-64); other M keep the separate launches.
+    SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE = EnvBool(False)
+    SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE_MAX_M = EnvInt(64)
+    # ... and also append the composed f_b.f_a rows (E4M3 [heads/tp*128, hidden],
+    # one scale per row, +11 MB/layer) so target verify reads the forget gate
+    # straight from the GEMM: the f_b skinny GEMM launch goes away too.
+    SGLANG_ROCM_K3_KDA_INPROJ_FP8_MERGE_FB = EnvBool(False)
     # ROCm K3 KDA target-verify fusion: the verify step skips the unused
     # intermediate-row mask and applies o_norm with a strided-gate kernel (no
     # gate copy); implies the fused chain-verify kernel (SGLANG_OPT_FUSED_KDA_VERIFY)
@@ -1120,6 +1133,18 @@ class Envs:
     SGLANG_ROCM_K3_AR_AGG_FUSED_MAX_T = EnvInt(64)
     # token ceiling of the all-gather variant
     SGLANG_ROCM_K3_AR_AGG_FUSED_AG_MAX_T = EnvInt(64)
+    # ROCm K3 TP8 decode/verify, with SGLANG_ROCM_K3_AR_AGG_FUSED +
+    # SGLANG_ROCM_K3_UPPROJ_AG + SGLANG_ROCM_K3_MOE_EPI_FUSE: the MoE
+    # [latent | shared] all-reduce and the latent RMSNorm in one kernel (AITER
+    # 2-stage AR + aiter rmsnorm otherwise). Many producer blocks reduce column
+    # units in AITER's summation order and publish each unit's sum of squares
+    # with its flag; consumers merge the statistics in a fixed order. The
+    # shared half is only reduce-scattered (the fused up_proj all-gather tail
+    # reads this rank's columns only). Reduced rows bit-identical, normed
+    # latent within 1 bf16 ulp, identical on all ranks. Only where the ag_agg
+    # tail is known to fire (not the last MoE layer). See
+    # kernels/ops/communication/k3_moe_ar_norm_hip.py.
+    SGLANG_ROCM_K3_MOE_AR_NORM_FUSED = EnvBool(False)
     # With SGLANG_ROCM_K3_AR_AGG_FUSED: let the next layer's attention-side
     # aggregation take the result the MoE all-gather kernel already computed
     # when it receives the same storage (KimiK3MoE.forward returns a .view() of

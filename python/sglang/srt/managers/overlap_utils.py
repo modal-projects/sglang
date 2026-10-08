@@ -66,6 +66,8 @@ def decide_needs_confidence_relay() -> bool:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+from sglang.srt.speculative.k3_step_timing import STEP_TIMER as _K3_STEP_TIMER  # noqa: E402
 _is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
@@ -532,6 +534,8 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+        if _K3_STEP_TIMER.enabled:
+            _K3_STEP_TIMER.mark("publish_waited")
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
@@ -559,6 +563,8 @@ class FutureMap:
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
         self.fwd_prepare_d2h_stream.synchronize()
+        if _K3_STEP_TIMER.enabled:
+            _K3_STEP_TIMER.mark("seq_lens_d2h_done")
 
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]

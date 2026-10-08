@@ -381,6 +381,8 @@ else:
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.speculative.k3_step_timing import STEP_TIMER as _K3_STEP_TIMER  # noqa: E402
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1950,12 +1952,20 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        from sglang.srt.speculative.k3_step_timing import STEP_TIMER as _st
+
+        _st_on = _st.enabled
+
         while True:
             if self.gracefully_exit:
                 break
 
+            if _st_on:
+                _st.iter_begin()
             # Receive requests
             self.ingest_requests()
+            if _st_on:
+                _st.mark("ingested")
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1970,6 +1980,8 @@ class Scheduler(
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            if _st_on:
+                _st.mark("batch_ready")
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1990,6 +2002,8 @@ class Scheduler(
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if _st_on:
+                    _st.mark("run_batch_ret")
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -1998,6 +2012,8 @@ class Scheduler(
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
+                    if _st_on:
+                        _st.mark("prev_result_done")
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -4394,9 +4410,26 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                if _K3_STEP_TIMER.enabled:
+                    _K3_STEP_TIMER.meta(
+                        it=self.forward_ct,
+                        mode=(
+                            "decode"
+                            if batch.forward_mode.is_decode()
+                            else (
+                                "idle"
+                                if batch.forward_mode.is_idle()
+                                else "extend"
+                            )
+                        ),
+                        bs=batch.batch_size(),
+                    )
+                    _K3_STEP_TIMER.mark("resolve_begin")
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
+                if _K3_STEP_TIMER.enabled:
+                    _K3_STEP_TIMER.mark("resolve_done")
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -4429,9 +4462,13 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        if _K3_STEP_TIMER.enabled:
+                            _K3_STEP_TIMER.mark("fwd_call")
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if _K3_STEP_TIMER.enabled:
+                            _K3_STEP_TIMER.mark("fwd_ret")
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4468,6 +4505,8 @@ class Scheduler(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                                if _K3_STEP_TIMER.enabled:
+                                    _K3_STEP_TIMER.mark("copy_to_cpu_ret")
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf

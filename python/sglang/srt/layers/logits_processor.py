@@ -929,7 +929,16 @@ class LogitsProcessor(nn.Module):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             else:
-                logits = self._logits_gatherer(logits)
+                gathered = (
+                    _k3_logits_all_gather_lastdim(logits)
+                    if envs.SGLANG_ROCM_K3_LOGITS_AG_LASTDIM.get()
+                    else None
+                )
+                logits = (
+                    gathered
+                    if gathered is not None
+                    else self._logits_gatherer(logits)
+                )
             _trace_e2e_logits(
                 "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
             )
@@ -1458,3 +1467,50 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def _k3_logits_all_gather_lastdim(logits: torch.Tensor) -> Optional[torch.Tensor]:
+    """SGLANG_ROCM_K3_LOGITS_AG_LASTDIM: gather vocab-parallel logits
+    [rows, vocab/tp] -> [rows, vocab] with the AITER custom last-dim all-gather
+    (one kernel writing the final layout) instead of a dim-0 gather plus the
+    movedim copy. Pure data movement: bit-identical. None = not applicable
+    (caller falls back to the default gather)."""
+    if not (torch.version.hip and logits.is_cuda and logits.dim() == 2):
+        return None
+    if logits.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    if not logits.is_contiguous():
+        return None
+    pack = 16 // logits.element_size()
+    if logits.shape[-1] % pack != 0 or logits.shape[0] == 0:
+        return None
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    ca = getattr(group, "ca_comm", None)
+    if (
+        ca is None
+        or getattr(ca, "disabled", True)
+        or not hasattr(ca, "all_gather_reg")
+        or not hasattr(ca, "all_gather_unreg")
+        or not ca.should_custom_ag(logits)
+    ):
+        return None
+    world = group.world_size
+    out = torch.empty(
+        (logits.shape[0], logits.shape[1] * world),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    if getattr(ca, "_IS_CAPTURING", False):
+        if torch.cuda.is_current_stream_capturing():
+            if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                ca.all_gather_unreg(logits, out=out, dim=-1)
+            else:
+                ca.all_gather_reg(logits, out=out, dim=-1)
+        else:
+            # Graph warmup: no host collective (mirrors _all_gather_into_tensor).
+            out.zero_()
+    else:
+        ca.all_gather_unreg(logits, out=out, dim=-1)
+    return out

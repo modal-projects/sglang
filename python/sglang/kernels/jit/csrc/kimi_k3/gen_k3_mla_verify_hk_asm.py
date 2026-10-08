@@ -26,7 +26,9 @@ VSLOTS = int(os.environ.get("GEN_VSLOTS", "6"))   # V ring v[208:255] (v192..207
 VRING = 256 - 8 * VSLOTS
 PDV = int(os.environ.get("GEN_PDV", "3"))
 ROWLIN = os.environ.get("GEN_ROWLIN", "1") == "1"  # LDS tile = token-major 576 B rows (chunk c at c ^ ((t>>2)&3))
-LSUM8 = os.environ.get("GEN_LSUM8", "1") == "1"   # l = sum of the fp8-rounded P (via an MFMA with A = ones)
+LSUM8 = os.environ.get("GEN_LSUM8", "1") == "1"
+QROT = os.environ.get("GEN_QROT", "0") == "1"  # CTA-rotated Q load order
+DELTA = float(os.environ.get("GEN_DELTA", "3"))  # rescale headroom (log2 units) added to a new running max   # l = sum of the fp8-rounded P (via an MFMA with A = ones)
 
 out = []
 w = out.append
@@ -145,6 +147,8 @@ def decide_valu(cur, tmp):
     v.append(f"v_max_f32_e32 v{t[2]}, %[m], v{t[0]}")           # m_new
     v.append(f"v_sub_f32_e32 v{t[3]}, v{t[2]}, %[m]")
     v.append(f"v_cmp_lt_f32_e64 %[rs], 2.0, v{t[3]}")            # rows with growth > tau
+    if DELTA:
+        v.append(f"v_add_f32_e32 v{t[2]}, {DELTA}, v{t[2]}")      # headroom: m_used = m_new + delta
     v.append("s_nop 4")
     v.append("s_cmp_lg_u64 %[rs], 0")
     v.append("s_cselect_b64 %[mk], -1, 0")
@@ -349,12 +353,23 @@ for R in range(8):
 # Raw bf16 Q (32 dims x 9 k-steps per lane = 144 dwords) -> v[48:191] with all loads in
 # flight at once; per-row amax (int max of |bf16| bits, then across lane halves);
 # quantize in place to fp8 v[48:119] (fp8 dword k of k-step ks from raw dwords 2k, 2k+1).
-def q_prologue(lds=False):
+def q_prologue(lds=False, part=0):
+    """part 0: whole prologue; 1: loads only (raw bf16 Q in v[48:191]); 2: amax + quantize only."""
     l = []
+    if part == 2:
+        lds = None
     if lds:
         # coalesced LDS-DMA of this wave's 32 contiguous rows (36 KB) into its slot, then
         # per-lane ds_read_b128 in the MFMA layout (row l32, dims 64 ks + 32 h + 16 jj)
         for k in range(36):
+            if QROT:
+                # rotated issue order (CTA-dependent start): spreads the L2 channel hot spot when
+                # many CTAs read the same Q block at the same time
+                l += [f"s_add_u32 %[t0], %[rot], {1024*k}", "s_cmp_ge_u32 %[t0], 36864",
+                      "s_cselect_b32 %[t1], 36864, 0", "s_sub_u32 %[t0], %[t0], %[t1]",
+                      "v_add_u32_e32 v192, %[t0], %[v16]", "s_add_u32 m0, %[sl], %[t0]", "s_nop 0",
+                      "buffer_load_dwordx4 v192, %[rs], 0 offen lds"]
+                continue
             l.append(f"v_add_u32_e32 v192, {1024*k}, %[v16]")
             l += [f"s_add_u32 m0, %[sl], {1024*k}", "s_nop 0", "buffer_load_dwordx4 v192, %[rs], 0 offen lds"]
         l.append("s_waitcnt vmcnt(0)")
@@ -363,12 +378,18 @@ def q_prologue(lds=False):
                 r = 48 + 16 * ks + 4 * jj
                 l.append(f"ds_read_b128 v[{r}:{r+3}], %[la] offset:{128*ks + 16*jj}")
         l.append("s_waitcnt lgkmcnt(0)")
+    elif lds is None:
+        pass
     else:
         for ks in range(9):
             for jj in range(4):
                 r = 48 + 16 * ks + 4 * jj
                 l.append(f"global_load_dwordx4 v[{r}:{r+3}], %[qa], off offset:{128*ks + 16*jj}")
         l.append("s_waitcnt vmcnt(0)")
+    if part == 1:
+        return l
+    if os.environ.get("GEN_QNOVALU"):
+        return l + ["v_mov_b32_e32 %[am], 1.0"]
     acc = [192, 193, 194, 195]
     tmp = [196, 197, 198, 199]
     for i in range(144):
@@ -429,10 +450,23 @@ w("  float am;")
 w(asm_block(q_prologue(), outs='[am] "=v"(am)', ins='[qa] "v"(qa)', clob=ALL_V + ', "memory"'))
 w("  return am;")
 w("}")
-w("__device__ __forceinline__ float q_prologue_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la) {")
+w("__device__ __forceinline__ float q_prologue_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la, uint32_t rot) {")
 w("  float am;")
-w(asm_block(q_prologue(True), outs='[am] "=v"(am)', ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la)',
+w("  uint32_t t0, t1;")
+w(asm_block(q_prologue(True), outs='[am] "=v"(am), [t0] "=&s"(t0), [t1] "=&s"(t1)',
+            ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la), [rot] "s"(rot)',
             clob=ALL_V + ', "m0", "scc", "memory"'))
+w("  return am;")
+w("}")
+w("__device__ __forceinline__ void q_load_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la, uint32_t rot) {")
+w("  uint32_t t0, t1;")
+w(asm_block(q_prologue(True, 1), outs='[t0] "=&s"(t0), [t1] "=&s"(t1)',
+            ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la), [rot] "s"(rot)',
+            clob=ALL_V + ', "m0", "scc", "memory"'))
+w("}")
+w("__device__ __forceinline__ float q_quant_asm() {")
+w("  float am;")
+w(asm_block(q_prologue(None, 2), outs='[am] "=v"(am)', clob=ALL_V))
 w("  return am;")
 w("}")
 

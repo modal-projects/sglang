@@ -1811,8 +1811,10 @@ def _k3_auto_reduce(
     G_S_BLK: tl.constexpr,
     G_BLOCK_N: tl.constexpr,
     D_BLK: tl.constexpr,
+    V_DONE: tl.constexpr = False,
 ):
-    """One program per (request, row = q_pos*H + h, D_BLK columns)."""
+    """One program per (request, row = q_pos*H + h, D_BLK columns).
+    V_DONE: the long-context stage 1 merged its splits itself (HK fused merge)."""
     ROWS: tl.constexpr = H * QLEN
     b = tl.program_id(0)
     r = tl.program_id(1)
@@ -1822,7 +1824,9 @@ def _k3_auto_reduce(
     h = r % H
     o_off = (b * QLEN + qpos).to(tl.int64) * stride_o_tok + h * stride_o_h
     use_v2 = tl.load(FLAG)
-    if use_v2 != 0:
+    if V_DONE and use_v2 != 0:
+        pass
+    elif use_v2 != 0:
         # == _k3_mla_verify_reduce (base-2 LSE merge of the v2/v3 splits)
         L = tl.load(KV_INDPTR + b + 1) - tl.load(KV_INDPTR + b)
         chunk = _split_chunk(L, NSPLIT, BLOCK_N, MIN_CHUNK)
@@ -1955,6 +1959,7 @@ def k3_mla_verify_auto(
     g_within_2gb = kv.shape[0] * kv.stride(0) * kv.element_size() <= 0x80000000
 
     # v2 operands / partials
+    v_done = 0
     w8 = (not fused) and (not hk) and bs <= w8_max_bs
     min_chunk = _V3_MIN_CHUNK
     nsplit = max(2, default_num_splits(bs))
@@ -2008,9 +2013,11 @@ def k3_mla_verify_auto(
         )
         # ---------------- 2. HK / v2 / v3 stage 1 on sel (all-empty in the Gluon regime)
         if hk:
-            from sglang.kernels.ops.attention.k3_mla_verify_hk import hk_stage1
+            from sglang.kernels.ops.attention.k3_mla_verify_hk import hk_stage1, merger_rows
 
-            hk_stage1(q, kv, sel, kv_indices, kv_scale, o_part, lse_part, out, nsplit, min_chunk, sm_scale)
+            v_done = merger_rows(bs, nsplit)
+            hk_stage1(q, kv, sel, kv_indices, kv_scale, o_part, lse_part, out, nsplit, min_chunk, sm_scale,
+                      v_done)
         elif w8:
             _k3_mla_verify_v3_fwd[(nsplit, bs)](
                 q, kv, sel, kv_indices, kv_scale, o_part, lse_part,
@@ -2042,7 +2049,7 @@ def k3_mla_verify_auto(
         NSPLIT_P2=triton.next_power_of_2(nsplit), BLOCK_N=block_n, MIN_CHUNK=min_chunk,
         S_BLK=min(64, triton.next_power_of_2(nsplit)),
         G_NSPLIT=g_ns, G_S_BLK=min(64, triton.next_power_of_2(g_ns)), G_BLOCK_N=_GLUON_BLOCK_N,
-        D_BLK=128,
+        D_BLK=128, V_DONE=v_done > 0,
         num_warps=4 if nsplit >= 64 else 2,
     )
     return out

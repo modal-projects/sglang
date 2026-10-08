@@ -53,7 +53,8 @@ constexpr float kPScale = 64.0f;  // p <= 2^tau = 4 -> 256 < 448
 #ifdef K3HK_DEBUG
 __device__ int kDbg;
 __device__ unsigned long long kTs[4096 * 8];
-#define K3_TS(k) do { if (lane == 0) kTs[(blockIdx.y * gridDim.x + blockIdx.x) * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); } while (0)
+__device__ int kCnt[4096 * 4];
+#define K3_TS(k) do { if (lane == 0) kTs[(blockIdx.x) * 8 + (k)] = __builtin_amdgcn_s_memrealtime(); } while (0)
 #define K3_DBG_ARG , int dbg
 #define K3_DBG_PASS , dbg
 #else
@@ -76,10 +77,30 @@ struct Params {
   int32_t nsplit, min_chunk;
   float sm_scale_log2;
   int32_t q_lds;  // 1: q rows are contiguous ([tok][12][576] dense) -> coalesced LDS staging of Q
+  // fused split merge (flags != nullptr): grid = bs * nsplit compute CTAs + nmrg merger CTAs
+  int32_t* flags;    // [kFlagCap] zero-initialised, self-resetting: split-done counters, then merger exit counters
+  int32_t bs;
+  int32_t mrg_rows;  // rows per merger CTA (1, 2, 4, 8); nmrg = bs * 96 / mrg_rows
+  int32_t nmrg;
+  // auto path (Gluon-or-HK regime switch on the GPU): kv_indptr above is the regime-selected
+  // indptr (all zero in the Gluon regime); in the Gluon regime the merger CTAs merge the Gluon
+  // splits instead (natural-log LSE, = aiter _mla_softmax_reducev_kernel), so no reduce launch.
+  const int32_t* regime;      // nullptr, or the use-HK flag written by the Gluon prologue
+  const int32_t* g_indptr;    // true kv_indptr (Gluon split formula)
+  const uint16_t* g_logits;   // bf16 [bs, qlen, H, g_ns, 512] (strided)
+  const float* g_lse;         // fp32 [bs, qlen, H, g_ns] (strided)
+  int64_t g_sl_b, g_sl_qs, g_sl_h, g_sl_s;
+  int64_t g_ml_b, g_ml_qs, g_ml_h, g_ml_s;
+  int32_t g_ns, g_block_n;
 };
+constexpr int kFlagCap = 32768;  // flags[b * nsplit + s] (b * nsplit < kFlagCap), exit counters at flags[kFlagCap + b]
 
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_rsrc(const void* p, uint32_t bytes) {
   return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), (short)0, (int)bytes, 0x00020000);
+}
+
+__device__ __forceinline__ void store_sc1(uint16_t* dst, v4i v) {
+  asm volatile("global_store_dwordx4 %0, %1, off sc1" ::"v"(dst), "v"(v) : "memory");
 }
 
 __device__ __forceinline__ float bf16_to_f(uint32_t bits16) { return __uint_as_float(bits16 << 16); }
@@ -155,6 +176,9 @@ __device__ __forceinline__ void load_idx(v4u idx_rs, int pos) {
   load_idx_asm<R>(idx_rs, pos * 4);
 }
 
+#ifndef K3HK_BIDX
+#define K3HK_BIDX 0  // 1: compute waves start their Q loads after the loader issued the kv-index loads
+#endif
 #ifndef K3HK_PFA
 #define K3HK_PFA 2  // L2 prefetch distance in tiles beyond the LDS-DMA tile (<= 4)
 #endif
@@ -220,6 +244,9 @@ __device__ __forceinline__ void loader_wave(const Params& p, uint8_t K3_LDS* sme
   };
   // prologue: idx(0 .. 3+P), DMA tiles 0..2, prefetch tiles 3 .. 2+P
   for (int t = 0; t < 4 + kPfa && t < ntiles; ++t) idx(t);
+#if K3HK_BIDX
+  barrier_raw();  // B_idx: the compute waves issue their Q loads behind the kv-index loads
+#endif
   wait_vm<0>();
   dma(0);
   K3_TS(6);
@@ -431,7 +458,12 @@ __device__ __forceinline__ void iteration(WaveState& st, uint32_t slot, uint32_t
     if (next_mask) mask_s<1 - D>(next_thr);
     uint64_t rs;
     pv_decide<1 - D>(slot + voff, slot + voff_o, s_scale, st.m_i, st.nb, st.al, rs, dc.ones, st.l_i);
-    if (rs != 0) o_scale(st.al);
+    if (rs != 0) {
+      o_scale(st.al);
+#ifdef K3HK_DEBUG
+      if ((threadIdx.x & 63) == 0) kCnt[blockIdx.x * 4 + dc.w] += 1;
+#endif
+    }
   } else {
     pv_tile_asm<D>(slot + voff, slot + voff_o, dc.ones, st.al, st.l_i);
   }
@@ -448,19 +480,25 @@ __device__ __forceinline__ void compute_wave(const Params& p, uint8_t K3_LDS* sm
   const uint16_t* qrow = p.q + (int64_t)(b * kQLen + qpos) * p.stride_q_tok + (int64_t)head * p.stride_q_h + 32 * h;
   // q8 = fp8(q * 448 / amax_row); qscale = amax_row / 448
   float qscale;
+  const float kv_scale = *p.kv_scale;
+#if K3HK_BIDX
+  asm volatile("s_barrier" ::: "memory");  // B_idx
+#endif
   if (p.q_lds) {
     // this wave's 32 rows are one contiguous 36 KB block: DMA it into LDS slot 1 + w (tiles 1, 2
-    // are issued by the loader only after barrier B_q), read back in the MFMA layout
+    // are issued by the loader only after barrier B_q), read back in the MFMA layout; the slot
+    // is released (B_q) before the quantization VALU so the loader's DMA(1, 2) overlap it
     const uint16_t* qblk = p.q + ((int64_t)b * kRows + 32 * w) * kD;
     const uint32_t sl = (uint32_t)(uintptr_t)smem + (uint32_t)((1 + w) * kTileBytes);
-    qscale = q_prologue_lds_asm(make_rsrc_s(qblk, 32 * kD * 2), sl, 16u * (uint32_t)lane,
-                                sl + 1152u * (uint32_t)l32 + 64u * (uint32_t)h);
+    q_load_lds_asm(make_rsrc_s(qblk, 32 * kD * 2), sl, 16u * (uint32_t)lane, sl + 1152u * (uint32_t)l32 + 64u * (uint32_t)h,
+                   1024u * (uint32_t)__builtin_amdgcn_readfirstlane((blockIdx.x >> 3) % 36));
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_q: Q staging slots free
+    qscale = q_quant_asm();
   } else {
     qscale = q_prologue_asm(qrow);
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_q
   }
   if (w == 0) K3_TS(5);
-  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_q: Q staging slots free
-  const float kv_scale = *p.kv_scale;
   const float s_scale = qscale * (kv_scale * p.sm_scale_log2);
 
   const uint32_t base = (uint32_t)(uintptr_t)smem;
@@ -521,7 +559,12 @@ __device__ __forceinline__ void compute_wave(const Params& p, uint8_t K3_LDS* sm
   const float o_mul = has ? kv_scale / l_tot : 0.f;
   if (p.nsplit != 1 && h == 0) {
     const int64_t prow = ((int64_t)b * p.nsplit + split) * kRows + row;
-    p.lse_part[prow] = has ? st.m_i + __builtin_amdgcn_logf(l_tot) - 6.0f : -INFINITY;
+    const float lse = has ? st.m_i + __builtin_amdgcn_logf(l_tot) - 6.0f : -INFINITY;
+    if (p.flags != nullptr) {
+      __hip_atomic_store(p.lse_part + prow, lse, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);  // sc1
+    } else {
+      p.lse_part[prow] = lse;
+    }
   }
   // After the last barrier only the last tile's slot is still read (by other waves):
   // wave w stages its 32 x 512 bf16 O block in slot (ntiles + w) % 4.
@@ -538,7 +581,17 @@ __device__ __forceinline__ void compute_wave(const Params& p, uint8_t K3_LDS* sm
     } else {
       dst = p.o_part + (((int64_t)b * p.nsplit + split) * kRows + rr) * kDV;
     }
-    *(v4i*)(dst + 8 * lane) = *(const v4i K3_LDS*)(buf + r * kOPitch + 8 * lane);
+    const v4i v = *(const v4i K3_LDS*)(buf + r * kOPitch + 8 * lane);
+    if (p.flags != nullptr) {
+      store_sc1(dst + 8 * lane, v);
+    } else {
+      *(v4i*)(dst + 8 * lane) = v;
+    }
+  }
+  if (p.flags != nullptr) {
+    // publish: this wave's 32 partial rows (+ lse) are at the coherence point -> flag += 1 (3 = split done)
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    if (lane == 0) __hip_atomic_fetch_add(p.flags + b * p.nsplit + split, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
   if (w == 0) {
     __builtin_amdgcn_s_waitcnt(0);
@@ -546,10 +599,299 @@ __device__ __forceinline__ void compute_wave(const Params& p, uint8_t K3_LDS* sm
   }
 }
 
+// ---------------------------------------------------------------- fused split merge
+// Merger CTAs come after all compute CTAs in the grid. Merger m owns U = mrg_rows consecutive
+// rows of request b = m / (96 / U). Its waves poll the per-split done counters (3 = all three
+// compute waves published), pull newly finished splits' partial rows (bf16, written with sc1 =
+// agent-coherent write-through) and fold them into an online base-2 LSE merge, so the merge
+// overlaps the CTA tail. Deadlock-free: mergers only wait on compute CTAs, which never wait,
+// and nmrg (<= 128) < #CUs, so compute CTAs always find a CU even if dispatch were unordered.
+// U <= 4: WS = 4 / U waves per row, wave w takes splits s = sub (mod WS); U = 8: 2 rows / wave.
+#ifndef K3HK_MRG_SLEEP
+#define K3HK_MRG_SLEEP 2  // x 127 x 64 clk between empty polls
+#endif
+constexpr int kMrgAux = 16;  // cache policy sc1 (agent-coherent load)
+
+__device__ __forceinline__ float wave_max(float v) {
+#pragma unroll
+  for (int o = 32; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 64));
+  return v;
+}
+__device__ __forceinline__ float wave_sum(float v) {
+#pragma unroll
+  for (int o = 32; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+  return v;
+}
+
+// Splits are polled / batched per group of 64 (lane l <-> split 64 j + l). A batch = the newly
+// finished splits of one group (<= KB): per-lane lse loads (one instruction per row), one 1 KB
+// LDS-DMA per (split, row), then batch max -> rescale -> weighted sum (weights via readlane).
+template <int U>
+__device__ __forceinline__ void merger_body(const Params& p, uint8_t K3_LDS* smem, int m) {
+  constexpr int WS = U <= 4 ? 4 / U : 1;
+  constexpr int R = U <= 4 ? 1 : U / 4;
+  constexpr int KB = R == 1 ? 32 : 16;  // splits per batch (LDS: KB * R KB per wave)
+  const int w = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+  const int lane = threadIdx.x & 63;
+  constexpr int cpr = kRows / U;
+  const int b = m / cpr;
+  const int row0 = (m - b * cpr) * U + (U <= 4 ? w / WS : R * w);
+  const int sub = U <= 4 ? w % WS : 0;
+  const int kv0 = p.kv_indptr[b];
+  const int L = p.kv_indptr[b + 1] - kv0;
+  const int chunk = split_chunk(L, p.nsplit, p.min_chunk);
+  const int n = L > 0 ? min((L + chunk - 1) / chunk, p.nsplit) : 0;
+  if (n == 0) return;  // nothing to merge (and nothing was published): no exit count either
+  if (w == 0) K3_TS(0);
+  int npoll = 0;
+  const int32_t* flg = p.flags + b * p.nsplit;
+  const int64_t pbase = (int64_t)b * p.nsplit;
+  __amdgpu_buffer_rsrc_t ors = make_rsrc(p.o_part + pbase * kRows * kDV, (uint32_t)(n * kRows * kDV * 2));
+  const float* lsep = p.lse_part + pbase * kRows + row0;
+  uint8_t K3_LDS* wbuf = smem + w * (KB * R * 1024);
+  float acc[R][8];
+  float mx[R], ws[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    mx[r] = -INFINITY;
+    ws[r] = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[r][e] = 0.f;
+  }
+  uint64_t todo[4];
+  int left = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int s = 64 * j + lane;
+    todo[j] = __ballot(s < n && (s % WS) == sub);
+    left += __builtin_popcountll(todo[j]);
+  }
+  while (left > 0) {
+    // poll the done counters of the first group with work left
+    int j = 0;
+    while (todo[j] == 0) ++j;
+    const int s_l = 64 * j + lane;
+    bool r = false;
+    if ((todo[j] >> lane) & 1) r = __hip_atomic_load(flg + s_l, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >= 3;
+    uint64_t take = __ballot(r);
+    ++npoll;
+    if (take == 0) {
+      // back off: the done counters of a request share a few lines; hammering them slows the
+      // compute CTAs' KV stream on that channel
+      for (int z = 0; z < K3HK_MRG_SLEEP; ++z) __builtin_amdgcn_s_sleep(127);
+      continue;
+    }
+    // limit to KB splits (lowest lanes first)
+    if (__builtin_popcountll(take) > KB) {
+      uint64_t t2 = take;
+      for (int k = 0; k < KB; ++k) t2 &= t2 - 1;
+      take &= ~t2;
+    }
+    todo[j] &= ~take;
+    const int nb = __builtin_popcountll(take);
+    left -= nb;
+    const bool mine = (take >> lane) & 1;
+    float lv[R];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr)
+      lv[rr] = mine ? __hip_atomic_load(lsep + (int64_t)s_l * kRows + rr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : -INFINITY;
+    {
+      uint64_t mk = take;
+      for (int k = 0; mk != 0; ++k) {
+        const int s = 64 * j + __builtin_ctzll(mk);
+        mk &= mk - 1;
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr)
+          __builtin_amdgcn_raw_ptr_buffer_load_lds(ors, (void K3_LDS*)(wbuf + (k * R + rr) * 1024), 16,
+                                                   (uint32_t)(((s * kRows + row0 + rr) * kDV + 8 * lane) * 2), 0, 0, kMrgAux);
+      }
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+      const float mn = fmaxf(mx[rr], wave_max(lv[rr]));
+      if (mn == -INFINITY) continue;  // all rows empty so far
+      const float al = __builtin_amdgcn_exp2f(mx[rr] - mn);
+      mx[rr] = mn;
+      const float wl = mine ? __builtin_amdgcn_exp2f(lv[rr] - mn) : 0.f;
+      ws[rr] = ws[rr] * al + wave_sum(wl);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[rr][e] *= al;
+      uint64_t mk = take;
+      for (int k = 0; mk != 0; ++k) {
+        const int bit = __builtin_ctzll(mk);
+        mk &= mk - 1;
+        const float wk = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, wl), bit));
+        const v4i x = *(const v4i K3_LDS*)(wbuf + (k * R + rr) * 1024 + 16 * lane);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const uint32_t u = (uint32_t)x[e];
+          acc[rr][2 * e] += wk * bf16_to_f(u & 0xffffu);
+          acc[rr][2 * e + 1] += wk * bf16_to_f(u >> 16);
+        }
+      }
+    }
+  }
+  if (w == 0) K3_TS(3);
+#ifdef K3HK_DEBUG
+  if (w == 0 && lane == 0) kTs[blockIdx.x * 8 + 5] = npoll;
+#endif
+  // combine the WS waves of a row through LDS (batch buffers are free now)
+  if constexpr (WS > 1) {
+    __syncthreads();
+    float K3_LDS* cb = (float K3_LDS*)smem + w * (64 * 8 + 2);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) cb[e * 64 + lane] = acc[0][e];
+    if (lane == 0) {
+      cb[512] = mx[0];
+      cb[513] = ws[0];
+    }
+    __syncthreads();
+    if (sub == 0) {
+      float M = mx[0];
+      for (int t = 1; t < WS; ++t) M = fmaxf(M, ((float K3_LDS*)smem)[(w + t) * (64 * 8 + 2) + 512]);
+      const float Mu = M == -INFINITY ? 0.f : M;
+      float tw = 0.f;
+      float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      for (int t = 0; t < WS; ++t) {
+        const float K3_LDS* c = (const float K3_LDS*)smem + (w + t) * (64 * 8 + 2);
+        const float f = __builtin_amdgcn_exp2f(c[512] - Mu);
+        tw += f * c[513];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o[e] += f * c[e * 64 + lane];
+      }
+      ws[0] = tw;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[0][e] = o[e];
+    }
+  }
+  if (sub == 0) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int row = row0 + r;
+      const float inv = ws[r] > 0.f ? 1.f / ws[r] : 0.f;
+      v4i o;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const bf16x2 pk = __builtin_convertvector((v2f{acc[r][2 * e] * inv, acc[r][2 * e + 1] * inv}), bf16x2);
+        o[e] = __builtin_bit_cast(int, pk);
+      }
+      const int qp = row / kH;
+      *(v4i*)(p.o_final + (int64_t)(b * kQLen + qp) * p.stride_o_tok + (int64_t)(row - qp * kH) * p.stride_o_h + 8 * lane) = o;
+    }
+  }
+  // last merger CTA of request b resets its done counters (all are 3: every merger saw every split)
+  __syncthreads();
+  if (w == 0) K3_TS(4);
+  if (w == 0) {
+    int old = 0;
+    if (lane == 0) old = __hip_atomic_fetch_add(p.flags + kFlagCap + b, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    old = __builtin_amdgcn_readfirstlane(old);
+    if (old == cpr - 1) {
+      for (int s = lane; s < p.nsplit; s += 64)
+        __hip_atomic_store(p.flags + b * p.nsplit + s, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      if (lane == 0) __hip_atomic_store(p.flags + kFlagCap + b, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+}
+
+// Gluon-regime merge of merger m's rows (Gluon stage 1 has completed: plain loads, no waiting).
+// Wave w handles rows row0 + w, w + 4, ... of the CTA's U rows; lane owns columns 8 lane .. + 7.
+__device__ __forceinline__ void gluon_merge(const Params& p, int m) {
+  const int w = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+  const int lane = threadIdx.x & 63;
+  const int U = p.mrg_rows;
+  const int cpr = kRows / U;
+  const int b = m / cpr;
+  const int gL = p.g_indptr[b + 1] - p.g_indptr[b];
+  const int gper = max(p.g_block_n, gL / p.g_ns);
+  const int gnact = gL > 0 ? min((gL + gper - 1) / gper, p.g_ns) : 0;
+  for (int row = (m - b * cpr) * U + w; row < (m - b * cpr + 1) * U; row += 4) {
+    const int qp = row / kH, h = row - qp * kH;
+    const uint16_t* lg = p.g_logits + b * p.g_sl_b + qp * p.g_sl_qs + h * p.g_sl_h + 8 * lane;
+    const float* ls = p.g_lse + b * p.g_ml_b + qp * p.g_ml_qs + h * p.g_ml_h;
+    float e_max = -INFINITY, e_sum = 0.f;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int s0 = 0; s0 < gnact; s0 += 4) {
+      v4i x[4];
+      float l[4];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int s = min(s0 + k, gnact - 1);
+        l[k] = s0 + k < gnact ? ls[s * p.g_ml_s] : -INFINITY;
+        x[k] = *(const v4i*)(lg + s * p.g_sl_s);
+      }
+      float tmax = l[0];
+#pragma unroll
+      for (int k = 1; k < 4; ++k) tmax = fmaxf(tmax, l[k]);
+      const float nmax = fmaxf(e_max, tmax);
+      if (nmax == -INFINITY) continue;
+      const float osc = e_max == -INFINITY ? 0.f : __expf(e_max - nmax);
+      e_sum *= osc;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[e] *= osc;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const float wk = l[k] == -INFINITY ? 0.f : __expf(l[k] - nmax);
+        e_sum += wk;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const uint32_t u = (uint32_t)x[k][e];
+          acc[2 * e] += wk * bf16_to_f(u & 0xffffu);
+          acc[2 * e + 1] += wk * bf16_to_f(u >> 16);
+        }
+      }
+      e_max = nmax;
+    }
+    const float inv = e_sum > 0.f ? 1.f / e_sum : 1.f;
+    v4i o;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const bf16x2 pk = __builtin_convertvector((v2f{acc[2 * e] * inv, acc[2 * e + 1] * inv}), bf16x2);
+      o[e] = __builtin_bit_cast(int, pk);
+    }
+    *(v4i*)(p.o_final + (int64_t)(b * kQLen + qp) * p.stride_o_tok + (int64_t)h * p.stride_o_h + 8 * lane) = o;
+  }
+}
+
+__device__ __forceinline__ void merger_cta(const Params& p, uint8_t K3_LDS* smem, int m) {
+#ifdef K3HK_NO_MERGER
+  return;
+#endif
+  if (m >= p.nmrg) return;
+  asm volatile(";K3_MERGER_BEGIN" ::: "memory");
+  if (p.regime != nullptr && *p.regime == 0) {
+    if (p.g_ns > 1) gluon_merge(p, m);
+    asm volatile(";K3_MERGER_END" ::: "memory");
+    return;
+  }
+  switch (p.mrg_rows) {
+    case 1: merger_body<1>(p, smem, m); break;
+    case 2: merger_body<2>(p, smem, m); break;
+    case 4: merger_body<4>(p, smem, m); break;
+    default: merger_body<8>(p, smem, m); break;
+  }
+  asm volatile(";K3_MERGER_END" ::: "memory");
+}
+
 __global__ __launch_bounds__(kThreads, 1) __attribute__((amdgpu_num_vgpr(48))) void k3_mla_verify_hk_kernel(const Params p) {
   __shared__ __attribute__((aligned(1024))) uint8_t smem_raw[kStages * kTileBytes + kMboxBytes];
   uint8_t K3_LDS* smem = (uint8_t K3_LDS*)smem_raw;
-  const int split = blockIdx.x, b = blockIdx.y;
+  const int cid = blockIdx.x;
+  const int ncomp = p.bs * p.nsplit;
+  if (cid >= ncomp) {
+    merger_cta(p, smem, cid - ncomp);
+    // terminate here so the merger path never joins the compute path's CFG (register-map check)
+    asm volatile("s_endpgm" ::: "memory");
+    __builtin_unreachable();
+  }
+  const int b = cid / p.nsplit, split = cid - b * p.nsplit;
+#ifdef K3HK_DEBUG
+  {
+    const int lane = threadIdx.x;
+    if (threadIdx.x == 0) K3_TS(7);
+  }
+#endif
   const int kv_start = p.kv_indptr[b];
   const int L = p.kv_indptr[b + 1] - kv_start;
   const int chunk = split_chunk(L, p.nsplit, p.min_chunk);
@@ -684,9 +1026,11 @@ struct K3MlaVerifyHK {
                   const tvm::ffi::TensorView o_part,
                   const tvm::ffi::TensorView lse_part,
                   const tvm::ffi::TensorView out,
+                  const tvm::ffi::TensorView flags,
                   int64_t nsplit,
                   int64_t min_chunk,
-                  double sm_scale_log2) {
+                  double sm_scale_log2,
+                  int64_t mrg_rows) {
     using namespace host;
     const int64_t ntok = q.size(0);
     const int64_t bs = ntok / k3hk::kQLen;
@@ -719,7 +1063,21 @@ struct K3MlaVerifyHK {
     p.min_chunk = static_cast<int32_t>(min_chunk);
     p.sm_scale_log2 = static_cast<float>(sm_scale_log2);
     p.q_lds = (q.stride(1) == k3hk::kD && q.stride(0) == k3hk::kH * k3hk::kD) ? 1 : 0;
-    LaunchKernel(dim3(static_cast<uint32_t>(nsplit), static_cast<uint32_t>(bs)), k3hk::kThreads, q.device())(
+    p.bs = static_cast<int32_t>(bs);
+    p.flags = nullptr;
+    p.mrg_rows = 1;
+    p.nmrg = 0;
+    if (mrg_rows > 0 && nsplit > 1) {
+      // fused split merge: merger CTAs after the compute CTAs (see merger_body)
+      RuntimeCheck(mrg_rows == 1 || mrg_rows == 2 || mrg_rows == 4 || mrg_rows == 8, "mrg_rows must be 1/2/4/8");
+      RuntimeCheck(bs * nsplit <= k3hk::kFlagCap && bs <= k3hk::kFlagCap, "fused merge: bs * nsplit too large");
+      RuntimeCheck(flags.numel() >= 2 * k3hk::kFlagCap, "fused merge: flags buffer too small");
+      RuntimeCheck(bs * k3hk::kRows / mrg_rows <= 192, "fused merge: too many merger CTAs");
+      p.flags = static_cast<int32_t*>(flags.data_ptr());
+      p.mrg_rows = static_cast<int32_t>(mrg_rows);
+      p.nmrg = static_cast<int32_t>(bs * k3hk::kRows / mrg_rows);
+    }
+    LaunchKernel(dim3(static_cast<uint32_t>(nsplit * bs + p.nmrg)), k3hk::kThreads, q.device())(
         k3hk::k3_mla_verify_hk_kernel, p);
   }
 };

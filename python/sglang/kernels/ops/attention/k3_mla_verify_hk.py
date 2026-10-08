@@ -21,6 +21,7 @@ No host syncs; the grid depends only on bs (CUDA-graph capturable).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 from typing import Optional
@@ -62,11 +63,40 @@ def _module():
     )
 
 
+_FLAG_CAP = 32768  # k3hk::kFlagCap
+_MAX_MERGERS = 192  # merger CTAs (< #CUs: compute CTAs always find a CU)
+
+
+def fused_merge_enabled() -> bool:
+    """In-kernel split merge (merger CTAs) instead of the separate Triton reduce."""
+    return os.environ.get("SGLANG_ROCM_K3_MLA_VERIFY_HK_FUSE", "0") == "1"
+
+
+@functools.lru_cache(maxsize=16)
+def _flags(device, stream_id: int) -> torch.Tensor:
+    # zero-initialised, self-resetting done / exit counters of the fused merge; one buffer per
+    # (device, stream) so concurrent streams never share counters. Allocated on the first
+    # (eager / warmup) call, i.e. outside CUDA-graph capture, like v2's _ones().
+    return torch.zeros(2 * _FLAG_CAP, dtype=torch.int32, device=device)
+
+
+def merger_rows(bs: int, nsplit: int) -> int:
+    """Rows per merger CTA (1/2/4/8) for the fused merge, 0 = use the separate reduce."""
+    if nsplit <= 1 or bs * nsplit > _FLAG_CAP or not fused_merge_enabled():
+        return 0
+    u = 1
+    while u < bs and u < 8:
+        u *= 2
+    return u if bs * 96 // u <= _MAX_MERGERS else 0
+
+
 def hk_stage1(q, kv, kv_indptr, kv_indices, kv_scale, o_part, lse_part, out, nsplit: int, min_chunk: int,
-              sm_scale: float) -> None:
-    """Stage 1 only (partials into o_part / lse_part with the v2 split formula)."""
-    _module().run(q, kv.view(torch.uint8), kv_indptr, kv_indices, kv_scale, o_part, lse_part, out,
-                  nsplit, min_chunk, float(sm_scale) * _LOG2E)
+              sm_scale: float, mrg_rows: int = 0) -> None:
+    """Stage 1 (partials into o_part / lse_part with the v2 split formula); with mrg_rows > 0
+    the kernel also merges the splits into out (no separate reduce needed)."""
+    flags = _flags(q.device, torch.cuda.current_stream(q.device).cuda_stream) if mrg_rows > 0 else kv_scale
+    _module().run(q, kv.view(torch.uint8), kv_indptr, kv_indices, kv_scale, o_part, lse_part, out, flags,
+                  nsplit, min_chunk, float(sm_scale) * _LOG2E, mrg_rows)
 
 
 def default_num_splits(bs: int) -> int:
@@ -116,11 +146,10 @@ def k3_mla_verify_hk(
     else:
         o_part = out
         lse_part = kv_scale
-    _module().run(
-        q, kv.view(torch.uint8), kv_indptr, kv_indices, kv_scale.float(), o_part, lse_part, out,
-        nsplit, _MIN_CHUNK, float(sm_scale) * _LOG2E,
-    )
-    if nsplit > 1:
+    mrg = merger_rows(bs, nsplit)
+    hk_stage1(q, kv, kv_indptr, kv_indices, kv_scale.float(), o_part, lse_part, out, nsplit, _MIN_CHUNK,
+              sm_scale, mrg)
+    if nsplit > 1 and mrg == 0:
         _k3_mla_verify_reduce[(bs, rows, v_head_dim // 128)](
             o_part, lse_part, kv_indptr, out, out.stride(0), out.stride(1),
             H=num_heads, QLEN=qlen, D_V=v_head_dim, NSPLIT=nsplit,

@@ -64,6 +64,22 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
     return _HIP_SHAPE_GATE(hidden_size, nvb)
 
 
+def _same_storage_view(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """SGLANG_ROCM_K3_AG_AGG_STASH_ALIAS: b is a same-shape view of a. The
+    stash holds a strong reference to a, so its storage cannot be freed and
+    reused: equal pointer/shape/strides/dtype means b aliases a's data."""
+    from sglang.srt.environ import envs
+
+    return (
+        envs.SGLANG_ROCM_K3_AG_AGG_STASH_ALIAS.get()
+        and a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+        and a.device == b.device
+    )
+
+
 def smallm_max_t() -> int:
     """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
     global _SMALLM_MAX_T
@@ -709,7 +725,7 @@ class AttnResidual:
         if stash is not None:
             h, s_out, s_fp8, s_proj, s_nvb, s_write = stash
             if (
-                h is hidden_states
+                (h is hidden_states or _same_storage_view(h, hidden_states))
                 and prefix_sum is None
                 and rows is None
                 and s_proj is score_proj

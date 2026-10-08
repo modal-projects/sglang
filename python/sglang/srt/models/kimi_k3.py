@@ -1759,6 +1759,7 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
         mid = None
+        shared_sort_fuse = False
         if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS or (
             # pre-activated variant beats the situ + GEMM + top-k fallback up
             # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
@@ -1776,19 +1777,49 @@ class KimiK3MoE(nn.Module):
                 device=hidden_states.device,
             )
             act = self.shared_experts.act_fn
-            k3_moe_epi.shared_down_topk(
-                gate_up,
-                self.shared_experts.down_proj.weight,
-                shared_output,
-                act.beta,
-                act.linear_beta,
-                router_logits,
-                cfg.correction_bias,
-                topk_ids,
-                topk_weights,
-                renormalize=cfg.renormalize,
-                routed_scale=1.0,
+            w_down = self.shared_experts.down_proj.weight
+            # SGLANG_ROCM_K3_SHARED_SORT_FUSE: [SiTU | top-k] here; the shared
+            # down GEMM rides the experts' sort + quant launch (the runner's
+            # small-sort path: M * top_k <= 256), see k3_moe_epi
+            shared_sort_fuse = (
+                envs.SGLANG_ROCM_K3_SHARED_SORT_FUSE.get()
+                and envs.SGLANG_ROCM_K3_SHARED_PREACT.get()
+                and num_tokens * cfg.top_k <= 256
+                and w_down.is_contiguous()
             )
+            if shared_sort_fuse:
+                shared_act = torch.empty(
+                    (num_tokens, w_down.shape[1]),
+                    dtype=w_down.dtype,
+                    device=hidden_states.device,
+                )
+                k3_moe_epi.situ_topk(
+                    gate_up,
+                    shared_act,
+                    act.beta,
+                    act.linear_beta,
+                    router_logits,
+                    cfg.correction_bias,
+                    topk_ids,
+                    topk_weights,
+                    renormalize=cfg.renormalize,
+                    routed_scale=1.0,
+                )
+                k3_moe_epi.offer_shared_gemm(topk_ids, shared_act, w_down, shared_output)
+            else:
+                k3_moe_epi.shared_down_topk(
+                    gate_up,
+                    w_down,
+                    shared_output,
+                    act.beta,
+                    act.linear_beta,
+                    router_logits,
+                    cfg.correction_bias,
+                    topk_ids,
+                    topk_weights,
+                    renormalize=cfg.renormalize,
+                    routed_scale=1.0,
+                )
             topk_output = build_precomputed_topk_output(
                 topk_weights, topk_ids, cfg, self.layer_idx
             )
@@ -1807,6 +1838,9 @@ class KimiK3MoE(nn.Module):
         else:
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
+        if shared_sort_fuse:
+            # no-op when the sort took it; else run the shared GEMM standalone
+            k3_moe_epi.flush_shared_gemm()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
         buf = tensor_model_parallel_all_reduce(buf)
@@ -2711,6 +2745,11 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_deferred_f_b = False
         if verify_defer_f_b:
             self.attn._k3_verify_deferred_f_b = False
+        if not fused_onorm and forward_batch.forward_mode.is_target_verify():
+            # SGLANG_ROCM_K3_KDA_ONORM_OPROJ: gated o_norm + o_proj, one launch
+            partial = self._k3_onorm_oproj(core_attn_out, g_proj_states)
+            if partial is not None:
+                return partial
         if (
             not fused_onorm
             and (
@@ -2748,6 +2787,64 @@ class KimiK3DeltaAttention(nn.Module):
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
         return self.o_proj(core_attn_out)[0]
+
+
+    def _k3_onorm_oproj(
+        self, core_attn_out: torch.Tensor, g_proj_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """ROCm SGLANG_ROCM_K3_KDA_ONORM_OPROJ (target verify, M <= MAX_M):
+        the gated o_norm (sigmoid gate read through its row stride) in the
+        prologue of the o_proj GEMM -- one HIP kernel instead of
+        _kda_onorm_gated_strided_kernel + the tuned hgemm. Returns o_proj's
+        TP-partial output, or None when not covered (caller runs the unfused
+        pair). Only on the deferred-reduce o_proj (SGLANG_ROCM_K3_AR_AGG_FUSED:
+        the decoder layer completes the reduction)."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_KDA_ONORM_OPROJ.get()):
+            return None
+        m = g_proj_states.shape[0] if g_proj_states.dim() == 2 else -1
+        if not (0 < m <= envs.SGLANG_ROCM_K3_KDA_ONORM_OPROJ_MAX_M.get()):
+            return None
+        o_proj = self.o_proj
+        w = getattr(o_proj, "weight", None)
+        if (
+            self.all_reduce_fusion
+            or o_proj.reduce_results
+            or getattr(o_proj, "bias", None) is not None
+            or type(o_proj.quant_method).__name__ != "UnquantizedLinearMethod"
+            or not isinstance(w, torch.Tensor)
+            or type(w.data) is not torch.Tensor
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or self.o_norm.activation != "sigmoid"
+            or self.o_norm.weight is None
+            or self.o_norm.weight.shape != (core_attn_out.shape[-1],)
+            or not core_attn_out.is_contiguous()
+            or core_attn_out.dtype != torch.bfloat16
+            or core_attn_out.numel() != m * w.shape[1]
+            or g_proj_states.stride(-1) != 1
+            or g_proj_states.stride(0) % 8 != 0
+            or g_proj_states.shape[1] != w.shape[1]
+        ):
+            return None
+        from sglang.kernels.ops.gemm import k3_norm_gemm
+
+        if not k3_norm_gemm.hip_onorm_supported(
+            m, w.shape[1], w.shape[0], self.o_norm.weight.shape[0]
+        ):
+            return None
+        nw = self.__dict__.get("_k3_onorm_w32")
+        if nw is None:  # first (eager warm-up) call, before graph capture
+            nw = self.o_norm.weight.detach().float().contiguous()
+            self.__dict__["_k3_onorm_w32"] = nw
+        return k3_norm_gemm.kda_onorm_oproj_hip(
+            core_attn_out.view(m, -1),
+            g_proj_states,
+            nw,
+            float(self.o_norm.eps),
+            w,
+            fast_sigmoid=envs.SGLANG_ROCM_K3_KDA_ONORM_OPROJ_FAST.get(),
+        )
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):

@@ -1120,6 +1120,29 @@ class Envs:
     SGLANG_ROCM_K3_AR_AGG_FUSED_MAX_T = EnvInt(64)
     # token ceiling of the all-gather variant
     SGLANG_ROCM_K3_AR_AGG_FUSED_AG_MAX_T = EnvInt(64)
+    # With SGLANG_ROCM_K3_AR_AGG_FUSED: let the next layer's attention-side
+    # aggregation take the result the MoE all-gather kernel already computed
+    # when it receives the same storage (KimiK3MoE.forward returns a .view() of
+    # the all-gather output, so the identity check always missed and
+    # attn_res_smallm recomputed it: ~85 launches / ~0.6 ms per 90k bs1 verify
+    # pass). Output identical to the recompute up to the fused kernel's rare
+    # 1-ulp bf16 flips (its documented contract).
+    SGLANG_ROCM_K3_AG_AGG_STASH_ALIAS = EnvBool(False)
+    # ROCm K3 decode/verify (M <= 16): KDA gated o_norm fused into the o_proj
+    # GEMM (one HIP kernel, kernels/ops/gemm/k3_norm_gemm.py). Operand
+    # bit-identical to _kda_onorm_gated_strided_kernel; output within 1 bf16
+    # ulp of the tuned hgemm (GEMM summation order).
+    SGLANG_ROCM_K3_KDA_ONORM_OPROJ = EnvBool(False)
+    SGLANG_ROCM_K3_KDA_ONORM_OPROJ_MAX_M = EnvInt(8)
+    # ... with the sigmoid reciprocal as v_rcp_f32 (faster; operand may flip
+    # 1 bf16 ulp in rare elements).
+    SGLANG_ROCM_K3_KDA_ONORM_OPROJ_FAST = EnvBool(False)
+    # ROCm K3 decode/verify MoE (with SGLANG_ROCM_K3_MOE_EPI_FUSE +
+    # SGLANG_ROCM_K3_SHARED_PREACT, M * top_k <= 256): regroup the routing glue
+    # by dependency, [SiTU | top-k] then [shared down GEMM | sort + mxfp8
+    # quant] (the GEMM rides the aiter runner's sort launch): one launch fewer
+    # per MoE layer, bit-identical. See kernels/ops/moe/k3_moe_epi.py.
+    SGLANG_ROCM_K3_SHARED_SORT_FUSE = EnvBool(False)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
     # ROCm K3 decode (with SGLANG_ROCM_K3_UPPROJ_AG): the up_proj all-gather +

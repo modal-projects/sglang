@@ -410,19 +410,40 @@ def _run_small_sort(
         if k3_route_sort.sort_quant_supported(m, topk, block_size, n_cols) and (
             moe_buf.numel() in (0, m * n_cols)
         ):
-            k3_route_sort.sort_quant(
-                topk_ids,
-                topk_weights,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                moe_buf,
-                block_size,
-                mx_quant_input,
-                qout,
-                qscale,
-            )
+            from sglang.kernels.ops.moe import k3_moe_epi
+
+            # SGLANG_ROCM_K3_SHARED_SORT_FUSE: the model offered its shared
+            # down GEMM for this top-k; run it in the sort's launch
+            pending = k3_moe_epi.take_shared_gemm(topk_ids)
+            if pending is not None:
+                k3_moe_epi.shared_gemm_sort_quant(
+                    pending,
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    block_size,
+                    mx_quant_input,
+                    qout,
+                    qscale,
+                )
+            else:
+                k3_route_sort.sort_quant(
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    block_size,
+                    mx_quant_input,
+                    qout,
+                    qscale,
+                )
             return qout, qscale.view(torch.float8_e8m0fnu)
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:

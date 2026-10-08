@@ -579,3 +579,281 @@ def norm_add3(
         N=N, K=K, K_POW2=triton.next_power_of_2(K), BLOCK=block, HAS_PF=has_pf, num_warps=4,
     )
     return out
+
+
+# --------------------------------------------------------------------------
+# SGLANG_ROCM_K3_SHARED_SORT_FUSE: regroup the decode MoE routing glue by
+# dependency instead of by producer (M <= 64, pre-activated shared expert):
+#
+#   before:  [SiTU] -> [shared down GEMM | top-k] -> [sort + mxfp8 quant] -> stage1
+#   after:   [SiTU | top-k]  ->  [shared down GEMM | sort + mxfp8 quant] -> stage1
+#
+# SiTU and top-k both read only the front GEMM output; the shared down GEMM
+# (reads the SiTU output) and the sort/quant (reads the top-k output) both
+# feed only later kernels. Same bodies, same tiling, same reduction order as
+# _k3_situ_kernel / _k3_shared_topk_kernel / k3_route_sort._k3_sort_quant_kernel,
+# so every output is bit-identical; one launch fewer per MoE layer.
+#
+# The sort runs inside the aiter MoE runner (moe_sorting_small._run_small_sort),
+# so the model offers the pending shared GEMM through a one-slot handoff keyed
+# on the top-k ids tensor; the runner's sort call takes it and launches the
+# combined kernel. flush_shared_gemm() runs an untaken GEMM standalone.
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _topk_body(t, lg_ptr, stride_lg, bias_ptr, topk_ids_ptr, topk_w_ptr, routed_scale,
+               E: tl.constexpr, E_POW2: tl.constexpr, TOPK: tl.constexpr, RENORM: tl.constexpr):
+    # == the DO_TOPK branch of _k3_shared_topk_kernel
+    offs_e = tl.arange(0, E_POW2)
+    me = offs_e < E
+    lg = tl.load(lg_ptr + t * stride_lg + offs_e, mask=me, other=0.0).to(tl.float32)
+    bias = (
+        tl.load(bias_ptr + offs_e, mask=me, other=0.0)
+        .to(lg_ptr.dtype.element_ty)
+        .to(tl.float32)
+    )
+    biased = tl.where(me, tl.sigmoid(lg) + bias, float("-inf"))
+    top = tl.topk(_score_key(biased, offs_e), TOPK, dim=0)  # descending
+    ids = (0xFFFF - (top & 0xFFFF)).to(tl.int32)
+    wt = tl.sigmoid(tl.load(lg_ptr + t * stride_lg + ids).to(tl.float32))
+    if RENORM:
+        wt = wt / tl.sum(wt, axis=0)
+    wt = wt * routed_scale
+    offs_k = tl.arange(0, TOPK)
+    tl.store(topk_ids_ptr + t * TOPK + offs_k, ids)
+    tl.store(topk_w_ptr + t * TOPK + offs_k, wt)
+
+
+@triton.jit(do_not_specialize=["M", "stride_gu", "stride_lg"])
+def _k3_situ_topk_kernel(
+    gu_ptr, stride_gu, act_ptr, M, beta, inv_beta, lin_beta, inv_lin_beta,
+    lg_ptr, stride_lg, bias_ptr, topk_ids_ptr, topk_w_ptr, routed_scale,
+    I: tl.constexpr, HAS_LIN: tl.constexpr, BLOCK: tl.constexpr,
+    E: tl.constexpr, E_POW2: tl.constexpr, TOPK: tl.constexpr, RENORM: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    NB: tl.constexpr = (I + BLOCK - 1) // BLOCK
+    n_situ = M * NB
+    if pid < n_situ:
+        # == _k3_situ_kernel, program (m, blk)
+        m = pid // NB
+        offs = (pid % NB) * BLOCK + tl.arange(0, BLOCK)
+        mk = offs < I
+        g = tl.load(gu_ptr + m * stride_gu + offs, mask=mk, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + m * stride_gu + I + offs, mask=mk, other=0.0).to(tl.float32)
+        a = _situ(g, u, beta, inv_beta, lin_beta, inv_lin_beta, HAS_LIN)
+        tl.store(act_ptr + m * I + offs, a.to(act_ptr.dtype.element_ty), mask=mk)
+    else:
+        _topk_body(pid - n_situ, lg_ptr, stride_lg, bias_ptr, topk_ids_ptr, topk_w_ptr,
+                   routed_scale, E, E_POW2, TOPK, RENORM)
+
+
+@triton.jit(do_not_specialize=["M", "stride_out", "stride_qx"])
+def _k3_shared_sortq_kernel(
+    # shared down GEMM (pre-activated): out[M, N] = act[M, I] @ wd[N, I]^T
+    act_ptr, wd_ptr, out_ptr, stride_out,
+    # sort + mxfp8 quant (k3_route_sort._k3_sort_quant_kernel)
+    topk_ids_ptr, topk_weights_ptr, sorted_ids_ptr, sorted_weights_ptr,
+    sorted_expert_ids_ptr, num_valid_ids_ptr, moe_buf_ptr, qx_ptr, stride_qx,
+    qout_ptr, qscale_ptr,
+    M,
+    N: tl.constexpr, I: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    TOPK: tl.constexpr, BLOCK_SIZE: tl.constexpr, P_POW2: tl.constexpr, N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr, SCALEN_PAD: tl.constexpr, MOE_BUF_ZERO: tl.constexpr,
+):
+    # sort/quant programs first: they gate stage 1, the GEMM only the AR
+    CHUNKS: tl.constexpr = N_COLS // QCHUNK
+    n_sort = M * CHUNKS
+    pid = tl.program_id(0)
+    NT_N: tl.constexpr = N // BN
+    if pid >= n_sort:
+        # == _k3_shared_topk_kernel GEMM branch with PRE_ACT
+        gpid = pid - n_sort
+        pid_n = gpid % NT_N
+        pid_m = gpid // NT_N
+        offs_m = pid_m * BM + tl.arange(0, BM)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        mm = offs_m < M
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in tl.range(0, I, BK):
+            offs_k = k0 + tl.arange(0, BK)
+            w = tl.load(wd_ptr + offs_n[:, None] * I + offs_k[None, :])
+            a = tl.load(act_ptr + offs_m[:, None] * I + offs_k[None, :], mask=mm[:, None], other=0.0)
+            acc = tl.dot(a, tl.trans(w), acc)
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_out + offs_n[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=mm[:, None],
+        )
+    else:
+        # == k3_route_sort._k3_sort_quant_kernel, program pid
+        spid = pid
+        t = spid // CHUNKS
+        c0 = (spid % CHUNKS) * QCHUNK
+        P = M * TOPK
+        offs_p = tl.arange(0, P_POW2)
+        mask_p = offs_p < P
+        SENT: tl.constexpr = 0x7FFFFFFF
+        e = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=SENT)
+        srt = tl.sort(e)
+        prv = tl.gather(srt, tl.maximum(offs_p - 1, 0), axis=0)
+        first = ((offs_p == 0) | (srt != prv)) & (srt != SENT)
+        offs_k = tl.arange(0, TOPK)
+        ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
+        match = e[None, :] == ek[:, None]
+        rank_k = tl.sum(tl.where(match & (offs_p[None, :] < t * TOPK), 1, 0), axis=1)
+        bb_k = tl.sum(tl.where(first[None, :] & (srt[None, :] < ek[:, None]), 1, 0), axis=1)
+        dest_k = bb_k * BLOCK_SIZE + rank_k
+        if c0 == 0:
+            wk = tl.load(topk_weights_ptr + t * TOPK + offs_k)
+            tl.store(sorted_ids_ptr + dest_k, (offs_k << 24) | t)
+            tl.store(sorted_weights_ptr + dest_k, wk)
+            lead = rank_k == 0
+            cnt_k = tl.sum(tl.where(match, 1, 0), axis=1)
+            tl.store(sorted_expert_ids_ptr + bb_k, ek, mask=lead)
+            offs_b = tl.arange(0, BLOCK_SIZE)
+            pm = lead[:, None] & (offs_b[None, :] >= cnt_k[:, None])
+            pad_at = bb_k[:, None] * BLOCK_SIZE + offs_b[None, :]
+            tl.store(sorted_ids_ptr + pad_at, tl.full((TOPK, BLOCK_SIZE), (TOPK << 24), tl.int32) + M, mask=pm)
+            tl.store(sorted_weights_ptr + pad_at, tl.zeros((TOPK, BLOCK_SIZE), tl.float32), mask=pm)
+            if t == 0:
+                num_valid = tl.sum(first.to(tl.int32), axis=0) * BLOCK_SIZE
+                tl.store(num_valid_ids_ptr + tl.arange(0, 2), tl.where(tl.arange(0, 2) == 0, num_valid, M))
+        offs_q = tl.arange(0, QCHUNK)
+        x = tl.load(qx_ptr + t * stride_qx + c0 + offs_q).to(tl.float32)
+        x2 = tl.reshape(x, (QCHUNK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
+        bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
+        scale = (exp << 23).to(tl.float32, bitcast=True)
+        q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
+        tl.store(qout_ptr + t * N_COLS + c0 + offs_q, tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty))
+        if MOE_BUF_ZERO:
+            tl.store(moe_buf_ptr + t * N_COLS + c0 + offs_q, tl.zeros((QCHUNK,), moe_buf_ptr.dtype.element_ty))
+        offs_g = tl.arange(0, QCHUNK // 32)
+        y = c0 // 32 + offs_g
+        base_sw = (dest_k // 32) * (SCALEN_PAD * 32) + (dest_k % 16) * 4 + (dest_k % 32) // 16
+        sw = base_sw[:, None] + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+        tl.store(qscale_ptr + sw, tl.broadcast_to(exp[None, :], (TOPK, QCHUNK // 32)).to(tl.uint8))
+
+
+SORTQ_FUSE_WARPS: Optional[int] = None  # override for sweeps
+SORTQ_FUSE_BN: Optional[int] = None
+
+
+def situ_topk(
+    gate_up: torch.Tensor,  # [M, 2I]
+    act: torch.Tensor,  # [M, I] out
+    beta: float,
+    linear_beta: Optional[float],
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    renormalize: bool = True,
+    routed_scale: float = 1.0,
+) -> None:
+    """Launch A: SiTU pre-activation + router top-k (bit-identical to
+    _k3_situ_kernel + the top-k CTAs of _k3_shared_topk_kernel)."""
+    M, two_i = gate_up.shape
+    I = two_i // 2
+    E = router_logits.shape[1]
+    topk = topk_ids.shape[1]
+    assert gate_up.stride(1) == 1 and router_logits.stride(1) == 1 and act.is_contiguous()
+    assert E < 0xFFFF and topk & (topk - 1) == 0
+    lin = linear_beta is not None
+    blk = 256
+    _k3_situ_topk_kernel[(M * triton.cdiv(I, blk) + M,)](
+        gate_up, gate_up.stride(0), act, M,
+        float(beta), 1.0 / float(beta),
+        float(linear_beta) if lin else 1.0, 1.0 / float(linear_beta) if lin else 1.0,
+        router_logits, router_logits.stride(0), correction_bias, topk_ids, topk_weights,
+        float(routed_scale),
+        I=I, HAS_LIN=lin, BLOCK=blk, E=E, E_POW2=triton.next_power_of_2(E), TOPK=topk,
+        RENORM=renormalize, num_warps=4,
+    )
+
+
+# one-slot handoff of the pending shared down GEMM to the runner's sort call
+_pending_shared = None
+_flush_warned = False
+
+
+def offer_shared_gemm(topk_ids: torch.Tensor, act: torch.Tensor, w_down: torch.Tensor, out: torch.Tensor) -> None:
+    global _pending_shared
+    assert _pending_shared is None, "unflushed pending shared GEMM"
+    _pending_shared = (topk_ids, act, w_down, out)
+
+
+def take_shared_gemm(topk_ids: torch.Tensor):
+    """The pending (act, w_down, out) if it was offered for exactly this
+    top-k tensor (the slot keeps it alive: same pointer == same tensor)."""
+    global _pending_shared
+    p = _pending_shared
+    if p is not None and p[0].data_ptr() == topk_ids.data_ptr() and p[0].shape == topk_ids.shape:
+        _pending_shared = None
+        return p[1:]
+    return None
+
+
+def flush_shared_gemm() -> None:
+    """Run an offered GEMM that no sort call took (standalone, same tiling)."""
+    global _pending_shared, _flush_warned
+    p, _pending_shared = _pending_shared, None
+    if p is not None:
+        if not _flush_warned:
+            _flush_warned = True
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "SGLANG_ROCM_K3_SHARED_SORT_FUSE: the MoE sort did not take the "
+                "shared GEMM (M=%d); running it standalone (correct, no launch saved)",
+                p[1].shape[0],
+            )
+        _, act, w_down, out = p
+        shared_gemm_preact(act, w_down, out)
+
+
+def shared_gemm_preact(act, w_down, out) -> None:
+    M, I = act.shape
+    N = w_down.shape[0]
+    bm, bn, bk, nw, ns = _shared_preact_cfg(M)
+    _k3_shared_topk_kernel[((N // bn) * triton.cdiv(M, bm),)](
+        act, act.stride(0), w_down, out, out.stride(0),
+        act, 0, act, act, act, 1.0, M, 1.0, 1.0, 1.0, 1.0,
+        N=N, I=I, HAS_LIN=False, BM=bm, BN=bn, BK=bk, DO_TOPK=False, E=1, E_POW2=1, TOPK=1,
+        RENORM=False, PRE_ACT=True, num_warps=nw, num_stages=ns,
+    )
+
+
+def shared_gemm_sort_quant(
+    pending, topk_ids, topk_weights, sorted_ids, sorted_weights, sorted_expert_ids,
+    num_valid_ids, moe_buf, block_size, mx_quant_input, qout, qscale,
+) -> None:
+    """Launch B: the pending shared down GEMM + k3_route_sort.sort_quant."""
+    from sglang.kernels.ops.moe.k3_route_sort import SORT_QCHUNK
+
+    act, w_down, out = pending
+    M, I = act.shape
+    N = w_down.shape[0]
+    m, topk = topk_ids.shape
+    n = mx_quant_input.shape[1]
+    assert m == M and act.is_contiguous() and w_down.is_contiguous() and out.stride(1) == 1
+    bm, bn, bk, nw, ns = _shared_preact_cfg(M)
+    # wider N tiles than the standalone GEMM (fewer CTAs next to the sort
+    # programs; MI355X M=8: 6.3 vs 6.7 us). N tiling only: every element keeps
+    # the same K loop and MFMA order, so the output stays bit-identical.
+    bn = SORTQ_FUSE_BN or (64 if M <= 16 else bn)
+    n_gemm = (N // bn) * triton.cdiv(M, bm)
+    _k3_shared_sortq_kernel[(n_gemm + m * (n // SORT_QCHUNK),)](
+        act, w_down, out, out.stride(0),
+        topk_ids, topk_weights, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+        moe_buf, mx_quant_input, mx_quant_input.stride(0), qout, qscale,
+        M,
+        N=N, I=I, BM=bm, BN=bn, BK=bk,
+        TOPK=topk, BLOCK_SIZE=block_size, P_POW2=triton.next_power_of_2(m * topk), N_COLS=n,
+        QCHUNK=SORT_QCHUNK, SCALEN_PAD=qscale.shape[1], MOE_BUF_ZERO=moe_buf.numel() > 0,
+        num_warps=SORTQ_FUSE_WARPS or nw, num_stages=ns,
+    )

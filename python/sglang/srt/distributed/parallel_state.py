@@ -485,6 +485,11 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        # SGLANG_ROCM_K3_PREFILL_AR_QR: dedicated quantized route for prefill-sized ARs
+        self.prefill_qr_comm: Optional[Any] = None
+        self._prefill_qr_min_bytes = 0
+        self._prefill_qr_level = 0
+        self._prefill_qr_fp16 = True
 
         self.pcie_ipc_comm: Optional[Any] = None
         from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
@@ -544,6 +549,7 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+                self._init_prefill_qr()
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
@@ -957,6 +963,119 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _init_prefill_qr(self) -> None:
+        """SGLANG_ROCM_K3_PREFILL_AR_QR: quick-reduce codec for prefill-sized
+        all-reduces only (>= SGLANG_ROCM_K3_PREFILL_AR_QR_MIN_MB), routed ahead of
+        the bf16 aiter custom AR. Codecs (SGLANG_ROCM_K3_PREFILL_AR_QR_LEVEL):
+          FP / INT8 / INT6 / INT4      -> SGLang quick-reduce (sgl kernel)
+          AITER_FP8 / AITER_INT6 / AITER_INT4 -> AITER quick-reduce
+        The SGLang communicator reuses self.qr_comm's IPC buffer when present
+        (the codec is a per-call argument); otherwise a dedicated one is created
+        irrespective of ROCM_QUICK_REDUCE_QUANTIZATION /
+        AITER_QUICK_REDUCE_QUANTIZATION."""
+        if not (is_hip() and self.world_size > 1 and envs.SGLANG_ROCM_K3_PREFILL_AR_QR.get()):
+            return
+        try:
+            level = envs.SGLANG_ROCM_K3_PREFILL_AR_QR_LEVEL.get().upper()
+            use_aiter = level.startswith("AITER_")
+            codec = level[len("AITER_"):] if use_aiter else level
+            if use_aiter:
+                from aiter.dist.device_communicators.quick_all_reduce import (
+                    QuickAllReduce as QRCls,
+                    QuickReduceRegime as Regime,
+                    qr_rocm_arch_available,
+                )
+
+                env_key = "AITER_QUICK_REDUCE_QUANTIZATION"
+                if codec not in ("FP", "FP8", "INT6", "INT4"):
+                    raise ValueError(f"bad SGLANG_ROCM_K3_PREFILL_AR_QR_LEVEL={level}")
+                import importlib
+
+                _aqr_mod = importlib.import_module(
+                    "aiter.dist.device_communicators.quick_all_reduce"
+                )
+
+                if not _aqr_mod.quick_ar:
+                    # the module decides availability once at import time from
+                    # AITER_QUICK_REDUCE_QUANTIZATION; probe the op ourselves
+                    import aiter as _aiter_probe
+
+                    _aiter_probe.qr_max_size()
+                    _aqr_mod.quick_ar = True
+            else:
+                from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                    QuickAllReduce as QRCls,
+                    QuickReduceRegime as Regime,
+                    qr_rocm_arch_available,
+                )
+
+                env_key = "ROCM_QUICK_REDUCE_QUANTIZATION"
+                if codec not in ("FP", "INT8", "INT6", "INT4"):
+                    raise ValueError(f"bad SGLANG_ROCM_K3_PREFILL_AR_QR_LEVEL={level}")
+            if not qr_rocm_arch_available():
+                return
+            comm = self.qr_comm
+            if not (type(comm) is QRCls and not comm.disabled):
+                saved = os.environ.get(env_key)
+                os.environ[env_key] = codec
+                try:
+                    comm = QRCls(group=self.cpu_group, device=self.device)
+                finally:
+                    if saved is None:
+                        os.environ.pop(env_key, None)
+                    else:
+                        os.environ[env_key] = saved
+            if comm.disabled:
+                return
+            if use_aiter:
+                import aiter as _aiter_ops
+
+                self._prefill_qr_fn = _aiter_ops.qr_all_reduce
+            else:
+                from sglang.srt.distributed.device_communicators import (
+                    custom_all_reduce_ops as _qr_ops,
+                )
+
+                self._prefill_qr_fn = _qr_ops.qr_all_reduce
+            self.prefill_qr_comm = comm
+            self._prefill_qr_level = Regime[codec].value
+            self._prefill_qr_fp16 = bool(envs.SGLANG_ROCM_K3_PREFILL_AR_QR_FP16.get())
+            self._prefill_qr_min_bytes = max(
+                1, envs.SGLANG_ROCM_K3_PREFILL_AR_QR_MIN_MB.get()
+            ) * (1 << 20)
+            logger.info(
+                "[AR] prefill quick-reduce: %s (fp16 codec=%s) for all-reduces >= %d MiB "
+                "on group %s",
+                level,
+                self._prefill_qr_fp16,
+                self._prefill_qr_min_bytes >> 20,
+                self.unique_name,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize prefill QuickAllReduce: {e}")
+            self.prefill_qr_comm = None
+
+    def _should_prefill_qr(self, input_: torch.Tensor) -> bool:
+        if input_.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        nbytes = input_.numel() * input_.element_size()
+        return (
+            self._prefill_qr_min_bytes <= nbytes <= self.prefill_qr_comm.qr_max_size
+            and nbytes % 16 == 0
+            and input_.is_contiguous()
+        )
+
+    def _prefill_quick_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(input_)
+        self._prefill_qr_fn(
+            self.prefill_qr_comm._ptr,
+            input_,
+            out,
+            self._prefill_qr_level,
+            self._prefill_qr_fp16,
+        )
+        return out
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
@@ -967,6 +1086,10 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        # Prefill-sized messages first (ahead of the bf16 custom AR): the
+        # decision depends only on size/dtype/layout, so every rank agrees.
+        if self.prefill_qr_comm is not None and self._should_prefill_qr(input_):
+            return "prefill_qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -1059,6 +1182,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "prefill_qr":
+            out = self._prefill_quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)

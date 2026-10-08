@@ -989,6 +989,20 @@ class Envs:
     SGLANG_ROCM_K3_ROUTE_SORT_MID_MAX_TOKENS = EnvInt(128)
     # ROCm: use aiter QuickAllReduce (configured by AITER_QUICK_REDUCE_*) for large all-reduces
     SGLANG_ROCM_AITER_QUICK_REDUCE = EnvBool(False)
+    # ROCm K3: route all-reduces of >= SGLANG_ROCM_K3_PREFILL_AR_QR_MIN_MB MiB (prefill-sized)
+    # to a quick-reduce codec ahead of the bf16 aiter custom AR. Decode/verify messages
+    # (<= 64 reqs x 8 tokens = 512 tokens = 10.5 MiB) are always below the threshold, so
+    # they stay bf16 exact. Measured on 8xMI355X (mi355 ar_qr study, 2026-10-08):
+    # SGLang INT8 (rel err 0.8%) only beats bf16 2-stage above ~85 MiB (-8% at 123 MiB,
+    # -12% at 185 MiB) -> default 96. AITER_FP8 (3.4%), AITER_INT6 (3.0%), AITER_INT4 (12%)
+    # are 1.3-1.9x faster than bf16 from 16 MiB up but much less accurate.
+    SGLANG_ROCM_K3_PREFILL_AR_QR = EnvBool(False)
+    SGLANG_ROCM_K3_PREFILL_AR_QR_MIN_MB = EnvInt(96)
+    # SGLang codecs: FP, INT8, INT6, INT4; AITER codecs: AITER_FP8, AITER_INT6, AITER_INT4
+    SGLANG_ROCM_K3_PREFILL_AR_QR_LEVEL = EnvStr("INT8")
+    # 1: codec runs on fp16 (faster; |x| > 65504 saturates (SGLang) or becomes inf (AITER)),
+    # 0: bf16 kernels (overflow-safe, 0-30% slower)
+    SGLANG_ROCM_K3_PREFILL_AR_QR_FP16 = EnvBool(True)
     # ROCm K3: run the shared expert on a side stream, overlapping the routed experts
     SGLANG_ROCM_K3_SHARED_OVERLAP = EnvBool(False)
     # ROCm K3 MoE (fused front, single-collective tail): fuse SiTU into the shared
@@ -1050,6 +1064,14 @@ class Envs:
     # otherwise) is picked on the GPU from bs * max(kv_len) at replay time, so
     # the cost is min(gluon, v2) + ~0-2us. Takes precedence over v2/v3.
     SGLANG_ROCM_K3_MLA_VERIFY_AUTO = EnvBool(False)
+    # ROCm K3 MLA target_verify HK (kernels/ops/attention/k3_mla_verify_hk.py):
+    # v2 contract and split/merge scheme with a hand-scheduled HIP stage 1
+    # (jit/csrc/kimi_k3/k3_mla_verify_hk.cuh: 3 compute waves + 1 LDS-DMA loader
+    # wave, FP8 MFMA, inline-asm inner loop). Alone it replaces the v2 path; with
+    # SGLANG_ROCM_K3_MLA_VERIFY_AUTO it becomes auto's long-context body (bf16
+    # Gluon below the GPU-side bs * max(L) threshold, HK above). Takes precedence
+    # over v2/v3.
+    SGLANG_ROCM_K3_MLA_VERIFY_HK = EnvBool(False)
     # ROCm K3 (NoPE MLA, aiter backend) decode / target verify: one Triton launch
     # builds q = [q_nope_out | q_pe] and writes the latent row into the MLA KV
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x
@@ -1125,6 +1147,11 @@ class Envs:
     # host-waits on each step) before the mamba/KDA state commit instead of
     # after it, so the commit overlaps the scheduler's host work.
     SGLANG_ROCM_K3_DFLASH_EARLY_PUBLISH = EnvBool(False)
+    # ROCm K3 decode/verify dense GEMMs: route the skinny KDA [f_a|b] (N=144) and
+    # f_b (K=128) GEMMs that today fall back to F.linear (hipBLASLt heuristic)
+    # above the tiny-GEMM token limit through AITER tgemm, so the tuned rows in
+    # aiter/configs/model_configs/kimik3_decode_bf16_tuned_gemm.csv pick them.
+    SGLANG_ROCM_K3_DECODE_GEMM_TUNED = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

@@ -78,6 +78,22 @@ _THRESH_DEFAULT = 38000  # bs > 16 (extrapolated)
 _W8_MAX_BS = 2  # fused=False only
 
 
+# Gluon vs HK crossover (bs * max_L tokens; HK regime iff eff >= thresh).
+_THRESH_HK = {1: 27000, 2: 28000, 4: 27000, 8: 29000, 16: 30000}
+_THRESH_HK_DEFAULT = 30000
+
+
+def auto_threshold_hk(bs: int) -> int:
+    env = os.environ.get("SGLANG_ROCM_K3_MLA_VERIFY_AUTO_HK_THRESH")
+    if env is not None and env != "":
+        v = int(env)
+        return _INT32_MAX if v < 0 else v
+    for k in sorted(_THRESH_HK):
+        if bs <= k:
+            return _THRESH_HK[k]
+    return _THRESH_HK_DEFAULT
+
+
 def auto_threshold(bs: int) -> int:
     env = os.environ.get("SGLANG_ROCM_K3_MLA_VERIFY_AUTO_THRESH")
     if env is not None and env != "":
@@ -1880,6 +1896,7 @@ def k3_mla_verify_auto(
     thresh: Optional[int] = None,
     w8_max_bs: int = _W8_MAX_BS,
     fused: bool = True,
+    hk: bool = False,
 ) -> torch.Tensor:
     """MLA target verify; same contract as k3_mla_verify_v2.
 
@@ -1889,7 +1906,9 @@ def k3_mla_verify_auto(
     thresh: v2 regime iff bs * max(L) >= thresh (default auto_threshold(bs)).
     fused: one stage-1 launch running either body (2 launches total);
         False = separate Gluon-with-exit + v2/v3 launches (3 launches).
-    w8_max_bs: (fused=False only) v3 8-warp stage 1 for bs <= w8_max_bs."""
+    w8_max_bs: (fused=False only) v3 8-warp stage 1 for bs <= w8_max_bs.
+    hk: long-context body = the HIP HK kernel (k3_mla_verify_hk) instead of v2;
+        implies the non-fused launch structure (Gluon-with-exit + HK + reduce)."""
     assert _HAS_GLUON, "k3_mla_verify_auto needs triton.experimental.gluon (gfx950)"
     D = kv_buffer.shape[-1]
     assert D == 576 and v_head_dim == 512 and num_heads * qlen <= 128
@@ -1910,8 +1929,10 @@ def k3_mla_verify_auto(
         kv_scale = torch.full((1,), float(kv_scale), dtype=torch.float32, device=q.device)
     if bs == 0:
         return out
+    if hk:
+        fused = False
     if thresh is None:
-        thresh = auto_threshold(bs)
+        thresh = auto_threshold_hk(bs) if hk else auto_threshold(bs)
     thresh = int(min(max(thresh, 0), _INT32_MAX))
     dev = q.device
     rows = num_heads * qlen
@@ -1934,7 +1955,7 @@ def k3_mla_verify_auto(
     g_within_2gb = kv.shape[0] * kv.stride(0) * kv.element_size() <= 0x80000000
 
     # v2 operands / partials
-    w8 = (not fused) and bs <= w8_max_bs
+    w8 = (not fused) and (not hk) and bs <= w8_max_bs
     min_chunk = _V3_MIN_CHUNK
     nsplit = max(2, default_num_splits(bs))
     block_n = 64
@@ -1985,8 +2006,12 @@ def k3_mla_verify_auto(
             REGIME="bh16bn128", RETURN_LSE=False, QLEN=qlen, HAS_PE=True, HAS_ATTN_SINK=False,
             Sel_buf=sel, sel_bs=bs, sel_thresh=thresh, SEL_P2=sel_p2,
         )
-        # ---------------- 2. v2 / v3 stage 1 on sel (all-empty in the Gluon regime)
-        if w8:
+        # ---------------- 2. HK / v2 / v3 stage 1 on sel (all-empty in the Gluon regime)
+        if hk:
+            from sglang.kernels.ops.attention.k3_mla_verify_hk import hk_stage1
+
+            hk_stage1(q, kv, sel, kv_indices, kv_scale, o_part, lse_part, out, nsplit, min_chunk, sm_scale)
+        elif w8:
             _k3_mla_verify_v3_fwd[(nsplit, bs)](
                 q, kv, sel, kv_indices, kv_scale, o_part, lse_part,
                 q.stride(0), q.stride(1), sm_scale * _LOG2E,

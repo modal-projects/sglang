@@ -423,6 +423,21 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            _use_aiter
+            and bias is None
+            and x.dim() == 2
+            # <= 56: at 64 tokens the existing K3 lm_head row is slower than F.linear
+            and 0 < x.shape[0] <= 56
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and type(layer.weight.data) is torch.Tensor
+            and envs.SGLANG_ROCM_K3_DECODE_GEMM_TUNED.get()
+        ):
+            # Decode/verify lm_head: AITER tgemm picks the tuned row
+            # (kimik3_decode_bf16_tuned_gemm.csv); untuned shapes fall back to
+            # torch, i.e. the same F.linear as below.
+            return tgemm.mm(x, layer.weight, None, otype=x.dtype)
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

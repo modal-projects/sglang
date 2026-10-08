@@ -61,6 +61,18 @@ except ImportError:
     _flashinfer_top_k = None
 
 
+def _rocm_decode_gemm_tuned() -> bool:
+    """SGLANG_ROCM_K3_DECODE_GEMM_TUNED (ROCm + AITER only)."""
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import get_bool_env_var, is_hip
+
+    return (
+        is_hip()
+        and get_bool_env_var("SGLANG_USE_AITER")
+        and envs.SGLANG_ROCM_K3_DECODE_GEMM_TUNED.get()
+    )
+
+
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
@@ -775,7 +787,20 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
+        if (
+            not self.is_nemotron_35_draft
+            and 0 < target_hidden.shape[0] <= 64
+            and target_hidden.dtype == torch.bfloat16
+            and self.fc.weight.dtype == torch.bfloat16
+            and _rocm_decode_gemm_tuned()
+        ):
+            # ROCm decode: tuned hipBLASLt row via AITER tgemm (falls back to
+            # torch for untuned token counts).
+            from aiter.tuned_gemm import tgemm
+
+            projected = tgemm.mm(target_hidden, self.fc.weight, None, otype=target_hidden.dtype)
+        else:
+            projected = self.fc(target_hidden)
         if self.is_nemotron_35_draft:
             projected = projected[0]
         return self.hidden_norm(projected)

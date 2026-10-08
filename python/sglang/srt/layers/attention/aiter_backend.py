@@ -879,11 +879,13 @@ class AiterAttnBackend(AttentionBackend):
             self.use_mla_verify_v3 = envs.SGLANG_ROCM_K3_MLA_VERIFY_V3.get()
             self.mla_verify_v3_w8_max_bs = envs.SGLANG_ROCM_K3_MLA_VERIFY_V3_W8_MAX_BS.get()
             self.use_mla_verify_auto = envs.SGLANG_ROCM_K3_MLA_VERIFY_AUTO.get()
+            self.use_mla_verify_hk = envs.SGLANG_ROCM_K3_MLA_VERIFY_HK.get()
             self.use_mla_verify_v2 = (
                 (
                     envs.SGLANG_ROCM_K3_MLA_VERIFY_V2.get()
                     or self.use_mla_verify_v3
                     or self.use_mla_verify_auto
+                    or self.use_mla_verify_hk
                 )
                 and is_gfx95_supported()
                 and self.dcp_world_size <= 1
@@ -893,6 +895,7 @@ class AiterAttnBackend(AttentionBackend):
             )
             self.mla_verify_v2_min_bs = envs.SGLANG_ROCM_K3_MLA_VERIFY_V2_MIN_BS.get()
             self.use_mla_verify_v3 = self.use_mla_verify_v3 and self.use_mla_verify_v2
+            self.use_mla_verify_hk = self.use_mla_verify_hk and self.use_mla_verify_v2
             # auto launches the bf16 Gluon qlen-8 kernel itself (regime switch
             # on the GPU), so it needs the Gluon prerequisites too.
             self.use_mla_verify_auto = (
@@ -907,9 +910,13 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla_verify_v2:
                 logger.info(
                     "aiter MLA target_verify: k3_mla_verify_%s (read-KV-once FP8) enabled",
-                    "auto"
+                    ("auto+hk" if self.use_mla_verify_hk else "auto")
                     if self.use_mla_verify_auto
-                    else ("v3" if self.use_mla_verify_v3 else "v2"),
+                    else (
+                        "hk"
+                        if self.use_mla_verify_hk
+                        else ("v3" if self.use_mla_verify_v3 else "v2")
+                    ),
                 )
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -1551,8 +1558,13 @@ class AiterAttnBackend(AttentionBackend):
             return k3_mla_verify_auto(
                 *args,
                 kv_scale_float=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                hk=getattr(self, "use_mla_verify_hk", False),
                 **kwargs,
             )
+        if getattr(self, "use_mla_verify_hk", False):
+            from sglang.kernels.ops.attention.k3_mla_verify_hk import k3_mla_verify_hk
+
+            return k3_mla_verify_hk(*args, **kwargs)
         if getattr(self, "use_mla_verify_v3", False):
             from sglang.kernels.ops.attention.k3_mla_verify_v3 import k3_mla_verify_v3
 

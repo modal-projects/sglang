@@ -17,6 +17,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    static_quant_fp8,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -476,6 +477,10 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
+
+
+# Token cap for the ROCm pre-shuffled static-FP8 path (decode / verify sizes).
+_ROCM_BPRE_MAX_TOKENS = 1024
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -1058,6 +1063,26 @@ class Fp8LinearMethod(LinearMethodBase):
                     and weight_scale.numel() == 1
                     else None
                 )
+                if (
+                    _use_aiter
+                    and layer.input_scale is not None
+                    and envs.SGLANG_ROCM_K3_DECODE_GEMM_TUNED.get()
+                ):
+                    # ROCm static per-tensor FP8 (DFlash draft): keep a
+                    # pre-shuffled [N, K] copy for AITER's bpreshuffle GEMM
+                    # (FlyDSL/CK rows in a8w8_bpreshuffle_tuned_gemm_kimik3*.csv),
+                    # 1.1-1.6x faster than torch._scaled_mm/hipBLASLt at decode
+                    # sizes. Both scalar scales fold into the per-column w_scale.
+                    n_out = qweight.shape[0]
+                    layer._rocm_bpre_w = shuffle_weight(qweight.contiguous(), (16, 16))
+                    layer._rocm_bpre_w_scale = (
+                        (weight_scale.float().reshape(1, 1) * layer.input_scale.float().reshape(1, 1))
+                        .expand(1, n_out)
+                        .contiguous()
+                    )
+                    layer._rocm_bpre_x_scale = torch.ones(
+                        _ROCM_BPRE_MAX_TOKENS, 1, device=qweight.device, dtype=torch.float32
+                    )
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module
@@ -1282,6 +1307,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 True,  # is_vnni
             )
             return output.view(*x.shape[:-1], layer.weight.shape[0])
+
+        bpre_w = getattr(layer, "_rocm_bpre_w", None)
+        if (
+            bpre_w is not None
+            and bias is None
+            and not isinstance(x, tuple)
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and 0 < x.numel() // x.shape[-1] <= _ROCM_BPRE_MAX_TOKENS
+        ):
+            from aiter import gemm_a8w8_bpreshuffle
+
+            x2 = x.reshape(-1, x.shape[-1])
+            qx, _ = static_quant_fp8(x2.contiguous(), layer.input_scale)
+            y = gemm_a8w8_bpreshuffle(
+                qx,
+                bpre_w,
+                layer._rocm_bpre_x_scale[: x2.shape[0]],
+                layer._rocm_bpre_w_scale,
+                dtype=x.dtype,
+            )
+            return y.view(*x.shape[:-1], bpre_w.shape[0])
 
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:

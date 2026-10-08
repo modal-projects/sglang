@@ -1908,6 +1908,21 @@ class KimiK3MoE(nn.Module):
             # graph warm-up: no collective (ranks may warm up unevenly)
             out = torch.empty_like(shared_output)
             return _add3(out.zero_(), shared_output, prefix_sum)
+        ctx = getattr(self, "_ag_agg_ctx", None)
+        if ctx is not None:
+            attn_res, nxt = ctx
+            out = attn_res.forward_ag_fused(
+                ca,
+                y,
+                shared_output,
+                prefix_sum,
+                nxt.self_attention_res_proj,
+                nxt.self_attention_res_norm,
+                nxt.input_layernorm,
+                nxt.is_block_write_layer,
+            )
+            if out is not None:
+                return out
         if (
             envs.SGLANG_ROCM_K3_AG_ONE_BARRIER.get()
             and getattr(ca, "_IS_CAPTURING", False)
@@ -3063,6 +3078,25 @@ class KimiK3DecoderLayer(nn.Module):
         )
         if self._rocm_ar_pipe:
             o_proj.reduce_results = False
+        # SGLANG_ROCM_K3_AR_AGG_FUSED: o_proj emits TP-partial sums; the
+        # layer completes the reduction fused with the MLP-side aggregation
+        # (plain all-reduce when the fused kernel does not apply)
+        self._rocm_ar_agg = (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_AR_AGG_FUSED.get()
+            and not self._sp_moe
+            and not self.all_reduce_fusion
+            and not self._rocm_ar_pipe
+            and config.attn_res_block_size is not None
+            and o_proj is not None
+            and get_parallel().attn_tp_size == 8
+            and get_parallel().attn_tp_size == get_parallel().tp_size
+        )
+        if self._rocm_ar_agg:
+            o_proj.reduce_results = False
+        # set per forward by the model loop: the next decoder layer whose
+        # attention-side aggregation rides this layer's MoE all-gather
+        self._ag_agg_next = None
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -3478,6 +3512,21 @@ class KimiK3DecoderLayer(nn.Module):
                         # the first sharded layer still holds a full-batch prefix.
                         if prefix_sum.shape[0] != hidden_states.shape[0]:
                             prefix_sum = prefix_sum[rows]
+        elif self._rocm_ar_agg:
+            group = get_parallel().attn_tp_group
+            fused = attn_res.forward_ar_fused(
+                group.ca_comm,
+                hidden_states,
+                prefix_sum,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+            if fused is not None:
+                hidden_states, prefix_sum = fused
+                agg2_fused = True
+            else:
+                hidden_states = group.all_reduce(hidden_states)
         elif self.all_reduce_fusion:
             # Complete the o_proj reduce here, folding the pending prefix add
             # into the fused all-reduce; attn_res then takes the pre-added
@@ -3499,9 +3548,18 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        nxt = self._ag_agg_next
+        if nxt is not None and shard_lo < 0:
+            # SGLANG_ROCM_K3_AR_AGG_FUSED: the MoE up_proj all-gather also
+            # runs the next layer's attention-side aggregation
+            self.mlp._ag_agg_ctx = (attn_res, nxt)
+        try:
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
+        finally:
+            if nxt is not None:
+                self.mlp._ag_agg_ctx = None
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
@@ -3522,6 +3580,13 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # SGLANG_ROCM_K3_AR_AGG_FUSED with the up_proj all-gather tail: the
+        # next layer's attention-side aggregation rides the MoE all-gather
+        self._ag_agg_fused = (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_AR_AGG_FUSED.get()
+            and envs.SGLANG_ROCM_K3_UPPROJ_AG.get()
+        )
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
 
@@ -3668,6 +3733,8 @@ class KimiK3LinearModel(nn.Module):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
+            if self._ag_agg_fused and attn_res is not None:
+                self.layers[i]._ag_agg_next = self._ag_agg_next_layer(i)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual, sp_sharded = self.layers[i](
                     positions=positions,
@@ -3760,6 +3827,22 @@ class KimiK3LinearModel(nn.Module):
         return (
             self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
         )
+
+    def _ag_agg_next_layer(self, i: int):
+        """Layer i + 1 when its attention-side aggregation can be computed by
+        layer i's MoE all-gather kernel (SGLANG_ROCM_K3_AR_AGG_FUSED), else
+        None. dspark capture layers keep the unfused path (their stream
+        capture rides the next aggregation itself)."""
+        if i + 1 >= self.end_layer:
+            return None
+        if self.dspark_layers_to_capture is not None and i in self.dspark_layers_to_capture:
+            return None
+        nxt = self.layers[i + 1]
+        if not getattr(nxt, "_rocm_ar_agg", False) or not getattr(
+            nxt, "use_attn_residuals", False
+        ):
+            return None
+        return nxt
 
     def _dspark_defer_capture(
         self,

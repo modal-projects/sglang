@@ -425,6 +425,123 @@ def _k3_mla_cat_cache(
     return cc.k3_mla_cat_cache(q_nope_out, q_pe, k_nope, k_pe, kv, loc)
 
 
+_K3_MLA_ABSORB_FUSED = envs.SGLANG_ROCM_K3_MLA_ABSORB_FUSED.get()
+
+
+def _k3_absorb_plain_bf16(w, w_scale) -> bool:
+    return (
+        isinstance(w, torch.Tensor)
+        and w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+    )
+
+
+def _k3_absorb_q_cache_target(
+    attn: DeepseekV2AttentionMLA,
+    forward_batch: ForwardBatch,
+    num_rows: int,
+):
+    """SGLANG_ROCM_K3_MLA_ABSORB_FUSED gate for the W_UK half: (kv_buffer,
+    loc) when the absorb BMM + q cat + latent KV write can run as one launch,
+    else None. Same eligibility as _k3_mla_cat_cache plus a bf16 W_UK and
+    <= 64 rows; prepare and core both call it, so they agree."""
+    if not (
+        _K3_MLA_ABSORB_FUSED
+        and attn.rotary_emb is None
+        and attn.current_attention_backend == "aiter"
+        and not get_parallel().dcp_enabled
+        and not attn.use_deep_gemm_bmm
+        and not is_kv_b_lora_active(attn)
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and 0 < num_rows <= 64
+        and _k3_absorb_plain_bf16(getattr(attn, "w_kc", None), attn.w_scale)
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+    ):
+        return None
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    pool = get_token_to_kv_pool()
+    inner = getattr(pool, "full_kv_pool", pool)
+    if type(inner) is not MLATokenToKVPool or getattr(
+        inner, "dsa_kv_cache_store_fp8", False
+    ):
+        return None
+    if getattr(inner, "requires_physical_write_loc", False) and not getattr(
+        forward_batch, "out_cache_loc_is_physical", False
+    ):
+        return None
+    return pool.get_key_buffer(attn.attn_mqa.layer_id), forward_batch.out_cache_loc
+
+
+def _k3_absorb_q_cat_cache(
+    attn: DeepseekV2AttentionMLA,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> Optional[torch.Tensor]:
+    """One launch: q = [q_nope @ W_UK | q_pe] and the latent KV-cache write.
+    Returns q, or None when not covered (caller runs the unfused chain)."""
+    target = _k3_absorb_q_cache_target(attn, forward_batch, q_nope.shape[0])
+    if target is None:
+        return None
+    from sglang.kernels.ops.attention import k3_mla_absorb as ka
+
+    kv, loc = target
+    if not ka.covered_q(q_nope, q_pe, attn.w_kc, k_nope, k_pe, kv, loc):
+        return None
+    return ka.k3_mla_absorb_q_cat_cache(q_nope, q_pe, attn.w_kc, k_nope, k_pe, kv, loc)
+
+
+def _k3_absorb_v_gate(
+    attn: DeepseekV2AttentionMLA,
+    attn_output: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> Optional[torch.Tensor]:
+    """SGLANG_ROCM_K3_MLA_ABSORB_FUSED W_UV half: one launch for
+    attn_output @ W_UV and, when the K3 output gate is pending, the gate
+    multiply the o_proj wrapper would otherwise apply. Returns the o_proj
+    input [M, H * v_head_dim], or None (caller keeps rocm_absorb_v_bmm)."""
+    if not (
+        _K3_MLA_ABSORB_FUSED
+        and attn.rotary_emb is None
+        and not attn.use_deep_gemm_bmm
+        and not is_kv_b_lora_active(attn)
+        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        and not get_parallel().dcp_enabled
+        and not is_in_tc_piecewise_cuda_graph()
+        and getattr(attn.o_proj, "weight", None) is not None
+        and attn.o_proj.weight.dtype == torch.bfloat16
+        and _k3_absorb_plain_bf16(getattr(attn, "w_vc", None), attn.w_scale)
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+    ):
+        return None
+    from sglang.kernels.ops.attention import k3_mla_absorb as ka
+
+    if not ka.covered_v(attn_output, attn.w_vc, None):
+        return None
+    gate_input = getattr(attn, "_gate_hidden_states", None)
+    if gate_input is None:
+        return ka.k3_mla_absorb_v_gate(attn_output, attn.w_vc, None)
+    # Take the gate over from the o_proj wrapper (KimiK3MLAAttention): with
+    # _gate_hidden_states cleared and the side-stream join done here, the
+    # wrapper passes straight through to o_proj.
+    attn._gate_hidden_states = None
+    gate = attn._compute_output_gate(gate_input)
+    if ka.covered_v(attn_output, attn.w_vc, gate):
+        return ka.k3_mla_absorb_v_gate(attn_output, attn.w_vc, gate)
+    x = ka.k3_mla_absorb_v_gate(attn_output, attn.w_vc, None)
+    return x * torch.sigmoid(gate)
+
+
 def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
@@ -665,6 +782,7 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        k3_absorb_deferred = False
         # The fused kernel wins at decode-sized batches (decode, target verify,
         # draft extend); prefill shapes run faster as the two separate launches.
         fuse_bmm_rope_cache = (
@@ -714,6 +832,15 @@ class DeepseekMLARocmForwardMixin:
                 # The absorb is the first half of the kernel core will run, and
                 # that kernel wants q_nope un-absorbed. Nothing to do here.
                 q_nope_out = None
+            elif (
+                _K3_MLA_ABSORB_FUSED
+                and _k3_absorb_q_cache_target(self, forward_batch, q_nope.shape[0])
+                is not None
+            ):
+                # SGLANG_ROCM_K3_MLA_ABSORB_FUSED: core runs the absorb fused
+                # with the q cat + KV write; hand it q_nope un-absorbed.
+                q_nope_out = None
+                k3_absorb_deferred = True
             else:
                 q_nope_out = rocm_absorb_q_bmm(
                     self, q_nope, is_capture_mode=get_is_capture_mode()
@@ -804,7 +931,7 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
-            q_nope if fuse_bmm_rope_cache else None,
+            q_nope if (fuse_bmm_rope_cache or k3_absorb_deferred) else None,
         )
 
     def forward_absorb_rocm_core(
@@ -967,7 +1094,24 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            k3_q = None
+            if q_nope_out is None and q_nope_unabsorbed is not None:
+                # SGLANG_ROCM_K3_MLA_ABSORB_FUSED: prepare deferred W_UK here.
+                k3_q = _k3_absorb_q_cat_cache(
+                    self, q_nope_unabsorbed, q_pe, k_nope, k_pe, forward_batch
+                )
+                if k3_q is None:
+                    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                    q_nope_out = rocm_absorb_q_bmm(
+                        self, q_nope_unabsorbed, is_capture_mode=get_is_capture_mode()
+                    ).transpose(0, 1)
+            if k3_q is not None:
+                q = k3_q
+                # KV row already written; as on the cat-cache path below.
+                k = q[:, :1, :]
+                save_kv_cache = False
+            elif self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
@@ -1074,6 +1218,14 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
+        elif (
+            _K3_MLA_ABSORB_FUSED
+            and (
+                attn_bmm_output := _k3_absorb_v_gate(self, attn_output, forward_batch)
+            )
+            is not None
+        ):
+            pass
         else:
             attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 

@@ -78,6 +78,24 @@ def smallm_max_t() -> int:
     return _SMALLM_MAX_T
 
 
+_FUSED_MAX_T = None
+
+
+def fused_max_t(all_gather: bool = False) -> int:
+    """Token ceiling of SGLANG_ROCM_K3_AR_AGG_FUSED (0 when disabled) for the
+    all-reduce or the all-gather variant."""
+    global _FUSED_MAX_T
+    if _FUSED_MAX_T is None:
+        from sglang.srt.environ import envs
+
+        on = is_hip() and envs.SGLANG_ROCM_K3_AR_AGG_FUSED.get()
+        _FUSED_MAX_T = (
+            envs.SGLANG_ROCM_K3_AR_AGG_FUSED_MAX_T.get() if on else 0,
+            envs.SGLANG_ROCM_K3_AR_AGG_FUSED_AG_MAX_T.get() if on else 0,
+        )
+    return _FUSED_MAX_T[1 if all_gather else 0]
+
+
 def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:
     """Whether an aggregation point of this shape takes attn_res_smallm_hip."""
     return (
@@ -519,6 +537,9 @@ class AttnResidual:
         self.num_valid_blocks = 0
         # Deferred dspark capture (SGLANG_ROCM_K3_AGG_SMALLM): see defer_stream.
         self._stream_pending = None
+        # Precomputed attention-side aggregation (SGLANG_ROCM_K3_AR_AGG_FUSED):
+        # see forward_ag_fused.
+        self._agg_stash = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -568,6 +589,108 @@ class AttnResidual:
                 )
             )
 
+    def _fused_outputs(self, like: torch.Tensor):
+        from sglang.srt.layers import k3_rocm_dense_fp8
+
+        out_fp8 = (
+            torch.empty(like.shape, dtype=torch.float8_e4m3fn, device=like.device)
+            if k3_rocm_dense_fp8.front_enabled()
+            else None
+        )
+        return torch.empty_like(like), torch.empty_like(like), out_fp8
+
+    def forward_ar_fused(
+        self,
+        ca,
+        partial: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """SGLANG_ROCM_K3_AR_AGG_FUSED: all-reduce the TP-partial `partial`
+        (o_proj output) and aggregate in one kernel. Same result as
+        forward(all_reduce(partial), prefix_sum, ...) (no bank write). None
+        when the fused kernel does not apply; the caller then reduces."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        T, H = partial.shape
+        if T > fused_max_t() or not k3_ar_agg_hip.usable(ca, T, H, nvb):
+            return None
+        if prefix_sum is not None and prefix_sum.shape != partial.shape:
+            return None
+        self.flush_stream()
+        out, prefix, out_fp8 = self._fused_outputs(partial)
+        k3_ar_agg_hip.ar_agg(
+            ca,
+            partial.contiguous(),
+            prefix_sum,
+            self.block_residual,
+            get_cw(score_proj, score_norm),
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            out=out,
+            prefix_out=prefix,
+            out_fp8=out_fp8,
+        )
+        if out_fp8 is not None:
+            from sglang.srt.layers import k3_rocm_dense_fp8
+
+            k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
+        return out, prefix
+
+    def forward_ag_fused(
+        self,
+        ca,
+        y: torch.Tensor,
+        add_b: torch.Tensor,
+        add_c: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        write: bool,
+    ) -> Optional[torch.Tensor]:
+        """SGLANG_ROCM_K3_AR_AGG_FUSED: h = bf16(bf16(all_gather(y) + add_b)
+        [+ add_c]) (the MoE up_proj tail) and, in the same kernel, the NEXT
+        layer's attention-side aggregation of h (score_proj / score_norm /
+        out_norm / write are that layer's). Returns h; the aggregation is
+        stashed and handed out by the next forward() on exactly (h, None,
+        score_proj, write). None when the fused kernel does not apply."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        T = y.shape[0]
+        H = add_b.shape[1]
+        if (
+            T > fused_max_t(all_gather=True)
+            or not k3_ar_agg_hip.usable(ca, T, H, nvb)
+            or (write and self.block_residual.shape[1] <= nvb)
+            or self._stream_pending is not None
+        ):
+            return None
+        out, h, out_fp8 = self._fused_outputs(add_b)
+        k3_ar_agg_hip.ag_agg(
+            ca,
+            y.contiguous(),
+            add_b,
+            add_c,
+            self.block_residual,
+            get_cw(score_proj, score_norm),
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            out=out,
+            prefix_out=h,
+            out_fp8=out_fp8,
+            write_bank=write,
+        )
+        self._agg_stash = (h, out, out_fp8, score_proj, nvb, write)
+        return h
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -582,6 +705,25 @@ class AttnResidual:
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
+        stash, self._agg_stash = self._agg_stash, None
+        if stash is not None:
+            h, s_out, s_fp8, s_proj, s_nvb, s_write = stash
+            if (
+                h is hidden_states
+                and prefix_sum is None
+                and rows is None
+                and s_proj is score_proj
+                and s_nvb == self.num_valid_blocks
+                and s_write == write
+            ):
+                self.flush_stream()
+                if s_fp8 is not None:
+                    from sglang.srt.layers import k3_rocm_dense_fp8
+
+                    k3_rocm_dense_fp8.offer_prequantized(s_out, s_fp8)
+                if write:
+                    self.num_valid_blocks += 1  # row s_nvb written in-kernel
+                return s_out, hidden_states
         nvb = self.num_valid_blocks
         stream_out = None
         if self._stream_pending is not None:

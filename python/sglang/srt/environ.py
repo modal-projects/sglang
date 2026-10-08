@@ -1077,6 +1077,13 @@ class Envs:
     # cache (kernels/ops/attention/k3_mla_cat_cache_hip.py), replacing 2x
     # torch.cat + the cache cast + index_put. Bit-identical; -3 launches per MLA layer.
     SGLANG_ROCM_K3_MLA_CAT_CACHE = EnvBool(False)
+    # ROCm K3 (NoPE MLA, aiter backend) decode / target verify at <= 64 rows:
+    # the absorbed W_UK BMM is fused with the q cat + latent KV-cache write, and
+    # the W_UV BMM with the K3 output gate x*sigmoid(g)
+    # (kernels/ops/attention/k3_mla_absorb.py). Replaces 4 launches (2 hipBLASLt
+    # BMMs, cat-cache, gate) with 2 per MLA layer; fp32 accumulation over one
+    # head, one bf16 rounding (bit-identical to hipBLASLt in tests).
+    SGLANG_ROCM_K3_MLA_ABSORB_FUSED = EnvBool(False)
     # ROCm K3 (aiter backend) extend with a cached prefix: build the prefix K/V
     # for the MHA without torch.cat. One Triton launch gathers + casts the FP8
     # latent rows and writes k_pe (broadcast to all heads) into its final slot;
@@ -1100,6 +1107,19 @@ class Envs:
     # (opus has no split-KV). Takes precedence over PREFIX_NOCAT.
     # See kernels/ops/attention/k3_mla_prefill_fp8.py.
     SGLANG_ROCM_K3_MLA_PREFILL_FMHA = EnvBool(False)
+    # ROCm K3 TP8 decode/verify (T <= SGLANG_ROCM_K3_AR_AGG_FUSED_MAX_T): fuse
+    # each collective with the attention-residual aggregation that consumes it.
+    # o_proj all-reduce + MLP-side aggregation is one kernel; with
+    # SGLANG_ROCM_K3_UPPROJ_AG the MoE up_proj all-gather/add3 + the next
+    # layer's attention-side aggregation is one kernel. The aggregation is
+    # spread over T x 4 blocks, its score/norm statistics riding the
+    # collective's barrier. AR / add3 rows and bank snapshots bit-identical,
+    # normalized outputs within 1 bf16 ulp. See
+    # kernels/ops/communication/k3_ar_agg_hip.py.
+    SGLANG_ROCM_K3_AR_AGG_FUSED = EnvBool(False)
+    SGLANG_ROCM_K3_AR_AGG_FUSED_MAX_T = EnvInt(64)
+    # token ceiling of the all-gather variant
+    SGLANG_ROCM_K3_AR_AGG_FUSED_AG_MAX_T = EnvInt(64)
     # ROCm K3 decode: up_proj on this rank's hidden/tp columns + fused all-gather/add3
     SGLANG_ROCM_K3_UPPROJ_AG = EnvBool(False)
     # ROCm K3 decode (with SGLANG_ROCM_K3_UPPROJ_AG): the up_proj all-gather +
@@ -1139,6 +1159,12 @@ class Envs:
     # K slice + one fused bf16-exact RoPE / prefix-valid KV write per draft
     # layer (replaces copy/rope/copy/store; bit-identical).
     SGLANG_ROCM_K3_DFLASH_KV_FUSE = EnvBool(False)
+    # DFlash fc (target-feature projection, replicated 616 MB bf16 for K3) at
+    # <= 64 rows: per-rank column shard (free view) + AITER custom last-dim
+    # all-gather instead of every rank reading the whole weight
+    # (models/dflash.py _rocm_fc_column_shard). Tuned rows:
+    # aiter model_configs/kimik3_dflash_fc_shard_bf16_tuned_gemm.csv.
+    SGLANG_ROCM_K3_DFLASH_FC_SHARD = EnvBool(False)
     # DFlash draft prep (host-latency-bound eager path): one kernel for the
     # compact window lengths + suffix start, and one kernel for the draft
     # runner's TARGET_VERIFY attention metadata (replaces ~25 small launches).
@@ -1147,6 +1173,39 @@ class Envs:
     # host-waits on each step) before the mamba/KDA state commit instead of
     # after it, so the commit overlaps the scheduler's host work.
     SGLANG_ROCM_K3_DFLASH_EARLY_PUBLISH = EnvBool(False)
+    # DFlash draft step (ROCm K3): one CUDA graph per draft batch size holds the
+    # eager draft prep (block ids/positions/cache locs, noise embedding + its
+    # TP all-reduce, compact window lens + draft req->token rebuild) AND the
+    # draft runner's replay prep (buffer fill, input-embeds copy, attention
+    # metadata); the draft graph is then replayed directly. Per step: one small
+    # input copy + 2 graph launches instead of ~10 eager launches and the
+    # generic model_runner.forward Python. Needs SGLANG_ROCM_K3_DFLASH_PREP_FUSE.
+    SGLANG_ROCM_K3_DFLASH_PREP_GRAPH = EnvBool(False)
+    # Largest draft batch size given a prep graph (larger batches run eager prep).
+    SGLANG_ROCM_K3_DFLASH_PREP_GRAPH_MAX_BS = EnvInt(16)
+    # Debug: for the first N graph steps per batch size also run the eager prep
+    # and compare draft tokens / block ids / positions / cache locs (logs any
+    # mismatch). 0 = off.
+    SGLANG_ROCM_K3_DFLASH_PREP_GRAPH_CHECK = EnvInt(0)
+    # DFlash post-verify tail (ROCm K3): the draft-KV materialization (fc
+    # projection + per-layer K-norm / RoPE / KV proj / prefix-valid KV write,
+    # ~26 eager launches) replayed from one lazily captured CUDA graph per batch
+    # size; commit_lens is staged into a static buffer. Off with
+    # SGLANG_ROCM_K3_DFLASH_FC_SHARD (its all-gather is not captured here).
+    SGLANG_ROCM_K3_DFLASH_TAIL_GRAPH = EnvBool(False)
+    # Vocab-parallel logits gather (verify/decode lm_head) via the AITER custom
+    # last-dim all-gather straight into [rows, vocab] (no dim-0 gather + movedim
+    # copy). Bit-identical (pure data movement).
+    SGLANG_ROCM_K3_LOGITS_AG_LASTDIM = EnvBool(False)
+    # Debug: per-rank host/GPU step timeline without rocprof. N > 0 enables it
+    # and logs a per-rank summary every N decode iterations; every iteration is
+    # also appended to <DIR>/rank<r>.log (merge ranks with
+    # /mnt/scratch/k3/agent_hostgap/step_timing_report.py).
+    SGLANG_DEBUG_K3_STEP_TIMING = EnvInt(0)
+    SGLANG_DEBUG_K3_STEP_TIMING_DIR = EnvStr("/tmp/k3_step_timing")
+    # Also record GPU timing events at the segment boundaries (adds ~8 event
+    # records per step).
+    SGLANG_DEBUG_K3_STEP_TIMING_GPU = EnvBool(True)
     # ROCm K3 decode/verify dense GEMMs: route the skinny KDA [f_a|b] (N=144) and
     # f_b (K=128) GEMMs that today fall back to F.linear (hipBLASLt heuristic)
     # above the tiny-GEMM token limit through AITER tgemm, so the tuned rows in

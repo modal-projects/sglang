@@ -73,6 +73,78 @@ def _rocm_decode_gemm_tuned() -> bool:
     )
 
 
+_FC_SHARD_STATE: dict = {}
+
+
+def _rocm_fc_shard_state(fc_weight: torch.Tensor):
+    """Static part of SGLANG_ROCM_K3_DFLASH_FC_SHARD, resolved once per weight
+    (and TP group): (custom-AR comm, this rank's weight rows, out features,
+    GEMM fn), or None when the path does not apply."""
+    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_hip
+
+    if not (is_hip() and envs.SGLANG_ROCM_K3_DFLASH_FC_SHARD.get()):
+        return None
+    if fc_weight.dtype != torch.bfloat16 or not fc_weight.is_contiguous():
+        return None
+    group = get_tp_group()
+    key = (fc_weight.data_ptr(), id(group))
+    if key in _FC_SHARD_STATE:
+        return _FC_SHARD_STATE[key]
+    st = None
+    tp = group.world_size
+    n = fc_weight.shape[0]
+    ca = getattr(group, "ca_comm", None)
+    if (
+        tp > 1
+        and n % (8 * tp) == 0
+        and ca is not None
+        and not getattr(ca, "disabled", True)
+        and hasattr(ca, "all_gather_unreg")
+    ):
+        ns = n // tp
+        r = group.rank_in_group
+        try:
+            from aiter.tuned_gemm import tgemm
+
+            def gemm(x, w):
+                return tgemm.mm(x, w, None, otype=x.dtype)
+
+        except ImportError:
+            gemm = F.linear
+        st = (ca, fc_weight[r * ns : (r + 1) * ns], n, gemm)
+    _FC_SHARD_STATE[key] = st
+    return st
+
+
+def _rocm_fc_column_shard(fc_weight: torch.Tensor, x: torch.Tensor) -> Optional[torch.Tensor]:
+    """SGLANG_ROCM_K3_DFLASH_FC_SHARD: the replicated DFlash ``fc`` (hidden ->
+    hidden, K = num_features * hidden; 616 MB for K3) read by every rank each
+    decode step becomes a column shard per TP rank (out rows
+    [r*N/tp, (r+1)*N/tp), a free contiguous view of the replicated weight)
+    plus one AITER custom last-dim all-gather. Each output element is the same
+    full-K dot product, so numerics match the replicated GEMM up to the GEMM
+    kernel's fp32 summation order (<= 1 bf16 ulp). Returns None when not
+    applicable (caller runs the replicated GEMM)."""
+    m = x.shape[0]
+    if not (0 < m <= 64 and x.dtype == torch.bfloat16 and x.is_contiguous()):
+        return None
+    st = _rocm_fc_shard_state(fc_weight)
+    if st is None:
+        return None
+    ca, w, n, gemm = st
+    y = gemm(x, w)
+    if not ca.should_custom_ag(y):
+        return None
+    out = torch.empty((m, n), dtype=y.dtype, device=y.device)
+    if getattr(ca, "_IS_CAPTURING", False) and torch.cuda.is_current_stream_capturing():
+        ca.all_gather_reg(y, out=out, dim=-1)
+    else:
+        ca.all_gather_unreg(y, out=out, dim=-1)
+    return out
+
+
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
@@ -788,6 +860,12 @@ class DFlashDraftModel(nn.Module):
                 "the draft checkpoint/config expects."
             )
         if (
+            not self.is_nemotron_35_draft
+            and (projected := _rocm_fc_column_shard(self.fc.weight, target_hidden))
+            is not None
+        ):
+            pass
+        elif (
             not self.is_nemotron_35_draft
             and 0 < target_hidden.shape[0] <= 64
             and target_hidden.dtype == torch.bfloat16

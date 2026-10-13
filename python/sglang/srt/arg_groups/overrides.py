@@ -306,7 +306,10 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 @register_model_override_predicate(
     lambda arch: (
-        "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
+        "Step3p5ForCausalLM" in arch
+        or "Step3p7ForConditionalGeneration" in arch
+        or "Step5ForCausalLM" in arch
+        or "Step5ForConditionalGeneration" in arch
     )
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:

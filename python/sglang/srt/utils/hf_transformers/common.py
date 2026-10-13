@@ -90,6 +90,8 @@ from sglang.srt.configs import (
     Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
+    Step5Config,
+    Step5VLConfig,
     Step3VLConfig,
     XllmConfig,
 )
@@ -173,6 +175,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         KimiK25Config,
         Step3p5Config,
         Step3p7Config,
+        Step5Config,
+        Step5VLConfig,
         MiniCPMHybridConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,

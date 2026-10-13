@@ -784,6 +784,8 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
@@ -802,6 +804,8 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
@@ -874,6 +878,9 @@ class LoRAManager:
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
+
+        for adapter in self.loras.values():
+            self.memory_pool.retain_local_expert_weights(adapter)
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})

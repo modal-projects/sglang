@@ -1155,7 +1155,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
-            is_concat=True,
+            is_concat=layer.moe_runner_config.is_gated,
             is_packed=False,
         )
 
@@ -1306,7 +1306,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    (2 if layer.moe_runner_config.is_gated else 1)
+                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=scale_dtype,
                 ),
@@ -1330,10 +1331,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert quant_config.activation_scheme == "dynamic"
 
         else:
-            # Allocate 2 scales for w1 and w3 respectively.
+            # Allocate one scale per projection (gate/up or ungated up).
             # They will be combined to a single scale after weight loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(
+                    num_experts,
+                    2 if layer.moe_runner_config.is_gated else 1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -2155,7 +2161,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
             for expert_id in range(layer.num_local_experts):
                 start = 0
-                for shard_id in range(2):
+                for shard_id in range(layer.w13_weight_scale.shape[1]):
                     dq_weight = per_tensor_dequantize(
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],

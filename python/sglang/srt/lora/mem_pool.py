@@ -369,6 +369,23 @@ class LoRAMemoryPool:
         local = global_eid - self.moe_ep_rank * self._num_experts_local
         return local if 0 <= local < self._num_experts_local else None
 
+    def retain_local_expert_weights(self, adapter: LoRAAdapter) -> None:
+        """Keep only this rank's per-expert CPU weights after normalization."""
+        if not self.moe_use_local_expert_ids or self.experts_shared_outer_loras:
+            return
+        for layer in adapter.layers:
+            for name in list(layer.weights):
+                expert = re.search(r"\.experts\.(\d+)\.", name)
+                if expert and self._global_to_local_expert_id(int(expert.group(1))) is None:
+                    del layer.weights[name]
+                else:
+                    # Eager safetensors can expose slices of a whole-file buffer.
+                    # A retained local tensor must not keep that global buffer alive.
+                    layer.weights[name] = layer.weights[name].clone()
+        for weights in (adapter.embedding_layers, adapter.added_tokens_embeddings):
+            for name in weights:
+                weights[name] = weights[name].clone()
+
     def _iter_local_expert_weights(
         self,
         weights: Union[torch.Tensor, Dict[int, torch.Tensor]],

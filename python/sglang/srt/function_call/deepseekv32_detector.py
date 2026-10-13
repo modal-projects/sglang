@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from typing import Any, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -9,6 +10,10 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
+)
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,7 +135,98 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
 
-    def _parse_parameters_from_xml(self, invoke_content: str) -> str:
+    def _get_arguments_config(
+        self, func_name: str, tools: Optional[list[Tool]]
+    ) -> dict:
+        """Extract argument configuration for a function."""
+        for tool in tools or []:
+            if tool.function.name == func_name:
+                return get_schema_properties(tool.function.parameters)
+        return {}
+
+    def _get_param_type(self, param_schema: Any) -> Optional[str]:
+        """Infer the parser conversion type from a JSON schema parameter."""
+        inferred_type = infer_type_from_json_schema(param_schema)
+        if inferred_type is None:
+            return None
+        return str(inferred_type).strip().lower()
+
+    def _convert_param_value(
+        self,
+        param_value: Any,
+        raw_value: str,
+        param_name: str,
+        param_config: dict,
+        func_name: str,
+    ) -> Any:
+        """Convert a parameter value to the type in the schema.
+
+        The model types each value with the DSML `string=` flag, which it
+        sometimes gets wrong. Values already matching the schema type, nulls,
+        and values that can't be converted are returned unchanged.
+        """
+        if param_value is None or param_name not in param_config:
+            return param_value
+
+        param_type = self._get_param_type(param_config[param_name])
+        if param_type is None:
+            return param_value
+        if param_type == "string":
+            return param_value if isinstance(param_value, str) else raw_value
+        if not isinstance(param_value, str):
+            return param_value
+
+        value = param_value.strip()
+        if param_type.startswith("int"):
+            try:
+                return int(value)
+            except ValueError:
+                logger.warning(
+                    f"Parsed value '{value}' of parameter '{param_name}' is not an integer in tool "
+                    f"'{func_name}', degenerating to string."
+                )
+        elif param_type.startswith("num"):
+            try:
+                number = float(value)
+                if (
+                    number.is_integer()
+                    and "." not in value
+                    and "e" not in value.lower()
+                ):
+                    return int(number)
+                return number
+            except ValueError:
+                logger.warning(
+                    f"Parsed value '{value}' of parameter '{param_name}' is not a number in tool "
+                    f"'{func_name}', degenerating to string."
+                )
+        elif param_type in ("boolean", "bool"):
+            if value.lower() in ("true", "false"):
+                return value.lower() == "true"
+            logger.warning(
+                f"Parsed value '{value}' of parameter '{param_name}' is not a boolean in tool "
+                f"'{func_name}', degenerating to string."
+            )
+        elif param_type in ("object", "array"):
+            expected = dict if param_type == "object" else list
+            try:
+                parsed = json.loads(value, parse_constant=_reject_json_constant)
+                if isinstance(parsed, expected):
+                    return parsed
+            except ValueError:
+                pass
+            logger.warning(
+                f"Parsed value '{value}' of parameter '{param_name}' is not a JSON {param_type} "
+                f"in tool '{func_name}', degenerating to string."
+            )
+        return param_value
+
+    def _parse_parameters_from_xml(
+        self,
+        invoke_content: str,
+        func_name: str = "",
+        tools: Optional[list[Tool]] = None,
+    ) -> str:
         """
         Parse parameters from either XML-like format or JSON format to str.
 
@@ -138,6 +234,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
         2. Direct JSON: { "key": "value" }
         """
+        param_config = self._get_arguments_config(func_name, tools)
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
@@ -146,7 +243,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
             )
             if not isinstance(parsed, dict):
                 raise ValueError("DeepSeek tool arguments must be a JSON object")
-            return invoke_content_stripped
+            converted = {
+                name: self._convert_param_value(
+                    value,
+                    json.dumps(value, ensure_ascii=False),
+                    name,
+                    param_config,
+                    func_name,
+                )
+                for name, value in parsed.items()
+            }
+            if all(converted[name] is parsed[name] for name in parsed):
+                return invoke_content_stripped
+            return json.dumps(converted, ensure_ascii=False)
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
@@ -169,7 +278,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             last_match_end = match.end()
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters[param_name] = (
+                value = (
                     param_value.strip()
                     if self.strip_string_param_value
                     else param_value
@@ -177,11 +286,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             else:
                 # Try to parse as JSON for other types
                 try:
-                    parameters[param_name] = json.loads(
+                    value = json.loads(
                         param_value.strip(), parse_constant=_reject_json_constant
                     )
                 except (json.JSONDecodeError, ValueError):
-                    parameters[param_name] = param_value.strip()
+                    value = param_value.strip()
+            parameters[param_name] = self._convert_param_value(
+                value, param_value.strip(), param_name, param_config, func_name
+            )
         leftover.append(invoke_content[last_match_end:])
 
         leftover_text = "".join(leftover)
@@ -232,7 +344,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         )
                         continue
                     try:
-                        func_args = self._parse_parameters_from_xml(invoke_content)
+                        func_args = self._parse_parameters_from_xml(
+                            invoke_content, func_name, tools
+                        )
                     except ValueError as e:
                         logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
                         continue
@@ -325,7 +439,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     preamble = current_text[:call_start].removesuffix("\n\n")
 
                 try:
-                    current_params = self._parse_parameters_from_xml(invoke_content)
+                    current_params = self._parse_parameters_from_xml(
+                        invoke_content, func_name, tools
+                    )
                 except ValueError as e:
                     # Fail closed: drop this invoke, keep going for the next one.
                     logger.warning(f"Dropping malformed DeepSeek invoke: {e}")

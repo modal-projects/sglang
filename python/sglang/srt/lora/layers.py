@@ -1166,6 +1166,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
+        if self._lora_runner_backend.is_marlin():
+            # The dispatcher initializes the EP map lazily on its first dispatch.
+            quant_info.expert_map = base_layer.dispatcher.local_expert_mapping
+            quant_info.global_num_experts = (
+                base_layer.num_experts if quant_info.expert_map is not None else -1
+            )
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():

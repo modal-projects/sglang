@@ -164,10 +164,6 @@ class LoRAAdapter(nn.Module):
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
-        )
-
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -177,6 +173,9 @@ class LoRAAdapter(nn.Module):
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
+            normalized_target_modules = get_normalized_target_modules(
+                self.config.target_modules
+            )
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
             # "all-linear"), we allow loading since the server-level

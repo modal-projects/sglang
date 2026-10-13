@@ -164,10 +164,6 @@ class LoRAAdapter(nn.Module):
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
-        )
-
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -177,6 +173,9 @@ class LoRAAdapter(nn.Module):
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
+            normalized_target_modules = get_normalized_target_modules(
+                self.config.target_modules
+            )
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
             # "all-linear"), we allow loading since the server-level
@@ -463,7 +462,16 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         for weight_name in weight_names:
-            if "gate_proj" in weight_name:
+            if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
+                weight_name
+            ):
+                gate_name = weight_name.replace(".up_proj.", ".gate_proj.")
+                if weight_name in weights and gate_name not in weights:
+                    # Non-gated experts can export their single input projection
+                    # as up_proj. The fused MoE buffer still calls it gate_up_proj.
+                    merged_name = weight_name.replace(".up_proj.", ".gate_up_proj.")
+                    weights[merged_name] = weights.pop(weight_name)
+            elif "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 # PEFT can ship up_proj in two forms when there's no real

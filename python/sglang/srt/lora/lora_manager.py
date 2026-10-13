@@ -865,6 +865,13 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        # Normalization maps up_proj to gate_up_proj for fused MoE weights.
+        # Keep standalone dense/shared-expert up_proj modules eligible too.
+        if "gate_up_proj" in self.target_modules and any(
+            name.endswith(".up_proj") for name, _ in self.base_model.named_modules()
+        ):
+            self.target_modules.add("up_proj")
+
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
@@ -919,6 +926,8 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -943,6 +952,8 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -1021,6 +1032,9 @@ class LoRAManager:
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
+
+        for adapter in self.loras.values():
+            self.memory_pool.retain_local_expert_weights(adapter)
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})

@@ -232,6 +232,14 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 @dataclasses.dataclass
+class LoRARequestRef:
+    """One registry acquisition shared by a logical request and its children."""
+
+    lora_id: str
+    users: int = 1
+
+
+@dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
 
@@ -242,6 +250,7 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    lora_ref: Optional[LoRARequestRef] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1816,14 +1825,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
-            # Delete the key to prevent resending abort request to the scheduler and
-            # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
-
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            # Request-state removal owns the LoRA release. This consumer may
+            # run after the RID has already been reused by a new request.
+            if self.rid_to_state.get(state.obj.rid) is state:
+                self._pop_req_state(state.obj.rid)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2034,6 +2039,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
+                self._share_lora_ref(objs[i].rid, tmp_obj.rid)
                 request_rids.add(tmp_obj.rid)
                 await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
@@ -2051,6 +2057,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
+                    self._share_lora_ref(objs[i].rid, tmp_obj.rid)
                     request_rids.add(tmp_obj.rid)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
@@ -2061,7 +2068,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     rids.append(tmp_obj.rid)
 
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                self._pop_req_state(objs[i].rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2639,11 +2646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
-
-                # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._pop_req_state(rid)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3441,7 +3444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
-        del self.rid_to_state[recv_obj.rid]
+        self._pop_req_state(recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3589,13 +3592,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
                 )
 
-        # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
-        # Propagate lora_id to any sub-objects already cached by __getitem__.
-        for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
-            sub_obj.lora_id = (
-                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
-            )
+        # Acquire once per logical request, not once per expanded n-sample slot.
+        # Children share the parent's reference until the final child finishes.
+        single = not hasattr(obj, "is_single") or obj.is_single
+        rids = [obj.rid] if single else list(obj.rid)
+        states = [self.rid_to_state[rid] for rid in rids]
+        paths = [state.obj.lora_path for state in states]
+
+        async def acquire_and_attach():
+            ids = await self.lora_registry.acquire(paths)
+            obj.lora_id = ids[0] if single else ids
+            for state, lora_id in zip(states, ids):
+                state.obj.lora_id = lora_id
+                if lora_id is None:
+                    continue
+                if self.rid_to_state.get(state.obj.rid) is state:
+                    state.lora_ref = LoRARequestRef(lora_id)
+                else:
+                    # Cleanup removed this state while acquisition waited.
+                    self._track_lora_task(self.lora_registry.release(lora_id))
+
+        # Cancellation cannot interrupt a partially acquired batch or leave an
+        # acquisition unattached. Cleanup can remove states while this finishes.
+        await asyncio.shield(self._track_lora_task(acquire_and_attach()))
+
+    def _track_lora_task(self, coroutine):
+        # Hold strong references to cleanup tasks after HTTP consumers disappear.
+        tasks = self.__dict__.setdefault("_lora_tasks", set())
+        task = asyncio.create_task(coroutine)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    def _share_lora_ref(self, parent_rid: str, child_rid: str) -> None:
+        child = self.rid_to_state[child_rid]
+        child.lora_ref = self.rid_to_state[parent_rid].lora_ref
+        if child.lora_ref is not None:
+            child.lora_ref.users += 1
+
+    def _pop_req_state(self, rid: str) -> Optional[ReqState]:
+        """Remove a request state, releasing its LoRA reference exactly once."""
+        state = self.rid_to_state.pop(rid, None)
+        if state is None:
+            return None
+        ref, state.lora_ref = state.lora_ref, None
+        if ref is not None:
+            assert ref.users > 0
+            ref.users -= 1
+            if ref.users == 0:
+                self._track_lora_task(self.lora_registry.release(ref.lora_id))
+        return state
 
     def _init_req_state(
         self,
@@ -3659,7 +3705,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Failed to abort request %s during cleanup", rid
                         )
                 else:
-                    del self.rid_to_state[rid]
+                    self._pop_req_state(rid)
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()

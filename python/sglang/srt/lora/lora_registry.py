@@ -142,27 +142,24 @@ class LoRARegistry:
             self._registry.move_to_end(name)
             return lora_ref.lora_id
 
-        if isinstance(lora_name, str):
-            async with self._registry_lock.writer_lock:
-                lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
-            return lora_id
-        elif isinstance(lora_name, list):
-            async with self._registry_lock.writer_lock:
-                lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
-            return lora_ids
-        else:
+        if not isinstance(lora_name, (str, list)):
             raise TypeError("lora_name must be either a string or a list of strings.")
+        names = [lora_name] if isinstance(lora_name, str) else lora_name
+        async with self._registry_lock.writer_lock:
+            # Lookup and pin are atomic with respect to unregister. Otherwise an
+            # eviction can observe zero and delete a counter before its increment.
+            ids = [_lookup(name) for name in names]
+            acquired = []
+            try:
+                for lora_id in ids:
+                    if lora_id is not None:
+                        await self._counters[lora_id].increment(notify_all=False)
+                        acquired.append(lora_id)
+            except BaseException:
+                for lora_id in acquired:
+                    await self._counters[lora_id].decrement()
+                raise
+        return ids[0] if isinstance(lora_name, str) else ids
 
     async def release(self, lora_id: Union[str, List[str]]):
         """

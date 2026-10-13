@@ -462,7 +462,9 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         for weight_name in weight_names:
-            if ".up_proj." in weight_name and self._is_non_gated_moe_weight(weight_name):
+            if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
+                weight_name
+            ):
                 gate_name = weight_name.replace(".up_proj.", ".gate_proj.")
                 if weight_name in weights and gate_name not in weights:
                     # Non-gated experts can export their single input projection

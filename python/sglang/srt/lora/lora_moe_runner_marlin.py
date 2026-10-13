@@ -83,9 +83,11 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
 
         M, hidden_size = hidden_states.shape
         K = quant_info.w13_qweight.shape[1] * 16
-        padded_hidden_states = torch.nn.functional.pad(
-            hidden_states, (0, K - hidden_size)
-        ) if K != hidden_size else hidden_states
+        padded_hidden_states = (
+            torch.nn.functional.pad(hidden_states, (0, K - hidden_size))
+            if K != hidden_size
+            else hidden_states
+        )
         E = quant_info.w13_qweight.shape[0]
         N = quant_info.w2_qweight.shape[1] * 16
         intermediate_size = runner_config.intermediate_size_per_partition
@@ -172,14 +174,18 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
 
         # Hook: after gate_up
         if hooks.after_gate_up:
-            intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * intermediate_size)
+            intermediate_cache1_3d = intermediate_cache1.view(
+                M, topk, 2 * intermediate_size
+            )
             hooks.after_gate_up(
                 hidden_states, intermediate_cache1_3d, topk_weights, topk_ids
             )
 
         # Stage 2: Activation
         intermediate_cache2 = torch.empty(
-            (M * topk, intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * topk, intermediate_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         if runner_config.gemm1_alpha is not None:
             swiglu_gpt_oss_sigmoid_alpha_contiguous(
@@ -190,9 +196,11 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             )
         else:
             silu_and_mul(intermediate_cache1, intermediate_cache2)
-        padded_intermediate = torch.nn.functional.pad(
-            intermediate_cache2, (0, N - intermediate_size)
-        ) if N != intermediate_size else intermediate_cache2
+        padded_intermediate = (
+            torch.nn.functional.pad(intermediate_cache2, (0, N - intermediate_size))
+            if N != intermediate_size
+            else intermediate_cache2
+        )
 
         # Stage 3: Down (Marlin)
         intermediate_cache3 = torch.empty(
@@ -229,7 +237,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             use_fp32_reduce=True,
             is_zp_float=False,
         )
-        intermediate_cache3 = intermediate_cache3[:, :hidden_size].contiguous().view(M, topk, hidden_size)
+        intermediate_cache3 = (
+            intermediate_cache3[:, :hidden_size].contiguous().view(M, topk, hidden_size)
+        )
 
         # Hook: after down
         if hooks.after_down:

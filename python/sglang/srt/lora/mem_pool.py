@@ -376,7 +376,10 @@ class LoRAMemoryPool:
         for layer in adapter.layers:
             for name in list(layer.weights):
                 expert = re.search(r"\.experts\.(\d+)\.", name)
-                if expert and self._global_to_local_expert_id(int(expert.group(1))) is None:
+                if (
+                    expert
+                    and self._global_to_local_expert_id(int(expert.group(1))) is None
+                ):
                     del layer.weights[name]
                 else:
                     # Eager safetensors can expose slices of a whole-file buffer.

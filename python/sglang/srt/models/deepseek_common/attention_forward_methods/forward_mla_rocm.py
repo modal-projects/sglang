@@ -421,9 +421,6 @@ def _fused_rope_cat_and_cache(
     )
 
 
-_K3_MLA_CAT_CACHE = True
-
-
 def _k3_mla_cat_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -438,8 +435,7 @@ def _k3_mla_cat_cache(
     replacing two torch.cat + set_kv_buffer's cast + index_put (bit-identical).
     Returns q, or None when not covered (the caller keeps the unfused path)."""
     if not (
-        _K3_MLA_CAT_CACHE
-        and attn.rotary_emb is None
+        attn.rotary_emb is None
         and attn.current_attention_backend == "aiter"
         and not get_parallel().dcp_enabled
         and (
@@ -468,9 +464,6 @@ def _k3_mla_cat_cache(
     return cc.k3_mla_cat_cache(q_nope_out, q_pe, k_nope, k_pe, kv, loc)
 
 
-_K3_MLA_ABSORB_FUSED = True
-
-
 def _k3_absorb_plain_bf16(w, w_scale) -> bool:
     return (
         isinstance(w, torch.Tensor)
@@ -490,8 +483,7 @@ def _k3_absorb_q_cache_target(
     else None. Same eligibility as _k3_mla_cat_cache plus a bf16 W_UK and
     <= 64 rows; prepare and core both call it, so they agree."""
     if not (
-        _K3_MLA_ABSORB_FUSED
-        and attn.rotary_emb is None
+        attn.rotary_emb is None
         and attn.current_attention_backend == "aiter"
         and not get_parallel().dcp_enabled
         and not attn.use_deep_gemm_bmm
@@ -551,8 +543,7 @@ def _k3_absorb_v_gate(
     multiply the o_proj wrapper would otherwise apply. Returns the o_proj
     input [M, H * v_head_dim], or None (caller keeps rocm_absorb_v_bmm)."""
     if not (
-        _K3_MLA_ABSORB_FUSED
-        and attn.rotary_emb is None
+        attn.rotary_emb is None
         and not attn.use_deep_gemm_bmm
         and not is_kv_b_lora_active(attn)
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
@@ -885,8 +876,7 @@ class DeepseekMLARocmForwardMixin:
                 # that kernel wants q_nope un-absorbed. Nothing to do here.
                 q_nope_out = None
             elif (
-                _K3_MLA_ABSORB_FUSED
-                and _k3_absorb_q_cache_target(self, forward_batch, q_nope.shape[0])
+                _k3_absorb_q_cache_target(self, forward_batch, q_nope.shape[0])
                 is not None
             ):
                 # Core runs the absorb fused
@@ -1271,10 +1261,8 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         elif (
-            _K3_MLA_ABSORB_FUSED
-            and (attn_bmm_output := _k3_absorb_v_gate(self, attn_output, forward_batch))
-            is not None
-        ):
+            attn_bmm_output := _k3_absorb_v_gate(self, attn_output, forward_batch)
+        ) is not None:
             pass
         else:
             attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)

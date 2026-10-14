@@ -3681,6 +3681,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        if _is_hip:
+            from sglang.srt.layers import k3_rocm_logits_gather
+
+            k3_rocm_logits_gather.install(self.logits_processor)
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):

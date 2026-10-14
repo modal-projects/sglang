@@ -3965,10 +3965,6 @@ class Scheduler(
         # A latched flag is otherwise only cleared when the running batch shrinks,
         # stalling the queue until an unrelated finish. PrefillAdder enforces limits.
         running_batch.batch_is_full = False
-        if running_batch.is_empty():
-            # An empty batch never reaches update_running_batch, the only
-            # other place that clears the flag, so admission would stay shut.
-            running_batch.batch_is_full = False
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0

@@ -1966,7 +1966,7 @@ def load_audio(
 @dataclass
 class ImageData:
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    detail: Optional[Literal["auto", "low", "high", "original"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
     content_hash: Optional[str] = None

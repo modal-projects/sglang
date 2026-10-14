@@ -162,6 +162,7 @@ def backend_extend(c, nocat):
     be.head_pad_mode = "zero"
     be.k3_mla_prefix_nocat = nocat
     be.forward_metadata = SimpleNamespace(
+        k3_fp8_prefill_plan=None,
         max_q_len=extend,
         max_kv_len=seq,
         kv_indptr=c["kv_indptr"],

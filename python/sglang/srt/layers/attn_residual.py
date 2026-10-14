@@ -1,3 +1,14 @@
+import functools
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.utils import is_cuda, is_hip, is_npu
+
 # SPDX-License-Identifier: Apache-2.0
 # Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #
@@ -16,22 +27,12 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
-
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
-_SMALLM_MAX_T = None  # 0 = off, else the max token count
 
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
@@ -78,28 +79,17 @@ def _same_storage_view(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
+@functools.cache
 def smallm_max_t() -> int:
     """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
-    global _SMALLM_MAX_T
-    if _SMALLM_MAX_T is None:
-        _SMALLM_MAX_T = 128 if is_hip() else 0
-    return _SMALLM_MAX_T
+    return 128 if is_hip() else 0
 
 
-_FUSED_MAX_T = None
-
-
+@functools.cache
 def fused_max_t(all_gather: bool = False) -> int:
-    """Token ceiling of the fused AllReduce + aggregation (0 when disabled) for the
-    all-reduce or the all-gather variant."""
-    global _FUSED_MAX_T
-    if _FUSED_MAX_T is None:
-        on = is_hip()
-        _FUSED_MAX_T = (
-            64 if on else 0,
-            64 if on else 0,
-        )
-    return _FUSED_MAX_T[1 if all_gather else 0]
+    """Token ceiling of the fused AllReduce + aggregation (0 when disabled), the
+    same for the all-reduce and the all-gather variant."""
+    return 64 if is_hip() else 0
 
 
 def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:

@@ -494,6 +494,9 @@ from sglang.srt.entrypoints.early_reject import (
 )
 
 app.add_middleware(APIEarlyRejectMiddleware)
+from sglang.srt.entrypoints.sse_keepalive import SSEKeepaliveMiddleware
+
+app.add_middleware(SSEKeepaliveMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

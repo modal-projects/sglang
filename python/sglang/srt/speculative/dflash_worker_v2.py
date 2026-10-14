@@ -174,7 +174,7 @@ class _DflashDraftSampler:
         # Packed-key path: one custom all-gather of int32 keys (carried in an
         # fp32-typed buffer, 16B-aligned rows) instead of two NCCL gathers.
         self.packed = bool(
-            self.tp_size > 1
+            not ("dfg" in __import__("os").environ.get("K3_ABL", "").split(",")) and self.tp_size > 1
             and _is_hip
             and weight.dtype == torch.bfloat16
             and self.num_org <= 65536
@@ -636,7 +636,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._k3_prep_graph = None
         # Lazily captured per batch size.
         self._k3_tail_graph_on = bool(
-            _is_hip and self.lilicorr is None and not get_parallel().attn_dp_enabled
+            not ("dfg" in __import__("os").environ.get("K3_ABL", "").split(",")) and _is_hip and self.lilicorr is None and not get_parallel().attn_dp_enabled
         )
         self._k3_tail_states: dict = {}
         self._k3_tail_pool = None
@@ -744,7 +744,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
             self._k3_prep_graph = None
-            if capture_decode_cuda_graph:
+            if capture_decode_cuda_graph and not ("dfg" in __import__("os").environ.get("K3_ABL", "").split(",")):
                 from sglang.srt.speculative.k3_dflash_prep_graph import (
                     K3DFlashPrepGraph,
                 )
@@ -1971,7 +1971,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
-                kv_fuse = _is_hip
+                kv_fuse = _is_hip and not ("dfg" in __import__("os").environ.get("K3_ABL", "").split(","))
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(

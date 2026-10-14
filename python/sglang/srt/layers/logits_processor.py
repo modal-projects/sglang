@@ -1480,6 +1480,8 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 def _k3_logits_all_gather_lastdim(logits: torch.Tensor) -> Optional[torch.Tensor]:
+    if ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")):
+        return None
     """Gather vocab-parallel logits
     [rows, vocab/tp] -> [rows, vocab] with the AITER custom last-dim all-gather
     (one kernel writing the final layout) instead of a dim-0 gather plus the

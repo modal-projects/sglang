@@ -290,7 +290,7 @@ def _dense_mlp_parallel_group() -> str:
 
 
 def _rocm_up_ag_fits(num_tokens: int, hidden_size: int) -> bool:
-    if not _is_hip:
+    if not _is_hip or ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
         return False
     if not 0 < num_tokens <= 128:
         return False
@@ -1620,6 +1620,8 @@ class KimiK3MoE(nn.Module):
         return True
 
     def _rocm_epi_fuse_fits(self, hidden_states, prefix_sum) -> bool:
+        if ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            return False
         n = hidden_states.shape[0]
         return (
             0 < n <= 256
@@ -1636,6 +1638,8 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _rocm_route_mid_ok(self) -> bool:
+        if ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            return False
         """Static eligibility for the 2-launch top-k + sort + quant routing glue
         (kernels/ops/moe/k3_route_sort_mid.py):
         the same routing contract the aiter STANDARD top-k path implements
@@ -2629,7 +2633,7 @@ class KimiK3DeltaAttention(nn.Module):
         TP-partial output, or None when not covered (caller runs the unfused
         pair). Only on the deferred-reduce o_proj (fused AllReduce + aggregation:
         the decoder layer completes the reduction)."""
-        if not _is_hip:
+        if not _is_hip or ("kda" in __import__("os").environ.get("K3_ABL", "").split(",")):
             return None
         m = g_proj_states.shape[0] if g_proj_states.dim() == 2 else -1
         if not (0 < m <= 8):
@@ -3306,7 +3310,7 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         # Fused AllReduce + aggregation with the up_proj all-gather tail: the
         # next layer's attention-side aggregation rides the MoE all-gather
-        self._ag_agg_fused = _is_hip
+        self._ag_agg_fused = _is_hip and not ("attnres" in __import__("os").environ.get("K3_ABL", "").split(","))
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -3564,6 +3568,8 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         aux_hidden_states,
     ) -> bool:
+        if ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            return False
         """Instead of a standalone aggregate_stream
         launch plus the packer's copy, claim the packed aux slot and let the
         next layer's attention-side aggregation (same stream head, same

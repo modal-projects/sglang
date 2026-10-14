@@ -299,6 +299,8 @@ def _moe_sorting_small_kernel_distributed(
 def _mid_sort_supported(
     topk_ids, block_size, expert_mask, num_local_tokens, num_experts, qx
 ):
+    if ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
+        return False
     from sglang.kernels.ops.moe import k3_route_sort_mid
 
     if qx is None:
@@ -395,7 +397,7 @@ def _run_small_sort(
     m, topk = topk_ids.shape
     p = m * topk
     buf_block = 4096
-    emit_mx = mx_quant_input is not None
+    emit_mx = mx_quant_input is not None and not ("moe" in __import__("os").environ.get("K3_ABL", "").split(","))
     if emit_mx:
         n_cols = mx_quant_input.shape[-1]
         scalen_pad = ((n_cols // 32 + 7) // 8) * 8

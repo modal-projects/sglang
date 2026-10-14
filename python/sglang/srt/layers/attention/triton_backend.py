@@ -244,8 +244,8 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self._use_draft_swa_splitkv = _is_hip and model_runner.is_draft_worker
-        self._use_draft_verify_meta_fuse = _is_hip and model_runner.is_draft_worker
+        self._use_draft_swa_splitkv = _is_hip and model_runner.is_draft_worker and not ("swa" in __import__("os").environ.get("K3_ABL", "").split(","))
+        self._use_draft_verify_meta_fuse = _is_hip and model_runner.is_draft_worker and not ("swa" in __import__("os").environ.get("K3_ABL", "").split(","))
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
             _is_hip

@@ -82,7 +82,7 @@ def smallm_max_t() -> int:
     """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
     global _SMALLM_MAX_T
     if _SMALLM_MAX_T is None:
-        _SMALLM_MAX_T = 128 if is_hip() else 0
+        _SMALLM_MAX_T = 128 if is_hip() and not ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")) else 0
     return _SMALLM_MAX_T
 
 
@@ -620,6 +620,8 @@ class AttnResidual:
         score_norm: RMSNorm,
         out_norm: RMSNorm,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            return None
         """All-reduce the TP-partial `partial`
         (o_proj output) and aggregate in one kernel. Same result as
         forward(all_reduce(partial), prefix_sum, ...) (no bank write). None
@@ -665,6 +667,8 @@ class AttnResidual:
         out_norm: RMSNorm,
         write: bool,
     ) -> Optional[torch.Tensor]:
+        if ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            return None
         """H = bf16(bf16(all_gather(y) + add_b)
         [+ add_c]) (the MoE up_proj tail) and, in the same kernel, the NEXT
         layer's attention-side aggregation of h (score_proj / score_norm /

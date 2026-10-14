@@ -586,11 +586,11 @@ class AiterAttnBackend(AttentionBackend):
 
         # Extend-with-prefix MHA builds the
         # prefix K/V without torch.cat (kernels/ops/attention/k3_mla_prefix_nocat.py).
-        self.k3_mla_prefix_nocat = self.use_mla
+        self.k3_mla_prefix_nocat = self.use_mla and not ("mlap" in __import__("os").environ.get("K3_ABL", "").split(","))
         # FP8 PS-ASM MHA for the d192/v128
         # extend (kernels/ops/attention/k3_mla_prefill_fp8.py).
         self.k3_mla_prefill_fmha = (
-            self.use_mla and self.num_head % 4 == 0 and is_gfx95_supported()
+            not ("mlap" in __import__("os").environ.get("K3_ABL", "").split(",")) and self.use_mla and self.num_head % 4 == 0 and is_gfx95_supported()
         )
         self.use_k3_mla_verify = False
 
@@ -724,6 +724,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_cache_dtype=self.kv_cache_dtype,
                 )
             )
+            self.use_k3_mla_verify = self.use_k3_mla_verify and not ("mlav" in __import__("os").environ.get("K3_ABL", "").split(","))
             if self.use_k3_mla_verify:
                 logger.info("aiter MLA target_verify: K3 Gluon/HipKittens kernels")
 

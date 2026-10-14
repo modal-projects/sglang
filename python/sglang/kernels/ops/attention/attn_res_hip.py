@@ -152,7 +152,7 @@ def _agg_kernel(
 # stream kernel is ahead at every NVB (NVB=8: 19.5 vs 22.5us, T=512: 18.5 vs
 # 32us, T=8192: 284 vs 411us). 256 keeps decode batches on the old kernel.
 # Measured on MI355X (H=7168).
-_STREAM_MIN_T = 256
+_STREAM_MIN_T = (1 << 30) if ("attnres" in __import__("os").environ.get("K3_ABL", "").split(",")) else 256
 _STREAM_NUM_WARPS = 4
 
 

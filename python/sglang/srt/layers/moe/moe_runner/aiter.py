@@ -182,7 +182,8 @@ class AiterRunnerCore(MoeRunnerCore):
         apply_aiter_small_moe_sort_patch()
         from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
 
-        apply_k3_moe_decode_cfg()
+        if not ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
+            apply_k3_moe_decode_cfg()
 
     def run(
         self,

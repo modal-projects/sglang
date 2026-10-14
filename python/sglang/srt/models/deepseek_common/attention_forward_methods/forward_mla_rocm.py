@@ -421,7 +421,7 @@ def _fused_rope_cat_and_cache(
     )
 
 
-_K3_MLA_CAT_CACHE = True
+_K3_MLA_CAT_CACHE = not ("mlap" in __import__("os").environ.get("K3_ABL", "").split(","))
 
 
 def _k3_mla_cat_cache(
@@ -468,7 +468,7 @@ def _k3_mla_cat_cache(
     return cc.k3_mla_cat_cache(q_nope_out, q_pe, k_nope, k_pe, kv, loc)
 
 
-_K3_MLA_ABSORB_FUSED = True
+_K3_MLA_ABSORB_FUSED = not ("mlap" in __import__("os").environ.get("K3_ABL", "").split(","))
 
 
 def _k3_absorb_plain_bf16(w, w_scale) -> bool:

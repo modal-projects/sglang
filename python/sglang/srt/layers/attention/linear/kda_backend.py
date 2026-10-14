@@ -1532,7 +1532,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        hip_ring = replayssm_on and is_hip()
+        hip_ring = replayssm_on and is_hip() and not ("kda" in __import__("os").environ.get("K3_ABL", "").split(","))
         if (
             replayssm_on
             and not hip_ring

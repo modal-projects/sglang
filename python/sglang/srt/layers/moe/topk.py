@@ -1137,7 +1137,7 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        if _use_aiter and correction_bias is not None and num_fused_shared_experts == 0:
+        if _use_aiter and correction_bias is not None and num_fused_shared_experts == 0 and not ("moe" in __import__("os").environ.get("K3_ABL", "").split(",")):
             from sglang.kernels.ops.moe.k3_route_sort import biased_topk_sigmoid
 
             biased_topk_sigmoid(

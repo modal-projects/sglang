@@ -3626,6 +3626,9 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # AiterAttnBackend: FP8 PS-ASM MLA prefill + prefix no-cat K/V build.
+    aiter_k3_mla_prefill = True
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -4081,6 +4084,9 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    # AiterAttnBackend: FP8 PS-ASM MLA prefill + prefix no-cat K/V build.
+    aiter_k3_mla_prefill = True
 
     supports_cuda_vmm_feature_transport = True
 

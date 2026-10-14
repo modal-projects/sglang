@@ -75,6 +75,10 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.api_contract import generate_contract_error
+from sglang.srt.entrypoints.early_reject import (
+    APIEarlyRejectMiddleware,
+    configure_api_early_reject,
+)
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -488,11 +492,6 @@ app = FastAPI(
     **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
-from sglang.srt.entrypoints.early_reject import (
-    APIEarlyRejectMiddleware,
-    configure_api_early_reject,
-)
-
 app.add_middleware(APIEarlyRejectMiddleware)
 from sglang.srt.entrypoints.sse_keepalive import SSEKeepaliveMiddleware
 

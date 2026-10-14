@@ -619,6 +619,10 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    SGLANG_SHORT_PREFILL_SCAN_WAITING = EnvBool(False)
+    SGLANG_SHORT_PREFILL_THRESHOLD = EnvInt(0)
+    SGLANG_SHORT_PREFILL_CHUNK = EnvInt(0)
+    SGLANG_SHORT_PREFILL_MAX_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

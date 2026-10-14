@@ -4004,13 +4004,9 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            running_batch.batch_is_full = False
-        if running_batch.is_empty():
-            # An empty batch has no request left to leave, and only a leaving
-            # request clears the flag elsewhere, so admission would stay shut.
-            running_batch.batch_is_full = False
+        # A latched flag is otherwise only cleared when the running batch shrinks,
+        # stalling the queue until an unrelated finish. PrefillAdder enforces limits.
+        running_batch.batch_is_full = False
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -4098,7 +4094,19 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            from sglang.srt.managers import short_prefill
+
+            if short_prefill.THRESHOLD > 0 and adder.chunked_req_limit is None:
+                self.chunked_req = short_prefill.add_chunk_with_short_prefill_budget(
+                    adder,
+                    self.chunked_req,
+                    self.waiting_queue,
+                    threshold=short_prefill.THRESHOLD,
+                    chunk_size=short_prefill.CHUNK_SIZE,
+                    batch_size=short_prefill.MAX_TOKENS,
+                )
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {

@@ -17,12 +17,17 @@ import contextlib
 import functools
 import logging
 from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
+
+if TYPE_CHECKING:
+    from sglang.kernels.ops.moe.k3_route_sort_mid import RouteState
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +338,7 @@ def _run_mid_sort(topk_ids, topk_weights, num_experts, block_size, moe_buf, qx):
     )
     sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
     num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-    st = mid.take_pending(topk_ids, qx)
+    st = _k3_sort_plan.get().take_route_state(topk_ids, qx)
     if st is None:
         st = mid.route_quant(
             qx,
@@ -411,7 +416,8 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
-    if emit_mx and _k3_route_sort.get():
+    plan = _k3_sort_plan.get()
+    if emit_mx and plan is not None:
         from sglang.kernels.ops.moe import k3_route_sort
 
         if k3_route_sort.sort_quant_supported(m, topk, block_size, n_cols) and (
@@ -419,9 +425,9 @@ def _run_small_sort(
         ):
             from sglang.kernels.ops.moe import k3_moe_epi
 
-            # The model offered its shared
-            # down GEMM for this top-k; run it in the sort's launch
-            pending = k3_moe_epi.take_shared_gemm(topk_ids)
+            # The model planned its shared down GEMM for this top-k; run it in
+            # the sort's launch
+            pending = plan.take_shared_gemm(topk_ids)
             if pending is not None:
                 k3_moe_epi.shared_gemm_sort_quant(
                     pending,
@@ -544,18 +550,89 @@ def _mid_max_tokens() -> int:
     return k3_route_sort_mid.max_tokens()
 
 
-# Set by the aiter MoE runner for layers that opted in (layer.aiter_k3_route_sort,
-# set by models/kimi_k3.py): only those take the K3 route/sort/quant kernels.
-_k3_route_sort: ContextVar[bool] = ContextVar("aiter_k3_route_sort", default=False)
+@dataclass
+class K3SortPlan:
+    """What the K3 route/sort/quant kernels need from the model for one aiter
+    ``fused_moe`` call. aiter runs the sort internally and forwards none of it,
+    so the model enters the plan with ``k3_sort_plan`` around its experts call;
+    an active plan also opts that call into the K3 kernels.
+
+    route_state: launch-A products of k3_route_sort_mid (top-k, counts, quant).
+    shared_gemm: (topk_ids, act, w_down, out) of the shared down GEMM to run in
+        the small-batch sort launch (k3_moe_epi.shared_gemm_sort_quant).
+    Both belong to the top-k tensor they were computed for, and the sort takes
+    them only for that tensor; ``finish`` resolves whatever was not taken.
+    """
+
+    route_state: RouteState | None = None
+    shared_gemm: tuple | None = None
+
+    def take_route_state(self, topk_ids, qx) -> RouteState | None:
+        st = self.route_state
+        if (
+            st is None
+            or st.consumed
+            or topk_ids.data_ptr() != st.topk_ids.data_ptr()
+            or topk_ids.shape != st.topk_ids.shape
+            or qx is None
+            or qx.data_ptr() != st.qx.data_ptr()
+            or qx.shape != st.qx.shape
+            or qx.stride() != st.qx.stride()
+        ):
+            return None
+        return st
+
+    def take_shared_gemm(self, topk_ids):
+        """(act, w_down, out) if the GEMM was planned for exactly this top-k."""
+        p = self.shared_gemm
+        if (
+            p is not None
+            and p[0].data_ptr() == topk_ids.data_ptr()
+            and p[0].shape == topk_ids.shape
+        ):
+            self.shared_gemm = None
+            return p[1:]
+        return None
+
+    def finish(self) -> None:
+        st = self.route_state
+        if st is not None and not st.consumed:
+            # launch A ran but its sort launch B never did
+            st.counts.zero_()
+        if self.shared_gemm is not None:
+            from sglang.kernels.ops.moe import k3_moe_epi
+
+            _, act, w_down, out = self.shared_gemm
+            self.shared_gemm = None
+            _warn_shared_gemm_untaken(act.shape[0])
+            k3_moe_epi.shared_gemm_preact(act, w_down, out)
+
+
+@functools.cache
+def _warn_shared_gemm_untaken(m: int) -> None:
+    logger.warning(
+        "The MoE sort did not take the shared GEMM (M=%d); running it "
+        "standalone (correct, no launch saved)",
+        m,
+    )
+
+
+_k3_sort_plan: ContextVar[K3SortPlan | None] = ContextVar(
+    "aiter_k3_sort_plan", default=None
+)
 
 
 @contextlib.contextmanager
-def k3_route_sort(enabled: bool):
-    token = _k3_route_sort.set(enabled)
+def k3_sort_plan(plan: K3SortPlan | None = None):
+    """Run the enclosed aiter fused_moe calls with the K3 sort kernels and
+    ``plan``'s inputs; resolves the untaken parts of the plan on exit."""
+    plan = K3SortPlan() if plan is None else plan
+    token = _k3_sort_plan.set(plan)
     try:
-        yield
+        yield plan
     finally:
-        _k3_route_sort.reset(token)
+        _k3_sort_plan.reset(token)
+        plan.finish()
 
 
 # aiter calls _moe_sorting_impl from inside fused_moe without passing hidden_states through
@@ -590,7 +667,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs
     ):
         quant_type = kwargs.get("quant_type", fm.QuantType.No)
-        k3 = _k3_route_sort.get()
+        k3 = _k3_sort_plan.get() is not None
         emit = (
             quant_type == fm.QuantType.per_1x32
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
@@ -638,7 +715,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         **orig_kwargs,
     ):
         # a caller-owned moe_buf (output=) is zeroed by the sort kernel like ours
-        k3 = _k3_route_sort.get()
+        k3 = _k3_sort_plan.get() is not None
         output = orig_kwargs.get("output")
         own_output = output is None or (k3 and accumulate)
         if (
@@ -760,7 +837,11 @@ def apply_aiter_small_moe_sort_patch() -> None:
         if pre is not None and pre[0].shape == input.shape:
             _emitted_quant.set(None)
             return pre
-        if _k3_route_sort.get() and input.dim() == 2 and not input.is_contiguous():
+        if (
+            _k3_sort_plan.get() is not None
+            and input.dim() == 2
+            and not input.is_contiguous()
+        ):
             # fused_moe_wrapper skips the densify when it expects the fused sort+quant
             input = input.contiguous()
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)

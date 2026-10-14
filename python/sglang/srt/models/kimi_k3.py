@@ -12,6 +12,7 @@ import os
 import re
 from array import array
 from collections.abc import Iterable
+from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -20,6 +21,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.moe.moe_sorting_small import K3SortPlan, k3_sort_plan
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -543,9 +545,7 @@ class KimiK3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
         if _is_hip:
-            # K3's fused AITER route/sort/quant kernels (moe_sorting_small) and
-            # tuned AITER decode MoE configs apply to this model's experts only.
-            self.experts.aiter_k3_route_sort = True
+            # Tuned AITER decode MoE configs for this model's expert shape.
             from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
 
             apply_k3_moe_decode_cfg()
@@ -1347,11 +1347,9 @@ class KimiK3MoE(nn.Module):
         try:
             mid = self._rocm_route_mid(router_logits, routed_input)
             if mid is not None:
-                from sglang.kernels.ops.moe import k3_route_sort_mid
-
                 topk_output, mid_state = mid
                 with (
-                    k3_route_sort_mid.pending(mid_state),
+                    k3_sort_plan(K3SortPlan(route_state=mid_state)),
                     zero_copy_context.set_moe_output(latent),
                 ):
                     expert_output = self.experts(routed_input, topk_output)
@@ -1678,7 +1676,7 @@ class KimiK3MoE(nn.Module):
         mxfp8 quant) for 16 < M <= 128;
         returns (topk_output, state) or None. The patched
         aiter sort consumes the state (launch B) inside self.experts; run the
-        experts under k3_route_sort_mid.pending(state)."""
+        experts under k3_sort_plan(K3SortPlan(route_state=state))."""
         if not self._rocm_route_mid_ok:
             return None
         from sglang.kernels.ops.moe import k3_route_sort_mid
@@ -1750,8 +1748,7 @@ class KimiK3MoE(nn.Module):
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
-        mid = None
-        shared_sort_fuse = False
+        sort_plan = K3SortPlan()
         # pre-activated variant beats the situ + GEMM + top-k fallback up
         # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
         if num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS:
@@ -1770,8 +1767,7 @@ class KimiK3MoE(nn.Module):
             # [SiTU | top-k] here; the shared
             # down GEMM rides the experts' sort + quant launch (the runner's
             # small-sort path: M * top_k <= 256), see k3_moe_epi
-            shared_sort_fuse = num_tokens * cfg.top_k <= 256 and w_down.is_contiguous()
-            if shared_sort_fuse:
+            if num_tokens * cfg.top_k <= 256 and w_down.is_contiguous():
                 shared_act = torch.empty(
                     (num_tokens, w_down.shape[1]),
                     dtype=w_down.dtype,
@@ -1789,9 +1785,7 @@ class KimiK3MoE(nn.Module):
                     renormalize=cfg.renormalize,
                     routed_scale=1.0,
                 )
-                k3_moe_epi.offer_shared_gemm(
-                    topk_ids, shared_act, w_down, shared_output
-                )
+                sort_plan.shared_gemm = (topk_ids, shared_act, w_down, shared_output)
             else:
                 k3_moe_epi.shared_down_topk(
                     gate_up,
@@ -1813,23 +1807,12 @@ class KimiK3MoE(nn.Module):
             self._forward_shared(gate_up, shared_output)
             mid = self._rocm_route_mid(router_logits, routed_input)
             if mid is not None:
-                topk_output, mid_state = mid
+                topk_output, sort_plan.route_state = mid
             else:
                 topk_output = self.topk(hidden_states, router_logits)
-        if mid is not None:
-            from sglang.kernels.ops.moe import k3_route_sort_mid
-
-            with (
-                k3_route_sort_mid.pending(mid_state),
-                zero_copy_context.set_moe_output(latent),
-            ):
-                expert_output = self.experts(routed_input, topk_output)
-        else:
-            with zero_copy_context.set_moe_output(latent):
-                expert_output = self.experts(routed_input, topk_output)
-        if shared_sort_fuse:
-            # no-op when the sort took it; else run the shared GEMM standalone
-            k3_moe_epi.flush_shared_gemm()
+        # the plan runs an untaken shared GEMM on exit, before the all-reduce
+        with k3_sort_plan(sort_plan), zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(routed_input, topk_output)
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
         buf = tensor_model_parallel_all_reduce(buf)
@@ -1935,10 +1918,13 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        # K3's route/sort/quant kernels inside the AITER MoE runner (no-op
+        # elsewhere); paths with model-side inputs enter their own plan.
+        with k3_sort_plan() if _is_hip else nullcontext():
+            if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         return out.view(num_tokens, hidden_size)
 
 

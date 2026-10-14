@@ -362,9 +362,9 @@ def norm_add3(
 # so every output is bit-identical; one launch fewer per MoE layer.
 #
 # The sort runs inside the aiter MoE runner (moe_sorting_small._run_small_sort),
-# so the model offers the pending shared GEMM through a one-slot handoff keyed
-# on the top-k ids tensor; the runner's sort call takes it and launches the
-# combined kernel. flush_shared_gemm() runs an untaken GEMM standalone.
+# so the model plans the shared GEMM for its top-k ids tensor
+# (moe_sorting_small.K3SortPlan.shared_gemm); the runner's sort call takes it and
+# launches the combined kernel, and the plan runs an untaken GEMM standalone.
 # --------------------------------------------------------------------------
 
 
@@ -650,52 +650,6 @@ def situ_topk(
         RENORM=renormalize,
         num_warps=4,
     )
-
-
-# one-slot handoff of the pending shared down GEMM to the runner's sort call
-_pending_shared = None
-_flush_warned = False
-
-
-def offer_shared_gemm(
-    topk_ids: torch.Tensor, act: torch.Tensor, w_down: torch.Tensor, out: torch.Tensor
-) -> None:
-    global _pending_shared
-    assert _pending_shared is None, "unflushed pending shared GEMM"
-    _pending_shared = (topk_ids, act, w_down, out)
-
-
-def take_shared_gemm(topk_ids: torch.Tensor):
-    """The pending (act, w_down, out) if it was offered for exactly this
-    top-k tensor (the slot keeps it alive: same pointer == same tensor)."""
-    global _pending_shared
-    p = _pending_shared
-    if (
-        p is not None
-        and p[0].data_ptr() == topk_ids.data_ptr()
-        and p[0].shape == topk_ids.shape
-    ):
-        _pending_shared = None
-        return p[1:]
-    return None
-
-
-def flush_shared_gemm() -> None:
-    """Run an offered GEMM that no sort call took (standalone, same tiling)."""
-    global _pending_shared, _flush_warned
-    p, _pending_shared = _pending_shared, None
-    if p is not None:
-        if not _flush_warned:
-            _flush_warned = True
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "The MoE sort did not take the "
-                "shared GEMM (M=%d); running it standalone (correct, no launch saved)",
-                p[1].shape[0],
-            )
-        _, act, w_down, out = p
-        shared_gemm_preact(act, w_down, out)
 
 
 def shared_gemm_preact(act, w_down, out) -> None:

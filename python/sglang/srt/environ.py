@@ -1501,6 +1501,7 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(0)
 
     # ===================================================================
     # CUDA graphs and execution buffers

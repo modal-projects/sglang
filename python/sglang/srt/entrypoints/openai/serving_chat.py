@@ -1034,18 +1034,6 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tool_call_parser
         )
 
-    def _validate_kimi_k3_sampling_params(
-        self, request: ChatCompletionRequest
-    ) -> Optional[str]:
-        """Validate the K3 sampling envelope used by target-only verification."""
-        return self._validate_kimi_k3_sampling_envelope(
-            temperature=request.temperature,
-            top_p=request.top_p,
-            presence_penalty=request.presence_penalty,
-            frequency_penalty=request.frequency_penalty,
-            n=request.n,
-        )
-
     def _validate_kimi_k3_sampling_envelope(
         self,
         temperature: Optional[float],
@@ -1132,7 +1120,13 @@ class OpenAIServingChat(OpenAIServingBase):
             validation_error = self._validate_kimi_k3_reasoning_effort(request)
             if validation_error:
                 return validation_error
-            validation_error = self._validate_kimi_k3_sampling_params(request)
+            validation_error = self._validate_kimi_k3_sampling_envelope(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                n=request.n,
+            )
             if validation_error:
                 return validation_error
 

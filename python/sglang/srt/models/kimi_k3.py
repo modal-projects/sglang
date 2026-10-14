@@ -93,6 +93,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -305,8 +306,7 @@ def _rocm_up_ag_fits(num_tokens: int, hidden_size: int) -> bool:
     )
 
 
-# k3_moe_epi.shared_down_topk beats situ + hipBLASLt + top-k only at small M (MI355X)
-_K3_EPI_SHARED_TOPK_MAX_TOKENS = 16
+# fused SiTU + shared down GEMM + top-k beats situ + hipBLASLt + top-k up to this M (MI355X)
 _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS = 64
 
 
@@ -1579,8 +1579,7 @@ class KimiK3MoE(nn.Module):
         if not (isinstance(act, SituAndMul) and _plain_bf16(down_w)):
             return False
         if not (
-            _plain_bf16(up_w)
-            and type(up.quant_method).__name__ == "UnquantizedLinearMethod"
+            _plain_bf16(up_w) and isinstance(up.quant_method, UnquantizedLinearMethod)
         ):
             return False
         if up_w.shape != (down_w.shape[0], self.moe_hidden_size):
@@ -1753,11 +1752,9 @@ class KimiK3MoE(nn.Module):
 
         mid = None
         shared_sort_fuse = False
-        if num_tokens <= _K3_EPI_SHARED_TOPK_MAX_TOKENS or (
-            # pre-activated variant beats the situ + GEMM + top-k fallback up
-            # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
-            num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS
-        ):
+        # pre-activated variant beats the situ + GEMM + top-k fallback up
+        # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
+        if num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS:
             # SiTU + shared down GEMM + router top-k in one launch
             cfg = self.topk.topk_config
             topk_ids = torch.empty(

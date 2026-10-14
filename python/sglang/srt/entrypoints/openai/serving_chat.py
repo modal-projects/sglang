@@ -222,7 +222,6 @@ KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 # Moonshot fixes top_p at 0.95 and temperature at 1.0 for K3 (prod parity).
 KIMI_K3_DEFAULT_TOP_P = 0.95
 KIMI_K3_DEFAULT_TEMPERATURE = 1.0
-KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -1034,66 +1033,6 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tool_call_parser
         )
 
-    def _validate_kimi_k3_sampling_envelope(
-        self,
-        temperature: Optional[float],
-        top_p: Optional[float],
-        presence_penalty: float,
-        frequency_penalty: float,
-        n: int,
-    ) -> Optional[str]:
-        """Validate the K3 sampling envelope for either OpenAI surface."""
-        if temperature is not None and not (0.0 <= temperature <= 1.0):
-            return "Kimi K3 temperature must be within [0.0, 1.0]."
-        if top_p is not None and not (0.95 <= top_p <= 1.0):
-            return "Kimi K3 top_p must be within [0.95, 1.0]."
-        if presence_penalty != 0:
-            return "Kimi K3 presence_penalty must be 0."
-        if frequency_penalty != 0:
-            return "Kimi K3 frequency_penalty must be 0."
-        if n != 1:
-            return "Kimi K3 n must be 1."
-        return None
-
-    def _validate_kimi_k3_reasoning_effort(
-        self, request: ChatCompletionRequest
-    ) -> Optional[str]:
-        """Reject effort tiers K3 cannot honor instead of silently dropping them.
-
-        Omitting the field stays valid; Moonshot documents it as optional and
-        defaulting to "max".
-        """
-        template_kwargs = request.chat_template_kwargs or {}
-        supported = ", ".join(repr(tier) for tier in KIMI_K3_THINKING_EFFORTS)
-
-        # normalize_reasoning_inputs funnels every disable spelling into these
-        # keys, including thinking={"type":"disabled"} and reasoning_effort="none".
-        if False in (
-            template_kwargs.get("thinking"),
-            template_kwargs.get("enable_thinking"),
-        ):
-            return (
-                "Kimi K3 always reasons and cannot disable thinking. Omit the "
-                f"thinking controls, or pass a reasoning_effort of {supported}."
-            )
-
-        # chat_template_kwargs.reasoning_effort is promoted onto the request
-        # later, in _convert_to_internal_request.
-        candidates = (
-            ("reasoning_effort", template_kwargs.get("reasoning_effort")),
-            ("reasoning_effort", request.reasoning_effort),
-            ("thinking_effort", template_kwargs.get("thinking_effort")),
-        )
-        for field, value in candidates:
-            if value is None:
-                continue
-            if value not in KIMI_K3_THINKING_EFFORTS:
-                return (
-                    f"Kimi K3 does not support {field}={value!r}; "
-                    f"supported values are {supported}."
-                )
-        return None
-
     def _apply_kimi_k3_sampling_defaults(
         self,
         sampling_params: Dict[str, Any],
@@ -1115,20 +1054,6 @@ class OpenAIServingChat(OpenAIServingBase):
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
-
-        if self.chat_encoding_spec == "kimi_k3":
-            validation_error = self._validate_kimi_k3_reasoning_effort(request)
-            if validation_error:
-                return validation_error
-            validation_error = self._validate_kimi_k3_sampling_envelope(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                n=request.n,
-            )
-            if validation_error:
-                return validation_error
 
         if (
             request.chat_template_kwargs
@@ -1457,11 +1382,6 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
-            # Server defaults land after _validate_request, so re-check them.
-            if self.chat_encoding_spec == "kimi_k3":
-                validation_error = self._validate_kimi_k3_reasoning_effort(request)
-                if validation_error:
-                    raise ValueError(validation_error)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config

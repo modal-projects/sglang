@@ -2852,9 +2852,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = alt
 
     def _rocm_absorb_q_cache_target(self, forward_batch, num_rows):
-        return kimi_k3_mla_rocm.absorb_q_cache_target(
-            self, forward_batch, num_rows
-        )
+        return kimi_k3_mla_rocm.absorb_q_cache_target(self, forward_batch, num_rows)
 
     def _rocm_absorb_q_cat_cache(self, q_nope, q_pe, k_nope, k_pe, forward_batch):
         return kimi_k3_mla_rocm.absorb_q_cat_cache(

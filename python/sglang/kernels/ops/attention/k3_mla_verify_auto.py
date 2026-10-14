@@ -97,7 +97,7 @@ def _k3_auto_reduce(
     o_off = (b * QLEN + qpos).to(tl.int64) * stride_o_tok + h * stride_o_h
     use_v2 = tl.load(FLAG)
     if use_v2 != 0:
-        # == _k3_mla_verify_reduce (base-2 LSE merge of the v2/v3 splits)
+        # base-2 LSE merge of the v2/v3 splits
         L = tl.load(KV_INDPTR + b + 1) - tl.load(KV_INDPTR + b)
         chunk = _split_chunk(L, NSPLIT, BLOCK_N, MIN_CHUNK)
         nact = tl.minimum(tl.cdiv(L, chunk), NSPLIT)

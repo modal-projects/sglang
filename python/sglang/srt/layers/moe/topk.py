@@ -1095,7 +1095,28 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        if _use_aiter and correction_bias is not None:
+        if (
+            _use_aiter
+            and correction_bias is not None
+            and num_fused_shared_experts == 0
+            and envs.SGLANG_ROCM_TRITON_ROUTE.get()
+        ):
+            from sglang.kernels.ops.moe.k3_route_sort import biased_topk_sigmoid
+
+            biased_topk_sigmoid(
+                gating_output,
+                correction_bias,
+                topk_weights,
+                topk_ids,
+                renormalize,
+                (
+                    routed_scaling_factor
+                    if apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor is not None
+                    else 1.0
+                ),
+            )
+        elif _use_aiter and correction_bias is not None:
             aiter_biased_grouped_topk(
                 gating_output,
                 correction_bias.to(dtype=gating_output.dtype),

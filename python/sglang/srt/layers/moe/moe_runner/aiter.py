@@ -247,6 +247,14 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     return bound
 
 
+@functools.cache
+def _is_k3_zero_copy_ok() -> bool:
+    """aiter.fused_moe takes a caller-owned destination (output=)."""
+    from aiter.fused_moe import fused_moe
+
+    return "output" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -255,6 +263,9 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         apply_aiter_small_moe_sort_patch()
+        from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
+
+        apply_k3_moe_decode_cfg()
 
     def run(
         self,
@@ -369,6 +380,21 @@ class AiterRunnerCore(MoeRunnerCore):
         activation = extra.pop("activation", None) if is_gfx95 else None
         if activation is None:
             activation = _aiter_activation(self.config)
+
+        if (
+            _is_k3_zero_copy_ok()
+            and not extra.get("no_combine")
+            and runner_input.num_local_tokens is None
+        ):
+            from sglang.srt.layers import zero_copy_context
+
+            dst = zero_copy_context.get_moe_output_spec(
+                (runner_input.hidden_states.shape[0], quant_info.w2_weight.shape[1]),
+                runner_input.output_dtype or runner_input.hidden_states.dtype,
+                runner_input.hidden_states.device,
+            )
+            if dst is not None:
+                extra["output"] = dst
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,

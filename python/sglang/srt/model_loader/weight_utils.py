@@ -365,7 +365,17 @@ def get_quant_config(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,
             )
-        return quant_cls()
+        from sglang.srt.environ import envs
+
+        quant_config = quant_cls()
+        if (
+            model_config.quantization == "fp8"
+            and model_config.is_draft_model
+            and envs.SGLANG_DRAFT_FP8_ACTIVATION_SCHEME.get() == "static"
+        ):
+            # online FP8 draft: fixed 1.0 activation scale per linear
+            quant_config.online_static_input = True
+        return quant_config
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
 

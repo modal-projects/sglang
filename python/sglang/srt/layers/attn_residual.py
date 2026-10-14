@@ -338,7 +338,7 @@ def _aggregate_hip(
     kernel instead (attn_res_smallm_hip), which can also emit the pre-norm
     mixture into stream_out (only valid on that path; see use_hip_smallm)."""
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
-    from sglang.srt.layers import k3_rocm_dense_fp8
+    from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
@@ -592,7 +592,7 @@ class AttnResidual:
             )
 
     def _fused_outputs(self, like: torch.Tensor):
-        from sglang.srt.layers import k3_rocm_dense_fp8
+        from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
         out_fp8 = (
             torch.empty(like.shape, dtype=torch.float8_e4m3fn, device=like.device)
@@ -639,7 +639,7 @@ class AttnResidual:
             out_fp8=out_fp8,
         )
         if out_fp8 is not None:
-            from sglang.srt.layers import k3_rocm_dense_fp8
+            from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
             k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
         return out, prefix
@@ -725,7 +725,7 @@ class AttnResidual:
             ):
                 self.flush_stream()
                 if s_fp8 is not None:
-                    from sglang.srt.layers import k3_rocm_dense_fp8
+                    from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
                     k3_rocm_dense_fp8.offer_prequantized(s_out, s_fp8)
                 if write:

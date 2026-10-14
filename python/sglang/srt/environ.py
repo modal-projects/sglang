@@ -341,6 +341,7 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    SGLANG_API_EARLY_REJECT_MAX_CONCURRENCY = EnvInt(0)
 
     # ===================================================================
     # Logging

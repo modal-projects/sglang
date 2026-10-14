@@ -244,8 +244,13 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self._use_draft_swa_splitkv = _is_hip and model_runner.is_draft_worker
-        self._use_draft_verify_meta_fuse = _is_hip and model_runner.is_draft_worker
+        # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
+        # SWA verify kernel + one-launch verify metadata.
+        self._use_dflash_draft_verify = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash()
+        )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
             _is_hip
@@ -595,7 +600,7 @@ class TritonAttnBackend(AttentionBackend):
         """Fill all cuda-graph buffers for target_verify mode."""
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
         if (
-            self._use_draft_verify_meta_fuse
+            self._use_dflash_draft_verify
             and (spec_info is None or spec_info.custom_mask is None)
             and not self.kv_index_translator.reads_are_translated
             and not isinstance(self.token_to_kv_pool, BaseSWAKVPool)
@@ -1807,7 +1812,7 @@ class TritonAttnBackend(AttentionBackend):
         # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
         # GQA-packed sliding-window kernel; reads the strided q/k/v directly.
         if (
-            self._use_draft_swa_splitkv
+            self._use_dflash_draft_verify
             and k is not None
             and v is not None
             and score_mod is None

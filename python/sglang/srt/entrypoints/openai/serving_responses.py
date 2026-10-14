@@ -476,6 +476,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    self._apply_kimi_k3_sampling_defaults(
+                        sampling_params, request.top_p, request.temperature
+                    )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,
@@ -667,6 +670,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        # Promote chat_template_kwargs.reasoning_effort (prod parity).
+        template_kwargs = dict(request.chat_template_kwargs or {})
+        effort = template_kwargs.pop("reasoning_effort", None)
+        if effort is None:
+            effort = request.reasoning.effort if request.reasoning else None
+        template_kwargs = template_kwargs or None
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -683,8 +692,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
-            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=effort,
+            chat_template_kwargs=template_kwargs,
         )
 
         media_error = self._validate_media_content(chat_request)

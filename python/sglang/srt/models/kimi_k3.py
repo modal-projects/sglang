@@ -542,6 +542,13 @@ class KimiK3MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        if _is_hip:
+            # K3's fused AITER route/sort/quant kernels (moe_sorting_small) and
+            # tuned AITER decode MoE configs apply to this model's experts only.
+            self.experts.aiter_k3_route_sort = True
+            from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
+
+            apply_k3_moe_decode_cfg()
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,

@@ -13,6 +13,7 @@ Output layouts match the aiter kernels bit-for-bit:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from contextvars import ContextVar
@@ -410,7 +411,7 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
-    if emit_mx:
+    if emit_mx and _k3_route_sort.get():
         from sglang.kernels.ops.moe import k3_route_sort
 
         if k3_route_sort.sort_quant_supported(m, topk, block_size, n_cols) and (
@@ -543,6 +544,20 @@ def _mid_max_tokens() -> int:
     return k3_route_sort_mid.max_tokens()
 
 
+# Set by the aiter MoE runner for layers that opted in (layer.aiter_k3_route_sort,
+# set by models/kimi_k3.py): only those take the K3 route/sort/quant kernels.
+_k3_route_sort: ContextVar[bool] = ContextVar("aiter_k3_route_sort", default=False)
+
+
+@contextlib.contextmanager
+def k3_route_sort(enabled: bool):
+    token = _k3_route_sort.set(enabled)
+    try:
+        yield
+    finally:
+        _k3_route_sort.reset(token)
+
+
 # aiter calls _moe_sorting_impl from inside fused_moe without passing hidden_states through
 _pending_quant_input: ContextVar[torch.Tensor | None] = ContextVar(
     "aiter_pending_quant_input", default=None
@@ -575,16 +590,23 @@ def apply_aiter_small_moe_sort_patch() -> None:
         hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs
     ):
         quant_type = kwargs.get("quant_type", fm.QuantType.No)
+        k3 = _k3_route_sort.get()
         emit = (
             quant_type == fm.QuantType.per_1x32
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
-            and hidden_states.dim() == 2
-            and hidden_states.stride(-1) == 1
-            and _mx_quant_chunk(hidden_states.shape[-1]) is not None
-            and (topk_ids.numel() <= 256 or topk_ids.shape[0] <= _mid_max_tokens())
+            and (
+                hidden_states.dim() == 2
+                and hidden_states.stride(-1) == 1
+                and _mx_quant_chunk(hidden_states.shape[-1]) is not None
+                and (topk_ids.numel() <= 256 or topk_ids.shape[0] <= _mid_max_tokens())
+                if k3
+                else hidden_states.is_contiguous()
+                and hidden_states.shape[-1] % 2048 == 0
+                and topk_ids.numel() <= 256
+            )
         )
-        if not emit and not hidden_states.is_contiguous():
+        if k3 and not emit and not hidden_states.is_contiguous():
             # Only the fused sort+quant reads strided rows; aiter's own path
             # wants a dense activation (callers may hand in a column slice).
             hidden_states = hidden_states.contiguous()
@@ -616,11 +638,14 @@ def apply_aiter_small_moe_sort_patch() -> None:
         **orig_kwargs,
     ):
         # a caller-owned moe_buf (output=) is zeroed by the sort kernel like ours
+        k3 = _k3_route_sort.get()
         output = orig_kwargs.get("output")
+        own_output = output is None or (k3 and accumulate)
         if (
-            not output_aux
+            k3
+            and not output_aux
             and not return_local_topk_ids
-            and (output is None or accumulate)
+            and own_output
             and _mid_sort_supported(
                 topk_ids,
                 int(block_size),
@@ -658,7 +683,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         if (
             not output_aux
             and not return_local_topk_ids
-            and (output is None or accumulate)
+            and own_output
             and _small_sort_supported(
                 topk_ids,
                 int(block_size),
@@ -735,7 +760,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         if pre is not None and pre[0].shape == input.shape:
             _emitted_quant.set(None)
             return pre
-        if input.dim() == 2 and not input.is_contiguous():
+        if _k3_route_sort.get() and input.dim() == 2 and not input.is_contiguous():
             # fused_moe_wrapper skips the densify when it expects the fused sort+quant
             input = input.contiguous()
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)

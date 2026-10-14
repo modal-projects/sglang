@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.k3_mla_prefix_nocat import _gather_dequant
+
 _TILE_Q = 256
 _FP8_MAX = 448.0
 # The ASM kernel addresses K/V with 32-bit byte offsets.
@@ -184,47 +186,12 @@ def cast_fp8(x: torch.Tensor, fp8_dtype) -> torch.Tensor:
     return y
 
 
-@triton.jit
-def _gather_latent_kernel(
-    CACHE,
-    IDX,
-    OUT,
-    N,
-    s_cache,
-    LORA: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """cache[idx[n], :LORA] (fp8, unit scale) -> bf16 out [N, LORA] (exact)."""
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    rm = rows < N
-    idx = tl.load(IDX + rows, mask=rm, other=0).to(tl.int64)
-    offs = tl.arange(0, LORA)[None, :]
-    x = tl.load(CACHE + idx[:, None] * s_cache + offs, mask=rm[:, None], other=0.0)
-    tl.store(
-        OUT + rows.to(tl.int64)[:, None] * LORA + offs,
-        x.to(OUT.dtype.element_ty),
-        mask=rm[:, None],
-    )
-
-
 def gather_latent(
     cache2d: torch.Tensor, kv_indices: torch.Tensor, lora: int, dtype
 ) -> torch.Tensor:
-    n = kv_indices.shape[0]
-    out = torch.empty((n, lora), dtype=dtype, device=cache2d.device)
-    if n:
-        block_n = 8
-        _gather_latent_kernel[(triton.cdiv(n, block_n),)](
-            cache2d,
-            kv_indices,
-            out,
-            n,
-            cache2d.stride(0),
-            LORA=lora,
-            BLOCK_N=block_n,
-            num_warps=4,
-        )
+    """cache[idx, :lora] (fp8, unit scale) -> bf16 [N, lora] (exact)."""
+    out = torch.empty((kv_indices.shape[0], lora), dtype=dtype, device=cache2d.device)
+    _gather_dequant(cache2d, kv_indices, out, None, lora, cache2d.shape[1] - lora)
     return out
 
 

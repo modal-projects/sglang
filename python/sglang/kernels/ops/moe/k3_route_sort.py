@@ -19,8 +19,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["M", "stride_qx"])
-def _k3_sort_quant_kernel(
+@triton.jit
+def _sort_quant_program(
+    pid,
     topk_ids_ptr,  # [M, TOPK] i32
     topk_weights_ptr,  # [M, TOPK] fp32
     sorted_ids_ptr,
@@ -47,7 +48,6 @@ def _k3_sort_quant_kernel(
     # e8m0 scales to the token's TOPK sorted rows; the c == 0 CTA also writes
     # the token's sorted entries and, for each expert the token is first to
     # pick, that block's expert id and tail padding. Every byte has one writer.
-    pid = tl.program_id(0)
     CHUNKS: tl.constexpr = N_COLS // QCHUNK
     t = pid // CHUNKS
     c0 = (pid % CHUNKS) * QCHUNK
@@ -124,6 +124,52 @@ def _k3_sort_quant_kernel(
     tl.store(
         qscale_ptr + sw,
         tl.broadcast_to(exp[None, :], (TOPK, QCHUNK // 32)).to(tl.uint8),
+    )
+
+
+@triton.jit(do_not_specialize=["M", "stride_qx"])
+def _k3_sort_quant_kernel(
+    topk_ids_ptr,  # [M, TOPK] i32
+    topk_weights_ptr,  # [M, TOPK] fp32
+    sorted_ids_ptr,
+    sorted_weights_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    moe_buf_ptr,  # [M, N_COLS] zeroed here
+    qx_ptr,  # [M, N_COLS] routed activations, row stride stride_qx
+    stride_qx,
+    qout_ptr,  # [M, N_COLS] fp8 out
+    qscale_ptr,  # swizzled e8m0, one per (sorted_row, group)
+    M,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    P_POW2: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
+    MOE_BUF_ZERO: tl.constexpr,
+):
+    _sort_quant_program(
+        tl.program_id(0),
+        topk_ids_ptr,
+        topk_weights_ptr,
+        sorted_ids_ptr,
+        sorted_weights_ptr,
+        sorted_expert_ids_ptr,
+        num_valid_ids_ptr,
+        moe_buf_ptr,
+        qx_ptr,
+        stride_qx,
+        qout_ptr,
+        qscale_ptr,
+        M,
+        TOPK,
+        BLOCK_SIZE,
+        P_POW2,
+        N_COLS,
+        QCHUNK,
+        SCALEN_PAD,
+        MOE_BUF_ZERO,
     )
 
 

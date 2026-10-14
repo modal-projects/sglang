@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai import kimi_k3_api_parity
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -306,9 +307,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "background=true requires store=true.", param="store"
             )
 
-        model_error = self._validate_model(request.model)
-        if model_error is not None:
-            return model_error
+        # Modal's K3 endpoint serves any model name.
+        if self.chat_encoding_spec != "kimi_k3":
+            model_error = self._validate_model(request.model)
+            if model_error is not None:
+                return model_error
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
@@ -476,6 +479,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if self.chat_encoding_spec == "kimi_k3":
+                        kimi_k3_api_parity.apply_sampling_defaults(
+                            sampling_params,
+                            self.default_sampling_params,
+                            request.top_p,
+                            request.temperature,
+                        )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,
@@ -692,6 +702,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=effort,
             chat_template_kwargs=template_kwargs,
         )
+
+        # /v1/responses does not run handle_request, so the chat-side K3
+        # validation only fires if invoked here.
+        if self.chat_encoding_spec == "kimi_k3":
+            validation_error = kimi_k3_api_parity.validate_reasoning_effort(
+                chat_request
+            ) or kimi_k3_api_parity.validate_sampling_envelope(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                n=1,
+            )
+            if validation_error:
+                raise ValueError(validation_error)
 
         media_error = self._validate_media_content(chat_request)
         if media_error:

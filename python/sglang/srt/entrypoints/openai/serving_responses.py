@@ -479,9 +479,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
-                    self._apply_kimi_k3_sampling_defaults(
-                        sampling_params, request.top_p, request.temperature
-                    )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,

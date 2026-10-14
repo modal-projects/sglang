@@ -122,11 +122,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from sglang.srt.models import kimi_k3_mla_rocm
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
-from sglang.srt.models import kimi_k3_mla_rocm
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -1592,17 +1592,22 @@ class KimiK3MoE(nn.Module):
             return False
         if self._front_sizes[0] != 2 * down_w.shape[1]:
             return False
-        # the kernel emits (weights, ids) itself: same contract as the aiter
-        # STANDARD top-k path (sigmoid + bias, one group, renormalized weights)
-        cfg = self.topk.topk_config
+        # the kernel emits (weights, ids) itself
         backend = get_moe_runner_backend()
+        return (
+            self._aiter_standard_topk_ok()
+            and self._front_sizes[1] < 0xFFFF
+            and not backend.is_triton_kernels()
+            and not backend.is_flashinfer_trtllm()
+            and not backend.is_flashinfer_mxfp4()
+        )
+
+    def _aiter_standard_topk_ok(self) -> bool:
+        """The routing contract the aiter STANDARD top-k path implements and the
+        fused K3 routing kernels reproduce: sigmoid + bias, one group,
+        renormalized weights, scale 1, power-of-two top-k."""
+        cfg = self.topk.topk_config
         if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
-            return False
-        if (
-            backend.is_triton_kernels()
-            or backend.is_flashinfer_trtllm()
-            or backend.is_flashinfer_mxfp4()
-        ):
             return False
         if cfg.scoring_func != "sigmoid" or cfg.correction_bias is None:
             return False
@@ -1614,7 +1619,7 @@ class KimiK3MoE(nn.Module):
             return False
         if cfg.routed_scaling_factor not in (None, 1.0):
             return False
-        if cfg.top_k & (cfg.top_k - 1) or self._front_sizes[1] >= 0xFFFF:
+        if cfg.top_k & (cfg.top_k - 1):
             return False
         if (
             envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
@@ -1642,35 +1647,13 @@ class KimiK3MoE(nn.Module):
     @cached_property
     def _rocm_route_mid_ok(self) -> bool:
         """Static eligibility for the 2-launch top-k + sort + quant routing glue
-        (kernels/ops/moe/k3_route_sort_mid.py):
-        the same routing contract the aiter STANDARD top-k path implements
-        (sigmoid + bias, one group, renormalized weights, scale 1)."""
-        if not _is_hip:
-            return False
-        if not get_moe_runner_backend().is_aiter():
-            return False
-        cfg = self.topk.topk_config
-        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
-            return False
-        if cfg.scoring_func != "sigmoid" or cfg.correction_bias is None:
-            return False
-        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
-            return False
-        if cfg.num_fused_shared_experts != 0 or cfg.custom_routing_function is not None:
-            return False
-        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
-            return False
-        if cfg.routed_scaling_factor not in (None, 1.0):
-            return False
-        if cfg.top_k & (cfg.top_k - 1) or cfg.top_k > 64:
-            return False
-        if (
-            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-            or get_exec().deterministic.enable_deterministic_inference
-        ):
-            return False
-        return True
+        (kernels/ops/moe/k3_route_sort_mid.py)."""
+        return (
+            _is_hip
+            and get_moe_runner_backend().is_aiter()
+            and self.topk.topk_config.top_k <= 64
+            and self._aiter_standard_topk_ok()
+        )
 
     def _rocm_route_mid(self, router_logits, routed_input):
         """Launch A of k3_route_sort_mid (aiter-exact top-k + expert counts +

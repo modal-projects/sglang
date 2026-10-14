@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -267,8 +268,12 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        online_static_input: bool = False,
     ) -> None:
         super().__init__()
+        # Online (non-serialized) FP8 with a fixed unit activation scale per
+        # linear instead of dynamic activation quantization.
+        self.online_static_input = online_static_input
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
@@ -482,6 +487,17 @@ class Fp8Config(QuantizationConfig):
 
 # Token cap for the ROCm pre-shuffled static-FP8 path (decode / verify sizes).
 _ROCM_BPRE_MAX_TOKENS = 1024
+
+
+@dataclass(frozen=True)
+class _RocmBpreshuffleFp8:
+    """Static per-tensor FP8 weight pre-shuffled for aiter.gemm_a8w8_bpreshuffle,
+    with both scalar scales folded into the per-column ``w_scale`` and a unit
+    per-row ``x_scale`` for up to _ROCM_BPRE_MAX_TOKENS rows."""
+
+    weight: torch.Tensor
+    w_scale: torch.Tensor
+    x_scale: torch.Tensor
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -1122,20 +1138,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     # 1.1-1.6x faster than torch._scaled_mm/hipBLASLt at decode
                     # sizes. Both scalar scales fold into the per-column w_scale.
                     n_out = qweight.shape[0]
-                    layer._rocm_bpre_w = shuffle_weight(qweight.contiguous(), (16, 16))
-                    layer._rocm_bpre_w_scale = (
-                        (
+                    layer.rocm_bpreshuffle_fp8 = _RocmBpreshuffleFp8(
+                        weight=shuffle_weight(qweight.contiguous(), (16, 16)),
+                        w_scale=(
                             weight_scale.float().reshape(1, 1)
                             * layer.input_scale.float().reshape(1, 1)
                         )
                         .expand(1, n_out)
-                        .contiguous()
-                    )
-                    layer._rocm_bpre_x_scale = torch.ones(
-                        _ROCM_BPRE_MAX_TOKENS,
-                        1,
-                        device=qweight.device,
-                        dtype=torch.float32,
+                        .contiguous(),
+                        x_scale=torch.ones(
+                            _ROCM_BPRE_MAX_TOKENS,
+                            1,
+                            device=qweight.device,
+                            dtype=torch.float32,
+                        ),
                     )
 
             # If checkpoint is fp8, handle that there are N scales for N
@@ -1377,9 +1393,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             return output.view(*x.shape[:-1], layer.weight.shape[0])
 
-        bpre_w = getattr(layer, "_rocm_bpre_w", None)
+        bpre = getattr(layer, "rocm_bpreshuffle_fp8", None)
         if (
-            bpre_w is not None
+            bpre is not None
             and bias is None
             and not isinstance(x, tuple)
             and x.dtype in (torch.bfloat16, torch.float16)
@@ -1391,12 +1407,12 @@ class Fp8LinearMethod(LinearMethodBase):
             qx, _ = static_quant_fp8(x2.contiguous(), layer.input_scale)
             y = gemm_a8w8_bpreshuffle(
                 qx,
-                bpre_w,
-                layer._rocm_bpre_x_scale[: x2.shape[0]],
-                layer._rocm_bpre_w_scale,
+                bpre.weight,
+                bpre.x_scale[: x2.shape[0]],
+                bpre.w_scale,
                 dtype=x.dtype,
             )
-            return y.view(*x.shape[:-1], bpre_w.shape[0])
+            return y.view(*x.shape[:-1], bpre.weight.shape[0])
 
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:

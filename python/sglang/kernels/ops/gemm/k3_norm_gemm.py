@@ -5,7 +5,7 @@ kernel: jit/csrc/kimi_k3/norm_gemm_hip.cuh.
 
 ``kda_onorm_oproj_hip``
     y[M, N] = o @ w_o^T,  o = bf16(((x * rstd) * norm_w) * sigmoid(gate)) per
-    (token, head of 128) -- _kda_onorm_gated_strided_kernel + the o_proj GEMM
+    (token, head of 128) -- the gated RMSNorm (layer_norm_gated_fwd_kernel) + the o_proj GEMM
     in one launch. The operand o is bit-identical to the unfused kernel's.
 
 Outputs differ from the unfused pair only by GEMM summation order (<= 1 bf16

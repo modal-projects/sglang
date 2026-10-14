@@ -306,7 +306,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "background=true requires store=true.", param="store"
             )
 
-        model_error = self._validate_model(request.model)
+        model_error = None  # K3 B300 parity: serve any model name
         if model_error is not None:
             return model_error
 
@@ -487,6 +487,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if processed_messages
                             else None
                         ),
+                    )
+                    self._apply_kimi_k3_sampling_defaults(
+                        sampling_params, request.top_p, request.temperature
                     )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
@@ -679,6 +682,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        # Promote chat_template_kwargs.reasoning_effort (prod parity).
+        template_kwargs = dict(request.chat_template_kwargs or {})
+        effort = template_kwargs.pop("reasoning_effort", None)
+        if effort is None:
+            effort = request.reasoning.effort if request.reasoning else None
+        template_kwargs = template_kwargs or None
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -695,9 +704,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
-            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=effort,
+            chat_template_kwargs=template_kwargs,
         )
+
+        # /v1/responses does not run handle_request, so the chat-side K3
+        # validation only fires if invoked here (prod parity).
+        if self.chat_encoding_spec == "kimi_k3":
+            validation_error = self._validate_kimi_k3_reasoning_effort(
+                chat_request
+            ) or self._validate_kimi_k3_sampling_envelope(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                n=1,
+            )
+            if validation_error:
+                raise ValueError(validation_error)
 
         media_error = self._validate_media_content(chat_request)
         if media_error:

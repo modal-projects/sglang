@@ -479,6 +479,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if self.chat_encoding_spec == "kimi_k3":
+                        kimi_k3_api_parity.apply_sampling_defaults(
+                            sampling_params,
+                            self.default_sampling_params,
+                            request.top_p,
+                            request.temperature,
+                        )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,

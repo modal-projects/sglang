@@ -71,7 +71,11 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+from sglang.kernels.ops.attention import k3_mla_prefill_fp8
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.k3_mla_prefix_nocat import (
+    k3_mla_prefix_kv,
+)
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -166,8 +170,15 @@ class ForwardMetadata:
     asm_ctx_cu_k: Optional[torch.Tensor] = None
     # (page_indptr, page_ids, last_page_len); None means use the token-level table
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    # K3 FP8 MLA prefill (k3_mla_prefill_fp8.K3Fp8PrefillPlan)
+    k3_fp8_prefill_plan: Optional[object] = None
 
 
+# MLA target_verify split-4: a request with KV length L and 8 query rows becomes
+# two causal pseudo-requests of 4 rows, (rows 0..3, KV L-4) and (rows 4..7, KV L).
+# The kernel's causal mask is anchored at the end of the KV, so row j of the
+# original request sees KV[0 : L - 8 + j + 1] either way. The persistent ASM
+# kernel has FP8-Q/FP8-KV qh16 instantiations for qseqlen 4 but none for 8.
 def _build_paged_kv_view(
     kv_indices: torch.Tensor, seq_lens_cpu: torch.Tensor, page_size: int
 ):
@@ -493,6 +504,16 @@ class AiterAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
+        # Extend-with-prefix MHA builds the
+        # prefix K/V without torch.cat (kernels/ops/attention/k3_mla_prefix_nocat.py).
+        self.k3_mla_prefix_nocat = self.use_mla
+        # FP8 PS-ASM MHA for the d192/v128
+        # extend (kernels/ops/attention/k3_mla_prefill_fp8.py).
+        self.k3_mla_prefill_fmha = (
+            self.use_mla and self.num_head % 4 == 0 and is_gfx95_supported()
+        )
+        self.use_k3_mla_verify = False
+
         if self.use_mla:
             _mla_low_head_repeat = (4, 8)
             _mla_low_head_zero_pad = (12,)
@@ -587,6 +608,21 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+            self.use_k3_mla_verify = (
+                is_gfx95_supported()
+                and self.dcp_world_size <= 1
+                and self.kv_cache_dtype == fp8_dtype
+                and self.num_draft_tokens == 8
+                and getattr(self, "num_head", None) == 12
+                and prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+            )
+            if self.use_k3_mla_verify:
+                logger.info("aiter MLA target_verify: K3 Gluon/HipKittens kernels")
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -1158,6 +1194,30 @@ class AiterAttnBackend(AttentionBackend):
             )
         return self._kv_indices_scratch[:required_tokens]
 
+    def _forward_k3_mla_verify(
+        self, q: torch.Tensor, layer: RadixAttention, k_descale
+    ) -> torch.Tensor:
+        args = (
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            layer.scaling,
+            k_descale if k_descale is not None else self.k_scale,
+        )
+        kwargs = dict(
+            num_heads=layer.tp_q_head_num,
+            qlen=self.num_draft_tokens,
+            v_head_dim=layer.v_head_dim,
+        )
+        from sglang.kernels.ops.attention.k3_mla_verify_auto import k3_mla_verify_auto
+
+        return k3_mla_verify_auto(
+            *args,
+            kv_scale_float=self._resolve_fp8_kv_scale_float(layer, k_descale),
+            **kwargs,
+        )
+
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
     ):
@@ -1500,6 +1560,50 @@ class AiterAttnBackend(AttentionBackend):
             return_lse=True,
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
+
+    def _k3_fp8_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        K_Buffer: torch.Tensor,
+        kv_indices: torch.Tensor,
+        plan,
+        *,
+        no_prefix: bool,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        qk_nope_head_dim: int,
+    ) -> torch.Tensor:
+        """E4M3 (unit scale) Q/K/V + AITER
+        FP8 PS-ASM MHA prefill. With a prefix the K/V of every token of the
+        batch (prefix + new, ordered like kv_indptr) come from the latent
+        cache via the kv_b GEMM and one fused split + cast kernel."""
+        if no_prefix:
+            k8 = k3_mla_prefill_fp8.cast_fp8(k, fp8_dtype)
+            v8 = k3_mla_prefill_fp8.cast_fp8(v, fp8_dtype)
+        else:
+            cache2d = K_Buffer.view(K_Buffer.shape[0], -1)
+            kvc = k3_mla_prefill_fp8.gather_latent(
+                cache2d, kv_indices, kv_lora_rank, q.dtype
+            )
+            kv = layer.kv_b_proj(kvc)[0]
+            k8, v8 = k3_mla_prefill_fp8.kvb_to_fp8(
+                kv.view(kv.shape[0], -1),
+                cache2d,
+                kv_indices,
+                layer.tp_k_head_num,
+                qk_nope_head_dim,
+                layer.v_head_dim,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                fp8_dtype,
+            )
+        q8 = k3_mla_prefill_fp8.cast_fp8(q, fp8_dtype)
+        return k3_mla_prefill_fp8.attention(
+            q8, k8, v8, plan, layer.scaling, out_dtype=q.dtype
+        )
 
     def mla_fp8_prefill_attn(
         self,
@@ -2136,6 +2240,21 @@ class AiterAttnBackend(AttentionBackend):
                         total_s, device=self.device, dtype=torch.int32
                     )
 
+                # Host-side PS metadata for the
+                # FP8 ASM MHA prefill, shared by all MLA layers of this batch.
+                k3_fp8_prefill_plan = None
+                if self.k3_mla_prefill_fmha and not getattr(
+                    forward_batch, "mha_return_lse", False
+                ):
+                    qo_lens = list(forward_batch.extend_seq_lens_cpu)
+                    kv_lens = forward_batch.seq_lens_cpu[:bs].tolist()
+                    if sum(qo_lens) > 0 and k3_mla_prefill_fp8.supported(
+                        self.num_head, 192, 128, sum(kv_lens)
+                    ):
+                        k3_fp8_prefill_plan = k3_mla_prefill_fp8.make_plan(
+                            qo_lens, kv_lens, self.num_head, self.device
+                        )
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
                     self.mla_indices_updater_prefill.kv_indices,
@@ -2150,6 +2269,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+                    k3_fp8_prefill_plan=k3_fp8_prefill_plan,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -3212,6 +3332,27 @@ class AiterAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                     )
+                k3_plan = self.forward_metadata.k3_fp8_prefill_plan
+                if (
+                    k3_plan is not None
+                    and q.shape[-1] == 192
+                    and v.shape[-1] == 128
+                    and layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim)
+                    and not (self.use_fp8_prefill_attn and self.head_pad_mode != "zero")
+                ):
+                    return self._k3_fp8_prefill(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        K_Buffer,
+                        kv_indices,
+                        k3_plan,
+                        no_prefix=kv_indices.shape[0] == 0 or extend_no_prefix,
+                        kv_lora_rank=kv_lora_rank,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        qk_nope_head_dim=qk_nope_head_dim,
+                    )
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
                         output = self.mla_fp8_prefill_attn(
@@ -3233,6 +3374,36 @@ class AiterAttnBackend(AttentionBackend):
                             causal=True,
                         )
                     return output
+                elif (
+                    layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim)
+                    and self.k3_mla_prefix_nocat
+                    and not (self.use_fp8_prefill_attn and self.head_pad_mode != "zero")
+                ):
+                    # Same math as the branch below without the strided casts,
+                    # the contiguous copy and the k_nope|k_pe torch.cat: K / V
+                    # come back as strided views the opus varlen kernel reads.
+                    k, v = k3_mla_prefix_kv(
+                        K_Buffer,
+                        kv_indices,
+                        layer.kv_b_proj,
+                        layer.tp_k_head_num,
+                        qk_nope_head_dim,
+                        layer.v_head_dim,
+                        kv_lora_rank,
+                        qk_rope_head_dim,
+                        dtype=q.dtype,
+                    )
+                    return flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        kv_indptr,
+                        max_q_len,
+                        max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
                     kvc, k_pe = torch.split(
@@ -3344,6 +3515,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.use_k3_mla_verify:
+                    return self._forward_k3_mla_verify(q, layer, k_descale)
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),

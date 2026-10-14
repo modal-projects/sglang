@@ -24,7 +24,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.moe.k3_route_sort import SORT_QCHUNK, _sort_quant_program
+from sglang.kernels.ops.moe.k3_route_sort import SORT_QCHUNK
 from sglang.kernels.ops.moe.k3_route_sort_mid import _aiter_biased_topk
 
 _SITU_BLOCK = 256
@@ -259,10 +259,12 @@ def _k3_situ_topk_kernel(
 
 @triton.jit(do_not_specialize=["M", "stride_out", "stride_qx"])
 def _k3_shared_sortq_kernel(
+    # shared down GEMM (pre-activated): out[M, N] = act[M, I] @ wd[N, I]^T
     act_ptr,
     wd_ptr,
     out_ptr,
     stride_out,
+    # sort + mxfp8 quant (k3_route_sort._k3_sort_quant_kernel)
     topk_ids_ptr,
     topk_weights_ptr,
     sorted_ids_ptr,
@@ -288,35 +290,111 @@ def _k3_shared_sortq_kernel(
     SCALEN_PAD: tl.constexpr,
     MOE_BUF_ZERO: tl.constexpr,
 ):
-    # sort/quant programs first: they gate stage 1, the GEMM only the all-reduce
+    # sort/quant programs first: they gate stage 1, the GEMM only the AR
+    CHUNKS: tl.constexpr = N_COLS // QCHUNK
+    n_sort = M * CHUNKS
     pid = tl.program_id(0)
-    n_sort = M * (N_COLS // QCHUNK)
-    if pid < n_sort:
-        _sort_quant_program(
-            pid,
-            topk_ids_ptr,
-            topk_weights_ptr,
-            sorted_ids_ptr,
-            sorted_weights_ptr,
-            sorted_expert_ids_ptr,
-            num_valid_ids_ptr,
-            moe_buf_ptr,
-            qx_ptr,
-            stride_qx,
-            qout_ptr,
-            qscale_ptr,
-            M,
-            TOPK,
-            BLOCK_SIZE,
-            P_POW2,
-            N_COLS,
-            QCHUNK,
-            SCALEN_PAD,
-            MOE_BUF_ZERO,
+    NT_N: tl.constexpr = N // BN
+    if pid >= n_sort:
+        # == _k3_shared_topk_kernel GEMM branch with PRE_ACT
+        gpid = pid - n_sort
+        pid_n = gpid % NT_N
+        pid_m = gpid // NT_N
+        offs_m = pid_m * BM + tl.arange(0, BM)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        mm = offs_m < M
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in tl.range(0, I, BK):
+            offs_k = k0 + tl.arange(0, BK)
+            w = tl.load(wd_ptr + offs_n[:, None] * I + offs_k[None, :])
+            a = tl.load(
+                act_ptr + offs_m[:, None] * I + offs_k[None, :],
+                mask=mm[:, None],
+                other=0.0,
+            )
+            acc = tl.dot(a, tl.trans(w), acc)
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_out + offs_n[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=mm[:, None],
         )
     else:
-        _down_gemm_program(
-            pid - n_sort, act_ptr, I, wd_ptr, out_ptr, stride_out, M, N, I, BM, BN, BK
+        # == k3_route_sort._k3_sort_quant_kernel, program pid
+        spid = pid
+        t = spid // CHUNKS
+        c0 = (spid % CHUNKS) * QCHUNK
+        P = M * TOPK
+        offs_p = tl.arange(0, P_POW2)
+        mask_p = offs_p < P
+        SENT: tl.constexpr = 0x7FFFFFFF
+        e = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=SENT)
+        srt = tl.sort(e)
+        prv = tl.gather(srt, tl.maximum(offs_p - 1, 0), axis=0)
+        first = ((offs_p == 0) | (srt != prv)) & (srt != SENT)
+        offs_k = tl.arange(0, TOPK)
+        ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
+        match = e[None, :] == ek[:, None]
+        rank_k = tl.sum(tl.where(match & (offs_p[None, :] < t * TOPK), 1, 0), axis=1)
+        bb_k = tl.sum(
+            tl.where(first[None, :] & (srt[None, :] < ek[:, None]), 1, 0), axis=1
+        )
+        dest_k = bb_k * BLOCK_SIZE + rank_k
+        if c0 == 0:
+            wk = tl.load(topk_weights_ptr + t * TOPK + offs_k)
+            tl.store(sorted_ids_ptr + dest_k, (offs_k << 24) | t)
+            tl.store(sorted_weights_ptr + dest_k, wk)
+            lead = rank_k == 0
+            cnt_k = tl.sum(tl.where(match, 1, 0), axis=1)
+            tl.store(sorted_expert_ids_ptr + bb_k, ek, mask=lead)
+            offs_b = tl.arange(0, BLOCK_SIZE)
+            pm = lead[:, None] & (offs_b[None, :] >= cnt_k[:, None])
+            pad_at = bb_k[:, None] * BLOCK_SIZE + offs_b[None, :]
+            tl.store(
+                sorted_ids_ptr + pad_at,
+                tl.full((TOPK, BLOCK_SIZE), (TOPK << 24), tl.int32) + M,
+                mask=pm,
+            )
+            tl.store(
+                sorted_weights_ptr + pad_at,
+                tl.zeros((TOPK, BLOCK_SIZE), tl.float32),
+                mask=pm,
+            )
+            if t == 0:
+                num_valid = tl.sum(first.to(tl.int32), axis=0) * BLOCK_SIZE
+                tl.store(
+                    num_valid_ids_ptr + tl.arange(0, 2),
+                    tl.where(tl.arange(0, 2) == 0, num_valid, M),
+                )
+        offs_q = tl.arange(0, QCHUNK)
+        x = tl.load(qx_ptr + t * stride_qx + c0 + offs_q).to(tl.float32)
+        x2 = tl.reshape(x, (QCHUNK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
+        bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
+        scale = (exp << 23).to(tl.float32, bitcast=True)
+        q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
+        tl.store(
+            qout_ptr + t * N_COLS + c0 + offs_q,
+            tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty),
+        )
+        if MOE_BUF_ZERO:
+            tl.store(
+                moe_buf_ptr + t * N_COLS + c0 + offs_q,
+                tl.zeros((QCHUNK,), moe_buf_ptr.dtype.element_ty),
+            )
+        offs_g = tl.arange(0, QCHUNK // 32)
+        y = c0 // 32 + offs_g
+        base_sw = (
+            (dest_k // 32) * (SCALEN_PAD * 32) + (dest_k % 16) * 4 + (dest_k % 32) // 16
+        )
+        sw = (
+            base_sw[:, None]
+            + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+        )
+        tl.store(
+            qscale_ptr + sw,
+            tl.broadcast_to(exp[None, :], (TOPK, QCHUNK // 32)).to(tl.uint8),
         )
 
 

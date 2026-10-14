@@ -124,7 +124,6 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
-    NV: tl.constexpr = 1,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -620,7 +619,6 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
-        NV=NV,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,

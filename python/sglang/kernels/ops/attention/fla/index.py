@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import collections
 import contextlib
 
 import torch
@@ -20,7 +21,7 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 _CPU_LENS_HINT = None
 # pinned sources of in-flight non_blocking H2D copies: freeing one early lets the
 # host allocator hand the buffer out again before the DMA has read it
-_PINNED_KEEPALIVE = __import__("collections").deque(maxlen=64)
+_PINNED_KEEPALIVE = collections.deque(maxlen=64)
 
 
 @contextlib.contextmanager

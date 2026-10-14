@@ -72,13 +72,9 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-from sglang.kernels.ops.attention import k3_mla_prefill_fp8
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
-)
-from sglang.kernels.ops.attention.k3_mla_prefix_nocat import (
-    k3_mla_prefix_kv,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.utils import (
@@ -1940,6 +1936,8 @@ class AiterAttnBackend(AttentionBackend):
         FP8 PS-ASM MHA prefill. With a prefix the K/V of every token of the
         batch (prefix + new, ordered like kv_indptr) come from the latent
         cache via the kv_b GEMM and one fused split + cast kernel."""
+        from sglang.kernels.ops.attention import k3_mla_prefill_fp8
+
         if no_prefix:
             k8 = k3_mla_prefill_fp8.cast_fp8(k, fp8_dtype)
             v8 = k3_mla_prefill_fp8.cast_fp8(v, fp8_dtype)
@@ -2651,6 +2649,8 @@ class AiterAttnBackend(AttentionBackend):
                 if self.k3_mla_prefill_fmha and not getattr(
                     forward_batch, "mha_return_lse", False
                 ):
+                    from sglang.kernels.ops.attention import k3_mla_prefill_fp8
+
                     qo_lens = list(forward_batch.extend_seq_lens_cpu)
                     kv_lens = forward_batch.seq_lens_cpu[:bs].tolist()
                     if sum(qo_lens) > 0 and k3_mla_prefill_fp8.supported(
@@ -4019,6 +4019,10 @@ class AiterAttnBackend(AttentionBackend):
                     # Same math as the branch below without the strided casts,
                     # the contiguous copy and the k_nope|k_pe torch.cat: K / V
                     # come back as strided views the opus varlen kernel reads.
+                    from sglang.kernels.ops.attention.k3_mla_prefix_nocat import (
+                        k3_mla_prefix_kv,
+                    )
+
                     k, v = k3_mla_prefix_kv(
                         K_Buffer,
                         kv_indices,

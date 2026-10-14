@@ -254,6 +254,12 @@ for _mod, _fn, _backend, _device in [
     ),
     ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
     (
+        "attn_res_smallm_hip",
+        "attn_res_smallm_hip",
+        KernelBackend.JIT,
+        CapabilityRequirement.HIP,
+    ),
+    (
         "mla_output_gate",
         "kimi_k3_mla_output_gate",
         KernelBackend.JIT,

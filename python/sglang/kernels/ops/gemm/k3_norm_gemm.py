@@ -15,7 +15,6 @@ ulp vs the tuned hgemm; equal error vs a float64 reference).
 from __future__ import annotations
 
 import functools
-from typing import Optional
 
 import torch
 
@@ -45,8 +44,8 @@ def _hip_module(mode: int, waves: int, nt: int, kb: int):
     )
 
 
-def hip_onorm_supported(M: int, K: int, N: int, D: int, cfg=None) -> bool:
-    waves, nt = cfg or HIP_ONORM_CFG
+def hip_onorm_supported(M: int, K: int, N: int, D: int) -> bool:
+    waves, nt = HIP_ONORM_CFG
     return 1 <= M <= HIP_MAX_M and D == 128 and K == waves * 128 and N % (16 * nt) == 0
 
 
@@ -56,16 +55,13 @@ def kda_onorm_oproj_hip(
     norm_weight: torch.Tensor,  # [D] bf16 or fp32
     eps: float,
     w: torch.Tensor,  # [N, HV*D] bf16 contiguous
-    out: Optional[torch.Tensor] = None,
-    cfg: Optional[tuple] = None,
 ) -> torch.Tensor:
     x = x.reshape(-1, w.shape[1])
     M, K = x.shape
     N = w.shape[0]
-    waves, nt = cfg or HIP_ONORM_CFG
-    assert hip_onorm_supported(M, K, N, norm_weight.shape[0], (waves, nt))
-    if out is None:
-        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    waves, nt = HIP_ONORM_CFG
+    assert hip_onorm_supported(M, K, N, norm_weight.shape[0])
+    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
     if norm_weight.dtype != torch.float32:  # callers on the hot path pass fp32
         norm_weight = norm_weight.float()
     flags = 1 | 4

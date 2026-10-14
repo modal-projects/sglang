@@ -240,7 +240,7 @@ struct NormGemm {
       const tvm::ffi::TensorView nw,
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView y,
-      int64_t flags,  // bit0: g valid, bit1: nw valid (bf16), bit2: nw valid (fp32)
+      int64_t flags,  // bit0: g valid, bit2: nw valid (fp32)
       double eps) {
     using namespace host;
     const int64_t M = x.size(0);
@@ -259,7 +259,6 @@ struct NormGemm {
       p.g = static_cast<const uint16_t*>(g.data_ptr());
       p.sg = g.stride(0);
     }
-    RuntimeCheck(!(flags & 2), "norm_gemm: bf16 norm weight unsupported (pass fp32 / fold it)");
     if (flags & 4) p.nwf = static_cast<const float*>(nw.data_ptr());
     p.w = static_cast<const uint16_t*>(w.data_ptr());
     p.y = static_cast<uint16_t*>(y.data_ptr());

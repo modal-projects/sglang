@@ -173,7 +173,7 @@ class Step5Config(PretrainedConfig):
             kwargs["moe_layers_enum"] = ",".join(str(i) for i in self.moe_layer_list)
         # The checkpoint carries both names for top-k; keep one.
         kwargs.pop("num_experts_per_tok", None)
-        kwargs.pop("architectures", None)
+        kwargs.setdefault("architectures", ["Step5ForCausalLM"])
 
         # Transformers validates layer_types against num_hidden_layers; the checkpoint's
         # list includes the MTP layers. Align for the validator, then restore.
@@ -291,5 +291,5 @@ class Step5VLConfig(PretrainedConfig):
         self.use_im_start_end = use_im_start_end
         self.vision_select_layer = vision_select_layer
 
-        kwargs.pop("architectures", None)
+        kwargs.setdefault("architectures", ["Step5ForConditionalGeneration"])
         super().__init__(**kwargs)

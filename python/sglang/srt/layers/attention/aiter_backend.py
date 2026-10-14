@@ -584,13 +584,17 @@ class AiterAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
+        # Kimi-K3 opts in through its model class (aiter_k3_mla_prefill).
+        k3_mla_prefill = self.use_mla and bool(
+            getattr(getattr(model_runner, "model", None), "aiter_k3_mla_prefill", False)
+        )
         # Extend-with-prefix MHA builds the
         # prefix K/V without torch.cat (kernels/ops/attention/k3_mla_prefix_nocat.py).
-        self.k3_mla_prefix_nocat = self.use_mla
+        self.k3_mla_prefix_nocat = k3_mla_prefill
         # FP8 PS-ASM MHA for the d192/v128
         # extend (kernels/ops/attention/k3_mla_prefill_fp8.py).
         self.k3_mla_prefill_fmha = (
-            self.use_mla and self.num_head % 4 == 0 and is_gfx95_supported()
+            k3_mla_prefill and self.num_head % 4 == 0 and is_gfx95_supported()
         )
         self.use_k3_mla_verify = False
 

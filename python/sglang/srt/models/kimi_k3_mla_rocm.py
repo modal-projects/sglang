@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 
-def _k3_mla_cat_cache(
+def mla_cat_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
@@ -64,7 +64,7 @@ def _k3_mla_cat_cache(
     return cc.k3_mla_cat_cache(q_nope_out, q_pe, k_nope, k_pe, kv, loc)
 
 
-def _k3_absorb_plain_bf16(w, w_scale) -> bool:
+def _absorb_plain_bf16(w, w_scale) -> bool:
     return (
         isinstance(w, torch.Tensor)
         and w.dtype == torch.bfloat16
@@ -73,14 +73,14 @@ def _k3_absorb_plain_bf16(w, w_scale) -> bool:
     )
 
 
-def _k3_absorb_q_cache_target(
+def absorb_q_cache_target(
     attn: DeepseekV2AttentionMLA,
     forward_batch: ForwardBatch,
     num_rows: int,
 ):
     """Fused-absorb gate for the W_UK half: (kv_buffer,
     loc) when the absorb BMM + q cat + latent KV write can run as one launch,
-    else None. Same eligibility as _k3_mla_cat_cache plus a bf16 W_UK and
+    else None. Same eligibility as mla_cat_cache plus a bf16 W_UK and
     <= 64 rows; prepare and core both call it, so they agree."""
     if not (
         attn.rotary_emb is None
@@ -90,7 +90,7 @@ def _k3_absorb_q_cache_target(
         and not is_kv_b_lora_active(attn)
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
         and 0 < num_rows <= 64
-        and _k3_absorb_plain_bf16(getattr(attn, "w_kc", None), attn.w_scale)
+        and _absorb_plain_bf16(getattr(attn, "w_kc", None), attn.w_scale)
         and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -112,7 +112,7 @@ def _k3_absorb_q_cache_target(
     return pool.get_key_buffer(attn.attn_mqa.layer_id), forward_batch.out_cache_loc
 
 
-def _k3_absorb_q_cat_cache(
+def absorb_q_cat_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -122,7 +122,7 @@ def _k3_absorb_q_cat_cache(
 ) -> Optional[torch.Tensor]:
     """One launch: q = [q_nope @ W_UK | q_pe] and the latent KV-cache write.
     Returns q, or None when not covered (caller runs the unfused chain)."""
-    target = _k3_absorb_q_cache_target(attn, forward_batch, q_nope.shape[0])
+    target = absorb_q_cache_target(attn, forward_batch, q_nope.shape[0])
     if target is None:
         return None
     from sglang.kernels.ops.attention import k3_mla_absorb as ka
@@ -133,7 +133,7 @@ def _k3_absorb_q_cat_cache(
     return ka.k3_mla_absorb_q_cat_cache(q_nope, q_pe, attn.w_kc, k_nope, k_pe, kv, loc)
 
 
-def _k3_absorb_v_gate(
+def absorb_v_gate(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -151,7 +151,7 @@ def _k3_absorb_v_gate(
         and not is_in_tc_piecewise_cuda_graph()
         and getattr(attn.o_proj, "weight", None) is not None
         and attn.o_proj.weight.dtype == torch.bfloat16
-        and _k3_absorb_plain_bf16(getattr(attn, "w_vc", None), attn.w_scale)
+        and _absorb_plain_bf16(getattr(attn, "w_vc", None), attn.w_scale)
         and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()

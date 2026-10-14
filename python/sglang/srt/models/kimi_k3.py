@@ -126,6 +126,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models import kimi_k3_mla_rocm
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -2839,6 +2840,24 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             alt = self._gate_alt_stream
             alt.wait_stream(torch.cuda.current_stream())
             self._gate_pending_stream = alt
+
+    def _rocm_absorb_q_cache_target(self, forward_batch, num_rows):
+        return kimi_k3_mla_rocm.absorb_q_cache_target(
+            self, forward_batch, num_rows
+        )
+
+    def _rocm_absorb_q_cat_cache(self, q_nope, q_pe, k_nope, k_pe, forward_batch):
+        return kimi_k3_mla_rocm.absorb_q_cat_cache(
+            self, q_nope, q_pe, k_nope, k_pe, forward_batch
+        )
+
+    def _rocm_mla_cat_cache(self, q_nope_out, q_pe, k_nope, k_pe, forward_batch):
+        return kimi_k3_mla_rocm.mla_cat_cache(
+            self, q_nope_out, q_pe, k_nope, k_pe, forward_batch
+        )
+
+    def _rocm_absorb_v_gate(self, attn_output, forward_batch):
+        return kimi_k3_mla_rocm.absorb_v_gate(self, attn_output, forward_batch)
 
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream

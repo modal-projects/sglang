@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.moe.k3_route_sort import _mx_e8m0, _mx_scale_col, _mx_scale_row
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -106,19 +107,10 @@ def _moe_sorting_small_kernel(
             offs_g = tl.arange(0, QCHUNK // 32)
             token_p = tl.sum(tl.where(offs_p == p, token, 0), axis=0)
             dest_p = tl.sum(tl.where(offs_p == p, dest, 0), axis=0)
-            base_sw = (
-                (dest_p // 32) * (SCALEN_PAD * 32)
-                + (dest_p % 16) * 4
-                + (dest_p % 32) // 16
-            )
+            base_sw = _mx_scale_row(dest_p, SCALEN_PAD)
             x = tl.load(qx_ptr + token_p * stride_qx + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
-            amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
-            sf = amax * (1.0 / 448.0)
-            bits = sf.to(tl.int32, bitcast=True)
-            exp = (bits >> 23) & 0xFF
-            exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
-            scale = (exp << 23).to(tl.float32, bitcast=True)
+            exp, scale = _mx_e8m0(x2)
             if p % TOPK == 0:
                 # one fp8 out row per token (pairs are token-major)
                 q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
@@ -127,7 +119,7 @@ def _moe_sorting_small_kernel(
                     tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty),
                 )
             y = c0 // 32 + offs_g
-            sw = base_sw + (y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2
+            sw = base_sw + _mx_scale_col(y)
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
         return
 
@@ -277,19 +269,12 @@ def _moe_sorting_small_kernel_distributed(
         token_p = p // TOPK
         offs_q = tl.arange(0, QCHUNK)
         offs_g = tl.arange(0, QCHUNK // 32)
-        base_sw = (
-            (dest_p // 32) * (SCALEN_PAD * 32) + (dest_p % 16) * 4 + (dest_p % 32) // 16
-        )
+        base_sw = _mx_scale_row(dest_p, SCALEN_PAD)
         for cc in tl.static_range(N_COLS // QCHUNK):
             c0 = cc * QCHUNK
             x = tl.load(qx_ptr + token_p * stride_qx + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
-            amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
-            sf = amax * (1.0 / 448.0)
-            bits = sf.to(tl.int32, bitcast=True)
-            exp = (bits >> 23) & 0xFF
-            exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
-            scale = (exp << 23).to(tl.float32, bitcast=True)
+            exp, scale = _mx_e8m0(x2)
             if p % TOPK == 0:
                 # one fp8 out row per token (pairs are token-major)
                 q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
@@ -298,7 +283,7 @@ def _moe_sorting_small_kernel_distributed(
                     tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty),
                 )
             y = c0 // 32 + offs_g
-            sw = base_sw + (y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2
+            sw = base_sw + _mx_scale_col(y)
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 

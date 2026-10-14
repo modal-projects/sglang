@@ -35,13 +35,11 @@ A pair with routed weight exactly 0 gets scale byte 0, as aiter's fused quant do
 (ZERO_W_SCALE; aiter's M > 128 split path does not do this).
 
 The counts buffer must be all-zero before launch A; kernel B leaves it zeroed.
-If A runs and B does not (the MoE runner took another path), pending() re-zeroes it.
+If A runs and B does not (the MoE runner took another path), moe_sorting_small.K3SortPlan.finish re-zeroes it.
 """
 
 from __future__ import annotations
 
-import contextlib
-from contextvars import ContextVar
 from dataclasses import dataclass
 
 import torch
@@ -383,11 +381,6 @@ class RouteState:
     consumed: bool = False
 
 
-_pending: ContextVar[RouteState | None] = ContextVar(
-    "k3_route_mid_pending", default=None
-)
-
-
 def route_quant(
     qx: torch.Tensor,  # [M, N] bf16 routed activations (row-strided ok)
     counts: torch.Tensor,
@@ -492,35 +485,3 @@ def sort_scatter(
     )
     state.consumed = True
     return state.qout, qscale.view(torch.float8_e8m0fnu)
-
-
-@contextlib.contextmanager
-def pending(state: RouteState | None):
-    """Offer launch-A products to the patched aiter sort inside fused_moe."""
-    if state is None:
-        yield None
-        return
-    token = _pending.set(state)
-    try:
-        yield state
-    finally:
-        _pending.reset(token)
-        if not state.consumed:
-            # launch A ran but its sort launch B never did
-            state.counts.zero_()
-
-
-def take_pending(topk_ids: torch.Tensor, qx: torch.Tensor | None) -> RouteState | None:
-    st = _pending.get()
-    if (
-        st is None
-        or st.consumed
-        or topk_ids.data_ptr() != st.topk_ids.data_ptr()
-        or topk_ids.shape != st.topk_ids.shape
-        or qx is None
-        or qx.data_ptr() != st.qx.data_ptr()
-        or qx.shape != st.qx.shape
-        or qx.stride() != st.qx.stride()
-    ):
-        return None
-    return st

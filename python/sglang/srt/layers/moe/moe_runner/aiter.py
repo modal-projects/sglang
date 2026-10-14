@@ -180,9 +180,6 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         apply_aiter_small_moe_sort_patch()
-        from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
-
-        apply_k3_moe_decode_cfg()
 
     def run(
         self,
@@ -322,26 +319,29 @@ class AiterRunnerCore(MoeRunnerCore):
             if dst is not None:
                 extra["output"] = dst
 
-        output = fused_moe(
-            hidden_states=runner_input.hidden_states,
-            w1=quant_info.w13_weight,
-            w2=quant_info.w2_weight,
-            topk_weight=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
-            quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=activation,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=quant_info.a2_scale,
-            bias1=quant_info.b13,
-            bias2=quant_info.b2,
-            expert_mask=quant_info.expert_mask,
-            doweight_stage1=quant_info.doweight_stage1,
-            hidden_pad=quant_info.hidden_pad,
-            intermediate_pad=quant_info.intermediate_pad,
-            **extra,
-        )
+        from sglang.kernels.ops.moe.moe_sorting_small import k3_route_sort
+
+        with k3_route_sort(getattr(self.config.layer, "aiter_k3_route_sort", False)):
+            output = fused_moe(
+                hidden_states=runner_input.hidden_states,
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                topk_weight=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                quant_type=_aiter_quant_type(runner_input.quant_type),
+                activation=activation,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=quant_info.a2_scale,
+                bias1=quant_info.b13,
+                bias2=quant_info.b2,
+                expert_mask=quant_info.expert_mask,
+                doweight_stage1=quant_info.doweight_stage1,
+                hidden_pad=quant_info.hidden_pad,
+                intermediate_pad=quant_info.intermediate_pad,
+                **extra,
+            )
         return AiterRunnerOutput(hidden_states=output)
 
     @property

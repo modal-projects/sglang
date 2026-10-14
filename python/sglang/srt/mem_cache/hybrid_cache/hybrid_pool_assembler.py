@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -2487,8 +2488,6 @@ def build_minimax_sparse_hicache_stack(
 
 
 def _k3_mamba_host_sizing(hicache_ratio, mamba_host_size):
-    from sglang.srt.environ import envs
-
     ratio = envs.SGLANG_K3_HICACHE_MAMBA_RATIO.get()
     if ratio > 0:
         return ratio, 0

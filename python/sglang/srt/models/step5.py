@@ -59,6 +59,9 @@ def _normalize_ignored_layers(quant_config: Optional[QuantizationConfig]) -> Non
             if name.endswith(suffix):
                 extra.append(name[: -len(suffix)])
                 break
+    # The checkpoint names the routed-MoE block "moe"; step3p5 builds it under
+    # "mlp" (and renames weights at load). Alias the ignore entries the same way.
+    extra += [n.replace(".moe.", ".mlp.") for n in [*ignored, *extra] if ".moe." in n]
     merged = list(dict.fromkeys([*ignored, *extra]))
     if len(merged) != len(ignored):
         quant_config.ignored_layers = merged

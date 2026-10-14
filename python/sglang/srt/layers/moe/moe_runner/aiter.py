@@ -164,14 +164,6 @@ def _aiter_fused_moe_supports_output() -> bool:
     return "output" in inspect.signature(fused_moe).parameters
 
 
-@functools.cache
-def _is_k3_zero_copy_ok() -> bool:
-    """aiter.fused_moe takes a caller-owned destination (output=)."""
-    from aiter.fused_moe import fused_moe
-
-    return "output" in inspect.signature(fused_moe).parameters
-
-
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -305,7 +297,7 @@ class AiterRunnerCore(MoeRunnerCore):
             activation = _aiter_activation(self.config)
 
         if (
-            _is_k3_zero_copy_ok()
+            _aiter_fused_moe_supports_output()
             and not extra.get("no_combine")
             and runner_input.num_local_tokens is None
         ):

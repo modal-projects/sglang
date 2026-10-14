@@ -414,6 +414,63 @@ class _DominoDraftSampler:
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
 
+class _AcceptBonusBuffers:
+    """Outputs of the triton accept/bonus kernel at fixed addresses.
+
+    accept_len is consumed within the step. The other outputs are handed to the
+    next step (overlap scheduling reads them after this step returns), so they
+    are double buffered and ``take`` alternates between the two slots. Buffers
+    only grow (2x), and keep their addresses while ``bs`` fits.
+    """
+
+    def __init__(self) -> None:
+        self.cap = 0
+        self.next_slot = 0
+        self.accept_len: Optional[torch.Tensor] = None
+        self.commit_lens: List[torch.Tensor] = []
+        self.bonus_ids: List[torch.Tensor] = []
+        self.out_tokens: List[torch.Tensor] = []
+        self.new_seq_lens: List[torch.Tensor] = []
+
+    def reserve(self, bs: int, *, device, block_size: int) -> None:
+        if self.cap >= bs:
+            return
+        cap = max(bs, self.cap * 2 if self.cap > 0 else bs)
+        self.accept_len = torch.empty((cap,), dtype=torch.int32, device=device)
+        self.commit_lens = [
+            torch.empty((cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        # int64 keeps the downstream .to(torch.int64) a no-op.
+        self.bonus_ids = [
+            torch.empty((cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self.out_tokens = [
+            torch.empty((cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self.new_seq_lens = [
+            torch.empty((cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self.cap = cap
+
+    def take(
+        self, bs: int, *, device, block_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(accept_len, commit_lens, bonus_ids, out_tokens, new_seq_lens)[:bs]
+        of the next slot."""
+        bs = int(bs)
+        self.reserve(bs, device=device, block_size=block_size)
+        slot = self.next_slot
+        self.next_slot = (slot + 1) % 2
+        return (
+            self.accept_len[:bs],
+            self.commit_lens[slot][:bs],
+            self.bonus_ids[slot][:bs],
+            self.out_tokens[slot][:bs],
+            self.new_seq_lens[slot][:bs],
+        )
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     # Platform hooks below are overridden by DFlashWorkerV2ROCm
     # (dflash_worker_v2_rocm.py); the defaults are the portable path.
@@ -639,13 +696,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # gather's implicit nonzero D2H + lengths.max().item()); keep it only
         # for platforms without GPU triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
-        self._accept_bonus_buffer_cap: int = 0
-        self._accept_bonus_buffer_slot: int = 0
-        self._accept_len_buf: Optional[torch.Tensor] = None
-        self._commit_lens_bufs: List[torch.Tensor] = []
-        self._bonus_id_bufs: List[torch.Tensor] = []
-        self._out_tokens_bufs: List[torch.Tensor] = []
-        self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._accept_bonus_buffers = _AcceptBonusBuffers()
         # K3 DFlash prep graph (built in init_cuda_graphs).
         self._k3_prep_graph = None
         self._init_tail_graph_state()
@@ -2192,58 +2243,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
-    def _ensure_accept_bonus_buffers(self, bs: int) -> None:
-        if self._accept_bonus_buffer_cap >= int(bs):
-            return
-
-        new_cap = max(
-            int(bs),
-            (
-                self._accept_bonus_buffer_cap * 2
-                if self._accept_bonus_buffer_cap > 0
-                else int(bs)
-            ),
-        )
-        device = self.device
-        block_size = int(self.block_size)
-        self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
-        self._commit_lens_bufs = [
-            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
-        ]
-        # int64 keeps the downstream .to(torch.int64) a no-op.
-        self._bonus_id_bufs = [
-            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self._out_tokens_bufs = [
-            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
-            for _ in range(2)
-        ]
-        self._new_seq_lens_bufs = [
-            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self._accept_bonus_buffer_cap = new_cap
-
-    def _next_accept_bonus_buffers(
-        self, bs: int
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        self._ensure_accept_bonus_buffers(bs)
-        assert self._accept_len_buf is not None
-        slot = self._accept_bonus_buffer_slot
-        self._accept_bonus_buffer_slot = (slot + 1) % 2
-        return (
-            self._accept_len_buf[:bs],
-            self._commit_lens_bufs[slot][:bs],
-            self._bonus_id_bufs[slot][:bs],
-            self._out_tokens_bufs[slot][:bs],
-            self._new_seq_lens_bufs[slot][:bs],
-        )
-
     def _verify_argmax(self, next_token_logits: torch.Tensor) -> torch.Tensor:
         return torch.argmax(next_token_logits, dim=-1)
 
@@ -2298,7 +2297,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         bonus,
                         out_tokens,
                         new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
+                    ) = self._accept_bonus_buffers.take(
+                        bs, device=self.device, block_size=int(self.block_size)
+                    )
                     _compute_dflash_accept_bonus_triton_unchecked(
                         candidates=candidates,
                         target_top1=target_predict,

@@ -2587,28 +2587,6 @@ class KimiK3DeltaAttention(nn.Module):
             partial = self._k3_onorm_oproj(core_attn_out, g_proj_states)
             if partial is not None:
                 return partial
-        if (
-            not fused_onorm
-            and (
-                _is_hip
-                and forward_batch.forward_mode.is_target_verify()
-                and self.o_norm.activation == "sigmoid"
-                and self.o_norm.weight is not None
-                and self.o_norm.weight.shape == (core_attn_out.shape[-1],)
-            )
-            and core_attn_out.is_contiguous()
-            and g_proj_states.dim() == 2
-            and g_proj_states.stride(-1) == 1
-        ):
-            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
-                kda_onorm_gated_strided,
-            )
-
-            # One launch instead of the gate's contiguous copy + gated norm.
-            core_attn_out = kda_onorm_gated_strided(
-                core_attn_out, g_proj_states, self.o_norm.weight, self.o_norm.eps
-            )
-            fused_onorm = True
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -2625,7 +2603,7 @@ class KimiK3DeltaAttention(nn.Module):
         """ROCm fused KDA o_norm + o_proj (target verify, M <= MAX_M):
         the gated o_norm (sigmoid gate read through its row stride) in the
         prologue of the o_proj GEMM -- one HIP kernel instead of
-        _kda_onorm_gated_strided_kernel + the tuned hgemm. Returns o_proj's
+        the gated RMSNorm + the tuned hgemm. Returns o_proj's
         TP-partial output, or None when not covered (caller runs the unfused
         pair). Only on the deferred-reduce o_proj (fused AllReduce + aggregation:
         the decoder layer completes the reduction)."""

@@ -6,7 +6,7 @@
 //
 //   kGatedHead (KDA o_norm + o_proj): per (row, head of kD = 128 columns)
 //       A = bf16(((x * rstd) * nw) * sigmoid(g)),  rstd = 1 / sqrt(sum(x^2) / kD + eps)
-//       (the op sequence of _kda_onorm_gated_strided_kernel)
+//       (the op sequence of layer_norm_gated_fwd_kernel)
 //
 // Layout: a block owns kNT x 16 output columns and all M (<= 16) rows; its
 // kWaves waves split K (kKB blocks of 32 per wave). Every lane (row r = lane %

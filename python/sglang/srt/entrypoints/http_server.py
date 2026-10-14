@@ -298,6 +298,10 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
+    configure_api_early_reject(
+        fast_api_app, envs.SGLANG_K3_API_EARLY_REJECT_MAX_CONCURRENCY.get() or None
+    )
+
     # Add prometheus middleware
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
@@ -484,6 +488,15 @@ app = FastAPI(
     **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
+from sglang.srt.entrypoints.early_reject import (
+    APIEarlyRejectMiddleware,
+    configure_api_early_reject,
+)
+
+app.add_middleware(APIEarlyRejectMiddleware)
+from sglang.srt.entrypoints.sse_keepalive import SSEKeepaliveMiddleware
+
+app.add_middleware(SSEKeepaliveMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

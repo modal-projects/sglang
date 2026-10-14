@@ -463,7 +463,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
-        self._init_rocm_bcg_prefix_extend(model_runner)
+        # ROCm + aiter runs the prefix work of an MHA-companion extend inside
+        # the attention eager break, so prefix extends can replay under BCG.
+        self._rocm_bcg_prefix_extend = bool(
+            envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get()
+            and is_hip()
+            and self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and model_runner.prefill_attention_backend_str == "aiter"
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -1275,57 +1283,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
-    def _init_rocm_bcg_prefix_extend(self, model_runner: ModelRunner) -> None:
-        """SGLANG_ROCM_BCG_PREFIX_EXTEND: replay prefix-carrying EXTEND batches
-        through the breakable prefill graph on ROCm + aiter.
-
-        Under BCG, handle_attention_aiter pins the MHA method, so an MLA layer
-        captures forward_normal_rocm_prepare (new-token q/k/v + latent KV write
-        at out_cache_loc, all fixed-shape) and calls attn_mha through
-        breakable_unified_attention_with_output. Everything prefix-dependent
-        -- the latent-KV gather over kv_indices, kv_b_proj expansion, the
-        varlen attention over prefix+new tokens -- lives in
-        AiterAttnBackend.forward_extend inside that eager break, reading the
-        live ForwardBatch and the forward_metadata rebuilt by
-        init_forward_metadata at replay. That is the same code the eager
-        MHA_ROCM dispatch runs when sum(seq_lens) <= max KV chunk capacity;
-        above it eager switches to chunked KV, so those batches stay eager.
-        """
-        prefill_attn_backend = getattr(
-            model_runner, "prefill_attention_backend_str", None
-        )
-        if prefill_attn_backend is None:
-            from sglang.srt.runtime_context import attention_backends
-
-            prefill_attn_backend = attention_backends()[0]
-        self._rocm_bcg_prefix_extend = bool(
-            envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get()
-            and is_hip()
-            and self.prefill_backend_name == Backend.BREAKABLE
-            and self.has_mha_companion_layers
-            and prefill_attn_backend == "aiter"
-        )
-        # Eager handle_attention_aiter keeps the one-pass MHA path (the one
-        # the break runs) only while sum(seq_lens) fits the KV chunk capacity.
-        self._rocm_bcg_prefix_max_kv_tokens = envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
-        if self._rocm_bcg_prefix_extend and get_parallel().tp_rank == 0:
-            logger.info(
-                "SGLANG_ROCM_BCG_PREFIX_EXTEND: breakable prefill graph will "
-                "replay prefix EXTEND batches (aiter MHA-companion path) with "
-                "sum(seq_lens) <= %d",
-                self._rocm_bcg_prefix_max_kv_tokens,
-            )
-        elif envs.SGLANG_ROCM_BCG_PREFIX_EXTEND.get() and get_parallel().tp_rank == 0:
-            logger.warning(
-                "SGLANG_ROCM_BCG_PREFIX_EXTEND set but inactive (is_hip=%s, "
-                "prefill_graph_backend=%s, has_mha_companion_layers=%s, "
-                "prefill_attention_backend=%s)",
-                is_hip(),
-                self.prefill_backend_name,
-                self.has_mha_companion_layers,
-                prefill_attn_backend,
-            )
-
     def can_replay_locally(
         self,
         *,
@@ -1349,72 +1306,36 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
-        return (
-            self._replay_locally_reject_reason(
-                batch_size=batch_size,
-                num_tokens=num_tokens,
-                input_embeds=input_embeds,
-                replace_embeds=replace_embeds,
-                prefix_lens=prefix_lens,
-                is_target_verify=is_target_verify,
-                capture_hidden_mode=capture_hidden_mode,
-                return_logprob=return_logprob,
-                lora_ineligible=lora_ineligible,
-                is_mixed=is_mixed,
-                batch_max_context_len=batch_max_context_len,
-                contains_mm_inputs=contains_mm_inputs,
-            )
-            is None
-        )
-
-    def _replay_locally_reject_reason(
-        self,
-        *,
-        batch_size: int,
-        num_tokens: Optional[int],
-        input_embeds,
-        replace_embeds,
-        prefix_lens,
-        is_target_verify: bool,
-        capture_hidden_mode,
-        return_logprob: bool,
-        lora_ineligible: bool = False,
-        is_mixed: bool = False,
-        batch_max_context_len: Optional[int] = None,
-        contains_mm_inputs: bool = False,
-    ) -> Optional[str]:
-        """``can_replay_locally`` body: None when replayable, else a short
-        reason tag."""
         if contains_mm_inputs and (
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
-            return "mm_inputs_qwen_bcg"
+            return False
         # Full replay bypasses forward_extend's Python image-mask guard.
         # Keep FA4 multimodal prefill eager until its full-graph path is
         # supported; both forward dispatch and the DP vote use this policy.
         if self._is_full_backend and self._fa4_prefill and contains_mm_inputs:
-            return "mm_inputs_fa4_prefill"
+            return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
-            return "full_cg_batch_size_over_req_slots"
+            return False
         if (
             self._captured_attn_metadata_max_bs is not None
             and batch_size > self._captured_attn_metadata_max_bs
         ):
-            return "batch_size_over_captured_attn_metadata"
+            return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
-            return "lora"
+            return False
         if is_mixed and getattr(self, "prefer_eager_mixed_prefill", False):
-            return "mixed_prefer_eager"
+            return False
         if input_embeds is not None:
-            return "input_embeds"
+            return False
         if replace_embeds is not None:
-            return "replace_embeds"
-        # Off CUDA, BCG takes the MHA companion. Its prefix work runs inside
-        # the attention eager break; it is enabled (aiter only) by
-        # SGLANG_ROCM_BCG_PREFIX_EXTEND, see _init_rocm_bcg_prefix_extend.
+            return False
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable
+        # unless _rocm_bcg_prefix_extend; over the KV chunk capacity eager aiter
+        # switches to chunked KV, so those batches stay eager.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
@@ -1422,63 +1343,56 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and prefix_lens is not None
             and any(prefix_lens)
         ):
-            if not self._rocm_bcg_prefix_extend:
-                return "prefix_on_mha_companion"
-            if (
+            if not self._rocm_bcg_prefix_extend or (
                 num_tokens is not None
                 and int(sum(prefix_lens)) + int(num_tokens)
-                > self._rocm_bcg_prefix_max_kv_tokens
+                > envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
             ):
-                # Eager would take MHA_CHUNKED_KV here; keep it eager rather
-                # than materialize the whole expanded prefix in the break.
-                return "prefix_over_kv_chunk_capacity"
+                return False
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
-            return "full_cg_uncapturable_chunked_prefix"
+            return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
-            return "target_verify"
+            return False
         if (
             capture_hidden_mode is not None
             and self.capture_hidden_mode < capture_hidden_mode
         ):
-            return "capture_hidden_mode"
+            return False
         if return_logprob and not self._uses_eager_prefill_tail():
-            return "return_logprob"
+            return False
         if self.max_context_size is not None:
             if (
                 batch_max_context_len is None
                 or batch_max_context_len > self.max_context_size
             ):
-                return "max_context_size"
+                return False
         if num_tokens is None:
-            return None
+            return True
         if num_tokens > self.max_num_tokens:
-            return "num_tokens_over_max_bucket"
+            return False
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return "padding_factor"
-        return None
+            return False
+        return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        return self._run_graph_reject_reason(forward_batch) is None
-
-    def _run_graph_reject_reason(self, forward_batch: ForwardBatch) -> Optional[str]:
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
             forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_prefill_cuda_graph
         ):
-            return "dp_group_vote"
+            return False
 
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
-            return "dp_inactive_rank"
+            return False
 
         # A batch can be too small to activate CP. Its unsharded inputs must
         # not replay a model body captured with CP-local rows.
@@ -1493,7 +1407,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.max_context_size is not None
             else None
         )
-        reason = self._replay_locally_reject_reason(
+        if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),
             input_embeds=forward_batch.input_embeds,
@@ -1519,12 +1433,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             ),
             batch_max_context_len=batch_max_context_len,
-        )
-        if reason is not None:
-            return reason
+        ):
+            return False
         if getattr(self, "enable_cp_bcg_capture", False):
             if not is_cp_active(forward_batch):
-                return "cp_bcg_inactive"
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
@@ -1535,15 +1448,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 is None
             ):
-                return "cp_no_replay_bucket"
+                return False
         backend_can_run = self._backend_can_run_prefill_cuda_graph
         if backend_can_run is not None and not backend_can_run(forward_batch):
-            return "attn_backend_can_run_prefill_cuda_graph"
+            return False
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
-        return None
+        return True
 
     def _build_capture_spec_info(self, num_tokens: int):
         if self.static_draft_hidden_states is None:

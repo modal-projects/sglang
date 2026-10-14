@@ -361,6 +361,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             draft_owns_attention=False,
             lilicorr=None,
             _use_fused_kv_materialize=False,
+            _kv_fuse_store=lambda *args, **kwargs: False,
             _fused_kv_helper=None,
         )
         worker._append_target_hidden_sequential = lambda **kw: (

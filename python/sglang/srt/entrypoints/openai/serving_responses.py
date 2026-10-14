@@ -306,9 +306,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "background=true requires store=true.", param="store"
             )
 
-        model_error = None  # K3 B300 parity: serve any model name
-        if model_error is not None:
-            return model_error
+        # K3 B300 parity: the K3 endpoint serves any model name.
+        if self.chat_encoding_spec != "kimi_k3":
+            model_error = self._validate_model(request.model)
+            if model_error is not None:
+                return model_error
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case

@@ -1,7 +1,9 @@
 """Unit tests for srt/entrypoints/sse_keepalive.py"""
 
 import asyncio
+import os
 import unittest
+from unittest.mock import patch
 
 import orjson
 
@@ -101,7 +103,9 @@ class TestSSEKeepaliveMiddleware(CustomTestCase):
     def test_interval_defaults_to_env(self):
         with envs.SGLANG_K3_SSE_KEEPALIVE_S.override(15):
             self.assertEqual(SSEKeepaliveMiddleware(_app(0)).interval, 15)
-        self.assertEqual(SSEKeepaliveMiddleware(_app(0)).interval, 0)
+        with patch.dict(os.environ):
+            envs.SGLANG_K3_SSE_KEEPALIVE_S.clear()
+            self.assertEqual(SSEKeepaliveMiddleware(_app(0)).interval, 0)
 
 
 if __name__ == "__main__":

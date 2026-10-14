@@ -43,6 +43,28 @@ def _drop_sparse_indexer_weights(weights: Iterable[Tuple[str, torch.Tensor]]):
         logger.info("Step5: skipped %d sparse-indexer tensors (dense phase)", dropped)
 
 
+_PARAM_SUFFIXES = (".w13_weight", ".w2_weight", ".weight", ".bias")
+
+
+def _normalize_ignored_layers(quant_config: Optional[QuantizationConfig]) -> None:
+    """The checkpoint's modules_to_not_convert names parameters
+    ("...moe.experts.w13_weight"); sglang skips quantization by module prefix
+    ("...moe.experts"). Add the module form of every parameter-style entry."""
+    ignored = getattr(quant_config, "ignored_layers", None)
+    if not ignored:
+        return
+    extra = []
+    for name in ignored:
+        for suffix in _PARAM_SUFFIXES:
+            if name.endswith(suffix):
+                extra.append(name[: -len(suffix)])
+                break
+    merged = list(dict.fromkeys([*ignored, *extra]))
+    if len(merged) != len(ignored):
+        quant_config.ignored_layers = merged
+        logger.info("Step5: expanded %d parameter-style ignore entries to module prefixes", len(merged) - len(ignored))
+
+
 class Step5ForCausalLM(Step3p5ForCausalLM):
     def __init__(
         self,
@@ -50,6 +72,7 @@ class Step5ForCausalLM(Step3p5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        _normalize_ignored_layers(quant_config)
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

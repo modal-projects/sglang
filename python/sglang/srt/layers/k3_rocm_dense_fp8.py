@@ -115,15 +115,10 @@ class StaticFP8Weight:
             self._MAX_TOKENS, 1, dtype=torch.float32, device=weight.device
         )
 
-    @property
-    def shape(self) -> torch.Size:
-        return self.weight.shape
-
     def __call__(
         self,
         x: torch.Tensor,
         out_dtype: torch.dtype | None = None,
-        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         import aiter
 
@@ -146,11 +141,7 @@ class StaticFP8Weight:
             y = aiter.gemm_a8w8_bpreshuffle(
                 xq, self.weight, self.x_scale[:m], self.w_scale, dtype=dtype
             )
-        y = y.reshape(*x.shape[:-1], self.n)
-        if out is not None:
-            out.copy_(y)
-            return out
-        return y
+        return y.reshape(*x.shape[:-1], self.n)
 
 
 class StaticFP8LinearMethod:

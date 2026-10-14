@@ -25,16 +25,9 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.k3_route_sort import SORT_QCHUNK, _sort_quant_program
+from sglang.kernels.ops.moe.k3_route_sort_mid import _aiter_biased_topk
 
 _SITU_BLOCK = 256
-
-
-@triton.jit
-def _score_key(s, idx):
-    # order-preserving int64 key: higher score first, lower expert id on ties
-    b = s.to(tl.int32, bitcast=True)
-    k = tl.where(b >= 0, b, b ^ 0x7FFFFFFF).to(tl.int64)
-    return (k << 32) | (0xFFFF - idx).to(tl.int64)
 
 
 @triton.jit
@@ -78,21 +71,16 @@ def _topk_program(
     RENORM: tl.constexpr,
 ):
     offs_e = tl.arange(0, E_POW2)
-    me = offs_e < E
-    lg = tl.load(lg_ptr + t * stride_lg + offs_e, mask=me, other=0.0).to(tl.float32)
-    # the bias is rounded to the logits dtype first, as aiter's router does
-    bias = (
-        tl.load(bias_ptr + offs_e, mask=me, other=0.0)
-        .to(lg_ptr.dtype.element_ty)
-        .to(tl.float32)
+    ids, wt = _aiter_biased_topk(
+        lg_ptr + t * stride_lg,
+        bias_ptr,
+        offs_e,
+        offs_e < E,
+        E_POW2,
+        TOPK,
+        RENORM,
+        routed_scale,
     )
-    biased = tl.where(me, tl.sigmoid(lg) + bias, float("-inf"))
-    top = tl.topk(_score_key(biased, offs_e), TOPK, dim=0)  # descending
-    ids = (0xFFFF - (top & 0xFFFF)).to(tl.int32)
-    wt = tl.sigmoid(tl.load(lg_ptr + t * stride_lg + ids).to(tl.float32))
-    if RENORM:
-        wt = wt / tl.sum(wt, axis=0)
-    wt = wt * routed_scale
     offs_k = tl.arange(0, TOPK)
     tl.store(topk_ids_ptr + t * TOPK + offs_k, ids)
     tl.store(topk_w_ptr + t * TOPK + offs_k, wt)

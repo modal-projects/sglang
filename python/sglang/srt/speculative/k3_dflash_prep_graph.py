@@ -109,8 +109,7 @@ class K3DFlashPrepGraph:
         return pg
 
     def _bucket_sizes(self):
-
-        cap = int(16)
+        cap = 16
         return sorted({int(b) for b in self.runner.capture_bs if 0 < int(b) <= cap})
 
     def capture_all(self) -> None:

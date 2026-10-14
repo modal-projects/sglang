@@ -1,3 +1,4 @@
+import collections
 import logging
 import math
 import os
@@ -20,8 +21,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-
-_PINNED_KEEPALIVE = __import__("collections").deque(maxlen=64)
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -112,6 +111,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# pinned sources of in-flight non_blocking H2D copies (SGLANG_ROCM_NO_EXTEND_SYNC)
+_PINNED_KEEPALIVE = collections.deque(maxlen=64)
 
 _FusedKVMaterializeHelper = None
 

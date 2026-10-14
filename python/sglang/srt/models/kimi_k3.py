@@ -773,7 +773,7 @@ class KimiK3MoE(nn.Module):
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
         if _is_hip and not self._front_is_ep_pair:
-            from sglang.srt.layers import k3_rocm_dense_fp8
+            from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
             if k3_rocm_dense_fp8.front_enabled():
                 # One E4M3 copy of the merged front; the bf16 component weights
@@ -2257,7 +2257,7 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_npu:
             return
         if _is_hip:
-            from sglang.srt.layers import k3_rocm_dense_fp8
+            from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
             if k3_rocm_dense_fp8.qkvg_enabled():
                 # E4M3 q/k/v/g like the CUDA "wide" scope; f_a/b stay bf16, so the

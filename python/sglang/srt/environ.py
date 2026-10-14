@@ -948,6 +948,7 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    SGLANG_ROCM_TRITON_ROUTE = EnvBool(True)
     SGLANG_SHORT_PREFILL_SCAN_WAITING = EnvBool(False)
     SGLANG_SHORT_PREFILL_THRESHOLD = EnvInt(0)
     SGLANG_SHORT_PREFILL_CHUNK = EnvInt(0)

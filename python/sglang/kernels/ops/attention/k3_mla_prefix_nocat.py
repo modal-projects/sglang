@@ -25,7 +25,7 @@ MI355X, one layer, 12 heads, K/V build only: 3x(90k+9k) rows 2.67 -> 1.45 ms,
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -62,12 +62,13 @@ def _k3_prefix_gather_kernel(
         mask=rmask[:, None],
     )
 
-    offs_r = tl.arange(0, ROPE)[None, :]
-    pe = tl.load(src + LORA + offs_r, mask=rmask[:, None], other=0.0)
-    pe = pe.to(kpe_ptr.dtype.element_ty)
-    dst = kpe_ptr + rows64 * s_kpe_n + offs_r
-    for h in tl.static_range(H):
-        tl.store(dst + h * s_kpe_h, pe, mask=rmask[:, None])
+    if H > 0:  # H == 0: latent only
+        offs_r = tl.arange(0, ROPE)[None, :]
+        pe = tl.load(src + LORA + offs_r, mask=rmask[:, None], other=0.0)
+        pe = pe.to(kpe_ptr.dtype.element_ty)
+        dst = kpe_ptr + rows64 * s_kpe_n + offs_r
+        for h in tl.static_range(H):
+            tl.store(dst + h * s_kpe_h, pe, mask=rmask[:, None])
 
 
 @triton.jit
@@ -92,15 +93,18 @@ def _gather_dequant(
     cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kvc: torch.Tensor,
-    kpe_dst: torch.Tensor,
+    kpe_dst: Optional[torch.Tensor],
     kv_lora_rank: int,
     rope_dim: int,
 ) -> None:
+    """kvc <- cache[kv_indices, :lora]; kpe_dst[:, h] <- cache[kv_indices, lora:]."""
     n = kv_indices.shape[0]
     if n == 0:
         return
     cache2d = cache.view(cache.shape[0], -1)
     assert cache2d.shape[1] == kv_lora_rank + rope_dim and cache2d.stride(1) == 1
+    if kpe_dst is None:
+        kpe_dst = kvc.new_empty((0, 0, 1))
     assert kpe_dst.dim() == 3 and kpe_dst.stride(2) == 1
     block_n = 8
     _k3_prefix_gather_kernel[(triton.cdiv(n, block_n),)](

@@ -1039,6 +1039,7 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton

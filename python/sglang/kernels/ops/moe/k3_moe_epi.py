@@ -8,8 +8,8 @@ shared_down_topk: one launch that does two independent jobs of the fused
       its prologue:  out[M, N] = bf16(situ(gate) * up) @ w_down[N, I]^T
       (replaces sglang::situ_and_mul + the hipBLASLt down GEMM)
     * CTAs [n_gemm, n_gemm + M): sigmoid + correction-bias top-k of the router
-      logits, one CTA per token (same math as k3_route_sort._k3_topk_kernel /
-      aiter biased_grouped_topk with one group).
+      logits, one CTA per token (same math as aiter biased_grouped_topk with one
+      group).
 """
 
 from __future__ import annotations

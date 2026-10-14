@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode routing kernels for the ROCm aiter MoE runner.
 
-_k3_topk_kernel: sigmoid + correction-bias top-k, one CTA per token (replaces
-aiter's topk_reg kernel). _k3_sort_quant_kernel: MoE sorting + stage-1 mxfp8
-activation quant + moe_buf zeroing in one launch for M <= block_size, where
-every used expert owns exactly one block, so there is no cross-CTA ordering
-(replaces moe_sorting_small's distributed kernel at decode sizes).
+_k3_sort_quant_kernel: MoE sorting + stage-1 mxfp8 activation quant + moe_buf
+zeroing in one launch for M <= block_size, where every used expert owns exactly
+one block, so there is no cross-CTA ordering (replaces moe_sorting_small's
+distributed kernel at decode sizes).
 
 Output layouts are identical to moe_sorting_small (and therefore aiter):
   sorted_ids[i]        = (topk_slot << 24) | token   (padding: (topk << 24) | M)
@@ -16,53 +15,8 @@ Output layouts are identical to moe_sorting_small (and therefore aiter):
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _score_key(s, idx):
-    # order-preserving int64 key: higher score first, lower expert id on ties
-    b = s.to(tl.int32, bitcast=True)
-    k = tl.where(b >= 0, b, b ^ 0x7FFFFFFF).to(tl.int64)
-    return (k << 32) | (0xFFFF - idx).to(tl.int64)
-
-
-@triton.jit(do_not_specialize=["stride_lg"])
-def _k3_topk_kernel(
-    logits_ptr,  # [M, E] fp32/bf16, row stride stride_lg
-    stride_lg,
-    bias_ptr,  # [E] correction bias
-    topk_ids_ptr,  # [M, TOPK] i32 out
-    topk_weights_ptr,  # [M, TOPK] fp32 out
-    routed_scale,
-    E: tl.constexpr,
-    E_POW2: tl.constexpr,
-    TOPK: tl.constexpr,
-    RENORM: tl.constexpr,
-):
-    # one CTA per token: top-k of sigmoid(logit) + bias, weights = renormalized sigmoid
-    t = tl.program_id(0)
-    offs_e = tl.arange(0, E_POW2)
-    me = offs_e < E
-    lg = tl.load(logits_ptr + t * stride_lg + offs_e, mask=me, other=0.0).to(tl.float32)
-    # the bias is rounded to the logits dtype first, as the aiter router does
-    bias = (
-        tl.load(bias_ptr + offs_e, mask=me, other=0.0)
-        .to(logits_ptr.dtype.element_ty)
-        .to(tl.float32)
-    )
-    biased = tl.where(me, tl.sigmoid(lg) + bias, float("-inf"))
-    top = tl.topk(_score_key(biased, offs_e), TOPK, dim=0)  # descending
-    ids = (0xFFFF - (top & 0xFFFF)).to(tl.int32)
-    w = tl.sigmoid(tl.load(logits_ptr + t * stride_lg + ids).to(tl.float32))
-    if RENORM:
-        w = w / tl.sum(w, axis=0)
-    w = w * routed_scale
-    offs_k = tl.arange(0, TOPK)
-    tl.store(topk_ids_ptr + t * TOPK + offs_k, ids)
-    tl.store(topk_weights_ptr + t * TOPK + offs_k, w)
 
 
 @triton.jit(do_not_specialize=["M", "stride_qx"])
@@ -170,36 +124,6 @@ def _k3_sort_quant_kernel(
     tl.store(
         qscale_ptr + sw,
         tl.broadcast_to(exp[None, :], (TOPK, QCHUNK // 32)).to(tl.uint8),
-    )
-
-
-def biased_topk_sigmoid(
-    gating_output: torch.Tensor,  # [M, E] (row-strided ok)
-    correction_bias: torch.Tensor,
-    topk_weights: torch.Tensor,  # [M, topk] fp32 out
-    topk_ids: torch.Tensor,  # [M, topk] i32 out
-    renormalize: bool,
-    routed_scale: float = 1.0,
-) -> None:
-    """top-k of sigmoid(logit) + bias (bias rounded to the logits dtype, as
-    aiter's biased_grouped_topk does); weights = renormalized sigmoid."""
-    M, E = gating_output.shape
-    if M == 0:
-        return
-    topk = topk_ids.shape[1]
-    assert E < 0xFFFF and topk & (topk - 1) == 0 and gating_output.stride(1) == 1
-    _k3_topk_kernel[(M,)](
-        gating_output,
-        gating_output.stride(0),
-        correction_bias,
-        topk_ids,
-        topk_weights,
-        float(routed_scale),
-        E=E,
-        E_POW2=triton.next_power_of_2(E),
-        TOPK=topk,
-        RENORM=renormalize,
-        num_warps=4,
     )
 
 

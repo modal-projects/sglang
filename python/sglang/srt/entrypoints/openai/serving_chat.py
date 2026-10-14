@@ -220,10 +220,6 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
-# Moonshot fixes top_p at 0.95 and temperature at 1.0 for K3 (prod parity).
-KIMI_K3_DEFAULT_TOP_P = 0.95
-KIMI_K3_DEFAULT_TEMPERATURE = 1.0
-
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
@@ -1034,23 +1030,6 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tool_call_parser
         )
 
-    def _apply_kimi_k3_sampling_defaults(
-        self,
-        sampling_params: Dict[str, Any],
-        requested_top_p: Optional[float],
-        requested_temperature: Optional[float],
-    ) -> None:
-        """Supply Moonshot's fixed sampling values when nothing else does."""
-        if self.chat_encoding_spec != "kimi_k3":
-            return
-        if requested_top_p is None and "top_p" not in self.default_sampling_params:
-            sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
-        if (
-            requested_temperature is None
-            and "temperature" not in self.default_sampling_params
-        ):
-            sampling_params["temperature"] = KIMI_K3_DEFAULT_TEMPERATURE
-
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
         """Validate that the input is valid."""
         if not request.messages:
@@ -1286,9 +1265,6 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
-        )
-        self._apply_kimi_k3_sampling_defaults(
-            sampling_params, request.top_p, request.temperature
         )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids

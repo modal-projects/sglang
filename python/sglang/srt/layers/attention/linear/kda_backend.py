@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 from typing import Optional, Tuple, Union
 
@@ -17,6 +18,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -438,7 +440,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
-            and verify_backend.is_triton()
+            # nv_cutedsl resolves to the Triton verify kernel off CUDA
+            and (
+                verify_backend.is_triton()
+                or (not is_cuda() and verify_backend.is_nv_cutedsl())
+            )
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
             from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
@@ -905,35 +911,48 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-            beta_is_raw=gate_was_flat,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            layer_id=layer.layer_id,
-            # draft_extend_v2 must stay rollback-able, so kernels that commit state
-            # in place (e.g. FlashKDA) must not run for it.
-            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
-            # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
-            # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
-            track_state=h_track_buf,
-            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
-        )
+        hint = contextlib.nullcontext()
+        lens_cpu = forward_batch.extend_seq_lens_cpu
+        if (
+            envs.SGLANG_ROCM_NO_EXTEND_SYNC.get()
+            and lens_cpu is not None
+            and query_start_loc is not None
+            and query_start_loc.numel() == len(lens_cpu) + 1
+            and sum(lens_cpu) == q.shape[1]
+        ):
+            from sglang.kernels.ops.attention.fla.index import cpu_seqlens_hint
+
+            hint = cpu_seqlens_hint(query_start_loc, lens_cpu)
+        with hint:
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+                beta_is_raw=gate_was_flat,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_prefix_lens=forward_batch.extend_prefix_lens,
+                layer_id=layer.layer_id,
+                # draft_extend_v2 must stay rollback-able, so kernels that commit state
+                # in place (e.g. FlashKDA) must not run for it.
+                is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                return_intermediate_states=track_ssm,
+                # Which global chunk rows of h the track snapshot will read; lets
+                # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+                # fast path when the snapshot only needs the final state.
+                track_ssm_h_src=(
+                    self.forward_metadata.track_ssm_h_src if track_ssm else None
+                ),
+                track_state=h_track_buf,
+                track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
@@ -1028,15 +1047,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        if not pp_spec_stable_rows_enabled():
+            # The row mask below is only read with PP spec; building it
+            # eagerly costs one elementwise launch per layer.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+        else:
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1095,7 +1120,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             ):
-                return self._fused_chain_verify_fn(
+                out = self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
                     conv_weight=layer.conv_weights,
                     conv_bias=layer.bias,
@@ -1125,7 +1150,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
                     **ring_kwargs,
+                    **(
+                        {"block_v": self._k3_verify_block_v(layer, batch_size)}
+                        if replayssm_on and is_hip()
+                        else {}
+                    ),
                 )
+                return out
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1276,8 +1307,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        hip_ring = replayssm_on and is_hip()
+        if (
+            replayssm_on
+            and not hip_ring
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1324,10 +1361,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
+        # ReplaySSM ring (no intermediate-ssm cache): the kernel only reads
+        # ssm_states (h0, upcast to fp32 in-kernel, as the unfused
+        # fused_sigmoid_gating_delta_rule_update does), so a bf16 state pool
+        # (--mamba-ssm-dtype bfloat16) is fine there.
+        ssm_dtype_ok = ssm_states.dtype == torch.float32 or (
+            replayssm_on
+            and hip_ring
+            and ssm_states.dtype in (torch.bfloat16, torch.float16)
+        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or ssm_states.dtype != torch.float32
+            or not ssm_dtype_ok
         ):
             return False
         if replayssm_on:
@@ -1355,8 +1401,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
+        a_width = layer.head_k_dim * layer.num_v_heads
         if (
-            a.numel() != seq_len * layer.num_v_heads * layer.head_k_dim
+            a.numel() != seq_len * a_width
             or b.numel() != seq_len * layer.num_v_heads
             or layer.A_log.numel() != layer.num_v_heads
             or layer.dt_bias.numel() != layer.num_v_heads * layer.head_k_dim
@@ -1408,6 +1455,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not replayssm_on:
             tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _k3_verify_block_v(layer: RadixLinearAttention, batch_size: int):
+        """V-tile width for the fused chain-verify kernel on gfx950 at the K3
+        TP8 shard (12 heads of 128): narrow tiles win at small batch (more CTAs
+        per serial T-step chain), 16-wide tiles from 8 requests up, where the
+        per-tile duplicated q/k conv work dominates. Bit-exact across widths
+        (the V tiling never touches the K-axis reduction order)."""
+        if layer.head_v_dim == 128 and batch_size >= 8:
+            return 16
+        return None
 
     @staticmethod
     def _replayssm_ring_ok(

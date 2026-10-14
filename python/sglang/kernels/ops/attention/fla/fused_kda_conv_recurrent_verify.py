@@ -124,6 +124,7 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    NV: tl.constexpr = 1,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -217,7 +218,6 @@ def fused_kda_conv_gating_verify_kernel(
 
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
-
     for t in tl.static_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
         # then silu; accumulation order and dtypes mirror the unfused kernel) ----
@@ -451,6 +451,7 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    block_v: Optional[int] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -493,12 +494,13 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
+    if block_v is not None:
+        BV = min(triton.next_power_of_2(V), block_v)
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
     b2 = b.reshape(seq_len, HV)
     assert a2.stride(-1) == 1 and b2.stride(-1) == 1
-
     o = mixed_qkv.new_empty(seq_len, HV, V)
 
     if intermediate_conv_window is not None:
@@ -618,6 +620,7 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        NV=NV,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,
@@ -625,3 +628,73 @@ def fused_kda_conv_gating_verify(
         **pdl_kwargs,
     )
     return o.view(1, seq_len, HV, V)
+
+
+@triton.jit
+def _kda_onorm_gated_strided_kernel(
+    x,  # [rows = seq_len * HV, D] contiguous, normalized in place
+    g,  # [seq_len, HV * D] gate, row stride stride_g_tok
+    w,  # [D]
+    eps,
+    stride_g_tok,
+    R,
+    HV: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # Same tile shape and math as layer_norm_gated_fwd_kernel (RMS, sigmoid
+    # gate, weight, no bias/residual) but reads the gate through its row stride,
+    # so the strided [q,k,v,g] slice needs no contiguous copy first.
+    i_t = tl.program_id(0)
+    o_r = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_r = o_r < R
+    m_d = o_d < D
+    m = m_r[:, None] & m_d[None, :]
+    p_x = x + o_r[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m, other=0.0).to(tl.float32)
+    b_xbar = tl.where(m_d[None, :], b_x, 0.0)
+    b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
+    b_rstd = 1 / tl.sqrt(b_var + eps)
+    b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
+    b_y = b_x * b_rstd[:, None]
+    b_y = b_y * b_w[None, :]
+    tok = o_r // HV
+    head = o_r % HV
+    p_g = (
+        g + tok[:, None].to(tl.int64) * stride_g_tok + head[:, None] * D + o_d[None, :]
+    )
+    b_g = tl.load(p_g, mask=m, other=0.0).to(tl.float32)
+    b_y = b_y * tl.sigmoid(b_g)
+    tl.store(p_x, b_y.to(p_x.dtype.element_ty), mask=m)
+
+
+def kda_onorm_gated_strided(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """In-place gated RMSNorm (sigmoid gate) of the KDA output ``x`` [.., HV, D]
+    with ``gate`` [seq_len, HV*D] read through its row stride. Equivalent to
+    FusedRMSNormGated(activation="sigmoid")(x, gate.unflatten(-1, (HV, D))),
+    minus the contiguous copy of the strided gate that call makes."""
+    D = x.shape[-1]
+    HV = x.shape[-2]
+    assert x.is_contiguous() and gate.dim() == 2 and gate.stride(-1) == 1
+    assert gate.shape[-1] == HV * D and weight.shape == (D,)
+    R = x.numel() // D
+    assert gate.shape[0] * HV == R
+    BT = 32
+    _kda_onorm_gated_strided_kernel[(triton.cdiv(R, BT),)](
+        x,
+        gate,
+        weight,
+        float(eps),
+        gate.stride(0),
+        R,
+        HV=HV,
+        D=D,
+        BT=BT,
+        BD=triton.next_power_of_2(D),
+        num_warps=4,
+    )
+    return x

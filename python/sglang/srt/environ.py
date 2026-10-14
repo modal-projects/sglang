@@ -948,6 +948,10 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
+    SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)
+    SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     SGLANG_SHORT_PREFILL_SCAN_WAITING = EnvBool(False)
     SGLANG_SHORT_PREFILL_THRESHOLD = EnvInt(0)
     SGLANG_SHORT_PREFILL_CHUNK = EnvInt(0)

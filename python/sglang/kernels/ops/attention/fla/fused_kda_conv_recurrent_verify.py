@@ -450,7 +450,6 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
-    block_v: Optional[int] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -493,8 +492,10 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
-    if block_v is not None:
-        BV = min(triton.next_power_of_2(V), block_v)
+    elif is_hip_runtime() and cache_ring and V == 128 and B >= 8:
+        # gfx950 ReplaySSM ring at 12 heads of 128 (Kimi-K3 TP8): from 8
+        # requests up the per-tile duplicated q/k conv work dominates.
+        BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)

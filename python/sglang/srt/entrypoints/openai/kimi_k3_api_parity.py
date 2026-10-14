@@ -1,15 +1,32 @@
-"""Kimi-K3 request validation matching Modal's production K3 endpoint.
+"""Kimi-K3 request validation and sampling defaults matching Modal's
+production K3 endpoint.
 
 Requests outside the sampling envelope target-only verification supports, or
 asking for an effort tier K3 cannot honor, are rejected rather than silently
 adjusted.
 """
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
+# Moonshot fixes top_p at 0.95 and temperature at 1.0 for K3 (prod parity).
+KIMI_K3_DEFAULT_TOP_P = 0.95
+KIMI_K3_DEFAULT_TEMPERATURE = 1.0
+
+
+def apply_sampling_defaults(
+    sampling_params: Dict[str, Any],
+    model_defaults: Dict[str, Any],
+    requested_top_p: Optional[float],
+    requested_temperature: Optional[float],
+) -> None:
+    """Supply Moonshot's fixed sampling values when nothing else does."""
+    if requested_top_p is None and "top_p" not in model_defaults:
+        sampling_params["top_p"] = KIMI_K3_DEFAULT_TOP_P
+    if requested_temperature is None and "temperature" not in model_defaults:
+        sampling_params["temperature"] = KIMI_K3_DEFAULT_TEMPERATURE
 
 
 def validate_sampling_envelope(

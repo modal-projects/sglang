@@ -71,6 +71,23 @@ class TestKimiK3ReasoningEffort(CustomTestCase):
         )
 
 
+class TestKimiK3SamplingDefaults(CustomTestCase):
+    def _apply(self, model_defaults, top_p=None, temperature=None):
+        params = {"top_p": 1.0, "temperature": 0.7}
+        kimi_k3_api_parity.apply_sampling_defaults(
+            params, model_defaults, top_p, temperature
+        )
+        return params
+
+    def test_omitted_values_get_moonshot_defaults(self):
+        self.assertEqual(self._apply({}), {"top_p": 0.95, "temperature": 1.0})
+
+    def test_request_and_generation_config_values_win(self):
+        unchanged = {"top_p": 1.0, "temperature": 0.7}
+        self.assertEqual(self._apply({}, top_p=1.0, temperature=0.7), unchanged)
+        self.assertEqual(self._apply({"top_p": 1.0, "temperature": 0.7}), unchanged)
+
+
 class TestKimiK3ServingGates(CustomTestCase):
     def setUp(self):
         reset_context()

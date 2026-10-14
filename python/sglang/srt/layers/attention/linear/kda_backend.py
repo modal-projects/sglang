@@ -1345,7 +1345,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             ):
-                out = self._fused_chain_verify_fn(
+                return self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
                     conv_weight=layer.conv_weights,
                     conv_bias=layer.bias,
@@ -1375,13 +1375,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
                     **ring_kwargs,
-                    **(
-                        {"block_v": self._k3_verify_block_v(layer, batch_size)}
-                        if replayssm_on and is_hip()
-                        else {}
-                    ),
                 )
-                return out
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1680,17 +1674,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not replayssm_on:
             tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
-
-    @staticmethod
-    def _k3_verify_block_v(layer: RadixLinearAttention, batch_size: int):
-        """V-tile width for the fused chain-verify kernel on gfx950 at the K3
-        TP8 shard (12 heads of 128): narrow tiles win at small batch (more CTAs
-        per serial T-step chain), 16-wide tiles from 8 requests up, where the
-        per-tile duplicated q/k conv work dominates. Bit-exact across widths
-        (the V tiling never touches the K-axis reduction order)."""
-        if layer.head_v_dim == 128 and batch_size >= 8:
-            return 16
-        return None
 
     @staticmethod
     def _replayssm_ring_ok(

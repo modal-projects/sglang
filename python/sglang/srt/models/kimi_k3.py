@@ -2618,6 +2618,62 @@ class KimiK3DeltaAttention(nn.Module):
             return partial
         return self.o_proj(core_attn_out)[0]
 
+    def _k3_onorm_oproj(
+        self, core_attn_out: torch.Tensor, g_proj_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """ROCm fused KDA o_norm + o_proj (target verify, M <= MAX_M):
+        the gated o_norm (sigmoid gate read through its row stride) in the
+        prologue of the o_proj GEMM -- one HIP kernel instead of
+        _kda_onorm_gated_strided_kernel + the tuned hgemm. Returns o_proj's
+        TP-partial output, or None when not covered (caller runs the unfused
+        pair). Only on the deferred-reduce o_proj (fused AllReduce + aggregation:
+        the decoder layer completes the reduction)."""
+        if not _is_hip:
+            return None
+        m = g_proj_states.shape[0] if g_proj_states.dim() == 2 else -1
+        if not (0 < m <= 8):
+            return None
+        o_proj = self.o_proj
+        w = getattr(o_proj, "weight", None)
+        if (
+            self.all_reduce_fusion
+            or o_proj.reduce_results
+            or getattr(o_proj, "bias", None) is not None
+            or type(o_proj.quant_method).__name__ != "UnquantizedLinearMethod"
+            or not isinstance(w, torch.Tensor)
+            or type(w.data) is not torch.Tensor
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or self.o_norm.activation != "sigmoid"
+            or self.o_norm.weight is None
+            or self.o_norm.weight.shape != (core_attn_out.shape[-1],)
+            or not core_attn_out.is_contiguous()
+            or core_attn_out.dtype != torch.bfloat16
+            or core_attn_out.numel() != m * w.shape[1]
+            or g_proj_states.stride(-1) != 1
+            or g_proj_states.stride(0) % 8 != 0
+            or g_proj_states.shape[1] != w.shape[1]
+        ):
+            return None
+        from sglang.kernels.ops.gemm import k3_norm_gemm
+
+        if not k3_norm_gemm.hip_onorm_supported(
+            m, w.shape[1], w.shape[0], self.o_norm.weight.shape[0]
+        ):
+            return None
+        nw = self.__dict__.get("_k3_onorm_w32")
+        if nw is None:  # first (eager warm-up) call, before graph capture
+            nw = self.o_norm.weight.detach().float().contiguous()
+            self.__dict__["_k3_onorm_w32"] = nw
+        return k3_norm_gemm.kda_onorm_oproj_hip(
+            core_attn_out.view(m, -1),
+            g_proj_states,
+            nw,
+            float(self.o_norm.eps),
+            w,
+        )
+
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
@@ -2928,6 +2984,25 @@ class KimiK3DecoderLayer(nn.Module):
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the layer's own AR call-site must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+
+        o_proj = getattr(self.self_attn, "o_proj", None)
+        # O_proj emits TP-partial sums; the
+        # layer completes the reduction fused with the MLP-side aggregation
+        # (plain all-reduce when the fused kernel does not apply)
+        self._rocm_ar_agg = (
+            _is_hip
+            and not self._sp_moe
+            and not self.all_reduce_fusion
+            and config.attn_res_block_size is not None
+            and o_proj is not None
+            and get_parallel().attn_tp_size == 8
+            and get_parallel().attn_tp_size == get_parallel().tp_size
+        )
+        if self._rocm_ar_agg:
+            o_proj.reduce_results = False
+        # set per forward by the model loop: the next decoder layer whose
+        # attention-side aggregation rides this layer's MoE all-gather
+        self._ag_agg_next = None
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -3267,6 +3342,21 @@ class KimiK3DecoderLayer(nn.Module):
                         # the first sharded layer still holds a full-batch prefix.
                         if prefix_sum.shape[0] != hidden_states.shape[0]:
                             prefix_sum = prefix_sum[rows]
+        elif self._rocm_ar_agg:
+            group = get_parallel().attn_tp_group
+            fused = attn_res.forward_ar_fused(
+                group.ca_comm,
+                hidden_states,
+                prefix_sum,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+            if fused is not None:
+                hidden_states, prefix_sum = fused
+                agg2_fused = True
+            else:
+                hidden_states = group.all_reduce(hidden_states)
         elif self.all_reduce_fusion:
             # Complete the o_proj reduce here, folding the pending prefix add
             # into the fused all-reduce; attn_res then takes the pre-added
@@ -3288,9 +3378,18 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        nxt = self._ag_agg_next
+        if nxt is not None and shard_lo < 0:
+            # The MoE up_proj all-gather also
+            # runs the next layer's attention-side aggregation
+            self.mlp._ag_agg_ctx = (attn_res, nxt)
+        try:
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
+        finally:
+            if nxt is not None:
+                self.mlp._ag_agg_ctx = None
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
@@ -3311,6 +3410,9 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # Fused AllReduce + aggregation with the up_proj all-gather tail: the
+        # next layer's attention-side aggregation rides the MoE all-gather
+        self._ag_agg_fused = _is_hip
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
 
@@ -3457,6 +3559,8 @@ class KimiK3LinearModel(nn.Module):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
+            if self._ag_agg_fused and attn_res is not None:
+                self.layers[i]._ag_agg_next = self._ag_agg_next_layer(i)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual, sp_sharded = self.layers[i](
                     positions=positions,
@@ -3473,9 +3577,17 @@ class KimiK3LinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
-                )
+                if not self._dspark_defer_capture(
+                    i, hidden_states, residual, attn_res, aux_hidden_states, sp_sharded
+                ):
+                    aux_hidden_states.append(
+                        self._dspark_capture_stream(
+                            i, hidden_states, residual, attn_res
+                        )
+                    )
+
+        if attn_res is not None:
+            attn_res.flush_stream()
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3543,6 +3655,60 @@ class KimiK3LinearModel(nn.Module):
         return (
             self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
         )
+
+    def _ag_agg_next_layer(self, i: int):
+        """Layer i + 1 when its attention-side aggregation can be computed by
+        layer i's MoE all-gather kernel, else
+        None. dspark capture layers keep the unfused path (their stream
+        capture rides the next aggregation itself)."""
+        if i + 1 >= self.end_layer:
+            return None
+        if (
+            self.dspark_layers_to_capture is not None
+            and i in self.dspark_layers_to_capture
+        ):
+            return None
+        nxt = self.layers[i + 1]
+        if not getattr(nxt, "_rocm_ar_agg", False) or not getattr(
+            nxt, "use_attn_residuals", False
+        ):
+            return None
+        return nxt
+
+    def _dspark_defer_capture(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        attn_res: Optional[AttnResidual],
+        aux_hidden_states,
+        sp_sharded: bool,
+    ) -> bool:
+        """Instead of a standalone aggregate_stream
+        launch plus the packer's copy, claim the packed aux slot and let the
+        next layer's attention-side aggregation (same stream head, same
+        weights, same rows) write the pre-norm mixture into it in place.
+        Returns False when the capture must run eagerly."""
+        if (
+            attn_res is None
+            or residual is not None
+            or sp_sharded
+            or layer_idx + 1 >= self.end_layer
+            or not isinstance(aux_hidden_states, AuxHiddenStatePacker)
+        ):
+            return False
+        next_layer = self.layers[layer_idx + 1]
+        nvb = next_layer.prev_valid_blocks
+        if not attn_res.can_defer_stream(hidden_states, nvb):
+            return False
+        attn_res.defer_stream(
+            aux_hidden_states.reserve(hidden_states),
+            hidden_states,
+            nvb,
+            next_layer.self_attention_res_proj,
+            next_layer.self_attention_res_norm,
+        )
+        return True
 
     def _dspark_capture_stream(
         self,

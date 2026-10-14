@@ -1193,8 +1193,7 @@ def build_hybrid_mamba_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
+        *_k3_mamba_host_sizing(get_memory().hicache_ratio, mamba_host_size),
         allocator_type=_get_allocator_type(),
         layout=mamba_layout,
     )
@@ -1307,8 +1306,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
+        *_k3_mamba_host_sizing(get_memory().hicache_ratio, mamba_host_size),
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
     )
@@ -2408,3 +2406,12 @@ def build_minimax_sparse_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
+
+
+def _k3_mamba_host_sizing(hicache_ratio, mamba_host_size):
+    from sglang.srt.environ import envs
+
+    ratio = envs.SGLANG_K3_HICACHE_MAMBA_RATIO.get()
+    if ratio > 0:
+        return ratio, 0
+    return hicache_ratio, mamba_host_size

@@ -44,7 +44,7 @@ class SSEKeepaliveMiddleware:
     def __init__(self, app: ASGIApp, interval: float | None = None):
         self.app = app
         if interval is None:
-            interval = envs.SGLANG_K3_SSE_KEEPALIVE_S.get()
+            interval = envs.SGLANG_SSE_KEEPALIVE_S.get()
         self.interval = interval
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

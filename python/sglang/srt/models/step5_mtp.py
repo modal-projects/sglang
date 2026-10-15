@@ -25,6 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step5 import (
+    _step5_resolve_checkpoint_dir,
     Step5DecoderLayer,
     Step5ForCausalLM,
 )
@@ -178,8 +179,10 @@ class Step5MTP(nn.Module):
         ):
             raise ValueError("Step5 draft requires a resolved effective vocabulary")
         self.config = config
-        self.checkpoint_path = (
-            get_spec().speculative_draft_model_path or get_model().model_path
+        _spec = get_spec()
+        self.checkpoint_path = _step5_resolve_checkpoint_dir(
+            _spec.speculative_draft_model_path or get_model().model_path,
+            getattr(_spec, "speculative_draft_model_revision", None),
         )
         self.quant_config = quant_config
         self.draft_model_idx = draft_model_idx

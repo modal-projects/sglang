@@ -339,7 +339,7 @@ def _step5_routed_expert_row(name: str, num_experts: int) -> tuple[str, int] | N
     return f"{head}.moe.{projection}", int(expert)
 
 
-def _step5_resolve_checkpoint_dir(model_path):
+def _step5_resolve_checkpoint_dir(model_path, revision=None):
     """Map an HF repo id to its cached snapshot directory so index-driven loading
     (duplicate-shard arbitration, NVFP4 layer detection) works when the server is
     launched with ``--model-path <repo_id> --revision <sha>`` rather than a local
@@ -351,7 +351,7 @@ def _step5_resolve_checkpoint_dir(model_path):
 
         return snapshot_download(
             model_path,
-            revision=getattr(get_model(), "revision", None),
+            revision=revision if revision is not None else getattr(get_model(), "revision", None),
             local_files_only=True,
             allow_patterns=["model.safetensors.index.json"],
         )

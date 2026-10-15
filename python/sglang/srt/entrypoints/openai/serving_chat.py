@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv4,
     encoding_dsv32,
     encoding_dsv41,
+    kimi_k3_api_parity,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
@@ -1034,6 +1035,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if self.chat_encoding_spec == "kimi_k3":
+            kimi_k3_api_parity.drop_unsupported_reasoning_controls(request)
+
         if (
             request.chat_template_kwargs
             and "chat_template" in request.chat_template_kwargs
@@ -1260,6 +1264,13 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        if self.chat_encoding_spec == "kimi_k3":
+            kimi_k3_api_parity.apply_sampling_defaults(
+                sampling_params,
+                self.default_sampling_params,
+                request.top_p,
+                request.temperature,
+            )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
@@ -1358,6 +1369,9 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+            # Server defaults land after _validate_request, so re-check them.
+            if self.chat_encoding_spec == "kimi_k3":
+                kimi_k3_api_parity.drop_unsupported_reasoning_controls(request)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config

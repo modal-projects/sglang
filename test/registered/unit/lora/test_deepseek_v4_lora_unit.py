@@ -97,6 +97,31 @@ class TestTargetNormalization(unittest.TestCase):
         )
         self.assertEqual(got, {"self_attn.wq_b", "shared_experts.down_proj"})
 
+    def test_parent_qualified_cli_targets(self):
+        from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
+
+        cli = [
+            "attn.wq_a",
+            "attn.wkv",
+            "attn.wq_b",
+            "attn.wo_b",
+            "ffn.shared_experts.w1",
+            "ffn.shared_experts.w2",
+            "ffn.shared_experts.w3",
+        ]
+        self.assertTrue(set(cli) <= set(SUPPORTED_LORA_TARGET_MODULES))
+        self.assertEqual(
+            get_normalized_target_modules(cli, _AliasModel(False)),
+            {
+                "self_attn.wq_a",
+                "self_attn.wkv",
+                "self_attn.wq_b",
+                "self_attn.wo_b",
+                "shared_experts.gate_up_proj",
+                "shared_experts.down_proj",
+            },
+        )
+
     def test_other_models_keep_generic_mapping(self):
         self.assertEqual(get_normalized_target_modules(["wq_b"]), {"indexer.wq_b"})
         self.assertEqual(

@@ -4607,6 +4607,13 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "w1",
     "w2",
     "w3",
+    "attn.wq_a",
+    "attn.wkv",
+    "attn.wq_b",
+    "attn.wo_b",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

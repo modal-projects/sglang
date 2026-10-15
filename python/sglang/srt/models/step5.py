@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 import weakref
@@ -336,6 +337,26 @@ def _step5_routed_expert_row(name: str, num_experts: int) -> tuple[str, int] | N
     if not 0 <= int(expert) < num_experts:
         return None
     return f"{head}.moe.{projection}", int(expert)
+
+
+def _step5_resolve_checkpoint_dir(model_path):
+    """Map an HF repo id to its cached snapshot directory so index-driven loading
+    (duplicate-shard arbitration, NVFP4 layer detection) works when the server is
+    launched with ``--model-path <repo_id> --revision <sha>`` rather than a local
+    directory. Local paths are returned unchanged; nothing is downloaded."""
+    if not model_path or os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            model_path,
+            revision=getattr(get_model(), "revision", None),
+            local_files_only=True,
+            allow_patterns=["model.safetensors.index.json"],
+        )
+    except Exception:
+        return model_path
 
 
 def _step5_indexed_nvfp4_layers(checkpoint_path) -> dict[int, str] | None:
@@ -1423,7 +1444,7 @@ class Step5Model(nn.Module):
         super().__init__()
         self.attention_profile = parse_step5_attention_profile(config)
         self.nvfp4_expert_layouts = step5_nvfp4_expert_layouts(
-            config, quant_config, get_model().model_path
+            config, quant_config, _step5_resolve_checkpoint_dir(get_model().model_path)
         )
         self.nvfp4_expert_layers = frozenset(self.nvfp4_expert_layouts)
         parallel = get_parallel()
@@ -1529,7 +1550,7 @@ class Step5ForCausalLM(nn.Module):
                 "Step5 requires a resolved effective vocabulary at construction"
             )
         self.config = config
-        self.checkpoint_path = get_model().model_path
+        self.checkpoint_path = _step5_resolve_checkpoint_dir(get_model().model_path)
         self.quant_config = quant_config
         self.model = Step5Model(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)

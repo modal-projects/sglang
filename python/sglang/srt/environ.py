@@ -958,7 +958,7 @@ class Envs:
     SGLANG_SHORT_PREFILL_MAX_TOKENS = EnvInt(0)
     SGLANG_K3_HICACHE_MAMBA_RATIO = EnvFloat(0)
     SGLANG_API_EARLY_REJECT_MAX_CONCURRENCY = EnvInt(0)
-    SGLANG_K3_SSE_KEEPALIVE_S = EnvFloat(0)
+    SGLANG_SSE_KEEPALIVE_S = EnvFloat(0)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

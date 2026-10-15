@@ -101,10 +101,10 @@ class TestSSEKeepaliveMiddleware(CustomTestCase):
                 self.assertNotIn(KEEPALIVE_COMMENT, _bodies(sent))
 
     def test_interval_defaults_to_env(self):
-        with envs.SGLANG_K3_SSE_KEEPALIVE_S.override(15):
+        with envs.SGLANG_SSE_KEEPALIVE_S.override(15):
             self.assertEqual(SSEKeepaliveMiddleware(_app(0)).interval, 15)
         with patch.dict(os.environ):
-            envs.SGLANG_K3_SSE_KEEPALIVE_S.clear()
+            envs.SGLANG_SSE_KEEPALIVE_S.clear()
             self.assertEqual(SSEKeepaliveMiddleware(_app(0)).interval, 0)
 
 

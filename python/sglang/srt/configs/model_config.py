@@ -2361,6 +2361,7 @@ multimodal_model_archs = [
     "StepVLForConditionalGeneration",
     "Step3p7ForConditionalGeneration",
     "Step5ForConditionalGeneration",
+    "Step5MTP",
     "KimiK25ForConditionalGeneration",
     "BailingMMNativeForConditionalGeneration",
     "BailingMM2NativeForConditionalGeneration",
@@ -2626,6 +2627,7 @@ def get_hybrid_layer_ids(
         or "Step3p7ForConditionalGeneration" in model_architectures
         or "Step5ForCausalLM" in model_architectures
         or "Step5ForConditionalGeneration" in model_architectures
+        or "Step5MTP" in model_architectures
     ):
         layer_types = hf_text_config.layer_types
         swa_attention_layer_ids = [

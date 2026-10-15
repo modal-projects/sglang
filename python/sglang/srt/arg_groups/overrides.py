@@ -312,6 +312,7 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
         or "Step3p7ForConditionalGeneration" in arch
         or "Step5ForCausalLM" in arch
         or "Step5ForConditionalGeneration" in arch
+        or "Step5MTP" in arch
     )
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:

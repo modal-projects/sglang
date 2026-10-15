@@ -603,6 +603,7 @@ def handle_model_specific_adjustments(server_args: Any):
         or "Step3p7ForConditionalGeneration" in model_arch
         or "Step5ForCausalLM" in model_arch
         or "Step5ForConditionalGeneration" in model_arch
+        or "Step5MTP" in model_arch
     ):
         # Attention backend selection + EAGLE multi-layer +
         # hierarchical-cache SWA writes moved to the override registry

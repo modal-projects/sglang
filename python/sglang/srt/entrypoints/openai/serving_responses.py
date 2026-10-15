@@ -703,20 +703,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_template_kwargs=template_kwargs,
         )
 
-        # /v1/responses does not run handle_request, so the chat-side K3
-        # validation only fires if invoked here.
+        # /v1/responses does not run handle_request, so apply the chat-side
+        # K3 handling here.
         if self.chat_encoding_spec == "kimi_k3":
-            validation_error = kimi_k3_api_parity.validate_reasoning_effort(
-                chat_request
-            ) or kimi_k3_api_parity.validate_sampling_envelope(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                n=1,
-            )
-            if validation_error:
-                raise ValueError(validation_error)
+            kimi_k3_api_parity.drop_unsupported_reasoning_controls(chat_request)
 
         media_error = self._validate_media_content(chat_request)
         if media_error:

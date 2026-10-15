@@ -1036,9 +1036,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return "Messages cannot be empty."
 
         if self.chat_encoding_spec == "kimi_k3":
-            validation_error = kimi_k3_api_parity.validate_chat_request(request)
-            if validation_error:
-                return validation_error
+            kimi_k3_api_parity.drop_unsupported_reasoning_controls(request)
 
         if (
             request.chat_template_kwargs
@@ -1373,9 +1371,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = effort
             # Server defaults land after _validate_request, so re-check them.
             if self.chat_encoding_spec == "kimi_k3":
-                validation_error = kimi_k3_api_parity.validate_reasoning_effort(request)
-                if validation_error:
-                    raise ValueError(validation_error)
+                kimi_k3_api_parity.drop_unsupported_reasoning_controls(request)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config

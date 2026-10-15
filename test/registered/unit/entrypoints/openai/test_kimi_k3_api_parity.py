@@ -23,52 +23,36 @@ def _chat_request(**kwargs) -> ChatCompletionRequest:
     )
 
 
-class TestKimiK3SamplingEnvelope(CustomTestCase):
-    def _validate(self, **overrides):
-        kwargs = dict(
-            temperature=None,
-            top_p=None,
-            presence_penalty=0,
-            frequency_penalty=0,
-            n=1,
-        )
-        kwargs.update(overrides)
-        return kimi_k3_api_parity.validate_sampling_envelope(**kwargs)
+class TestKimiK3ReasoningControls(CustomTestCase):
+    def _drop(self, **kwargs):
+        request = _chat_request(**kwargs)
+        kimi_k3_api_parity.drop_unsupported_reasoning_controls(request)
+        return request
 
-    def test_envelope_bounds(self):
-        self.assertIsNone(self._validate())
-        self.assertIsNone(self._validate(temperature=1.0, top_p=0.95))
-        cases = {
-            "temperature": dict(temperature=1.5),
-            "top_p": dict(top_p=0.9),
-            "presence_penalty": dict(presence_penalty=0.5),
-            "frequency_penalty": dict(frequency_penalty=0.5),
-            "n must be 1": dict(n=2),
-        }
-        for needle, overrides in cases.items():
-            with self.subTest(needle=needle):
-                self.assertIn(needle, self._validate(**overrides))
-
-
-class TestKimiK3ReasoningEffort(CustomTestCase):
-    def test_supported_and_omitted_efforts_pass(self):
-        self.assertIsNone(kimi_k3_api_parity.validate_reasoning_effort(_chat_request()))
+    def test_supported_and_omitted_efforts_are_kept(self):
+        self.assertIsNone(self._drop().reasoning_effort)
         for effort in kimi_k3_api_parity.KIMI_K3_THINKING_EFFORTS:
             with self.subTest(effort=effort):
-                request = _chat_request(reasoning_effort=effort)
-                self.assertIsNone(kimi_k3_api_parity.validate_reasoning_effort(request))
+                self.assertEqual(
+                    self._drop(reasoning_effort=effort).reasoning_effort, effort
+                )
+                kwargs = self._drop(chat_template_kwargs={"thinking_effort": effort})
+                self.assertEqual(
+                    kwargs.chat_template_kwargs, {"thinking_effort": effort}
+                )
 
-    def test_unsupported_effort_and_disabled_thinking_are_rejected(self):
-        request = _chat_request(chat_template_kwargs={"thinking_effort": "medium"})
-        self.assertIn(
-            "thinking_effort='medium'",
-            kimi_k3_api_parity.validate_reasoning_effort(request),
+    def test_unsupported_effort_and_disabled_thinking_are_dropped(self):
+        self.assertIsNone(self._drop(reasoning_effort="medium").reasoning_effort)
+        request = self._drop(
+            chat_template_kwargs={
+                "thinking": False,
+                "enable_thinking": False,
+                "reasoning_effort": "none",
+                "thinking_effort": "medium",
+                "other": 1,
+            }
         )
-        request = _chat_request(chat_template_kwargs={"thinking": False})
-        self.assertIn(
-            "cannot disable thinking",
-            kimi_k3_api_parity.validate_reasoning_effort(request),
-        )
+        self.assertEqual(request.chat_template_kwargs, {"other": 1})
 
 
 class TestKimiK3SamplingDefaults(CustomTestCase):
@@ -94,11 +78,20 @@ class TestKimiK3ServingGates(CustomTestCase):
         self.addCleanup(reset_context)
         self.serving = make_serving()
 
-    def test_chat_validation_only_applies_to_kimi_k3(self):
-        request = _chat_request(top_p=0.5)
-        self.assertIsNone(self.serving._validate_request(request))
+    def test_kimi_k3_accepts_prod_b300_sampling_and_reasoning_params(self):
         self.serving.chat_encoding_spec = "kimi_k3"
-        self.assertIn("top_p", self.serving._validate_request(request))
+        request = _chat_request(
+            temperature=1.3,
+            top_p=0.5,
+            presence_penalty=0.5,
+            frequency_penalty=0.3,
+            n=2,
+            reasoning_effort="medium",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        self.assertIsNone(self.serving._validate_request(request))
+        self.assertIsNone(request.reasoning_effort)
+        self.assertNotIn(False, request.chat_template_kwargs.values())
 
     def test_responses_model_name_is_only_free_form_for_kimi_k3(self):
         # tool_choice="required" without tools fails right after the model

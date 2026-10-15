@@ -84,5 +84,14 @@ class Step5MTP(Step3p5MTP):
         self.logits_processor = LogitsProcessor(config)
         self.lm_head = self.model.lm_head
 
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        # The MTP block is a sliding-window layer (config.layer_types[92..94]);
+        # the draft ModelRunner needs the window so the attention backend
+        # builds window_kv_indptr for it.
+        layer_id = self.config.num_hidden_layers + self.draft_model_idx
+        if self.config.layer_types[layer_id] == "sliding_attention":
+            return self.config.sliding_window
+        return None
+
 
 EntryClass = [Step5MTP]

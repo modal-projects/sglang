@@ -353,6 +353,10 @@ def _bf16_gemm_dispatch_impl(
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
+    if x.stride(-1) != 1:
+        # The fast paths below take a K-major [M, K] view; callers such as the
+        # Step-3.7/Step-5 vision projector hand us permuted features.
+        x = x.contiguous()
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):

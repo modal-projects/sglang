@@ -957,6 +957,13 @@ class ModelConfig:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "Step5ForConditionalGeneration",
+            "Step5ForCausalLM",
+        ):
+            self.hf_config.architectures[0] = "Step5MTP"
+            self.hf_text_config.architectures = list(self.hf_config.architectures)
+
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
         if (

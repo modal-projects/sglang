@@ -186,6 +186,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
+            "Step5MTP",
             "InklingForConditionalGenerationMTP",
             "GigaChat35ForCausalLMNextN",
         ]

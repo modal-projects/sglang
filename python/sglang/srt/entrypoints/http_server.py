@@ -304,7 +304,7 @@ async def lifespan(fast_api_app: FastAPI):
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     configure_api_early_reject(
-        fast_api_app, envs.SGLANG_K3_API_EARLY_REJECT_MAX_CONCURRENCY.get() or None
+        fast_api_app, envs.SGLANG_API_EARLY_REJECT_MAX_CONCURRENCY.get() or None
     )
 
     # Add prometheus middleware

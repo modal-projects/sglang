@@ -956,7 +956,7 @@ class Envs:
     SGLANG_SHORT_PREFILL_THRESHOLD = EnvInt(0)
     SGLANG_SHORT_PREFILL_CHUNK = EnvInt(0)
     SGLANG_SHORT_PREFILL_MAX_TOKENS = EnvInt(0)
-    SGLANG_K3_HICACHE_MAMBA_RATIO = EnvFloat(0)
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(0)
     SGLANG_API_EARLY_REJECT_MAX_CONCURRENCY = EnvInt(0)
     SGLANG_SSE_KEEPALIVE_S = EnvFloat(0)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |

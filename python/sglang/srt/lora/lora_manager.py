@@ -714,6 +714,11 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        validate_model_targets = getattr(
+            self.base_model, "validate_lora_target_modules", None
+        )
+        if validate_model_targets is not None:
+            validate_model_targets(self.target_modules)
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
@@ -803,7 +808,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -847,7 +854,7 @@ class LoRAManager:
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, self.base_model
             )
 
             if target_modules is not None:
@@ -1139,9 +1146,14 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                # Fused replicated projections whose LoRA has two stacked slices.
+                first_output_dim = getattr(
+                    self.base_model, "lora_first_output_dims", {}
+                ).get(".".join(parts[-2:]))
+                if first_output_dim:
+                    lora_module.first_output_dim = first_output_dim
+                self.lora_modules[layer_id][module_name] = lora_module
                 continue
 
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(

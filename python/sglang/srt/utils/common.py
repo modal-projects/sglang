@@ -4600,6 +4600,13 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # DeepSeek-V4 attention projections and shared experts.
+    "wq_a",
+    "wkv",
+    "wo_b",
+    "w1",
+    "w2",
+    "w3",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

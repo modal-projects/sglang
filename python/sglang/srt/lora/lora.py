@@ -169,6 +169,10 @@ class LoRAAdapter(nn.Module):
         if "unembed_tokens" in name:
             name = name.replace("unembed_tokens", "lm_head")
 
+        remap_name = getattr(self.base_model, "remap_lora_weight_name", None)
+        if remap_name is not None:
+            name = remap_name(name)
+
         layer_id = get_layer_id(name)
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
@@ -199,7 +203,12 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        normalize_model_weights = getattr(
+            self.base_model, "normalize_lora_layer_weights", None
+        )
         for layer in self.layers:
+            if normalize_model_weights is not None:
+                normalize_model_weights(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)

@@ -260,10 +260,13 @@ def get_default_hidden_dim(
 
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+    A base model may define ``lora_target_module_aliases`` to map leaf names
+    to its own normalized names ahead of the generic mapping.
 
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
     {"all"} as a sentinel value.  Callers that need a concrete module set
@@ -303,10 +306,13 @@ def get_normalized_target_modules(
         "weights_proj": "indexer.weights_proj",
     }
 
+    aliases = getattr(base_model, "lora_target_module_aliases", None) or {}
     result = set()
     for name in target_modules:
         base_name = name.split(".")[-1]
-        normalized_name = params_mapping.get(base_name, base_name)
+        normalized_name = aliases.get(base_name) or params_mapping.get(
+            base_name, base_name
+        )
         result.add(normalized_name)
     return result
 
@@ -362,6 +368,9 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
+    # DeepSeek-V4
+    "self_attn.wo_b",
+    "shared_experts.down_proj",
 ]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
@@ -371,6 +380,10 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fc1_latent_proj",
     "fc2_latent_proj",
     *DSA_INDEXER_LORA_NAMES,
+    # DeepSeek-V4
+    "self_attn.wqkv_a",
+    "self_attn.wq_a",
+    "self_attn.wkv",
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
 # under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
@@ -388,6 +401,9 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        # DeepSeek-V4
+        "self_attn.wq_b",
+        "self_attn.wo_b",
     }
 )
 

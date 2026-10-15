@@ -1195,7 +1195,7 @@ def build_mamba_host_pool(
     capacity = mamba_pool.host_capacity_tokens
     if capacity is None:
         capacity = mamba_pool.size
-    hicache_ratio, host_size = _k3_mamba_host_sizing(
+    hicache_ratio, host_size = _mamba_host_sizing(
         get_memory().hicache_ratio, host_size
     )
     return MambaPoolHost(
@@ -2487,8 +2487,8 @@ def build_minimax_sparse_hicache_stack(
     return host_pool_group, cache_controller
 
 
-def _k3_mamba_host_sizing(hicache_ratio, mamba_host_size):
-    ratio = envs.SGLANG_K3_HICACHE_MAMBA_RATIO.get()
+def _mamba_host_sizing(hicache_ratio, mamba_host_size):
+    ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get()
     if ratio > 0:
         return ratio, 0
     return hicache_ratio, mamba_host_size

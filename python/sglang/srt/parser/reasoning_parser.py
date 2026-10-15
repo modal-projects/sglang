@@ -2280,6 +2280,7 @@ class ReasoningParser:
         "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
+        "step5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "granite_thinking_parser": GraniteThinkingDetector,

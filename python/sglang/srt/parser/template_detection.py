@@ -801,6 +801,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch in ("Step5ForConditionalGeneration", "Step5ForCausalLM") or model_type in ("step5_vl", "step5"):
+        reasoning_parser, tool_call_parser = "step5", "step5"
     elif arch == "IQuestQ1ForCausalLM":
         reasoning_parser, tool_call_parser = "iquest_q1", "iquest_q1"
     elif arch in (

@@ -1740,7 +1740,13 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # Normal mode: use original 2-stage kernel
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            # Spec-decode draft paths supply pre-windowed kv_indptr/kv_indices via
+            # spec_info and never build the window_* buffers; fall through to them.
+            and self.forward_metadata.window_kv_indices is not None
+        ):
             bidirectional_extend = (
                 layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
             )
@@ -1879,7 +1885,13 @@ class TritonAttnBackend(AttentionBackend):
             raise NotImplementedError(
                 "Triton dense one-shot prefill does not support sinks/score_mod"
             )
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            # Spec-decode draft paths supply pre-windowed kv_indptr/kv_indices via
+            # spec_info and never build the window_* buffers; fall through to them.
+            and self.forward_metadata.window_kv_indices is not None
+        ):
             raise NotImplementedError(
                 "Triton dense one-shot prefill does not support sliding windows"
             )
@@ -1934,7 +1946,13 @@ class TritonAttnBackend(AttentionBackend):
             raise NotImplementedError("DCP Triton extend does not support sinks")
         if self.forward_metadata.custom_mask is not None:
             raise NotImplementedError("DCP Triton extend does not support custom masks")
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            # Spec-decode draft paths supply pre-windowed kv_indptr/kv_indices via
+            # spec_info and never build the window_* buffers; fall through to them.
+            and self.forward_metadata.window_kv_indices is not None
+        ):
             raise NotImplementedError(
                 "DCP Triton extend does not support sliding window"
             )
@@ -2081,7 +2099,13 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
 
         # Determine sliding window settings
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            # Spec-decode draft paths supply pre-windowed kv_indptr/kv_indices via
+            # spec_info and never build the window_* buffers; fall through to them.
+            and self.forward_metadata.window_kv_indices is not None
+        ):
             bidirectional_extend = (
                 layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
             )
@@ -2262,7 +2286,13 @@ class TritonAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            # Spec-decode draft paths supply pre-windowed kv_indptr/kv_indices via
+            # spec_info and never build the window_* buffers; fall through to them.
+            and self.forward_metadata.window_kv_indices is not None
+        ):
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
         else:

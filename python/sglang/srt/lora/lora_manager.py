@@ -1042,6 +1042,12 @@ class LoRAManager:
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
+        logger.info(
+            "LoRA wraps %s (%s) as %s",
+            module_name,
+            type(module).__name__,
+            type(lora_module).__name__,
+        )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 

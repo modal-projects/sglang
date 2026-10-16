@@ -296,7 +296,10 @@ class LoRAMemoryPool:
         linears = getattr(self, "_dense_linears", None)
         if linears is None:
             linears = {}
+            should_apply_lora = getattr(base_model, "should_apply_lora", None)
             for name, module in base_model.named_modules():
+                if should_apply_lora is not None and not should_apply_lora(name):
+                    continue
                 layer_id = get_layer_id(name)
                 base_layer = unwrap_lora_layer(module)
                 if layer_id is not None and (

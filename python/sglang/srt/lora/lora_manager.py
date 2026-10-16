@@ -1096,6 +1096,7 @@ class LoRAManager:
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
+        should_apply_lora = getattr(self.base_model, "should_apply_lora", None)
         for module_name, module in self.base_model.named_modules():
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
@@ -1116,6 +1117,9 @@ class LoRAManager:
                     lora_module = self.set_lora_module(module_name, module)
                     self.lm_head_module = lora_module
                     continue
+
+            if should_apply_lora is not None and not should_apply_lora(module_name):
+                continue
 
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer

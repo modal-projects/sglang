@@ -201,6 +201,10 @@ class NemotronH_Nano_VL_V2(EVS):
     def get_stacked_multiply(self, module_name):
         return self.language_model.get_stacked_multiply(module_name)
 
+    def should_apply_lora(self, module_name: str) -> bool:
+        # The RADIO encoder also exposes qkv_proj/proj under encoder.layers.N.
+        return module_name.startswith("language_model.")
+
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 

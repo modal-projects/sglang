@@ -121,6 +121,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.sse_keepalive import SSEKeepaliveMiddleware
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
@@ -495,6 +496,7 @@ app = FastAPI(
     **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
+app.add_middleware(SSEKeepaliveMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

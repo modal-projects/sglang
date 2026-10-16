@@ -344,6 +344,7 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    SGLANG_SSE_KEEPALIVE_S = EnvFloat(0)
 
     # ===================================================================
     # Logging
@@ -668,6 +669,10 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    SGLANG_SHORT_PREFILL_SCAN_WAITING = EnvBool(False)
+    SGLANG_SHORT_PREFILL_THRESHOLD = EnvInt(0)
+    SGLANG_SHORT_PREFILL_CHUNK = EnvInt(0)
+    SGLANG_SHORT_PREFILL_MAX_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1625,6 +1630,8 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(0)
+    SGLANG_HICACHE_DROP_CHECKPOINT_PAGE_CACHE = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

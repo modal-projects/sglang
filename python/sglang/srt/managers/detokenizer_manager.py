@@ -548,6 +548,9 @@ def run_detokenizer_process(
     detokenizer_manager_class=DetokenizerManager,
 ):
     kill_itself_when_parent_died()
+    # The tokenizer manager coordinates worker shutdown after draining requests.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     setproctitle.setproctitle("sglang::detokenizer")
     load_plugins()
     configure_logger(server_args)

@@ -586,7 +586,7 @@ class ChatCompletionMessageContentThinkingPart(BaseModel):
 
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    detail: Optional[Literal["auto", "low", "high", "original"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     content_hash: Optional[str] = None

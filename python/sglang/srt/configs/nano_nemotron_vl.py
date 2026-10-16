@@ -146,7 +146,6 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             "video_maintain_aspect_ratio", True
         )
 
-
     def get_text_config(self, *args, **kwargs):
         # LoRA and other language-model consumers read layer counts and vocab here.
         return self.llm_config

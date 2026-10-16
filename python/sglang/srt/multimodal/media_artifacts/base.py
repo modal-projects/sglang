@@ -43,6 +43,7 @@ from sglang.srt.multimodal.cache import (
     snapshot_media,
 )
 from sglang.srt.utils import load_image
+from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
 
 
 @runtime_checkable
@@ -69,6 +70,19 @@ class MediaArtifact(Protocol):
     def cache_size_items(self) -> Sequence[Any]:
         """Return owned values counted against the preprocess-cache budget."""
         ...
+
+
+async def _await_media_snapshot(
+    future, modality: Modality, index: int
+) -> MediaSnapshot:
+    """Unfetchable or invalid user media is a client error (400), not a 500."""
+    try:
+        return await asyncio.wrap_future(future)
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        raise ValueError(
+            f"An exception occurred while loading {modality.name} data "
+            f"at index {index}: {e}"
+        ) from e
 
 
 @dataclass(frozen=True)
@@ -330,7 +344,7 @@ class MediaArtifactCacheMixin:
             for index in load_indices
         }
         for index, future in snapshot_futures.items():
-            snapshot = await asyncio.wrap_future(future)
+            snapshot = await _await_media_snapshot(future, modality, index)
             caller_hash = content_hashes[index]
             if caller_hash is not None and caller_hash != snapshot.content_digest:
                 raise ValueError(
@@ -437,7 +451,7 @@ class MediaArtifactCacheMixin:
         ]
         snapshots = []
         for index, future in enumerate(snapshot_futures):
-            snapshot = await asyncio.wrap_future(future)
+            snapshot = await _await_media_snapshot(future, modality, index)
             caller_hash = content_hashes[index]
             if caller_hash is not None and caller_hash != snapshot.content_digest:
                 raise ValueError(

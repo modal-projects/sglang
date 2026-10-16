@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1194,9 +1199,10 @@ def build_mamba_host_pool(
     capacity = mamba_pool.host_capacity_tokens
     if capacity is None:
         capacity = mamba_pool.size
+    hicache_ratio, host_size = _mamba_host_sizing(get_memory().hicache_ratio, host_size)
     return MambaPoolHost(
         pool_info.buffer_info,
-        get_memory().hicache_ratio,
+        hicache_ratio,
         host_size,
         device_capacity=capacity,
         mtp_draft_buffer_infos=draft_buffer_infos,
@@ -2356,6 +2362,37 @@ def _apply_stack_result(
     )
 
 
+def _fadvise_dontneed(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def _drop_checkpoint_page_cache(model_path: str) -> None:
+    """Evict this rank's share of the checkpoint from the OS page cache.
+
+    The weights are on the GPU by now; a cached checkpoint makes allocating and
+    pinning the host pools reclaim it page by page, which is several times slower.
+    """
+    if not envs.SGLANG_HICACHE_DROP_CHECKPOINT_PAGE_CACHE.get():
+        return
+    import torch.distributed as dist
+
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if dist.is_initialized():
+        files = files[dist.get_rank() :: dist.get_world_size()]
+    tic = time.perf_counter()
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(_fadvise_dontneed, files))
+    logger.info(
+        "Dropped page cache of %d checkpoint files in %.1f s",
+        len(files),
+        time.perf_counter() - tic,
+    )
+
+
 def attach_hybrid_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
@@ -2367,6 +2404,7 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    _drop_checkpoint_page_cache(server_args.model_path)
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
@@ -2481,3 +2519,10 @@ def build_minimax_sparse_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
+
+
+def _mamba_host_sizing(hicache_ratio, mamba_host_size):
+    ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get()
+    if ratio > 0:
+        return ratio, 0
+    return hicache_ratio, mamba_host_size

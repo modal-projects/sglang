@@ -1563,11 +1563,8 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
-                # Only one unfinished chunked request can be tracked.
+            if has_chunked_req:
+                # Only one unfinished chunked request can be tracked (any policy).
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly

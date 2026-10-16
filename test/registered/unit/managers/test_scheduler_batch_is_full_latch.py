@@ -46,6 +46,19 @@ class TestEmptyBatchFullLatch(CustomTestCase):
             )
         self.assertFalse(running_batch.batch_is_full)
 
+    def test_latched_running_batch_still_admits(self):
+        # Clearing the flag only when the batch shrinks would stall the queue
+        # until an unrelated request finishes.
+        s = self._scheduler()
+        running_batch = ScheduleBatch(
+            reqs=[SimpleNamespace(rid="running-0")], batch_is_full=True
+        )
+
+        with self.assertRaises(_AdmissionAttempted):
+            s._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

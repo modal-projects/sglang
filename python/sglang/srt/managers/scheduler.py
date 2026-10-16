@@ -4180,7 +4180,19 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            from sglang.srt.managers import short_prefill
+
+            if short_prefill.THRESHOLD > 0 and adder.chunked_req_limit is None:
+                self.chunked_req = short_prefill.add_chunk_with_short_prefill_budget(
+                    adder,
+                    self.chunked_req,
+                    self.waiting_queue,
+                    threshold=short_prefill.THRESHOLD,
+                    chunk_size=short_prefill.CHUNK_SIZE,
+                    batch_size=short_prefill.MAX_TOKENS,
+                )
+            else:
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
             running_loras = {
@@ -6268,6 +6280,9 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    # The tokenizer manager coordinates worker shutdown after draining requests.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)

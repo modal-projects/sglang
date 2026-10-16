@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai import kimi_k3_api_parity
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -312,9 +313,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "background=true requires store=true.", param="store"
             )
 
-        model_error = self._validate_model(request.model)
-        if model_error is not None:
-            return model_error
+        # Modal's K3 endpoint serves any model name.
+        if self.chat_encoding_spec != "kimi_k3":
+            model_error = self._validate_model(request.model)
+            if model_error is not None:
+                return model_error
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
@@ -482,6 +485,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    if self.chat_encoding_spec == "kimi_k3":
+                        kimi_k3_api_parity.apply_sampling_defaults(
+                            sampling_params,
+                            self.default_sampling_params,
+                            request.top_p,
+                            request.temperature,
+                        )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,
@@ -687,6 +697,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        # Promote chat_template_kwargs.reasoning_effort (prod parity).
+        template_kwargs = dict(request.chat_template_kwargs or {})
+        effort = template_kwargs.pop("reasoning_effort", None)
+        if effort is None:
+            effort = request.reasoning.effort if request.reasoning else None
+        template_kwargs = template_kwargs or None
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -703,10 +719,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
-            chat_template_kwargs=request.chat_template_kwargs,
+            reasoning_effort=effort,
+            chat_template_kwargs=template_kwargs,
         )
         chat_request._template_tools = self._response_tools_to_template_tools(request)
+
+        # /v1/responses does not run handle_request, so apply the chat-side
+        # K3 handling here.
+        if self.chat_encoding_spec == "kimi_k3":
+            kimi_k3_api_parity.drop_unsupported_reasoning_controls(chat_request)
 
         media_error = self._validate_media_content(chat_request)
         if media_error:

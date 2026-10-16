@@ -760,5 +760,11 @@ class TestValidationEdgeCases(unittest.TestCase):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
 
+class TestImageDetail(unittest.TestCase):
+    def test_original_detail_is_accepted(self):
+        part = ChatCompletionMessageContentImageURL(url="x", detail="original")
+        self.assertEqual(part.detail, "original")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -148,7 +148,11 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
 
     def get_text_config(self, *args, **kwargs):
         # LoRA and other language-model consumers read layer counts and vocab here.
-        return self.llm_config
+        # PretrainedConfig.__init__ calls this before llm_config is assigned.
+        llm_config = self.__dict__.get("llm_config")
+        if llm_config is None:
+            return super().get_text_config(*args, **kwargs)
+        return llm_config
 
     def create_radio_config(self):
         config = self.raw_vision_config

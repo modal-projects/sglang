@@ -2465,6 +2465,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+            # Some container runtimes send SIGINT alongside SIGTERM.
+            loop.add_signal_handler(signal.SIGINT, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
@@ -4079,6 +4081,9 @@ class SignalHandler:
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
+        # Do not escalate expected worker exits while draining.
+        if self.tokenizer_manager._subprocess_watchdog is not None:
+            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):

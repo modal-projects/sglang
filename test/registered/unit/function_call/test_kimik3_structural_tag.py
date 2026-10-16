@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    MESSAGE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -837,6 +838,11 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+def test_single_call_auto_admits_the_turn_close():
+    grammar = _grammar([_tool()], parallel_tool_calls=False)
+    assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
 
 
 if __name__ == "__main__":

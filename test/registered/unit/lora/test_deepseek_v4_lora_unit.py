@@ -14,18 +14,22 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.lora import deepseek_v4_targets as v4_lora
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.lora.utils import (
-    ATTN_TP_LORA_MODULE_NAMES,
-    REPLICATED_LINEAR_LORA_NAMES,
-    ROW_PARALLELISM_LINEAR_LORA_NAMES,
-    get_normalized_target_modules,
-    get_target_module_name,
-)
+from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import get_normalized_target_modules, get_target_module_name
 
 PHASE1_TARGETS = ["wq_a", "wkv", "wq_b", "wo_b", "w1", "w2", "w3"]
+PHASE1_MODULES = {
+    "self_attn.wqkv_a",
+    "self_attn.wq_b",
+    "self_attn.wo_b",
+    "shared_experts.gate_up_proj",
+    "shared_experts.down_proj",
+}
+V4_ALIASES = SimpleNamespace(lora_target_module_aliases=v4_lora.TARGET_MODULE_ALIASES)
 
 V41_DIMS = dict(
     hidden_size=5120,
@@ -67,35 +71,10 @@ def _make_v4_model(config):
     return model
 
 
-class _AliasModel(torch.nn.Module):
-    def __init__(self, fuse_wqa_wkv):
-        super().__init__()
-        self.lora_target_module_aliases = v4_lora.target_module_aliases(fuse_wqa_wkv)
-
-
 class TestTargetNormalization(unittest.TestCase):
     def test_fused_targets(self):
-        got = get_normalized_target_modules(PHASE1_TARGETS, _AliasModel(True))
-        self.assertEqual(
-            got,
-            {
-                "self_attn.wqkv_a",
-                "self_attn.wq_b",
-                "self_attn.wo_b",
-                "shared_experts.gate_up_proj",
-                "shared_experts.down_proj",
-            },
-        )
-
-    def test_unfused_targets(self):
-        got = get_normalized_target_modules(["wq_a", "wkv"], _AliasModel(False))
-        self.assertEqual(got, {"self_attn.wq_a", "self_attn.wkv"})
-
-    def test_qualified_peft_names_use_leaf(self):
-        got = get_normalized_target_modules(
-            ["attn.wq_b", "ffn.shared_experts.w2"], _AliasModel(True)
-        )
-        self.assertEqual(got, {"self_attn.wq_b", "shared_experts.down_proj"})
+        got = get_normalized_target_modules(PHASE1_TARGETS, V4_ALIASES)
+        self.assertEqual(got, PHASE1_MODULES)
 
     def test_parent_qualified_cli_targets(self):
         from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
@@ -110,17 +89,7 @@ class TestTargetNormalization(unittest.TestCase):
             "ffn.shared_experts.w3",
         ]
         self.assertTrue(set(cli) <= set(SUPPORTED_LORA_TARGET_MODULES))
-        self.assertEqual(
-            get_normalized_target_modules(cli, _AliasModel(False)),
-            {
-                "self_attn.wq_a",
-                "self_attn.wkv",
-                "self_attn.wq_b",
-                "self_attn.wo_b",
-                "shared_experts.gate_up_proj",
-                "shared_experts.down_proj",
-            },
-        )
+        self.assertEqual(get_normalized_target_modules(cli, V4_ALIASES), PHASE1_MODULES)
 
     def test_other_models_keep_generic_mapping(self):
         self.assertEqual(get_normalized_target_modules(["wq_b"]), {"indexer.wq_b"})
@@ -130,7 +99,7 @@ class TestTargetNormalization(unittest.TestCase):
         )
 
     def test_targets_do_not_match_colliding_modules(self):
-        targets = get_normalized_target_modules(PHASE1_TARGETS, _AliasModel(True))
+        targets = get_normalized_target_modules(PHASE1_TARGETS, V4_ALIASES)
         expected = {
             "model.layers.3.self_attn.wqkv_a": "self_attn.wqkv_a",
             "model.layers.3.self_attn.wq_b": "self_attn.wq_b",
@@ -151,17 +120,13 @@ class TestTargetNormalization(unittest.TestCase):
             with self.assertRaises(ValueError):
                 get_target_module_name(module_name, targets)
 
-    def test_parallelism_classes(self):
-        for name in ("self_attn.wqkv_a", "self_attn.wq_a", "self_attn.wkv"):
-            self.assertIn(name, REPLICATED_LINEAR_LORA_NAMES)
-        for name in ("self_attn.wo_b", "shared_experts.down_proj"):
-            self.assertIn(name, ROW_PARALLELISM_LINEAR_LORA_NAMES)
-        for name in ("self_attn.wq_b", "self_attn.wo_b"):
-            self.assertIn(name, ATTN_TP_LORA_MODULE_NAMES)
-
 
 class TestWeightNames(unittest.TestCase):
     def test_checkpoint_names(self):
+        sglang_names = (
+            "base_model.model.model.layers.3.self_attn.wo_b.lora_A.weight",
+            "base_model.model.model.layers.3.mlp.shared_experts.down_proj.lora_B.weight",
+        )
         cases = {
             "base_model.model.layers.3.attn.wq_a.lora_A.weight": (
                 "base_model.model.layers.3.self_attn.wq_a.lora_A.weight"
@@ -175,16 +140,10 @@ class TestWeightNames(unittest.TestCase):
             "base_model.model.layers.3.ffn.shared_experts.w2.lora_A.weight": (
                 "base_model.model.layers.3.mlp.shared_experts.down_proj.lora_A.weight"
             ),
+            **{name: name for name in sglang_names},
         }
         for src, dst in cases.items():
             self.assertEqual(v4_lora.remap_weight_name(src), dst)
-
-    def test_sglang_names_are_unchanged(self):
-        for name in (
-            "base_model.model.model.layers.3.self_attn.wo_b.lora_A.weight",
-            "base_model.model.model.layers.3.mlp.shared_experts.down_proj.lora_B.weight",
-        ):
-            self.assertEqual(v4_lora.remap_weight_name(name), name)
 
 
 class TestFuseWqaWkv(unittest.TestCase):
@@ -248,39 +207,38 @@ class TestModelHooks(unittest.TestCase):
     def setUp(self):
         self.model = _make_v4_model(SimpleNamespace(**V41_DIMS))
 
-    def test_hidden_dims_match_v41(self):
+    def test_buffer_shapes_match_v41(self):
         expected = {
-            "self_attn.wqkv_a": (5120, 1280 + 512),
-            "self_attn.wq_a": (5120, 1280),
-            "self_attn.wkv": (5120, 512),
-            "self_attn.wq_b": (1280, 64 * 512),
-            "self_attn.wo_b": (8 * 1024, 5120),
-            "shared_experts.gate_up_proj": (5120, 2 * 2304),
-            "shared_experts.down_proj": (2304, 5120),
+            "self_attn.wqkv_a": ((5120, 1280 + 512), 2),
+            "self_attn.wq_b": ((1280, 64 * 512), 1),
+            "self_attn.wo_b": ((8 * 1024, 5120), 1),
+            "shared_experts.gate_up_proj": ((5120, 2 * 2304), 2),
+            "shared_experts.down_proj": ((2304, 5120), 1),
         }
-        for name, dims in expected.items():
+        for name, (dims, stacked) in expected.items():
             self.assertEqual(self.model.get_hidden_dim(name, 0), dims)
-
-    def test_stacked_multiply(self):
-        self.assertEqual(self.model.get_stacked_multiply("self_attn.wqkv_a"), 2)
-        self.assertEqual(
-            self.model.get_stacked_multiply("shared_experts.gate_up_proj"), 2
-        )
-        self.assertEqual(self.model.get_stacked_multiply("self_attn.wq_b"), 1)
+            self.assertEqual(self.model.get_stacked_multiply(name), stacked)
         self.assertEqual(self.model.get_stacked_multiply("gate_up_proj_moe"), 2)
-
-    def test_first_output_dim(self):
-        self.assertEqual(self.model.lora_first_output_dims, {"self_attn.wqkv_a": 1280})
 
     def test_validation(self):
         targets = get_normalized_target_modules(PHASE1_TARGETS, self.model)
         parallel = SimpleNamespace(attn_cp_size=1)
-        with mock.patch(
-            "sglang.srt.models.deepseek_v4.get_parallel", return_value=parallel
+        with (
+            mock.patch(
+                "sglang.srt.models.deepseek_v4.get_parallel", return_value=parallel
+            ),
+            envs.SGLANG_OPT_FUSE_WQA_WKV.override(True),
         ):
             self.model.validate_lora_target_modules(targets)
             with self.assertRaisesRegex(ValueError, "does not support target modules"):
                 self.model.validate_lora_target_modules(targets | {"indexer.wq_b"})
+            with envs.SGLANG_OPT_FUSE_WQA_WKV.override(False):
+                with self.assertRaisesRegex(ValueError, "SGLANG_OPT_FUSE_WQA_WKV=1"):
+                    self.model.validate_lora_target_modules(targets)
+            self.model.num_fused_shared_experts = 1
+            with self.assertRaisesRegex(ValueError, "unfused shared experts"):
+                self.model.validate_lora_target_modules(targets)
+            self.model.num_fused_shared_experts = 0
             parallel.attn_cp_size = 2
             with self.assertRaisesRegex(ValueError, "context parallelism"):
                 self.model.validate_lora_target_modules(targets)
@@ -288,6 +246,38 @@ class TestModelHooks(unittest.TestCase):
             self.model.quant_config = object()
             with self.assertRaisesRegex(ValueError, "BF16"):
                 self.model.validate_lora_target_modules(targets)
+
+
+class TestFusedQkvAFirstOutputDim(unittest.TestCase):
+    """LoRAManager marks where q_a ends in the fused q_a + kv_a LoRA B."""
+
+    def test_v4_and_mla(self):
+        for leaf, target in (
+            ("wqkv_a", "self_attn.wqkv_a"),
+            ("fused_qkv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"),
+        ):
+            with self.subTest(leaf):
+                attn = torch.nn.Module()
+                attn.add_module(leaf, torch.nn.Linear(16, 10, bias=False))
+                model = torch.nn.Module()
+                model.layers = torch.nn.ModuleList([torch.nn.Module()])
+                model.layers[0].self_attn = attn
+
+                manager = LoRAManager.__new__(LoRAManager)
+                manager.base_model = model
+                manager.base_hf_config = SimpleNamespace(
+                    num_hidden_layers=1, q_lora_rank=6
+                )
+                manager.target_modules = {target}
+                with mock.patch.object(
+                    manager,
+                    "set_lora_module",
+                    side_effect=lambda *_: SimpleNamespace(first_output_dim=0),
+                ):
+                    manager.init_lora_modules()
+
+                lora_module = manager.lora_modules[0][f"layers.0.self_attn.{leaf}"]
+                self.assertEqual(lora_module.first_output_dim, 6)
 
 
 class TestAdapterNormalization(unittest.TestCase):
@@ -333,8 +323,19 @@ class TestAdapterNormalization(unittest.TestCase):
                 "target_modules": PHASE1_TARGETS,
             }
         )
-        adapter = LoRAAdapter("a", lora_config, config, None, None, base_model=model)
-        adapter.initialize_weights_from_tensors(tensors)
+        targets = get_normalized_target_modules(lora_config.target_modules, model)
+        with (
+            mock.patch(
+                "sglang.srt.models.deepseek_v4.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=1),
+            ),
+            envs.SGLANG_OPT_FUSE_WQA_WKV.override(True),
+        ):
+            model.validate_lora_target_modules(targets)
+            adapter = LoRAAdapter(
+                "a", lora_config, config, None, None, base_model=model
+            )
+            adapter.initialize_weights_from_tensors(tensors)
 
         names = set(adapter.layers[layer].weights)
         m = f"{prefix}.self_attn"
@@ -358,7 +359,6 @@ class TestAdapterNormalization(unittest.TestCase):
         self.assertEqual(weights[f"{m}.wqkv_a.lora_A.weight"].shape, (2 * r, 16))
         self.assertEqual(weights[f"{m}.wqkv_a.lora_B.weight"].shape, (6 + 4, r))
         self.assertEqual(weights[f"{s}.gate_up_proj.lora_B.weight"].shape, (2 * 5, r))
-        targets = get_normalized_target_modules(lora_config.target_modules, model)
         for name in names:
             get_target_module_name(name, targets)
         self.assertEqual(adapter.layers[0].weights, {})

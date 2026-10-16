@@ -169,10 +169,6 @@ class LoRAAdapter(nn.Module):
         if "unembed_tokens" in name:
             name = name.replace("unembed_tokens", "lm_head")
 
-        remap_name = getattr(self.base_model, "remap_lora_weight_name", None)
-        if remap_name is not None:
-            name = remap_name(name)
-
         layer_id = get_layer_id(name)
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()

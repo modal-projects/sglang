@@ -382,9 +382,9 @@ REPLICATED_LINEAR_LORA_NAMES = [
     *DSA_INDEXER_LORA_NAMES,
     # DeepSeek-V4
     "self_attn.wqkv_a",
-    "self_attn.wq_a",
-    "self_attn.wkv",
 ]
+# Fused q_a + kv_a projections; LoRA B splits into two slices at q_lora_rank.
+FUSED_QKV_A_LORA_NAMES = frozenset({"fused_qkv_a_proj_with_mqa", "wqkv_a"})
 # Attention-projection LoRA modules shard on the attention-TP group, which
 # under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
 # than the outer TP size. in_proj / in_proj_qkvz (linear-attention hybrids)

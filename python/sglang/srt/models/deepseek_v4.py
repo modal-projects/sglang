@@ -5118,21 +5118,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     # LoRA covers the attention projections and the unfused shared experts.
-    @property
-    def lora_target_module_aliases(self) -> Dict[str, str]:
-        return v4_lora.target_module_aliases(envs.SGLANG_OPT_FUSE_WQA_WKV.get())
-
-    @property
-    def lora_first_output_dims(self) -> Dict[str, int]:
-        return {v4_lora.WQKV_A: self.config.q_lora_rank}
-
-    remap_lora_weight_name = staticmethod(v4_lora.remap_weight_name)
+    lora_target_module_aliases = v4_lora.TARGET_MODULE_ALIASES
 
     def normalize_lora_layer_weights(self, weights: Dict[str, torch.Tensor]) -> None:
-        if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
-            v4_lora.fuse_wqa_wkv_weights(
-                weights, self.config.q_lora_rank, self.config.head_dim
-            )
+        v4_lora.normalize_layer_weights(
+            weights, self.config.q_lora_rank, self.config.head_dim
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
         dims = v4_lora.hidden_dims(module_name, self.config)
@@ -5146,12 +5137,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def validate_lora_target_modules(self, target_modules: Set[str]) -> None:
-        if self.num_fused_shared_experts and v4_lora.SHARED_GATE_UP in target_modules:
-            raise ValueError("Shared-expert LoRA requires unfused shared experts.")
         v4_lora.validate_target_modules(
             target_modules,
             quantized=self.quant_config is not None,
             attn_cp_size=get_parallel().attn_cp_size,
+            fuse_wqa_wkv=envs.SGLANG_OPT_FUSE_WQA_WKV.get(),
+            fused_shared_experts=bool(self.num_fused_shared_experts),
         )
 
     def forward(

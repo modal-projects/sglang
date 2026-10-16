@@ -251,7 +251,7 @@ class LoRAMemoryPool:
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
             target_module_names = get_normalized_target_modules(
-                config.target_modules, getattr(self, "base_model", None)
+                config.target_modules, self.base_model
             )
             if "all" in target_module_names:
                 return True

@@ -39,6 +39,7 @@ from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
+    FUSED_QKV_A_LORA_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -1118,25 +1119,6 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
-            # Handle DeepSeek MLA fused projection: set the boundary
-            # between q_a and kv_a output partitions so the LoRA layer
-            # can apply separate B projections for each.
-            if (
-                "fused_qkv_a_proj_with_mqa" in self.target_modules
-                and module_name.endswith("fused_qkv_a_proj_with_mqa")
-            ):
-                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
-
-                layer_id = get_layer_id(module_name)
-                if layer_id is None:
-                    continue
-                lora_module = self.set_lora_module(module_name, module)
-                if isinstance(lora_module, ReplicatedLinearWithLoRA):
-                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
-                    lora_module.first_output_dim = q_lora_rank
-                self.lora_modules[layer_id][module_name] = lora_module
-                continue
-
             # The module should be converted if it is included in target_names
             parts = module_name.split(".")
             if (
@@ -1147,12 +1129,10 @@ class LoRAManager:
                 if layer_id is None:
                     continue
                 lora_module = self.set_lora_module(module_name, module)
-                # Fused replicated projections whose LoRA has two stacked slices.
-                first_output_dim = getattr(
-                    self.base_model, "lora_first_output_dims", {}
-                ).get(".".join(parts[-2:]))
-                if first_output_dim:
-                    lora_module.first_output_dim = first_output_dim
+                if parts[-1] in FUSED_QKV_A_LORA_NAMES:
+                    lora_module.first_output_dim = (
+                        getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    )
                 self.lora_modules[layer_id][module_name] = lora_module
                 continue
 

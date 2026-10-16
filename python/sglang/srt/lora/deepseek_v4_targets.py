@@ -12,33 +12,28 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 
 WQKV_A = "self_attn.wqkv_a"
-WQ_A = "self_attn.wq_a"
-WKV = "self_attn.wkv"
 WQ_B = "self_attn.wq_b"
 WO_B = "self_attn.wo_b"
 SHARED_GATE_UP = "shared_experts.gate_up_proj"
 SHARED_DOWN = "shared_experts.down_proj"
 
-SUPPORTED_TARGET_MODULES = frozenset(
-    {WQKV_A, WQ_A, WKV, WQ_B, WO_B, SHARED_GATE_UP, SHARED_DOWN}
-)
+SUPPORTED_TARGET_MODULES = frozenset({WQKV_A, WQ_B, WO_B, SHARED_GATE_UP, SHARED_DOWN})
 
+TARGET_MODULE_ALIASES = {
+    "wq_a": WQKV_A,
+    "wkv": WQKV_A,
+    "wq_b": WQ_B,
+    "wo_b": WO_B,
+    "w1": SHARED_GATE_UP,
+    "w3": SHARED_GATE_UP,
+    "gate_proj": SHARED_GATE_UP,
+    "up_proj": SHARED_GATE_UP,
+    "gate_up_proj": SHARED_GATE_UP,
+    "w2": SHARED_DOWN,
+    "down_proj": SHARED_DOWN,
+}
 
-def target_module_aliases(fuse_wqa_wkv: bool) -> Dict[str, str]:
-    q_a, kv = (WQKV_A, WQKV_A) if fuse_wqa_wkv else (WQ_A, WKV)
-    return {
-        "wq_a": q_a,
-        "wkv": kv,
-        "wq_b": WQ_B,
-        "wo_b": WO_B,
-        "w1": SHARED_GATE_UP,
-        "w3": SHARED_GATE_UP,
-        "gate_proj": SHARED_GATE_UP,
-        "up_proj": SHARED_GATE_UP,
-        "gate_up_proj": SHARED_GATE_UP,
-        "w2": SHARED_DOWN,
-        "down_proj": SHARED_DOWN,
-    }
+STACKED_MULTIPLY = {WQKV_A: 2, SHARED_GATE_UP: 2}
 
 
 def remap_weight_name(name: str) -> str:
@@ -62,7 +57,7 @@ def fuse_wqa_wkv_weights(
     """
     pairs: Dict[str, Dict[str, str]] = {}
     for name in weights:
-        for part, module in (("q", f".{WQ_A}."), ("kv", f".{WKV}.")):
+        for part, module in (("q", ".self_attn.wq_a."), ("kv", ".self_attn.wkv.")):
             if module in name:
                 fused = name.replace(module, f".{WQKV_A}.")
                 pairs.setdefault(fused, {})[part] = name
@@ -83,6 +78,14 @@ def fuse_wqa_wkv_weights(
         weights[fused] = torch.cat((q, kv), dim=0)
 
 
+def normalize_layer_weights(
+    weights: Dict[str, torch.Tensor], q_dim: int, kv_dim: int
+) -> None:
+    for name in list(weights):
+        weights[remap_weight_name(name)] = weights.pop(name)
+    fuse_wqa_wkv_weights(weights, q_dim, kv_dim)
+
+
 def hidden_dims(module_name: str, config) -> Optional[Tuple[int, int]]:
     hidden = config.hidden_size
     q_rank = config.q_lora_rank
@@ -90,8 +93,6 @@ def hidden_dims(module_name: str, config) -> Optional[Tuple[int, int]]:
     shared_inter = config.moe_intermediate_size * config.n_shared_experts
     return {
         WQKV_A: (hidden, q_rank + head_dim),
-        WQ_A: (hidden, q_rank),
-        WKV: (hidden, head_dim),
         WQ_B: (q_rank, config.num_attention_heads * head_dim),
         WO_B: (config.o_groups * config.o_lora_rank, hidden),
         SHARED_GATE_UP: (hidden, 2 * shared_inter),
@@ -99,16 +100,16 @@ def hidden_dims(module_name: str, config) -> Optional[Tuple[int, int]]:
     }.get(module_name)
 
 
-STACKED_MULTIPLY = {WQKV_A: 2, SHARED_GATE_UP: 2}
-
-
 def validate_target_modules(
     target_modules: Iterable[str],
     *,
     quantized: bool,
     attn_cp_size: int,
+    fuse_wqa_wkv: bool,
+    fused_shared_experts: bool,
 ) -> None:
-    unsupported = set(target_modules) - SUPPORTED_TARGET_MODULES
+    target_modules = set(target_modules)
+    unsupported = target_modules - SUPPORTED_TARGET_MODULES
     if unsupported:
         raise ValueError(
             f"DeepSeek-V4 LoRA does not support target modules {sorted(unsupported)}; "
@@ -123,3 +124,7 @@ def validate_target_modules(
         raise ValueError(
             "DeepSeek-V4 LoRA does not support attention context parallelism."
         )
+    if not fuse_wqa_wkv:
+        raise ValueError("DeepSeek-V4 LoRA requires SGLANG_OPT_FUSE_WQA_WKV=1.")
+    if fused_shared_experts and target_modules & {SHARED_GATE_UP, SHARED_DOWN}:
+        raise ValueError("Shared-expert LoRA requires unfused shared experts.")

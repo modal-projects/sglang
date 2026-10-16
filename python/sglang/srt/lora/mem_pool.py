@@ -296,7 +296,10 @@ class LoRAMemoryPool:
         linears = getattr(self, "_dense_linears", None)
         if linears is None:
             linears = {}
+            should_apply_lora = getattr(base_model, "should_apply_lora", None)
             for name, module in base_model.named_modules():
+                if should_apply_lora is not None and not should_apply_lora(name):
+                    continue
                 layer_id = get_layer_id(name)
                 base_layer = unwrap_lora_layer(module)
                 if layer_id is not None and (
@@ -922,7 +925,7 @@ class LoRAMemoryPool:
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
+            buffer_view: torch.Tensor, weight: Optional[torch.Tensor], context: str = ""
         ):
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
@@ -930,7 +933,8 @@ class LoRAMemoryPool:
                 buffer_view.zero_()
             else:
                 assert buffer_view.shape == weight.shape, (
-                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}"
+                    f" for {context}."
                 )
                 copy_weight_into_buffer(buffer_view, weight)
 
@@ -1287,7 +1291,9 @@ class LoRAMemoryPool:
                             weights_cache_key,
                             weights,
                         )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights, f"{name} ({weights_cache_key})"
+                    )
 
             for name, weights in temp_B_buffer.items():
                 if name not in active_target_modules:
@@ -1394,7 +1400,9 @@ class LoRAMemoryPool:
                             weights_cache_key,
                             weights,
                         )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights, f"{name} ({weights_cache_key})"
+                    )
                     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
@@ -1418,7 +1426,9 @@ class LoRAMemoryPool:
                             name,
                             weights,
                         )
-                        load_lora_weight_tensor(buffer_view, weights)
+                        load_lora_weight_tensor(
+                        buffer_view, weights, f"{name} ({weights_cache_key})"
+                    )
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
@@ -1438,7 +1448,9 @@ class LoRAMemoryPool:
                         name,
                         weights,
                     )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights, f"{name} ({weights_cache_key})"
+                    )
                 elif (
                     target_module == "embed_tokens"
                     and "embed_tokens" in name
@@ -1475,7 +1487,9 @@ class LoRAMemoryPool:
                         name,
                         weights,
                     )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights, f"{name} ({weights_cache_key})"
+                    )
                 elif (
                     target_module == "lm_head"
                     and lora_lm_head_module is not None

@@ -363,8 +363,13 @@ def _small_sort_supported(
         and num_local_tokens is None
         and p <= 256
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
-        # aiter at E=129 but loses at E=513; cutoff untuned in between
-        and ((p <= 64 and p <= 2 * block_size) or num_experts <= 256)
+        # aiter at E=129 but loses at E=513; cutoff untuned in between. A K3 sort plan
+        # fuses the shared GEMM and quant into this sort, which wins at any E.
+        and (
+            (p <= 64 and p <= 2 * block_size)
+            or num_experts <= 256
+            or _k3_sort_plan.get() is not None
+        )
         and topk < 128
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()

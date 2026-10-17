@@ -1,10 +1,7 @@
 """LoRA target mapping for DeepSeek-V4 attention projections and shared experts.
 
-Adapters may use checkpoint names (``layers.N.attn.wq_a``,
-``layers.N.ffn.shared_experts.w1``) or SGLang module names. Normalized target
-names are parent-qualified because the bare leaf names also exist under the
-indexer (``wq_b``), the compressor and Engram (``wkv``) and the routed experts
-(``w1``/``w2``/``w3``).
+Targets are parent-qualified: bare ``wq_b``, ``wkv`` and ``w1``/``w2``/``w3`` also name
+indexer, compressor, Engram and routed-expert modules.
 """
 
 from typing import Dict, Iterable, Optional, Tuple

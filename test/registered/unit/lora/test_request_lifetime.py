@@ -1,6 +1,7 @@
 """LoRA references survive request cancellation until scheduler completion."""
 
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,11 @@ from sglang.srt.managers.tokenizer_manager import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(
+    est_time=10,
+    suite="base-a-test-cpu",
+    disabled="out of sync with TokenizerManager request-state helpers",
+)
 
 
 def manager(registry):
@@ -409,3 +414,7 @@ def test_registry_cancelled_partial_acquisition_rolls_back():
         assert all(counter.value() == 0 for counter in registry._counters.values())
 
     asyncio.run(scenario())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

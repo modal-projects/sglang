@@ -580,6 +580,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
+    logger.info("%s %s: %.500s", exc.status_code, request.url.path, exc.detail)
     if request.url.path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
         anthropic_type = {
@@ -639,6 +640,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
+    # Log field paths and messages only; error inputs can hold request content.
+    reasons = [(e.get("loc"), e.get("msg")) for e in exc.errors()]
+    logger.info("400 %s: %.500s", request.url.path, reasons)
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2953,11 +2957,13 @@ def _setup_and_run_http_server(
             # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
-            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            }
+            # Worker processes skip configure_logger, so name the loggers to keep.
+            for name in ("http_server", "openai.serving_base"):
+                LOGGING_CONFIG["loggers"][f"sglang.srt.entrypoints.{name}"] = {
+                    "handlers": ["default"],
+                    "level": "INFO",
+                    "propagate": False,
+                }
 
             if get_serving().enable_ssl_refresh:
                 logger.warning(

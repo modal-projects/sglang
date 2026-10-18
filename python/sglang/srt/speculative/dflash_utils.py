@@ -73,8 +73,19 @@ elif is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_triton,
+    )
 
-    tree_speculative_sampling_target_only = None
+    def tree_speculative_sampling_target_only(*, candidates, draft_probs, **kwargs):
+        # DFLASH drafts are greedy, so rejection sampling against one-hot draft
+        # probabilities is target-only verification.
+        draft_probs[:, :-1].scatter_(2, candidates[:, 1:, None], 1.0)
+        chain_speculative_sampling_triton(
+            candidates=candidates, draft_probs=draft_probs, **kwargs
+        )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None

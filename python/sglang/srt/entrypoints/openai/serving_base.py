@@ -210,6 +210,7 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        logger.info("%s %s: %.500s", status_code, err_type, message)
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",

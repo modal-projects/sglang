@@ -2805,11 +2805,13 @@ def _setup_and_run_http_server(
             # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
-            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            }
+            # Worker processes skip configure_logger, so name the loggers to keep.
+            for name in ("http_server", "openai.serving_base"):
+                LOGGING_CONFIG["loggers"][f"sglang.srt.entrypoints.{name}"] = {
+                    "handlers": ["default"],
+                    "level": "INFO",
+                    "propagate": False,
+                }
 
             if get_serving().enable_ssl_refresh:
                 logger.warning(

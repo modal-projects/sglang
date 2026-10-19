@@ -2596,6 +2596,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                 # Drop our param refs so tensors replaced by post-processing are freed.
                 del state_dict
                 gc.collect()
+                # Release copy staging blocks so post-processing packs like a normal load.
+                torch.cuda.empty_cache()
                 post_load_weights(model)
                 self.postprocess_weights(model, target_device)
 

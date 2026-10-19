@@ -320,6 +320,19 @@ def post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+@contextmanager
+def _skip_post_load_weights(model: nn.Module):
+    """Make ``post_load_weights`` a no-op inside ``model.load_weights()``."""
+    modules = [m for m in model.modules() if hasattr(m, "post_load_weights")]
+    for module in modules:
+        module.post_load_weights = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        for module in modules:
+            del module.post_load_weights
+
+
 def _modules_with_quant_method(model: nn.Module):
     from sglang.srt.lora.layers import BaseLayerWithLoRA
 
@@ -1734,6 +1747,9 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     Optional roots in ``model_loader_extra_config`` (subdir still appended):
     ``presharded_path`` (target), ``draft_presharded_path`` (speculative draft).
+    ``replay_postprocess`` dumps the weights before ``post_load_weights`` and
+    quant processing and reruns both on reload, for models whose post-processing
+    keeps state outside tensors (e.g. Kimi-K3's dense FP8 conversion).
     Dump dir must be shared across ranks/nodes.
     """
 
@@ -1745,6 +1761,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     PLAN_VERSION = 1
     DEFAULT_HASH_NUM_THREADS = 8
     _CONTENT_HASH_HEX_LEN = 32
+    _replay_postprocess = False
 
     def __init__(self, load_config: LoadConfig):
         extra = (
@@ -1759,6 +1776,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
         )
         self._verify_on_load = bool(extra.pop("verify_on_load", False))
+        self._replay_postprocess = bool(extra.pop("replay_postprocess", False))
         load_config.model_loader_extra_config = extra
         load_config.load_format = LoadFormat.AUTO
         super().__init__(load_config)
@@ -1821,7 +1839,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         from sglang.srt.layers.dp_attention import get_moe_cp_size
 
         parallel = get_parallel()
-        return {
+        shard_config = {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
@@ -1839,6 +1857,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+        if self._replay_postprocess:
+            shard_config["replay_postprocess"] = True
+        return shard_config
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
@@ -2135,11 +2156,12 @@ class PreshardedModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            self.load_weights_and_postprocess(
-                model,
-                self._get_all_weights(model_config, model),
-                target_device,
-            )
+            weights = self._get_all_weights(model_config, model)
+            if self._replay_postprocess:
+                with _skip_post_load_weights(model):
+                    self.load_weights_only(model, weights, target_device)
+            else:
+                self.load_weights_and_postprocess(model, weights, target_device)
 
             state_dict = dict(model.state_dict())
             extras = self._collect_extra_tensors(model)
@@ -2147,6 +2169,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             del state_dict
             del extras
             gc.collect()
+            if self._replay_postprocess:
+                post_load_weights(model)
+                self.postprocess_weights(model, target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -2493,11 +2518,12 @@ class PreshardedModelLoader(DefaultModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            if not self._replay_postprocess:
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
 
             rank, _ = self._world_rank_and_size()
             with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
@@ -2565,6 +2591,10 @@ class PreshardedModelLoader(DefaultModelLoader):
 
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
+
+            if self._replay_postprocess:
+                post_load_weights(model)
+                self.postprocess_weights(model, target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

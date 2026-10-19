@@ -999,5 +999,48 @@ class TestShardConfig(unittest.TestCase):
             self.assertEqual(plan["shard_config"]["tp"], 8)
 
 
+class TestReplayPostprocess(unittest.TestCase):
+    def test_skip_post_load_weights_only_inside_load(self):
+        from sglang.srt.model_loader.loader import _skip_post_load_weights
+
+        class Model(torch.nn.Module):
+            calls = 0
+
+            def post_load_weights(self):
+                Model.calls += 1
+
+            def load_weights(self):
+                self.post_load_weights()
+
+        model = Model()
+        with _skip_post_load_weights(model):
+            model.load_weights()
+        self.assertEqual(Model.calls, 0)
+        model.load_weights()
+        self.assertEqual(Model.calls, 1)
+
+    def test_replay_postprocess_changes_shard_config(self):
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(quantization=None, dtype=torch.bfloat16)
+        override = get_context().override_server_args(tp_size=8, pp_size=1)
+        override.install()
+        self.addCleanup(override.restore)
+        with (
+            get_parallel().override(tp_size=8, pp_size=1),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig16"
+            ),
+        ):
+            loader._replay_postprocess = False
+            plain = loader._collect_shard_config(model_config)
+            loader._replay_postprocess = True
+            replay = loader._collect_shard_config(model_config)
+        self.assertNotIn("replay_postprocess", plain)
+        self.assertEqual(replay, plain | {"replay_postprocess": True})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2593,6 +2593,9 @@ class PreshardedModelLoader(DefaultModelLoader):
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
             if self._replay_postprocess:
+                # Drop our param refs so tensors replaced by post-processing are freed.
+                del state_dict
+                gc.collect()
                 post_load_weights(model)
                 self.postprocess_weights(model, target_device)
 

@@ -320,6 +320,35 @@ def post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def _log_load_mem(stage: str, model: nn.Module) -> None:
+    """Debug: GPU allocator state vs. bytes actually held by the model."""
+    if not os.environ.get("SGLANG_DEBUG_LOAD_MEM") or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    storages = {}
+    for m in model.modules():
+        vals = list(m._parameters.values()) + list(m._buffers.values())
+        vals += [v for v in vars(m).values() if isinstance(v, torch.Tensor)]
+        for v in vals:
+            if isinstance(v, torch.Tensor) and v.is_cuda and v.numel() > 0:
+                st = v.untyped_storage()
+                storages[st.data_ptr()] = st.nbytes()
+    st = torch.cuda.memory_stats()
+    gib = 1 << 30
+    logger.info(
+        "load-mem %s: alloc=%.3f reserved=%.3f inactive_split=%.3f "
+        "model_storages=%.3f GiB (n=%d) segments=%d",
+        stage,
+        torch.cuda.memory_allocated() / gib,
+        torch.cuda.memory_reserved() / gib,
+        st.get("inactive_split_bytes.all.current", 0) / gib,
+        sum(storages.values()) / gib,
+        len(storages),
+        st.get("segment.all.current", 0),
+    )
+
+
 @contextmanager
 def _skip_post_load_weights(model: nn.Module):
     """Make ``post_load_weights`` a no-op inside ``model.load_weights()``."""
@@ -1039,7 +1068,9 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         DefaultModelLoader.load_weights_only(model, weights, target_device)
+        _log_load_mem("load_weights", model)
         DefaultModelLoader.postprocess_weights(model, target_device)
+        _log_load_mem("postprocess", model)
 
     @staticmethod
     def load_weights_only(model, weights, target_device):
@@ -2596,10 +2627,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 # Drop our param refs so tensors replaced by post-processing are freed.
                 del state_dict
                 gc.collect()
+                _log_load_mem("presharded_copied", model)
                 # Release copy staging blocks so post-processing packs like a normal load.
                 torch.cuda.empty_cache()
                 post_load_weights(model)
+                _log_load_mem("post_load", model)
                 self.postprocess_weights(model, target_device)
+                _log_load_mem("postprocess", model)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

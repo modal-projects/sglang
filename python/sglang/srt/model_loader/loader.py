@@ -2531,6 +2531,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                     loaded_param_keys=loaded_param_keys,
                     verify_hashes=verify_hashes,
                 )
+                del cached
+                if envs.SGLANG_HICACHE_DROP_CHECKPOINT_PAGE_CACHE.get():
+                    # The weights are on the GPU now; cached file pages would
+                    # slow the HiCache host-pool allocation that follows.
+                    fd = os.open(os.path.join(presharded_dir, filename), os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 

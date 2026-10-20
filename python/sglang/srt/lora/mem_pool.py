@@ -250,7 +250,9 @@ class LoRAMemoryPool:
                 return False
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
-            target_module_names = get_normalized_target_modules(config.target_modules)
+            target_module_names = get_normalized_target_modules(
+                config.target_modules, self.base_model
+            )
             if "all" in target_module_names:
                 return True
             return target_module_names.issubset(self.target_modules)
@@ -303,7 +305,11 @@ class LoRAMemoryPool:
                     hasattr(base_layer, "input_size_per_partition")
                     or hasattr(base_layer, "output_partition_sizes")
                 ):
-                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+                    parts = name.split(".")
+                    # Keyed by leaf and by parent-qualified name (e.g.
+                    # "shared_experts.down_proj").
+                    linears.setdefault((parts[-1], layer_id), base_layer)
+                    linears.setdefault((".".join(parts[-2:]), layer_id), base_layer)
             self._dense_linears = linears
         base_layer = linears.get((module_name, layer_idx))
         if base_layer is None:

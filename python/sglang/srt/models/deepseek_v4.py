@@ -11,6 +11,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -121,6 +122,8 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.lora import deepseek_v4_targets as v4_lora
+from sglang.srt.lora.utils import get_default_hidden_dim, get_stacked_multiply
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
@@ -1289,7 +1292,8 @@ class MQALayer(MqaAttentionBase):
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        method = self.wq_b.quant_method
+        # None when LoRA wraps wq_b, which keeps its input in BF16.
+        method = getattr(self.wq_b, "quant_method", None)
         if (
             _is_cuda
             and self.is_dsv41
@@ -2174,7 +2178,11 @@ class MQALayer(MqaAttentionBase):
                 or (
                     forward_batch.forward_mode.is_target_verify()
                     # Other MXFP8 backends may share mutable GEMM workspace.
-                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                    and getattr(
+                        getattr(self.wq_b, "quant_method", None),
+                        "mxfp8_dense_backend",
+                        None,
+                    )
                     == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                 )
             )
@@ -5107,6 +5115,34 @@ class DeepseekV4ForCausalLM(nn.Module):
         # The decision was installed by the loader; this only reads it.
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
+
+    # LoRA covers the attention projections and the unfused shared experts.
+    lora_target_module_aliases = v4_lora.TARGET_MODULE_ALIASES
+
+    def normalize_lora_layer_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        v4_lora.normalize_layer_weights(
+            weights, self.config.q_lora_rank, self.config.head_dim
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        dims = v4_lora.hidden_dims(module_name, self.config)
+        if dims is None:
+            return get_default_hidden_dim(module_name, self.config, layer_idx)
+        return dims
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        return v4_lora.STACKED_MULTIPLY.get(module_name) or get_stacked_multiply(
+            module_name
+        )
+
+    def validate_lora_target_modules(self, target_modules: Set[str]) -> None:
+        v4_lora.validate_target_modules(
+            target_modules,
+            quantized=self.quant_config is not None,
+            attn_cp_size=get_parallel().attn_cp_size,
+            fuse_wqa_wkv=envs.SGLANG_OPT_FUSE_WQA_WKV.get(),
+            fused_shared_experts=bool(self.num_fused_shared_experts),
         )
 
     def forward(

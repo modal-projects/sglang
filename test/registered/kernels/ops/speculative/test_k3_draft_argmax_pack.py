@@ -12,11 +12,26 @@ import torch
 
 from sglang.kernels.ops.speculative.k3_draft_argmax import (
     pack_row_argmax,
-    reference_argmax,
     select_from_gathered,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
+
+
+def reference_argmax(logits_shards):
+    """torch reference of the baseline sampler: list of [n, V] shards."""
+    n, V = logits_shards[0].shape
+    mx = []
+    ids = []
+    for r, lg in enumerate(logits_shards):
+        a, b = torch.max(lg, dim=-1)
+        mx.append(a)
+        ids.append(b + r * V)
+    gm = torch.stack(mx)
+    gi = torch.stack(ids)
+    best = torch.argmax(gm, dim=0)
+    return torch.gather(gi, 0, best[None]).view(-1)
+
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 

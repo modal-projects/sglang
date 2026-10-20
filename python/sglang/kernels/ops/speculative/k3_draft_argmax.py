@@ -99,18 +99,3 @@ def select_from_gathered(
     _select_kernel[(triton.cdiv(max(n, 1), BLOCK),)](
         gathered_i32, out, n, n_pad, shard, TP=tp, BLOCK=BLOCK, num_warps=1
     )
-
-
-def reference_argmax(logits_shards):
-    """torch reference of the baseline sampler (for tests): list of [n, V] shards."""
-    n, V = logits_shards[0].shape
-    mx = []
-    ids = []
-    for r, lg in enumerate(logits_shards):
-        a, b = torch.max(lg, dim=-1)
-        mx.append(a)
-        ids.append(b + r * V)
-    gm = torch.stack(mx)
-    gi = torch.stack(ids)
-    best = torch.argmax(gm, dim=0)
-    return torch.gather(gi, 0, best[None]).view(-1)

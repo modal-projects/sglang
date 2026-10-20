@@ -19,7 +19,6 @@ from sglang.kernels.ops.speculative.k3_dflash_kv_store import rope_store_prefix_
 from sglang.kernels.ops.speculative.k3_dflash_post import (
     compact_draft_lens,
     mamba_track_steps,
-    mamba_track_steps_reference,
     verify_argmax,
 )
 from sglang.srt.layers import layernorm
@@ -27,6 +26,23 @@ from sglang.srt.layers.rotary_embedding.factory import get_rope
 from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_prefix_valid_impl
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
+
+
+def mamba_track_steps_reference(commit_lens, pre, post, interval, has_track):
+    last = commit_lens.to(torch.int64) - 1
+    if not has_track:
+        return last, None
+    to_track_mask = pre // interval != post // interval
+    tracking_point = post // interval * interval
+    to_track_ith = torch.clamp(tracking_point - pre - 1, min=0)
+    can_track_mask = to_track_mask & (to_track_ith < commit_lens.to(to_track_ith.dtype))
+    steps = torch.where(
+        can_track_mask,
+        to_track_ith.to(torch.int64),
+        torch.full_like(to_track_ith, -1, dtype=torch.int64),
+    )
+    return last, steps
+
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 

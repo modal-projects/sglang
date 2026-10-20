@@ -97,22 +97,6 @@ def mamba_track_steps(commit_lens, seq_lens_pre, seq_lens_post, interval, has_tr
     return last, (steps if has_track else None)
 
 
-def mamba_track_steps_reference(commit_lens, pre, post, interval, has_track):
-    last = commit_lens.to(torch.int64) - 1
-    if not has_track:
-        return last, None
-    to_track_mask = pre // interval != post // interval
-    tracking_point = post // interval * interval
-    to_track_ith = torch.clamp(tracking_point - pre - 1, min=0)
-    can_track_mask = to_track_mask & (to_track_ith < commit_lens.to(to_track_ith.dtype))
-    steps = torch.where(
-        can_track_mask,
-        to_track_ith.to(torch.int64),
-        torch.full_like(to_track_ith, -1, dtype=torch.int64),
-    )
-    return last, steps
-
-
 @triton.jit
 def _compact_lens_kernel(seq_ptr, dpl_out, suffix_out, n, W, PAGE, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)

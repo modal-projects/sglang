@@ -86,12 +86,11 @@ def _shared_down_tile(
     )
 
 
-@triton.jit(do_not_specialize=["M", "stride_gu"])
+@triton.jit(do_not_specialize=["stride_gu"])
 def _k3_situ_kernel(
     gu_ptr,  # [M, 2*I] bf16 (gate | up)
     stride_gu,
     act_ptr,  # [M, I] bf16 out
-    M,
     beta,
     inv_beta,
     lin_beta,
@@ -236,7 +235,6 @@ def shared_down_topk(
             gate_up,
             gate_up.stride(0),
             act,
-            M,
             float(beta),
             1.0 / float(beta),
             float(linear_beta) if lin else 1.0,
@@ -414,7 +412,6 @@ def _topk_body(
         bias_ptr,
         offs_e,
         offs_e < E,
-        E_POW2,
         TOPK,
         RENORM,
         routed_scale,

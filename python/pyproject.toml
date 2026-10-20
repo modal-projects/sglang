@@ -194,6 +194,8 @@ test = [
 dev = ["sglang[test]"]
 
 all = [
+  "flashinfer-cubin==0.7.2 ; sys_platform == 'linux'",
+  "flashinfer-jit-cache==0.7.2 ; sys_platform == 'linux'",
   "sglang[diffusion]",
   "sglang[fastokens]",
   "sglang[http2]",

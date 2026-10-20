@@ -1,0 +1,8 @@
+# FlashInfer's precompiled caches are published outside PyPI.
+[[index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+
+[[index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"

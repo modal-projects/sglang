@@ -86,7 +86,7 @@ def smallm_max_t() -> int:
 
 
 @functools.cache
-def fused_max_t(all_gather: bool = False) -> int:
+def fused_max_t() -> int:
     """Token ceiling of the fused AllReduce + aggregation (0 when disabled), the
     same for the all-reduce and the all-gather variant."""
     return 64 if is_hip() else 0
@@ -667,7 +667,7 @@ class AttnResidual:
         T = y.shape[0]
         H = add_b.shape[1]
         if (
-            T > fused_max_t(all_gather=True)
+            T > fused_max_t()
             or not k3_ar_agg_hip.usable(ca, T, H, nvb)
             or (write and self.block_residual.shape[1] <= nvb)
             or self._stream_pending is not None

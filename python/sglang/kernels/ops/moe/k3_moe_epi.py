@@ -140,14 +140,14 @@ def _k3_shared_topk_kernel(
 
 
 def _shared_cfg(m: int):
-    # (BM, BN, BK, num_warps); tuned on MI355X for N=7168, I=768
+    # (BM, BN, BK, num_warps, num_stages); tuned on MI355X for N=7168, I=768
     if m <= 16:
         return 16, 32, 128, 8, 2
     if m <= 32:
-        return 32, 32, 256, 4
+        return 32, 32, 256, 4, 2
     if m <= 64:
-        return 64, 32, 128, 4
-    return 64, 64, 128, 4
+        return 64, 32, 128, 4, 2
+    return 64, 64, 128, 4, 2
 
 
 def _shared_preact_cfg(m: int):
@@ -171,7 +171,7 @@ def shared_down_topk(
     topk_weights: Optional[torch.Tensor] = None,  # [M, TOPK] fp32 out
     renormalize: bool = True,
     routed_scale: float = 1.0,
-    cfg: Optional[tuple] = None,
+    cfg: Optional[tuple] = None,  # (BM, BN, BK, num_warps, num_stages)
     pre_act: bool = True,
 ) -> None:
     """pre_act (default on): run the SiTU
@@ -203,10 +203,7 @@ def shared_down_topk(
             num_warps=2,
         )
         gate_up = act
-    bm, bn, bk, nw, *rest = cfg or (
-        _shared_preact_cfg(M) if pre_act else _shared_cfg(M)
-    )
-    ns = rest[0] if rest else 2
+    bm, bn, bk, nw, ns = cfg or (_shared_preact_cfg(M) if pre_act else _shared_cfg(M))
     assert N % bn == 0 and I % bk == 0
     do_topk = router_logits is not None
     if do_topk:

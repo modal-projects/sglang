@@ -560,10 +560,6 @@ def _k3_shared_sortq_kernel(
         )
 
 
-SORTQ_FUSE_WARPS: Optional[int] = None  # override for sweeps
-SORTQ_FUSE_BN: Optional[int] = None
-
-
 def situ_topk(
     gate_up: torch.Tensor,  # [M, 2I]
     act: torch.Tensor,  # [M, I] out
@@ -681,7 +677,7 @@ def shared_gemm_sort_quant(
     # wider N tiles than the standalone GEMM (fewer CTAs next to the sort
     # programs; MI355X M=8: 6.3 vs 6.7 us). N tiling only: every element keeps
     # the same K loop and MFMA order, so the output stays bit-identical.
-    bn = SORTQ_FUSE_BN or (64 if M <= 16 else bn)
+    bn = 64 if M <= 16 else bn
     n_gemm = (N // bn) * triton.cdiv(M, bm)
     _k3_shared_sortq_kernel[(n_gemm + m * (n // SORT_QCHUNK),)](
         act,
@@ -712,6 +708,6 @@ def shared_gemm_sort_quant(
         QCHUNK=SORT_QCHUNK,
         SCALEN_PAD=qscale.shape[1],
         MOE_BUF_ZERO=moe_buf.numel() > 0,
-        num_warps=SORTQ_FUSE_WARPS or nw,
+        num_warps=nw,
         num_stages=ns,
     )

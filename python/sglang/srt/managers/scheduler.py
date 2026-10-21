@@ -458,6 +458,9 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # (old version, queued batch, its reqs): a version change made while a result
+    # the old weights produced was still queued (see record_weight_version_change)
+    _version_change_behind_queued: Optional[tuple[str, ScheduleBatch, list[Req]]] = None
 
     def __init__(
         self,
@@ -4933,6 +4936,17 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        deferred = self._version_change_behind_queued
+        if deferred is not None and deferred[1] is batch:
+            old_version, _, reqs = deferred
+            self._version_change_behind_queued = None
+            # outputs sent while processing label this batch's tokens with the weights
+            # that produced them
+            with get_serving().override(weight_version=old_version):
+                self.process_batch_result(batch, result)
+            record_weight_version_events(reqs, old_version=old_version)
+            return
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5445,6 +5459,18 @@ class Scheduler(
             live_reqs.update(
                 act.req for act in self.hisparse_coordinator.ack_staging_queue
             )
+        # Overlap keeps the last launched batch's result queued across the change (an
+        # in_place pause holds it until resume). The old weights produced its tokens,
+        # so its requests are stamped once it is processed.
+        if self._version_change_behind_queued is None and len(self.result_queue) == 1:
+            queued_batch = self.result_queue[0][0]
+            self._version_change_behind_queued = (
+                old_version,
+                queued_batch,
+                list(queued_batch.reqs),
+            )
+        if self._version_change_behind_queued is not None:
+            live_reqs.difference_update(self._version_change_behind_queued[2])
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"

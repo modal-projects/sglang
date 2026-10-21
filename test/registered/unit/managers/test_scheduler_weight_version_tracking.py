@@ -1,4 +1,6 @@
 import unittest
+from collections import deque
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -27,6 +29,10 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import (
+    WeightVersionEvent,
+    compute_weight_version_spans,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +42,22 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class _ServingStub:
     def __init__(self, weight_version: str):
         self.weight_version = weight_version
+
+    @contextmanager
+    def override(self, weight_version: str):
+        saved, self.weight_version = self.weight_version, weight_version
+        try:
+            yield self
+        finally:
+            self.weight_version = saved
+
+
+class _ReqStub:
+    """Hashable like Req, unlike SimpleNamespace."""
+
+    def __init__(self, output_ids: list[int]):
+        self.output_ids = output_ids
+        self.weight_version_events = []
 
 
 class _ContextStub:
@@ -59,9 +81,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         return serving
 
     def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
+        self, *, inflight=(), waiting=(), chunked=None, staging=(), queued_batch=None
     ) -> SimpleNamespace:
         return SimpleNamespace(
+            result_queue=deque([(queued_batch, None)] if queued_batch else []),
+            _version_change_behind_queued=None,
+            scheduler_stage_metrics=None,
             collect_inflight_reqs=lambda: set(inflight),
             waiting_queue=list(waiting),
             chunked_req=chunked,
@@ -114,6 +139,72 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
         self.assertEqual(
             set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
+        )
+
+    @staticmethod
+    def _req(*output_ids: int) -> "_ReqStub":
+        return _ReqStub(list(output_ids))
+
+    def test_queued_batch_is_stamped_after_its_result(self):
+        """An in_place pause under overlap holds a result the old weights produced; its token stays on the old span."""
+        serving = self._serving("v1")
+        queued, waiting = self._req(1, 2), self._req(3)
+        batch = SimpleNamespace(reqs=[queued])
+        scheduler = self._scheduler(
+            inflight=[queued], waiting=[waiting], queued_batch=batch
+        )
+
+        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+
+        self.assertEqual(serving.weight_version, "v2")
+        self.assertEqual(queued.weight_version_events, [])
+        self.assertEqual(waiting.weight_version_events, [WeightVersionEvent("v1", 1)])
+
+        versions_seen = []
+
+        def process(batch, result):
+            versions_seen.append(serving.weight_version)
+            queued.output_ids.append(4)
+
+        scheduler.process_batch_result = process
+        Scheduler.process_batch_result(scheduler, batch, None)
+
+        self.assertEqual(versions_seen, ["v1"])
+        self.assertEqual(serving.weight_version, "v2")
+        self.assertEqual(queued.weight_version_events, [WeightVersionEvent("v1", 3)])
+        self.assertIsNone(scheduler._version_change_behind_queued)
+
+    def test_first_token_in_flight_is_stamped(self):
+        """A request whose first token was queued has no output yet at the change, and still gets its boundary."""
+        self._serving("v1")
+        req = self._req()
+        batch = SimpleNamespace(reqs=[req])
+        scheduler = self._scheduler(inflight=[req], queued_batch=batch)
+
+        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        scheduler.process_batch_result = lambda batch, result: req.output_ids.append(7)
+        Scheduler.process_batch_result(scheduler, batch, None)
+
+        self.assertEqual(req.weight_version_events, [WeightVersionEvent("v1", 1)])
+
+    def test_second_change_before_the_result_keeps_the_producing_version(self):
+        """Two updates in one pause: the queued token belongs to the version that ran it, the next ones to the latest."""
+        self._serving("v1")
+        req = self._req(1)
+        batch = SimpleNamespace(reqs=[req])
+        scheduler = self._scheduler(inflight=[req], queued_batch=batch)
+
+        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        Scheduler.record_weight_version_change(scheduler, new_version="v3")
+        scheduler.process_batch_result = lambda batch, result: req.output_ids.append(2)
+        Scheduler.process_batch_result(scheduler, batch, None)
+        req.output_ids.append(3)
+
+        spans = compute_weight_version_spans(
+            req.weight_version_events, current_version="v3", num_output_tokens=3
+        )
+        self.assertEqual(
+            [(s.version, s.start, s.end) for s in spans], [("v1", 0, 2), ("v3", 2, 3)]
         )
 
 

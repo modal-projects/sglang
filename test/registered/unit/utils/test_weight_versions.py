@@ -313,6 +313,7 @@ class _SchedulerStub:
         self.serving = _ServingStub(version)
         self.enable_continuous_input_polling = False
         self.result_queue = deque()
+        self._version_change_behind_queued = None
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting

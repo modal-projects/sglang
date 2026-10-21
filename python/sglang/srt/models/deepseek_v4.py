@@ -965,8 +965,6 @@ class MqaAttentionBase(nn.Module):
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
         """Whether wo_b consumes FlashInfer-swizzled MXFP8, so wo_a can fuse the
         quantization into its epilogue. Not known until wo_b's weights load."""
-        if isinstance(self.wo_b, BaseLayerWithLoRA):
-            return False
         quant_method = getattr(self.wo_b, "quant_method", None)
         return getattr(
             quant_method, "mxfp8_dense_backend", None
@@ -1287,7 +1285,6 @@ class MQALayer(MqaAttentionBase):
             method = getattr(linear, "quant_method", None)
             return bool(
                 linear is not None
-                and not isinstance(linear, BaseLayerWithLoRA)
                 and getattr(method, "mxfp8_dense_backend", None)
                 in (
                     Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
@@ -1307,7 +1304,7 @@ class MQALayer(MqaAttentionBase):
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        # None when LoRA wraps wq_b, which keeps its input in BF16.
+        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
         method = getattr(self.wq_b, "quant_method", None)
         if (
             _is_cuda

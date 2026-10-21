@@ -47,7 +47,14 @@ def transfer_kv_mamba_pf_lf(
     item_size: int,
     src_layout_dim: int,
     num_warps_per_item: int = 32,
+    *,
+    dst_stride_bytes: int | None = None,
 ):
+    """Load one layer into contiguous items separated by the destination stride.
+
+    Item pointers and byte strides must be 16-byte aligned. Omitted stride means
+    packed slots. Indices are contiguous CUDA int64 vectors; destinations are unique.
+    """
     module = _jit_transfer_mamba_module()
     module.transfer_kv_mamba_pf_lf(
         src,
@@ -57,6 +64,7 @@ def transfer_kv_mamba_pf_lf(
         layer_id,
         item_size,
         src_layout_dim,
+        item_size if dst_stride_bytes is None else dst_stride_bytes,
     )
 
 
@@ -70,7 +78,15 @@ def transfer_kv_mamba_lf_pf(
     dst_layout_dim: int,
     num_layers: int,
     num_warps_per_item: int = 32,
+    *,
+    src_stride_bytes: int | None = None,
 ):
+    """Back up layers whose contiguous items share one slot stride in bytes.
+
+    Every layer pointer and byte stride must be 16-byte aligned. Omitted stride
+    means packed slots. Indices are contiguous CUDA int64 vectors; destinations
+    are unique. Source allocations must outlive the transfer.
+    """
     module = _jit_transfer_mamba_module()
     module.transfer_kv_mamba_lf_pf(
         src_ptrs,
@@ -80,4 +96,5 @@ def transfer_kv_mamba_lf_pf(
         item_size,
         dst_layout_dim,
         num_layers,
+        item_size if src_stride_bytes is None else src_stride_bytes,
     )

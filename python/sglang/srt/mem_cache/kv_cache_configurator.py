@@ -105,7 +105,9 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_serving,
     get_spec,
+    max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
@@ -249,6 +251,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.unified_memory_pool import (
         UnifiedKVPool,
+        UnifiedMHATokenToKVPool,
         UnifiedPoolBundle,
     )
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -260,6 +263,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
     )
+    from sglang.srt.speculative.dflash_cache import DFlashCacheSizing
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -350,6 +354,7 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    dflash_cache_sizing: Optional[DFlashCacheSizing] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -360,6 +365,96 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
             self.layer_info.swa_attention_layer_ids
         )
+        if get_spec().enable_dflash_swa_cache and not self.is_draft_worker:
+            self.dflash_cache_sizing = self._resolve_dflash_cache_sizing()
+
+    def _resolve_dflash_cache_sizing(self) -> DFlashCacheSizing:
+        from sglang.srt.speculative.dflash_cache import DFlashCacheSizing
+
+        draft = self.spec_aux_config.draft_model_config
+        if (
+            self.mambaish_config is None
+            or self.is_hybrid_swa
+            or self.use_mla_backend
+            or draft is None
+            or not get_exec().mamba.enable_mamba_extra_buffer
+            or get_parallel().attn_dcp_size != 1
+            or get_disagg().disaggregation_mode != "null"
+            or get_memory().enable_session_radix_cache
+            or get_serving().enable_streaming_session
+            or get_memory().disable_radix_cache
+            or get_memory().hicache_host_memory_mode != "cache"
+            or self.post_capture_kv_active
+        ):
+            raise ValueError(
+                "--enable-dflash-swa-cache requires a Full-attention + Mamba target, "
+                "Mamba tracking buffers, ordinary HiCache, and pre-capture sizing; "
+                "target SWA/MLA, DCP, disaggregation and session caches are unsupported"
+            )
+        hf = draft.hf_text_config
+        window = getattr(hf, "sliding_window", None)
+        layers = int(self.spec_aux_config.dflash_draft_num_layers or 0)
+        if (
+            not window
+            or window <= 0
+            or layers <= 0
+            or getattr(hf, "layer_types", None) != ["sliding_attention"] * layers
+            or draft.dtype not in (torch.bfloat16, torch.float16)
+            or get_spec().speculative_draft_window_size is not None
+        ):
+            raise ValueError(
+                "--enable-dflash-swa-cache requires a native all-sliding DFLASH "
+                "draft with unquantized KV and no legacy compact draft window"
+            )
+        requests = get_schedule().max_running_requests
+        if requests is None or requests <= 0:
+            raise ValueError(
+                "--enable-dflash-swa-cache requires --max-running-requests"
+            )
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+        from sglang.srt.speculative.draft_worker_common import (
+            resolve_draft_worker_attention_backend,
+        )
+
+        _, draft_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+            model=None,
+            model_dtype=draft.dtype,
+            is_draft_worker=True,
+            is_dflash=True,
+            speculative_draft_attention_backend=resolve_draft_worker_attention_backend(),
+            speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+        )
+        if draft_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("--enable-dflash-swa-cache requires unquantized draft KV")
+        prefill_tokens = max_prefill_buffer_tokens()
+        if prefill_tokens and get_schedule().enable_mixed_chunk:
+            prefill_tokens += requests * int(get_spec().speculative_num_draft_tokens)
+        sizing = DFlashCacheSizing(
+            window_size=int(window),
+            block_size=int(get_spec().speculative_num_draft_tokens),
+            max_requests=max(1, requests // self.attn_dp_size),
+            feature_size=self.model_config.hidden_size
+            * len(self.spec_aux_config.dflash_target_layer_ids),
+            feature_dtype=self.model_dtype,
+            kv_heads=draft.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=draft.head_dim,
+            num_layers=layers,
+            kv_dtype=draft_dtype,
+            page_size=self.page_size,
+            prefill_tokens=prefill_tokens,
+            overlap=not get_schedule().disable_overlap_schedule,
+        )
+        logger.info(
+            "DFLASH SWA budget per rank: %d requests, %d draft tokens (%.3f GiB), "
+            "raw GPU reserve %.3f GiB (latest active tails %.3f GiB)",
+            sizing.max_requests,
+            sizing.draft_tokens,
+            sizing.draft_bytes / 2**30,
+            sizing.raw_gpu_reserve_bytes / 2**30,
+            sizing.max_requests * sizing.raw_window_bytes / 2**30,
+        )
+        return sizing
 
     def hybrid_swa_token_capacity(
         self,
@@ -585,7 +680,11 @@ class KVCacheConfigurator:
             # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
             # FULL lifetime -- its branch reads the HF config's
             # full_attention_layer_ids, which for Inkling is ALL layers.
-            if self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4:
+            if self.dflash_cache_sizing is not None:
+                bundle = self._init_dflash_swa_pools(sizes)
+            elif (
+                self.mambaish_config is not None and self.is_hybrid_swa and not is_dsv4
+            ):
                 bundle = self._init_unified_mamba_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -636,6 +735,14 @@ class KVCacheConfigurator:
                 ),
             ):
                 alloc = token_to_kv_pool_allocator
+                if isinstance(alloc, UnifiedSWAAllocatorBase):
+                    draft_swa_pool = alloc.get_draft_swa_kvcache()
+                    if draft_swa_pool is not None:
+                        return self._bind_draft_swa_pool(
+                            pool=draft_swa_pool,
+                            allocator=alloc,
+                            req_to_token_pool=req_to_token_pool,
+                        )
                 placement = self._fused_draft_from_target_buffer(alloc)
                 if placement is not None:
                     from sglang.srt.mem_cache.unified_draft_pool import (
@@ -923,6 +1030,106 @@ class KVCacheConfigurator:
         )
         return bundle
 
+    def _bind_draft_swa_pool(
+        self,
+        *,
+        pool: UnifiedMHATokenToKVPool,
+        allocator: UnifiedSWAAllocatorBase,
+        req_to_token_pool: Optional[ReqToTokenPool],
+    ) -> _InitializedPools:
+        """Bind the target-created SWA view after checking the loaded draft."""
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.mem_cache.unified_draft_pool import draft_state_layer_classes
+
+        if (
+            not get_spec().enable_dflash_swa_cache
+            or not get_memory().enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "The draft SWA pool requires --enable-dflash-swa-cache "
+                "and --enable-hierarchical-cache"
+            )
+        if req_to_token_pool is None:
+            raise ValueError(
+                "A shared draft SWA pool requires the target request table"
+            )
+        if self.draft_model_idx not in (None, 0):
+            raise ValueError("The draft SWA pool belongs to a single draft runner")
+        if self.page_size != pool.page_size or self.kv_cache_dtype != pool.dtype:
+            raise ValueError(
+                "The draft SWA pool page size/dtype differs from the runner"
+            )
+        layers = [m for m in self.model.modules() if isinstance(m, RadixAttention)]
+        sizing = getattr(allocator, "dflash_cache_sizing", None)
+        if sorted(m.layer_id for m in layers) != list(pool.model_layer_ids):
+            raise ValueError(
+                "The draft SWA pool layer IDs differ from the loaded draft"
+            )
+        if draft_state_layer_classes(self.model) or any(
+            m.sliding_window_size <= 0
+            or (sizing is not None and m.sliding_window_size + 1 != sizing.window_size)
+            or m.tp_k_head_num != pool.head_num
+            or m.tp_v_head_num != pool.head_num
+            or m.head_dim != pool.head_dim
+            or m.v_head_dim != pool.v_head_dim
+            for m in layers
+        ):
+            raise ValueError(
+                "The draft SWA pool requires only sliding-attention layers "
+                "with matching window and KV head geometry"
+            )
+        return _InitializedPools(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+
+    def _init_dflash_swa_pools(self, sizes: _PoolSizes) -> UnifiedPoolBundle:
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            init_unified_mamba_swa_pools,
+        )
+
+        sizing = self.dflash_cache_sizing
+        config = self.mambaish_config
+        bundle = init_unified_mamba_swa_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            swa_head_num=sizing.kv_heads,
+            swa_head_dim=sizing.head_dim,
+            swa_v_head_dim=sizing.head_dim,
+            page_size=self.page_size,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            swa_attention_layer_ids=[],
+            full_attention_layer_ids=config.full_attention_layer_ids,
+            mamba_layer_ids=config.mamba2_cache_params.layers,
+            mamba2_cache_params=config.mamba2_cache_params,
+            full_max_total_num_tokens=sizes.max_total_num_tokens,
+            swa_max_total_num_tokens=sizing.draft_tokens,
+            max_mamba_cache_size=get_schedule().max_mamba_cache_size,
+            model_context_len=self.model_config.context_len,
+            extra_max_context_len=4 + sizing.block_size,
+            max_num_reqs=sizes.max_running_requests,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            need_sort=False,
+            speculative_num_draft_tokens=sizing.block_size,
+            forward_stream=self.forward_stream,
+            lazy_compaction=_should_enable_lazy_compaction(),
+            unified_total_bytes=sizes.unified_total_bytes,
+            sliding_window_size=sizing.window_size,
+            draft_swa_layer_ids=list(range(sizing.num_layers)),
+            draft_kv_cache_dtype=sizing.kv_dtype,
+            bounded_draft_swa=True,
+        )
+        bundle.token_to_kv_pool_allocator.dflash_cache_sizing = sizing
+        return bundle
+
     def _init_unified_mamba_swa_pools(
         self,
         *,
@@ -1068,6 +1275,8 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
 
         aux = self.spec_aux_config
+        if get_spec().enable_dflash_swa_cache:
+            return FusedDraftDecision()
         host_has_fusable_full_pool = (
             self.is_hybrid_swa or self.mambaish_config is not None
         )
@@ -2826,6 +3035,8 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        if self.dflash_cache_sizing is not None:
+            rest_memory -= self.dflash_cache_sizing.raw_gpu_reserve_bytes / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
@@ -3014,6 +3225,10 @@ class KVCacheConfigurator:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
+            if self.dflash_cache_sizing is not None:
+                config.unified_total_bytes = min(
+                    config.unified_total_bytes, budget_bytes - budget_bytes % 4096
+                )
         return config
 
     def _handle_max_mamba_cache(self, total_rest_memory):

@@ -43,7 +43,10 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _relieve_for_alloc,
     install_move_gate,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedKVPool,
+    UnifiedMHATokenToKVPool,
+)
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import expect, resolve_level
@@ -56,6 +59,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     """Shared FULL/SWA virtual IDs, allocation lifecycle, and index translation.
 
     Concrete allocators define the two-ended or Mamba/SWA/FULL capacity policy.
+    When SWA belongs to a separate model, pass its view as ``swa_kvcache``;
+    ``kvcache`` remains the target model's Full-KV wrapper.
     """
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
@@ -72,8 +77,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         self,
         *,
         unified_buffer: UnifiedKVPool,
-        kvcache,  # UnifiedSWAKVPool
+        kvcache,
         device: str,
+        swa_kvcache: Optional[UnifiedMHATokenToKVPool] = None,
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
         page_size: int = 1,
@@ -86,6 +92,16 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
                 "full_max_total_num_tokens and swa_max_total_num_tokens must "
                 "either both be set or both be omitted"
             )
+        if swa_kvcache is not None and (
+            swa_kvcache._unified_buffer is not unified_buffer
+            or swa_kvcache._sub_pool_name != "swa"
+            or swa_kvcache.page_size != page_size
+        ):
+            raise ValueError(
+                "swa_kvcache must be an SWA view of the same unified buffer "
+                "with matching page_size"
+            )
+        swa_pool = kvcache.swa_kv_pool if swa_kvcache is None else swa_kvcache
         legacy_capacities = full_max_total_num_tokens is not None
         self._size_full = (
             int(full_max_total_num_tokens)
@@ -126,7 +142,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=lazy_compaction,
         )
         self.swa_attn_allocator = self._build_swa_attn_allocator(
-            kvcache=kvcache.swa_kv_pool,
+            kvcache=swa_pool,
             unified_buffer=unified_buffer,
             device=device,
             page_size=page_size,
@@ -154,18 +170,18 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         self._joint_avail_memo_epoch: Optional[int] = None
         self._joint_avail_memo_tokens: int = 0
 
-        # The full/SWA KV pools need no allocator wiring (write locations resolved
-        # in attention metadata); the composite keeps allocators for read-path translates.
-        kvcache.attach_allocators(
-            full_allocator=self.full_attn_allocator,
-            swa_allocator=self.swa_attn_allocator,
-        )
+        # A combined Full/SWA model view also translates for host-cache copies.
+        if swa_kvcache is None:
+            kvcache.attach_allocators(
+                full_allocator=self.full_attn_allocator,
+                swa_allocator=self.swa_attn_allocator,
+            )
         # Size host pools in tokens; sub-pool `size` counts physical rows.
         kvcache.full_kv_pool.host_capacity_tokens = self._size_full
-        kvcache.swa_kv_pool.host_capacity_tokens = self._size_swa
+        swa_pool.host_capacity_tokens = self._size_swa
         for name, pool in (
             ("full", kvcache.full_kv_pool),
-            ("swa", kvcache.swa_kv_pool),
+            ("swa", swa_pool),
         ):
             pool.host_capacity_bytes = (
                 pool.host_capacity_tokens * unified_buffer.spec(name).entry_bytes()
@@ -376,6 +392,13 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def swa_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the SWA sub-pool."""
         return self.swa_attn_allocator.virtual_to_physical
+
+    def get_draft_swa_kvcache(self) -> Optional[UnifiedMHATokenToKVPool]:
+        """The separate draft view, or None when the target owns SWA."""
+        swa_pool = self.swa_attn_allocator.get_kvcache()
+        if swa_pool is getattr(self._kvcache, "swa_kv_pool", None):
+            return None
+        return swa_pool
 
     # -- alloc --
 
@@ -1338,8 +1361,9 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
 
 class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
-    """Tri-pool composite for models with full KV + SWA KV + mamba/conv state
-    (both `mambaish_config` and `is_hybrid_swa`).
+    """Tri-pool composite for full KV + SWA KV + mamba/conv state.
+
+    SWA may belong to the target or to a separate draft model.
 
     Chain (low byte -> high byte):
 
@@ -1356,11 +1380,12 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         self,
         *,
         unified_buffer: UnifiedKVPool,
-        kvcache,  # UnifiedSWAKVPool
+        kvcache,
         mamba_kvcache,  # UnifiedMambaPool (req_to_token_pool.mamba_pool)
         device: str,
         full_max_total_num_tokens: int,
         swa_max_total_num_tokens: int,
+        swa_kvcache: Optional[UnifiedMHATokenToKVPool] = None,
         page_size: int = 1,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
@@ -1370,6 +1395,7 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             unified_buffer=unified_buffer,
             kvcache=kvcache,
             device=device,
+            swa_kvcache=swa_kvcache,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
             page_size=page_size,

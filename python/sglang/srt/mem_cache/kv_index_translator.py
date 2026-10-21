@@ -143,7 +143,12 @@ class KVIndexTranslator:
         is_fused_draft = (
             host_allocator is not None and host_allocator is token_to_kv_pool_allocator
         )
-        self.is_translating = is_unified_target or is_fused_draft
+        is_draft_swa = (
+            isinstance(token_to_kv_pool_allocator, UnifiedSWAAllocatorBase)
+            and token_to_kv_pool is not None
+            and token_to_kv_pool_allocator.get_draft_swa_kvcache() is token_to_kv_pool
+        )
+        self.is_translating = is_unified_target or is_fused_draft or is_draft_swa
         self._spaces: Dict[IdSpaceKind, IdSpace] = {}
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
@@ -163,8 +168,10 @@ class KVIndexTranslator:
                 write=alloc.translate_write_loc,
                 read_v2p=None if self.defer_read_translate else self._full_v2p_table,
             )
-            routes_window_layers = is_unified_target or isinstance(
-                token_to_kv_pool, BaseSWAKVPool
+            routes_window_layers = (
+                is_unified_target
+                or is_draft_swa
+                or isinstance(token_to_kv_pool, BaseSWAKVPool)
             )
             if isinstance(alloc, UnifiedSWAAllocatorBase) and routes_window_layers:
                 # Straight from the virtual ids through the sliding-window
@@ -176,6 +183,15 @@ class KVIndexTranslator:
                         None if self.defer_read_translate else alloc.swa_v2p_page_table
                     ),
                 )
+            if is_draft_swa:
+                # This single-pool runner's default IDs are SWA physical IDs.
+                # Share the SWA key so direct writes and window readers reuse
+                # the same translation in a target-built plan.
+                self._spaces[IdSpaceKind.FULL] = self._spaces[
+                    IdSpaceKind.SLIDING_WINDOW
+                ]
+                self._full_v2p_table = alloc.swa_v2p_page_table
+                self._translate_full = alloc.translate_loc_from_full_to_swa
         else:
             self._capture_page_size = page_size
             self._full_v2p_table = None
@@ -626,8 +642,8 @@ class KVIndexTranslator:
 
     @property
     def full_v2p_table(self) -> Optional[torch.Tensor]:
-        """The full-attention virtual->physical PAGE table, or None when this
-        pool needs no translation.
+        """The default virtual->physical PAGE table (SWA for a draft-only SWA
+        view), or None when this pool needs no translation.
 
         For the DCP page-table builders, whose gather is over a rank's cyclic
         slice rather than a row prefix, so a plan's row-prefix table cannot

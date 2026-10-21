@@ -57,7 +57,7 @@ class IdSpaceKind(enum.Enum):
     """A sub-pool of a runner's KV pool, as the consumers that index it name
     it."""
 
-    # Full-attention layers: the pool's own token ids.
+    # The pool's default token IDs (SWA for a draft-only SWA view).
     FULL = enum.auto()
     # The sliding-window layers of a hybrid pool: the same token ids through
     # the sliding-window sub-pool's table.
@@ -166,7 +166,7 @@ class KVLocPlan:
 
     def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[Cols] = None):
         """Give ``batch`` (a ForwardBatch or a stand-in) this plan, the part of
-        the window it writes (``cols``), and its full-attention write ids in
+        the window it writes (``cols``), and its default write ids in
         `reader`'s pool. The one way a forward gets its write ids; another
         sub-pool's come from `KVIndexTranslator.write_ids`."""
         batch.kv_loc_plan = self
@@ -348,9 +348,20 @@ class KVLocPlan:
         )
 
     def is_translated_for(self, reader: KVIndexTranslator) -> bool:
-        """Whether `reader`'s pool indexes this plan's physical ids: the
-        target's, and a fused draft's, which lives in the target's full
-        sub-pool. A pass-through reader (a static pool, a private draft pool)
-        indexes the virtual ids."""
+        """Whether the reader shares a translating sub-pool with this plan.
+
+        A shared sub-pool establishes the same virtual ID owner even when
+        the runners' default physical spaces differ (target Full, draft SWA).
+        """
         full = reader.space(IdSpaceKind.FULL)
-        return full.write is not None and full.key == self._full_key
+        if full.write is None:
+            return False
+        if full.key == self._full_key:
+            return True
+        source_swa = self._source.space(IdSpaceKind.SLIDING_WINDOW)
+        reader_swa = reader.space(IdSpaceKind.SLIDING_WINDOW)
+        return (
+            source_swa is not None
+            and reader_swa is not None
+            and source_swa.key == reader_swa.key
+        )

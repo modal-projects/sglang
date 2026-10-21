@@ -3,12 +3,13 @@
 import unittest
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -59,6 +60,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
+        cache.dflash_feature_tail_host_pool = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
@@ -141,6 +143,89 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+
+
+class TestHiCacheReadinessPipeline(CustomTestCase):
+    def setUp(self):
+        self.cache = object.__new__(UnifiedRadixCache)
+        self.cache.tree_core = SimpleNamespace(
+            enable_storage=False, write_back_duplicate_reclaim_digest=17
+        )
+        self.cache.dflash_feature_tail_host_pool = object()
+        self.cache.pp_size = 1
+        self.cache.attn_cp_group = None
+        self.cache.attn_tp_group = object()
+        self.cache.tp_world_size = 2
+        self.cache.cache_controller = SimpleNamespace(
+            ack_write_queue=[], ack_load_queue=[]
+        )
+        self.works = []
+
+        def reduce(counts, *, op, group, async_op):
+            self.assertTrue(async_op)
+            work = _FakeWork()
+            self.works.append(work)
+            return work
+
+        for name, kwargs in (
+            ("get_world_size", {"return_value": 2}),
+            ("all_reduce", {"side_effect": reduce}),
+        ):
+            patcher = patch("torch.distributed." + name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def ack(ready=True):
+        return SimpleNamespace(finish_event=SimpleNamespace(query=lambda: ready))
+
+    def test_snapshot_does_not_complete_later_acks_after_blocking_drain(self):
+        """A count agreed before eviction must never apply to replacement acks."""
+        cc = self.cache.cache_controller
+        first, second, third = [self.ack() for _ in range(3)]
+        cc.ack_write_queue[:] = [first, second, third]
+        cc.ack_load_queue[:] = [self.ack()]
+        self.cache._start_hicache_ready_sync()
+        pending = self.cache._pending_hicache_ready
+        pending.counts[0] = 2  # The other rank has only two ready writes.
+        self.assertFalse(self.works[0].waited)
+
+        # Blocking eviction consumes the first write and the old load. New
+        # transfers can even be ready already, but belong to a later consensus.
+        cc.ack_write_queue.pop(0)
+        cc.ack_load_queue[:] = [self.ack()]
+        self.assertEqual(self.cache._sync_hicache_ready_counts(), (1, 0, (), ()))
+        self.assertTrue(self.works[0].waited)
+        self.assertIsNone(self.cache._pending_hicache_ready)
+        self.assertEqual(len(self.works), 1)
+
+        cc.ack_write_queue.pop(0)
+        self.assertEqual(self.cache._sync_hicache_ready_counts(), (1, 1, (), ()))
+
+    def test_digest_checks_same_snapshot_on_each_rank(self):
+        self.cache._start_hicache_ready_sync()
+        self.cache.tree_core.write_back_duplicate_reclaim_digest = 23
+        self.assertEqual(self.cache._sync_hicache_ready_counts(), (0, 0, (), ()))
+        self.cache._start_hicache_ready_sync()
+        self.cache._pending_hicache_ready.counts[-1] = -24
+        with self.assertRaisesRegex(AssertionError, "victims diverged"):
+            self.cache._sync_hicache_ready_counts()
+
+    def test_release_waits_before_destroying_transfer_resources(self):
+        self.cache._start_hicache_ready_sync()
+        work = self.works[0]
+        self.cache.linker = None
+        self.cache.host_pool_group = None
+        destroyed = []
+
+        def destroy():
+            self.assertTrue(work.waited)
+            destroyed.append(True)
+
+        self.cache.dflash_feature_tail_host_pool = SimpleNamespace(destroy=destroy)
+        self.cache.release_host_resources()
+        self.assertEqual(destroyed, [True])
+        self.assertIsNone(self.cache._pending_hicache_ready)
 
 
 if __name__ == "__main__":

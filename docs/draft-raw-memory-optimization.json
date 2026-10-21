@@ -1,0 +1,359 @@
+{
+  "date": "2026-10-21",
+  "base_commit": "6f168a98d8438f3cb8bfd7ecfbfd9c2efa15b5e2",
+  "hardware": "NVIDIA H200, 2 GPUs per server",
+  "target_model": "Qwen/Qwen3.6-35B-A3B",
+  "target_revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "draft_model": "/tmp/autospec/baseline",
+  "common_server_configuration": {
+    "tp_size": 2,
+    "dtype": "bfloat16",
+    "speculative_algorithm": "DFLASH",
+    "speculative_num_draft_tokens": 16,
+    "enable_unified_memory": true,
+    "max_running_requests": 32,
+    "max_mamba_cache_size": 256,
+    "max_total_tokens": 131072,
+    "chunked_prefill_size": 4096,
+    "context_length": 16384,
+    "mamba_radix_cache_strategy": "extra_buffer_lazy",
+    "page_size": 64,
+    "attention_backend": "fa3",
+    "speculative_draft_attention_backend": "fa3",
+    "mem_fraction_static": 0.8,
+    "cuda_graph_max_bs_decode": 32,
+    "cuda_graph_backend_prefill": "breakable"
+  },
+  "enabled_hicache_configuration": {
+    "hicache_ratio": 2,
+    "hicache_write_policy": "write_through"
+  },
+  "raw_memory_microbenchmark": {
+    "requests": 32,
+    "window": 2048,
+    "feature_size": 12288,
+    "prefill_tokens": 4096,
+    "dtype": "torch.bfloat16",
+    "checkpoint_gap": 512,
+    "live_suffix": 64,
+    "retained_feature_bytes": 2214592512,
+    "old_ring_and_two_snapshot_bytes": 4831838208,
+    "observed_allocation_bytes_above_sources": 2214596608,
+    "observed_peak_bytes_above_sources": 2227182080,
+    "admission_reserve_bytes": 10461118464,
+    "exact_row_checks": true,
+    "scope": "Raw-feature lifecycle on one CUDA stream; sources excluded. Not a model-serving peak measurement."
+  },
+  "gpu_admission": {
+    "old_raw_reserve_bytes": 19377684480,
+    "new_raw_reserve_bytes": 10461118464,
+    "logical_window_backing_row_bound": 2558,
+    "pending_transfers": 64,
+    "capture_batches_including_retired_source": 3,
+    "draft_capacity_rows": 69632,
+    "draft_bytes_tp2": 855638016,
+    "host_raw_bytes_per_rank": 12884901888,
+    "serving_run_raw_reserve_bytes": 10360455168,
+    "final_audit_adjustment": "After serving runs, added 4096 raw rows (96 MiB/rank) for one retired cross-stream capture. Runtime and explicitly capped pool sizes are unchanged."
+  },
+  "serving_validation": {
+    "pressure_requests": 20,
+    "requests": {
+      "cold": {
+        "prompt_tokens": 4133,
+        "completion_tokens": 128,
+        "cached_tokens": 0,
+        "cached_tokens_details": null,
+        "num_retractions": 0,
+        "output_token_ids_sha256": "d1a252fa90ed97f122d9009f96f6767aea98431ef5bb9156611d532a03177bd3"
+      },
+      "warm": {
+        "prompt_tokens": 4133,
+        "completion_tokens": 128,
+        "cached_tokens": 4096,
+        "cached_tokens_details": {
+          "device": 4096,
+          "host": 0
+        },
+        "num_retractions": 0,
+        "output_token_ids_sha256": "d1a252fa90ed97f122d9009f96f6767aea98431ef5bb9156611d532a03177bd3"
+      },
+      "long_decode": {
+        "prompt_tokens": 2071,
+        "completion_tokens": 2400,
+        "cached_tokens": 0,
+        "cached_tokens_details": null,
+        "num_retractions": 0,
+        "output_token_ids_sha256": "acfaaa2e645c67a0604c9fd578dd6b52b5974fe08583083b436de3ac35316c9e"
+      },
+      "reused": {
+        "prompt_tokens": 2071,
+        "completion_tokens": 128,
+        "cached_tokens": 2048,
+        "cached_tokens_details": {
+          "device": 2048,
+          "host": 0
+        },
+        "num_retractions": 0,
+        "output_token_ids_sha256": "ec1adc18d718e1f715e92fa71cbe8e93aeadac8d6e975f6a51c1d70f081d84c2"
+      },
+      "restored": {
+        "prompt_tokens": 4133,
+        "completion_tokens": 128,
+        "cached_tokens": 4096,
+        "cached_tokens_details": {
+          "device": 0,
+          "host": 4096
+        },
+        "num_retractions": 0,
+        "output_token_ids_sha256": "d1a252fa90ed97f122d9009f96f6767aea98431ef5bb9156611d532a03177bd3"
+      }
+    },
+    "warm_matches_cold": true,
+    "restored_matches_cold": true,
+    "older_checkpoint_reuse_matches_long_decode_prefix": true,
+    "concurrent_branches": 32,
+    "branch_cached_tokens": [
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096,
+      4096
+    ],
+    "branch_retractions": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "throughput": {
+    "workload": {
+      "dataset": "random-ids",
+      "input_length": 2048,
+      "output_length": 512,
+      "num_prompts": 128,
+      "max_concurrency": 32,
+      "request_rate": "inf",
+      "random_range_ratio": 1,
+      "seed": 20261021,
+      "flush_cache": true,
+      "warmup_requests": 4
+    },
+    "execution_order": [
+      [
+        "off",
+        "prior",
+        "optimized"
+      ],
+      [
+        "optimized",
+        "off",
+        "prior"
+      ],
+      [
+        "prior",
+        "optimized",
+        "off"
+      ]
+    ],
+    "variants": {
+      "off": {
+        "enable_dflash_swa_cache": false,
+        "enable_hierarchical_cache": false,
+        "tree_core_backend": "rust",
+        "gpus": [
+          4,
+          5
+        ],
+        "runs": [
+          {
+            "iteration": 0,
+            "completed": 128,
+            "duration": 16.909109496002202,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 15503.122743511618,
+            "output_throughput": 3875.7806858779045,
+            "total_throughput": 19378.90342938952,
+            "accept_length": 5.163978494623656
+          },
+          {
+            "iteration": 1,
+            "completed": 128,
+            "duration": 16.295138760004193,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 16087.251778636131,
+            "output_throughput": 4021.812944659033,
+            "total_throughput": 20109.064723295163,
+            "accept_length": 4.990582826635029
+          },
+          {
+            "iteration": 2,
+            "completed": 128,
+            "duration": 16.246024946012767,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 16135.885601008973,
+            "output_throughput": 4033.9714002522433,
+            "total_throughput": 20169.857001261218,
+            "accept_length": 4.990582826635029
+          }
+        ],
+        "median_total_tokens_per_second": 20109.064723295163,
+        "median_output_tokens_per_second": 4021.812944659033
+      },
+      "prior": {
+        "enable_dflash_swa_cache": true,
+        "enable_hierarchical_cache": true,
+        "tree_core_backend": "python",
+        "gpus": [
+          2,
+          3
+        ],
+        "runs": [
+          {
+            "iteration": 0,
+            "completed": 128,
+            "duration": 19.644327132002218,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13344.514079738876,
+            "output_throughput": 3336.128519934719,
+            "total_throughput": 16680.642599673596,
+            "accept_length": 4.990582826635029
+          },
+          {
+            "iteration": 1,
+            "completed": 128,
+            "duration": 19.00502572899859,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13793.404109946072,
+            "output_throughput": 3448.351027486518,
+            "total_throughput": 17241.755137432592,
+            "accept_length": 4.990582826635029
+          },
+          {
+            "iteration": 2,
+            "completed": 128,
+            "duration": 18.98007485299604,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13811.536678877748,
+            "output_throughput": 3452.884169719437,
+            "total_throughput": 17264.420848597187,
+            "accept_length": 4.990582826635029
+          }
+        ],
+        "median_total_tokens_per_second": 17241.755137432592,
+        "median_output_tokens_per_second": 3448.351027486518
+      },
+      "optimized": {
+        "enable_dflash_swa_cache": true,
+        "enable_hierarchical_cache": true,
+        "tree_core_backend": "python",
+        "gpus": [
+          0,
+          1
+        ],
+        "runs": [
+          {
+            "iteration": 0,
+            "completed": 128,
+            "duration": 19.098117697998532,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13726.169465772666,
+            "output_throughput": 3431.5423664431664,
+            "total_throughput": 17157.71183221583,
+            "accept_length": 4.990582826635029
+          },
+          {
+            "iteration": 1,
+            "completed": 128,
+            "duration": 18.788290772994515,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13952.51985224726,
+            "output_throughput": 3488.129963061815,
+            "total_throughput": 17440.649815309076,
+            "accept_length": 4.990582826635029
+          },
+          {
+            "iteration": 2,
+            "completed": 128,
+            "duration": 18.813690217008116,
+            "total_input_tokens": 262144,
+            "total_output_tokens": 65536,
+            "input_throughput": 13933.683236849212,
+            "output_throughput": 3483.420809212303,
+            "total_throughput": 17417.104046061515,
+            "accept_length": 4.990582826635029
+          }
+        ],
+        "median_total_tokens_per_second": 17417.104046061515,
+        "median_output_tokens_per_second": 3483.420809212303
+      }
+    },
+    "optimized_vs_prior_percent": 1.0170015014784317,
+    "optimized_vs_off_percent": -13.386801993407339,
+    "scope": "Cold synthetic workload with fixed target/Mamba capacity. Off disables HiCache and uses Rust TreeCore; enabled paths use Python TreeCore. Comparison includes both differences. Distinct same-model GPU pairs, not a crossover on the same pair. No claim about agentic reuse, memory-pressure gains, or full serving-memory peak."
+  }
+}

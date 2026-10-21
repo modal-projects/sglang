@@ -20,10 +20,14 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
@@ -35,6 +39,9 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -43,20 +50,28 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedHybridLinearKVPool,
     UnifiedKVPool,
+    UnifiedMambaPool,
     UnifiedMambaSlotAllocator,
+    UnifiedMHATokenToKVPool,
     init_unified_mamba_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_spec,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     tri_sub_pool_specs,
 )
 
-# Hermetic convention of this directory's pool tests: plain unittest.TestCase,
-# only ci_register imported (no heavy sglang.test.test_utils chain).
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _DEV = "cpu"
@@ -1155,7 +1170,9 @@ class TestTriFactorySizing(unittest.TestCase):
                         initial_available = allocator.available_size()
                         req = SimpleNamespace(
                             kv=SimpleNamespace(
-                                req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
+                                req_pool_idx=0,
+                                mamba_pool_idx=allocator.alloc(1)[0],
+                                dflash_feature_state=None,
                             )
                         )
                         pool._alloc_ping_pong_buffer(req)
@@ -1290,6 +1307,792 @@ class TestTriFactorySizing(unittest.TestCase):
                     sliding_window_size=64,
                 )
             )
+
+
+class TestSeparateDraftSWAPool(CustomTestCase):
+    def _build_pools(self, page_size):
+        full, swa, mamba = tri_sub_pool_specs(full_layer_num=2, swa_layer_num=6)
+        swa = replace(
+            swa,
+            head_num=1,
+            head_dim=8,
+            v_head_dim=8,
+            store_dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+        )
+        mamba = replace(mamba, temporal_state_shape=(2, 2, 4))
+        shared = UnifiedKVPool(
+            total_bytes=64 * full.entry_bytes()
+            + 32 * swa.entry_bytes()
+            + 8 * mamba.entry_bytes(),
+            sub_pool_specs=[full, swa, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        state = UnifiedMambaPool(
+            unified_buffer=shared,
+            sub_pool_name="mamba",
+            spec_state_size=1,
+            mamba_layer_ids=[0, 2],
+        )
+        full_pool = UnifiedMHATokenToKVPool(
+            unified_buffer=shared, sub_pool_name="full", page_size=page_size
+        )
+        target = UnifiedHybridLinearKVPool(
+            size=64,
+            dtype=full.kv_cache_dtype,
+            page_size=page_size,
+            head_num=full.head_num,
+            head_dim=full.head_dim,
+            full_attention_layer_ids=[1, 3],
+            device=_DEV,
+            mamba_pool=state,
+            full_kv_pool=full_pool,
+        )
+        draft = UnifiedMHATokenToKVPool(
+            unified_buffer=shared, sub_pool_name="swa", page_size=page_size
+        )
+        return shared, target, draft, state
+
+    def _allocator(self, shared, target, draft, state, page_size):
+        return UnifiedMambaSWATokenToKVPoolAllocator(
+            unified_buffer=shared,
+            kvcache=target,
+            swa_kvcache=draft,
+            mamba_kvcache=state,
+            device=_DEV,
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            page_size=page_size,
+        )
+
+    def test_draft_reclaim_preserves_target_kv_and_recurrent_state(self):
+        """SWA recycling and Full compaction must preserve both models' rows
+        despite overlapping layer IDs, different geometry, and different dtypes.
+        """
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                shared, target, draft, state = self._build_pools(page_size)
+                alloc = self._allocator(shared, target, draft, state, page_size)
+                self.assertIs(alloc.get_kvcache(), target)
+                ids = alloc.alloc(3 * page_size)
+                state_ids = alloc.mamba_allocator.alloc(1)
+                self.assertIsNotNone(ids)
+                self.assertIsNotNone(state_ids)
+                state_phys = alloc.mamba_allocator.translate_kv_loc(state_ids)
+                state.mamba_cache.conv[0][:, state_phys] = 42
+                state.mamba_cache.temporal[:, state_phys] = 43
+
+                buffers = []
+                for pool, layer_ids, translate, base in (
+                    (target, (1, 3), alloc.translate_kv_loc, 10),
+                    (draft, range(6), alloc.translate_loc_from_full_to_swa, 100),
+                ):
+                    for layer_id in layer_ids:
+                        for offset, get_buffer in enumerate(
+                            (pool.get_key_buffer, pool.get_value_buffer)
+                        ):
+                            buf = get_buffer(layer_id)
+                            values = (ids + base + 10 * layer_id + offset).to(buf.dtype)
+                            values = values[:, None, None].expand(-1, *buf.shape[1:])
+                            buf[translate(ids)] = values
+                            buffers.append((pool, buf, translate, values))
+
+                alloc.free_swa(ids[:page_size])
+                self.assertEqual(alloc.full_attn_allocator.allocated_count(), len(ids))
+                self.assertEqual(
+                    alloc.swa_attn_allocator.allocated_count(), 2 * page_size
+                )
+                self.assertTrue(
+                    bool((alloc.swa_v2p_page_table[ids[:1] // page_size] == -1).all())
+                )
+                alloc.swa_attn_allocator.alloc_with_virtual(ids[:1] // page_size)
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), len(ids))
+                for pool, buf, translate, values in buffers:
+                    if pool is draft:
+                        buf[translate(ids[:page_size])] = values[:page_size]
+                alloc.free(ids[page_size : 2 * page_size])
+                remaining = torch.cat((ids[:page_size], ids[2 * page_size :]))
+                swa = alloc.swa_attn_allocator
+                old_swa_phys = alloc.translate_loc_from_full_to_swa(remaining)
+                swa.make_room(
+                    side="low",
+                    min_bytes=swa._byte_low_frontier()
+                    - swa._chain_high_frontier_below_bytes()
+                    + swa.entry_bytes_per_page,
+                )
+                self.assertFalse(
+                    torch.equal(
+                        old_swa_phys, alloc.translate_loc_from_full_to_swa(remaining)
+                    )
+                )
+                for _, buf, translate, values in buffers:
+                    expected = torch.cat((values[:page_size], values[2 * page_size :]))
+                    torch.testing.assert_close(
+                        buf[translate(remaining)], expected, rtol=0, atol=0
+                    )
+                state_phys = alloc.mamba_allocator.translate_kv_loc(state_ids)
+                self.assertTrue(
+                    bool((state.mamba_cache.conv[0][:, state_phys] == 42).all())
+                )
+                self.assertTrue(
+                    bool((state.mamba_cache.temporal[:, state_phys] == 43).all())
+                )
+                alloc.free(remaining)
+                alloc.mamba_allocator.free(state_ids)
+                for member in (
+                    alloc.full_attn_allocator,
+                    alloc.swa_attn_allocator,
+                    alloc.mamba_allocator,
+                ):
+                    self.assertEqual(member.allocated_count(), 0)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_rejects_draft_view_of_wrong_storage(self):
+        shared, target, _, state = self._build_pools(page_size=1)
+        _, _, foreign_draft, _ = self._build_pools(page_size=1)
+        wrong_page_size = UnifiedMHATokenToKVPool(
+            unified_buffer=shared, sub_pool_name="swa", page_size=2
+        )
+        for wrong_pool in (target.full_kv_pool, foreign_draft, wrong_page_size):
+            with (
+                self.subTest(pool=wrong_pool),
+                self.assertRaisesRegex(
+                    ValueError, "SWA view of the same unified buffer"
+                ),
+            ):
+                self._allocator(shared, target, wrong_pool, state, page_size=1)
+
+
+class TestDraftSWAFactory(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(
+            enable_dflash_swa_cache=True,
+            enable_hierarchical_cache=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.enterContext(get_parallel().override(attn_dcp_rank=0))
+
+    def _factory_kwargs(self, **overrides):
+        kwargs = TestTriFactorySizing._factory_kwargs(self)
+        kwargs.update(
+            start_layer=4,
+            end_layer=8,
+            full_attention_layer_ids=[5, 7],
+            mamba_layer_ids=[4, 6],
+            swa_attention_layer_ids=[],
+            swa_head_num=1,
+            swa_head_dim=8,
+            swa_v_head_dim=16,
+            draft_swa_layer_ids=list(range(2, 8)),
+            draft_kv_cache_dtype=torch.bfloat16,
+            sliding_window_size=8,
+        )
+        kwargs["mamba2_cache_params"].layers = [4, 6]
+        kwargs["mamba2_cache_params"].shape.temporal = (2, 2, 4)
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_bounded_draft_windows_share_pages_and_survive_canonicalization(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.speculative.dflash_cache import DFlashCacheResidency
+        from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureState
+        from sglang.test.kernels.dflash_window import (
+            dflash_unbound_full_pages_reference,
+            dflash_update_window_reference,
+        )
+
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dflash_cache.dflash_compact_window_pages",
+                side_effect=lambda held, mapping, num_live: held[mapping[held] > 0],
+            )
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dflash_cache.dflash_unbound_full_pages",
+                side_effect=dflash_unbound_full_pages_reference,
+            )
+        )
+
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dflash_cache.dflash_update_window",
+                side_effect=dflash_update_window_reference,
+            )
+        )
+
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                bundle = init_unified_mamba_swa_pools(
+                    **self._factory_kwargs(
+                        page_size=page_size,
+                        bounded_draft_swa=True,
+                        model_context_len=80,
+                        unified_total_bytes=131072,
+                        full_max_total_num_tokens=128,
+                        swa_max_total_num_tokens=32,
+                    )
+                )
+                alloc = bundle.token_to_kv_pool_allocator
+                table = bundle.req_to_token_pool
+                draft = bundle.draft_token_to_kv_pool
+                ids = alloc.alloc(64)
+                self.assertIsNotNone(ids)
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), 0)
+                table.req_to_token[0, :64] = ids
+                table.req_to_token[1, :64] = ids
+                a, b = (SimpleNamespace(kv=ReqKvInfo(req_pool_idx=i)) for i in (0, 1))
+                for req in (a, b):
+                    req.kv.dflash_feature_state = DFlashFeatureState(8)
+                cache = DFlashCacheResidency(alloc, table, window_size=8)
+
+                def materialize(*, target_hidden, cache_loc, positions):
+                    draft.get_key_buffer(2)[cache_loc] = target_hidden[
+                        :, :1, None
+                    ].bfloat16()
+
+                batch = SimpleNamespace(
+                    reqs=[a, b],
+                    prefix_lens=[0, 0],
+                    extend_lens=[48, 48],
+                    seq_lens=torch.tensor([48, 48]),
+                )
+                cache.prepare(batch, materialize=materialize)
+                reserved = 2 * ((8 + 2 * page_size - 2) // page_size) * page_size
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
+                # The windows share their eight materialized tokens. Additional
+                # bindings provision the bounded pool for asynchronous growth.
+                self.assertEqual(
+                    alloc.translate_loc_from_full_to_swa(table.req_to_token[:2, 40:48])
+                    .unique()
+                    .numel(),
+                    8,
+                )
+                capture = SimpleNamespace(
+                    entries=[
+                        SimpleNamespace(
+                            owner=req.kv.dflash_feature_state,
+                            slices=[
+                                (40, torch.arange(start, start + 8).float()[:, None])
+                            ],
+                        )
+                        for req, start in zip((a, b), (40, 88))
+                    ]
+                )
+                cache.retain_prefill(batch, capture)
+                canonical = alloc.alloc(8)
+                table.req_to_token[1, 40:48] = canonical
+                cache.prepare(batch, materialize=materialize)
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
+                values = draft.get_key_buffer(2)[
+                    alloc.translate_loc_from_full_to_swa(canonical)
+                ]
+                torch.testing.assert_close(
+                    values[:, 0, 0].float(), torch.arange(88, 96).float()
+                )
+                a.kv.req_pool_idx = None
+                batch.reqs = [b]
+                batch.prefix_lens = [48]
+                batch.extend_lens = [16]
+                batch.seq_lens = torch.tensor([64])
+                cache.prepare(batch, materialize=materialize)
+                # Retired bindings remain reusable within the fixed window cap.
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
+                self.assertEqual(alloc.full_attn_allocator.allocated_count(), 72)
+                future = alloc.alloc(16)
+                table.req_to_token[1, 64:80] = future
+                limit = max(
+                    reserved, ((8 + 2 + 2 * page_size - 2) // page_size) * page_size
+                )
+                for prefix in range(64, 77):
+                    # Host progress trails the GPU by at most one verify block.
+                    b.kv.kv_committed_len = prefix - 2
+                    b.kv.kv_allocated_len = prefix + 2
+                    cache.prepare(
+                        batch,
+                        prefix_lens=torch.tensor([prefix]),
+                        block_size=2,
+                        materialize=materialize,
+                    )
+                    window = table.req_to_token[1, prefix - 8 : prefix + 2]
+                    self.assertTrue(
+                        (
+                            alloc.swa_attn_allocator.virtual_to_physical[
+                                window // page_size
+                            ]
+                            > 0
+                        ).all()
+                    )
+                    self.assertLessEqual(
+                        alloc.swa_attn_allocator.allocated_count(), limit
+                    )
+                    self.assertEqual(alloc.verify_byte_accounting(), [])
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), limit)
+                alloc.free_group_begin()
+                alloc.free_segment(ids, start_pos=0)
+                alloc.free_segment(canonical, start_pos=40)
+                alloc.free_segment(future, start_pos=64)
+                self.assertTrue(alloc.evict_to_free_tokens(None, 128))
+                alloc.free_group_end()
+                self.assertEqual(alloc.full_attn_allocator.allocated_count(), 0)
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), 0)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+                states = table.mamba_allocator.alloc(4)
+                self.assertIsNotNone(states)
+                self.assertIsNone(table.mamba_allocator.alloc(1))
+                table.mamba_allocator.free(states)
+
+    def test_model_views_and_recurrent_slot_wiring(self):
+        """Each model keeps its own layer IDs, head geometry, and dtype;
+        the target's recurrent state uses the shared slot allocator.
+        """
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                bundle = init_unified_mamba_swa_pools(
+                    **self._factory_kwargs(page_size=page_size)
+                )
+                shared = bundle.unified_memory_pool
+                target = bundle.token_to_kv_pool
+                draft = bundle.draft_token_to_kv_pool
+                req_pool = bundle.req_to_token_pool
+                alloc = bundle.token_to_kv_pool_allocator
+                self.assertIsInstance(target, UnifiedHybridLinearKVPool)
+                self.assertIsInstance(draft, UnifiedMHATokenToKVPool)
+                self.assertIs(alloc.get_kvcache(), target)
+                self.assertIs(target.mamba_pool, req_pool.mamba_pool)
+                ids = alloc.alloc(2 * page_size)
+                self.assertIsNotNone(ids)
+                buffers = []
+                for pool, layers, translate, shape, dtype, base in (
+                    (
+                        target,
+                        (5, 7),
+                        alloc.translate_kv_loc,
+                        (2, 4, 4),
+                        torch.float16,
+                        20,
+                    ),
+                    (
+                        draft,
+                        range(2, 8),
+                        alloc.translate_loc_from_full_to_swa,
+                        (1, 8, 16),
+                        torch.bfloat16,
+                        100,
+                    ),
+                ):
+                    for layer_id in layers:
+                        for offset, (get_buffer, head_dim) in enumerate(
+                            (
+                                (pool.get_key_buffer, shape[1]),
+                                (pool.get_value_buffer, shape[2]),
+                            )
+                        ):
+                            buf = get_buffer(layer_id)
+                            self.assertEqual(buf.shape[1:], (shape[0], head_dim))
+                            self.assertEqual(buf.dtype, dtype)
+                            self.assertEqual(
+                                buf.untyped_storage().data_ptr(), shared._raw.data_ptr()
+                            )
+                            value = base + layer_id + offset
+                            buf[translate(ids)] = value
+                            buffers.append((buf, translate(ids), value))
+                for buf, physical_ids, value in buffers:
+                    self.assertTrue(bool((buf[physical_ids] == value).all()))
+
+                state_ids = req_pool.mamba_allocator.alloc(2)
+                self.assertIsNotNone(state_ids)
+                physical_state_ids = alloc.mamba_allocator.translate_kv_loc(state_ids)
+                torch.testing.assert_close(
+                    req_pool.translate_mamba_indices(state_ids),
+                    physical_state_ids.to(torch.int32),
+                )
+                torch.testing.assert_close(
+                    target._mamba_translate(state_ids), physical_state_ids
+                )
+                req_pool.mamba_allocator.free(state_ids)
+                alloc.free(ids)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_draft_capacity_and_geometry_determine_byte_budget(self):
+        # Full: 2 layers * 2 heads * (4 K + 4 V) * 2 bytes = 64 bytes/token.
+        # Draft: 6 layers * 1 head * (8 K + 16 V) * 2 bytes = 288 bytes/token.
+        # State: 2 layers * (3*8 BF16 conv + 2*2*4 FP32 recurrent) = 224 bytes.
+        for token_budget in (None, 20_000):
+            for draft_tokens in (16, 32):
+                with self.subTest(token_budget=token_budget, draft_tokens=draft_tokens):
+                    bundle = init_unified_mamba_swa_pools(
+                        **self._factory_kwargs(
+                            swa_max_total_num_tokens=draft_tokens,
+                            unified_total_bytes=token_budget,
+                        )
+                    )
+                    token_bytes = (
+                        64 * 64 + draft_tokens * 288
+                        if token_budget is None
+                        else token_budget
+                    )
+                    self.assertEqual(
+                        bundle.unified_memory_pool.total_bytes,
+                        token_bytes + 4 * 224,
+                    )
+                    target = bundle.token_to_kv_pool.full_kv_pool
+                    draft = bundle.draft_token_to_kv_pool
+                    self.assertEqual(target.host_capacity_tokens, 64)
+                    self.assertEqual(target.host_capacity_bytes, 64 * 64)
+                    self.assertEqual(draft.host_capacity_tokens, draft_tokens)
+                    self.assertEqual(draft.host_capacity_bytes, draft_tokens * 288)
+
+    def test_bounded_recurrent_slots_do_not_reduce_full_token_budget(self):
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(
+                bounded_draft_swa=True,
+                unified_total_bytes=20_000,
+                swa_max_total_num_tokens=16,
+            )
+        )
+        allocator = bundle.token_to_kv_pool_allocator
+        states = bundle.req_to_token_pool.mamba_allocator
+        full_capacity = allocator.available_size()
+        state_ids = states.alloc(states.size)
+        self.assertIsNotNone(state_ids)
+        self.assertEqual(states.schedulable_available_size(), 0)
+        self.assertEqual(allocator.available_size(), full_capacity)
+        self.assertEqual(allocator.mamba_slot_full_token_cost(), 0)
+        tokens = allocator.alloc(full_capacity)
+        self.assertIsNotNone(tokens)
+        self.assertTrue(allocator.ensure_capacity(0, 16))
+        allocator.swa_attn_allocator.alloc_with_virtual(tokens[:16])
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 16)
+        allocator.free(tokens)
+        states.free(state_ids)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_bounded_pool_accounting_when_draft_splits_free_space(self):
+        """A live draft region must not appear as leaked target tokens."""
+        from sglang.srt.managers.scheduler_components.invariant_checker import (
+            SchedulerInvariantChecker,
+        )
+
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                bundle = init_unified_mamba_swa_pools(
+                    **self._factory_kwargs(
+                        bounded_draft_swa=True,
+                        full_max_total_num_tokens=1024,
+                        swa_max_total_num_tokens=16,
+                        unified_total_bytes=80_000,
+                        page_size=page_size,
+                    )
+                )
+                allocator = bundle.token_to_kv_pool_allocator
+                states = bundle.req_to_token_pool.mamba_allocator
+                state_ids = states.alloc(states.size)
+                tokens = allocator.alloc(32)
+                self.assertTrue(allocator.ensure_capacity(0, 16))
+                allocator.swa_attn_allocator.alloc_with_virtual(
+                    tokens[:16:page_size] // page_size
+                )
+                self.assertLess(allocator.available_size(), 1024 - 32)
+                for cached, expected_leak in ((32, False), (32 - page_size, True)):
+                    leak, message = SchedulerInvariantChecker._check_pool_invariant(
+                        "full", allocator.available_size(), cached, 0, 0, allocator.size
+                    )
+                    self.assertEqual(leak, expected_leak, message)
+
+                # The fixed admission cap remains usable after moving the draft
+                # region; reporting current capacity must not shrink that budget.
+                remaining = allocator.alloc(1024 - 32)
+                self.assertIsNotNone(remaining)
+                self.assertIsNone(allocator.alloc(page_size))
+                allocator.free(torch.cat((tokens, remaining)))
+                states.free(state_ids)
+                self.assertEqual(allocator.available_size(), 1024)
+                self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_rejects_ambiguous_draft_layouts(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        fused = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        for overrides in (
+            {"draft_swa_layer_ids": None},
+            {"draft_kv_cache_dtype": None},
+            {"draft_swa_layer_ids": []},
+            {"draft_swa_layer_ids": [2, 4]},
+            {"draft_swa_layer_ids": [3, 2]},
+            {"draft_swa_layer_ids": [-1, 0]},
+            {"swa_attention_layer_ids": [4]},
+            {"fused_draft": fused},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                init_unified_mamba_swa_pools(**self._factory_kwargs(**overrides))
+
+    def _draft_configurator(self, page_size):
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.is_draft_worker = True
+        cfg.draft_model_idx = None
+        cfg.page_size = page_size
+        cfg.kv_cache_dtype = torch.bfloat16
+        cfg.model = torch.nn.ModuleList(
+            RadixAttention(
+                num_heads=2,
+                num_kv_heads=1,
+                head_dim=8,
+                v_head_dim=16,
+                scaling=1,
+                layer_id=layer_id,
+                sliding_window_size=8,
+            )
+            for layer_id in range(2, 8)
+        )
+        return cfg
+
+    def test_draft_binding_requires_opt_in_and_hicache(self):
+        bundle = init_unified_mamba_swa_pools(**self._factory_kwargs(page_size=4))
+        for scope in (
+            get_spec().override(enable_dflash_swa_cache=False),
+            get_memory().override(enable_hierarchical_cache=False),
+        ):
+            with scope, self.assertRaisesRegex(ValueError, "--enable-dflash-swa-cache"):
+                self._draft_configurator(page_size=4)._init_pools(
+                    sizes=None,
+                    req_to_token_pool=bundle.req_to_token_pool,
+                    token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+                )
+
+    def test_draft_binding_and_shared_plan_use_swa_physical_ids(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                bundle = init_unified_mamba_swa_pools(
+                    **self._factory_kwargs(page_size=page_size)
+                )
+                alloc = bundle.token_to_kv_pool_allocator
+                cfg = self._draft_configurator(page_size)
+                pools = cfg._init_pools(
+                    sizes=None,
+                    req_to_token_pool=bundle.req_to_token_pool,
+                    token_to_kv_pool_allocator=alloc,
+                )
+                self.assertIs(pools.token_to_kv_pool, bundle.draft_token_to_kv_pool)
+                self.assertIs(pools.req_to_token_pool, bundle.req_to_token_pool)
+                self.assertIs(pools.token_to_kv_pool_allocator, alloc)
+                self.assertIsNone(pools.unified_memory_pool)
+
+                ids = alloc.alloc(3 * page_size)
+                self.assertIsNotNone(ids)
+                req_to_token = pools.req_to_token_pool.req_to_token
+                req_to_token[0, : ids.numel()] = ids.to(req_to_token.dtype)
+                target, draft = (
+                    KVIndexTranslator(
+                        req_to_token=req_to_token,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=pool,
+                        page_size=page_size,
+                        device=_DEV,
+                        is_draft_worker=is_draft,
+                    )
+                    for pool, is_draft in (
+                        (bundle.token_to_kv_pool, False),
+                        (pools.token_to_kv_pool, True),
+                    )
+                )
+                self.assertTrue(draft.is_translating)
+                self.assertEqual(draft.window_kv_kind, IdSpaceKind.SLIDING_WINDOW)
+                self.assertEqual(
+                    draft.capture_token_capacity(1),
+                    alloc.full_v2p_page_table.numel() * page_size,
+                )
+                values = torch.arange(ids.numel(), dtype=torch.bfloat16) + 10
+                buffer = pools.token_to_kv_pool.get_key_buffer(2)
+                buffer[alloc.translate_loc_from_full_to_swa(ids)] = values[
+                    :, None, None
+                ]
+
+                def check_plans():
+                    expected_full = alloc.translate_kv_loc(ids)
+                    expected_swa = alloc.translate_loc_from_full_to_swa(ids)
+                    self.assertFalse(torch.equal(expected_full, expected_swa))
+                    for source in (target, draft):
+                        plan = source.plan(
+                            req_pool_indices=torch.tensor([0]),
+                            seq_lens=torch.tensor([ids.numel()]),
+                            seq_lens_cpu=torch.tensor([ids.numel()]),
+                            write_virtual=ids,
+                        )
+                        for reader, expected in (
+                            (target, expected_full),
+                            (draft, expected_swa),
+                        ):
+                            batch = SimpleNamespace()
+                            plan.bind(batch, reader)
+                            torch.testing.assert_close(batch.out_cache_loc, expected)
+                            self.assertIs(batch.out_cache_loc_virtual, ids)
+                            # Exercise the gather source before and after a table reader.
+                            view = reader.read_source(
+                                plan, req_pool_indices=plan.req_pool_indices, bs=1
+                            )
+                            self.assertIs(
+                                view.v2p, reader.space(IdSpaceKind.FULL).read_v2p
+                            )
+                            table = reader.read_table(plan)
+                            torch.testing.assert_close(
+                                table.ids[0].long(), expected[::page_size] // page_size
+                            )
+                            self.assertIs(
+                                reader.read_source(
+                                    plan, req_pool_indices=plan.req_pool_indices, bs=1
+                                ).ids,
+                                table.ids,
+                            )
+                        self.assertIs(
+                            plan.write_ids(draft),
+                            plan.write_ids(target, kind=IdSpaceKind.SLIDING_WINDOW),
+                        )
+                        self.assertIs(
+                            draft.read_table(plan).ids,
+                            target.read_table(
+                                plan, kind=IdSpaceKind.SLIDING_WINDOW
+                            ).ids,
+                        )
+                        capture_table = torch.full((2, 3), -1, dtype=torch.int32)
+                        draft.copy_page_table(plan, out=capture_table)
+                        torch.testing.assert_close(
+                            capture_table[0].long(),
+                            expected_swa[::page_size] // page_size,
+                        )
+                        self.assertTrue(bool((capture_table[1] == 0).all()))
+
+                check_plans()
+                # Reclaiming the draft prefix leaves the target's IDs live.
+                alloc.free_swa(ids[:page_size])
+                check_plans()
+                alloc.swa_attn_allocator.alloc_with_virtual(ids[:1] // page_size)
+                buffer[alloc.translate_loc_from_full_to_swa(ids[:page_size])] = values[
+                    :page_size, None, None
+                ]
+                swa = alloc.swa_attn_allocator
+                before = alloc.translate_loc_from_full_to_swa(ids)
+                swa.make_room(
+                    side="low",
+                    min_bytes=swa._byte_low_frontier()
+                    - swa._chain_high_frontier_below_bytes()
+                    + swa.entry_bytes_per_page,
+                )
+                self.assertFalse(
+                    torch.equal(before, alloc.translate_loc_from_full_to_swa(ids))
+                )
+                check_plans()
+                torch.testing.assert_close(
+                    buffer[alloc.translate_loc_from_full_to_swa(ids), 0, 0], values
+                )
+                # Capture slots already name the draft's storage; no second translation.
+                slots = alloc.translate_loc_from_full_to_swa(ids)
+                capture = SimpleNamespace(out_cache_loc=slots)
+                draft.bind_runner_slots(capture)
+                self.assertIs(
+                    draft.write_ids(capture, IdSpaceKind.SLIDING_WINDOW), slots
+                )
+                alloc.free(ids)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_draft_binding_rejects_model_or_storage_mismatch(self):
+        bundle = init_unified_mamba_swa_pools(**self._factory_kwargs(page_size=4))
+        bundle.token_to_kv_pool_allocator.dflash_cache_sizing = SimpleNamespace(
+            window_size=9
+        )
+        mutations = {
+            "page size": lambda cfg: setattr(cfg, "page_size", 1),
+            "dtype": lambda cfg: setattr(cfg, "kv_cache_dtype", torch.float16),
+            "second runner": lambda cfg: setattr(cfg, "draft_model_idx", 1),
+            "layer IDs": lambda cfg: setattr(cfg.model[0], "layer_id", 0),
+            "K width": lambda cfg: setattr(cfg.model[0], "head_dim", 16),
+            "V width": lambda cfg: setattr(cfg.model[0], "v_head_dim", 8),
+            "K heads": lambda cfg: setattr(cfg.model[0], "tp_k_head_num", 2),
+            "V heads": lambda cfg: setattr(cfg.model[0], "tp_v_head_num", 2),
+            "full attention": lambda cfg: setattr(
+                cfg.model[0], "sliding_window_size", -1
+            ),
+            "window": lambda cfg: setattr(cfg.model[0], "sliding_window_size", 7),
+            "recurrent state": lambda cfg: cfg.model.append(
+                RadixLinearAttention(
+                    layer_id=8,
+                    num_q_heads=1,
+                    num_k_heads=1,
+                    num_v_heads=1,
+                    head_q_dim=8,
+                    head_k_dim=8,
+                    head_v_dim=8,
+                )
+            ),
+        }
+        for name, mutation in mutations.items():
+            cfg = self._draft_configurator(page_size=4)
+            mutation(cfg)
+            with (
+                self.subTest(mismatch=name),
+                self.assertRaisesRegex(ValueError, "draft SWA"),
+            ):
+                cfg._init_pools(
+                    sizes=None,
+                    req_to_token_pool=bundle.req_to_token_pool,
+                    token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+                )
+        with self.assertRaisesRegex(ValueError, "request table"):
+            self._draft_configurator(page_size=4)._init_pools(
+                sizes=None,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            )
+
+    def test_draft_plan_rejects_foreign_owner_and_unbound_views(self):
+        bundle, foreign = (
+            init_unified_mamba_swa_pools(**self._factory_kwargs()) for _ in range(2)
+        )
+        alloc = bundle.token_to_kv_pool_allocator
+        ids = alloc.alloc(2)
+        req_to_token = bundle.req_to_token_pool.req_to_token
+        target, draft, foreign_draft, unbound = (
+            KVIndexTranslator(
+                req_to_token=req_to_token,
+                token_to_kv_pool_allocator=allocator,
+                token_to_kv_pool=pool,
+                page_size=1,
+                device=_DEV,
+            )
+            for allocator, pool in (
+                (alloc, bundle.token_to_kv_pool),
+                (alloc, bundle.draft_token_to_kv_pool),
+                (foreign.token_to_kv_pool_allocator, foreign.draft_token_to_kv_pool),
+                (
+                    alloc,
+                    UnifiedMHATokenToKVPool(
+                        unified_buffer=bundle.unified_memory_pool, sub_pool_name="swa"
+                    ),
+                ),
+            )
+        )
+        plan = target.plan(
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([2]),
+            seq_lens_cpu=torch.tensor([2]),
+            write_virtual=ids,
+        )
+        self.assertTrue(plan.is_read_by(draft))
+        # The row tensor alone cannot establish logical-ID ownership.
+        with self.assertRaisesRegex(AssertionError, "own.*req_to_token"):
+            foreign_draft.read_table(plan)
+        # Sharing the raw buffer alone cannot establish a physical mapping.
+        self.assertFalse(unbound.is_translating)
+        self.assertIs(plan.write_ids(unbound), ids)
+        alloc.free(ids)
 
 
 class TestTriPoolHardening(unittest.TestCase):

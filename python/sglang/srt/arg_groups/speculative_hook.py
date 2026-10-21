@@ -158,6 +158,20 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    if cfg.enable_dflash_swa_cache:
+        if cfg.speculative_algorithm != "DFLASH":
+            raise ValueError(
+                "--enable-dflash-swa-cache requires --speculative-algorithm DFLASH."
+            )
+        if not cfg.enable_unified_memory:
+            raise ValueError(
+                "--enable-dflash-swa-cache requires --enable-unified-memory."
+            )
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-dflash-swa-cache requires --enable-hierarchical-cache for raw checkpoint tails."
+            )
+
     # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
     # EAGLE/NEXTN to FROZEN_KV_MTP.
     if (

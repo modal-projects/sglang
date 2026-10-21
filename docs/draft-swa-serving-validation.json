@@ -1,0 +1,79 @@
+{
+  "date": "2026-10-21",
+  "target": "Qwen3.6-35B-A3B",
+  "draft": "/tmp/autospec/baseline",
+  "hardware": "H200",
+  "tp": 2,
+  "page_size": 64,
+  "max_running_requests": 32,
+  "max_mamba_cache_size": 256,
+  "max_total_tokens": 131072,
+  "hicache_ratio": 2,
+  "hicache_write_policy": "write_through",
+  "attention_backend": "fa3",
+  "overlap": true,
+  "cuda_graphs": true,
+  "startup_unified_arena_bytes_per_rank": 10506895360,
+  "draft_token_cap": 69632,
+  "raw_gpu_reserve_bytes_per_rank": 19377684480,
+  "raw_host_bytes_per_rank": 12884901888,
+  "checks": {
+    "cold": {
+      "prompt_tokens": 4133,
+      "completion_tokens": 128,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "num_retractions": 0,
+      "output_sha256": "4b1d01bc48052f4789c9206f5e43788af457434b9d5c221013773468da39e71b"
+    },
+    "warm": {
+      "prompt_tokens": 4133,
+      "completion_tokens": 128,
+      "cached_tokens": 4096,
+      "cached_tokens_details": {
+        "device": 4096,
+        "host": 0
+      },
+      "num_retractions": 0,
+      "output_sha256": "4b1d01bc48052f4789c9206f5e43788af457434b9d5c221013773468da39e71b"
+    },
+    "long_decode": {
+      "prompt_tokens": 2071,
+      "completion_tokens": 2400,
+      "cached_tokens": 0,
+      "cached_tokens_details": null,
+      "num_retractions": 0,
+      "output_sha256": "c34d8c97d8d164d5580789506f75adcac19db1eb5df35ea93c64342afaa2a499"
+    },
+    "reused": {
+      "prompt_tokens": 2071,
+      "completion_tokens": 128,
+      "cached_tokens": 2048,
+      "cached_tokens_details": {
+        "device": 2048,
+        "host": 0
+      },
+      "num_retractions": 0,
+      "output_sha256": "fa4e7f95ec376bc3a8f140957fc311f934c0786e4119ed3e5af51d241ba4ab0e"
+    },
+    "restored": {
+      "prompt_tokens": 4133,
+      "completion_tokens": 128,
+      "cached_tokens": 4096,
+      "cached_tokens_details": {
+        "device": 0,
+        "host": 4096
+      },
+      "num_retractions": 0,
+      "output_sha256": "4b1d01bc48052f4789c9206f5e43788af457434b9d5c221013773468da39e71b"
+    }
+  },
+  "branch_count": 32,
+  "all_branches_hit_4096": true,
+  "max_branch_retractions": 0,
+  "cold_warm_host_output_match": true,
+  "long_decode_prefix_matches_reuse": true,
+  "scope": "Serving correctness qualification; not a throughput comparison or raw-feature peak-memory measurement.",
+  "output_hash_encoding": "SHA256 of the output token ID JSON array, UTF-8, compact separators without whitespace.",
+  "provenance": "Cold result is the initial zero-cache probe; later checks are subsequent probes on the same server and configuration."
+}

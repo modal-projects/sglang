@@ -20,7 +20,13 @@ from sglang.srt.mem_cache.pool_host.base import (
     ranks_per_host,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -94,7 +100,20 @@ def auto_size_hicache(
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
     budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
-    ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
+    sizing = (
+        params.token_to_kv_pool_allocator.dflash_cache_sizing
+        if get_spec().enable_dflash_swa_cache
+        else None
+    )
+    raw_bytes = (
+        0
+        if sizing is None
+        else get_schedule().max_mamba_cache_size * sizing.raw_window_bytes
+    )
+    ratio = min(
+        requested,
+        (budget - raw_bytes) * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes,
+    )
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
     if torch.distributed.is_initialized():

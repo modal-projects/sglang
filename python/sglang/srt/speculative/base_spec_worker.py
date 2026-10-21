@@ -11,7 +11,13 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_schedule,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -268,6 +274,10 @@ class BaseSpecWorker(ABC):
         target_model_runner.mtp_draft_device_pools = ()
         target_model_runner.mtp_draft_mamba_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
+        if get_spec().enable_dflash_swa_cache:
+            # Checkpoint recovery owns raw features. Materialized draft pages
+            # are a transient device working set, not a Full-KV host sidecar.
+            return HiCacheDraftPlan()
         if not (
             get_memory().enable_hierarchical_cache
             or get_memory().enable_unified_cache_external_linker

@@ -1623,6 +1623,41 @@ class TestPrefillAdder(CustomTestCase):
                             req, "mamba"
                         )
 
+    def test_zero_full_cost_preserves_mamba_slot_admission(self):
+        for holds_state, slots, admitted in (
+            (False, 1, False),
+            (True, 0, False),
+            (False, 2, True),
+            (True, 1, True),
+        ):
+            with self.subTest(holds_state=holds_state, slots=slots):
+                adder, req = self._build_mamba_restore_admission(
+                    holds_state=holds_state, available_slots=slots
+                )
+                adder._mamba_slot_cost = 0
+                self.mock_token_allocator.available_size.return_value = 64
+                result = adder.add_one_req(req, False, None)
+                self.assertEqual(adder.can_run_list, [req] if admitted else [])
+                self.assertEqual(adder.rem_mamba_slots, 0 if admitted else slots)
+                if admitted:
+                    self.mock_tree_cache.init_load_back.assert_called_once()
+                    self.assertEqual(adder.memory_budget.total_offset, 8 + 8 + 1)
+                else:
+                    self.assertIs(result, AddReqResult.NO_TOKEN)
+                    self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_zero_full_cost_initializes_mamba_slot_budget(self):
+        allocator = self.mock_token_allocator
+        allocator.mock_add_spec(schedule_policy.UnifiedMambaSWATokenToKVPoolAllocator)
+        allocator.mamba_slot_full_token_cost.return_value = 0
+        allocator.mamba_allocator = MagicMock()
+        allocator.mamba_allocator.schedulable_available_size.return_value = 2
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.mamba_evictable_size.return_value = 3
+        adder = self.create_adder(self.create_running_batch())
+        self.assertEqual(adder._mamba_slot_cost, 0)
+        self.assertEqual(adder.rem_mamba_slots, 5)
+
     def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):
         adder, req = self._build_mamba_restore_admission(
             holds_state=False, available_slots=2

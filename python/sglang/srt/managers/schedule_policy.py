@@ -661,6 +661,7 @@ class PrefillAdder:
         # as free, so reserve per slot or admission over-commits. Gate on the
         # ALLOCATOR: the reservation holds with the radix cache disabled too.
         self._mamba_slot_cost = 0
+        self.rem_mamba_slots = None
         if isinstance(
             self.token_to_kv_pool_allocator,
             (
@@ -672,14 +673,8 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
             )
 
-        # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
-        # `full_evictable_size()` — but `alloc_req_slots` can only recover
-        # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
-        # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
-        # that mamba-recoverable budget separately or an over-admit hits the
-        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
-        self.rem_mamba_slots = None
-        if self._mamba_slot_cost:
+            # Full-evictable rows cannot satisfy a Mamba slot. Keep this
+            # separate gate when fixed reservations make the Full cost zero.
             self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
@@ -801,22 +796,20 @@ class PrefillAdder:
             auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
         )
 
-    def _mamba_gap_budget_for_req(
-        self, req: Req, *, include_host_hit: bool = False
-    ) -> int:
-        """Reserve full-token equivalents for shared-pool Mamba state slots.
+    def _mamba_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
+        """Count Mamba state slots independently of their Full-token cost.
 
         Admission includes the host checkpoint before load-back binds the
         request slot. Continuing chunks only need the request-state budget;
         their host-hit metadata may still describe an already consumed hit.
         Tracking buffers and radix CoW headroom are not included here.
         """
-        if not self._mamba_slot_cost:
+        if self.rem_mamba_slots is None:
             return 0
         slots = int(not req.kv.holds_mamba)
         if include_host_hit:
             slots += req.mamba_host_hit_length
-        return slots * self._mamba_slot_cost
+        return slots
 
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
@@ -858,7 +851,7 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
-        mamba_gap_reserve: int = 0,
+        mamba_slots: int = 0,
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
@@ -884,7 +877,7 @@ class PrefillAdder:
             max_new_tokens,
             # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
-                mamba_gap_reserve
+                mamba_slots * self._mamba_slot_cost
                 + request_slot_reserve
                 + self.per_req_token_overhead
                 - self.page_size
@@ -893,8 +886,8 @@ class PrefillAdder:
             is_chunked_continuation=is_chunked_continuation,
         )
         # Debit every reserved state slot, including the load-back checkpoint.
-        if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
+        if mamba_slots and self.rem_mamba_slots is not None:
+            self.rem_mamba_slots -= mamba_slots
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1009,7 +1002,7 @@ class PrefillAdder:
             trunc_len,
             0,
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots=self._mamba_slots_for_req(req),
             replay_len=self._replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
@@ -1087,7 +1080,7 @@ class PrefillAdder:
             req.extend_len,
             max_new_tokens,
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots=self._mamba_slots_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -1171,7 +1164,7 @@ class PrefillAdder:
                 else 0
             ),
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slots=self._mamba_slots_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
         )
@@ -1203,7 +1196,7 @@ class PrefillAdder:
         )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
-        paged_input += self._mamba_gap_budget_for_req(req)
+        paged_input += self._mamba_slots_for_req(req) * self._mamba_slot_cost
         paged_input += self._request_slot_reserve_for_req(req)
         fits = self.memory_budget.can_allocate_prefill(
             paged_input=paged_input,
@@ -1304,7 +1297,7 @@ class PrefillAdder:
                 req.extend_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
-                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots=self._mamba_slots_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
             )
         else:
@@ -1330,7 +1323,7 @@ class PrefillAdder:
                 trunc_len,
                 0,
                 req.retracted_stain,
-                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slots=self._mamba_slots_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
@@ -1368,11 +1361,10 @@ class PrefillAdder:
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         # Reserve request and load-back state slots before init_load_back binds
         # the request slot. Reuse this reservation when committing admission.
-        mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)
-        total_tokens += mamba_gap_reserve
+        mamba_slots = self._mamba_slots_for_req(req, include_host_hit=True)
+        total_tokens += mamba_slots * self._mamba_slot_cost
         if self.rem_mamba_slots is not None:
-            required_mamba_slots = mamba_gap_reserve // self._mamba_slot_cost
-            if required_mamba_slots > self.rem_mamba_slots:
+            if mamba_slots > self.rem_mamba_slots:
                 if (
                     isinstance(self.tree_cache, UnifiedRadixCache)
                     and self.tree_cache.buffer_pipeline is not None
@@ -1445,7 +1437,7 @@ class PrefillAdder:
                             + admission.extend_len
                             + load_max_new
                             + self.page_size
-                            + mamba_gap_reserve
+                            + mamba_slots * self._mamba_slot_cost
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
@@ -1519,7 +1511,7 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            self._commit_prefill_admission(req, admission, mamba_gap_reserve)
+            self._commit_prefill_admission(req, admission, mamba_slots)
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -1618,7 +1610,7 @@ class PrefillAdder:
         )
 
     def _commit_prefill_admission(
-        self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
+        self, req: Req, admission: _PrefillAdmission, mamba_slots: int
     ) -> None:
         assert req.prefix_len == admission.prefix_len
         req.extend_end = admission.prefix_len + admission.extend_len
@@ -1631,7 +1623,7 @@ class PrefillAdder:
             admission.extend_len,
             admission.max_new_tokens,
             req.retracted_stain,
-            mamba_gap_reserve=mamba_gap_reserve,
+            mamba_slots=mamba_slots,
             request_slot_reserve=self._request_slot_reserve_for_req(
                 req, extend_input_len=admission.extend_len
             ),

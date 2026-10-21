@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -20,6 +21,56 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiCacheAutoSize(CustomTestCase):
+    def test_raw_checkpoint_reservation_leaves_room_for_target_host_pools(self):
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            page_size=2,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: pool,
+                dflash_cache_sizing=SimpleNamespace(raw_window_bytes=1000),
+            ),
+        )
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True,
+                enable_dflash_swa_cache=True,
+                max_mamba_cache_size=5,
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(
+                base,
+                "available_host_memory_bytes",
+                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 10_000,
+            ),
+            sizing.auto_size_hicache(params, None, enabled=True),
+        ):
+            base.host_memory_budget_bytes(5000)
+            host = MHATokenToKVPoolHost(
+                pool.get_device_pool_infos()[0].buffer_info,
+                get_memory().hicache_ratio,
+                0,
+                2,
+                "layer_first",
+                pin_memory=False,
+                device="cpu",
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                write_back_staging=pool.hicache_write_back_staging,
+            )
+            self.assertLessEqual(5000 + host.size * host.size_per_token, 8000)
+
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.

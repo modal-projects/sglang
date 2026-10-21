@@ -61,6 +61,7 @@ _TRITON_KERNELS = [
     ("kv_read_table", "build_kv_read_table_packed"),
     ("cache_move", "set_kv_buffer_prefix_valid_tiled"),
     ("cache_move", "copy_all_layer_kv_cache_tiled"),
+    ("dflash_features", "capture_dflash_features"),
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),
 ]

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
@@ -6,6 +6,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
@@ -360,7 +361,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer_prefix_valid(
         self,
         layer: "RadixAttention",
-        loc_2d: torch.Tensor,
+        loc_2d: Union[torch.Tensor, KVWriteLoc],
         commit_lens: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -380,6 +381,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 layer_id_override,
             )
 
+        self._check_physical_write_loc(loc_2d, "set_kv_buffer_prefix_valid (NPU)")
+        loc_2d, _, _ = unwrap_write_loc(loc_2d)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:

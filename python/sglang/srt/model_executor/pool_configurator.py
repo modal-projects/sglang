@@ -311,7 +311,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and not get_spec().enable_dflash_swa_cache
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -332,6 +336,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+        self._bounded_dflash = (
+            get_spec().enable_dflash_swa_cache and not kvc.is_draft_worker
+        )
+        if self._bounded_dflash:
+            sizing = kvc.dflash_cache_sizing
+            # Full tokens do not carry a draft KV row. Reserve its bounded
+            # working set once, plus state/page sinks and arena alignment.
+            self._fixed_overhead_bytes += (
+                sizing.draft_bytes
+                + 2 * kvc.mambaish_config.mamba2_cache_params.mamba_cache_per_req
+                + 2
+                * sizing.page_size
+                * (self._cell_size + sizing.draft_bytes // sizing.draft_tokens)
+            )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
@@ -625,7 +643,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        config = MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        if self._bounded_dflash:
+            total = max_total_num_tokens * self._cell_size + self._fixed_overhead_bytes
+            config.unified_total_bytes = -(-total // 4096) * 4096
+        return config
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):

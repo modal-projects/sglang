@@ -438,6 +438,17 @@ class MambaPoolHost(HostKVCache):
         )
 
     @staticmethod
+    def _can_transfer_strided_slots(tensor: torch.Tensor) -> bool:
+        # Unified state has padding between slots, with contiguous item bytes.
+        # The vectorized transfer must also preserve its 16-byte alignment.
+        return (
+            tensor[0].is_contiguous()
+            and tensor.stride(0) >= tensor[0].numel()
+            and (tensor.stride(0) * tensor.element_size()) % 16 == 0
+            and tensor.data_ptr() % 16 == 0
+        )
+
+    @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
         dst: torch.Tensor,
@@ -516,7 +527,9 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if MambaPoolHost._slots_are_strided(dst):
+        if MambaPoolHost._slots_are_strided(dst) and not (
+            io_backend == "kernel" and MambaPoolHost._can_transfer_strided_slots(dst)
+        ):
             # Transfer into contiguous staging, then scatter into the strided view.
             staged = torch.empty(
                 (dst_indices.numel(), *dst.shape[1:]),
@@ -549,6 +562,7 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
+                dst_stride_bytes=dst.stride(0) * dst.element_size(),
             )
         elif io_backend == "direct":
             transfer_kv_per_layer_direct_pf_lf(
@@ -592,11 +606,16 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if MambaPoolHost._slots_are_strided(src_layers[0]):
+        if MambaPoolHost._slots_are_strided(src_layers[0]) and not (
+            io_backend == "kernel"
+            and isinstance(src_layers, torch.Tensor)
+            and MambaPoolHost._can_transfer_strided_slots(src_layers[0])
+            and src_layers.stride(0) * src_layers.element_size() % 16 == 0
+        ):
             # Stage contiguous slots per layer and pass the staging buffer's pointers.
             staged = torch.stack(
                 [
-                    src_layers[i].index_select(0, src_indices.to(src_layers.device))
+                    src_layers[i].index_select(0, src_indices.to(src_layers[i].device))
                     for i in range(num_layers)
                 ]
             )
@@ -627,6 +646,7 @@ class MambaPoolHost(HostKVCache):
                 item_size=item_size,
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
+                src_stride_bytes=src_layers[0].stride(0) * src_layers[0].element_size(),
             )
         elif io_backend == "direct":
             src_ptrs = [src_layers[i] for i in range(num_layers)]

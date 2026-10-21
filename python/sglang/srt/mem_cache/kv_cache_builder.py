@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_spec
 
 logger = logging.getLogger(__name__)
 
@@ -438,7 +438,28 @@ def build_kv_cache(
         hicache_draft_plan,
         enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
     ):
+        feature_transfer_engine = None
+        if get_spec().enable_dflash_swa_cache:
+            from sglang.srt.mem_cache.l2_transfer import L2TransferEngine
+            from sglang.srt.mem_cache.pool_host.dflash import DFlashFeatureTailHostPool
+
+            sizing = token_to_kv_pool_allocator.dflash_cache_sizing
+            feature_transfer_engine = L2TransferEngine("direct")
+            params.dflash_feature_tail_host_pool = DFlashFeatureTailHostPool(
+                capacity=get_schedule().max_mamba_cache_size,
+                window_size=sizing.window_size,
+                feature_size=sizing.feature_size,
+                dtype=sizing.feature_dtype,
+                transfer_engine=feature_transfer_engine,
+                max_pending=sizing.max_pending_transfers,
+            )
         tree_cache = create_tree_cache(tree_context)
+        if feature_transfer_engine is not None:
+            # Serialize backups to reduce their interference with verification.
+            # The controller is created with the tree, before any transfers start.
+            feature_transfer_engine.device_to_host_stream = (
+                tree_cache.cache_controller.l2_transfer_engine.device_to_host_stream
+            )
 
         if (
             enable_hierarchical_cache or retraction_backup == "host_pool"

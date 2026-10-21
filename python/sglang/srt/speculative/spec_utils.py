@@ -880,6 +880,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None
+    batch.mamba_prefill_checkpoints = None
     batch.mamba_track_seqlens_cpu = None
 
 

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureCapture
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -150,6 +151,7 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+    dflash_feature_capture: Optional[DFlashFeatureCapture] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:
@@ -218,6 +220,7 @@ class GenerationBatchResult:
             self.routed_experts_output,
             self.indexer_topk_output,
             self.expert_distribution_metrics,
+            self.dflash_feature_capture,
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)

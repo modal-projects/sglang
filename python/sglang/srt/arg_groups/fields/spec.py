@@ -71,6 +71,15 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    enable_dflash_swa_cache: A[
+        bool,
+        "Opt in to the experimental separate DFLASH sliding-window KV pool and "
+        "raw target-feature tails for recurrent checkpoint recovery. Requires "
+        "--enable-unified-memory and --enable-hierarchical-cache. Disabled by "
+        "default; HiCache alone does not enable this path. Requires a Full + "
+        "Mamba target with tracking buffers and an all-sliding draft. Sizes "
+        "the working set from --max-running-requests.",
+    ] = False
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",

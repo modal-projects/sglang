@@ -2,7 +2,11 @@
 
 import argparse
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +34,59 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertIs(
                     ServerArgs.from_cli_args(args).trust_request_chat_template, expected
                 )
+
+    def test_dflash_swa_cache_is_opt_in_even_with_hicache(self):
+        for flags, expected in (
+            ([], False),
+            (["--enable-hierarchical-cache"], False),
+            (
+                [
+                    "--enable-dflash-swa-cache",
+                    "--enable-hierarchical-cache",
+                    "--enable-unified-memory",
+                ],
+                True,
+            ),
+        ):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).enable_dflash_swa_cache, expected
+                )
+
+    def test_dflash_swa_cache_validates_algorithm_and_host_storage(self):
+        kwargs = dict(
+            model_path="dummy",
+            device="cuda",
+            speculative_algorithm="dflash",
+            speculative_draft_model_path="draft",
+            speculative_num_draft_tokens=16,
+            speculative_draft_attention_backend="fa3",
+            max_running_requests=32,
+            enable_dflash_swa_cache=True,
+            enable_unified_memory=True,
+            enable_hierarchical_cache=True,
+        )
+        # Only model-config I/O is external; exercise real alias resolution and
+        # speculative validation, including a supported configuration.
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+        ):
+            args = ServerArgs(**kwargs)
+            handle_speculative_decoding(args)
+            self.assertEqual(resolution_result(args, "speculative_algorithm"), "DFLASH")
+            for overrides, error in (
+                ({"speculative_algorithm": None}, "--speculative-algorithm DFLASH"),
+                ({"speculative_algorithm": "EAGLE3"}, "--speculative-algorithm DFLASH"),
+                ({"enable_unified_memory": False}, "--enable-unified-memory"),
+                ({"enable_hierarchical_cache": False}, "--enable-hierarchical-cache"),
+            ):
+                with (
+                    self.subTest(overrides=overrides),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    handle_speculative_decoding(ServerArgs(**(kwargs | overrides)))
 
     def test_prefill_max_context_accepts_human_readable_values(self):
         for option in (

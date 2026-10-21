@@ -266,6 +266,9 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if result.dflash_feature_capture is not None:
+                result.dflash_feature_capture.consume(batch.reqs)
+                result.dflash_feature_capture = None
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -946,6 +949,9 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.dflash_feature_capture is not None:
+            result.dflash_feature_capture.consume(batch.reqs)
+            result.dflash_feature_capture = None
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

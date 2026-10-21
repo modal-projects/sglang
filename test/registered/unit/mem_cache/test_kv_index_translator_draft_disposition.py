@@ -385,8 +385,28 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             cache_loc_2d=cache_loc.view(2, 2),
             commit_lens=commit_lens,
         )
+        self.assertTrue(writes["loc_2d"].physical)
         torch.testing.assert_close(
-            writes["loc_2d"], physical.view(2, 2), rtol=0, atol=0
+            writes["loc_2d"].loc, physical.view(2, 2), rtol=0, atol=0
+        )
+
+        # Fused projection uses a callback to the same prefix-valid store.
+        def materialize(ctx_hidden, positions, write_layer_kv):
+            write_layer_kv(0, *attn.kv_proj_only(ctx_hidden))
+
+        writes.clear()
+        worker._fused_kv_helper = SimpleNamespace(materialize=materialize)
+        DFlashWorkerV2._append_target_hidden_fused(
+            worker,
+            ctx_hidden=hidden,
+            ctx_positions=positions,
+            ctx_cache_loc=cache_loc,
+            ctx_cache_loc_2d=cache_loc.view(2, 2),
+            commit_lens=commit_lens,
+        )
+        self.assertTrue(writes["loc_2d"].physical)
+        torch.testing.assert_close(
+            writes["loc_2d"].loc, physical.view(2, 2), rtol=0, atol=0
         )
 
         # DSPARK's injector, on an MHA draft pool: the plan's ids for the

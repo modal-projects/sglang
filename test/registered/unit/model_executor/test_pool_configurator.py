@@ -1299,6 +1299,53 @@ class TestFactory(CustomTestCase):
 class TestDflashDraftKvBudget(CustomTestCase):
     """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
 
+    def test_bounded_draft_cost_is_fixed_and_survives_target_token_caps(self):
+        import torch
+
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.speculative.dflash_cache import DFlashCacheSizing
+
+        mr = _make_model_runner(self)
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.dflash_cache_sizing = DFlashCacheSizing(
+            window_size=2048,
+            block_size=16,
+            max_requests=32,
+            feature_size=12288,
+            feature_dtype=torch.bfloat16,
+            kv_heads=8,
+            head_dim=128,
+            num_layers=6,
+            kv_dtype=torch.bfloat16,
+            page_size=64,
+            prefill_tokens=4096,
+            overlap=True,
+        )
+        mr.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1024)
+        )
+        with mock_cpu_env(), get_spec().override(enable_dflash_swa_cache=True):
+            solver = DefaultPoolConfigurator(mr)
+            small = solver.calculate_pool_sizes_from_max_tokens(4096, 64)
+            large = solver.calculate_pool_sizes_from_max_tokens(8192, 64)
+            # Growing the target does not grow the draft working set.
+            self.assertEqual(
+                large.unified_total_bytes - small.unified_total_bytes,
+                4096 * _full_per_token(mr) * 32,
+            )
+            self.assertGreater(
+                small.unified_total_bytes, mr.dflash_cache_sizing.draft_bytes
+            )
+            round_trip = solver.calculate_pool_sizes(large.unified_total_bytes, 64)
+            self.assertEqual(round_trip.max_total_num_tokens, 8192)
+        for offset in range(64):
+            positions = range(offset, offset + 2048 + 16)
+            pages = {pos // 64 for pos in positions}
+            self.assertLessEqual(
+                32 * len(pages) * 64, mr.dflash_cache_sizing.draft_tokens
+            )
+
     def test_bytes_per_token_from_draft_geometry(self):
         import torch
 

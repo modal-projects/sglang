@@ -359,7 +359,9 @@ def test_mamba_kernel_full_indices(dtype, layout):
         ("page_first_direct", "direct"),
     ],
 )
-@pytest.mark.parametrize("kind", ["dense", "strided", "conv_only"])
+@pytest.mark.parametrize(
+    "kind", ["dense", "strided", "padded", "unaligned_layer", "conv_only"]
+)
 def test_captured_mamba_state_round_trip(layout, io_backend, kind):
     """Transfer must preserve checkpoint bytes without reading the device pool.
 
@@ -368,7 +370,19 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
     """
     pool = object.__new__(MambaPool)
     pool.mamba_layer_ids = [7, 11]
-    if kind == "strided":
+    padding = []
+    if kind in ("padded", "unaligned_layer"):
+        # Whole-state envelopes have padding as well as other layers between
+        # slots. A direct transfer must leave those neighboring bytes untouched.
+        # Two unaligned layer strides can still yield an aligned slot stride.
+        # Such a view must retain staging instead of using uint4 on layer 1.
+        padding_width = 8 if kind == "padded" else 6
+        temporal_storage = torch.full((6, 2, 64 + padding_width), -37.0, device=DEVICE)
+        conv_storage = torch.full((6, 2, 256 + padding_width), -37.0, device=DEVICE)
+        temporal = temporal_storage[..., :64].transpose(0, 1)
+        conv = conv_storage[..., :256].view(6, 2, 64, 4).transpose(0, 1)
+        padding = [temporal_storage[..., 64:], conv_storage[..., 256:]]
+    elif kind == "strided":
         temporal = torch.empty(6, 2, 64, device=DEVICE).transpose(0, 1)
         conv = torch.empty(6, 2, 64, 4, device=DEVICE).transpose(0, 1)
     else:
@@ -432,6 +446,7 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
             assert not torch.count_nonzero(buffer[:, [0, 2, 3, 5]])
         assert torch.equal(extra[device_indices], extra_expected)
         assert not torch.count_nonzero(extra[[0, 2, 3, 5]])
+        assert all(torch.all(pad == -37) for pad in padding)
     finally:
         host.destroy()
 

@@ -72,6 +72,27 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+for _fn in (
+    "dflash_window_pages",
+    "dflash_window_page_changes",
+    "dflash_recycle_window_pages",
+    "dflash_update_window_pages",
+    "dflash_update_window",
+    "dflash_compact_window_pages",
+    "dflash_unbound_full_pages",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dflash_window:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            ),
+        )
+    )
+del _fn
+
 register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",

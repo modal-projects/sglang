@@ -712,7 +712,7 @@ class DSparkDraftMixin:
             if cache_loc_2d is not None and commit_lens is not None:
                 pool.set_kv_buffer_prefix_valid(
                     attn.attn,
-                    cache_loc_2d,
+                    KVWriteLoc(cache_loc_2d, physical=True),
                     commit_lens,
                     k,
                     v,

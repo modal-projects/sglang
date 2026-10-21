@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
+    from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureState
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1007,6 +1008,7 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    dflash_feature_state: Optional[DFlashFeatureState] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1045,6 +1047,9 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+        if self.dflash_feature_state is not None:
+            self.dflash_feature_state.close()
+            self.dflash_feature_state = None
 
 
 class Req(ReqDllmMixin):
@@ -2284,6 +2289,7 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
     track_index: int
     track_seqlen: int
+    checkpoint: Optional[Tuple[int, int]]
 
 
 def mamba_lazy_spec_in_window(
@@ -2558,6 +2564,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
     mamba_track_seqlens_cpu: Optional[List[int]] = None
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
+    # Exact (ping-pong position, token boundary), before kernel encoding (+1).
+    mamba_prefill_checkpoints: Optional[List[Optional[Tuple[int, int]]]] = None
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
@@ -2919,6 +2927,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        mamba_prefill_checkpoints = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.extend_batch_idx += 1
@@ -2992,6 +3001,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                mamba_prefill_checkpoints.append(track_entry.checkpoint)
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -3097,6 +3107,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
+            self.mamba_prefill_checkpoints = mamba_prefill_checkpoints
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -3229,6 +3240,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
+            checkpoint=(req.kv.mamba_last_track_idx, mamba_track_seqlen_aligned)
+            if mask
+            else None,
         )
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
@@ -3686,6 +3700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_prefill_checkpoints = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensors so they don't leak into ForwardBatch.
         self.input_embeds = None
@@ -3842,6 +3857,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_prefill_checkpoints = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -3910,6 +3926,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
+        self.mamba_prefill_checkpoints = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -3979,6 +3996,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
             mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
+            mamba_prefill_checkpoints=self.mamba_prefill_checkpoints,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,

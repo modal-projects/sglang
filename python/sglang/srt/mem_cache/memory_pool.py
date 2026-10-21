@@ -1794,6 +1794,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
+        if req.kv.dflash_feature_state is not None:
+            req.kv.dflash_feature_state.invalidate_checkpoint(idx)
         req.kv.mamba_ping_pong_track_buffer[idx] = value
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
             req.kv.mamba_ping_pong_track_buffer
@@ -1903,7 +1905,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
 @dataclass
 class KVWriteLoc:
-    """Write target(s) for ``KVCache.set_kv_buffer``.
+    """Write target(s) for ordinary and prefix-valid KV stores.
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
@@ -3299,7 +3301,7 @@ class MHATokenToKVPool(KVCache):
     def set_kv_buffer_prefix_valid(
         self,
         layer: RadixAttention,
-        loc_2d: torch.Tensor,
+        loc_2d: Union[torch.Tensor, KVWriteLoc],
         commit_lens: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -3307,6 +3309,15 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        """Commit each request's prefix; unified views require marked physical IDs.
+
+        The tiled writer uses the destination row strides, including the
+        gaps between layers in a unified entry. K/V rows must have equal widths
+        on CUDA/ROCm, as checked below.
+        """
+        loc_info = loc_2d
+        self._check_physical_write_loc(loc_info, "set_kv_buffer_prefix_valid (MHA)")
+        loc_2d, _, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -3346,7 +3357,10 @@ class MHATokenToKVPool(KVCache):
                 return
             self.set_kv_buffer(
                 layer,
-                loc_2d.reshape(-1).index_select(0, valid_idx),
+                KVWriteLoc(
+                    loc_2d.reshape(-1).index_select(0, valid_idx),
+                    physical=write_loc_is_physical(loc_info),
+                ),
                 cache_k.index_select(0, valid_idx),
                 cache_v.index_select(0, valid_idx),
                 k_scale,

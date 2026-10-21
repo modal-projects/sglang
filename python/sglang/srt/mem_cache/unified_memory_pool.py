@@ -942,12 +942,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """Physical growth direction used by this sub-pool's L1 allocator."""
         return self._unified_buffer.spec(self._sub_pool_name).grow_direction
 
-    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
-        raise NotImplementedError(
-            "prefix-valid commit is unsupported under the unified layout "
-            "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
-        )
-
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     """MLA KV pool whose per-layer `kv_buffer` entries are token-major views
@@ -1295,7 +1289,10 @@ class UnifiedMambaSlotAllocator:
     def schedulable_available_size(self) -> int:
         # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
         # drainable holes since alloc flushes the peer before extending.
-        return self._multi_ended_allocator.schedulable_available_size()
+        return min(
+            self.available_size(),
+            self._multi_ended_allocator.schedulable_available_size(),
+        )
 
     @property
     def free_slots(self) -> torch.Tensor:
@@ -1321,6 +1318,8 @@ class UnifiedMambaSlotAllocator:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
+        if need_size > self.available_size():
+            return None
         return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
@@ -1334,7 +1333,7 @@ class UnifiedMambaSlotAllocator:
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
         self._alloc_iter = None
         if num_reqs > 0:
-            result = self._multi_ended_allocator.alloc(num_reqs)
+            result = self.alloc(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
 
@@ -1537,9 +1536,10 @@ class UnifiedHybridLinearKVPool(HybridLinearKVPool):
 
 class UnifiedPoolBundle(NamedTuple):
     unified_memory_pool: UnifiedKVPool
-    token_to_kv_pool: object  # HybridLinearKVPool
-    token_to_kv_pool_allocator: object  # UnifiedMambaTokenToKVPoolAllocator
+    token_to_kv_pool: object  # HybridLinearKVPool or UnifiedSWAKVPool
+    token_to_kv_pool_allocator: object  # Unified Mamba or Mamba/SWA allocator
     req_to_token_pool: object  # UnifiedHybridReqToTokenPool
+    draft_token_to_kv_pool: Optional[UnifiedMHATokenToKVPool] = None
 
 
 def _check_bs1_feasibility_floor(
@@ -1572,17 +1572,20 @@ def _wire_mamba_slot_allocator(
     mamba_end,
     req_to_token_pool,
     device,
+    max_size: Optional[int] = None,
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation, host capacities, and transfer translation."""
     slot_allocator = UnifiedMambaSlotAllocator(
         mamba_end,
-        max_size=req_to_token_pool._shared_mamba_size,
+        max_size=req_to_token_pool._shared_mamba_size if max_size is None else max_size,
         device=device,
     )
     req_to_token_pool.mamba_allocator = slot_allocator
     state_pool = req_to_token_pool.mamba_pool
+    if max_size is not None:
+        state_pool.size = max_size
     state_pool.host_transfer_translate = slot_allocator.translate
-    state_pool.host_capacity_tokens = req_to_token_pool._shared_mamba_size
+    state_pool.host_capacity_tokens = slot_allocator.size
     state_pool.host_capacity_bytes = (
         state_pool.host_capacity_tokens * mamba_end.entry_bytes
     )
@@ -2339,14 +2342,14 @@ def init_unified_mamba_swa_pools(
     sliding_window_size: Optional[int] = None,
     decode_pre_alloc_size: int = 0,
     fused_draft: Optional[FusedDraftPlacement] = None,
+    draft_swa_layer_ids: Optional[List[int]] = None,
+    draft_kv_cache_dtype: Optional[torch.dtype] = None,
+    bounded_draft_swa: bool = False,
 ) -> UnifiedPoolBundle:
-    """Build the TRI-pool unified-memory-pool stack for models with full KV +
-    SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
-    `is_hybrid_swa` simultaneously — Inkling's SConv state is conv-only but
-    rides the mamba machinery, so "mamba" here == the conv state pool).
+    """Build shared Full/SWA KV and mamba/conv pools.
 
-    Chain: ``[mamba (up END) | swa (FLOAT) | full (down END)]``. The KV side
-    is a `UnifiedSWAKVPool` (per-layer full/swa routing, asymmetric head
+    Chain: ``[mamba (up END) | swa (FLOAT) | full (down END)]``. Target SWA
+    uses a `UnifiedSWAKVPool` (per-layer full/swa routing, asymmetric head
     geometry supported); the state side is a `UnifiedHybridReqToTokenPool`
     whose `mamba_pool` the model reads directly (sconv:
     `req_to_token_pool.mamba2_layer_cache(layer).conv[...]` with
@@ -2357,6 +2360,13 @@ def init_unified_mamba_swa_pools(
     sum and the runtime split floats. With ``fused_draft``, every entry of a
     sub-pool the placement names carries the draft's parts, as in the 2-pool
     factories.
+
+    For draft-only SWA, pass ``draft_swa_layer_ids`` and
+    ``draft_kv_cache_dtype`` with empty target ``swa_attention_layer_ids``.
+    The ``swa_head_*`` geometry and sliding window then describe the draft.
+    The target keeps a `UnifiedHybridLinearKVPool`; the returned
+    ``draft_token_to_kv_pool`` uses the draft's own layer IDs. This placement
+    cannot be combined with ``fused_draft``.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
@@ -2366,10 +2376,37 @@ def init_unified_mamba_swa_pools(
     assert len(full_attention_layer_ids) > 0, (
         "tri-pool with zero full-attention layers is degenerate"
     )
-    assert len(swa_attention_layer_ids) > 0, (
+    assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
+    if (draft_swa_layer_ids is None) != (draft_kv_cache_dtype is None):
+        raise ValueError(
+            "draft_swa_layer_ids and draft_kv_cache_dtype must be set together"
+        )
+    if draft_swa_layer_ids is not None:
+        if swa_attention_layer_ids:
+            raise ValueError("draft-only SWA requires empty target SWA layer IDs")
+        if fused_draft is not None:
+            raise ValueError("draft-only SWA cannot be combined with fused_draft")
+        if (
+            not draft_swa_layer_ids
+            or draft_swa_layer_ids[0] < 0
+            or draft_swa_layer_ids
+            != list(
+                range(
+                    draft_swa_layer_ids[0],
+                    draft_swa_layer_ids[0] + len(draft_swa_layer_ids),
+                )
+            )
+        ):
+            raise ValueError(
+                "draft_swa_layer_ids must be a nonempty contiguous range of nonnegative IDs"
+            )
+    swa_layer_ids = (
+        swa_attention_layer_ids if draft_swa_layer_ids is None else draft_swa_layer_ids
+    )
+    assert len(swa_layer_ids) > 0, (
         "tri-pool with zero SWA-attention layers is degenerate"
     )
-    assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
+    swa_dtype = kv_cache_dtype if draft_kv_cache_dtype is None else draft_kv_cache_dtype
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # mamba/conv at the LOWEST bytes, full KV at the HIGHEST, SWA floating
@@ -2387,12 +2424,12 @@ def init_unified_mamba_swa_pools(
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
-        layer_num=len(swa_attention_layer_ids),
+        layer_num=len(swa_layer_ids),
         head_num=swa_head_num,
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
-        store_dtype=store_dtype,
-        kv_cache_dtype=kv_cache_dtype,
+        store_dtype=_store_dtype_for(swa_dtype),
+        kv_cache_dtype=swa_dtype,
         grow_direction="float",
         draft_region=None if fused_draft is None else fused_draft.region("swa"),
     )
@@ -2449,15 +2486,6 @@ def init_unified_mamba_swa_pools(
         page_size=page_size,
         fused_draft=fused_draft,
     )
-    token_to_kv_pool = UnifiedSWAKVPool(
-        unified_buffer=shared_pool,
-        swa_attention_layer_ids=swa_attention_layer_ids,
-        full_attention_layer_ids=full_attention_layer_ids,
-        page_size=page_size,
-        start_layer=start_layer,
-        end_layer=end_layer,
-        enable_memory_saver=enable_memory_saver,
-    )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
         mamba_sub_pool_name="mamba",
@@ -2475,9 +2503,58 @@ def init_unified_mamba_swa_pools(
         start_layer=start_layer,
         pre_alloc_size=decode_pre_alloc_size,
     )
-    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+    draft_token_to_kv_pool = None
+    if draft_swa_layer_ids is None:
+        token_to_kv_pool = UnifiedSWAKVPool(
+            unified_buffer=shared_pool,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            page_size=page_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_memory_saver=enable_memory_saver,
+        )
+    else:
+        token_to_kv_pool = UnifiedHybridLinearKVPool(
+            size=full_max_total_num_tokens,
+            dtype=kv_cache_dtype,
+            page_size=page_size,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            device=device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            # The wrapper maps target layer IDs to compact Full-KV indices.
+            full_kv_pool=UnifiedMHATokenToKVPool(
+                unified_buffer=shared_pool,
+                sub_pool_name="full",
+                page_size=page_size,
+            ),
+        )
+        draft_token_to_kv_pool = UnifiedMHATokenToKVPool(
+            unified_buffer=shared_pool,
+            sub_pool_name="swa",
+            page_size=page_size,
+            start_layer=draft_swa_layer_ids[0],
+            end_layer=draft_swa_layer_ids[-1],
+        )
+    allocator_cls = UnifiedMambaSWATokenToKVPoolAllocator
+    if bounded_draft_swa:
+        from sglang.srt.mem_cache.allocator.dflash_swa import (
+            DFlashSWATokenToKVPoolAllocator,
+        )
+
+        if draft_swa_layer_ids is None:
+            raise ValueError(
+                "Bounded draft allocation requires a separate draft SWA view"
+            )
+        allocator_cls = DFlashSWATokenToKVPoolAllocator
+    allocator = allocator_cls(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
+        swa_kvcache=draft_token_to_kv_pool,
         mamba_kvcache=req_to_token_pool.mamba_pool,
         device=device,
         full_max_total_num_tokens=full_max_total_num_tokens,
@@ -2487,11 +2564,14 @@ def init_unified_mamba_swa_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
-    _wire_mamba_slot_allocator(
+    mamba_slot_allocator = _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
         req_to_token_pool=req_to_token_pool,
         device=device,
+        max_size=max_mamba_cache_size if bounded_draft_swa else None,
     )
+    if draft_token_to_kv_pool is not None:
+        token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
 
     logger.info(
         "[unified-memory-pool] ============================================================"
@@ -2503,7 +2583,7 @@ def init_unified_mamba_swa_pools(
         "[unified-memory-pool]   full_layers=%d, swa_layers=%d, state_layers=%d, "
         "head_num=%d/%d, head_dim=%d/%d, page_size=%d",
         len(full_attention_layer_ids),
-        len(swa_attention_layer_ids),
+        len(swa_layer_ids),
         len(mamba_layer_ids),
         head_num,
         swa_head_num,
@@ -2530,4 +2610,5 @@ def init_unified_mamba_swa_pools(
         token_to_kv_pool=token_to_kv_pool,
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=req_to_token_pool,
+        draft_token_to_kv_pool=draft_token_to_kv_pool,
     )

@@ -111,7 +111,12 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_observability,
+    get_spec,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.poll_timer import PollTimer
@@ -171,6 +176,14 @@ class _OngoingLoadBack(NamedTuple):
     host_lock_params: DecLockRefParams
 
 
+class _PendingHiCacheReady(NamedTuple):
+    counts: torch.Tensor
+    work: torch.distributed.Work
+    writes: tuple[HiCacheAck, ...]
+    loads: tuple[HiCacheAck, ...]
+    digest: int
+
+
 class _StoragePrefetchWait(msgspec.Struct):
     timer: PollTimer = msgspec.field(default_factory=PollTimer)
     timeout_s: float = 0.0
@@ -196,6 +209,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self.dflash_feature_tail_host_pool = params.dflash_feature_tail_host_pool
+        if self.dflash_feature_tail_host_pool is not None and (
+            not get_spec().enable_dflash_swa_cache
+            or not get_memory().enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "DFlash raw checkpoint tails require --enable-dflash-swa-cache "
+                "and --enable-hierarchical-cache"
+            )
+        if self.dflash_feature_tail_host_pool is not None and (
+            not params.enable_mamba_extra_buffer
+            or ComponentType.MAMBA not in (params.tree_components or ())
+        ):
+            raise ValueError("DFlash feature bundles require Mamba tracking buffers")
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -297,6 +324,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._pending_hicache_ready: Optional[_PendingHiCacheReady] = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -410,6 +438,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        self._finish_pending_hicache_ready()
+        if self.dflash_feature_tail_host_pool is not None:
+            self.dflash_feature_tail_host_pool.clear()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -591,10 +622,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        self._finish_pending_hicache_ready()
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
+        if self.dflash_feature_tail_host_pool is not None:
+            self.dflash_feature_tail_host_pool.destroy()
 
     @rank_consensus(
         same_params=["params"],
@@ -3347,10 +3381,79 @@ class UnifiedRadixCache(BasePrefixCache):
             ready_count += 1
         return ready_count
 
+    def _finish_pending_hicache_ready(self) -> Optional[_PendingHiCacheReady]:
+        pending = getattr(self, "_pending_hicache_ready", None)
+        if pending is not None:
+            pending.work.wait()
+            self._pending_hicache_ready = None
+        return pending
+
+    def _start_hicache_ready_sync(self) -> None:
+        # The opt-in draft cache needs host tails even during pure decode. Hide
+        # its host-cache consensus under the following forward. Other HiCache
+        # protocols retain their existing synchronous polling path.
+        if (
+            self.dflash_feature_tail_host_pool is None
+            or self.pp_size != 1
+            or self.enable_storage
+            or self.cache_controller is None
+            or getattr(self, "_pending_hicache_ready", None) is not None
+        ):
+            return
+        groups = [
+            group
+            for group in (self.attn_cp_group, self.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group) > 1
+        ]
+        if not groups and self.tp_world_size > 1:
+            groups = [self.tp_group]
+        if len(groups) != 1:
+            return
+        cc = self.cache_controller
+        writes = tuple(cc.ack_write_queue[: self._count_ready_acks(cc.ack_write_queue)])
+        loads = tuple(cc.ack_load_queue[: self._count_ready_acks(cc.ack_load_queue)])
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        counts = torch.tensor(
+            [len(writes), len(loads), digest, -digest], dtype=torch.int64
+        )
+        work = torch.distributed.all_reduce(
+            counts, op=torch.distributed.ReduceOp.MIN, group=groups[0], async_op=True
+        )
+        self._pending_hicache_ready = _PendingHiCacheReady(
+            counts, work, writes, loads, digest
+        )
+
+    @staticmethod
+    def _remaining_ready_prefix(queue, snapshot, count: int) -> int:
+        # A blocking eviction drain can consume acknowledgments while this
+        # consensus is in flight. Never apply its counts to newly appended acks.
+        ready = {id(ack) for ack in snapshot[:count]}
+        remaining = 0
+        for ack in queue:
+            if id(ack) not in ready:
+                break
+            remaining += 1
+        return remaining
+
     def _sync_hicache_ready_counts(
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         cc = self.cache_controller
+        self._start_hicache_ready_sync()
+        pending = self._finish_pending_hicache_ready()
+        if pending is not None:
+            writes, loads, minimum, negative_maximum = pending.counts.tolist()
+            assert pending.digest == minimum and pending.digest == -negative_maximum, (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
+            return (
+                self._remaining_ready_prefix(
+                    cc.ack_write_queue, pending.writes, writes
+                ),
+                self._remaining_ready_prefix(cc.ack_load_queue, pending.loads, loads),
+                (),
+                (),
+            )
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
@@ -3588,6 +3691,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.dflash_feature_tail_host_pool is not None:
+            self.dflash_feature_tail_host_pool.poll()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -3643,6 +3748,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        self._start_hicache_ready_sync()
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

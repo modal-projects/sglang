@@ -6,10 +6,28 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
+
+for _fn in ("transfer_kv_mamba_pf_lf", "transfer_kv_mamba_lf_pf"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.mamba.transfer_mamba:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            ),
+        )
+    )
+del _fn
 
 
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,

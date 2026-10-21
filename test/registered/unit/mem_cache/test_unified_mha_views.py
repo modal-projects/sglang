@@ -26,10 +26,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
@@ -39,6 +41,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
 )
+from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -437,12 +440,6 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             "envelope move did not relocate exactly the named pages",
         )
 
-    def test_prefix_valid_entry_point_fails_loud(self):
-        """Prefix-valid writes still assume token-major buffer indexing."""
-        _, pool = _make_pool_and_kv(1)
-        with self.assertRaises(NotImplementedError):
-            pool.set_kv_buffer_prefix_valid()
-
     def test_pd_registration_is_one_whole_envelope(self):
         """PD registers ONE region -- the whole raw buffer -- with the page
         envelope as the item, so the transfer engine addresses it as
@@ -470,6 +467,72 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             _, pool = _make_pool_and_kv(1)
             self.assertFalse(pool.use_hnd)
             self.assertEqual(pool.kv_cache_layout, "page_major")
+
+
+@patch.multiple(memory_pool, _is_cuda=False, _is_hip=False, _cpu_has_amx_support=False)
+class TestUnifiedPrefixValidWrites(CustomTestCase):
+    def test_prefix_commit_preserves_unselected_rows_and_layers(self):
+        """The CPU fallback must retain the physical mark and mask before
+        passing rows to the ordinary strided writer.
+        """
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                arena, pool = _make_pool_and_kv(page_size)
+                arena._raw.fill_(0x5A)
+                expected = arena._raw.clone()
+                ref_k, ref_v = _reference_paged_views(
+                    expected,
+                    page_size=page_size,
+                    num_pages=arena.max_slots("full") // page_size,
+                )
+                loc = torch.tensor(
+                    [[10, 11, -1, 99999], [99999, -1, 0, -1], [20, 21, 16, 17]]
+                )
+                lengths = torch.tensor([2, 0, 4], dtype=torch.int32)
+                k = torch.arange(12 * _H * _D, dtype=torch.float32).view(12, _H, _D)
+                v = -k
+                for batch, length in enumerate((2, 0, 4)):
+                    for col in range(length):
+                        page, slot = divmod(int(loc[batch, col]), page_size)
+                        ref_k[1][page, slot] = k[batch * 4 + col]
+                        ref_v[1][page, slot] = v[batch * 4 + col]
+                pool.set_kv_buffer_prefix_valid(
+                    _layer(0),
+                    KVWriteLoc(loc, physical=True),
+                    lengths,
+                    k,
+                    v,
+                    layer_id_override=1,
+                )
+                self.assertTrue(torch.equal(arena._raw, expected))
+                # All masked and empty batches leave the complete arena intact.
+                for empty_loc, empty_k, empty_v, empty_lens in (
+                    (torch.full_like(loc, -1), k, v, torch.zeros_like(lengths)),
+                    (loc[:0], k[:0], v[:0], lengths[:0]),
+                ):
+                    pool.set_kv_buffer_prefix_valid(
+                        _layer(1),
+                        KVWriteLoc(empty_loc, physical=True),
+                        empty_lens,
+                        empty_k,
+                        empty_v,
+                    )
+                    self.assertTrue(torch.equal(arena._raw, expected))
+
+    def test_prefix_commit_requires_marked_physical_locations(self):
+        arena, pool = _make_pool_and_kv(4)
+        before = arena._raw.clone()
+        loc = torch.tensor([[4, 5]])
+        k = torch.ones((2, _H, _D), dtype=_DTYPE)
+        for unmarked in (loc, KVWriteLoc(loc)):
+            with (
+                self.subTest(loc_type=type(unmarked)),
+                self.assertRaisesRegex(ValueError, "not marked physical"),
+            ):
+                pool.set_kv_buffer_prefix_valid(
+                    _layer(0), unmarked, torch.tensor([1]), k, k
+                )
+            self.assertTrue(torch.equal(arena._raw, before))
 
 
 class TestFactoryViews(unittest.TestCase):

@@ -29,6 +29,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import UnifiedSWAAllocatorBase
 from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -55,6 +56,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_feature_tail import (
+    DFlashFeatureCapture,
+    DFlashFeatureState,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -395,6 +400,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
+        self._feature_tail_window: Optional[int] = None
+        self._draft_cache = None
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
@@ -652,6 +659,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        use_swa_cache = get_spec().enable_dflash_swa_cache
+        if use_swa_cache and (
+            not isinstance(token_to_kv_pool_allocator, UnifiedSWAAllocatorBase)
+            or token_to_kv_pool_allocator.get_draft_swa_kvcache() is None
+        ):
+            raise ValueError(
+                "--enable-dflash-swa-cache requires a separate draft SWA pool"
+            )
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
         # enabled, the draft worker keeps a private compact req->token table
@@ -664,6 +679,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if use_swa_cache:
+            if (
+                not (is_cuda() or is_hip())
+                or not req_to_token_pool.enable_mamba_extra_buffer
+            ):
+                raise ValueError(
+                    "Draft feature capture requires CUDA/HIP and Mamba tracking buffers"
+                )
+            self._feature_tail_window = int(self.draft_model.config.sliding_window)
+            from sglang.srt.speculative.dflash_cache import DFlashCacheResidency
+
+            self._draft_cache = DFlashCacheResidency(
+                token_to_kv_pool_allocator, req_to_token_pool, self._feature_tail_window
+            )
 
     def init_attention_backends(self):
         with (
@@ -1098,7 +1127,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        if self._draft_cache is not None:
+            self._draft_cache.clear()
 
     def _gather_req_to_token_masked(
         self,
@@ -1800,8 +1830,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return out_tokens
 
     def _draft_write_ids(self, plan: KVLocPlan) -> torch.Tensor:
-        """The plan's write ids as the draft pool indexes them: the target's
-        physical ids for a fused draft, the virtual ids for a private one."""
+        """The plan's write IDs in the draft pool's own physical space."""
         return plan.write_ids(self.draft_model_runner.kv_index_translator)
 
     def _append_target_hidden_to_draft_kv_by_loc(
@@ -1961,7 +1990,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
-                        cache_loc_2d,
+                        KVWriteLoc(cache_loc_2d, physical=True),
                         commit_lens,
                         k,
                         v,
@@ -2045,7 +2074,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if ctx_cache_loc_2d is not None and commit_lens is not None:
                 token_to_kv_pool.set_kv_buffer_prefix_valid(
                     attn,
-                    ctx_cache_loc_2d,
+                    KVWriteLoc(ctx_cache_loc_2d, physical=True),
                     commit_lens,
                     cache_k,
                     cache_v,
@@ -2075,7 +2104,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify: torch.Tensor,
         seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """Commit Mamba intermediate states for accepted verify steps.
 
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
@@ -2117,6 +2146,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
+            return mamba_steps_to_track
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -2311,6 +2341,60 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
 
+    def _restore_cached_features(self, batch: ScheduleBatch) -> None:
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        pool = batch.tree_cache.dflash_feature_tail_host_pool
+        if pool is None:
+            return
+        window = self._feature_tail_window
+        if pool.window_size != window:
+            raise ValueError("Draft and checkpoint feature windows differ")
+        checkpoints = batch.mamba_prefill_checkpoints or [None] * len(batch.reqs)
+        for i, (req, prefix, length, checkpoint) in enumerate(
+            zip(
+                batch.reqs,
+                batch.prefix_lens,
+                batch.extend_lens,
+                checkpoints,
+                strict=True,
+            )
+        ):
+            if prefix == 0 or req.kv.dflash_feature_state is not None:
+                continue
+            if length >= window and (
+                checkpoint is None or checkpoint[1] - prefix >= window
+            ):
+                # The new target forward supplies every row needed by both tails.
+                continue
+            tail = batch.tree_cache.components[
+                ComponentType.MAMBA
+            ].restore_dflash_features(req.best_match_node, prefix)
+            req.kv.dflash_feature_state = DFlashFeatureState.from_tail(tail, window)
+            if length >= window:
+                continue
+            # Rebuild historical draft context before appending the new prompt.
+            # The target prefix and its recurrent COW/load path are unchanged.
+            start = tail.start_pos
+            if getattr(self, "_draft_cache", None) is not None:
+                start = max(start, prefix + length - window)
+            virtual = batch.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, start : tail.end_pos
+            ]
+            plan = self.draft_model_runner.kv_index_translator.plan(
+                req_pool_indices=batch.req_pool_indices[i : i + 1],
+                seq_lens=torch.tensor(
+                    [prefix], dtype=torch.int64, device=virtual.device
+                ),
+                seq_lens_cpu=torch.tensor([prefix], dtype=torch.int64),
+                write_virtual=virtual,
+            )
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=tail.as_tensor()[start - tail.start_pos :],
+                cache_loc=self._draft_write_ids(plan),
+                positions=torch.arange(start, tail.end_pos, device=virtual.device),
+            )
+
     def _make_next_draft_input_decode(
         self,
         *,
@@ -2357,6 +2441,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
 
+            # Target prefill uses Full KV only. Prepare the independent draft
+            # bindings after enqueueing it, before the plan first translates SWA.
+            if self._feature_tail_window is not None:
+                if getattr(self, "_draft_cache", None) is not None:
+                    self._draft_cache.prepare(
+                        batch, materialize=self._append_target_hidden_to_draft_kv_by_loc
+                    )
+                self._restore_cached_features(batch)
+
             if logits_output.hidden_states is None:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
@@ -2388,12 +2481,49 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             # The draft KV goes to the slots the target prefill just wrote.
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(kv_loc_plan),
-                positions=positions,
-                extend_lens=ctx_lens,
-            )
+            hidden = logits_output.hidden_states
+            cache_loc = self._draft_write_ids(kv_loc_plan)
+            if getattr(self, "_draft_cache", None) is not None and any(
+                length > self._feature_tail_window for length in batch.extend_lens
+            ):
+                offset = 0
+                tails = []
+                for length in batch.extend_lens:
+                    tails.append(
+                        torch.arange(
+                            offset + max(0, length - self._feature_tail_window),
+                            offset + length,
+                            device=device,
+                        )
+                    )
+                    offset += length
+                rows = torch.cat(tails)
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=hidden[rows],
+                    cache_loc=cache_loc[rows],
+                    positions=positions[rows],
+                    extend_lens=ctx_lens.clamp(max=self._feature_tail_window),
+                )
+            else:
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=hidden,
+                    cache_loc=cache_loc,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                )
+            if self._feature_tail_window is not None:
+                batch_output.dflash_feature_capture = DFlashFeatureCapture.prefill(
+                    reqs=batch.reqs,
+                    target_hidden=logits_output.hidden_states,
+                    prefix_lens=batch.prefix_lens,
+                    extend_lens=batch.extend_lens,
+                    checkpoints=batch.mamba_prefill_checkpoints,
+                    window_size=self._feature_tail_window,
+                )
+                if getattr(self, "_draft_cache", None) is not None:
+                    self._draft_cache.retain_prefill(
+                        batch, batch_output.dflash_feature_capture
+                    )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -2494,6 +2624,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         block_ids = self._draft_block_ids_buf[:bs]
         prefix_lens = batch.seq_lens
+        if self._draft_cache is not None:
+            self._draft_cache.prepare(
+                batch,
+                prefix_lens=prefix_lens,
+                block_size=block_size,
+                materialize=self._append_target_hidden_to_draft_kv_by_loc,
+            )
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
         if self._use_triton_prepare_block:
@@ -2934,11 +3071,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
+        mamba_checkpoint_steps = None
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             if new_seq_lens is None:
                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-            self._update_target_mamba_state_after_verify(
+            mamba_checkpoint_steps = self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 seq_lens_post_verify=new_seq_lens,
@@ -2957,6 +3095,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
+        feature_capture = None
+        if self._feature_tail_window is not None:
+            feature_capture = DFlashFeatureCapture.decode(
+                reqs=batch.reqs,
+                target_hidden=hidden,
+                start_positions=prefix_lens,
+                commit_lens=commit_lens,
+                checkpoint_steps=mamba_checkpoint_steps,
+                checkpoint_indices=batch.mamba_track_indices,
+                checkpoint_slots=batch.mamba_track_buffer_indices,
+                window_size=self._feature_tail_window,
+            )
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
@@ -2980,6 +3130,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
+            dflash_feature_capture=feature_capture,
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,

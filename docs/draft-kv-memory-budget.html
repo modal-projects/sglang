@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draft KV and raw-tail memory budget</title>
+<style>
+  :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172635; background: #f3f5f7; }
+  body { max-width: 1140px; margin: auto; padding: 32px 24px 48px; }
+  h1 { font-size: 30px; margin-bottom: 10px; letter-spacing: -.6px; }
+  h2 { font-size: 19px; margin: 0 0 14px; }
+  p { line-height: 1.55; max-width: 1000px; }
+  a { color: #16697b; }
+  .eyebrow { color: #526578; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+  .panel { background: white; border: 1px solid #dce3e8; border-radius: 12px; padding: 22px; margin-top: 20px; }
+  .controls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+  label { display: grid; gap: 7px; font-size: 13px; font-weight: 600; }
+  input, select { box-sizing: border-box; width: 100%; padding: 9px; border: 1px solid #aebcc9; border-radius: 5px; background: #fff; font: inherit; color: inherit; }
+  .hint { font-size: 12px; color: #596c7b; font-weight: 400; line-height: 1.4; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .stat strong { display: block; font-size: 27px; margin: 8px 0; }
+  .positive { color: #087f72; } .negative { color: #a85317; }
+  .muted { color: #596c7b; font-size: 13px; }
+  #constraint { margin-bottom: 0; font-size: 13px; }
+  svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 12px 0; font-size: 12px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 8px; text-align: right; border-bottom: 1px solid #e2e8ed; }
+  th:first-child, td:first-child { text-align: left; }
+  details { line-height: 1.65; } summary { cursor: pointer; font-weight: 600; }
+  code { font-size: 12px; background: #eef2f5; padding: 2px 4px; }
+  @media (max-width: 760px) { body { padding: 18px 12px; } .controls { grid-template-columns: repeat(2, 1fr); } .stats { grid-template-columns: 1fr; gap: 8px; } .panel { padding: 16px; } .table-wrap { overflow-x: auto; } }
+</style>
+<header>
+  <div class="eyebrow">ADAPTIVE SPEC V1 · CAPACITY ESTIMATE · 2026-10-21</div>
+  <h1>What do bounded draft KV and raw tails buy us?</h1>
+  <p>Compare a draft KV row for every retained target token with a bounded active draft window and raw target features. Values are <b>GiB per GPU</b> for the supplied six-layer DFlash2 draft and Qwen3.6-35B-A3B target. Target KV stays the same at a fixed token count; positive savings can fund more target KV.</p>
+</header>
+<section class="panel">
+  <div class="controls">
+    <label>Active requests A<input id="active" type="number" min="1" max="128" step="1" value="32"></label>
+    <label>Tensor parallelism<select id="tp"><option value="1">TP1</option><option value="2">TP2</option><option value="4">TP4</option></select></label>
+    <label>Persistent Mamba slots K<input id="slots" type="number" min="1" max="2048" step="1" value="256"><span class="hint">Includes live, track, cached, and reserved slots.</span></label>
+    <label>Retained target tokens T<input id="tokens" type="number" min="2048" max="8388608" step="2048" value="1048576"><span class="hint">Unique token rows across active requests and prefix cache.</span></label>
+    <label>Overlap scheduling<select id="overlap"><option value="1">Enabled</option><option value="0">Disabled</option></select><span class="hint">Reserves queued captures and delayed release across streams.</span></label>
+    <label>KV page size<input id="extra" type="number" min="1" max="256" step="1" value="64"><span class="hint">Covers window + 16-token block and both partial edge pages.</span></label>
+    <label>Prefill-token ceiling C<input id="prefill" type="number" min="1" max="131072" step="1" value="4096"><span class="hint">Include mixed-chunk decode rows if enabled. Also bounds raw capture staging.</span></label>
+    <label>State reservation / request S<select id="reserve"><option value="4">4 · extra_buffer_lazy, overlap</option><option value="5">5 · extra_buffer, overlap</option><option value="3">3 · lazy, decode-lock skip</option></select><span class="hint">Admission reservation includes COW/cache headroom.</span></label>
+  </div>
+  <p id="constraint" role="status"></p>
+</section>
+<section class="panel stats" aria-live="polite">
+  <div class="stat"><span>Net cache bytes freed</span><strong id="net"></strong><span class="hint">Positive = bounded design uses less memory.</span></div>
+  <div class="stat"><span>Equivalent additional target capacity</span><strong id="capacity"></strong><span class="hint">At fixed state and raw budgets. Negative values mean target capacity is lost.</span></div>
+  <div class="stat"><span>Break-even retained target tokens</span><strong id="breakeven"></strong><span id="equiv" class="hint"></span></div>
+</section>
+<section class="panel">
+  <h2>Memory at the selected target-token footprint</h2>
+  <svg id="bars" viewBox="0 0 1000 150" role="img" aria-label="Stacked baseline and bounded-cache memory comparison"></svg>
+  <div id="legend" class="legend"></div>
+  <p class="muted">Includes persistent state with one padding slot and the current unified pool's full speculative-state workspace: (A + 1) × 16 state-sized buffers. It excludes weights, graph pools, most model activations, additional prefill-kernel workspace, metadata, and allocator slack. These are budget components, not a prediction of total process VRAM.</p>
+</section>
+<section class="panel">
+  <h2>When does the tradeoff become a memory win?</h2>
+  <svg id="curve" viewBox="0 0 1000 320" role="img" aria-label="Net memory savings versus retained target tokens for TP1, TP2, and TP4"></svg>
+  <p class="muted">The lines use the same K, active count, page size, and GPU reserve. Raw features are replicated on every rank; draft KV and recurrent states shard with TP. The target has only two KV heads, so its per-rank Full KV stops shrinking after TP2. All counts are token rows, not bytes of prompt text.</p>
+</section>
+<section class="panel table-wrap">
+  <h2>Selected budget, by component</h2>
+  <table><thead><tr><th>Component (GiB / GPU)</th><th>Full-history draft</th><th>Bounded draft + raw tails</th></tr></thead><tbody id="rows"></tbody></table>
+</section>
+<section class="panel">
+  <details open><summary>Assumptions and formulas</summary>
+    <p>Window W = 2,048; block size = 16; BF16 features/KV/conv and FP32 recurrent state; target and draft use the same TP. HiCache stores cached raw tails on host. DCP, PP, quantized checkpoints, and ReplaySSM are excluded. The current unified pool does not support ReplaySSM. This comparison holds persistent-state and verify-scratch budgets equal on both sides.</p>
+    <p>One raw row R = 24,576 bytes. One raw tail = 48 MiB. Draft KV per row D = 24,576 / TP bytes. Target KV per row F = 20,480 / min(TP, 2) bytes. One recurrent slot M = 61.40625 / TP MiB.</p>
+    <p>Host raw storage is <code>K × W × R</code> per rank. GPU tails share append-only chunks of up to 256 rows. Each logical window can retain at most <code>W + 510</code> backing rows, including two partial edges. Admission covers <code>3A</code> active windows (live + two checkpoints) and at most <code>2A</code> pending transfer leases, even when their intervals are disjoint.</p>
+    <p>Let <code>F = min(C, 2AW)</code> and <code>N = 3</code> with overlap, otherwise <code>1</code>. GPU raw admission reserves <code>[5A × (W + 510) + N × max(F, 16A) + max(2W, min(F, AW))] × R</code>. The last two terms cover capture staging and projection inputs: canonical-page repair can hold a concatenated window and its selected rows together. Prefill remapping reuses capture storage. At the defaults this is <b>9.743 GiB/rank</b>, down from 18.047 GiB. The active latest-window payload is <code>A × W × R</code>; chunk slack and other lifetimes are included in the extra reserve.</p>
+    <p><code>old draft = T × D</code><br><code>draft cap = A × ceil((W + 16 + page − 1) / page) × page × D</code><br><code>net savings = old draft − draft cap − raw GPU reserve</code><br><code>additional target rows = net savings / F</code></p>
+    <p>Baseline: one materialized draft row per target row, with no recovery tails; it does not provide the new weight-update recovery contract. An existing private pool spanning a larger virtual-ID space can cost more. K is a planned simultaneous state occupancy/budget: unified sub-pool view maxima are overlapping capacities and must not be summed.</p>
+    <p>Retaining raw features avoids historical target replay for complete bundle hits, but introduces capture/copy and draft-reprojection work. A 32-request raw-storage microbenchmark retained 2.063 GiB with overlapping checkpoints, versus 4.5 GiB in the old ring-plus-snapshots layout. These curves compare admission budgets; they are not measured peak allocations.</p>
+    <p>At TP2, concurrency 32, and 2,048 input / 512 output tokens, measured median total throughput was 17.4k tokens/s with shared tails and HiCache, versus 17.2k before the storage optimization and 20.1k with the flag and HiCache off. The off path uses Rust TreeCore; the enabled paths use Python. This synthetic cold-cache workload does not measure the value of extra target capacity or agentic cache reuse. <a href="draft-raw-memory-optimization.json">Recorded evidence</a>.</p>
+    <p><a href="draft-kv-checkpoint-design.md">Design, implementation progress, and source references</a></p>
+  </details>
+</section>
+<script>
+  const GiB = 2 ** 30, MiB = 2 ** 20, W = 2048, R = 24576;
+  const colors = ["#8694a7", "#b8c1ce", "#336c9e", "#da913c", "#178e80", "#9563ad", "#c6a3d6", "#d9dfe6"];
+  const names = ["Persistent recurrent states", "Verify workspace", "Target Full KV", "Full-history draft KV", "Active draft KV", "Latest raw feature payload", "Additional raw admission reserve", "Prefill feature output"];
+  const number = value => Math.round(value).toLocaleString("en-US");
+  const signed = value => (value >= 0 ? "+" : "−") + Math.abs(value).toFixed(2);
+  function budget(p, tp = p.tp, tokens = p.tokens) {
+    const draft = R / tp, target = 20480 / Math.min(tp, 2), state = 61.40625 * MiB / tp;
+    const common = [(p.slots + 1) * state, (p.active + 1) * 16 * state, tokens * target];
+    const old = [...common, tokens * draft, 0, 0, 0, p.prefill * R];
+    const draftRows = p.active * Math.ceil((W + 16 + p.extra - 1) / p.extra) * p.extra;
+    const captureRows = Math.min(p.prefill, 2 * p.active * W);
+    const rawReserve = (5 * p.active * (W + 510)
+      + (p.overlap ? 3 : 1) * Math.max(captureRows, p.active * 16)
+      + Math.max(2 * W, Math.min(captureRows, p.active * W))) * R;
+    const next = [...common, 0, draftRows * draft, p.active * W * R, rawReserve - p.active * W * R, p.prefill * R];
+    const net = old[3] - next[4] - next[5] - next[6];
+    return {old, next, net, extraTokens: net / target, breakEven: draftRows + rawReserve / draft};
+  }
+  const text = (x, y, label, options = "") => `<text x="${x}" y="${y}" fill="#415467" font-family="system-ui, sans-serif" font-size="12" ${options}>${label}</text>`;
+  function renderBars(b) {
+    const sum = values => values.reduce((a, v) => a + v, 0);
+    const max = Math.max(sum(b.old), sum(b.next)), scale = 720 / max;
+    let svg = "";
+    for (const [label, values, y] of [["Full-history draft", b.old, 24], ["Bounded + tails", b.next, 84]]) {
+      svg += text(0, y + 23, label);
+      let x = 145;
+      values.forEach((value, i) => {
+        if (value) svg += `<rect x="${x}" y="${y}" width="${value * scale}" height="36" fill="${colors[i]}"><title>${names[i]}: ${(value / GiB).toFixed(3)} GiB</title></rect>`;
+        x += value * scale;
+      });
+      svg += text(x + 10, y + 23, `${(sum(values) / GiB).toFixed(2)} GiB`);
+    }
+    document.getElementById("bars").innerHTML = svg;
+    document.getElementById("legend").innerHTML = names.map((name, i) => `<span><i class="swatch" style="background:${colors[i]}"></i>${name}</span>`).join("");
+    document.getElementById("rows").innerHTML = names.map((name, i) => `<tr><td>${name}</td><td>${(b.old[i] / GiB).toFixed(3)}</td><td>${(b.next[i] / GiB).toFixed(3)}</td></tr>`).join("") + `<tr><th>Selected total</th><th>${(sum(b.old) / GiB).toFixed(3)}</th><th>${(sum(b.next) / GiB).toFixed(3)}</th></tr>`;
+  }
+  function renderCurve(p) {
+    const xmax = Math.max(2 ** 22, p.tokens * 1.1), left = 76, right = 970, top = 30, bottom = 267;
+    const ends = [1, 2, 4].flatMap(tp => [budget(p, tp, 0).net / GiB, budget(p, tp, xmax).net / GiB]);
+    const ymin = Math.min(0, ...ends), ymax = Math.max(1, ...ends);
+    const x = tokens => left + tokens / xmax * (right - left);
+    const y = value => bottom - (value - ymin) / (ymax - ymin) * (bottom - top);
+    let svg = text(left, 15, "GiB freed / GPU (above zero = saving)");
+    for (let i = 0; i <= 4; i++) {
+      const v = ymin + (ymax - ymin) * i / 4;
+      svg += `<path d="M${left} ${y(v)}H${right}" stroke="#e4e9ee"/>` + text(left - 10, y(v) + 4, v.toFixed(1), 'text-anchor="end"');
+      const n = xmax * i / 4;
+      svg += text(x(n), bottom + 22, `${(n / 2 ** 20).toFixed(1)}M`, 'text-anchor="middle"');
+    }
+    svg += `<path d="M${left} ${y(0)}H${right}" stroke="#596c7b" stroke-dasharray="4 4"/>`;
+    for (const [tp, color] of [[1, "#178e80"], [2, "#336c9e"], [4, "#9563ad"]]) {
+      const a = budget(p, tp, 0).net / GiB, z = budget(p, tp, xmax).net / GiB;
+      svg += `<path d="M${x(0)} ${y(a)}L${x(xmax)} ${y(z)}" fill="none" stroke="${color}" stroke-width="3"/>`;
+      svg += `<circle cx="${x(p.tokens)}" cy="${y(budget(p, tp).net / GiB)}" r="5" fill="${color}"/>`;
+      svg += text(690 + Math.log2(tp) * 85, 15, `TP${tp}`).replace('fill="#415467"', `fill="${color}"`);
+    }
+    svg += text(523, 315, "Total retained target-token rows · M = 1,048,576", 'text-anchor="middle"');
+    document.getElementById("curve").innerHTML = svg;
+  }
+  function render() {
+    const p = Object.fromEntries(["active", "tp", "slots", "tokens", "overlap", "extra", "prefill", "reserve"].map(id => [id, Number(document.getElementById(id).value)]));
+    if ([...document.querySelectorAll("input")].some(input => !input.checkValidity() || input.value === "")) return;
+    const b = budget(p), net = document.getElementById("net"), capacity = document.getElementById("capacity");
+    net.textContent = `${signed(b.net / GiB)} GiB`;
+    capacity.textContent = `${b.extraTokens >= 0 ? "+" : "−"}${number(Math.abs(b.extraTokens))} tokens`;
+    net.className = capacity.className = b.net >= 0 ? "positive" : "negative";
+    document.getElementById("breakeven").textContent = number(b.breakEven);
+    document.getElementById("equiv").textContent = `${number(b.breakEven / p.active)} retained rows per active request, if divided evenly.`;
+    const spare = p.slots - p.active * p.reserve, constraint = document.getElementById("constraint");
+    constraint.textContent = spare >= 0 ? `K = ${number(p.slots)}: ${number(p.active * p.reserve)} slots reserved for active-request peaks and ${number(spare)} additional slots for retained checkpoints. Host raw tails reserve ${(p.slots * W * R / GiB).toFixed(2)} GiB per rank separately from this GPU chart.` : `K is ${number(-spare)} slots below the ${number(p.active * p.reserve)}-slot reservation for this active count and strategy.`;
+    constraint.className = spare >= 0 ? "muted" : "negative";
+    renderBars(b); renderCurve(p);
+  }
+  document.querySelectorAll("input, select").forEach(input => input.addEventListener("input", render));
+  render();
+</script>
+</html>

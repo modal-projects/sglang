@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+from llguidance import LLTokenizer
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarBackend
+from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 from sglang.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarBackend,
     ReasonerGrammarObject,
@@ -310,6 +312,28 @@ class TestReasonerGrammarBackend(unittest.TestCase):
                 self._make_tokenizer(),
                 enable_strict_thinking=True,
             )
+
+    def test_wraps_llguidance_json_grammar(self):
+        """With a reasoning parser on, llguidance JSON grammars must not fail at wrap time."""
+        backend = object.__new__(GuidanceBackend)
+        BaseGrammarBackend.__init__(backend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
+        backend.any_whitespace = True
+        backend.whitespace_pattern = None
+        reasoner = ReasonerGrammarBackend(
+            backend, self._make_parser(), self._make_tokenizer()
+        )
+
+        wrapped = reasoner._init_value_dispatch(
+            ("json", '{"type": "integer"}'), reasoning=False
+        )
+
+        self.assertIsInstance(wrapped, ReasonerGrammarObject)
+        mask = wrapped.allocate_vocab_mask(
+            backend.llguidance_tokenizer.vocab_size, 1, "cpu"
+        )
+        wrapped.fill_vocab_mask(mask, 0)
+        self.assertTrue((mask[0] != -1).any())
 
 
 class TestReasonerGrammarObjectRollback(unittest.TestCase):

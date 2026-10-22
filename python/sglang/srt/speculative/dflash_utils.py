@@ -14,11 +14,12 @@ import triton.language as tl
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
+    top_k_top_p_normalize_probs_torch,
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -70,8 +71,19 @@ elif is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_triton,
+    )
 
-    tree_speculative_sampling_target_only = None
+    def tree_speculative_sampling_target_only(*, candidates, draft_probs, **kwargs):
+        # DFLASH drafts are greedy, so rejection sampling against one-hot draft
+        # probabilities is target-only verification.
+        draft_probs[:, :-1].scatter_(2, candidates[:, 1:, None], 1.0)
+        chain_speculative_sampling_triton(
+            candidates=candidates, draft_probs=draft_probs, **kwargs
+        )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -1144,6 +1156,21 @@ def build_speculative_verify_target_probs(
         sampling_info.temperatures, draft_token_num, dim=0
     )
     scaled_logits = next_token_logits / expanded_temperature
+    if (need_top_k or need_top_p) and get_exec().kernel.sampling_backend == "pytorch":
+        # Rejection sampling is lossless only against the distribution the
+        # non-speculative sampler draws from, so filter with the same kernel.
+        # The renorm kernels keep every tie at the top-p pivot instead.
+        target_probs = top_k_top_p_normalize_probs_torch(
+            F.softmax(scaled_logits, dim=-1),
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            max_top_k=(
+                getattr(sampling_info, "max_top_k", None)
+                if getattr(sampling_info, "sampling_seed", None) is None
+                else None
+            ),
+        )
+        return target_probs.view(bs, draft_token_num, -1).contiguous()
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:

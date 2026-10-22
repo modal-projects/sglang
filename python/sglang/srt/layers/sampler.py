@@ -748,6 +748,49 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def top_k_top_p_filter_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The pytorch backend's top-k/top-p filter, in descending-sorted order.
+
+    Returns unnormalized ``(probs_sort, probs_idx)``. Speculative verify reuses
+    this so its target distribution has exactly the sampler's support,
+    including how ties at the top-p cutoff are broken.
+
+    max_top_k, when given, must be >= every value in top_ks.
+    """
+    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
+    # leading columns carry all the mass that survives and sorting only those is
+    # exact. Callers that need a batch-independent tie order pass None.
+    if max_top_k is not None and max_top_k < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    return probs_sort, probs_idx
+
+
+def top_k_top_p_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+) -> torch.Tensor:
+    probs_sort, probs_idx = top_k_top_p_filter_probs_torch(
+        probs, top_ks, top_ps, max_top_k
+    )
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -768,13 +811,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = top_k_top_p_filter_probs_torch(probs, top_ks, top_ps)
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed

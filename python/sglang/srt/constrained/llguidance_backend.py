@@ -259,6 +259,20 @@ class GuidanceBackend(BaseGrammarBackend):
         )
         return register_vocab_mask_buffer(name, vocab_mask, max_rows)
 
+    # ReasonerGrammarBackend binds these mask hooks from the backend, not the grammar.
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        apply_token_bitmask_inplace(logits, vocab_mask)
+
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:
             return GuidanceGrammar(

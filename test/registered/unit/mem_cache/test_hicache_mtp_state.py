@@ -25,6 +25,9 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
     monkeypatch.setattr(
         spec, "get_memory", lambda: SimpleNamespace(enable_hierarchical_cache=True)
     )
+    monkeypatch.setattr(
+        spec, "get_spec", lambda: SimpleNamespace(enable_dflash_swa_cache=False)
+    )
     target = SimpleNamespace(
         spec_algorithm=SpeculativeAlgorithm.EAGLE,
         req_to_token_pool=SimpleNamespace(mamba_pool=target_pool),

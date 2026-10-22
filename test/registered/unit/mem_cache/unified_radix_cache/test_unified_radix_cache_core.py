@@ -631,6 +631,32 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_checkpoint_reports_rows_moved_to_canonical_pages(self):
+        """Draft KV bound to a request's own pages must learn which rows a
+        checkpoint moved onto pages another request inserted first."""
+        from sglang.srt.speculative.dflash_feature_tail import DFlashContextState
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        tokens = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, tokens[: 2 * ps])
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
+        if self.cfg.has_mamba:
+            req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.dflash_context_state = DFlashContextState(len(tokens))
+
+        cache.checkpoint(req, up_to=req.extend_end)
+        self.assertEqual(
+            req.kv.dflash_context_state.take_canonical_remap(), (0, 2 * ps)
+        )
+
+        # Rows the request already protects keep their pages.
+        cache.checkpoint(req, up_to=req.extend_end)
+        self.assertIsNone(req.kv.dflash_context_state.take_canonical_remap())
+
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
     @requires_swa_only
     @requires_ps1_window4
     def test_swa_unfinished_req_repoints_whole_insert_below_window(self):

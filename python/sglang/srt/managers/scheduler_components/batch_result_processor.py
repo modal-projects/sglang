@@ -266,9 +266,9 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
-            if result.dflash_feature_capture is not None:
-                result.dflash_feature_capture.consume(batch.reqs)
-                result.dflash_feature_capture = None
+            if result.dflash_context_capture is not None:
+                result.dflash_context_capture.consume(batch.reqs)
+                result.dflash_context_capture = None
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -949,9 +949,9 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
-        if result.dflash_feature_capture is not None:
-            result.dflash_feature_capture.consume(batch.reqs)
-            result.dflash_feature_capture = None
+        if result.dflash_context_capture is not None:
+            result.dflash_context_capture.consume(batch.reqs)
+            result.dflash_context_capture = None
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1593,9 +1593,9 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
-                other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
+            keep_may_be_written_in_flight = not (
+                req.kv.mamba_ping_pong_allocated & (1 << other_idx)
+            ) and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1680,8 +1680,7 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
+        if req.kv.mamba_ping_pong_allocated & (1 << other_idx):
             pool = batch.req_to_token_pool
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)

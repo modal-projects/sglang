@@ -60,7 +60,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
-        cache.dflash_feature_tail_host_pool = None
+        cache.dflash_checkpoint_pool = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
@@ -151,7 +151,7 @@ class TestHiCacheReadinessPipeline(CustomTestCase):
         self.cache.tree_core = SimpleNamespace(
             enable_storage=False, write_back_duplicate_reclaim_digest=17
         )
-        self.cache.dflash_feature_tail_host_pool = object()
+        self.cache.dflash_checkpoint_pool = object()
         self.cache.pp_size = 1
         self.cache.attn_cp_group = None
         self.cache.attn_tp_group = object()
@@ -222,7 +222,7 @@ class TestHiCacheReadinessPipeline(CustomTestCase):
             self.assertTrue(work.waited)
             destroyed.append(True)
 
-        self.cache.dflash_feature_tail_host_pool = SimpleNamespace(destroy=destroy)
+        self.cache.dflash_checkpoint_pool = SimpleNamespace(destroy=destroy)
         self.cache.release_host_resources()
         self.assertEqual(destroyed, [True])
         self.assertIsNone(self.cache._pending_hicache_ready)

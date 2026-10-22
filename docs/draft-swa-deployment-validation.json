@@ -1,0 +1,211 @@
+{
+  "date": "2026-10-22",
+  "scope": "DFlash materialized checkpoint KV, optional raw taps, GPU-only and HiCache deployment split",
+  "base_commit": "6f168a98d8438f3cb8bfd7ecfbfd9c2efa15b5e2",
+  "preserved_index_tree": "63ceecea536f74cd797eea515199a196126181df",
+  "artifacts": "/tmp/dflash-deployment-split-20261022",
+  "frozen_python_tree": "/tmp/dflash-deployment-split-20261022/final-source/python",
+  "frozen_python_file_count": 5857,
+  "frozen_python_hash_manifest_sha256": "5e070e7d89b8b27d18881f72fa12e8df816c1933ed2d8db7ae3671144120512c",
+  "working_python_matches_frozen_source": true,
+  "model": {
+    "target": "Qwen/Qwen3.6-35B-A3B",
+    "target_revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    "draft": "/tmp/autospec/baseline",
+    "platform": "NVIDIA H200",
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 2,
+    "window_tokens": 2048,
+    "block_tokens": 16,
+    "max_running_requests": 32,
+    "max_mamba_cache_size": 256,
+    "max_total_tokens": 131072,
+    "page_size": 64,
+    "chunked_prefill_size": 4096,
+    "mamba_strategy": "extra_buffer_lazy",
+    "attention_backend": "fa3",
+    "cuda_graph_backend_prefill": "breakable",
+    "tree_core": "python",
+    "hicache_ratio_when_enabled": 2,
+    "hicache_write_policy_when_enabled": "write_through"
+  },
+  "serving_reference": "/tmp/dflash-core-min-20261022/final-pruned-forced-host-r0/r0-a-serving.json",
+  "deployments": [
+    {
+      "name": "final-static-gpu",
+      "swa_cache": true,
+      "tap_cache": false,
+      "hicache": false,
+      "gpu_ids": "4,5",
+      "passed": true,
+      "output_sequences_matching_reference": 37,
+      "warm_cached_tokens": 4096,
+      "long_decode_tokens": 2400,
+      "restored_cached_tokens": 4096,
+      "restored_cached_tokens_details": {
+        "device": 4096,
+        "host": 0
+      },
+      "concurrent_branches": 32,
+      "startup_memory_log": [
+        "[2026-10-22 19:40:29 TP0] DFLASH SWA budget per rank: 32 requests, 69632 draft tokens (0.797 GiB), context GPU reserve 4.989 GiB, checkpoint window 24.000 MiB (taps=False)",
+        "[2026-10-22 19:40:30 TP0] DFLASH HiCache staging reserve per rank: 0.000 MiB",
+        "[2026-10-22 19:41:02 TP0] DFLASH checkpoint pool (cuda:0): 256 windows, 6.000 GiB per rank, pending transfer limit=64"
+      ],
+      "output_ids_sha256": "5791dead15638d568dcee059e3f781a1d3e6ef0a49ffc1c5df766abaa4088a52"
+    },
+    {
+      "name": "final-static-host",
+      "swa_cache": true,
+      "tap_cache": false,
+      "hicache": true,
+      "gpu_ids": "4,5",
+      "passed": true,
+      "output_sequences_matching_reference": 37,
+      "warm_cached_tokens": 4096,
+      "long_decode_tokens": 2400,
+      "restored_cached_tokens": 4096,
+      "restored_cached_tokens_details": {
+        "device": 0,
+        "host": 4096
+      },
+      "concurrent_branches": 32,
+      "startup_memory_log": [
+        "[2026-10-22 19:36:14 TP0] DFLASH SWA budget per rank: 32 requests, 69632 draft tokens (0.797 GiB), context GPU reserve 4.989 GiB, checkpoint window 24.000 MiB (taps=False)",
+        "[2026-10-22 19:36:15 TP0] DFLASH HiCache staging reserve per rank: 101.406 MiB",
+        "[2026-10-22 19:36:49 TP0] DFLASH checkpoint pool (host): 256 windows, 6.000 GiB per rank, pending transfer limit=64"
+      ],
+      "output_ids_sha256": "5791dead15638d568dcee059e3f781a1d3e6ef0a49ffc1c5df766abaa4088a52"
+    },
+    {
+      "name": "final-taps-gpu",
+      "swa_cache": true,
+      "tap_cache": true,
+      "hicache": false,
+      "gpu_ids": "6,7",
+      "passed": true,
+      "output_sequences_matching_reference": 37,
+      "warm_cached_tokens": 4096,
+      "long_decode_tokens": 2400,
+      "restored_cached_tokens": 4096,
+      "restored_cached_tokens_details": {
+        "device": 4096,
+        "host": 0
+      },
+      "concurrent_branches": 32,
+      "startup_memory_log": [
+        "[2026-10-22 19:36:14 TP0] DFLASH SWA budget per rank: 32 requests, 69632 draft tokens (0.797 GiB), context GPU reserve 14.778 GiB, checkpoint window 72.000 MiB (taps=True)",
+        "[2026-10-22 19:36:15 TP0] DFLASH HiCache staging reserve per rank: 0.000 MiB",
+        "[2026-10-22 19:36:48 TP0] DFLASH checkpoint pool (cuda:0): 256 windows, 18.000 GiB per rank, pending transfer limit=64"
+      ],
+      "output_ids_sha256": "5791dead15638d568dcee059e3f781a1d3e6ef0a49ffc1c5df766abaa4088a52"
+    },
+    {
+      "name": "final-taps-host",
+      "swa_cache": true,
+      "tap_cache": true,
+      "hicache": true,
+      "gpu_ids": "6,7",
+      "passed": true,
+      "output_sequences_matching_reference": 37,
+      "warm_cached_tokens": 4096,
+      "long_decode_tokens": 2400,
+      "restored_cached_tokens": 4096,
+      "restored_cached_tokens_details": {
+        "device": 0,
+        "host": 4096
+      },
+      "concurrent_branches": 32,
+      "startup_memory_log": [
+        "[2026-10-22 19:40:29 TP0] DFLASH SWA budget per rank: 32 requests, 69632 draft tokens (0.797 GiB), context GPU reserve 14.778 GiB, checkpoint window 72.000 MiB (taps=True)",
+        "[2026-10-22 19:40:30 TP0] DFLASH HiCache staging reserve per rank: 101.406 MiB",
+        "[2026-10-22 19:41:07 TP0] DFLASH checkpoint pool (host): 256 windows, 18.000 GiB per rank, pending transfer limit=64"
+      ],
+      "output_ids_sha256": "5791dead15638d568dcee059e3f781a1d3e6ef0a49ffc1c5df766abaa4088a52"
+    }
+  ],
+  "tests": {
+    "targeted_unit": {
+      "passed": 214,
+      "subtests_passed": 290,
+      "log": "/tmp/dflash-deployment-split-20261022/final-unit.log"
+    },
+    "unified_tree": {
+      "passed": 544,
+      "skipped": 59,
+      "subtests_passed": 39,
+      "log": "/tmp/dflash-deployment-split-20261022/final-tree-unit.log"
+    },
+    "cuda": {
+      "passed": 13,
+      "subtests_passed": 62,
+      "log": "/tmp/dflash-deployment-split-20261022/gpu-tests-r0.log"
+    },
+    "raw_lifecycle_memory": {
+      "passed": true,
+      "record": "/tmp/dflash-deployment-split-20261022/raw-lifecycle-memory.json",
+      "scope": "Raw row capture/storage only; context admission includes KV too."
+    },
+    "new_f_lint_issues": 0,
+    "preexisting_f_lint_issues": 7,
+    "diff_whitespace_check": "passed"
+  },
+  "revision_recovery_test": {
+    "target_extension_rows": 2,
+    "retained_window_rows": 4,
+    "valid_hit_projection_rows": [
+      2
+    ],
+    "stale_hit_projection_rows": [
+      4,
+      2
+    ],
+    "next_hit_projection_rows": [
+      2
+    ],
+    "modes": "tap off/on x GPU/host (CPU transfer fixture)",
+    "target_raw_dtype": "float32",
+    "draft_kv_dtype": "bfloat16",
+    "draft_weights_modified": true,
+    "active_residency_revision_test": true
+  },
+  "runtime_files_changed_in_this_step": [
+    "python/sglang/srt/arg_groups/fields/spec.py",
+    "python/sglang/srt/arg_groups/speculative_hook.py",
+    "python/sglang/srt/managers/schedule_batch.py",
+    "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+    "python/sglang/srt/managers/utils.py",
+    "python/sglang/srt/mem_cache/base_prefix_cache.py",
+    "python/sglang/srt/mem_cache/cache_init_params.py",
+    "python/sglang/srt/mem_cache/hicache_auto_size.py",
+    "python/sglang/srt/mem_cache/kv_cache_builder.py",
+    "python/sglang/srt/mem_cache/kv_cache_configurator.py",
+    "python/sglang/srt/mem_cache/memory_pool.py",
+    "python/sglang/srt/mem_cache/pool_host/dflash.py",
+    "python/sglang/srt/mem_cache/unified_cache/components/mamba.py",
+    "python/sglang/srt/mem_cache/unified_cache/tree_core_registry.py",
+    "python/sglang/srt/mem_cache/unified_radix_cache.py",
+    "python/sglang/srt/speculative/dflash_cache.py",
+    "python/sglang/srt/speculative/dflash_feature_tail.py",
+    "python/sglang/srt/speculative/dflash_worker_v2.py"
+  ],
+  "test_and_benchmark_files_changed_in_this_step": [
+    "test/manual/spec/benchmark_dflash_raw_memory.py",
+    "test/registered/hicache/test_dflash_feature_tail_host.py",
+    "test/registered/unit/managers/test_batch_result_processor_mamba_boundary.py",
+    "test/registered/unit/mem_cache/test_dflash_feature_tail_host_pool.py",
+    "test/registered/unit/mem_cache/test_hicache_auto_size.py",
+    "test/registered/unit/mem_cache/test_hicache_pp_sync_drain.py",
+    "test/registered/unit/mem_cache/test_mamba_donated_alloc_ratio.py",
+    "test/registered/unit/mem_cache/test_unified_tri_pool.py",
+    "test/registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_core.py",
+    "test/registered/unit/spec/test_dflash_feature_tail.py",
+    "test/registered/unit/test_server_args_cli_metadata.py"
+  ],
+  "limitations": [
+    "Serving tests exercise fixed weights; updates are tested at worker/residency interfaces.",
+    "No live autospec update coordinator or server update endpoint is implemented.",
+    "Both payloads share retention and transfer when taps are enabled.",
+    "No throughput parity claim; earlier reports predate this implementation."
+  ]
+}

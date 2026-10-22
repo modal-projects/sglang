@@ -258,6 +258,7 @@ class StreamingSession:
             indices = slot.kv.mamba_ping_pong_track_buffer
             mamba_allocator.free(indices[indices != -1])
             slot.kv.mamba_ping_pong_track_buffer = None
+            slot.kv.mamba_ping_pong_allocated = 0
 
     # -- Internal helpers (streaming body bits) --
 

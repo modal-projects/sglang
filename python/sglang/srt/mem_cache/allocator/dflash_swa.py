@@ -75,20 +75,13 @@ class DFlashSWATokenToKVPoolAllocator(UnifiedMambaSWATokenToKVPoolAllocator):
         return self.full_attn_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     def _release_page_reps(self, both, full_only):
-        # A Full row can have materialized or absent draft pages, independently
-        # of the target's prefix-cache eviction cursors.
+        # Draft bindings outlive freed target pages as spares in the fixed
+        # reservation; finding the bound reps would wait for the in-flight forward.
         pieces = (*both, *full_only)
         if pieces:
             reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
-            pages = reps // self.page_size
-            swa = self.swa_attn_allocator
-            bound = pages[swa.virtual_to_physical[pages] > 0]
-            # Segment representatives already name distinct pages, including
-            # across the free group. Preserve that contract for both sub-pools.
-            swa.free(bound * self.page_size, _pages=bound)
-            self.full_attn_allocator.free(reps, _pages=pages)
+            self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
             self.full_attn_allocator.clear_inverse_history()
-            swa.clear_inverse_history()
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         return BaseTokenToKVPoolAllocator.create_prefill_budget(

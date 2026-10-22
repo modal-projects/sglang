@@ -17,7 +17,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureCapture
+from sglang.srt.speculative.dflash_feature_tail import DFlashContextCapture
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -256,7 +256,7 @@ class TestFeatureCaptureResultCompletion(CustomTestCase):
                     req, batch = _make_batch()
                     req.kv.req_pool_idx = 0
                     history = torch.arange(24, dtype=torch.float32).view(4, 6)
-                    capture = DFlashFeatureCapture.prefill(
+                    capture = DFlashContextCapture.prefill(
                         reqs=[req],
                         target_hidden=history,
                         prefix_lens=[0],
@@ -269,25 +269,25 @@ class TestFeatureCaptureResultCompletion(CustomTestCase):
                     capture.metadata[:] = torch.tensor([[0, 0, -1]])
 
                     def complete():
-                        self.assertIsNone(req.kv.dflash_feature_state.end_pos)
+                        self.assertIsNone(req.kv.dflash_context_state.end_pos)
                         capture.metadata[:] = torch.tensor([[0, 4, 4]])
 
                     result = _make_result()
                     result.next_token_ids = torch.tensor([4])
                     result.copy_done = SimpleNamespace(synchronize=complete)
-                    result.dflash_feature_capture = capture
+                    result.dflash_context_capture = capture
                     processor = _make_processor()
                     if prefill:
                         req.inflight_middle_chunks = 1
                         processor.process_batch_result_prefill(batch, result)
                     else:
                         processor.process_batch_result_decode(batch, result)
-                    tail = req.kv.dflash_feature_state.checkpoint(0, 4)
+                    tail = req.kv.dflash_context_state.checkpoint(0, 4)
                     self.assertIsNotNone(tail)
                     torch.testing.assert_close(
                         tail.as_tensor(), history, rtol=0, atol=0
                     )
-                    self.assertIsNone(result.dflash_feature_capture)
+                    self.assertIsNone(result.dflash_context_capture)
                     self.assertFalse(capture.entries)
 
 

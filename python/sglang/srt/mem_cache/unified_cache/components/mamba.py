@@ -59,7 +59,6 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
-    from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureTail
 
 
 class MambaComponent(TreeComponent):
@@ -85,7 +84,7 @@ class MambaComponent(TreeComponent):
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
-        self._dflash_feature_tail_host_pool = params.dflash_feature_tail_host_pool
+        self._dflash_checkpoint_pool = params.dflash_checkpoint_pool
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]
@@ -152,7 +151,7 @@ class MambaComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
-        feature_pool = self._dflash_feature_tail_host_pool
+        feature_pool = self._dflash_checkpoint_pool
         # HiCache: evicted + backuped (host_value present) is also a valid match
         return lambda node: (
             (
@@ -164,8 +163,8 @@ class MambaComponent(TreeComponent):
             )
             and (
                 feature_pool is None
-                or feature_pool.is_ready(
-                    node.component_data[ct].metadata.get("dflash_feature_tail")
+                or feature_pool.is_usable(
+                    node.component_data[ct].metadata.get("dflash_checkpoint")
                 )
             )
         )
@@ -242,17 +241,17 @@ class MambaComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
-        pool, handle = self._dflash_feature_tail_host_pool, params.dflash_feature_tail
+        pool, handle = self._dflash_checkpoint_pool, params.dflash_checkpoint
         if pool is not None and handle is not None:
             if handle.end_pos != len(params.key):
                 raise ValueError(
                     "Draft features and recurrent checkpoint must have the same key boundary"
                 )
             metadata = node.component_data[self.component_type].metadata
-            existing = metadata.get("dflash_feature_tail")
+            existing = metadata.get("dflash_checkpoint")
             if existing is None or not pool.contains(existing):
-                metadata["dflash_feature_tail"] = handle
-                params.dflash_feature_tail = None
+                metadata["dflash_checkpoint"] = handle
+                params.dflash_checkpoint = None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -381,8 +380,8 @@ class MambaComponent(TreeComponent):
         # Device/host recurrent residency can change independently of the tail.
         # Release the recovery source only when the last recurrent copy goes.
         if cd.value is None and cd.host_value is None:
-            handle = cd.metadata.pop("dflash_feature_tail", None)
-            pool = self._dflash_feature_tail_host_pool
+            handle = cd.metadata.pop("dflash_checkpoint", None)
+            pool = self._dflash_checkpoint_pool
             if pool is not None and handle is not None and pool.contains(handle):
                 pool.release(handle)
 
@@ -644,7 +643,7 @@ class MambaComponent(TreeComponent):
                 if checkpoint is None:
                     return 0
                 cache_len, keep_idx = checkpoint
-                if not self._prepare_dflash_feature_donation(
+                if not self._prepare_dflash_checkpoint_donation(
                     req, insert_params, keep_idx, cache_len
                 ):
                     return 0
@@ -662,7 +661,7 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            if not self._prepare_dflash_feature_donation(
+            if not self._prepare_dflash_checkpoint_donation(
                 req, insert_params, req.kv.mamba_last_track_idx, cache_len
             ):
                 return 0
@@ -700,45 +699,38 @@ class MambaComponent(TreeComponent):
             insert_params.mamba_value = mamba_value_donated
             return cache_len
 
-    def _prepare_dflash_feature_donation(
+    def _prepare_dflash_checkpoint_donation(
         self, req: Req, insert_params: InsertParams, index: int, end_pos: int
     ) -> bool:
-        pool = self._dflash_feature_tail_host_pool
+        pool = self._dflash_checkpoint_pool
         if pool is None:
             return True
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         # Checkpoint metadata follows synchronized target commits. Logical host
         # slots follow tree ownership; event fences make their reuse independent
         # of rank-local DMA completion, so donation needs no readiness collective.
-        if (
-            end_pos <= 0
-            or end_pos % self.cache.page_size != 0
-            or state is None
-            or not state.has_checkpoint(index, end_pos)
-            or pool.available_size() == 0
-        ):
+        if end_pos <= 0 or end_pos % self.cache.page_size != 0 or state is None:
             return False
         handle = state.donate_checkpoint(index, end_pos, pool)
-        assert handle is not None
-        insert_params.dflash_feature_tail = handle
+        if handle is None:
+            return False
+        insert_params.dflash_checkpoint = handle
         return True
 
-    def restore_dflash_features(
-        self, node_id: NodeId, end_pos: int
-    ) -> DFlashFeatureTail:
-        """Restore only raw features; recurrent-state loading stays independent."""
-        pool = self._dflash_feature_tail_host_pool
+    def get_dflash_checkpoint(self, node_id: NodeId, end_pos: int):
+        """Get the exact context bundle; recurrent-state loading stays independent."""
+        pool = self._dflash_checkpoint_pool
         if pool is None:
             raise RuntimeError("Draft feature host pool is not configured")
         node = self.tree_core.node_by_id(node_id)
         handle = node.component_data[self.component_type].metadata.get(
-            "dflash_feature_tail"
+            "dflash_checkpoint"
         )
-        if handle is None or handle.end_pos != end_pos or not pool.is_ready(handle):
+        if handle is None or handle.end_pos != end_pos or not pool.is_usable(handle):
             raise RuntimeError(
                 "Matched recurrent checkpoint has no complete draft feature bundle"
             )
-        return pool.restore(handle)
+        return handle
 
     def cleanup_after_caching_req(
         self,
@@ -747,10 +739,10 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
-        if insert_params is not None and insert_params.dflash_feature_tail is not None:
-            pool = self._dflash_feature_tail_host_pool
-            handle = insert_params.dflash_feature_tail
-            insert_params.dflash_feature_tail = None
+        if insert_params is not None and insert_params.dflash_checkpoint is not None:
+            pool = self._dflash_checkpoint_pool
+            handle = insert_params.dflash_checkpoint
+            insert_params.dflash_checkpoint = None
             if pool.contains(handle):
                 pool.release(handle)
         if is_finished:

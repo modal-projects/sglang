@@ -90,11 +90,27 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    host_lists = (
+        forward_batch.extend_seq_lens_cpu,
+        forward_batch.mamba_prefill_track_mask_cpu,
+        forward_batch.mamba_track_seqlens_cpu,
+        forward_batch.extend_prefix_lens_cpu,
+    )
+    if all(values is not None for values in host_lists):
+        # The scheduler's host mirrors avoid four blocking device readbacks.
+        extend_seq_lens = torch.tensor(host_lists[0], dtype=torch.int64)
+        track_mask = torch.tensor(host_lists[1], dtype=torch.bool)
+        relative_track_lens = torch.tensor(
+            host_lists[2], dtype=torch.int64
+        ) - torch.tensor(host_lists[3], dtype=torch.int64)
+    else:
+        extend_seq_lens = forward_batch.extend_seq_lens.to(
+            device="cpu", dtype=torch.int64
+        )
+        track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+        relative_track_lens = forward_batch.mamba_track_seqlens.to(
+            device="cpu", dtype=torch.int64
+        ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)

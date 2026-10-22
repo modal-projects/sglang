@@ -14,10 +14,10 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.runtime_context import get_context, get_memory, get_spec
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_feature_tail import (
-    FEATURE_CHUNK_SIZE,
-    DFlashFeatureCapture,
-    DFlashFeatureState,
-    DFlashFeatureTail,
+    CONTEXT_CHUNK_SIZE,
+    DFlashContextCapture,
+    DFlashContextState,
+    DFlashContextWindow,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kernels.dflash_features import capture_dflash_features_reference
@@ -33,7 +33,9 @@ class TestDFlashFeatureTail(CustomTestCase):
         backing = torch.arange(128 * 16, dtype=torch.float32).view(128, 16)
         source = backing[:, ::2].requires_grad_()
         expected = source[18:26].detach().clone()
-        tail = DFlashFeatureTail.capture(source, start_pos=0, end_pos=26, window_size=8)
+        tail = DFlashContextWindow.capture(
+            source, start_pos=0, end_pos=26, window_size=8
+        )
         with torch.no_grad():
             backing.fill_(float("nan"))
         torch.testing.assert_close(tail.as_tensor(), expected, rtol=0, atol=0)
@@ -54,7 +56,7 @@ class TestDFlashFeatureTail(CustomTestCase):
                 source = history[start:stop].clone()
                 for end in (start, min(start + 2, stop), stop):
                     with self.subTest(window=window, start=start, end=end):
-                        tail = DFlashFeatureTail.capture(
+                        tail = DFlashContextWindow.capture(
                             source,
                             start_pos=start,
                             end_pos=end,
@@ -74,7 +76,7 @@ class TestDFlashFeatureTail(CustomTestCase):
 
     def test_only_committed_verify_input_rows_enter_the_tail(self):
         history = torch.arange(48 * 8, dtype=torch.float32).view(48, 8)
-        prefix = DFlashFeatureTail.capture(
+        prefix = DFlashContextWindow.capture(
             history[:32], start_pos=0, end_pos=32, window_size=8
         )
         for num_commit_tokens in (1, 5, 16):
@@ -82,7 +84,7 @@ class TestDFlashFeatureTail(CustomTestCase):
                 source = history[32:].clone()
                 source[num_commit_tokens:].fill_(float("nan"))
                 end = 32 + num_commit_tokens
-                tail = DFlashFeatureTail.capture(
+                tail = DFlashContextWindow.capture(
                     source,
                     start_pos=32,
                     end_pos=end,
@@ -96,12 +98,12 @@ class TestDFlashFeatureTail(CustomTestCase):
     def test_missing_or_misaligned_history_cannot_form_a_complete_tail(self):
         history = torch.zeros(16, 8)
         for old_end, old_window in ((7, 8), (9, 8), (8, 2)):
-            prefix = DFlashFeatureTail.capture(
+            prefix = DFlashContextWindow.capture(
                 history, start_pos=0, end_pos=old_end, window_size=old_window
             )
             with self.subTest(old_end=old_end, old_window=old_window):
                 with self.assertRaisesRegex(ValueError, "Missing target feature"):
-                    DFlashFeatureTail.capture(
+                    DFlashContextWindow.capture(
                         history[8:9],
                         start_pos=8,
                         end_pos=9,
@@ -109,11 +111,11 @@ class TestDFlashFeatureTail(CustomTestCase):
                         prefix_tail=prefix,
                     )
         with self.assertRaisesRegex(ValueError, "Missing target feature"):
-            DFlashFeatureTail.capture(
+            DFlashContextWindow.capture(
                 history[8:9], start_pos=8, end_pos=9, window_size=8
             )
         # A complete new window needs no cached features.
-        tail = DFlashFeatureTail.capture(
+        tail = DFlashContextWindow.capture(
             history[8:], start_pos=8, end_pos=16, window_size=8
         )
         self.assertEqual((tail.start_pos, tail.end_pos), (8, 16))
@@ -123,10 +125,10 @@ class TestDFlashFeatureTail(CustomTestCase):
         for start, end, window in ((-1, 2, 4), (2, 1, 4), (0, 5, 4), (0, 4, 0)):
             with self.subTest(start=start, end=end, window=window):
                 with self.assertRaises(ValueError):
-                    DFlashFeatureTail.capture(
+                    DFlashContextWindow.capture(
                         source, start_pos=start, end_pos=end, window_size=window
                     )
-        prefix = DFlashFeatureTail.capture(
+        prefix = DFlashContextWindow.capture(
             source, start_pos=0, end_pos=4, window_size=4
         )
         for new in (
@@ -136,7 +138,7 @@ class TestDFlashFeatureTail(CustomTestCase):
         ):
             with self.subTest(shape=new.shape, dtype=new.dtype, device=new.device):
                 with self.assertRaisesRegex(ValueError, "must match"):
-                    DFlashFeatureTail.capture(
+                    DFlashContextWindow.capture(
                         new, start_pos=4, end_pos=5, window_size=4, prefix_tail=prefix
                     )
 
@@ -152,7 +154,9 @@ class TestDFlashFeatureTail(CustomTestCase):
         )
         history = torch.arange(20 * 12, dtype=torch.float32).view(20, 12) / 100
         source = history.clone()
-        tail = DFlashFeatureTail.capture(source, start_pos=0, end_pos=16, window_size=8)
+        tail = DFlashContextWindow.capture(
+            source, start_pos=0, end_pos=16, window_size=8
+        )
         with torch.no_grad():
             model.fc.weight.copy_(torch.arange(48).view(4, 12) / 50)
             old = DFlashDraftModel.project_target_hidden(model, tail.as_tensor())
@@ -191,7 +195,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
 
     def prefill(self, req, start, end, checkpoint=None, window=8):
         source = self.history[start:end].clone()
-        capture = DFlashFeatureCapture.prefill(
+        capture = DFlashContextCapture.prefill(
             reqs=[req],
             target_hidden=source,
             prefix_lens=[start],
@@ -205,7 +209,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
     def decode(self, req, start, count, checkpoint=None, window=8):
         source = self.history[start : start + 16].clone()
         source[count:].fill_(float("nan"))
-        capture = DFlashFeatureCapture.decode(
+        capture = DFlashContextCapture.decode(
             reqs=[req],
             target_hidden=source.unsqueeze(0),
             start_positions=torch.tensor([start]),
@@ -243,7 +247,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
                     staged = sum(x.shape[0] for _, x in capture.entries[0].slices)
                     self.assertLessEqual(staged, min(end - start, 2 * window))
                     capture.consume([req])
-                    state = req.kv.dflash_feature_state
+                    state = req.kv.dflash_context_state
                     self.assert_tail(state.snapshot(), end, window)
                     snapshots.append((state.checkpoint(0, boundary), boundary))
                 end = 98
@@ -270,7 +274,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
 
         req = self.req()
         self.prefill(req, 0, 64, window=64).consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         start = 64
         for count in (3, 1, 9, 16, 2, 16, 16, 7):
             capture = self.decode(req, start, count, (0, start + count), window=64)
@@ -292,7 +296,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         req = self.req()
         window = 2048
         self.prefill(req, 0, 4096, (0, 4096), window).consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         previous = state.checkpoint(0, 4096)
         for start in range(4096, 4672, 16):
             checkpoint = (1, 4608) if start + 16 == 4608 else None
@@ -309,7 +313,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         for tail, end in ((previous, 4096), (latest, 4608), (live, 4672)):
             self.assert_tail(tail, end, window)
 
-        branch = DFlashFeatureState.from_tail(latest, window)
+        branch = DFlashContextState.from_tail(latest, window)
         branch._append(torch.full((16, 6), -7.0), 4608)
         for start in range(4672, 7168, 16):
             self.decode(req, start, 16, window=window).consume([req])
@@ -324,7 +328,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
     def test_cache_hit_without_history_only_becomes_complete_after_a_new_window(self):
         req = self.req()
         self.prefill(req, 64, 67, (0, 66)).consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         self.assertIsNone(state.snapshot())
         self.assertIsNone(state.checkpoint(0, 66))
         self.decode(req, 67, 5, (1, 72)).consume([req])
@@ -342,8 +346,8 @@ class TestDFlashFeatureCapture(CustomTestCase):
                 end = first + 3 * window + 5
                 self.prefill(req, 0, first, (0, first), window).consume([req])
                 self.prefill(req, first, end, (1, second), window).consume([req])
-                state = req.kv.dflash_feature_state
-                bound = window + 2 * (min(window, FEATURE_CHUNK_SIZE) - 1)
+                state = req.kv.dflash_context_state
+                bound = window + 2 * (min(window, CONTEXT_CHUNK_SIZE) - 1)
 
                 def assert_storage(tail, position):
                     self.assert_tail(tail, position, window)
@@ -365,7 +369,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
                 # internal padding or allow either branch to overwrite old rows.
                 for count in (1, 3, 15, 7, 16, 2, 9, 16):
                     tail = state.snapshot()
-                    state = DFlashFeatureState.from_tail(tail, window)
+                    state = DFlashContextState.from_tail(tail, window)
                     state._append(self.history[end : end + count], end)
                     assert_storage(tail, end)
                     end += count
@@ -381,7 +385,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         self.decode(req, 8, 16, (1, 16)).consume([req])
         for start in range(24, 120, 16):
             self.decode(req, start, 16).consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         self.assert_tail(state.snapshot(), 120)
         pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
         pool.enable_mamba_extra_buffer_lazy = False
@@ -400,7 +404,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
     def test_slot_replacement_rejects_pending_snapshot_but_keeps_active_rows(self):
         req = self.req()
         self.prefill(req, 0, 8, (0, 8)).consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         pending = self.decode(req, 8, 8, (0, 16))
         pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
         pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.zeros(
@@ -420,7 +424,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         first = self.prefill(req, 0, 8, (0, 8))
         second = self.prefill(req, 8, 16, (0, 16))
         first.consume([req])
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         self.assertIsNone(state.checkpoint(0, 8))
         self.assert_tail(state.snapshot(), 8)
         second.consume([req])
@@ -430,7 +434,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
     def test_release_and_recycled_request_row_cannot_resurrect_pending_features(self):
         req = self.req()
         self.prefill(req, 0, 8, (0, 8)).consume([req])
-        old = req.kv.dflash_feature_state
+        old = req.kv.dflash_context_state
         pending = self.decode(req, 8, 8, (1, 16))
         req.kv.mark_kv_released()
         self.assertTrue(old.closed)
@@ -439,7 +443,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         req.kv = ReqKvInfo(req_pool_idx=0)
         self.prefill(req, 0, 4, (0, 4)).consume([req])
         pending.consume([req])
-        self.assert_tail(req.kv.dflash_feature_state.snapshot(), 4)
+        self.assert_tail(req.kv.dflash_context_state.snapshot(), 4)
 
     def test_retracted_or_finished_requests_discard_inflight_captures(self):
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -454,14 +458,14 @@ class TestDFlashFeatureCapture(CustomTestCase):
                 else:
                     req.is_retracted = True
                 pending.consume([req])
-                self.assert_tail(req.kv.dflash_feature_state.snapshot(), 8)
+                self.assert_tail(req.kv.dflash_context_state.snapshot(), 8)
                 req.kv.mark_kv_released()
-                self.assertIsNone(req.kv.dflash_feature_state)
+                self.assertIsNone(req.kv.dflash_context_state)
 
     def test_batched_rows_and_negative_tracking_slot_do_not_cross_requests(self):
         reqs = [self.req(), self.req()]
         hidden = torch.stack((self.history[:16], self.history[32:48]))
-        DFlashFeatureCapture.decode(
+        DFlashContextCapture.decode(
             reqs=reqs,
             target_hidden=hidden,
             start_positions=torch.tensor([0, 32]),
@@ -471,10 +475,10 @@ class TestDFlashFeatureCapture(CustomTestCase):
             checkpoint_slots=[0, 1],
             window_size=8,
         ).consume(reqs)
-        self.assert_tail(reqs[0].kv.dflash_feature_state.snapshot(), 5)
-        self.assert_tail(reqs[0].kv.dflash_feature_state.checkpoint(0, 4), 4)
-        self.assert_tail(reqs[1].kv.dflash_feature_state.snapshot(), 45)
-        self.assertIsNone(reqs[1].kv.dflash_feature_state.checkpoint(1, 40))
+        self.assert_tail(reqs[0].kv.dflash_context_state.snapshot(), 5)
+        self.assert_tail(reqs[0].kv.dflash_context_state.checkpoint(0, 4), 4)
+        self.assert_tail(reqs[1].kv.dflash_context_state.snapshot(), 45)
+        self.assertIsNone(reqs[1].kv.dflash_context_state.checkpoint(1, 40))
 
     def test_prefill_uses_actual_checkpoint_boundary_before_kernel_encoding(self):
         req = self.req()
@@ -502,8 +506,8 @@ class TestDFlashFeatureCapture(CustomTestCase):
         req.kv.mamba_last_track_seqlen = 48
         req.kv.mamba_last_track_idx = 1
         capture.consume([req])
-        self.assert_tail(req.kv.dflash_feature_state.checkpoint(0, 12), 12)
-        self.assert_tail(req.kv.dflash_feature_state.snapshot(), 40)
+        self.assert_tail(req.kv.dflash_context_state.checkpoint(0, 12), 12)
+        self.assert_tail(req.kv.dflash_context_state.snapshot(), 40)
 
     def test_decode_checkpoint_uses_the_recurrent_commit_selection(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -540,7 +544,7 @@ class TestDFlashFeatureCapture(CustomTestCase):
         )
         torch.testing.assert_close(selected["last_correct_step_indices"], counts - 1)
         torch.testing.assert_close(steps, torch.tensor([0, 0, 8]))
-        DFlashFeatureCapture.decode(
+        DFlashContextCapture.decode(
             reqs=reqs,
             target_hidden=self.history[7:23].expand(3, -1, -1),
             start_positions=starts,
@@ -551,28 +555,28 @@ class TestDFlashFeatureCapture(CustomTestCase):
             window_size=8,
         ).consume(reqs)
         for req, end, boundary in zip(reqs, (8, 13, 17), (8, 8, 16)):
-            self.assert_tail(req.kv.dflash_feature_state.snapshot(), end)
+            self.assert_tail(req.kv.dflash_context_state.snapshot(), end)
             self.assert_tail(
-                req.kv.dflash_feature_state.checkpoint(0, boundary), boundary
+                req.kv.dflash_context_state.checkpoint(0, boundary), boundary
             )
 
     def test_worker_default_and_hicache_alone_do_not_enable_raw_capture(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
         worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
-        worker._feature_tail_window = None
+        worker._context_window = None
         worker.use_compact_draft_cache = False
         worker._draft_worker = SimpleNamespace(alloc_memory_pool=lambda **kwargs: None)
         for hicache in (False, True):
             with get_memory().override(enable_hierarchical_cache=hicache):
                 worker.alloc_memory_pool()
-                self.assertIsNone(worker._feature_tail_window)
+                self.assertIsNone(worker._context_window)
         with get_spec().override(enable_dflash_swa_cache=True):
             with self.assertRaisesRegex(
                 ValueError, "requires a separate draft SWA pool"
             ):
                 worker.alloc_memory_pool()
-        self.assertIsNone(worker._feature_tail_window)
+        self.assertIsNone(worker._context_window)
 
     def test_worker_prefill_retains_raw_features_before_clearing_target_output(self):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -592,7 +596,13 @@ class TestDFlashFeatureCapture(CustomTestCase):
                     seq_lens=torch.tensor([40]),
                     out_cache_loc=torch.arange(40),
                     mamba_prefill_checkpoints=[(0, 12)],
-                    tree_cache=SimpleNamespace(dflash_feature_tail_host_pool=None),
+                    tree_cache=SimpleNamespace(
+                        dflash_checkpoint_pool=SimpleNamespace(
+                            revision=0, window_size=window
+                        )
+                        if window
+                        else None
+                    ),
                 )
                 source = self.history[:40].clone()
                 output = GenerationBatchResult(
@@ -603,7 +613,16 @@ class TestDFlashFeatureCapture(CustomTestCase):
                     ),
                 )
                 worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
-                worker._feature_tail_window = window
+                worker._context_window = window
+                worker._draft_cache = (
+                    SimpleNamespace(
+                        prepare=lambda *a, **kw: None,
+                        retain_prefill=lambda *a: None,
+                    )
+                    if window
+                    else None
+                )
+                worker._project_context_rows = lambda hidden, *a, **kw: hidden.clone()
                 # Inference, collectives, and KV projection are external to the
                 # capture contract. Run the actual prefill orchestration around them.
                 worker._target_worker = SimpleNamespace(
@@ -619,12 +638,12 @@ class TestDFlashFeatureCapture(CustomTestCase):
                 source.fill_(float("nan"))
                 self.assertIsNone(result.logits_output.hidden_states)
                 if window is None:
-                    self.assertIsNone(result.dflash_feature_capture)
-                    self.assertIsNone(req.kv.dflash_feature_state)
+                    self.assertIsNone(result.dflash_context_capture)
+                    self.assertIsNone(req.kv.dflash_context_state)
                 else:
-                    result.dflash_feature_capture.consume([req])
-                    self.assert_tail(req.kv.dflash_feature_state.snapshot(), 40)
-                    self.assert_tail(req.kv.dflash_feature_state.checkpoint(0, 12), 12)
+                    result.dflash_context_capture.consume([req])
+                    self.assert_tail(req.kv.dflash_context_state.snapshot(), 40)
+                    self.assert_tail(req.kv.dflash_context_state.checkpoint(0, 12), 12)
 
 
 if __name__ == "__main__":

@@ -4,12 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -23,13 +25,14 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
-class TestMamba(unittest.TestCase):
+class TestMamba(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         pass
@@ -168,6 +171,40 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
+
+    def test_tracking_slot_updates_without_host_scalar_uploads(self):
+        """Clearing a tracking slot must not block on a pageable scalar copy."""
+
+        class NoHostScalarCopy(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func is torch.ops.aten.copy_.default:
+                    if args[0].device.type != "cpu" and args[1].device.type == "cpu":
+                        raise AssertionError("Pageable scalar upload in slot update")
+                return func(*args, **(kwargs or {}))
+
+        device = get_device()
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_allocator = MambaSlotAllocator(4, device)
+        pool.mamba_ping_pong_track_buffer_size = 2
+        pool.mamba_initial_tracking_slots = 1
+        pool.enable_mamba_extra_buffer_lazy = True
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.full(
+            (2, 2), -1, dtype=torch.int64, device=device
+        )
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
+        pool._alloc_ping_pong_buffer(req)
+        replacement = pool.mamba_allocator.alloc(1)[0]
+        expected = [-1, replacement.item()]
+        with NoHostScalarCopy():
+            pool.set_mamba_ping_pong_slot(req, 0, -1)
+            pool.set_mamba_ping_pong_slot(req, 1, replacement)
+        self.assertEqual(req.kv.mamba_ping_pong_track_buffer.tolist(), expected)
+        self.assertEqual(
+            pool.req_index_to_mamba_ping_pong_track_buffer_mapping[0].tolist(), expected
+        )
+        self.assertEqual(
+            pool.req_index_to_mamba_ping_pong_track_buffer_mapping[1].tolist(), [-1, -1]
         )
 
     def test_mamba_pool_deduplicated_conv_window_axis(self):

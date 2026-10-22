@@ -6,18 +6,166 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
+from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host import base, mamba, mha
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestDFlashHiCacheStagingBudget(CustomTestCase):
+    """Regression: late HiCache scratch must not spend reserved runtime headroom."""
+
+    def setUp(self):
+        self.enterContext(
+            get_context().override_server_args(
+                enable_hierarchical_cache=True,
+                hicache_mem_layout="page_first",
+                mem_fraction_static=0.75,
+                tp_size=2,
+                cuda_graph_config=CudaGraphConfig(),
+            )
+        )
+        self.enterContext(
+            get_parallel().override(
+                world_group=SimpleNamespace(world_size=2, cpu_group=None),
+            )
+        )
+        # CPU tests replace only hardware/JIT availability, not allocation shapes.
+        self.enterContext(
+            patch.object(
+                kcc.current_platform, "capabilities", hicache_device_kernels=True
+            )
+        )
+        for module in (mha, mamba):
+            self.enterContext(patch.object(module, "_is_cuda", True))
+            self.enterContext(
+                patch.object(
+                    module,
+                    "can_use_write_back_jit_kernel",
+                    side_effect=lambda *, element_size: element_size % 16 == 0,
+                    create=True,
+                )
+            )
+        cfg = self.cfg = object.__new__(kcc.KVCacheConfigurator)
+        cfg.device, cfg.gpu_id = "cuda", 0
+        cfg.page_size = 64
+        cfg.post_capture_kv_active = False
+        cfg.is_hybrid_swa = cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = torch.bfloat16
+        cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=40)
+        cfg.model_config = SimpleNamespace(
+            is_multimodal=False,
+            get_num_kv_heads=lambda tp, dcp: 2 // tp,
+            head_dim=256,
+            v_head_dim=256,
+        )
+        cfg.mambaish_config = SimpleNamespace(
+            full_attention_layer_ids=list(range(0, 40, 4)),
+            mamba2_cache_params=SimpleNamespace(
+                layers=[i for i in range(40) if i % 4],
+                shape=SimpleNamespace(temporal=(16, 128, 128), conv=((4096, 3),)),
+                dtype=SimpleNamespace(temporal=torch.float32, conv=torch.bfloat16),
+            ),
+        )
+        cfg.dflash_cache_sizing = SimpleNamespace(context_gpu_reserve_bytes=3 << 30)
+        self.enterContext(
+            patch.object(kcc, "get_available_gpu_memory", return_value=80)
+        )
+        # The existing recurrent-pool reserve is independent of transfer scratch.
+        self.enterContext(
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_handle_max_mamba_cache",
+                side_effect=lambda n: n,
+            )
+        )
+
+    def test_initial_budget_prices_late_staging_once(self):
+        expected = (80 - 25 - 3) * (1 << 30) - 106_332_160
+        self.assertEqual(self.cfg._profile_available_bytes(100), expected)
+        self.assertEqual(self.cfg._profile_available_bytes(100), expected)
+
+    def test_disabled_cache_and_direct_layout_do_not_reserve_staging(self):
+        for fields in (
+            dict(enable_hierarchical_cache=False),
+            dict(hicache_mem_layout="page_first_direct"),
+        ):
+            with (
+                self.subTest(fields=fields),
+                get_memory().override(**fields),
+            ):
+                self.assertEqual(self.cfg._profile_available_bytes(100), 52 << 30)
+
+    def test_flag_off_profile_keeps_existing_budget(self):
+        self.cfg.dflash_cache_sizing = None
+        self.assertEqual(self.cfg._profile_available_bytes(100), 55 << 30)
+
+    def test_unavailable_kernels_do_not_reserve_staging(self):
+        with (
+            patch.object(mha, "can_use_write_back_jit_kernel", return_value=False),
+            patch.object(mamba, "can_use_write_back_jit_kernel", return_value=False),
+        ):
+            self.assertEqual(self.cfg._profile_available_bytes(100), 52 << 30)
+
+    def test_reserve_matches_allocations_and_kernel_fallbacks(self):
+        for temporal, conv in (
+            ((16, 128, 128), ((4096, 3),)),
+            ((0,), ((16, 8), (3,))),  # conv-only; the unaligned row falls back
+        ):
+            with self.subTest(temporal=temporal, conv=conv):
+                self.cfg.mambaish_config.mamba2_cache_params.shape = SimpleNamespace(
+                    temporal=temporal, conv=conv
+                )
+                host = object.__new__(mamba.MambaPoolHost)
+                host.layout, host._buffer_device = "page_first", "meta"
+                host.temporal_buffer = torch.empty(
+                    (257, 30, 1, *temporal), dtype=torch.float32, device="meta"
+                )
+                host.conv_buffer = [
+                    torch.empty((257, 30, 1, *s), dtype=torch.bfloat16, device="meta")
+                    for s in conv
+                ]
+                host._init_write_back_staging_buffers()
+                info = SimpleNamespace(
+                    head_num=1,
+                    head_dim=256,
+                    v_head_dim=256,
+                    dtype=torch.bfloat16,
+                    device="meta",
+                )
+                kv = mha.prepare_mha_write_back_staging(
+                    info, layer_num=10, page_size=64
+                )
+                allocated = sum(
+                    t.nbytes
+                    for t in (
+                        *kv,
+                        host.temporal_staging_buffer,
+                        *host.conv_staging_buffers,
+                    )
+                    if t is not None
+                )
+                self.assertEqual(self.cfg._dflash_hicache_staging_bytes(), allocated)
+                # A host pool smaller than one transfer chunk needs less scratch.
+                small = mha.prepare_mha_write_back_staging(
+                    info, layer_num=10, page_size=64, page_capacity=4
+                )
+                self.assertLess(sum(t.nbytes for t in small), sum(t.nbytes for t in kv))
+                # Post-capture preparation can pass its existing allocations through.
+                reused = mha.prepare_mha_write_back_staging(
+                    info, layer_num=10, page_size=64, staging=kv
+                )
+                self.assertIs(reused, kv)
 
 
 class TestHiCacheAutoSize(CustomTestCase):
@@ -38,7 +186,7 @@ class TestHiCacheAutoSize(CustomTestCase):
             page_size=2,
             token_to_kv_pool_allocator=SimpleNamespace(
                 get_kvcache=lambda: pool,
-                dflash_cache_sizing=SimpleNamespace(raw_window_bytes=1000),
+                dflash_cache_sizing=SimpleNamespace(checkpoint_window_bytes=1000),
             ),
         )
         with (

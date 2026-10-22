@@ -1680,7 +1680,13 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dflash-swa-cache`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt in to the experimental bounded DFLASH sliding-window KV pool and raw target-feature tails. Requires `--enable-unified-memory`, `--enable-hierarchical-cache`, a Full + Mamba target with tracking buffers, and an all-sliding draft. The GPU working-set reserve follows `--max-running-requests`; host raw-tail capacity follows `--max-mamba-cache-size`. HiCache alone does not enable this path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt in to the experimental bounded DFLASH sliding-window KV pool and materialized checkpoint windows. Requires `--enable-unified-memory`, a Full + Mamba target with tracking buffers, an all-sliding draft, and `--max-running-requests`. Checkpoint capacity follows `--max-mamba-cache-size`; windows reside on GPU, or on host when HiCache is enabled. Raw target taps require `--enable-dflash-tap-cache`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boolean flag</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dflash-tap-cache`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Retain raw target hidden-feature windows alongside materialized DFLASH checkpoint KV for recovery after compatible draft revisions. Requires `--enable-dflash-swa-cache`. Active history stays on GPU; cached windows use GPU storage without HiCache and host storage with HiCache. This flag does not enable live draft-weight update orchestration.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boolean flag</td>
     </tr>

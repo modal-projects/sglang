@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import torch
+
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec, get_spec
 
@@ -441,17 +443,23 @@ def build_kv_cache(
         feature_transfer_engine = None
         if get_spec().enable_dflash_swa_cache:
             from sglang.srt.mem_cache.l2_transfer import L2TransferEngine
-            from sglang.srt.mem_cache.pool_host.dflash import DFlashFeatureTailHostPool
+            from sglang.srt.mem_cache.pool_host.dflash import DFlashCheckpointPool
 
             sizing = token_to_kv_pool_allocator.dflash_cache_sizing
-            feature_transfer_engine = L2TransferEngine("direct")
-            params.dflash_feature_tail_host_pool = DFlashFeatureTailHostPool(
+            if enable_hierarchical_cache:
+                feature_transfer_engine = L2TransferEngine("direct")
+            params.dflash_checkpoint_pool = DFlashCheckpointPool(
                 capacity=get_schedule().max_mamba_cache_size,
                 window_size=sizing.window_size,
-                feature_size=sizing.feature_size,
-                dtype=sizing.feature_dtype,
+                feature_size=sizing.context_layout.row_bytes,
+                dtype=torch.uint8,
                 transfer_engine=feature_transfer_engine,
+                device=token_to_kv_pool_allocator.device,
+                layout=sizing.context_layout,
                 max_pending=sizing.max_pending_transfers,
+            )
+            token_to_kv_pool_allocator.dflash_checkpoint_pool = (
+                params.dflash_checkpoint_pool
             )
         tree_cache = create_tree_cache(tree_context)
         if feature_transfer_engine is not None:

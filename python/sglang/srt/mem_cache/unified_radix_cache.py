@@ -209,16 +209,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
-        self.dflash_feature_tail_host_pool = params.dflash_feature_tail_host_pool
-        if self.dflash_feature_tail_host_pool is not None and (
+        self.dflash_checkpoint_pool = params.dflash_checkpoint_pool
+        if self.dflash_checkpoint_pool is not None and (
             not get_spec().enable_dflash_swa_cache
-            or not get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "DFlash raw checkpoint tails require --enable-dflash-swa-cache "
-                "and --enable-hierarchical-cache"
+                "DFlash checkpoint windows require --enable-dflash-swa-cache"
             )
-        if self.dflash_feature_tail_host_pool is not None and (
+        if self.dflash_checkpoint_pool is not None and (
             not params.enable_mamba_extra_buffer
             or ComponentType.MAMBA not in (params.tree_components or ())
         ):
@@ -439,8 +437,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self._finish_pending_hicache_ready()
-        if self.dflash_feature_tail_host_pool is not None:
-            self.dflash_feature_tail_host_pool.clear()
+        if self.dflash_checkpoint_pool is not None:
+            self.dflash_checkpoint_pool.clear()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -627,8 +625,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
-        if self.dflash_feature_tail_host_pool is not None:
-            self.dflash_feature_tail_host_pool.destroy()
+        if self.dflash_checkpoint_pool is not None:
+            self.dflash_checkpoint_pool.destroy()
 
     @rank_consensus(
         same_params=["params"],
@@ -1288,6 +1286,15 @@ class UnifiedRadixCache(BasePrefixCache):
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        if (
+            req.kv.dflash_context_state is not None
+            and new_prefix_len > req.kv.cache_protected_len
+        ):
+            # Rows matched in the tree switch to canonical pages, which need
+            # not hold this request's draft KV.
+            req.kv.dflash_context_state.note_canonical_remap(
+                req.kv.cache_protected_len, new_prefix_len
+            )
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -3393,7 +3400,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # its host-cache consensus under the following forward. Other HiCache
         # protocols retain their existing synchronous polling path.
         if (
-            self.dflash_feature_tail_host_pool is None
+            self.dflash_checkpoint_pool is None
             or self.pp_size != 1
             or self.enable_storage
             or self.cache_controller is None
@@ -3691,8 +3698,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
-        if self.dflash_feature_tail_host_pool is not None:
-            self.dflash_feature_tail_host_pool.poll()
+        if self.dflash_checkpoint_pool is not None:
+            self.dflash_checkpoint_pool.poll()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],

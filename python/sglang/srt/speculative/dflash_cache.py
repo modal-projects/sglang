@@ -13,8 +13,8 @@ from sglang.kernels.ops.attention.dflash_window import (
     dflash_update_window,
 )
 from sglang.srt.speculative.dflash_feature_tail import (
-    FEATURE_CHUNK_SIZE,
-    DFlashFeatureTail,
+    CONTEXT_CHUNK_SIZE,
+    DFlashContextLayout,
 )
 from sglang.srt.utils.common import ceil_align
 
@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.dflash_feature_tail import (
-        DFlashFeatureCapture,
-        DFlashFeatureState,
+        DFlashContextCapture,
+        DFlashContextState,
     )
 
 
@@ -44,6 +44,22 @@ class DFlashCacheSizing:
     page_size: int
     prefill_tokens: int
     overlap: bool
+    tap_cache: bool = False
+
+    @property
+    def context_layout(self) -> DFlashContextLayout:
+        return DFlashContextLayout(
+            self.num_layers,
+            self.kv_heads,
+            self.head_dim,
+            self.kv_dtype,
+            self.feature_size if self.tap_cache else 0,
+            self.feature_dtype,
+        )
+
+    @property
+    def checkpoint_window_bytes(self) -> int:
+        return self.window_size * self.context_layout.row_bytes
 
     @property
     def draft_tokens(self) -> int:
@@ -72,12 +88,12 @@ class DFlashCacheSizing:
         return 2 * self.max_requests
 
     @property
-    def raw_gpu_reserve_bytes(self) -> int:
+    def context_gpu_reserve_bytes(self) -> int:
         # Each request owns one live window and at most two checkpoints. These
         # share chunks, but disjoint checkpoint windows are valid too. A tail
         # can retain unused rows in its two boundary chunks. The transfer queue
         # independently caps leases after request/checkpoint ownership ends.
-        chunk = min(self.window_size, FEATURE_CHUNK_SIZE)
+        chunk = min(self.window_size, CONTEXT_CHUNK_SIZE)
         owned_rows = (3 * self.max_requests + self.max_pending_transfers) * (
             self.window_size + 2 * (chunk - 1)
         )
@@ -93,16 +109,17 @@ class DFlashCacheSizing:
         staged_rows = (3 if self.overlap else 1) * max(
             prefill_rows, self.max_requests * self.block_size
         )
-        # Canonical-page repair can hold a concatenated window and its selected
-        # rows together. A prefill gather instead retains at most its new rows.
+        # Revision recovery can hold joined, projected and rechunked windows.
+        # Prefill projects both checkpoint and final windows in one batch.
         projection_rows = max(
-            2 * self.window_size,
-            min(prefill_rows, self.max_requests * self.window_size),
+            3 * self.window_size,
+            prefill_rows,
         )
         return (
-            (owned_rows + staged_rows + projection_rows)
-            * self.feature_size
-            * self.feature_dtype.itemsize
+            (owned_rows + staged_rows + projection_rows) * self.context_layout.row_bytes
+            # Selected target rows are temporary projection inputs, including
+            # when retaining raw taps is disabled.
+            + prefill_rows * self.feature_size * self.feature_dtype.itemsize
         )
 
 
@@ -111,18 +128,17 @@ class _DraftWindow:
     kv: ReqKvInfo
     req_pool_idx: int
     block_size: int
-    feature_state: DFlashFeatureState | None = None
-    prefill_features: DFlashFeatureTail | None = None
-    prefill_virtual: torch.Tensor | None = None
+    feature_state: DFlashContextState | None = None
 
 
 class DFlashCacheResidency:
     """Keep active windows in a bounded, reusable set of SWA page bindings.
 
     The request table remains authoritative, including canonicalization by the
-    radix tree. Cached checkpoints own raw host tails, not materialized pages.
-    Retired bindings can supply the next window without changing physical
-    ownership; target eviction still frees them through the shared allocator.
+    radix tree. Cached checkpoints own immutable context windows separately.
+    Retired bindings, including those whose target page was freed, can supply
+    the next window without changing physical ownership: a binding never
+    implies materialized content.
     """
 
     def __init__(
@@ -160,7 +176,7 @@ class DFlashCacheResidency:
         *,
         prefix_lens: torch.Tensor | None = None,
         block_size: int = 0,
-        materialize: Callable[..., None],
+        restore: Callable,
     ) -> None:
         self._windows = {
             key: w
@@ -168,7 +184,7 @@ class DFlashCacheResidency:
             if w.kv.holds_kv
             and w.kv.req_pool_idx == w.req_pool_idx
             and (
-                w.feature_state is None or w.kv.dflash_feature_state is w.feature_state
+                w.feature_state is None or w.kv.dflash_context_state is w.feature_state
             )
         }
         batch_indices = {id(req.kv): i for i, req in enumerate(batch.reqs)}
@@ -178,7 +194,7 @@ class DFlashCacheResidency:
             old = self._windows.get(id(req.kv))
             if old is None:
                 self._windows[id(req.kv)] = _DraftWindow(
-                    req.kv, req.kv.req_pool_idx, block_size, req.kv.dflash_feature_state
+                    req.kv, req.kv.req_pool_idx, block_size, req.kv.dflash_context_state
                 )
             else:
                 old.block_size = block_size
@@ -250,65 +266,39 @@ class DFlashCacheResidency:
         )
         swa.clear_inverse_history()
 
-        # An unfinished prefill may have deduplicated its new Full pages into
-        # canonical radix pages after the worker returned. A spare binding does
-        # not imply materialized content: repair changed virtual IDs explicitly.
+        # Canonical target pages may have no draft contents. Restore saved KV;
+        # a draft revision change instead rebuilds the live window from its taps.
+        revision = self.allocator.dflash_checkpoint_pool.revision
         for w in self._windows.values():
-            features = w.prefill_features
-            if features is None:
+            state = w.kv.dflash_context_state
+            remap = state.take_canonical_remap() if state is not None else None
+            stale = state is not None and state.revision != revision
+            tail = state.snapshot() if remap is not None or stale else None
+            if tail is None:
                 continue
-            positions = torch.arange(
-                features.start_pos,
-                features.end_pos,
-                device=table.device,
-            )
-            virtual = table[w.req_pool_idx, positions]
-            keep = (virtual != w.prefill_virtual) & (
-                swa.virtual_to_physical[virtual.long() // ps] > 0
-            )
-            if keep.any():
-                materialize(
-                    target_hidden=features.as_tensor()[keep],
+            start = tail.start_pos if stale else max(remap[0], tail.start_pos)
+            end = tail.end_pos if stale else min(remap[1], tail.end_pos)
+            if start >= end:
+                continue
+            positions = torch.arange(start, end, device=table.device)
+            virtual = table[w.req_pool_idx, start:end]
+            keep = swa.virtual_to_physical[virtual.long() // ps] > 0
+            if stale or keep.any():
+                updated = restore(
+                    tail=tail,
                     cache_loc=self.allocator.translate_loc_from_full_to_swa(
                         virtual[keep]
                     ),
                     positions=positions[keep],
                 )
-            w.prefill_features = None
-            w.prefill_virtual = None
+                if stale:
+                    state.replace_live_window(updated)
 
     def retain_prefill(
-        self, batch: ScheduleBatch, capture: DFlashFeatureCapture
+        self, batch: ScheduleBatch, capture: DFlashContextCapture
     ) -> None:
-        for req, prefix, length, entry in zip(
-            batch.reqs,
-            batch.prefix_lens,
-            batch.extend_lens,
-            capture.entries,
-            strict=True,
-        ):
-            keep = min(length, self.window_size)
-            w = self._windows[id(req.kv)]
-            w.feature_state = entry.owner if entry is not None else None
-            start = prefix + length - keep
-            # Reuse captured chunks through radix canonicalization. Concatenate
-            # only if a changed page actually needs its contents rebuilt.
-            w.prefill_features = (
-                DFlashFeatureTail(
-                    start,
-                    tuple(
-                        features[max(0, length - keep - offset) :]
-                        for offset, features in entry.slices
-                        if offset + features.shape[0] > length - keep
-                    ),
-                )
-                if keep and entry is not None
-                else None
-            )
-            w.prefill_virtual = (
-                self.req_to_token_pool.req_to_token[
-                    w.req_pool_idx, start : prefix + length
-                ].clone()
-                if w.prefill_features is not None
-                else None
+        # Tie each window to the feature state its prefill created.
+        for req, entry in zip(batch.reqs, capture.entries, strict=True):
+            self._windows[id(req.kv)].feature_state = (
+                entry.owner if entry is not None else None
             )

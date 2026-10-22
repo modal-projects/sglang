@@ -26,15 +26,15 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
-from sglang.srt.mem_cache.pool_host.dflash import DFlashFeatureTailHostPool
+from sglang.srt.mem_cache.pool_host.dflash import DFlashCheckpointPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType, EvictLayer
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context, get_memory, get_spec
+from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_feature_tail import (
-    DFlashFeatureCapture,
-    DFlashFeatureTail,
+    DFlashContextCapture,
+    DFlashContextWindow,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -115,7 +115,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         self.history = torch.arange(24 * 8, dtype=torch.float32).view(24, 8)
 
     def pool(self, capacity=2):
-        pool = DFlashFeatureTailHostPool(
+        pool = DFlashCheckpointPool(
             capacity=capacity,
             window_size=4,
             feature_size=8,
@@ -127,7 +127,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         return pool
 
     def tail(self, end):
-        return DFlashFeatureTail.capture(
+        return DFlashContextWindow.capture(
             self.history, start_pos=0, end_pos=end, window_size=4
         )
 
@@ -180,7 +180,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         )
 
     def test_pending_copy_limit_bounds_gpu_sources_even_with_free_host_slots(self):
-        pool = DFlashFeatureTailHostPool(
+        pool = DFlashCheckpointPool(
             capacity=4,
             window_size=4,
             feature_size=8,
@@ -225,7 +225,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         self.assertIsNone(destination())
 
     def test_restores_and_delayed_donations_share_a_bounded_transfer_queue(self):
-        pool = DFlashFeatureTailHostPool(
+        pool = DFlashCheckpointPool(
             capacity=4,
             window_size=4,
             feature_size=8,
@@ -257,15 +257,17 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "another pool"):
                 operation(foreign)
         for tail in (
-            DFlashFeatureTail(9, (torch.zeros(3, 8),)),
-            DFlashFeatureTail(-1, (torch.zeros(4, 8),)),
-            DFlashFeatureTail(0, (torch.zeros(5, 8),)),
-            DFlashFeatureTail(0, (torch.zeros(4, 7),)),
-            DFlashFeatureTail(0, (torch.zeros(4, 8, dtype=torch.bfloat16),)),
-            DFlashFeatureTail(0, (torch.zeros(4, 16)[:, ::2],)),
+            DFlashContextWindow(9, (torch.zeros(3, 8),)),
+            DFlashContextWindow(-1, (torch.zeros(4, 8),)),
+            DFlashContextWindow(0, (torch.zeros(5, 8),)),
+            DFlashContextWindow(0, (torch.zeros(4, 7),)),
+            DFlashContextWindow(0, (torch.zeros(4, 8, dtype=torch.bfloat16),)),
+            DFlashContextWindow(0, (torch.zeros(4, 16)[:, ::2],)),
         ):
             with self.subTest(tail=tail):
-                with self.assertRaisesRegex(ValueError, "complete raw window"):
+                with self.assertRaisesRegex(
+                    ValueError, "Checkpoint context must match"
+                ):
                     pool.backup(tail)
                 self.assertEqual(pool.available_size(), 2)
 
@@ -392,7 +394,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
                 page_size=1,
                 tree_components=(ComponentType.FULL, ComponentType.MAMBA),
                 enable_mamba_extra_buffer=True,
-                dflash_feature_tail_host_pool=pool,
+                dflash_checkpoint_pool=pool,
                 tree_core_backend="rust",
             )
         )
@@ -411,7 +413,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         req.kv.kv_allocated_len = req.kv.kv_committed_len = end
         req.kv.mamba_last_track_idx = 0
         req.kv.mamba_last_track_seqlen = checkpoint
-        capture = DFlashFeatureCapture.prefill(
+        capture = DFlashContextCapture.prefill(
             reqs=[req],
             target_hidden=self.history[:end],
             prefix_lens=[0],
@@ -428,15 +430,9 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
             )
         )
 
-    def test_host_attachment_requires_opt_in_and_hicache(self):
-        for scope in (
-            get_spec().override(enable_dflash_swa_cache=False),
-            get_memory().override(enable_hierarchical_cache=False),
-        ):
-            with (
-                scope,
-                self.assertRaisesRegex(ValueError, "raw checkpoint tails require"),
-            ):
+    def test_checkpoint_attachment_requires_opt_in(self):
+        with get_spec().override(enable_dflash_swa_cache=False):
+            with self.assertRaisesRegex(ValueError, "checkpoint windows require"):
                 self.cache()
 
     def test_pending_donation_keeps_exact_boundary_after_slot_replacement(self):
@@ -456,14 +452,18 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
             ).item(),
             old_slot.item(),
         )
-        tail = component.restore_dflash_features(match.best_match_node, 12)
+        tail = cache.dflash_checkpoint_pool.restore(
+            component.get_dflash_checkpoint(match.best_match_node, 12)
+        )
         torch.testing.assert_close(tail.as_tensor(), self.history[8:12])
-        self.assertEqual(req.kv.dflash_feature_state.snapshot().end_pos, 20)
+        self.assertEqual(req.kv.dflash_context_state.snapshot().end_pos, 20)
         release_kv_cache(req, cache, checkpoint=False)
-        self.assertIsNone(req.kv.dflash_feature_state)
+        self.assertIsNone(req.kv.dflash_context_state)
         self.assertEqual(self.match(cache).device_prefix_len, 12)
         torch.testing.assert_close(
-            component.restore_dflash_features(match.best_match_node, 12).as_tensor(),
+            cache.dflash_checkpoint_pool.restore(
+                component.get_dflash_checkpoint(match.best_match_node, 12)
+            ).as_tensor(),
             self.history[8:12],
         )
 
@@ -474,12 +474,12 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         first_capture.consume([first])
         second, second_capture = self.request_capture(cache)
         cache.checkpoint(second, up_to=20)
-        pool = cache.dflash_feature_tail_host_pool
+        pool = cache.dflash_checkpoint_pool
         self.assertEqual(pool.available_size(), 1)
         second_capture.consume([second])
         self.assertEqual(pool.available_size(), 1)
         self.assertEqual(self.match(cache).device_prefix_len, 12)
-        self.assertEqual(second.kv.dflash_feature_state.snapshot().end_pos, 20)
+        self.assertEqual(second.kv.dflash_context_state.snapshot().end_pos, 20)
 
     def test_evicted_or_reset_pending_capture_never_revives_cache_bundle(self):
         for reset in (False, True):
@@ -497,18 +497,14 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
                         defaultdict(list),
                         EvictLayer.ALL,
                     )
-                self.assertEqual(
-                    cache.dflash_feature_tail_host_pool.available_size(), 1
-                )
+                self.assertEqual(cache.dflash_checkpoint_pool.available_size(), 1)
                 capture.consume([req])
                 self.assertEqual(self.match(cache).device_prefix_len, 0)
-                self.assertEqual(
-                    cache.dflash_feature_tail_host_pool.available_size(), 1
-                )
+                self.assertEqual(cache.dflash_checkpoint_pool.available_size(), 1)
 
     def test_capacity_decline_preserves_request_checkpoint(self):
         cache = self.cache(capacity=1)
-        pool = cache.dflash_feature_tail_host_pool
+        pool = cache.dflash_checkpoint_pool
         pool.reserve(4)
         req, capture = self.request_capture(cache)
         capture.consume([req])
@@ -519,7 +515,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         self.assertEqual(
             cache.req_to_token_pool.mamba_allocator.available_size(), free_states
         )
-        self.assertIsNotNone(req.kv.dflash_feature_state.checkpoint(0, 12))
+        self.assertIsNotNone(req.kv.dflash_context_state.checkpoint(0, 12))
         self.assertEqual(self.match(cache).device_prefix_len, 0)
         self.assertEqual(pool.available_size(), 0)
 
@@ -547,7 +543,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         req.finished_reason = FINISH_ABORT()
         release_kv_cache(req, cache, checkpoint=False)
         capture.consume([req])
-        self.assertEqual(cache.dflash_feature_tail_host_pool.available_size(), 1)
+        self.assertEqual(cache.dflash_checkpoint_pool.available_size(), 1)
         self.assertEqual(self.match(cache).device_prefix_len, 0)
 
     def test_finished_donation_uses_older_checkpoint_after_decode_overshoot(self):
@@ -556,7 +552,7 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
         cache = self.cache()
         req, capture = self.request_capture(cache, end=8, checkpoint=8)
         capture.consume([req])
-        later = DFlashFeatureCapture.prefill(
+        later = DFlashContextCapture.prefill(
             reqs=[req],
             target_hidden=self.history[8:24],
             prefix_lens=[8],
@@ -581,191 +577,217 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
             old_slot.item(),
         )
         torch.testing.assert_close(
-            component.restore_dflash_features(match.best_match_node, 8).as_tensor(),
+            cache.dflash_checkpoint_pool.restore(
+                component.get_dflash_checkpoint(match.best_match_node, 8)
+            ).as_tensor(),
             self.history[4:8],
         )
         self.assertEqual(cache.req_to_token_pool.mamba_allocator.available_size(), 31)
 
-    def test_worker_restores_current_projection_and_only_extends_target_suffix(self):
+    def test_worker_prefers_saved_kv_and_reprojects_only_after_revision_change(self):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.models.dflash import DFlashDraftModel
+        from sglang.srt.speculative.dflash_feature_tail import DFlashContextLayout
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-        # The fixture stores CPU KV even when this test runs on a GPU host.
+        self.history = self.history / 7
         for backend in ("_is_cuda", "_is_hip"):
             self.enterContext(
                 patch(f"sglang.srt.mem_cache.memory_pool.{backend}", False)
             )
-        cache = self.cache()
-        donor, capture = self.request_capture(cache)
-        capture.consume([donor])
-        cache.checkpoint(donor, up_to=20)
-        match = self.match(cache)
-        release_kv_cache(donor, cache, checkpoint=False)
-        kv_pool = MHATokenToKVPool(
-            size=256,
-            page_size=1,
-            dtype=torch.float32,
-            head_num=1,
-            head_dim=4,
-            layer_num=1,
-            device="cpu",
-            enable_memory_saver=False,
-        )
-        translator = KVIndexTranslator(
-            req_to_token=cache.req_to_token_pool.req_to_token,
-            token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
-            token_to_kv_pool=kv_pool,
-            page_size=1,
-            device="cpu",
-            is_draft_worker=True,
-        )
-        # Small deterministic attention geometry keeps projection and physical
-        # writes observable while using the real worker and DFlash projection.
-        model = SimpleNamespace(
-            config=SimpleNamespace(hidden_size=4),
-            num_context_features=2,
-            quantizable=False,
-            fc=torch.nn.Linear(8, 4, bias=False),
-            hidden_norm=torch.nn.RMSNorm(4),
-        )
-        model.project_target_hidden = lambda raw: (
-            DFlashDraftModel.project_target_hidden(model, raw)
-        )
-        model.prepare_context_hidden_for_kv = lambda layer, hidden: hidden
-        attn = SimpleNamespace(
-            num_kv_heads=1,
-            head_dim=4,
-            kv_proj_only=lambda hidden: (hidden * 2, hidden * 3),
-            apply_k_norm=lambda keys: keys,
-            apply_k_rope=lambda positions, keys: keys + positions[:, None],
-            attn=SimpleNamespace(layer_id=0, k_scale=None, v_scale=None),
-        )
-        model.layers = [SimpleNamespace(self_attn=attn)]
-        worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
-        worker._feature_tail_window = 4
-        worker.draft_model = model
-        worker.draft_owns_attention = False
-        worker.lilicorr = None
-        worker._use_fused_kv_materialize = False
-        worker.model_runner = SimpleNamespace(
-            device=torch.device("cpu"), prefill_attention_backend_str="torch_native"
-        )
-        worker.draft_model_runner = SimpleNamespace(
-            kv_index_translator=translator, token_to_kv_pool=kv_pool
-        )
-        worker._tp_sync = SimpleNamespace(sync=lambda *a: None)
-        with torch.no_grad():
-            model.fc.weight.copy_(torch.arange(32).view(4, 8) / 50)
+        for taps in (False, True):
+            for host in (False, True):
+                with self.subTest(taps=taps, host=host):
+                    cache = self.cache()
+                    layout = DFlashContextLayout(
+                        1, 1, 4, torch.bfloat16, 8 if taps else 0, torch.float32
+                    )
+                    pool = DFlashCheckpointPool(
+                        capacity=2,
+                        window_size=4,
+                        feature_size=layout.row_bytes,
+                        dtype=torch.uint8,
+                        layout=layout,
+                        transfer_engine=self.engine if host else None,
+                        pin_memory=False,
+                    )
+                    self.addCleanup(pool.destroy)
+                    cache.dflash_checkpoint_pool = pool
+                    component = cache.components[ComponentType.MAMBA]
+                    component._dflash_checkpoint_pool = pool
+                    cache.token_to_kv_pool_allocator.dflash_checkpoint_pool = pool
+                    kv_pool = MHATokenToKVPool(
+                        size=256,
+                        page_size=1,
+                        dtype=torch.bfloat16,
+                        head_num=1,
+                        head_dim=4,
+                        layer_num=1,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    translator = KVIndexTranslator(
+                        req_to_token=cache.req_to_token_pool.req_to_token,
+                        token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+                        token_to_kv_pool=kv_pool,
+                        page_size=1,
+                        device="cpu",
+                        is_draft_worker=True,
+                    )
+                    model = SimpleNamespace(
+                        config=SimpleNamespace(hidden_size=4),
+                        num_context_features=2,
+                        quantizable=False,
+                        fc=torch.nn.Linear(8, 4, bias=False),
+                        hidden_norm=torch.nn.RMSNorm(4),
+                    )
+                    projected_rows = []
 
-        # The same host bundle supports two independent branches, including an
-        # fc change. The target still receives only the two-token continuation.
-        outputs = []
-        for revision in range(2):
-            with torch.no_grad():
-                model.fc.weight[0].mul_(-1)
-            req, _ = self.request_capture(cache, end=14)
-            req.kv.dflash_feature_state = None
-            req.best_match_node = match.best_match_node
-            row = cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
-            kv_pool.k_buffer[0].fill_(float("nan"))
-            kv_pool.v_buffer[0].fill_(float("nan"))
-            batch = ScheduleBatch(
-                reqs=[req],
-                forward_mode=ForwardMode.EXTEND,
-                sampling_info=SimpleNamespace(is_all_greedy=True),
-                prefix_lens=[12],
-                extend_lens=[2],
-                seq_lens=torch.tensor([14]),
-                req_pool_indices=torch.tensor([req.kv.req_pool_idx]),
-                out_cache_loc=row[12:14],
-                mamba_prefill_checkpoints=[(0, 13)],
-                tree_cache=cache,
-                req_to_token_pool=cache.req_to_token_pool,
-            )
+                    def project(raw):
+                        projected_rows.append(raw.shape[0])
+                        return DFlashDraftModel.project_target_hidden(model, raw)
 
-            def target_forward(received, **kwargs):
-                self.assertEqual(received.prefix_lens, [12])
-                self.assertEqual(received.extend_lens, [2])
-                return GenerationBatchResult(
-                    logits_output=LogitsProcessorOutput(
-                        None, hidden_states=self.history[12:14].clone()
-                    ),
-                    next_token_ids=torch.tensor([42]),
-                    kv_loc_plan=translator.plan(
-                        req_pool_indices=batch.req_pool_indices,
-                        seq_lens=batch.seq_lens,
-                        seq_lens_cpu=batch.seq_lens,
-                        write_virtual=batch.out_cache_loc,
-                    ),
-                )
+                    model.project_target_hidden = project
+                    model.prepare_context_hidden_for_kv = lambda layer, hidden: hidden
+                    attn = SimpleNamespace(
+                        num_kv_heads=1,
+                        head_dim=4,
+                        kv_proj_only=lambda hidden: (hidden * 2, hidden * 3),
+                        apply_k_norm=lambda keys: keys,
+                        apply_k_rope=lambda positions, keys: keys + positions[:, None],
+                        attn=SimpleNamespace(layer_id=0, k_scale=2, v_scale=3),
+                    )
+                    model.layers = [SimpleNamespace(self_attn=attn)]
+                    with torch.no_grad():
+                        model.fc.weight.copy_(torch.arange(32).view(4, 8) / 50)
+                    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+                    worker._context_window, worker._context_layout = 4, layout
+                    worker._draft_cache = SimpleNamespace(
+                        allocator=cache.token_to_kv_pool_allocator,
+                        prepare=lambda *a, **kw: None,
+                        retain_prefill=lambda *a: None,
+                    )
+                    worker.draft_model = model
+                    worker.draft_owns_attention = False
+                    worker.lilicorr = None
+                    worker._use_fused_kv_materialize = False
+                    worker.model_runner = SimpleNamespace(
+                        device=torch.device("cpu"),
+                        prefill_attention_backend_str="torch_native",
+                    )
+                    worker.draft_model_runner = SimpleNamespace(
+                        kv_index_translator=translator, token_to_kv_pool=kv_pool
+                    )
+                    worker._tp_sync = SimpleNamespace(sync=lambda *a: None)
+                    donor, _ = self.request_capture(cache)
+                    DFlashContextCapture.prefill(
+                        reqs=[donor],
+                        target_hidden=self.history[:20],
+                        prefix_lens=[0],
+                        extend_lens=[20],
+                        checkpoints=[(0, 12)],
+                        window_size=4,
+                        materialize=lambda rows, *_: worker._project_context_rows(
+                            self.history[rows], rows
+                        ),
+                    ).consume([donor])
+                    cache.checkpoint(donor, up_to=20)
+                    match = self.match(cache)
+                    release_kv_cache(donor, cache, checkpoint=False)
+                    handle = component.get_dflash_checkpoint(match.best_match_node, 12)
+                    self.assertEqual(
+                        pool.restore(handle).as_tensor().shape, (4, layout.row_bytes)
+                    )
 
-            worker._target_worker = SimpleNamespace(
-                forward_batch_generation=target_forward
-            )
-            output = worker.forward_batch_generation(batch)
-            output.dflash_feature_capture.consume([req])
-            with torch.no_grad():
-                projected = model.project_target_hidden(self.history[8:14])
-            torch.testing.assert_close(
-                kv_pool.k_buffer[0][row[8:14], 0],
-                projected * 2 + torch.arange(8, 14)[:, None],
-            )
-            torch.testing.assert_close(kv_pool.v_buffer[0][row[8:14], 0], projected * 3)
-            self.assertTrue(torch.isnan(kv_pool.k_buffer[0][row[:8]]).all())
-            torch.testing.assert_close(
-                req.kv.dflash_feature_state.checkpoint(0, 13).as_tensor(),
-                self.history[9:13],
-            )
-            torch.testing.assert_close(
-                req.kv.dflash_feature_state.snapshot().as_tensor(),
-                self.history[10:14],
-            )
-            outputs.append(kv_pool.v_buffer[0][row[8:12]].clone())
-            release_kv_cache(req, cache, checkpoint=False)
-        self.assertFalse(torch.equal(*outputs))
+                    for reuse in range(3 if taps else 2):
+                        stale = taps and reuse == 1
+                        if stale:
+                            with torch.no_grad():
+                                model.fc.weight[0].mul_(-1)
+                            worker.invalidate_draft_context()
+                        projected_rows.clear()
+                        req, _ = self.request_capture(cache, end=14)
+                        req.kv.dflash_context_state = None
+                        req.best_match_node = match.best_match_node
+                        row = cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+                        kv_pool.k_buffer[0].fill_(float("nan"))
+                        kv_pool.v_buffer[0].fill_(float("nan"))
+                        batch = ScheduleBatch(
+                            reqs=[req],
+                            forward_mode=ForwardMode.EXTEND,
+                            sampling_info=SimpleNamespace(is_all_greedy=True),
+                            prefix_lens=[12],
+                            extend_lens=[2],
+                            seq_lens=torch.tensor([14]),
+                            req_pool_indices=torch.tensor([req.kv.req_pool_idx]),
+                            out_cache_loc=row[12:14],
+                            mamba_prefill_checkpoints=[(0, 13)],
+                            tree_cache=cache,
+                            req_to_token_pool=cache.req_to_token_pool,
+                        )
 
-        # A long suffix supplies its own live window. Only an early interior
-        # checkpoint can still require old raw rows; neither case needs old KV.
-        for checkpoint, needs_raw in ((None, False), ((0, 13), True), ((0, 16), False)):
-            req, _ = self.request_capture(cache)
-            req.kv.dflash_feature_state = None
-            req.best_match_node = match.best_match_node
-            kv_pool.k_buffer[0].fill_(float("nan"))
-            batch = ScheduleBatch(
-                reqs=[req],
-                prefix_lens=[12],
-                extend_lens=[8],
-                req_pool_indices=torch.tensor([req.kv.req_pool_idx]),
-                mamba_prefill_checkpoints=[checkpoint],
-                tree_cache=cache,
-                req_to_token_pool=cache.req_to_token_pool,
-            )
-            worker._restore_cached_features(batch)
-            self.assertEqual(req.kv.dflash_feature_state is not None, needs_raw)
-            self.assertTrue(torch.isnan(kv_pool.k_buffer[0]).all())
-            capture = DFlashFeatureCapture.prefill(
-                reqs=[req],
-                target_hidden=self.history[12:20],
-                prefix_lens=[12],
-                extend_lens=[8],
-                checkpoints=[checkpoint],
-                window_size=4,
-            )
-            capture.consume([req])
-            torch.testing.assert_close(
-                req.kv.dflash_feature_state.snapshot().as_tensor(),
-                self.history[16:20],
-            )
-            if checkpoint is not None:
-                end = checkpoint[1]
-                torch.testing.assert_close(
-                    req.kv.dflash_feature_state.checkpoint(0, end).as_tensor(),
-                    self.history[end - 4 : end],
-                )
-            release_kv_cache(req, cache, checkpoint=False)
+                        def target_forward(received, **kwargs):
+                            self.assertEqual(received.prefix_lens, [12])
+                            self.assertEqual(received.extend_lens, [2])
+                            return GenerationBatchResult(
+                                logits_output=LogitsProcessorOutput(
+                                    None, hidden_states=self.history[12:14].clone()
+                                ),
+                                next_token_ids=torch.tensor([42]),
+                                kv_loc_plan=translator.plan(
+                                    req_pool_indices=batch.req_pool_indices,
+                                    seq_lens=batch.seq_lens,
+                                    seq_lens_cpu=batch.seq_lens,
+                                    write_virtual=batch.out_cache_loc,
+                                ),
+                            )
+
+                        worker._target_worker = SimpleNamespace(
+                            forward_batch_generation=target_forward
+                        )
+                        result = worker.forward_batch_generation(batch)
+                        result.dflash_context_capture.consume([req])
+                        self.assertEqual(projected_rows, [4, 2] if stale else [2])
+                        self.assertEqual(handle.revision, pool.revision)
+                        with torch.no_grad():
+                            expected = DFlashDraftModel.project_target_hidden(
+                                model, self.history[9:14]
+                            )
+                        torch.testing.assert_close(
+                            kv_pool.k_buffer[0][row[10:14], 0],
+                            ((expected[1:] * 2 + torch.arange(10, 14)[:, None]) / 2).to(
+                                torch.bfloat16
+                            ),
+                        )
+                        torch.testing.assert_close(
+                            kv_pool.v_buffer[0][row[10:14], 0],
+                            expected[1:].to(torch.bfloat16),
+                        )
+                        self.assertTrue(
+                            torch.isnan(kv_pool.k_buffer[0][row[:10]]).all()
+                        )
+                        checkpoint = req.kv.dflash_context_state.checkpoint(0, 13)
+                        k, v = layout.kv(checkpoint.as_tensor(), 0)
+                        torch.testing.assert_close(
+                            k[:, 0],
+                            ((expected[:4] * 2 + torch.arange(9, 13)[:, None]) / 2).to(
+                                torch.bfloat16
+                            ),
+                        )
+                        torch.testing.assert_close(
+                            v[:, 0], expected[:4].to(torch.bfloat16)
+                        )
+                        if taps:
+                            torch.testing.assert_close(
+                                layout.features(checkpoint.as_tensor()),
+                                self.history[9:13],
+                            )
+                        release_kv_cache(req, cache, checkpoint=False)
+                    if not taps:
+                        with self.assertRaisesRegex(ValueError, "tap-cache"):
+                            worker.invalidate_draft_context()
 
     def test_tail_follows_last_recurrent_copy_and_stays_on_split_child(self):
         for first_eviction in (EvictLayer.DEVICE, EvictLayer.HOST):
@@ -776,16 +798,16 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
                 cache.checkpoint(req, up_to=20)
                 node = cache.tree_core.node_by_id(req.last_node)
                 handle = node.component_data[ComponentType.MAMBA].metadata[
-                    "dflash_feature_tail"
+                    "dflash_checkpoint"
                 ]
                 self.assertEqual(self.match(cache, end=8).device_prefix_len, 0)
                 self.assertNotIn(
-                    "dflash_feature_tail",
+                    "dflash_checkpoint",
                     node.parent.component_data[ComponentType.MAMBA].metadata,
                 )
                 self.assertIs(
                     node.component_data[ComponentType.MAMBA].metadata[
-                        "dflash_feature_tail"
+                        "dflash_checkpoint"
                     ],
                     handle,
                 )
@@ -796,20 +818,20 @@ class TestDFlashFeatureTailHostPool(CustomTestCase):
                 component.evict_component(
                     node, defaultdict(list), defaultdict(list), first_eviction
                 )
-                self.assertTrue(cache.dflash_feature_tail_host_pool.is_ready(handle))
+                self.assertTrue(cache.dflash_checkpoint_pool.is_ready(handle))
                 torch.testing.assert_close(
-                    component.restore_dflash_features(node.id, 12).as_tensor(),
+                    cache.dflash_checkpoint_pool.restore(
+                        component.get_dflash_checkpoint(node.id, 12)
+                    ).as_tensor(),
                     self.history[8:12],
                 )
                 component.evict_component(
                     node, defaultdict(list), defaultdict(list), EvictLayer.ALL
                 )
-                self.assertFalse(cache.dflash_feature_tail_host_pool.contains(handle))
+                self.assertFalse(cache.dflash_checkpoint_pool.contains(handle))
                 self.engine.device_to_host_stream.synchronize()
                 self.engine.host_to_device_stream.synchronize()
-                self.assertEqual(
-                    cache.dflash_feature_tail_host_pool.available_size(), 1
-                )
+                self.assertEqual(cache.dflash_checkpoint_pool.available_size(), 1)
 
 
 if __name__ == "__main__":

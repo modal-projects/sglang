@@ -14,6 +14,8 @@ struct HicacheRelayoutParams {
   uint32_t num_pages;
   uint32_t num_layers;
   uint32_t page_size;
+  // Bytes between consecutive source tokens of one layer (the element size when packed).
+  int64_t src_stride_bytes;
 };
 
 template <typename IndexType, int64_t kElementSize, bool kIsMLA>
@@ -24,7 +26,8 @@ __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutP
   constexpr uint32_t kVecBytes = 16;
   constexpr uint32_t kVecPerItem = kElementSize / kVecBytes;
 
-  const auto& [k_cache_dst, v_cache_dst, indices_src, k_ptr_src, v_ptr_src, num_pages, num_layers, page_size] = params;
+  const auto& [k_cache_dst, v_cache_dst, indices_src, k_ptr_src, v_ptr_src, num_pages, num_layers, page_size, src_stride_bytes] =
+      params;
   const auto k_ptr_src_arr = static_cast<const void* const*>(k_ptr_src);
   const auto v_ptr_src_arr = static_cast<const void* const*>(v_ptr_src);
   const auto tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -44,7 +47,7 @@ __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutP
     const auto src_token = src_page + token_in_page;
     const auto src_k = pointer::offset(
         static_cast<const void*>(k_ptr_src_arr[layer_id]),
-        static_cast<int64_t>(src_token) * kElementSize + static_cast<int64_t>(vec_id) * kVecBytes);
+        static_cast<int64_t>(src_token) * src_stride_bytes + static_cast<int64_t>(vec_id) * kVecBytes);
     const auto dst_k =
         pointer::offset(static_cast<void*>(k_cache_dst), static_cast<int64_t>(linear_vec_id) * kVecBytes);
     const auto vec_k = details::load_nc(reinterpret_cast<const pack_t*>(src_k));
@@ -53,7 +56,7 @@ __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutP
     if constexpr (!kIsMLA) {
       const auto src_v = pointer::offset(
           static_cast<const void*>(v_ptr_src_arr[layer_id]),
-          static_cast<int64_t>(src_token) * kElementSize + static_cast<int64_t>(vec_id) * kVecBytes);
+          static_cast<int64_t>(src_token) * src_stride_bytes + static_cast<int64_t>(vec_id) * kVecBytes);
       const auto dst_v =
           pointer::offset(static_cast<void*>(v_cache_dst), static_cast<int64_t>(linear_vec_id) * kVecBytes);
       const auto vec_v = details::load_nc(reinterpret_cast<const pack_t*>(src_v));

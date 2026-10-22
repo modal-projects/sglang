@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from typing import Optional, Sequence
@@ -36,10 +37,15 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
     )
 if _is_cuda or _is_hip:
+    from sglang.kernels.ops.kvcache.hicache import (
+        can_use_write_back_jit_kernel,
+        transfer_hicache_all_layer_mla_staged_lf_pf,
+    )
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
     )
+
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection
 
@@ -56,6 +62,21 @@ if _is_npu:
         pass
 
 logger = logging.getLogger(__name__)
+
+# Slots gathered per staged backup chunk; bounds the device staging.
+_STAGED_BACKUP_SLOTS = 2
+
+
+def mamba_write_back_staging_shape(
+    slot_shape: tuple[int, ...], dtype: torch.dtype
+) -> tuple[int, ...] | None:
+    """Page-first slot shape is (layers, 1, *state_shape)."""
+    if not _is_cuda or math.prod(slot_shape) == 0:
+        return None
+    element_size = math.prod(slot_shape[1:]) * dtype.itemsize
+    if not can_use_write_back_jit_kernel(element_size=element_size):
+        return None
+    return (_STAGED_BACKUP_SLOTS, *slot_shape)
 
 
 _NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
@@ -347,6 +368,29 @@ class MambaPoolHost(HostKVCache):
         self.can_use_write_back_jit = True
         self._temporal_can_use_jit = False
         self._conv_can_use_jit = [False] * len(self.conv_buffer)
+        # Staged backups gather slots on the device, then the copy engine moves
+        # them to host: a direct kernel would hold SMs for the PCIe transfer.
+        if self.layout != "page_first" or not _is_cuda:
+            return
+        self.temporal_staging_buffer = self._staging_for(self.temporal_buffer)
+        self._temporal_can_use_jit = self.temporal_staging_buffer is not None
+        for conv_idx, host_buffer in enumerate(self.conv_buffer):
+            self.conv_staging_buffers[conv_idx] = self._staging_for(host_buffer)
+            self._conv_can_use_jit[conv_idx] = (
+                self.conv_staging_buffers[conv_idx] is not None
+            )
+
+    def _staging_for(self, host_buffer: torch.Tensor) -> Optional[torch.Tensor]:
+        shape = mamba_write_back_staging_shape(
+            tuple(host_buffer.shape[1:]), host_buffer.dtype
+        )
+        if shape is None:
+            return None
+        return torch.empty(
+            shape,
+            dtype=host_buffer.dtype,
+            device=self._buffer_device,
+        )
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
@@ -637,6 +681,18 @@ class MambaPoolHost(HostKVCache):
             )
             return
         if io_backend == "kernel":
+            src_stride_bytes = src_layers[0].stride(0) * src_layers[0].element_size()
+            if staging is not None and can_use_jit and not dst_indices.is_cuda:
+                transfer_hicache_all_layer_mla_staged_lf_pf(
+                    ptr_src=src_ptrs,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices.to(torch.int64),
+                    staging=staging,
+                    dst=dst,
+                    page_size=1,
+                    src_stride_bytes=src_stride_bytes,
+                )
+                return
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
@@ -646,7 +702,7 @@ class MambaPoolHost(HostKVCache):
                 item_size=item_size,
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
-                src_stride_bytes=src_layers[0].stride(0) * src_layers[0].element_size(),
+                src_stride_bytes=src_stride_bytes,
             )
         elif io_backend == "direct":
             src_ptrs = [src_layers[i] for i in range(num_layers)]
@@ -809,7 +865,14 @@ class MambaPoolHost(HostKVCache):
             else self.buffer_info.conv
         )
         if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel" and host_indices.device != device_indices.device:
+            staged = (
+                self.temporal_state_elem_size == 0 or self._temporal_can_use_jit
+            ) and all(self._conv_can_use_jit)
+            if (
+                io_backend == "kernel"
+                and host_indices.device != device_indices.device
+                and not staged
+            ):
                 # The mamba JIT kernel wants both index tensors on the device;
                 # the staged MHA/MLA write path hands us CPU host indices.
                 # Convert once here rather than per conv/temporal tensor.

@@ -5,122 +5,66 @@ description: "Code trace, recovery invariants, memory tradeoffs, and a proposed 
 
 # Draft KV and recurrent checkpoint bundles for v1
 
-Design proposal for review, based on the local SGLang checkout at
-`6f168a98d8438f3cb8bfd7ecfbfd9c2efa15b5e2`, inspected on 2026-10-20. This document
-extends the [v1 review](adaptive-spec-v1-review.md) and its agreed working rules.
-Allocator, factory, draft binding, address translation, prefix-valid KV writes,
-active feature-tail capture, host retention, checkpoint attachment, and
-cache-hit restoration, opt-in serving construction, bounded allocation, and
-memory admission are implemented. The serving path has been exercised on H200
-at TP1 and TP2, including 32 active requests, CUDA graphs, and HiCache recovery.
-The latest change shares overlapping raw-tail storage and tightens GPU admission
-from 18.047 to 9.743 GiB per rank at the 32-request baseline. See
-[the current memory bound and throughput results](#step-10-lossless-raw-tail-storage-and-tighter-admission).
-See [implementation progress](#implementation-progress).
+The original investigation began on 2026-10-20 against local base commit
+`6f168a98d8438f3cb8bfd7ecfbfd9c2efa15b5e2`. The implemented design was revised
+on **2026-10-22** to separate fixed-draft serving from optional tap retention.
+See [deployment shapes](draft-swa-deployment-shapes.md) for the current flags,
+implementation, memory accounting and validation. This document retains the
+original model investigation and dated implementation history below.
 
 ## Agreed recovery design
 
-Agreed on 2026-10-21: retain raw target-feature tails with recurrent
-checkpoints and active requests, and keep materialized draft KV in the bounded
-unified SWA pool. Draft KV eviction or draft weight updates must not force
-historical target replay, or shorten an otherwise usable target cache hit just
-to recover draft context. The target still processes the uncached prompt
-suffix normally. A complete retained bundle owns its recovery source.
+Each reusable recurrent boundary owns a materialized draft KV window. When
+`--enable-dflash-tap-cache` is enabled, it also owns the corresponding raw target
+hidden features. Reuse prefers compatible materialized KV and projects only
+new context. A compatible draft weight update invalidates saved projections;
+retained raw taps let the worker rebuild them without replaying target history.
+The target still computes the uncached prompt suffix.
 
-The selected placement keeps active requests' latest raw tails on GPU and
-offloads cached checkpoint tails to the HiCache host tier. Host capacity is
-explicit and bounded; initial admission declines a new donation when full.
-Factory sizing and GPU admission account for shared chunks, bounded transfers,
-and the configured prefill ceiling; FA3 has been exercised end to end. The memory estimate below
-uses 32 active requests and explicitly budgets recurrent state and cached
-checkpoints; its original GPU-only comparison is followed by the host-placement
-estimate.
+Active attention uses the bounded unified SWA pool, with independent physical
+mapping and the target's logical token IDs. Exact checkpoint capture uses
+immutable context snapshots alongside it. Cached snapshot storage is bounded
+and resides on GPU without HiCache, or on pinned host memory with HiCache.
+Active requests retain their latest context history on GPU; taps are included
+only when enabled. Native sliding-attention layers define the window. The
+legacy compact-cache path remains excluded.
 
-The [context-projection microbenchmarks](draft-context-projection-benchmark.md)
-measure the alternative of rebuilding draft KV every round. At 32 full windows,
-the existing path takes roughly 7–13 ms per rank on H200 across TP4/TP2/TP1
-geometry, compared with 0.08–0.14 ms for a normal 16-row decode-block extension.
-These isolated timings support retaining the active materialized cache; they
-are not an end-to-end throughput measurement.
+This supersedes the initial policy of retaining raw features alone at cached
+checkpoints. Materialized checkpoint KV now avoids historical projection on
+valid hits. Both representations are initially retained together when taps are
+on. Independent eviction and deferred raw-history loading remain discussion
+items, not implemented policies.
 
-Treat a reusable recurrent checkpoint as a bundle with enough draft context to
-resume at **that exact token boundary**. The concern about long decodes is
-correct: target attention KV and an end-of-prefix recurrent state cannot
-regenerate earlier target hidden states. Keeping the latest checkpoint, or the
-latest two nearby checkpoints, does not establish a sliding-window replay bound.
-
-Bundling the checkpoint with its projected draft KV solves reuse at the same
-draft revision. It does not solve invalidation after a draft weight update.
-That requires either the original target features or an earlier recurrent state
-from which to regenerate them.
-
-For this baseline, **raw target features are the persistent draft context of
-the bundle**, with projected draft KV treated as a derived cache:
-
-```text
-At prefix boundary C:
-  existing target prefix identity and Full KV
-  recurrent state S(C), including the target's convolution state
-  raw target features for the draft window ending at C
-
-For an active request:
-  its latest raw target-feature window on GPU
-  a bounded draft KV window materialized with the current draft revision
-```
-
-This gives a direct recovery path after draft KV eviction or a weight update:
-reproject at most the required feature window under the current draft weights.
-It needs **no target replay** for a complete bundle. A persistent projected-KV
-copy can be added later if avoiding projection on cache hits justifies its cost;
-I would not store both representations for every cached checkpoint initially.
-
-This recommendation has a real memory cost. At TP1, a 2,048-token BF16 raw
-feature window is 48 MiB, equal to this draft's KV window. At higher TP, a simple
-replicated feature store is more expensive relative to sharded draft KV. An
-earlier-checkpoint replay design is recorded below for comparison; it is not
-the chosen recovery path because it spends target computation on old history.
-
-For physical KV storage, the current recommendation is a **paged draft SWA
-sub-pool within the unified byte budget**, with the same logical token IDs as
-the target and an independent physical mapping. The native sliding-attention
-layers define the window. The legacy compact-cache path is excluded from this
-design. See [draft pool sizing and integration](#draft-pool-sizing-and-integration).
+The internal draft revision hook is implemented. The autospec coordinator that
+drains work, updates draft weights and invokes it across ranks is still outside
+this change. Target weights and the tap layout must remain fixed.
 
 ## Explicit opt-in for performance ablation
 
-The entire smaller draft path is gated by **`--enable-dflash-swa-cache`**, which
-defaults to `False`. It covers the separate draft SWA view, active GPU raw
-tails, and cached checkpoint raw tails. Native sliding-attention layers,
-unified memory, or HiCache alone must not select it.
+Both flags default off:
 
-The initial host-backed implementation requires both
-`--enable-unified-memory` and `--enable-hierarchical-cache`, with the DFLASH
-algorithm. Raw-tail host attachment now checks the opt-in and HiCache setting
-explicitly; previously it was controlled only by injecting the host pool.
-There is no implicit GPU-only fallback for cached raw tails without HiCache.
+| SWA flag | Tap flag | HiCache | Cached checkpoint context |
+| --- | --- | --- | --- |
+| Off | Off | Either | Existing path, subject to its own configuration restrictions |
+| On | Off | Off | Materialized draft KV on GPU |
+| On | Off | On | Materialized draft KV on host |
+| On | On | Off | Materialized draft KV and raw taps on GPU |
+| On | On | On | Materialized draft KV and raw taps on host |
 
-| New flag | HiCache | Behavior |
-| --- | --- | --- |
-| Omitted | Off or on | Existing draft storage path; no new raw-tail storage or transfers. |
-| Enabled | Off | Configuration error: this implementation requires host retention. |
-| Enabled | On | Selects the bounded draft view, raw GPU working set, and bounded host checkpoint pool, subject to model requirements. |
+`--enable-dflash-tap-cache` requires `--enable-dflash-swa-cache`. The SWA flag
+requires DFLASH, unified memory, a compatible Full + Mamba target with tracking
+buffers, an all-sliding draft and an explicit running-request limit. HiCache
+is optional. Factory selection checks the flag explicitly and fails if the
+worker does not receive the required bounded pool.
 
-If the flag reaches a DFlash worker without the separate draft pool, startup
-fails explicitly instead of silently running the baseline. Factory selection
-uses this opt-in; compatible models are not switched automatically.
-This feature currently selects Python TreeCore, while the ordinary path
-defaults to Rust. An isolated cache-policy comparison should select Python
-on both sides; the aggregate comparison below retains each path's default
-selection and includes that backend difference.
-
-The agreed throughput comparison uses **flag off with HiCache off** versus
-**flag on with HiCache on**, retaining unified memory on both. The old fused
-DFLASH + unified-Mamba placement rejects HiCache, so a strict one-flag toggle
-would not start. This is not a blocker for the requested aggregate tokens/s
-comparison. Step 10 records both configurations and a third control using the
-pre-optimization feature-on implementation. It measures the combined feature
-cost, including HiCache and TreeCore selection, rather than attributing the
-difference solely to raw tail transfers.
+The bounded path uses Python TreeCore. For isolated performance comparisons,
+select the same backend on both sides. The historical flag-on/off results
+below compared the earlier raw-tail/HiCache path against flag off without
+HiCache and with default TreeCore selection. Their old memory reserves and
+throughput figures do not describe the new deployment split. The new
+[deployment record](draft-swa-deployment-shapes.md) reports its memory costs;
+the subsequent [performance matrix](draft-swa-performance-matrix.md) measures
+the new shapes at fixed capacities with cold and warm-prefix workloads.
 
 ## Inspected model and scope
 

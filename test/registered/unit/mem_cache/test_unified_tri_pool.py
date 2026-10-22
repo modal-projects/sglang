@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -75,6 +76,35 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _DEV = "cpu"
+
+
+class _NoMambaHostReadback(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func in (
+            torch.ops.aten._local_scalar_dense.default,
+            torch.ops.aten.nonzero.default,
+        ):
+            raise AssertionError(f"Host readback in tracking-slot bookkeeping: {func}")
+        if func is torch.ops.aten.index.Tensor and any(
+            index is not None and index.dtype == torch.bool for index in args[1]
+        ):
+            raise AssertionError("Boolean indexing needs a host-visible output size")
+        return func(*args, **(kwargs or {}))
+
+
+class _NoPageableCountReadback(TorchDispatchMode):
+    """Boolean indexing reads its output size into pageable memory, which
+    waits behind every in-flight HiCache D2H copy on the device."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.nonzero.default or (
+            func is torch.ops.aten.index.Tensor
+            and any(
+                index is not None and index.dtype == torch.bool for index in args[1]
+            )
+        ):
+            raise AssertionError(f"Pageable count readback: {func}")
+        return func(*args, **(kwargs or {}))
 
 
 class TestUnifiedTriPool(unittest.TestCase):
@@ -963,7 +993,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         self.assertEqual(sa._hole_pages(), 0)
 
 
-class TestTriFactorySizing(unittest.TestCase):
+class TestTriFactorySizing(CustomTestCase):
     """Factory-level contracts: byte-budget sizing, the bs=1 feasibility
     floor, and the boot signature the GPU harness greps for (3 sub-pools,
     swa grow=float)."""
@@ -1042,6 +1072,9 @@ class TestTriFactorySizing(unittest.TestCase):
                             req_pool_idx=1,
                             mamba_pool_idx=live[0],
                             mamba_ping_pong_track_buffer=track,
+                            mamba_ping_pong_allocated=sum(
+                                1 << i for i, index in enumerate(ids) if index != -1
+                            ),
                         )
                     )
                     session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
@@ -1049,6 +1082,7 @@ class TestTriFactorySizing(unittest.TestCase):
                     self.assertEqual(kv_mamba_slots(slot.kv), count + 1)
                     session._free_slot_mamba(slot)
                     self.assertEqual(kv_mamba_slots(slot.kv), 0)
+                    self.assertEqual(slot.kv.mamba_ping_pong_allocated, 0)
                     self.assertEqual(allocator.available_size(), available)
                     session._free_slot_mamba(slot)
                     self.assertEqual(allocator.available_size(), available)
@@ -1172,7 +1206,7 @@ class TestTriFactorySizing(unittest.TestCase):
                             kv=SimpleNamespace(
                                 req_pool_idx=0,
                                 mamba_pool_idx=allocator.alloc(1)[0],
-                                dflash_feature_state=None,
+                                dflash_context_state=None,
                             )
                         )
                         pool._alloc_ping_pong_buffer(req)
@@ -1205,6 +1239,123 @@ class TestTriFactorySizing(unittest.TestCase):
                             )
                             allocator.free(retained)
                         self.assertEqual(allocator.available_size(), initial_available)
+
+    def test_lazy_tracking_cleanup_without_host_readbacks(self):
+        """Free every owned slot except the donated one, without GPU filtering."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        for overlap in (False, True):
+            size = 2 if overlap else 1
+            for mask in range(1 << size):
+                for keep in [None] + [i for i in range(size) if mask & (1 << i)]:
+                    with self.subTest(overlap=overlap, mask=mask, keep=keep):
+                        kw = self._factory_kwargs(
+                            enable_mamba_extra_buffer=True,
+                            enable_mamba_extra_buffer_lazy=True,
+                            disable_overlap_schedule=not overlap,
+                            lazy_compaction=True,
+                        )
+                        with get_parallel().override(attn_dcp_size=1):
+                            pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+                        allocator = pool.mamba_allocator
+                        available = allocator.available_size()
+                        req = SimpleNamespace(
+                            kv=ReqKvInfo(
+                                req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
+                            )
+                        )
+                        pool._alloc_ping_pong_buffer(req)
+                        buf = req.kv.mamba_ping_pong_track_buffer
+                        for i in range(size):
+                            allocated = bool(buf[i] != -1)
+                            if mask & (1 << i):
+                                if not allocated:
+                                    pool.set_mamba_ping_pong_slot(
+                                        req, i, allocator.alloc(1)[0]
+                                    )
+                            elif allocated:
+                                allocator.free(buf[i : i + 1].clone())
+                                pool.set_mamba_ping_pong_slot(req, i, -1)
+                        pool.req_index_to_mamba_ping_pong_track_buffer_mapping[0] = buf
+                        retained = (
+                            None if keep is None else buf[keep : keep + 1].clone()
+                        )
+
+                        with _NoMambaHostReadback():
+                            pool.free_mamba_cache(req, keep)
+                        self.assertEqual(
+                            allocator.available_size(),
+                            available - int(keep is not None),
+                        )
+                        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+                        self.assertEqual(req.kv.mamba_ping_pong_allocated, 0)
+                        if retained is not None:
+                            self.assertTrue(
+                                bool((allocator.translate(retained) >= 0).all())
+                            )
+                            allocator.free(retained)
+                        self.assertEqual(allocator.available_size(), available)
+
+    def test_lazy_pending_slot_ownership_before_confirmation(self):
+        """A pending crossing owns its slot before its result promotes it."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        kw = self._factory_kwargs(
+            enable_mamba_extra_buffer=True,
+            enable_mamba_extra_buffer_lazy=True,
+            disable_overlap_schedule=False,
+            lazy_compaction=True,
+        )
+        with get_parallel().override(attn_dcp_size=1):
+            pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+        req = SimpleNamespace(
+            kv=ReqKvInfo(
+                req_pool_idx=0,
+                mamba_pool_idx=pool.mamba_allocator.alloc(1)[0],
+                kv_committed_len=63,
+            ),
+            finished=lambda: False,
+        )
+        pool._alloc_ping_pong_buffer(req)
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping[0] = (
+            req.kv.mamba_ping_pong_track_buffer
+        )
+        batch = ScheduleBatch(reqs=[req], req_to_token_pool=pool)
+        initial_available = pool.mamba_allocator.available_size()
+        with (
+            patch.object(pool.mamba_allocator, "alloc", return_value=None),
+            _NoMambaHostReadback(),
+        ):
+            batch.mamba_lazy_spec_prepare(64, 16)
+        self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [0])
+        self.assertEqual(pool.mamba_allocator.available_size(), initial_available)
+
+        with _NoMambaHostReadback():
+            batch.mamba_lazy_spec_prepare(64, 16)
+        pending = batch.mamba_lazy_spec_track_positions_cpu[0]
+        self.assertNotEqual(pending, req.kv.mamba_next_track_idx)
+        available = pool.mamba_allocator.available_size()
+        with _NoMambaHostReadback():
+            batch.mamba_lazy_spec_prepare(64, 16)
+        self.assertEqual(pool.mamba_allocator.available_size(), available)
+        with _NoMambaHostReadback():
+            SchedulerBatchResultProcessor._mamba_lazy_spec_update(
+                None, req, batch, 0, True, 64
+            )
+        self.assertEqual(req.kv.mamba_next_track_idx, pending)
+        self.assertEqual(pool.mamba_allocator.available_size(), available + 1)
+        with _NoMambaHostReadback():
+            batch.mamba_lazy_spec_prepare(64, 16)
+            SchedulerBatchResultProcessor._mamba_lazy_spec_update(
+                None, req, batch, 0, False, 0
+            )
+        self.assertEqual(req.kv.mamba_next_track_idx, pending)
+        self.assertEqual(pool.mamba_allocator.available_size(), available)
+        with _NoMambaHostReadback():
+            pool.free_mamba_cache(req)
 
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -1500,7 +1651,10 @@ class TestDraftSWAFactory(CustomTestCase):
 
         from sglang.srt.managers.schedule_batch import ReqKvInfo
         from sglang.srt.speculative.dflash_cache import DFlashCacheResidency
-        from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureState
+        from sglang.srt.speculative.dflash_feature_tail import (
+            DFlashContextState,
+            DFlashContextWindow,
+        )
         from sglang.test.kernels.dflash_window import (
             dflash_unbound_full_pages_reference,
             dflash_update_window_reference,
@@ -1547,14 +1701,29 @@ class TestDraftSWAFactory(CustomTestCase):
                 table.req_to_token[0, :64] = ids
                 table.req_to_token[1, :64] = ids
                 a, b = (SimpleNamespace(kv=ReqKvInfo(req_pool_idx=i)) for i in (0, 1))
-                for req in (a, b):
-                    req.kv.dflash_feature_state = DFlashFeatureState(8)
+                for req, start in zip((a, b), (40, 88)):
+                    # Each live tail holds prompt rows [40, 48); b's are distinct.
+                    req.kv.dflash_context_state = DFlashContextState.from_tail(
+                        DFlashContextWindow(
+                            40, (torch.arange(start, start + 8).float()[:, None],)
+                        ),
+                        8,
+                    )
+                alloc.dflash_checkpoint_pool = SimpleNamespace(revision=0)
                 cache = DFlashCacheResidency(alloc, table, window_size=8)
 
-                def materialize(*, target_hidden, cache_loc, positions):
+                def restore(*, tail, cache_loc, positions):
+                    if tail.revision != alloc.dflash_checkpoint_pool.revision:
+                        tail = DFlashContextWindow(
+                            tail.start_pos,
+                            (tail.as_tensor() + 1000,),
+                            alloc.dflash_checkpoint_pool.revision,
+                        )
+                    target_hidden = tail.as_tensor()[positions - tail.start_pos]
                     draft.get_key_buffer(2)[cache_loc] = target_hidden[
                         :, :1, None
                     ].bfloat16()
+                    return tail
 
                 batch = SimpleNamespace(
                     reqs=[a, b],
@@ -1562,7 +1731,7 @@ class TestDraftSWAFactory(CustomTestCase):
                     extend_lens=[48, 48],
                     seq_lens=torch.tensor([48, 48]),
                 )
-                cache.prepare(batch, materialize=materialize)
+                cache.prepare(batch, restore=restore)
                 reserved = 2 * ((8 + 2 * page_size - 2) // page_size) * page_size
                 self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
                 # The windows share their eight materialized tokens. Additional
@@ -1575,19 +1744,16 @@ class TestDraftSWAFactory(CustomTestCase):
                 )
                 capture = SimpleNamespace(
                     entries=[
-                        SimpleNamespace(
-                            owner=req.kv.dflash_feature_state,
-                            slices=[
-                                (40, torch.arange(start, start + 8).float()[:, None])
-                            ],
-                        )
-                        for req, start in zip((a, b), (40, 88))
+                        SimpleNamespace(owner=req.kv.dflash_context_state)
+                        for req in (a, b)
                     ]
                 )
                 cache.retain_prefill(batch, capture)
+                # The tree insert adopts canonical pages and records the rows.
                 canonical = alloc.alloc(8)
                 table.req_to_token[1, 40:48] = canonical
-                cache.prepare(batch, materialize=materialize)
+                b.kv.dflash_context_state.note_canonical_remap(40, 48)
+                cache.prepare(batch, restore=restore)
                 self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
                 values = draft.get_key_buffer(2)[
                     alloc.translate_loc_from_full_to_swa(canonical)
@@ -1595,12 +1761,24 @@ class TestDraftSWAFactory(CustomTestCase):
                 torch.testing.assert_close(
                     values[:, 0, 0].float(), torch.arange(88, 96).float()
                 )
+                old_window = b.kv.dflash_context_state.snapshot()
+                alloc.dflash_checkpoint_pool.revision += 1
+                cache.prepare(batch, restore=restore)
+                for req in (a, b):
+                    self.assertEqual(req.kv.dflash_context_state.revision, 1)
+                torch.testing.assert_close(
+                    old_window.as_tensor()[:, 0], torch.arange(88, 96).float()
+                )
+                torch.testing.assert_close(
+                    b.kv.dflash_context_state.snapshot().as_tensor()[:, 0],
+                    torch.arange(1088, 1096).float(),
+                )
                 a.kv.req_pool_idx = None
                 batch.reqs = [b]
                 batch.prefix_lens = [48]
                 batch.extend_lens = [16]
                 batch.seq_lens = torch.tensor([64])
-                cache.prepare(batch, materialize=materialize)
+                cache.prepare(batch, restore=restore)
                 # Retired bindings remain reusable within the fixed window cap.
                 self.assertEqual(alloc.swa_attn_allocator.allocated_count(), reserved)
                 self.assertEqual(alloc.full_attn_allocator.allocated_count(), 72)
@@ -1617,7 +1795,7 @@ class TestDraftSWAFactory(CustomTestCase):
                         batch,
                         prefix_lens=torch.tensor([prefix]),
                         block_size=2,
-                        materialize=materialize,
+                        restore=restore,
                     )
                     window = table.req_to_token[1, prefix - 8 : prefix + 2]
                     self.assertTrue(
@@ -1633,15 +1811,38 @@ class TestDraftSWAFactory(CustomTestCase):
                     )
                     self.assertEqual(alloc.verify_byte_accounting(), [])
                 self.assertEqual(alloc.swa_attn_allocator.allocated_count(), limit)
-                alloc.free_group_begin()
-                alloc.free_segment(ids, start_pos=0)
-                alloc.free_segment(canonical, start_pos=40)
-                alloc.free_segment(future, start_pos=64)
-                self.assertTrue(alloc.evict_to_free_tokens(None, 128))
-                alloc.free_group_end()
+                # Releasing pages with draft bindings runs during result
+                # processing, right after donations queue their host copies.
+                with _NoPageableCountReadback():
+                    alloc.free_group_begin()
+                    alloc.free_segment(ids, start_pos=0)
+                    alloc.free_segment(canonical, start_pos=40)
+                    alloc.free_segment(future, start_pos=64)
+                    self.assertTrue(alloc.evict_to_free_tokens(None, 128))
+                    alloc.free_group_end()
                 self.assertEqual(alloc.full_attn_allocator.allocated_count(), 0)
-                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), 0)
+                # Draft bindings outlive the freed target pages as spares, and
+                # the next window reuses them without growing the reservation.
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), limit)
                 self.assertEqual(alloc.verify_byte_accounting(), [])
+                b.kv.req_pool_idx = None
+                c = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
+                fresh = alloc.alloc(16)
+                table.req_to_token[0, :16] = fresh
+                batch.reqs = [c]
+                batch.seq_lens = torch.tensor([16])
+                cache.prepare(batch, restore=restore)
+                self.assertTrue(
+                    (
+                        alloc.swa_attn_allocator.virtual_to_physical[
+                            table.req_to_token[0, 8:16] // page_size
+                        ]
+                        > 0
+                    ).all()
+                )
+                self.assertEqual(alloc.swa_attn_allocator.allocated_count(), limit)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+                alloc.free(fresh)
                 states = table.mamba_allocator.alloc(4)
                 self.assertIsNotNone(states)
                 self.assertIsNone(table.mamba_allocator.alloc(1))
@@ -1855,18 +2056,22 @@ class TestDraftSWAFactory(CustomTestCase):
         )
         return cfg
 
-    def test_draft_binding_requires_opt_in_and_hicache(self):
+    def test_draft_binding_requires_opt_in_and_supports_gpu_only(self):
         bundle = init_unified_mamba_swa_pools(**self._factory_kwargs(page_size=4))
-        for scope in (
-            get_spec().override(enable_dflash_swa_cache=False),
-            get_memory().override(enable_hierarchical_cache=False),
-        ):
-            with scope, self.assertRaisesRegex(ValueError, "--enable-dflash-swa-cache"):
+        with get_spec().override(enable_dflash_swa_cache=False):
+            with self.assertRaisesRegex(ValueError, "--enable-dflash-swa-cache"):
                 self._draft_configurator(page_size=4)._init_pools(
                     sizes=None,
                     req_to_token_pool=bundle.req_to_token_pool,
                     token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
                 )
+        with get_memory().override(enable_hierarchical_cache=False):
+            pools = self._draft_configurator(page_size=4)._init_pools(
+                sizes=None,
+                req_to_token_pool=bundle.req_to_token_pool,
+                token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
+            )
+            self.assertIs(pools.token_to_kv_pool, bundle.draft_token_to_kv_pool)
 
     def test_draft_binding_and_shared_plan_use_swa_physical_ids(self):
         for page_size in (1, 4):

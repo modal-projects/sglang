@@ -352,6 +352,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
+            dflash_cache_sizing=None,
             fused_entry_bytes=lambda name: (
                 fused_state_entry if name == "mamba" else None
             ),
@@ -413,7 +414,15 @@ class TestPPMambaPoolSizing(unittest.TestCase):
 
 class TestExtraMambaCacheSizing(unittest.TestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes,
+        *,
+        pp_size=1,
+        dp_size=1,
+        draft_tokens=None,
+        checkpoint_bytes=0,
+        **schedule,
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -425,6 +434,11 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            dflash_cache_sizing=SimpleNamespace(
+                checkpoint_window_bytes=checkpoint_bytes
+            )
+            if checkpoint_bytes
+            else None,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
@@ -444,6 +458,22 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         with rc.get_context().override_server_args(**args):
             remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
+
+    def test_gpu_checkpoint_windows_share_the_state_capacity_budget(self):
+        self.assertEqual(self._size(0, checkpoint_bytes=4 << 20), (4, 84 << 20))
+        self.assertEqual(
+            self._size(0, checkpoint_bytes=4 << 20, max_mamba_cache_size=8),
+            (8, 52 << 20),
+        )
+        self.assertEqual(
+            self._size(
+                0,
+                checkpoint_bytes=4 << 20,
+                max_mamba_cache_size=8,
+                enable_hierarchical_cache=True,
+            ),
+            (8, 84 << 20),
+        )
 
     def test_auto_capacity_reserves_backend_state(self):
         self.assertEqual(self._size(0), (9, 80 << 20))

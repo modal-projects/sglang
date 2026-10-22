@@ -54,7 +54,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                     ServerArgs.from_cli_args(args).enable_dflash_swa_cache, expected
                 )
 
-    def test_dflash_swa_cache_validates_algorithm_and_host_storage(self):
+    def test_dflash_cache_flags_validate_dependencies(self):
         kwargs = dict(
             model_path="dummy",
             device="cuda",
@@ -76,11 +76,27 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             args = ServerArgs(**kwargs)
             handle_speculative_decoding(args)
             self.assertEqual(resolution_result(args, "speculative_algorithm"), "DFLASH")
+            for hicache in (False, True):
+                for taps in (False, True):
+                    handle_speculative_decoding(
+                        ServerArgs(
+                            **(
+                                kwargs
+                                | {
+                                    "enable_hierarchical_cache": hicache,
+                                    "enable_dflash_tap_cache": taps,
+                                }
+                            )
+                        )
+                    )
             for overrides, error in (
                 ({"speculative_algorithm": None}, "--speculative-algorithm DFLASH"),
                 ({"speculative_algorithm": "EAGLE3"}, "--speculative-algorithm DFLASH"),
                 ({"enable_unified_memory": False}, "--enable-unified-memory"),
-                ({"enable_hierarchical_cache": False}, "--enable-hierarchical-cache"),
+                (
+                    {"enable_dflash_swa_cache": False, "enable_dflash_tap_cache": True},
+                    "--enable-dflash-swa-cache",
+                ),
             ):
                 with (
                     self.subTest(overrides=overrides),

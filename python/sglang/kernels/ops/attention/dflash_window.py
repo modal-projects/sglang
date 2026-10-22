@@ -361,34 +361,6 @@ def _dflash_rebind_pages(
     tl.store(Held + offsets, new, reuse)
 
 
-@triton.jit(do_not_specialize=["Epoch", "NUM_PAGES", "NUM_HELD"])
-def _dflash_update_window_pages_kernel(
-    Pages,
-    Held,
-    VirtualToPhysical,
-    PhysicalToVirtual,
-    Epochs,
-    Missing,
-    Epoch,
-    NUM_PAGES,
-    NUM_HELD,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.arange(0, BLOCK)
-    pages = tl.load(Pages + offsets, offsets < NUM_PAGES, other=0)
-    _dflash_rebind_pages(
-        pages,
-        Held,
-        VirtualToPhysical,
-        PhysicalToVirtual,
-        Epochs,
-        Missing,
-        Epoch,
-        NUM_HELD,
-        BLOCK,
-    )
-
-
 # Counts and the epoch change during serving; alignment specialization would
 # compile new variants in the decode loop without improving this gather.
 @triton.jit(do_not_specialize=["Epoch", "NUM_WINDOWS", "NUM_HELD"])
@@ -523,26 +495,9 @@ def dflash_update_window_pages(
     possible unique nonzero pages in ``pages``. Epochs obey the page-planner
     contract. Only bindings change; physical ownership and contents stay put.
     """
-    block = triton.next_power_of_2(max(pages.numel(), held.numel()))
-    if block <= 4096:
-        missing = torch.empty_like(pages)
-        _dflash_update_window_pages_kernel[(1,)](
-            pages,
-            held,
-            virtual_to_physical,
-            physical_to_virtual,
-            page_epochs,
-            missing,
-            epoch,
-            pages.numel(),
-            held.numel(),
-            block,
-        )
-    else:
-        # Large page-count geometries use the same protocol across CTAs.
-        _, missing, retired, counts = dflash_window_page_changes(
-            pages, held, virtual_to_physical, page_epochs, epoch
-        )
-        dflash_recycle_window_pages(
-            held, missing, retired, counts, virtual_to_physical, physical_to_virtual
-        )
+    _, missing, retired, counts = dflash_window_page_changes(
+        pages, held, virtual_to_physical, page_epochs, epoch
+    )
+    dflash_recycle_window_pages(
+        held, missing, retired, counts, virtual_to_physical, physical_to_virtual
+    )

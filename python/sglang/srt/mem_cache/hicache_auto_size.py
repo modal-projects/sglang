@@ -105,14 +105,14 @@ def auto_size_hicache(
         if get_spec().enable_dflash_swa_cache
         else None
     )
-    raw_bytes = (
+    checkpoint_bytes = (
         0
         if sizing is None
-        else get_schedule().max_mamba_cache_size * sizing.raw_window_bytes
+        else get_schedule().max_mamba_cache_size * sizing.checkpoint_window_bytes
     )
     ratio = min(
         requested,
-        (budget - raw_bytes) * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes,
+        (budget - checkpoint_bytes) * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes,
     )
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.

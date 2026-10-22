@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.speculative.dflash_cache import DFlashCacheSizing
-from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureCapture
+from sglang.srt.speculative.dflash_feature_tail import DFlashContextCapture
 
 
 def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
@@ -41,7 +41,7 @@ def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
         for i in range(len(batch)):
             values = ((rows[:window] + 13 * (offset + i)) % 127).to(dtype)
             source[i * window : (i + 1) * window].copy_(values[:, None])
-        capture = DFlashFeatureCapture.prefill(
+        capture = DFlashContextCapture.prefill(
             reqs=batch,
             target_hidden=source[: len(batch) * window],
             prefix_lens=[0] * len(batch),
@@ -58,7 +58,7 @@ def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
                 ((rows[start : start + block] + 13 * i) % 127).to(dtype)[:, None]
             )
         checkpoint = start + block == window + gap
-        capture = DFlashFeatureCapture.decode(
+        capture = DFlashContextCapture.decode(
             reqs=reqs,
             target_hidden=verify,
             start_positions=torch.full((requests,), start, device=device),
@@ -78,9 +78,9 @@ def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
 
     tails = [
         (
-            req.kv.dflash_feature_state.checkpoint(0, window),
-            req.kv.dflash_feature_state.checkpoint(1, window + gap),
-            req.kv.dflash_feature_state.snapshot(),
+            req.kv.dflash_context_state.checkpoint(0, window),
+            req.kv.dflash_context_state.checkpoint(1, window + gap),
+            req.kv.dflash_context_state.snapshot(),
         )
         for req in reqs
     ]
@@ -107,8 +107,9 @@ def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
         page_size=64,
         prefill_tokens=prefill_tokens,
         overlap=True,
+        tap_cache=True,
     )
-    assert peak <= sizing.raw_gpu_reserve_bytes
+    assert peak <= sizing.context_gpu_reserve_bytes
     for i, windows in enumerate(tails):
         for tail in windows:
             pos = tail.start_pos
@@ -132,9 +133,9 @@ def measure(requests=32, window=2048, width=12288, prefill_tokens=4096):
         * dtype.itemsize,
         "observed_allocation_bytes_above_sources": observed,
         "observed_peak_bytes_above_sources": peak,
-        "admission_reserve_bytes": sizing.raw_gpu_reserve_bytes,
+        "context_admission_reserve_bytes": sizing.context_gpu_reserve_bytes,
         "exact_row_checks": True,
-        "scope": "Raw-feature lifecycle on one CUDA stream; sources excluded. Not a model-serving peak measurement.",
+        "scope": "Raw-feature lifecycle on one CUDA stream; sources excluded. Admission reserve also includes materialized KV. Not a model-serving peak measurement.",
     }
 
 

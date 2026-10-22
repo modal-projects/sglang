@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import (
+    async_h2d,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_hip,
@@ -155,7 +156,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
-    from sglang.srt.speculative.dflash_feature_tail import DFlashFeatureState
+    from sglang.srt.speculative.dflash_feature_tail import DFlashContextState
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -997,6 +998,8 @@ class ReqKvInfo:
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    # CPU ownership bits; device slot indices are consumed by model kernels.
+    mamba_ping_pong_allocated: int = 0
     mamba_next_track_idx: Optional[int] = None  # 0 or 1
     mamba_last_track_idx: Optional[int] = None  # 0 or 1
     # Seq len of the last cached mamba state
@@ -1008,7 +1011,7 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
-    dflash_feature_state: Optional[DFlashFeatureState] = None
+    dflash_context_state: Optional[DFlashContextState] = None
 
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
@@ -1047,9 +1050,9 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
-        if self.dflash_feature_state is not None:
-            self.dflash_feature_state.close()
-            self.dflash_feature_state = None
+        if self.dflash_context_state is not None:
+            self.dflash_context_state.close()
+            self.dflash_context_state = None
 
 
 class Req(ReqDllmMixin):
@@ -2093,6 +2096,7 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_ping_pong_allocated = 0
         self.kv.mamba_next_track_idx = None
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
@@ -2287,7 +2291,8 @@ class Req(ReqDllmMixin):
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
-    track_index: int
+    # 0-d device view of the tracking slot; reading it on the host would sync.
+    track_index: torch.Tensor
     track_seqlen: int
     checkpoint: Optional[Tuple[int, int]]
 
@@ -2925,7 +2930,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
         mamba_track_mask_cpu = []
-        mamba_track_indices_cpu = []
+        mamba_track_index_views = []
         mamba_track_seqlens_cpu = []
         mamba_prefill_checkpoints = []
 
@@ -2999,7 +3004,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if get_exec().mamba.enable_mamba_extra_buffer:
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
-                mamba_track_indices_cpu.append(track_entry.track_index)
+                mamba_track_index_views.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
                 mamba_prefill_checkpoints.append(track_entry.checkpoint)
 
@@ -3108,20 +3113,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
             self.mamba_prefill_checkpoints = mamba_prefill_checkpoints
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
+            self.mamba_track_indices = torch.stack(mamba_track_index_views).to(
+                torch.int64
             )
-            self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
+            self.mamba_track_mask = async_h2d(
+                mamba_track_mask_cpu, dtype=torch.bool, device=self.device
             )
-            self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
+            self.mamba_track_seqlens = async_h2d(
+                mamba_track_seqlens_cpu, dtype=torch.int64, device=self.device
             )
 
         # Collect mamba init info for deferred ops on forward stream
@@ -3184,9 +3183,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        track_index = req.kv.mamba_ping_pong_track_buffer[req.kv.mamba_next_track_idx]
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -3615,7 +3612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            if buf[other_idx].item() != -1:
+            if bool(req.kv.mamba_ping_pong_allocated & (1 << other_idx)):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
@@ -3656,7 +3653,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions.append(req.kv.mamba_next_track_idx)
                 continue
             other_idx = 1 - req.kv.mamba_next_track_idx
-            has_pending = buf[other_idx].item() != -1
+            has_pending = bool(req.kv.mamba_ping_pong_allocated & (1 << other_idx))
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
                     new_slot = None

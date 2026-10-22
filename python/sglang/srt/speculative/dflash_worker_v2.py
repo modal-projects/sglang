@@ -57,8 +57,9 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_feature_tail import (
-    DFlashFeatureCapture,
-    DFlashFeatureState,
+    DFlashContextCapture,
+    DFlashContextState,
+    DFlashContextWindow,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -109,6 +110,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils.common import async_h2d
 
 _is_npu = is_npu()
 
@@ -400,7 +402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
-        self._feature_tail_window: Optional[int] = None
+        self._context_window: Optional[int] = None
         self._draft_cache = None
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
@@ -687,11 +689,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise ValueError(
                     "Draft feature capture requires CUDA/HIP and Mamba tracking buffers"
                 )
-            self._feature_tail_window = int(self.draft_model.config.sliding_window)
+            self._context_window = int(self.draft_model.config.sliding_window)
+            self._context_layout = (
+                token_to_kv_pool_allocator.dflash_cache_sizing.context_layout
+            )
             from sglang.srt.speculative.dflash_cache import DFlashCacheResidency
 
             self._draft_cache = DFlashCacheResidency(
-                token_to_kv_pool_allocator, req_to_token_pool, self._feature_tail_window
+                token_to_kv_pool_allocator, req_to_token_pool, self._context_window
             )
 
     def init_attention_backends(self):
@@ -2026,8 +2031,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        write_layer_kv=None,
     ) -> None:
-        for layer in self.draft_model.layers:
+        for layer_idx, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
@@ -2043,6 +2049,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            if write_layer_kv is not None:
+                write_layer_kv(layer_idx, k, v)
+                continue
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 KVWriteLoc(ctx_cache_loc, physical=True),
@@ -2059,6 +2068,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        write_layer_kv=None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
@@ -2094,8 +2104,153 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
-            write_layer_kv=_write_layer_kv,
+            write_layer_kv=write_layer_kv or _write_layer_kv,
         )
+
+    def _project_context_rows(
+        self,
+        target_hidden,
+        positions,
+        *,
+        cache_loc=None,
+        cache_write_rows=None,
+        cache_loc_2d=None,
+        commit_lens=None,
+        extend_lens=None,
+    ) -> torch.Tensor:
+        """Project new rows once, saving checkpoint KV and writing active KV."""
+        layout = self._context_layout
+        projected = []
+
+        def pack_rows():
+            if layout.feature_size:
+                projected.append(target_hidden.view(torch.uint8))
+            return torch.cat(projected, dim=1)
+
+        with torch.inference_mode(), draft_tp_context(self.draft_owns_attention):
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if self.lilicorr is not None and (
+                extend_lens is not None or commit_lens is not None
+            ):
+                self._lilicorr_anchor = publish_anchor(
+                    draft_sampler=self._draft_sampler,
+                    ctx_hidden=ctx_hidden,
+                    extend_lens=extend_lens,
+                    commit_lens=commit_lens,
+                )
+
+            def write_layer(layer_idx, k, v):
+                shape = (target_hidden.shape[0], layout.kv_heads, layout.head_dim)
+                k, v = k.reshape(shape), v.reshape(shape)
+                # Match the unquantized pool's conversion before saving bytes;
+                # restored rows already have the pool dtype and must not rescale.
+                if k.dtype != layout.kv_dtype:
+                    attn = self.draft_model.layers[layer_idx].self_attn.attn
+                    k = (k / attn.k_scale if attn.k_scale is not None else k).to(
+                        layout.kv_dtype
+                    )
+                    v = (v / attn.v_scale if attn.v_scale is not None else v).to(
+                        layout.kv_dtype
+                    )
+                projected.extend(t.flatten(1).view(torch.uint8) for t in (k, v))
+                if cache_loc is None:
+                    return
+                loc = cache_loc
+                if cache_write_rows is not None:
+                    loc, k, v = (
+                        loc[cache_write_rows],
+                        k[cache_write_rows],
+                        v[cache_write_rows],
+                    )
+                self._write_context_layer(
+                    layer_idx,
+                    k,
+                    v,
+                    loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden,
+                        positions,
+                        cache_loc,
+                        write_layer_kv=write_layer,
+                    )
+                    return pack_rows()
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH checkpoint projection falling back to per-layer KV: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                    projected.clear()
+            self._append_target_hidden_sequential(
+                ctx_hidden,
+                positions,
+                cache_loc,
+                write_layer_kv=write_layer,
+            )
+        return pack_rows()
+
+    def _write_context_layer(
+        self, layer_idx, k, v, cache_loc, *, cache_loc_2d=None, commit_lens=None
+    ):
+        attn = self.draft_model.layers[layer_idx].self_attn.attn
+        pool = self.draft_model_runner.token_to_kv_pool
+        if cache_loc_2d is not None:
+            pool.set_kv_buffer_prefix_valid(
+                attn,
+                KVWriteLoc(cache_loc_2d, physical=True),
+                commit_lens,
+                k,
+                v,
+                attn.k_scale,
+                attn.v_scale,
+            )
+        else:
+            pool.set_kv_buffer(
+                attn,
+                KVWriteLoc(cache_loc, physical=True),
+                k,
+                v,
+                attn.k_scale,
+                attn.v_scale,
+            )
+
+    def _restore_context_window(self, tail, cache_loc, positions):
+        """Prefer saved KV; only stale revisions need raw-feature projection."""
+        pool = self._draft_cache.allocator.dflash_checkpoint_pool
+        rows = tail.as_tensor()
+        if tail.revision != pool.revision:
+            rows = self._project_context_rows(
+                self._context_layout.features(rows),
+                torch.arange(tail.start_pos, tail.end_pos, device=rows.device),
+            )
+            tail = DFlashContextWindow(tail.start_pos, (rows,), pool.revision)
+        if positions.numel():
+            selected = rows[positions - tail.start_pos]
+            for i in range(self._context_layout.num_layers):
+                k, v = self._context_layout.kv(selected, i)
+                self._write_context_layer(i, k, v, cache_loc)
+        return tail
+
+    def invalidate_draft_context(self) -> None:
+        """Invalidate projected KV after a drained, compatible draft weight update.
+
+        The caller owns the update barrier and keeps target weights/taps fixed.
+        Cached checkpoints and active windows rebuild lazily from retained taps.
+        """
+        if self._draft_cache is None:
+            raise ValueError(
+                "Draft context invalidation requires --enable-dflash-swa-cache"
+            )
+        self._draft_cache.allocator.dflash_checkpoint_pool.invalidate_materialized()
+        if self._use_fused_kv_materialize:
+            self._init_fused_kv_helper()
 
     def _update_target_mamba_state_after_verify(
         self,
@@ -2341,13 +2496,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
 
-    def _restore_cached_features(self, batch: ScheduleBatch) -> None:
+    def _restore_cached_context(self, batch: ScheduleBatch) -> None:
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-        pool = batch.tree_cache.dflash_feature_tail_host_pool
+        pool = batch.tree_cache.dflash_checkpoint_pool
         if pool is None:
             return
-        window = self._feature_tail_window
+        window = self._context_window
         if pool.window_size != window:
             raise ValueError("Draft and checkpoint feature windows differ")
         checkpoints = batch.mamba_prefill_checkpoints or [None] * len(batch.reqs)
@@ -2360,24 +2515,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 strict=True,
             )
         ):
-            if prefix == 0 or req.kv.dflash_feature_state is not None:
+            if prefix == 0 or req.kv.dflash_context_state is not None:
                 continue
             if length >= window and (
                 checkpoint is None or checkpoint[1] - prefix >= window
             ):
                 # The new target forward supplies every row needed by both tails.
                 continue
-            tail = batch.tree_cache.components[
+            handle = batch.tree_cache.components[
                 ComponentType.MAMBA
-            ].restore_dflash_features(req.best_match_node, prefix)
-            req.kv.dflash_feature_state = DFlashFeatureState.from_tail(tail, window)
-            if length >= window:
-                continue
-            # Rebuild historical draft context before appending the new prompt.
-            # The target prefix and its recurrent COW/load path are unchanged.
-            start = tail.start_pos
-            if getattr(self, "_draft_cache", None) is not None:
-                start = max(start, prefix + length - window)
+            ].get_dflash_checkpoint(req.best_match_node, prefix)
+            tail = pool.restore(handle)
+            start = min(tail.end_pos, max(tail.start_pos, prefix + length - window))
             virtual = batch.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, start : tail.end_pos
             ]
@@ -2389,11 +2538,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu=torch.tensor([prefix], dtype=torch.int64),
                 write_virtual=virtual,
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=tail.as_tensor()[start - tail.start_pos :],
+            tail = self._restore_context_window(
+                tail=tail,
                 cache_loc=self._draft_write_ids(plan),
                 positions=torch.arange(start, tail.end_pos, device=virtual.device),
             )
+            if handle.revision != tail.revision:
+                pool.refresh(handle, tail)
+            req.kv.dflash_context_state = DFlashContextState.from_tail(tail, window)
 
     def _make_next_draft_input_decode(
         self,
@@ -2443,12 +2595,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Target prefill uses Full KV only. Prepare the independent draft
             # bindings after enqueueing it, before the plan first translates SWA.
-            if self._feature_tail_window is not None:
+            if self._context_window is not None:
                 if getattr(self, "_draft_cache", None) is not None:
                     self._draft_cache.prepare(
-                        batch, materialize=self._append_target_hidden_to_draft_kv_by_loc
+                        batch, restore=self._restore_context_window
                     )
-                self._restore_cached_features(batch)
+                self._restore_cached_context(batch)
 
             if logits_output.hidden_states is None:
                 raise RuntimeError(
@@ -2465,8 +2617,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
+            # Pageable uploads would block here until the enqueued target prefill finishes.
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
                 batch.prefix_lens, dtype=torch.int32, device=device
             )
 
@@ -2483,26 +2636,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The draft KV goes to the slots the target prefill just wrote.
             hidden = logits_output.hidden_states
             cache_loc = self._draft_write_ids(kv_loc_plan)
-            if getattr(self, "_draft_cache", None) is not None and any(
-                length > self._feature_tail_window for length in batch.extend_lens
-            ):
-                offset = 0
-                tails = []
-                for length in batch.extend_lens:
-                    tails.append(
-                        torch.arange(
-                            offset + max(0, length - self._feature_tail_window),
-                            offset + length,
-                            device=device,
-                        )
+            if self._context_window is not None:
+
+                def materialize(rows, live_rows, selected_lens):
+                    return self._project_context_rows(
+                        hidden[rows],
+                        positions[rows],
+                        cache_loc=cache_loc[rows],
+                        cache_write_rows=live_rows,
+                        extend_lens=async_h2d(
+                            selected_lens, dtype=torch.int32, device=device
+                        ),
                     )
-                    offset += length
-                rows = torch.cat(tails)
-                self._append_target_hidden_to_draft_kv_by_loc(
-                    target_hidden=hidden[rows],
-                    cache_loc=cache_loc[rows],
-                    positions=positions[rows],
-                    extend_lens=ctx_lens.clamp(max=self._feature_tail_window),
+
+                batch_output.dflash_context_capture = DFlashContextCapture.prefill(
+                    reqs=batch.reqs,
+                    target_hidden=hidden,
+                    prefix_lens=batch.prefix_lens,
+                    extend_lens=batch.extend_lens,
+                    checkpoints=batch.mamba_prefill_checkpoints,
+                    window_size=self._context_window,
+                    materialize=materialize,
+                    revision=batch.tree_cache.dflash_checkpoint_pool.revision,
+                )
+                self._draft_cache.retain_prefill(
+                    batch, batch_output.dflash_context_capture
                 )
             else:
                 self._append_target_hidden_to_draft_kv_by_loc(
@@ -2511,19 +2669,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     positions=positions,
                     extend_lens=ctx_lens,
                 )
-            if self._feature_tail_window is not None:
-                batch_output.dflash_feature_capture = DFlashFeatureCapture.prefill(
-                    reqs=batch.reqs,
-                    target_hidden=logits_output.hidden_states,
-                    prefix_lens=batch.prefix_lens,
-                    extend_lens=batch.extend_lens,
-                    checkpoints=batch.mamba_prefill_checkpoints,
-                    window_size=self._feature_tail_window,
-                )
-                if getattr(self, "_draft_cache", None) is not None:
-                    self._draft_cache.retain_prefill(
-                        batch, batch_output.dflash_feature_capture
-                    )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -2629,7 +2774,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 prefix_lens=prefix_lens,
                 block_size=block_size,
-                materialize=self._append_target_hidden_to_draft_kv_by_loc,
+                restore=self._restore_context_window,
             )
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
@@ -3095,29 +3240,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
-        feature_capture = None
-        if self._feature_tail_window is not None:
-            feature_capture = DFlashFeatureCapture.decode(
+        context_capture = None
+        cache_loc = self._draft_write_ids(kv_loc_plan)
+        if self._context_window is not None:
+            rows = self._project_context_rows(
+                hidden.reshape(-1, hidden.shape[-1]),
+                positions,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+                commit_lens=commit_lens,
+            )
+            context_capture = DFlashContextCapture.decode(
                 reqs=batch.reqs,
-                target_hidden=hidden,
+                target_hidden=rows.view(bs, int(self.block_size), -1),
                 start_positions=prefix_lens,
                 commit_lens=commit_lens,
                 checkpoint_steps=mamba_checkpoint_steps,
                 checkpoint_indices=batch.mamba_track_indices,
                 checkpoint_slots=batch.mamba_track_buffer_indices,
-                window_size=self._feature_tail_window,
+                window_size=self._context_window,
+                revision=batch.tree_cache.dflash_checkpoint_pool.revision,
             )
-
-        # Consume in this step: every decode graph size shares one aux output,
-        # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(kv_loc_plan)
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=cache_loc,
-            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        else:
+            # Consume before the next target forward reuses its graph output.
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -3130,7 +3282,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
-            dflash_feature_capture=feature_capture,
+            dflash_context_capture=context_capture,
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,

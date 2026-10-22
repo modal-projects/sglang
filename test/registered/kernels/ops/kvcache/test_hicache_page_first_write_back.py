@@ -17,6 +17,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
     transfer_hicache_all_layer_mla_staged_lf_page_unified,
     transfer_hicache_all_layer_staged_lf_page_unified,
+    transfer_hicache_all_layer_staged_lf_pf,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -303,6 +304,57 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+@pytest.mark.parametrize("page_count", [1, 5])
+def test_page_first_staged_write_back_strided_source(page_count: int) -> None:
+    """Token-major device entries (the unified pool) space one layer's rows by
+    the whole entry, not the element; the staged gather must follow that."""
+    element_dim = 128
+    num_tokens = PAGE_SIZE * (page_count + 4)
+    entries = torch.empty(
+        num_tokens, NUM_LAYERS, 2, element_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    _fill_with_offset(entries, 0)
+    k_layers = [entries[:, layer, 0] for layer in range(NUM_LAYERS)]
+    v_layers = [entries[:, layer, 1] for layer in range(NUM_LAYERS)]
+
+    def pointers(layers):
+        return torch.tensor(
+            [t.data_ptr() for t in layers], dtype=torch.uint64, device=DEVICE
+        )
+
+    # Two staging pages force the multi-chunk path.
+    staging_k, staging_v = (
+        torch.empty(
+            2 * PAGE_SIZE, NUM_LAYERS, element_dim, device=DEVICE, dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    dst_k, dst_v = (
+        torch.zeros(
+            num_tokens, NUM_LAYERS, element_dim, dtype=torch.bfloat16, pin_memory=True
+        )
+        for _ in range(2)
+    )
+    device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
+    host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    transfer_hicache_all_layer_staged_lf_pf(
+        pointers(k_layers),
+        pointers(v_layers),
+        _token_indices_for_pages(device_pages),
+        _token_indices_for_pages(host_pages, device="cpu"),
+        staging_k,
+        staging_v,
+        dst_k,
+        dst_v,
+        page_size=PAGE_SIZE,
+        src_stride_bytes=k_layers[0].stride(0) * entries.element_size(),
+    )
+    torch.cuda.synchronize()
+
+    _assert_pages_equal(dst_k, torch.stack(k_layers, dim=1), host_pages, device_pages)
+    _assert_pages_equal(dst_v, torch.stack(v_layers, dim=1), host_pages, device_pages)
 
 
 @pytest.mark.parametrize(

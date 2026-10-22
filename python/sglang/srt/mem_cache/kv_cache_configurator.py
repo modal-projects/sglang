@@ -388,7 +388,7 @@ class KVCacheConfigurator:
         ):
             raise ValueError(
                 "--enable-dflash-swa-cache requires a Full-attention + Mamba target, "
-                "Mamba tracking buffers, ordinary HiCache, and pre-capture sizing; "
+                "Mamba tracking buffers and pre-capture sizing; "
                 "target SWA/MLA, DCP, disaggregation and session caches are unsupported"
             )
         hf = draft.hf_text_config
@@ -444,15 +444,17 @@ class KVCacheConfigurator:
             page_size=self.page_size,
             prefill_tokens=prefill_tokens,
             overlap=not get_schedule().disable_overlap_schedule,
+            tap_cache=get_spec().enable_dflash_tap_cache,
         )
         logger.info(
             "DFLASH SWA budget per rank: %d requests, %d draft tokens (%.3f GiB), "
-            "raw GPU reserve %.3f GiB (latest active tails %.3f GiB)",
+            "context GPU reserve %.3f GiB, checkpoint window %.3f MiB (taps=%s)",
             sizing.max_requests,
             sizing.draft_tokens,
             sizing.draft_bytes / 2**30,
-            sizing.raw_gpu_reserve_bytes / 2**30,
-            sizing.max_requests * sizing.raw_window_bytes / 2**30,
+            sizing.context_gpu_reserve_bytes / 2**30,
+            sizing.checkpoint_window_bytes / 2**20,
+            sizing.tap_cache,
         )
         return sizing
 
@@ -1041,14 +1043,8 @@ class KVCacheConfigurator:
         from sglang.srt.layers.radix_attention import RadixAttention
         from sglang.srt.mem_cache.unified_draft_pool import draft_state_layer_classes
 
-        if (
-            not get_spec().enable_dflash_swa_cache
-            or not get_memory().enable_hierarchical_cache
-        ):
-            raise ValueError(
-                "The draft SWA pool requires --enable-dflash-swa-cache "
-                "and --enable-hierarchical-cache"
-            )
+        if not get_spec().enable_dflash_swa_cache:
+            raise ValueError("The draft SWA pool requires --enable-dflash-swa-cache")
         if req_to_token_pool is None:
             raise ValueError(
                 "A shared draft SWA pool requires the target request table"
@@ -2986,7 +2982,49 @@ class KVCacheConfigurator:
                     )
         return token_to_kv_pool_allocator
 
+    def _dflash_hicache_staging_bytes(self) -> int:
+        # Bounded DFLASH uses pre-capture sizing. Its host pools allocate this
+        # scratch later, so free-memory profiling cannot account for it yet.
+        # Post-capture MHA paths instead prepare staging before their final profile.
+        if (
+            not get_memory().enable_hierarchical_cache
+            or get_memory().hicache_mem_layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
+            return 0
+        from sglang.srt.mem_cache.pool_host.mamba import mamba_write_back_staging_shape
+        from sglang.srt.mem_cache.pool_host.mha import mha_write_back_staging_shapes
+
+        full = self._full_host_spec(None)
+        # Host capacity is not known yet; reserve the maximum transfer chunk.
+        shapes = mha_write_back_staging_shapes(
+            layer_num=full.layer_num,
+            head_num=full.head_num,
+            head_dim=full.head_dim,
+            v_head_dim=full.v_head_dim,
+            dtype=full.store_dtype,
+            page_size=self.page_size,
+        )
+        staging_bytes = sum(math.prod(s) for s in shapes) * full.store_dtype.itemsize
+        mamba = self._mamba_host_spec(None)
+        for state_shape, dtype in (
+            (mamba.temporal_state_shape, mamba.temporal_dtype),
+            *((s, mamba.conv_dtype) for s in mamba.conv_state_shapes),
+        ):
+            shape = mamba_write_back_staging_shape(
+                (mamba.layer_num, 1, *state_shape), dtype
+            )
+            if shape is not None:
+                staging_bytes += math.prod(shape) * dtype.itemsize
+        return staging_bytes
+
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        staging_bytes = (
+            self._dflash_hicache_staging_bytes()
+            if self.dflash_cache_sizing is not None
+            and get_memory().enable_hierarchical_cache
+            else 0
+        )
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
@@ -3036,7 +3074,13 @@ class KVCacheConfigurator:
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.dflash_cache_sizing is not None:
-            rest_memory -= self.dflash_cache_sizing.raw_gpu_reserve_bytes / (1 << 30)
+            rest_memory -= (
+                self.dflash_cache_sizing.context_gpu_reserve_bytes + staging_bytes
+            ) / (1 << 30)
+            logger.info(
+                "DFLASH HiCache staging reserve per rank: %.3f MiB",
+                staging_bytes / (1 << 20),
+            )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
@@ -3296,6 +3340,13 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        checkpoint_per_slot = (
+            self.dflash_cache_sizing.checkpoint_window_bytes
+            if self.dflash_cache_sizing is not None
+            and not get_memory().enable_hierarchical_cache
+            else 0
+        )
+        extra_per_slot += checkpoint_per_slot
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
@@ -3368,7 +3419,12 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D) - extra_per_slot)
+                        (
+                            mamba_budget_bytes
+                            - per_req * (1 + D)
+                            - extra_per_slot
+                            + checkpoint_per_slot
+                        )
                         // (per_req * (1 + D / ratio) + extra_per_slot)
                     ),
                 )
@@ -3385,7 +3441,12 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
+                        (
+                            mamba_budget_bytes
+                            - replayssm_fixed_bytes
+                            - per_slot
+                            + checkpoint_per_slot
+                        )
                         // per_slot
                     ),
                 )
@@ -3410,6 +3471,7 @@ class KVCacheConfigurator:
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
             + replayssm_fixed_bytes
+            - checkpoint_per_slot  # Checkpoint windows have no padding slot.
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 

@@ -5,9 +5,11 @@ Verifies kernel backup (D2H) and load (H2D) correctness for
 supported layouts and multiple index scenarios.
 """
 
+import contextlib
 import sys
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -352,21 +354,23 @@ def test_mamba_kernel_full_indices(dtype, layout):
 
 
 @pytest.mark.parametrize(
-    "layout,io_backend",
+    "layout,io_backend,staged",
     [
-        ("page_first", "kernel"),
-        ("page_first_direct", "kernel"),
-        ("page_first_direct", "direct"),
+        ("page_first", "kernel", False),
+        ("page_first", "kernel", True),
+        ("page_first_direct", "kernel", False),
+        ("page_first_direct", "direct", False),
     ],
 )
 @pytest.mark.parametrize(
     "kind", ["dense", "strided", "padded", "unaligned_layer", "conv_only"]
 )
-def test_captured_mamba_state_round_trip(layout, io_backend, kind):
+def test_captured_mamba_state_round_trip(layout, io_backend, staged, kind):
     """Transfer must preserve checkpoint bytes without reading the device pool.
 
     Unified state is strided and short-conv-only models have no temporal payload.
     Both still carry registered extra checkpoint rows through the same restore.
+    A staged write keeps host indices on the CPU and copies with the copy engine.
     """
     pool = object.__new__(MambaPool)
     pool.mamba_layer_ids = [7, 11]
@@ -426,9 +430,20 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
         # reject the legacy default stream used by ordinary tensor operations.
         transfer_stream = torch.cuda.Stream()
         transfer_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(transfer_stream):
+        direct_copy = (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mamba.transfer_kv_mamba_lf_pf",
+                side_effect=AssertionError("a staged write held SMs for its copy"),
+            )
+            if staged
+            else contextlib.nullcontext()
+        )
+        with direct_copy, torch.cuda.stream(transfer_stream):
             host.backup_from_device_all_layer(
-                pool, host_indices, device_indices, io_backend
+                pool,
+                host_indices.cpu() if staged else host_indices,
+                device_indices,
+                io_backend,
             )
         transfer_stream.synchronize()
         for buffer in buffers:

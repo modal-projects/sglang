@@ -93,6 +93,30 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def mha_write_back_staging_shapes(
+    *,
+    layer_num: int,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    page_size: int,
+    page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
+) -> tuple[tuple[int, ...], ...]:
+    """Eligible staging shapes, shared by allocation and pre-allocation sizing."""
+    if not (_is_cuda or _is_hip) or layer_num == 0:
+        return ()
+    if not all(
+        can_use_write_back_jit_kernel(element_size=head_num * dim * dtype.itemsize)
+        for dim in (head_dim, v_head_dim)
+    ):
+        return ()
+    token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
+    return tuple(
+        (token_capacity, layer_num, head_num, dim) for dim in (head_dim, v_head_dim)
+    )
+
+
 def prepare_mha_write_back_staging(
     buffer_info: MHABufferInfo,
     *,
@@ -101,21 +125,17 @@ def prepare_mha_write_back_staging(
     page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
     staging: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not (_is_cuda or _is_hip) or layer_num == 0:
-        return None
-    head_num = buffer_info.head_num
-    if not all(
-        can_use_write_back_jit_kernel(
-            element_size=head_num * dim * buffer_info.dtype.itemsize
-        )
-        for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
-    ):
-        return None
-    token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
-    shapes = tuple(
-        (token_capacity, layer_num, head_num, dim)
-        for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
+    shapes = mha_write_back_staging_shapes(
+        layer_num=layer_num,
+        head_num=buffer_info.head_num,
+        head_dim=buffer_info.head_dim,
+        v_head_dim=buffer_info.v_head_dim,
+        dtype=buffer_info.dtype,
+        page_size=page_size,
+        page_capacity=page_capacity,
     )
+    if not shapes:
+        return None
     if staging is None:
         staging = (
             torch.empty(shapes[0], dtype=buffer_info.dtype, device=buffer_info.device),
@@ -357,16 +377,22 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    @property
+    def _staged_src_stride_bytes(self) -> int | None:
+        # Packed rows keep each staged call's own element size (K and V may differ).
+        return None if self.device_rows_packed else self.device_row_stride_bytes
+
     def _init_write_back_staging_buffers(self, buffer_info, write_back_staging):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        # The staged kernel reads whole device pages, so it needs packed rows.
+        # The staged relayout steps device rows by device_row_stride_bytes.
+        # Its copy engine moves the PCIe traffic that a direct kernel keeps
+        # on SMs while the forward runs.
         if (
             self.layout != "page_first"
-            or not self.device_rows_packed
             or not current_platform.capabilities.hicache_device_kernels
         ):
             return
@@ -624,6 +650,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_k=self.k_buffer,
                         dst_v=self.v_buffer,
                         page_size=self.page_size,
+                        src_stride_bytes=self._staged_src_stride_bytes,
                     )
                 elif self.can_use_jit and not self.device_rows_packed:
                     # The per-layer host views of page_first rows sit
@@ -1531,6 +1558,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     staging=self.staging_k_buffer,
                     dst=self.k_buffer,
                     page_size=self.page_size,
+                    src_stride_bytes=self._staged_src_stride_bytes,
                 )
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=device_v_data_ptrs,
@@ -1539,6 +1567,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     staging=self.staging_v_buffer,
                     dst=self.v_buffer,
                     page_size=self.page_size,
+                    src_stride_bytes=self._staged_src_stride_bytes,
                 )
             else:
                 transfer_kv_all_layer_mla_lf_pf(

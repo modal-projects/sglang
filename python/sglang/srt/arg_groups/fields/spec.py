@@ -73,12 +73,18 @@ class Spec(msgspec.Struct):
     ] = None
     enable_dflash_swa_cache: A[
         bool,
-        "Opt in to the experimental separate DFLASH sliding-window KV pool and "
-        "raw target-feature tails for recurrent checkpoint recovery. Requires "
-        "--enable-unified-memory and --enable-hierarchical-cache. Disabled by "
-        "default; HiCache alone does not enable this path. Requires a Full + "
+        "Enable a bounded DFLASH sliding-window KV pool and retain materialized "
+        "draft windows with recurrent checkpoints. Requires --enable-unified-memory "
+        "and a Full + "
         "Mamba target with tracking buffers and an all-sliding draft. Sizes "
-        "the working set from --max-running-requests.",
+        "the working set from --max-running-requests. HiCache optionally offloads "
+        "checkpoint windows to host memory.",
+    ] = False
+    enable_dflash_tap_cache: A[
+        bool,
+        "Retain raw target hidden-state windows alongside DFLASH checkpoint KV "
+        "for reprojection after draft updates without target replay. Requires "
+        "--enable-dflash-swa-cache; works with or without HiCache.",
     ] = False
     speculative_domino_candidate_pool_size: A[
         int,

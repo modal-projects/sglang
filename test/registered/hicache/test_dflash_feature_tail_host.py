@@ -16,12 +16,12 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.pool_host.dflash import DFlashFeatureTailHostPool
+from sglang.srt.mem_cache.pool_host.dflash import DFlashCheckpointPool
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.speculative.dflash_feature_tail import (
-    DFlashFeatureCapture,
-    DFlashFeatureState,
-    DFlashFeatureTail,
+    DFlashContextCapture,
+    DFlashContextState,
+    DFlashContextWindow,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -31,25 +31,54 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 class TestDFlashFeatureTailHost(CustomTestCase):
     def pool(self, engine, window, width, capacity=1):
-        pool = DFlashFeatureTailHostPool(
+        pool = DFlashCheckpointPool(
             capacity=capacity,
             window_size=window,
             feature_size=width,
             dtype=torch.bfloat16,
             transfer_engine=engine,
+            device="cuda",
         )
         self.addCleanup(pool.destroy)
         return pool
+
+    def test_gpu_checkpoint_slot_waits_for_previous_reader(self):
+        pool = self.pool(None, window=64, width=128)
+        first = DFlashContextWindow(
+            0, (torch.ones((64, 128), dtype=torch.bfloat16, device="cuda"),)
+        )
+        second = DFlashContextWindow(0, (torch.full_like(first.parts[0], 2),))
+        reader, writer = torch.cuda.Stream(), torch.cuda.Stream()
+        warm = pool.backup(first)
+        pool.restore(warm)
+        pool.release(warm)
+        torch.cuda.synchronize()
+        with patch.object(
+            torch.cuda.Event, "synchronize", side_effect=AssertionError("CPU wait")
+        ):
+            handle = pool.backup(first)
+            with torch.cuda.stream(reader):
+                torch.cuda._sleep(10_000_000)
+                observed_first = pool.restore(handle).as_tensor()
+            pool.release(handle)
+            with torch.cuda.stream(writer):
+                replacement = pool.backup(second)
+                observed_second = pool.restore(replacement).as_tensor()
+                pool.release(replacement)
+        reader.synchronize()
+        writer.synchronize()
+        torch.testing.assert_close(observed_first, first.as_tensor(), rtol=0, atol=0)
+        torch.testing.assert_close(observed_second, second.as_tensor(), rtol=0, atol=0)
 
     def test_reused_host_slot_waits_for_previous_reader_without_cpu_wait(self):
         window, width = 64, 128
         engine = L2TransferEngine("direct")
         pool = self.pool(engine, window, width)
         reader, writer = torch.cuda.Stream(), torch.cuda.Stream()
-        first = DFlashFeatureTail(
+        first = DFlashContextWindow(
             0, (torch.ones((window, width), dtype=torch.bfloat16, device="cuda"),)
         )
-        second = DFlashFeatureTail(0, (torch.full_like(first.parts[0], 2),))
+        second = DFlashContextWindow(0, (torch.full_like(first.parts[0], 2),))
 
         # Warm every destination/copy allocation so cudaMalloc cannot conceal
         # a missing dependency between the old read and the replacement write.
@@ -102,7 +131,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
 
         # Warm copies and both window allocations so cudaMalloc cannot hide an
         # omitted stream dependency in the delayed-producer case below.
-        warm_tail = DFlashFeatureTail.capture(
+        warm_tail = DFlashContextWindow.capture(
             source, start_pos=0, end_pos=end, window_size=window
         )
         warm_handle = pool.backup(warm_tail)
@@ -124,7 +153,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
             with torch.cuda.stream(producer):
                 torch.cuda._sleep(100_000_000)
                 source.copy_(history)
-                tail = DFlashFeatureTail.capture(
+                tail = DFlashContextWindow.capture(
                     source, start_pos=0, end_pos=end, window_size=window
                 )
                 handle = pool.backup(tail)
@@ -171,7 +200,9 @@ class TestDFlashFeatureTailHost(CustomTestCase):
         history = torch.arange(24 * 32, device="cuda", dtype=torch.bfloat16).view(
             24, 32
         )
-        raw = DFlashFeatureTail.capture(history, start_pos=0, end_pos=20, window_size=8)
+        raw = DFlashContextWindow.capture(
+            history, start_pos=0, end_pos=20, window_size=8
+        )
         handle = tails.backup(raw)
         raw_reference = weakref.ref(raw.parts[0])
         del raw
@@ -229,7 +260,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
 
         with torch.cuda.stream(producer):
             source.copy_(history)
-            prefill = DFlashFeatureCapture.prefill(
+            prefill = DFlashContextCapture.prefill(
                 reqs=[req],
                 target_hidden=source[:window],
                 prefix_lens=[0],
@@ -246,7 +277,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
                 result = GenerationBatchResult(
                     logits_output=LogitsProcessorOutput(None),
                     next_token_ids=torch.tensor([1], device="cuda"),
-                    dflash_feature_capture=capture,
+                    dflash_context_capture=capture,
                     copy_done=torch.cuda.Event(),
                 )
             copier.wait_stream(producer)
@@ -261,8 +292,8 @@ class TestDFlashFeatureTailHost(CustomTestCase):
 
         result = readback(prefill)
         with torch.cuda.stream(consumer):
-            result.dflash_feature_capture.consume([req])
-        state = req.kv.dflash_feature_state
+            result.dflash_context_capture.consume([req])
+        state = req.kv.dflash_context_state
         with torch.cuda.stream(producer):
             source.copy_(history)
             source[window + 9 :].fill_(float("nan"))
@@ -270,7 +301,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
             # the commit buffers are overwritten by another forward.
             starts = torch.tensor([window], device="cuda")
             commits = torch.tensor([9], device="cuda")
-            capture = DFlashFeatureCapture.decode(
+            capture = DFlashContextCapture.decode(
                 reqs=[req],
                 target_hidden=source[window:].unsqueeze(0),
                 start_positions=starts,
@@ -296,7 +327,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
             ),
             torch.cuda.stream(consumer),
         ):
-            result.dflash_feature_capture.consume([req])
+            result.dflash_context_capture.consume([req])
             snapshot = state.checkpoint(0, window + 4)
             handle = pool.backup(snapshot)
             live = state.snapshot()
@@ -312,7 +343,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
         self.assertEqual(live.as_tensor().untyped_storage().nbytes(), 48 * 1024**2)
         self.assertTrue(state.closed)
         self.assertEqual(state._chunks, [])
-        self.assertIsNone(req.kv.dflash_feature_state)
+        self.assertIsNone(req.kv.dflash_context_state)
         pool.release(handle)
 
     def test_pending_prefill_donation_restores_two_independent_active_rings(self):
@@ -331,7 +362,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
         producer.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(producer):
             source.copy_(history)
-            capture = DFlashFeatureCapture.prefill(
+            capture = DFlashContextCapture.prefill(
                 reqs=[req],
                 target_hidden=source,
                 prefix_lens=[0],
@@ -340,7 +371,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
                 window_size=window,
             )
             source.fill_(-1)
-        state = req.kv.dflash_feature_state
+        state = req.kv.dflash_context_state
         handle = state.donate_checkpoint(0, window, pool)
         self.assertFalse(pool.is_ready(handle))
         # The scheduler has already donated/replaced this physical tracking slot.
@@ -363,8 +394,8 @@ class TestDFlashFeatureTailHost(CustomTestCase):
                 req.kv.mark_kv_released()
             self.assertTrue(pool.is_ready(handle))
             with torch.cuda.stream(restore_stream):
-                first = DFlashFeatureState.from_tail(pool.restore(handle), window)
-                second = DFlashFeatureState.from_tail(pool.restore(handle), window)
+                first = DFlashContextState.from_tail(pool.restore(handle), window)
+                second = DFlashContextState.from_tail(pool.restore(handle), window)
                 checkpoint_copy = second.snapshot()
             # A restored active ring crosses into result processing and extends
             # independently; eviction must fence both host reads.
@@ -382,7 +413,7 @@ class TestDFlashFeatureTailHost(CustomTestCase):
         torch.testing.assert_close(continued.as_tensor(), history[16:], rtol=0, atol=0)
         pool.poll()
         self.assertEqual(pool.available_size(), 1)
-        self.assertIsNone(req.kv.dflash_feature_state)
+        self.assertIsNone(req.kv.dflash_context_state)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from sglang.srt.function_call.kimik3_format import (
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
+    get_kimik3_no_tool_call_structural_tag,
     get_kimik3_structural_tag,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -215,6 +216,14 @@ def test_required_rejects_message_close_before_tools():
     assert _accepts(
         grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
     )
+
+
+def test_tool_choice_none_rejects_tools_section():
+    grammar = xgr.Grammar.from_structural_tag(get_kimik3_no_tool_call_structural_tag())
+    plain = "<|open|>response<|sep|>Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE
+
+    assert _accepts(grammar, plain)
+    assert not _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():

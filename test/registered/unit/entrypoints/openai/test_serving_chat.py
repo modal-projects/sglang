@@ -2188,6 +2188,33 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="none",
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=False)
+
+        constraint_type, tag = result.tool_call_constraint
+        self.assertEqual(constraint_type, "structural_tag")
+        self.assertIn(TOOLS_OPEN, tag.format.excludes)
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

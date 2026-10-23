@@ -123,6 +123,7 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import deepseek_v4_targets as v4_lora
+from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.utils import get_default_hidden_dim, get_stacked_multiply
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -452,6 +453,17 @@ if _is_hip:
 @functools.lru_cache(maxsize=1)
 def _fused_wo_a_arch_supported() -> bool:
     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
+
+
+def _check_lora_input(linear: nn.Module, x) -> None:
+    # LoRA kernels read the activation directly, so fused producers must keep it BF16.
+    if isinstance(linear, BaseLayerWithLoRA) and not (
+        isinstance(x, torch.Tensor) and x.element_size() >= 2
+    ):
+        raise RuntimeError(
+            f"LoRA-wrapped {type(linear.base_layer).__name__} received a quantized "
+            f"activation ({type(x).__name__}); its producer must keep it BF16."
+        )
 
 
 def _apply_wo_a_bf16_matmul(
@@ -1292,7 +1304,7 @@ class MQALayer(MqaAttentionBase):
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        # None when LoRA wraps wq_b, which keeps its input in BF16.
+        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
         method = getattr(self.wq_b, "quant_method", None)
         if (
             _is_cuda
@@ -1343,6 +1355,7 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _check_lora_input(self.wq_b, q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
@@ -1866,6 +1879,7 @@ class MQALayer(MqaAttentionBase):
                 q, _ = self.wq_b(q_for_wqb)
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                _check_lora_input(self.wq_b, q_for_wqb)
                 q, _ = self.wq_b(q_for_wqb)
 
             kv = (
@@ -2141,6 +2155,8 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
+        if x_quant is not None:
+            _check_lora_input(self.wqkv_a if self.fuse_wqa_wkv else self.wq_a, x_quant)
 
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
@@ -2563,6 +2579,7 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
+        _check_lora_input(self.wo_b, o)
         o, _ = self.wo_b(
             o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
             skip_all_reduce=mhc is not None,
@@ -5140,6 +5157,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         v4_lora.validate_target_modules(
             target_modules,
             quantized=self.quant_config is not None,
+            cuda=_is_cuda,
             attn_cp_size=get_parallel().attn_cp_size,
             fuse_wqa_wkv=envs.SGLANG_OPT_FUSE_WQA_WKV.get(),
             fused_shared_experts=bool(self.num_fused_shared_experts),

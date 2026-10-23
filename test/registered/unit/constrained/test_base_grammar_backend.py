@@ -419,3 +419,13 @@ class TestNulByteGrammarRejection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_grammar_stop_token_ids_include_every_scheduler_stop_token():
+    from types import SimpleNamespace
+
+    from sglang.srt.constrained.base_grammar_backend import grammar_stop_token_ids
+
+    tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
+    assert grammar_stop_token_ids(tokenizer, {163586}) == [7, 163585, 163586]
+    assert grammar_stop_token_ids(SimpleNamespace(), None) is None

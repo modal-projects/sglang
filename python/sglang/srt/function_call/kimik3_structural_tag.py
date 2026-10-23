@@ -592,6 +592,18 @@ def get_kimik3_auto_tool_call_structural_tag(
     return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
 
 
+def get_kimik3_no_tool_call_structural_tag(
+    thinking_mode: bool = False,
+) -> StructuralTag:
+    """tool_choice="none": the K3 prompt still lists the tools, so forbid the
+    tools section instead of letting raw call markup reach the content."""
+    return StructuralTag(
+        format=_with_reasoning(
+            AnyTextFormat(excludes=[TOOLS_OPEN, CALL_OPEN]), thinking_mode
+        )
+    )
+
+
 def _select_tools(
     tools: List[Tool],
     tool_choice: Union[ToolChoice, Literal["auto", "required"]],

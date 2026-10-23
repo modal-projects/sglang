@@ -216,6 +216,14 @@ def test_required_rejects_message_close_before_tools():
     assert _accepts(
         grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
     )
+    assert not _accepts(grammar, response + "<|close|>messagemessage<|sep|>")
+    for near_miss in (
+        "<|close|>Message<|sep|>",
+        "<|close|>_message<|sep|>",
+        TOOLS_CLOSE,
+    ):
+        assert not _accepts(grammar, response + near_miss)
+    assert not _accepts(grammar, "<|open|>response<|sep|>Hi" + TOOLS_CLOSE)
 
 
 def test_tool_choice_none_rejects_tools_section():
@@ -224,6 +232,19 @@ def test_tool_choice_none_rejects_tools_section():
 
     assert _accepts(grammar, plain)
     assert not _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "<|open|>tools<|close|>message<|sep|>")
+    assert not _accepts(grammar, "<|sep|><|close|>tools<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "")
+    for blank in ("", " ", "\n\n"):
+        empty = f"<|open|>response<|sep|>{blank}<|close|>response<|sep|>"
+        assert not _accepts(grammar, empty + MESSAGE_CLOSE)
+    for text in ("é", "👋 hi", "<b>bold</b>", "x"):
+        response = f"<|open|>response<|sep|>{text}<|close|>response<|sep|>"
+        assert _accepts(grammar, response)
+    assert not _accepts(grammar, "<|open|>response<|sep|>x<|close|>Message<|sep|>")
+    assert _accepts(
+        grammar, "<|open|>response<|sep|>- **a** é\n<b><|close|>response<|sep|>"
+    )
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():

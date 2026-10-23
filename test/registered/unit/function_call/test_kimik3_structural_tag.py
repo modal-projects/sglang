@@ -204,6 +204,19 @@ def test_required_allows_response_prefix_but_requires_tools():
     assert not _accepts(grammar, response)
 
 
+def test_required_rejects_message_close_before_tools():
+    grammar = _grammar([_tool()], tool_choice="required")
+    response = "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>"
+
+    assert not _accepts(grammar, response + MESSAGE_CLOSE)
+    assert not _accepts(
+        grammar, response + MESSAGE_CLOSE + _tools_section(_valid_weather_call())
+    )
+    assert _accepts(
+        grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
+    )
+
+
 def test_auto_allows_plain_response_or_multiple_tool_calls():
     grammar = _grammar([_tool(), _tool("forecast")])
     plain = (

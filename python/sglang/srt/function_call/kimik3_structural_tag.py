@@ -620,8 +620,17 @@ def get_kimik3_structural_tag(
     if at_least_one:
         suffix: Format = SequenceFormat(
             elements=[
+                # Closing the message before the tools section is excluded:
+                # otherwise a model that decides no tool is needed loops on
+                # MESSAGE_CLOSE until max_tokens instead of making the call.
                 AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                    excludes=[
+                        TOOLS_OPEN,
+                        THINK_OPEN,
+                        THINK_CLOSE,
+                        CALL_OPEN,
+                        MESSAGE_CLOSE,
+                    ]
                 ),
                 tools_tag,
                 _OPTIONAL_MESSAGE_CLOSE,

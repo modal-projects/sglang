@@ -1923,7 +1923,19 @@ class ServingChatTestCase(CustomTestCase):
 
         constraint_type, tag = result.tool_call_constraint
         self.assertEqual(constraint_type, "structural_tag")
-        self.assertIn(TOOLS_OPEN, tag.format.excludes)
+        from sglang.srt.function_call.kimik3_structural_tag import (
+            get_kimik3_no_tool_call_structural_tag,
+        )
+
+        self.assertIn(
+            tag.model_dump_json(),
+            {
+                get_kimik3_no_tool_call_structural_tag(
+                    thinking_mode=m
+                ).model_dump_json()
+                for m in (False, True)
+            },
+        )
 
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None

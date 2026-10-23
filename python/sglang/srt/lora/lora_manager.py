@@ -39,6 +39,7 @@ from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
+    FUSED_QKV_A_LORA_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -714,6 +715,11 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        validate_model_targets = getattr(
+            self.base_model, "validate_lora_target_modules", None
+        )
+        if validate_model_targets is not None:
+            validate_model_targets(self.target_modules)
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
@@ -803,7 +809,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -847,7 +855,7 @@ class LoRAManager:
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, self.base_model
             )
 
             if target_modules is not None:
@@ -1121,25 +1129,6 @@ class LoRAManager:
             if should_apply_lora is not None and not should_apply_lora(module_name):
                 continue
 
-            # Handle DeepSeek MLA fused projection: set the boundary
-            # between q_a and kv_a output partitions so the LoRA layer
-            # can apply separate B projections for each.
-            if (
-                "fused_qkv_a_proj_with_mqa" in self.target_modules
-                and module_name.endswith("fused_qkv_a_proj_with_mqa")
-            ):
-                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
-
-                layer_id = get_layer_id(module_name)
-                if layer_id is None:
-                    continue
-                lora_module = self.set_lora_module(module_name, module)
-                if isinstance(lora_module, ReplicatedLinearWithLoRA):
-                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
-                    lora_module.first_output_dim = q_lora_rank
-                self.lora_modules[layer_id][module_name] = lora_module
-                continue
-
             # The module should be converted if it is included in target_names
             parts = module_name.split(".")
             if (
@@ -1149,9 +1138,12 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                if parts[-1] in FUSED_QKV_A_LORA_NAMES:
+                    lora_module.first_output_dim = (
+                        getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    )
+                self.lora_modules[layer_id][module_name] = lora_module
                 continue
 
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(

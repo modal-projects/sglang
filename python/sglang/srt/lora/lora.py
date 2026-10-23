@@ -199,7 +199,12 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        normalize_model_weights = getattr(
+            self.base_model, "normalize_lora_layer_weights", None
+        )
         for layer in self.layers:
+            if normalize_model_weights is not None:
+                normalize_model_weights(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)

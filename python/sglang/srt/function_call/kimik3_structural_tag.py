@@ -25,6 +25,8 @@ from sglang.srt.function_call.kimik3_format import (
     CALL_CLOSE,
     CALL_OPEN,
     MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -477,6 +479,22 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
+# Text outside a tools section is limited to the response channel, whose body
+# admits no control token. The model also emits near-miss markers
+# (<|close|>Message, <|close|>_message, a stray TOOLS_CLOSE), so excluding known
+# markers cannot keep markup out of the content.
+_RESPONSE_TEXT = AnyTextFormat(excludes=["<|open|>", _CLOSE_TOKEN])
+_RESPONSE = TagFormat(begin=RESPONSE_OPEN, content=_RESPONSE_TEXT, end=RESPONSE_CLOSE)
+# A model that wanted a tool otherwise closes an empty response block when no
+# tool may be called, and the client gets no content.
+_NONEMPTY_RESPONSE = TagFormat(
+    begin=RESPONSE_OPEN,
+    content=SequenceFormat(
+        elements=[RegexFormat(pattern=r"[^ \t\r\n<]|<[^|<]"), _RESPONSE_TEXT]
+    ),
+    end=RESPONSE_CLOSE,
+)
+
 # A grammar that ends at the tools close must still admit the turn's
 # MESSAGE_CLOSE: K3 emits it before EOS, which is masked until the grammar
 # completes, so without it the model can never finish the turn.
@@ -599,7 +617,8 @@ def get_kimik3_no_tool_call_structural_tag(
     tools section instead of letting raw call markup reach the content."""
     return StructuralTag(
         format=_with_reasoning(
-            AnyTextFormat(excludes=[TOOLS_OPEN, CALL_OPEN]), thinking_mode
+            SequenceFormat(elements=[_NONEMPTY_RESPONSE, _OPTIONAL_MESSAGE_CLOSE]),
+            thinking_mode,
         )
     )
 
@@ -632,18 +651,10 @@ def get_kimik3_structural_tag(
     if at_least_one:
         suffix: Format = SequenceFormat(
             elements=[
-                # Closing the message before the tools section is excluded:
-                # otherwise a model that decides no tool is needed loops on
-                # MESSAGE_CLOSE until max_tokens instead of making the call.
-                AnyTextFormat(
-                    excludes=[
-                        TOOLS_OPEN,
-                        THINK_OPEN,
-                        THINK_CLOSE,
-                        CALL_OPEN,
-                        MESSAGE_CLOSE,
-                    ]
-                ),
+                # Only a response may precede the tools section, so a model that
+                # decides no tool is needed cannot close the message or end the
+                # turn without making the call.
+                OptionalFormat(content=_RESPONSE),
                 tools_tag,
                 _OPTIONAL_MESSAGE_CLOSE,
             ]

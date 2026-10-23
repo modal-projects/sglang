@@ -1,10 +1,11 @@
-"""A spec mixed batch with grammar decode rows must not overlap the previous batch.
+"""Mixed batches whose decode rows carry a grammar must see the previous result.
 
 The decode rows of a mixed batch are sampled in the target extend, not in verify(),
-so the grammar barrier never runs for them. Their bitmask is built from the FSM as
-it stands, which misses the previous decode batch's committed tokens while that
-result is still queued; the sampled token is then rejected by accept_token and the
-request is aborted mid-stream.
+so the verify grammar barrier never runs for them. If their bitmask is built while
+the previous decode batch's result is still queued, it misses that batch's committed
+tokens; the sampled token is then rejected by accept_token and the request is
+aborted mid-stream. Workers that run the barrier before the extend sampling keep
+overlapping; the others take the sync path.
 """
 
 import unittest
@@ -16,6 +17,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
@@ -27,54 +29,58 @@ def _req(grammar):
     return SimpleNamespace(grammar=object() if grammar else None)
 
 
-def _batch(mode, decoding_reqs=None, has_grammar=True):
+def _batch(mode, decoding_reqs=None, algo=SpeculativeAlgorithm.DFLASH):
     batch = SimpleNamespace(
         forward_mode=mode,
-        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+        spec_algorithm=algo,
         decoding_reqs=decoding_reqs,
-        has_grammar=has_grammar,
+        has_grammar=True,
     )
-    batch.grammar_needs_sync = lambda: (
-        batch.has_grammar and not batch.spec_algorithm.supports_grammar_overlap()
+    batch.grammar_needs_sync = lambda: ScheduleBatch.grammar_needs_sync(batch)
+    batch.mixed_decode_rows_have_grammar = lambda: (
+        ScheduleBatch.mixed_decode_rows_have_grammar(batch)
     )
     return batch
 
 
-def _scheduler(queued):
-    return SimpleNamespace(
-        require_mlp_sync=False,
-        result_queue=deque([object()] * queued),
-        _mixed_batch_has_grammar_decode_rows=(
-            Scheduler._mixed_batch_has_grammar_decode_rows
-        ),
-    )
-
-
 def _disable(batch, queued=1):
-    return Scheduler.is_disable_overlap_for_batch(
-        _scheduler(queued), batch, last_batch=None
+    scheduler = SimpleNamespace(
+        require_mlp_sync=False, result_queue=deque([object()] * queued)
     )
+    return Scheduler.is_disable_overlap_for_batch(scheduler, batch, last_batch=None)
+
+
+class TestMixedDecodeRowsHaveGrammar(unittest.TestCase):
+    def test_only_mixed_batches_with_grammar_decode_rows(self):
+        def has(mode, reqs):
+            return _batch(mode, reqs).mixed_decode_rows_have_grammar()
+
+        self.assertTrue(has(ForwardMode.MIXED, [_req(False), _req(True)]))
+        self.assertFalse(has(ForwardMode.MIXED, [_req(False)]))
+        self.assertFalse(has(ForwardMode.MIXED, None))
+        self.assertFalse(has(ForwardMode.EXTEND, [_req(True)]))
 
 
 class TestMixedGrammarOverlapSync(unittest.TestCase):
-    def test_mixed_batch_with_grammar_decode_row_syncs(self):
-        batch = _batch(ForwardMode.MIXED, [_req(False), _req(True)])
+    def test_worker_without_mixed_barrier_syncs(self):
+        batch = _batch(ForwardMode.MIXED, [_req(True)], SpeculativeAlgorithm.EAGLE)
         self.assertTrue(_disable(batch))
 
-    def test_mixed_batch_without_grammar_decode_rows_overlaps(self):
-        batch = _batch(ForwardMode.MIXED, [_req(False)])
+    def test_worker_with_mixed_barrier_overlaps(self):
+        # DFLASH runs the barrier between the target extend and its sampling.
+        self.assertTrue(SpeculativeAlgorithm.DFLASH.supports_mixed_grammar_barrier())
+        self.assertFalse(_disable(_batch(ForwardMode.MIXED, [_req(True)])))
+
+    def test_no_grammar_decode_rows_overlaps(self):
+        batch = _batch(ForwardMode.MIXED, [_req(False)], SpeculativeAlgorithm.EAGLE)
         self.assertFalse(_disable(batch))
 
-    def test_mixed_batch_with_nothing_queued_overlaps(self):
-        batch = _batch(ForwardMode.MIXED, [_req(True)])
+    def test_nothing_queued_overlaps(self):
+        batch = _batch(ForwardMode.MIXED, [_req(True)], SpeculativeAlgorithm.EAGLE)
         self.assertFalse(_disable(batch, queued=0))
 
     def test_grammar_overlap_decode_keeps_overlapping(self):
-        # DFLASH advances the FSM inside verify() through the grammar barrier.
         self.assertFalse(_disable(_batch(ForwardMode.DECODE)))
-
-    def test_plain_extend_overlaps(self):
-        self.assertFalse(_disable(_batch(ForwardMode.EXTEND, None)))
 
 
 if __name__ == "__main__":

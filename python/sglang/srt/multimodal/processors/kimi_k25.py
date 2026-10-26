@@ -263,10 +263,12 @@ def _resize_images_by_source_shape(
     return [resized_by_index[index] for index, _ in indexed_images]
 
 
+_GPU_PREPROCESS_CHUNK_BYTES = 512 * 1024 * 1024
+
+
 def _byte_bounded_chunks(group: list, pixels_per_item: int) -> list[list]:
     """Split a size group so each chunk's fp32 RGBA pixels fit the budget."""
-    budget = envs.SGLANG_MM_GPU_PREPROCESS_CHUNK_BYTES.get()
-    step = max(1, budget // max(1, 4 * 4 * pixels_per_item))
+    step = max(1, _GPU_PREPROCESS_CHUNK_BYTES // max(1, 4 * 4 * pixels_per_item))
     return [group[i : i + step] for i in range(0, len(group), step)]
 
 

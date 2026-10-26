@@ -473,7 +473,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 
-# The renorm kernels the fix replaces only run on GPU.
+# The renorm kernels only run on GPU.
 _VERIFY_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -503,6 +503,8 @@ def _verify_target_probs(backend, logits, top_ks, top_ps):
         top_ps=top_ps.to(device),
         need_top_k_sampling=bool((top_ks < logits.shape[-1]).any()),
         need_top_p_sampling=bool((top_ps < 1.0).any()),
+        max_top_k=None,
+        sampling_seed=None,
     )
     with get_context().override_server_args(sampling_backend=backend):
         return (

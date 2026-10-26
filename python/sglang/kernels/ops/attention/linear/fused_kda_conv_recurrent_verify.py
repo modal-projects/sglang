@@ -505,6 +505,7 @@ def fused_kda_conv_gating_verify(
     a2 = a.reshape(seq_len, HV * K)
     b2 = b.reshape(seq_len, HV)
     assert a2.stride(-1) == 1 and b2.stride(-1) == 1
+
     o = mixed_qkv.new_empty(seq_len, HV, V)
 
     if intermediate_conv_window is not None:

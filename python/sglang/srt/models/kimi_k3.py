@@ -2552,13 +2552,9 @@ class KimiK3DeltaAttention(nn.Module):
     def _k3_onorm_oproj(
         self, core_attn_out: torch.Tensor, g_proj_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        """ROCm fused KDA o_norm + o_proj (target verify, M <= MAX_M):
-        the gated o_norm (sigmoid gate read through its row stride) in the
-        prologue of the o_proj GEMM -- one HIP kernel instead of
-        the gated RMSNorm + the tuned hgemm. Returns o_proj's
-        TP-partial output, or None when not covered (caller runs the unfused
-        pair). Only on the deferred-reduce o_proj (fused AllReduce + aggregation:
-        the decoder layer completes the reduction)."""
+        """ROCm fused gated o_norm + o_proj for target verify. Returns the
+        TP-partial o_proj output (the decoder layer completes the reduction),
+        or None when not covered."""
         if not _is_hip:
             return None
         m = g_proj_states.shape[0] if g_proj_states.dim() == 2 else -1

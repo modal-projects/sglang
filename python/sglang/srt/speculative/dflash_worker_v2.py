@@ -1,4 +1,3 @@
-import collections
 import logging
 import math
 import os
@@ -118,9 +117,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-# pinned sources of in-flight non_blocking H2D copies (SGLANG_ROCM_NO_EXTEND_SYNC)
-_PINNED_KEEPALIVE = collections.deque(maxlen=64)
 
 _FusedKVMaterializeHelper = None
 
@@ -422,63 +418,6 @@ class _DominoDraftSampler:
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
 
-class _AcceptBonusBuffers:
-    """Outputs of the triton accept/bonus kernel at fixed addresses.
-
-    accept_len is consumed within the step. The other outputs are handed to the
-    next step (overlap scheduling reads them after this step returns), so they
-    are double buffered and ``take`` alternates between the two slots. Buffers
-    only grow (2x), and keep their addresses while ``bs`` fits.
-    """
-
-    def __init__(self) -> None:
-        self.cap = 0
-        self.next_slot = 0
-        self.accept_len: Optional[torch.Tensor] = None
-        self.commit_lens: List[torch.Tensor] = []
-        self.bonus_ids: List[torch.Tensor] = []
-        self.out_tokens: List[torch.Tensor] = []
-        self.new_seq_lens: List[torch.Tensor] = []
-
-    def reserve(self, bs: int, *, device, block_size: int) -> None:
-        if self.cap >= bs:
-            return
-        cap = max(bs, self.cap * 2 if self.cap > 0 else bs)
-        self.accept_len = torch.empty((cap,), dtype=torch.int32, device=device)
-        self.commit_lens = [
-            torch.empty((cap,), dtype=torch.int32, device=device) for _ in range(2)
-        ]
-        # int64 keeps the downstream .to(torch.int64) a no-op.
-        self.bonus_ids = [
-            torch.empty((cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self.out_tokens = [
-            torch.empty((cap, block_size), dtype=torch.int64, device=device)
-            for _ in range(2)
-        ]
-        self.new_seq_lens = [
-            torch.empty((cap,), dtype=torch.int64, device=device) for _ in range(2)
-        ]
-        self.cap = cap
-
-    def take(
-        self, bs: int, *, device, block_size: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(accept_len, commit_lens, bonus_ids, out_tokens, new_seq_lens)[:bs]
-        of the next slot."""
-        bs = int(bs)
-        self.reserve(bs, device=device, block_size=block_size)
-        slot = self.next_slot
-        self.next_slot = (slot + 1) % 2
-        return (
-            self.accept_len[:bs],
-            self.commit_lens[slot][:bs],
-            self.bonus_ids[slot][:bs],
-            self.out_tokens[slot][:bs],
-            self.new_seq_lens[slot][:bs],
-        )
-
-
 class DFlashWorkerV2(BaseSpecWorker):
     # Platform hooks below are overridden by DFlashWorkerV2ROCm
     # (dflash_worker_v2_rocm.py); the defaults are the portable path.
@@ -715,11 +654,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # gather's implicit nonzero D2H + lengths.max().item()); keep it only
         # for platforms without GPU triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
-        self._accept_bonus_buffers = _AcceptBonusBuffers()
+        self._accept_bonus_buffer_cap: int = 0
+        self._accept_bonus_buffer_slot: int = 0
+        self._accept_len_buf: Optional[torch.Tensor] = None
+        self._commit_lens_bufs: List[torch.Tensor] = []
+        self._bonus_id_bufs: List[torch.Tensor] = []
+        self._out_tokens_bufs: List[torch.Tensor] = []
+        self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._target_logits_processor = self._defer_target_verify_gather()
-        # K3 DFlash prep graph (built in init_cuda_graphs).
-        self._k3_prep_graph = None
-        self._init_tail_graph_state()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -2313,6 +2255,58 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
+    def _ensure_accept_bonus_buffers(self, bs: int) -> None:
+        if self._accept_bonus_buffer_cap >= int(bs):
+            return
+
+        new_cap = max(
+            int(bs),
+            (
+                self._accept_bonus_buffer_cap * 2
+                if self._accept_bonus_buffer_cap > 0
+                else int(bs)
+            ),
+        )
+        device = self.device
+        block_size = int(self.block_size)
+        self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
+        self._commit_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        # int64 keeps the downstream .to(torch.int64) a no-op.
+        self._bonus_id_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._out_tokens_bufs = [
+            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self._new_seq_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._accept_bonus_buffer_cap = new_cap
+
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        self._ensure_accept_bonus_buffers(bs)
+        assert self._accept_len_buf is not None
+        slot = self._accept_bonus_buffer_slot
+        self._accept_bonus_buffer_slot = (slot + 1) % 2
+        return (
+            self._accept_len_buf[:bs],
+            self._commit_lens_bufs[slot][:bs],
+            self._bonus_id_bufs[slot][:bs],
+            self._out_tokens_bufs[slot][:bs],
+            self._new_seq_lens_bufs[slot][:bs],
+        )
+
     def _verify_argmax(self, next_token_logits: torch.Tensor) -> torch.Tensor:
         return torch.argmax(next_token_logits, dim=-1)
 
@@ -2367,9 +2361,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         bonus,
                         out_tokens,
                         new_seq_lens,
-                    ) = self._accept_bonus_buffers.take(
-                        bs, device=self.device, block_size=int(self.block_size)
-                    )
+                    ) = self._next_accept_bonus_buffers(bs)
                     _compute_dflash_accept_bonus_triton_unchecked(
                         candidates=candidates,
                         target_top1=target_predict,
@@ -2869,26 +2861,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            if envs.SGLANG_ROCM_NO_EXTEND_SYNC.get():
-                # pinned + non_blocking: a pageable H2D copy would block the host
-                # until the GPU drains, desynchronizing TP ranks at every extend
-                pinned = (
-                    torch.tensor(batch.extend_lens, dtype=torch.int32, pin_memory=True),
-                    torch.tensor(batch.prefix_lens, dtype=torch.int32, pin_memory=True),
-                )
-                # keep the pinned sources alive until their async copies have run
-                _PINNED_KEEPALIVE.append(pinned)
-                ctx_lens = pinned[0].to(device, non_blocking=True)
-                draft_seq_lens = pinned[1].to(device, non_blocking=True)
-            else:
-                # Enqueue metadata copies without waiting for the target prefill's
-                # outstanding GPU work; the same stream orders their consumers.
-                ctx_lens = async_h2d(
-                    batch.extend_lens, dtype=torch.int32, device=device
-                )
-                draft_seq_lens = async_h2d(
-                    batch.prefix_lens, dtype=torch.int32, device=device
-                )
+            # Enqueue metadata copies without waiting for the target prefill's
+            # outstanding GPU work; the same stream orders their consumers.
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
+                batch.prefix_lens, dtype=torch.int32, device=device
+            )
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(

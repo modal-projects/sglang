@@ -45,8 +45,8 @@ def _moe_sorting_small_kernel(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
-    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    stride_qx,
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -170,8 +170,8 @@ def _moe_sorting_small_kernel_distributed(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
-    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    stride_qx,
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -439,8 +439,7 @@ def _small_sort_supported(
         # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
         # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
         # does not scan per expert chunk (measured up to E=385, i.e. E_POW2 <= 512).
-        # A K3 sort plan fuses the shared GEMM and quant into this sort, which wins
-        # at any E.
+        # A K3 sort plan fuses the shared GEMM and quant into this sort: wins at any E
         and (
             (p <= 64 and p <= 2 * block_size)
             or num_experts <= 256
@@ -773,8 +772,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             )
         )
         if k3 and not emit and not hidden_states.is_contiguous():
-            # Only the fused sort+quant reads strided rows; aiter's own path
-            # wants a dense activation (callers may hand in a column slice).
+            # only the fused sort + quant reads strided rows
             hidden_states = hidden_states.contiguous()
         input_token = _pending_quant_input.set(hidden_states if emit else None)
         emitted_token = _emitted_quant.set(None)
@@ -932,7 +930,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and input.dim() == 2
             and not input.is_contiguous()
         ):
-            # fused_moe_wrapper skips the densify when it expects the fused sort+quant
             input = input.contiguous()
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)
 

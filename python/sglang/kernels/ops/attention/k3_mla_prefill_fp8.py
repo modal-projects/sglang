@@ -1,25 +1,13 @@
-"""Kimi-K3 MLA prefill/extend MHA (d_qk 192, d_v 128, 12 heads per rank) on
-AITER's gfx950 FP8 persistent-scheduled ASM kernel
-``mla_pfl_qh192_vh128_m32x8_n128x1_causal1`` (``mla_prefill_ps_asm_fwd``)
-+ ``mla_reduce_v1``.
+"""Kimi-K3 MLA prefill/extend MHA (d_qk 192, d_v 128) on AITER's gfx950 FP8
+persistent-scheduled ASM kernel (``mla_prefill_ps_asm_fwd``) + ``mla_reduce_v1``.
 
-Why: the bf16 opus ``gqa_d192_v128`` kernel (aiter flash_attn_varlen_func)
-reaches ~1.25 PFLOPS on the 9k-query x 99k-key extend (5.2 ms per layer) and
-has no split-KV, so short extends over a long prefix (C16 batches of a few
-hundred new tokens per request over 25-99k keys) run on a few dozen
-workgroups (~0.3 PFLOPS). The persistent FP8 kernel splits KV across all CUs
-and runs E4M3 MFMA: 3.1 ms on the 9k x 99k shape, 3.6-4x faster on short
-extends.
+Unlike the bf16 opus varlen kernel it splits KV across all CUs, which matters
+for short extends over a long prefix. Q/K/V are cast to E4M3 with unit scales
+(saturating at +-448), as TRT-LLM's FP8 ragged prefill.
 
-Numerics match TRT-LLM's FP8 ragged prefill (E4M3 Q/K/V cast with unit
-scales, P quantized to E4M3 for PV). Here Q/K/V are cast with unit scales
-too, saturating at +-448 instead of producing NaN. The FP8 kernel's
-error equals that of exact attention on e4m3-rounded Q/K/V/P.
-
-12 heads: mla_reduce_v1 has no 12-head instance. The partial / final buffers
-[rows, 12, 128] are viewed as [3*rows, 4, 128] (the 4-head instance) and the
-reduce row maps are scaled by 3 -- the reduction is per (row, head, dim), so
-this is exact.
+mla_reduce_v1 has no 12-head instance: the [rows, 12, 128] buffers are viewed
+as [3 * rows, 4, 128] and the reduce row maps scaled by 3 (exact, the reduction
+is per (row, head, dim)).
 
 The ASM kernel takes no strides: K8 [N, H, 192] and V8 [N, H, 128] must be
 dense, rows ordered per request exactly like kv_indptr (prefix then extend).
@@ -54,9 +42,6 @@ class K3Fp8PrefillPlan:
     reduce_partial_map3: torch.Tensor
     num_partial_rows: int
     max_q_len: int
-    total_q: int
-    total_kv: int
-    num_heads: int
     one: torch.Tensor
 
 
@@ -121,9 +106,6 @@ def make_plan(
         reduce_partial_map3=red_partial3,
         num_partial_rows=red_partial.size(0) * _TILE_Q,
         max_q_len=max_q,
-        total_q=total_q,
-        total_kv=total_kv,
-        num_heads=num_heads,
         one=torch.ones((), dtype=torch.float32, device=device),
     )
 

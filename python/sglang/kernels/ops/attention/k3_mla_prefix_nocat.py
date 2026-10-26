@@ -1,26 +1,9 @@
 """Kimi-K3 MLA extend-with-prefix K/V assembly without the concat (ROCm).
 
-An extend batch with a cached prefix runs MHA over the whole sequence, so the
-aiter backend rebuilds per-head K/V for every prefix token of every MLA layer:
-
-    K_Buffer = index_select(cache, kv_indices)          vectorized_gather
-    kvc, k_pe = split(K_Buffer); kvc.to(bf16); k_pe.to  2x strided fp8 cast
-    kv = kv_b_proj(kvc.contiguous())                    [N, H*(dn+dv)] GEMM
-    k = cat([kv[..., :dn], broadcast(k_pe, H)])         CatArrayBatchedCopy
-    v = kv[..., dn:]                                    (view)
-
-At 99k prefix tokens x 3 requests the cast + concat cost ~1.7 ms per layer,
-more than the GEMM. This module instead:
-
-1. gathers the latent rows from the paged cache by kv_indices in one Triton
-   launch, casts them to bf16 into a dense [N, kv_lora] GEMM input, and writes
-   k_pe (cast, broadcast to all H heads) straight into its slot of K;
-2. runs the original kv_b_proj GEMM, then one Triton copy of k_nope into the
-   dense [N, H, dn + rope] K; V stays a view of the GEMM output.
-
-MI355X, one layer, 12 heads, K/V build only: 3x(90k+9k) rows 2.67 -> 1.45 ms,
-1x(90k+9k) 0.90 -> 0.50 ms. The result is bit-identical to the original path
-(e4m3fn -> bf16 is exact).
+Replaces index_select + strided fp8 casts + contiguous + cat around kv_b_proj:
+one Triton gather dequantizes the latent rows into the GEMM input and writes
+k_pe (broadcast to all heads) into its slot of K, and one copy places k_nope;
+V stays a view of the GEMM output. Bit-identical (e4m3fn -> bf16 is exact).
 """
 
 from __future__ import annotations

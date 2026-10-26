@@ -14,6 +14,7 @@ Usage:
 import json
 import unittest
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -24,6 +25,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
+    grammar_stop_token_ids,
     register_grammar_backend,
 )
 from sglang.srt.runtime_context import get_context  # noqa: E402
@@ -417,15 +419,14 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 dispatch.assert_called_once_with(key_string)
 
 
+class TestGrammarStopTokenIds(unittest.TestCase):
+    def test_includes_every_scheduler_stop_token(self):
+        tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
+        self.assertEqual(
+            grammar_stop_token_ids(tokenizer, {163586}), [7, 163585, 163586]
+        )
+        self.assertIsNone(grammar_stop_token_ids(SimpleNamespace(), None))
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-def test_grammar_stop_token_ids_include_every_scheduler_stop_token():
-    from types import SimpleNamespace
-
-    from sglang.srt.constrained.base_grammar_backend import grammar_stop_token_ids
-
-    tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
-    assert grammar_stop_token_ids(tokenizer, {163586}) == [7, 163585, 163586]
-    assert grammar_stop_token_ids(SimpleNamespace(), None) is None

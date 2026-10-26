@@ -726,8 +726,6 @@ class AiterAttnBackend(AttentionBackend):
                     kv_cache_dtype=self.kv_cache_dtype,
                 )
             )
-            if self.use_k3_mla_verify:
-                logger.info("aiter MLA target_verify: K3 Gluon/HipKittens kernels")
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]

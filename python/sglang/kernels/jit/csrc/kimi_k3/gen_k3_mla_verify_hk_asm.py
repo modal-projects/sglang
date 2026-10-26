@@ -19,7 +19,6 @@ Q0 = 48
 SBUF = (120, 152)
 P0 = 184
 KR = 192
-VR = 224
 T = 240  # temps (QK block exp sums: v240..255; K ring uses v192..239)
 KSLOTS = 6  # K ring slots (v192.. during QK, V ring unused)
 PDK = 4  # K reads issued this many MFMAs ahead
@@ -190,15 +189,6 @@ def exp_valu(cur):
         for g8 in range(8):
             if step == 4 * g8 + 3 + 4 + 3:
                 v += grp[g8]
-    return v
-    for i in range(8):
-        v.append(f"v_add_f32_e32 v{t[i]}, v{t[i]}, v{t[8 + i]}")
-    for i in range(4):
-        v.append(f"v_add_f32_e32 v{t[i]}, v{t[i]}, v{t[4 + i]}")
-    v.append(f"v_add_f32_e32 v{t[0]}, v{t[0]}, v{t[2]}")
-    v.append(f"v_add_f32_e32 v{t[1]}, v{t[1]}, v{t[3]}")
-    v.append(f"v_add_f32_e32 v{t[0]}, v{t[0]}, v{t[1]}")
-    v.append(f"v_fma_f32 %[l], %[l], %[al], v{t[0]}")
     return v
 
 
@@ -495,57 +485,6 @@ def q_prologue(lds=False, part=0):
         for idx in range(g0, g0 + 4):
             t = 196 + 4 * (idx % 4)
             l.append(f"v_cvt_pk_fp8_f32 v{48 + idx}, v{t + 2}, v{t + 3} op_sel:[0,0,1]")
-    return l
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            t = 196 + 4 * ((8 * ks + k) % 4)
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_dot2_f32_bf16 v{t}, v{r0}, v194, 0",
-                f"v_dot2_f32_bf16 v{t + 1}, v{r0}, v195, 0",
-                f"v_dot2_f32_bf16 v{t + 2}, v{r0 + 1}, v194, 0",
-                f"v_dot2_f32_bf16 v{t + 3}, v{r0 + 1}, v195, 0",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{t + 1}",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t + 2}, v{t + 3} op_sel:[0,0,1]",
-            ]
-    return l
-    # exact per-row scale (amax -> 448), like v2: q8 = fp8(q * 448 / amax)
-    l.append("v_mul_f32_e32 v193, 0x3b124925, v192")  # amax / 448 (= qscale)
-    l.append("v_mov_b32_e32 %[am], v193")
-    l.append("v_rcp_f32_e32 v194, v192")
-    l.append("s_nop 1")
-    l.append("v_mul_f32_e32 v194, 0x43e00000, v194")  # q_inv = 448 / amax
-    l.append("v_mov_b32_e32 v195, v194")
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            t = 196 + 4 * ((8 * ks + k) % 4)
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_lshlrev_b32_e32 v{t}, 16, v{r0}",
-                f"v_and_b32_e32 v{t + 1}, 0xffff0000, v{r0}",
-                f"v_lshlrev_b32_e32 v{t + 2}, 16, v{r0 + 1}",
-                f"v_and_b32_e32 v{t + 3}, 0xffff0000, v{r0 + 1}",
-                f"v_pk_mul_f32 v[{t}:{t + 1}], v[{t}:{t + 1}], v[194:195]",
-                f"v_pk_mul_f32 v[{t + 2}:{t + 3}], v[{t + 2}:{t + 3}], v[194:195]",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{t + 1}",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t + 2}, v{t + 3} op_sel:[0,0,1]",
-            ]
-    return l
-    # power-of-two scale >= amax / 448 (fp8 relative precision is scale-invariant)
-    l.append("v_mul_f32_e32 v192, 0x3b124925, v192")  # amax / 448
-    l.append("v_add_u32_e32 v192, 0x7fffff, v192")
-    l.append("v_and_b32_e32 v192, 0x7f800000, v192")  # 2^ceil(log2(amax / 448))
-    l.append("v_mov_b32_e32 %[am], v192")
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0}, v192",
-                f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0 + 1}, v192 op_sel:[0,0,1]",
-            ]
     return l
 
 

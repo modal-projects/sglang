@@ -1,17 +1,10 @@
-"""K3 MLA target-verify (QLEN=8, 12 heads, FP8 KV latent 576) with an on-device
-regime switch between the bf16 Gluon kernel (aiter mla_gluon bh16bn128, best at
-short context / small batch) and the HipKittens kernel (k3_mla_verify_hk, best
-at long context or larger batches). Graph capturable: the grid depends only on
-the batch size; the regime is decided at replay time from kv_indptr.
+"""K3 MLA target verify (QLEN=8, 12 heads, FP8 KV latent 576) on gfx950.
 
-  1. _mla_gluon       aiter stage 1 with REGIME_SEL=True: a prologue computes
-                      eff = bs * max_b(L_b), publishes the regime and exits in
-                      the HK regime.
-  2. hk_stage1        HK split-KV stage 1 (no-op in the Gluon regime).
-  3. hk_reduce        merges whichever splits ran (_k3_auto_reduce when the HIP
-                      reduce does not apply).
-
-thresh(bs) comes from graph-replayed crossovers of the two kernels.
+An on-device switch picks per batch between AITER's Gluon MLA kernel (short
+context) and the HipKittens kernel k3_mla_verify_hk (long context): the Gluon
+prologue computes bs * max(L), publishes the regime and exits in the HK regime,
+and the HK stage 1 is a no-op in the Gluon regime. The grid depends only on bs,
+so this is CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -127,7 +120,7 @@ def _k3_auto_reduce(
         o = acc / tl.where(wsum > 0.0, wsum, 1.0)
         tl.store(O + o_off + offs_d, o.to(O.dtype.element_ty))
     elif G_NSPLIT > 1:
-        # == aiter _mla_softmax_reducev_kernel for this row / column block
+        # Gluon splits, as aiter _mla_softmax_reducev_kernel
         gL = tl.load(KV_INDPTR + b + 1) - tl.load(KV_INDPTR + b)
         gper = tl.maximum(G_BLOCK_N, gL // G_NSPLIT)
         gnact = tl.minimum(tl.cdiv(gL, gper), G_NSPLIT)

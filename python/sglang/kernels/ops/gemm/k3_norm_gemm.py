@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3 ROCm decode/verify: a row normalization fused into the prologue of
-the skinny bf16 GEMM that consumes it (M = tokens <= 16, graph replay). HIP
-kernel: jit/csrc/kimi_k3/norm_gemm_hip.cuh.
+"""Kimi-K3 ROCm KDA gated o_norm fused into the o_proj GEMM prologue (M <= 16).
 
-``kda_onorm_oproj_hip``
-    y[M, N] = o @ w_o^T,  o = bf16(((x * rstd) * norm_w) * sigmoid(gate)) per
-    (token, head of 128) -- the gated RMSNorm (layer_norm_gated_fwd_kernel) + the o_proj GEMM
-    in one launch. The operand o is bit-identical to the unfused kernel's.
-
-Outputs differ from the unfused pair only by GEMM summation order (<= 1 bf16
-ulp vs the tuned hgemm; equal error vs a float64 reference).
+The normalized operand is bit-identical to layer_norm_gated_fwd_kernel's; the
+output differs from the unfused pair only by GEMM summation order.
 """
 
 from __future__ import annotations
@@ -17,11 +10,6 @@ from __future__ import annotations
 import functools
 
 import torch
-
-# The HIP kernel issues this lane's operand loads, then its whole weight
-# stream, and normalizes only its own MFMA A fragment while the weights are in
-# flight (every block still recomputes the M x K prologue: that VALU work, not
-# bandwidth, is what the fusion costs on top of the plain GEMM).
 
 _MODE_GATED_HEAD = 0
 HIP_MAX_M = 16

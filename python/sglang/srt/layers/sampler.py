@@ -788,11 +788,7 @@ def top_k_top_p_filter_probs_torch(
     top_ps: torch.Tensor,
     max_top_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The pytorch backend's top-k/top-p filter, in descending-sorted order.
-
-    Returns unnormalized ``(probs_sort, probs_idx)``. Speculative verify reuses
-    this so its target distribution has exactly the sampler's support,
-    including how ties at the top-p cutoff are broken.
+    """Unnormalized descending ``(probs_sort, probs_idx)`` after top-k/top-p.
 
     max_top_k, when given, must be >= every value in top_ks.
     """

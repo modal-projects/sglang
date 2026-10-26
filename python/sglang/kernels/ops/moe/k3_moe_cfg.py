@@ -15,9 +15,6 @@ fused_moe looks one up; every other shape is untouched.
 from __future__ import annotations
 
 import functools
-import logging
-
-logger = logging.getLogger(__name__)
 
 # K3 TP8 routed experts: (model_dim, inter_dim, experts, topk)
 _K3_SHAPE = (3584, 384, 896, 16)
@@ -73,7 +70,6 @@ def apply_k3_moe_decode_cfg() -> None:
             state["done"] = True
             if n:
                 orig.cache_clear()
-                logger.info("K3 MoE decode configs applied to %d aiter tuned rows", n)
             else:
                 return res
         return orig(token, model_dim, inter_dim, expert, topk, *args, **kwargs)

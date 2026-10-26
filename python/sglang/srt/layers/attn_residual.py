@@ -533,10 +533,8 @@ class AttnResidual:
         # Whether a write snapshotted only this rank's slice of the rows, which
         # leaves the bank's other rows stale on this rank.
         self.written_on_slice = False
-        # Deferred dspark capture: see defer_stream.
+        # See defer_stream and forward_ag_fused.
         self._stream_pending = None
-        # Precomputed attention-side aggregation:
-        # see forward_ag_fused.
         self._agg_stash = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)

@@ -3220,8 +3220,6 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         nxt = self._ag_agg_next
         if nxt is not None:
-            # ROCm: the MoE up_proj all-gather also runs the next layer's
-            # attention-side aggregation (see AttnResidual.forward_ag_fused).
             self.mlp._ag_agg_ctx = (self._attn_bank.require(), nxt)
         try:
             if self._ffn_writes_stream:
@@ -3510,11 +3508,8 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         aux_hidden_states,
     ) -> bool:
-        """Instead of a standalone aggregate_stream
-        launch plus the packer's copy, claim the packed aux slot and let the
-        next layer's attention-side aggregation (same stream head, same
-        weights, same rows) write the pre-norm mixture into it in place.
-        Returns False when the capture must run eagerly."""
+        """Let the next layer's attention-side aggregation write this capture
+        into its packed aux slot; False when it must run eagerly."""
         if (
             not _is_hip
             or self.attn_bank is None

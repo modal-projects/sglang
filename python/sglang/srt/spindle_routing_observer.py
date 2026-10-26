@@ -2,26 +2,28 @@
 
 The scheduler captures immutable CPU metadata and changed token bytes. A
 separate process hashes and publishes observations; one acknowledged capture
-may be in flight. No tensors or cache access state are modified.
+may be in flight. No tensors or cache access state are modified. Caches without
+the native delta publish load only, and any capture failure disables
+observations instead of stopping the scheduler.
 Enable explicitly with SGLANG_SPINDLE_ROUTING_OBSERVATIONS=1.
 """
 
-from array import array
-import json
 import atexit
+import json
 import logging
 import os
 import pickle
-from pathlib import Path
-from queue import Empty, Queue
 import socket
-import subprocess
 import struct
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+from queue import Empty, Queue
 
 import xxhash
+
 if __name__ != "__main__":
     from sglang.srt.runtime_context import get_parallel
 
@@ -31,6 +33,7 @@ PATH = Path("/tmp/spindle-routing-work.json")
 publisher = None
 last_snapshot = 0.0
 sequence = 0
+load_only_logged = False
 
 
 class IncrementalPrefixes:
@@ -283,65 +286,31 @@ class BackgroundPublisher:
             self.closed.wait(1)
 
 
-def capture_python_cache(cache):
-    """Copy legacy CPU tree state; descendants of evicted nodes receive no credit."""
-    kind = type(cache).__name__
-    if kind == "UnifiedRadixCache" and not cache.is_swa_enabled:
-        if type(cache.tree_core).__name__ != "UnifiedTreeCore":
-            return None
-        root = cache.tree_core.root_node
-        validators = [
-            c.create_match_validator(match_device_only=True)
-            for c in cache.components.values()
-        ]
-
-        def resident(node):
-            return not node.evicted
-
-        def valid(node):
-            return all(check(node) for check in validators)
-
-        hybrid = cache.is_mamba_enabled
-    elif kind in {"RadixCache", "MambaRadixCache"}:
-        root = cache.root_node
-        hybrid = kind == "MambaRadixCache"
-
-        def resident(node):
-            return node.value is not None
-
-        def valid(node):
-            return resident(node) and (not hybrid or node.mamba_value is not None)
-    else:
+def native_delta(cache):
+    """The incremental export, or None when this cache or binary lacks it."""
+    if type(cache).__name__ != "UnifiedRadixCache" or cache.is_swa_enabled:
         return None
-    rows = []
-    stack = [(node, root.id) for node in root.children.values()]
-    while stack:
-        node, parent = stack.pop()
-        if not resident(node) or node.key.is_bigram or node.key.cache_salt:
-            continue
-        tokens = array("q", node.key.raw_token_ids())
-        if sys.byteorder != "little":
-            tokens.byteswap()
-        rows.append(
-            (
-                node.id,
-                parent,
-                node.key.extra_key,
-                tokens.tobytes(),
-                valid(node),
-                node.last_access_time,
-                len(tokens),
-            )
-        )
-        stack.extend((child, node.id) for child in node.children.values())
-    return root.id, rows, hybrid
+    tree_core = cache.tree_core
+    if type(tree_core).__name__ != "RustUnifiedTreeCore":
+        return None
+    return getattr(tree_core._binding, "routing_snapshot_delta", None)
 
 
 def snapshot(scheduler, running_batch, last_batch):
-    global last_snapshot, sequence, publisher
+    global ENABLED
+    if not ENABLED:
+        return
+    try:
+        capture(scheduler, running_batch, last_batch)
+    except Exception:
+        ENABLED = False
+        logging.exception("Spindle routing observations failed and are now disabled")
+
+
+def capture(scheduler, running_batch, last_batch):
+    global last_snapshot, sequence, publisher, load_only_logged
     if (
-        not ENABLED
-        or get_parallel().tp_rank != 0
+        get_parallel().tp_rank != 0
         or get_parallel().dp_size != 1
         or get_parallel().pp_size != 1
     ):
@@ -356,25 +325,24 @@ def snapshot(scheduler, running_batch, last_batch):
     manager = scheduler.tp_worker.model_runner.lora_manager
     names = {uid: ref.lora_name for uid, ref in manager.lora_refs.items()}
     cache = scheduler.tree_cache
-    incremental = (
-        type(cache).__name__ == "UnifiedRadixCache"
-        and not cache.is_swa_enabled
-        and type(cache.tree_core).__name__ == "RustUnifiedTreeCore"
-    )
     if publisher is None:
         publisher = BackgroundPublisher()
     if not publisher.ready(cache):
         return
-    if incremental:
-        root, cache_rows = cache.tree_core._binding.routing_snapshot_delta(
-            publisher.known
-        )
+    delta = native_delta(cache)
+    if delta is not None:
+        root, cache_rows = delta(publisher.known)
         hybrid = cache.is_mamba_enabled
     else:
-        capture = capture_python_cache(cache)
-        if capture is None:
-            return
-        root, cache_rows, hybrid = capture
+        # Copying a Python tree here costs the scheduler O(cached tokens) each
+        # second, so these workers report load and adapters without prefixes.
+        if not load_only_logged:
+            load_only_logged = True
+            logging.warning(
+                "Spindle routing observations omit prefixes for %s",
+                type(cache).__name__,
+            )
+        root, cache_rows, hybrid = None, [], False
     requests = {r.rid: r for r in scheduler.waiting_queue}
     for batch in (running_batch, last_batch):
         if batch is not None:

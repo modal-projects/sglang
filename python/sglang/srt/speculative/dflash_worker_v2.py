@@ -419,8 +419,7 @@ class _DominoDraftSampler:
 
 
 class DFlashWorkerV2(BaseSpecWorker):
-    # Platform hooks below are overridden by DFlashWorkerV2ROCm
-    # (dflash_worker_v2_rocm.py); the defaults are the portable path.
+    # Platform hooks, overridden by DFlashWorkerV2ROCm.
     _packed_draft_argmax = False
     _publish_before_mamba_commit = False
 
@@ -694,9 +693,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             and sampling_info.sampling_mask_batch_indices is None
         )
 
-    def _init_tail_graph_state(self) -> None:
-        pass
-
     @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
@@ -801,13 +797,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
-            self._k3_prep_graph = None
-            if capture_decode_cuda_graph:
-                from sglang.srt.speculative.k3_dflash_prep_graph import (
-                    K3DFlashPrepGraph,
-                )
-
-                self._k3_prep_graph = K3DFlashPrepGraph.maybe_build(self)
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -2094,20 +2083,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_cache_loc=cache_loc,
             )
 
-    def _replay_tail_graph(
-        self,
-        *,
-        target_hidden: torch.Tensor,
-        cache_loc: torch.Tensor,
-        cache_loc_2d: torch.Tensor,
-        positions: torch.Tensor,
-        commit_lens: torch.Tensor,
-        bs: int,
-    ) -> bool:
-        """Replay the draft-KV append from a captured graph. False: not
-        covered, the caller runs _append_target_hidden_to_draft_kv_by_loc."""
-        return False
-
     def _kv_fuse_store(self, attn, k, v, positions, cache_loc_2d, commit_lens) -> bool:
         """Fused k-norm + RoPE + KV write for one draft layer. False: not
         covered, nothing was written."""
@@ -2983,45 +2958,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
-        k3_fast = None
-        if self._k3_prep_graph is not None:
-            k3_fast = self._k3_prep_graph.run(
-                batch=batch, draft_input=draft_input, bs=bs
-            )
-        if k3_fast is not None:
-            (
-                block_ids,
-                positions,
-                verify_out_cache_loc,
-                verify_out_cache_loc_2d,
-                draft_next,
-                prefix_lens,
-            ) = k3_fast
-            kv_loc_plan = self._plan_block_kv_locs(
-                batch=batch,
-                draft_input=draft_input,
-                prefix_lens=prefix_lens,
-                verify_out_cache_loc=verify_out_cache_loc,
-                block_size=block_size,
-            )
-        else:
-            (
-                block_ids,
-                positions,
-                verify_out_cache_loc,
-                verify_out_cache_loc_2d,
-                draft_next,
-                prefix_lens,
-                kv_loc_plan,
-            ) = self._draft_block_eager(
-                batch=batch,
-                draft_input=draft_input,
-                bs=bs,
-                block_size=block_size,
-                device=device,
-                embed_module=embed_module,
-                lm_head=lm_head,
-            )
+        (
+            block_ids,
+            positions,
+            verify_out_cache_loc,
+            verify_out_cache_loc_2d,
+            draft_next,
+            prefix_lens,
+            kv_loc_plan,
+        ) = self._draft_block_eager(
+            batch=batch,
+            draft_input=draft_input,
+            bs=bs,
+            block_size=block_size,
+            device=device,
+            embed_module=embed_module,
+            lm_head=lm_head,
+        )
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -3172,16 +3125,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
-        # publish the new seq lens (the
-        # event the scheduler host-waits on) before the mamba-state commit, so
-        # that commit overlaps the scheduler's host work instead of delaying
-        # it. The commit stays on this stream, ahead of the next step's work.
-        published = False
         if on_publish is not None and self._publish_before_mamba_commit:
             if new_seq_lens is None:
                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             on_publish(new_seq_lens)
-            published = True
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -3196,7 +3143,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-        if on_publish is not None and not published:
+        if on_publish is not None and not self._publish_before_mamba_commit:
             on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
@@ -3210,21 +3157,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         cache_loc = self._draft_write_ids(kv_loc_plan)
-        if not self._replay_tail_graph(
+        self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
-            bs=bs,
-        ):
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-                positions=positions,
-                commit_lens=commit_lens,
-            )
+        )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

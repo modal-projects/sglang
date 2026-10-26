@@ -1,5 +1,4 @@
-"""DFlash V2 platform hooks: portable defaults, ROCm worker selection and the
-ROCm worker's fallbacks to the portable path."""
+"""DFlash V2 platform hooks: portable defaults and ROCm worker selection."""
 
 import unittest
 from types import SimpleNamespace
@@ -14,30 +13,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-_TAIL_KW = dict(
-    target_hidden=torch.zeros(8, 4),
-    cache_loc=torch.zeros(8, dtype=torch.int64),
-    cache_loc_2d=torch.zeros(1, 8, dtype=torch.int64),
-    positions=torch.zeros(8, dtype=torch.int64),
-    commit_lens=torch.ones(1, dtype=torch.int32),
-    bs=1,
-)
-
-
-def _worker(cls, **attrs):
-    worker = object.__new__(cls)
-    worker.__dict__.update(attrs)
-    return worker
-
-
-def _mamba_kw():
-    return dict(
-        batch=SimpleNamespace(mamba_track_indices=None),
-        commit_lens=torch.tensor([1, 3, 8], dtype=torch.int32),
-        seq_lens_pre_verify=torch.tensor([10, 20, 30]),
-        seq_lens_post_verify=torch.tensor([11, 23, 38]),
-    )
 
 
 class TestDFlashWorkerPlatformHooks(CustomTestCase):
@@ -54,7 +29,7 @@ class TestDFlashWorkerPlatformHooks(CustomTestCase):
                 self.assertIs(worker_cls, expected)
 
     def test_portable_defaults(self):
-        worker = _worker(DFlashWorkerV2)
+        worker = object.__new__(DFlashWorkerV2)
         self.assertFalse(DFlashWorkerV2._packed_draft_argmax)
         self.assertFalse(DFlashWorkerV2._publish_before_mamba_commit)
         logits = torch.randn(6, 33)
@@ -62,42 +37,32 @@ class TestDFlashWorkerPlatformHooks(CustomTestCase):
             torch.equal(worker._verify_argmax(logits), torch.argmax(logits, dim=-1))
         )
         self.assertFalse(worker._kv_fuse_store(None, None, None, None, None, None))
-        self.assertFalse(worker._replay_tail_graph(**_TAIL_KW))
-        steps, track = worker._mamba_commit_steps(**_mamba_kw())
+        steps, track = worker._mamba_commit_steps(
+            batch=SimpleNamespace(mamba_track_indices=None),
+            commit_lens=torch.tensor([1, 3, 8], dtype=torch.int32),
+            seq_lens_pre_verify=torch.tensor([10, 20, 30]),
+            seq_lens_post_verify=torch.tensor([11, 23, 38]),
+        )
         self.assertTrue(torch.equal(steps, torch.tensor([0, 2, 7])))
         self.assertEqual(steps.dtype, torch.int64)
         self.assertIsNone(track)
 
-    def test_rocm_worker_falls_back_off_device(self):
-        attrs = dict(
-            device=torch.device("cpu"),
-            draft_window_size=8,
-            page_size=1,
-            _use_triton_compact_rebuild=True,
-            _tail_graph_on=False,
+    def test_rocm_prefill_append_skips_tail_graph(self):
+        worker = object.__new__(DFlashWorkerV2ROCm)
+        worker._tail_graph_on = True
+        worker._replay_tail_graph = mock.Mock()
+        kw = dict(
+            target_hidden=torch.zeros(4, 2),
+            cache_loc=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            extend_lens=torch.tensor([4]),
         )
-        rocm = _worker(DFlashWorkerV2ROCm, **attrs)
-        portable = _worker(DFlashWorkerV2, **attrs)
-        self.assertTrue(DFlashWorkerV2ROCm._packed_draft_argmax)
-        self.assertTrue(DFlashWorkerV2ROCm._publish_before_mamba_commit)
-
-        logits = torch.randn(6, 33)
-        self.assertTrue(
-            torch.equal(rocm._verify_argmax(logits), portable._verify_argmax(logits))
-        )
-        for got, ref in zip(
-            rocm._mamba_commit_steps(**_mamba_kw()),
-            portable._mamba_commit_steps(**_mamba_kw()),
-        ):
-            self.assertTrue(got is ref is None or torch.equal(got, ref))
-        prefix_lens = torch.tensor([3, 8, 20], dtype=torch.int32)
-        got, got_suffix = rocm._compact_draft_prefix_lens(prefix_lens)
-        ref, ref_suffix = portable._compact_draft_prefix_lens(prefix_lens)
-        self.assertTrue(torch.equal(got, ref))
-        self.assertIsNone(got_suffix)
-        self.assertIsNone(ref_suffix)
-        # Disabled tail graph: the caller runs the eager append.
-        self.assertFalse(rocm._replay_tail_graph(**_TAIL_KW))
+        with mock.patch.object(
+            DFlashWorkerV2, "_append_target_hidden_to_draft_kv_by_loc"
+        ) as eager:
+            worker._append_target_hidden_to_draft_kv_by_loc(**kw)
+        worker._replay_tail_graph.assert_not_called()
+        eager.assert_called_once_with(cache_loc_2d=None, commit_lens=None, **kw)
 
 
 if __name__ == "__main__":

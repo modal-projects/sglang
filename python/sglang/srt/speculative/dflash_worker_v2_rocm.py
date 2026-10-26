@@ -1,10 +1,5 @@
-"""DFlash V2 worker with the ROCm (gfx950) fast paths.
-
-Same algorithm as DFlashWorkerV2; overrides its platform hooks with HIP
-kernels (packed draft argmax, fused draft-KV store, verify argmax and the
-post-verify bookkeeping kernels) and replays the post-verify draft-KV append
-from a captured graph.
-"""
+"""DFlashWorkerV2 with the ROCm fast paths: packed draft argmax, fused draft-KV
+store, fused post-verify bookkeeping, and graphed draft prep / draft-KV tail."""
 
 from __future__ import annotations
 
@@ -13,11 +8,24 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.speculative.k3_dflash_kv_store import rope_store_prefix_valid
+from sglang.kernels.ops.speculative.k3_dflash_post import (
+    compact_draft_lens,
+    mamba_track_steps,
+    verify_argmax,
+)
+from sglang.srt.layers import layernorm as _ln
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel, mamba_track_grid
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.k3_dflash_prep_graph import K3DFlashPrepGraph
+from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
 
 logger = logging.getLogger(__name__)
+
+_TAIL_GRAPH_MAX_BS = 64
+_TAIL_GRAPH_MAX_SIGNATURES = 64
+_TAIL_GRAPH_WARMUP_STEPS = 3
 
 
 class DFlashWorkerV2ROCm(DFlashWorkerV2):
@@ -26,47 +34,81 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
     # the mamba-state commit so the commit overlaps the scheduler's host work.
     _publish_before_mamba_commit = True
 
-    def _init_tail_graph_state(self) -> None:
-        # Lazily captured per input signature (see _tail_graph_run).
-        self._tail_graph_on = bool(
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._prep_graph: Optional[K3DFlashPrepGraph] = None
+        self._tail_graph_on = (
             self.lilicorr is None and not get_parallel().attn_dp_enabled
         )
-        self._tail_graph_states: dict = {}
+        self._tail_graphs: dict = {}
         self._tail_graph_pool = None
-        self._tail_graph_commit_buf: Optional[torch.Tensor] = None
+        self._tail_commit_lens: Optional[torch.Tensor] = None
 
-    def _replay_tail_graph(self, **kwargs) -> bool:
-        return self._tail_graph_on and self._tail_graph_run(**kwargs)
+    def init_cuda_graphs(self):
+        super().init_cuda_graphs()
+        self._prep_graph = None
+        if self._draft_sampler is not None:
+            with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
+                self._prep_graph = K3DFlashPrepGraph.maybe_build(self)
 
-    def _tail_graph_run(
+    def _draft_block_eager(self, *, batch, draft_input, bs, block_size, **kwargs):
+        out = None
+        if self._prep_graph is not None:
+            out = self._prep_graph.run(batch=batch, draft_input=draft_input, bs=bs)
+        if out is None:
+            return super()._draft_block_eager(
+                batch=batch,
+                draft_input=draft_input,
+                bs=bs,
+                block_size=block_size,
+                **kwargs,
+            )
+        kv_loc_plan = self._plan_block_kv_locs(
+            batch=batch,
+            draft_input=draft_input,
+            prefix_lens=out[5],
+            verify_out_cache_loc=out[2],
+            block_size=block_size,
+        )
+        return (*out, kv_loc_plan)
+
+    def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
         target_hidden: torch.Tensor,
         cache_loc: torch.Tensor,
-        cache_loc_2d: torch.Tensor,
         positions: torch.Tensor,
-        commit_lens: torch.Tensor,
-        bs: int,
-    ) -> bool:
-        """Replay the post-verify draft-KV
-        materialization (fc projection + per-layer K-norm/RoPE/KV-proj/
-        prefix-valid KV write, ~26 launches) as one CUDA graph per batch size.
-
-        Every input lives at a stable address for a given batch size (the
-        shared target aux-hidden output, the static draft-block cache-loc /
-        position buffers) except ``commit_lens`` (rotating accept buffers),
-        which is staged into a static buffer. Captured lazily after a few eager
-        steps with an unchanged input signature; any signature change (e.g. an
-        eager-verify step) runs eager. Returns False when the caller must run
-        the eager path."""
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
+    ) -> None:
         if (
-            commit_lens is None
-            or cache_loc_2d is None
-            or target_hidden.dim() != 2
-            or not target_hidden.is_cuda
-            or bs <= 0
-            or bs > 64
+            self._tail_graph_on
+            and commit_lens is not None
+            and cache_loc_2d is not None
+            and self._replay_tail_graph(
+                target_hidden, cache_loc, cache_loc_2d, positions, commit_lens
+            )
         ):
+            return
+        super()._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+            extend_lens=extend_lens,
+        )
+
+    def _replay_tail_graph(
+        self, target_hidden, cache_loc, cache_loc_2d, positions, commit_lens
+    ) -> bool:
+        """Replay the post-verify draft-KV append as one graph per input
+        signature, captured after a few eager steps. Every input but
+        ``commit_lens`` (staged into a static buffer) has a stable address per
+        batch size. False: the caller runs the eager append."""
+        bs = cache_loc_2d.shape[0]
+        if not 0 < bs <= _TAIL_GRAPH_MAX_BS:
             return False
         sig = (
             target_hidden.data_ptr(),
@@ -81,33 +123,31 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
             cache_loc.dtype,
             cache_loc_2d.dtype,
         )
-        st = self._tail_graph_states.get(sig)
+        st = self._tail_graphs.get(sig)
         if st is None:
-            # One graph per input signature (normally one per batch size);
-            # bounded so a flapping signature cannot recapture forever.
-            if len(self._tail_graph_states) >= 64:
+            if len(self._tail_graphs) >= _TAIL_GRAPH_MAX_SIGNATURES:
                 return False
-            st = {"warm": 0, "graph": None}
-            self._tail_graph_states[sig] = st
-        if self._tail_graph_commit_buf is None:
-            self._tail_graph_commit_buf = torch.zeros(
-                (64,), dtype=torch.int32, device=target_hidden.device
+            st = self._tail_graphs[sig] = {"warm": 0, "graph": None}
+        if self._tail_commit_lens is None:
+            self._tail_commit_lens = torch.zeros(
+                (_TAIL_GRAPH_MAX_BS,), dtype=torch.int32, device=target_hidden.device
             )
-        commit_static = self._tail_graph_commit_buf[:bs]
+        commit_static = self._tail_commit_lens[:bs]
         if st["graph"] is None:
             st["warm"] += 1
-            if st["warm"] <= 3 or st.get("failed"):
+            if st["warm"] <= _TAIL_GRAPH_WARMUP_STEPS or st.get("failed"):
                 return False
+        commit_static.copy_(commit_lens)
+        if st["graph"] is None:
             if self._tail_graph_pool is None:
                 self._tail_graph_pool = torch.cuda.graph_pool_handle()
-            commit_static.copy_(commit_lens)
             graph = torch.cuda.CUDAGraph()
             try:
                 torch.cuda.synchronize()
                 with torch.cuda.graph(
                     graph, pool=self._tail_graph_pool, capture_error_mode="thread_local"
                 ):
-                    self._append_target_hidden_to_draft_kv_by_loc(
+                    super()._append_target_hidden_to_draft_kv_by_loc(
                         target_hidden=target_hidden,
                         cache_loc=cache_loc,
                         cache_loc_2d=cache_loc_2d,
@@ -116,76 +156,58 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
                     )
             except Exception:
                 logger.warning(
-                    "K3 DFlash tail graph capture failed for bs=%d; "
-                    "running the eager draft-KV tail for it.",
+                    "DFlash draft-KV tail graph capture failed for bs=%d; "
+                    "running it eagerly.",
                     bs,
                     exc_info=True,
                 )
                 st["failed"] = True
                 return False
             st["graph"] = graph
-            if get_parallel().tp_rank == 0:
-                logger.info("Captured draft-KV tail bs=%d", bs)
-            graph.replay()
-            return True
-        commit_static.copy_(commit_lens)
         st["graph"].replay()
         return True
 
     def _kv_fuse_store(self, attn, k, v, positions, cache_loc_2d, commit_lens) -> bool:
-        """k-norm straight from the strided K
-        slice (same AITER kernel, no .contiguous() copy) + one fused bf16-exact
-        RoPE / prefix-valid KV write. Returns False (did nothing) if ineligible."""
-        from sglang.srt.layers import layernorm as _ln
-
+        """AITER k-norm on the strided K slice, then one bf16-exact RoPE +
+        prefix-valid KV write. False (nothing written) if ineligible."""
         rope = getattr(attn, "rotary_emb", None)
         pool = self.draft_model_runner.token_to_kv_pool
         hd = int(attn.head_dim)
         norm = attn.k_norm
         if not (
-            getattr(_ln, "_use_aiter", False)
-            and getattr(norm, "_forward_method", None) is not None
-            and getattr(norm._forward_method, "__func__", None)
+            _ln._use_aiter
+            and getattr(getattr(norm, "_forward_method", None), "__func__", None)
             is _ln.RMSNorm.forward_aiter
             and not getattr(norm, "_fused_pad_kernel", None)
+            and not _ln.is_batch_invariant_mode_enabled()
             and norm.weight.dtype == torch.bfloat16
             and int(attn.num_kv_heads) == 1
-            and k.dtype == torch.bfloat16
-            and v.dtype == torch.bfloat16
+            and k.dtype == v.dtype == torch.bfloat16
             and k.dim() == 2
             and k.shape[1] == hd
             and k.stride(1) == 1
             and v.stride(1) == 1
-            and rope is not None
             and getattr(rope, "use_fallback_kernel", False)
             and getattr(rope, "is_neox_style", False)
             and int(getattr(rope, "rotary_dim", -1)) == hd
             and int(getattr(rope, "head_size", -1)) == hd
-            and hasattr(rope, "cos_sin_cache_as")
             and getattr(pool, "store_dtype", None) == torch.bfloat16
             and getattr(pool, "dtype", None) == torch.bfloat16
             and not getattr(pool, "use_hnd", False)
         ):
             return False
-        from sglang.kernels.ops.speculative.k3_dflash_kv_store import (
-            rope_store_prefix_valid,
-        )
-
-        if getattr(_ln, "is_batch_invariant_mode_enabled", lambda: False)():
-            return False
         k_normed = _ln.rms_norm(k, norm.weight.data, norm.variance_epsilon)
         rope.cos_sin_cache = rope.cos_sin_cache.to(k.device)
-        cos_sin = rope.cos_sin_cache_as(torch.bfloat16)
-        layer_id = attn.attn.layer_id
+        layer = attn.attn.layer_id - pool.start_layer
         rope_store_prefix_valid(
             k_normed.view(-1, 1, hd),
             v.view(-1, 1, hd),
             positions,
-            cos_sin,
+            rope.cos_sin_cache_as(torch.bfloat16),
             cache_loc_2d,
             commit_lens,
-            pool.k_buffer[layer_id - pool.start_layer],
-            pool.v_buffer[layer_id - pool.start_layer],
+            pool.k_buffer[layer],
+            pool.v_buffer[layer],
         )
         return True
 
@@ -197,52 +219,27 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
         seq_lens_pre_verify: torch.Tensor,
         seq_lens_post_verify: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if not commit_lens.is_cuda:
-            return super()._mamba_commit_steps(
-                batch=batch,
-                commit_lens=commit_lens,
-                seq_lens_pre_verify=seq_lens_pre_verify,
-                seq_lens_post_verify=seq_lens_post_verify,
-            )
-        from sglang.kernels.ops.speculative.k3_dflash_post import (
-            mamba_track_steps,
-        )
-
         has_track = batch.mamba_track_indices is not None
-        last_correct_step_indices, mamba_steps_to_track = mamba_track_steps(
+        return mamba_track_steps(
             commit_lens,
             seq_lens_pre_verify,
             seq_lens_post_verify,
-            (mamba_track_grid(batch.tree_cache.page_size) if has_track else 1),
+            mamba_track_grid(batch.tree_cache.page_size) if has_track else 1,
             has_track,
         )
-        return last_correct_step_indices, mamba_steps_to_track
 
     def _verify_argmax(self, next_token_logits: torch.Tensor) -> torch.Tensor:
         if (
-            next_token_logits.is_cuda
-            and next_token_logits.dtype == torch.float32
+            next_token_logits.dtype == torch.float32
             and next_token_logits.dim() == 2
             and next_token_logits.stride(1) == 1
         ):
-            from sglang.kernels.ops.speculative.k3_dflash_post import (
-                verify_argmax,
-            )
-
             return verify_argmax(next_token_logits)
         return super()._verify_argmax(next_token_logits)
 
     def _compact_draft_prefix_lens(
         self, prefix_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if prefix_lens.is_cuda and self._use_triton_compact_rebuild:
-            from sglang.kernels.ops.speculative.k3_dflash_post import (
-                compact_draft_lens,
-            )
-
-            return compact_draft_lens(
-                prefix_lens,
-                int(self.draft_window_size),
-                self.page_size if self.page_size > 1 else 1,
-            )
-        return super()._compact_draft_prefix_lens(prefix_lens)
+        return compact_draft_lens(
+            prefix_lens, int(self.draft_window_size), self.page_size
+        )

@@ -89,6 +89,17 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
+def check_lora_input(linear: nn.Module, x) -> None:
+    """LoRA kernels read the activation directly, so fused producers must keep it BF16."""
+    if isinstance(linear, BaseLayerWithLoRA) and not (
+        isinstance(x, torch.Tensor) and x.element_size() >= 2
+    ):
+        raise RuntimeError(
+            f"LoRA-wrapped {type(linear.base_layer).__name__} received a quantized "
+            f"activation ({type(x).__name__}); its producer must keep it BF16."
+        )
+
+
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with LoRA support (simplified for TP=1, no extra tokens).

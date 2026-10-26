@@ -141,6 +141,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.layers import BaseLayerWithLoRA, check_lora_input
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -347,6 +348,7 @@ class DeepseekV2MLP(nn.Module):
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
             # inside the fp8 linear method. q rows may be padded to a multiple
             # of 4; the caller slices the MLP output back.
+            check_lora_input(self.gate_up_proj, gateup_pre_quant)
             gate_up, _ = self.gate_up_proj(gateup_pre_quant)
         else:
             if (
@@ -360,6 +362,7 @@ class DeepseekV2MLP(nn.Module):
                 ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
                 x = (x, None, y)
 
+            check_lora_input(self.gate_up_proj, x)
             gate_up, _ = self.gate_up_proj(x)
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
@@ -370,6 +373,7 @@ class DeepseekV2MLP(nn.Module):
             and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
+            and not isinstance(self.down_proj, BaseLayerWithLoRA)
         ):
             M, N = gate_up.shape
             down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
@@ -456,6 +460,7 @@ class DeepseekV2MLP(nn.Module):
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
+        check_lora_input(self.down_proj, x)
         x, _ = self.down_proj(x)
         return x
 

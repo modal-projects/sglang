@@ -43,8 +43,8 @@ def _moe_sorting_small_kernel(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
-    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    stride_qx,
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -168,8 +168,8 @@ def _moe_sorting_small_kernel_distributed(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
-    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only); rows may be strided
-    stride_qx,  # row stride of qx (elements); lets the caller pass a column slice
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    stride_qx,
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,

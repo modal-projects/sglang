@@ -419,15 +419,15 @@ class _DominoDraftSampler:
 
 
 class DFlashWorkerV2(BaseSpecWorker):
-    # Platform hooks, overridden by DFlashWorkerV2ROCm.
-    _packed_draft_argmax = False
-    _publish_before_mamba_commit = False
-
     """DFLASH speculative decoding worker (spec-v2).
 
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
     scheduler runs it synchronously when overlap is disabled.
     """
+
+    # Platform hooks, overridden by DFlashWorkerV2ROCm.
+    _packed_draft_argmax = False
+    _publish_before_mamba_commit = False
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)]

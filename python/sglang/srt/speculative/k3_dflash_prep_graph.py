@@ -10,7 +10,6 @@ replay state is snapshotted at capture and re-installed per replay.
 from __future__ import annotations
 
 import contextlib
-import logging
 from typing import Dict, Optional
 
 import torch
@@ -38,8 +37,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_worker_v2 import _resolve_dflash_embedding_module
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
-
-logger = logging.getLogger(__name__)
 
 _MAX_BS = 16
 
@@ -120,10 +117,6 @@ class K3DFlashPrepGraph:
                     meta=[(b, getattr(b, "forward_metadata", None)) for b in leaves],
                 )
         torch.cuda.synchronize()
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "Captured DFlash draft prep graphs for bs=%s", sorted(self.states)
-            )
 
     def _body(self, bs: int) -> None:
         """Mirrors DFlashWorkerV2._draft_block_eager up to the draft runner's

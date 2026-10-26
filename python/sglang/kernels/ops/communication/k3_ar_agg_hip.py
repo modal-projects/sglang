@@ -1,18 +1,14 @@
 """K3 ROCm TP8: a TP collective fused with the attention-residual aggregation
-that consumes it.
+that consumes it, in one launch (see ``jit/csrc/kimi_k3/comm/ar_agg_hip.cuh``).
 
 ``ar_agg``  o_proj all-reduce (AITER 2-stage summation order) + the MLP-side
-            aggregation point (score / softmax / mix / output RMSNorm / E4M3).
+            aggregation.
 ``ag_agg``  MoE up_proj column all-gather + 3-way add (AITER
             all_gather_lastdim_add math) + the next layer's attention-side
-            aggregation (with its bank snapshot).
+            aggregation and bank snapshot.
 
-Two cross-GPU barriers (ar_agg) / one (ag_agg) and one launch instead of the
-collective plus attn_res_smallm_hip; the aggregation is spread over
-T x 4 blocks, its score / norm statistics riding the collective's barrier
-(see ``jit/csrc/kimi_k3/comm/ar_agg_hip.cuh``). The AR / add3 row and the bank
-snapshot are bit-identical to the unfused path; the normalized output matches
-up to rare 1-ulp bf16 flips (fp32 reduction order). Token counts 1..80.
+The collective's row and the bank snapshot are bit-identical to the unfused
+path; the normalized output matches up to rare 1-ulp bf16 flips.
 """
 
 from __future__ import annotations

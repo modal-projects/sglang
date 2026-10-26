@@ -1,29 +1,7 @@
-"""Attention-residual aggregation for decode/verify token counts on ROCm.
-
-Same contract as attn_res_hip.attn_res_hip (score the nvb bank rows and the
-prefix, global-max softmax, mix, optional output RMSNorm / E4M3 copy, folded
-residual add and bank snapshot), as one HIP kernel
-(jit/csrc/kimi_k3/attn_res_smallm.cuh) shaped for T = 1..64.
-
-Why: the Triton _agg_kernel keeps the bank as a [next_pow2(nvb), 8192] fp32
-register tile and pays ~0.65-1 us per bank row in LDS layout round trips
-(45 s_barrier at nvb = 8), so at M = 8 it takes 5.3 us (nvb = 1) to 10.7 us
-(nvb = 8) although it moves < 1.2 MB. One CU streams those rows in well under a
-microsecond, so the HIP kernel keeps one block per token but holds each row as
-a few 16-byte vectors per thread: all loads in flight at once, per-thread
-partial sums, one block reduction for all 2 * (nvb + 1) score partials, one for
-||acc||^2. (Splitting H over CTAs was tried: the cross-CTA reduction costs
-either a second launch, ~7.8 us total, or an atomic barrier, +3-10 us.)
-
-Numerics: identical formulas and bf16 rounding points; fp32 reductions run in
-a different order than the Triton lane tree, so the bf16 outputs match
-_agg_kernel except rare 1-ulp round-half flips (~1e-4 of elements; equal
-error vs a float64 reference). prefix_out and the bank snapshot are
-bit-identical.
-
-stream_out additionally receives the bf16 pre-norm mixture (what attn_res_hip
-returns with ow=None): the K3 dspark aux capture of the previous layer is that
-value, so the capture's own launch and the packer copy fold in here.
+"""attn_res_hip for decode/verify token counts on ROCm, as one HIP kernel
+(jit/csrc/kimi_k3/attn_res_smallm.cuh) without the Triton kernel's per-row LDS
+round trips. Outputs match attn_res_hip up to rare 1-ulp bf16 flips (fp32
+reduction order); prefix_out and the bank snapshot are bit-identical.
 """
 
 from __future__ import annotations
@@ -86,11 +64,8 @@ def attn_res_smallm_hip(
     out_fp8: Optional[torch.Tensor] = None,
     stream_out: Optional[torch.Tensor] = None,
 ) -> None:
-    """Drop-in for attn_res_hip at small T (see module docstring).
-
-    stream_out : optional [T, H] (row-strided view ok) receiving the bf16
-                 pre-norm mixture.
-    """
+    """attn_res_hip; stream_out (optional [T, H], row-strided ok) also receives
+    the bf16 pre-norm mixture (a dspark aux capture)."""
     T, H = prefix_sum.shape
     assert supported(H, nvb), (H, nvb)
     assert addend is None or prefix_out is not None, "addend requires prefix_out"

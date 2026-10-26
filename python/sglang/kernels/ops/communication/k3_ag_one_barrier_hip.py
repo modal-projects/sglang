@@ -20,8 +20,8 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 
 WORLD_SIZE = 8
 
-# inputs of the latest calls; a slot is released two calls later, i.e. after
-# the next layer's collectives have passed their start barriers
+# Keeps each input alive until two calls later, past the next collective's
+# start barrier, so the graph allocator cannot reuse it while peers read it.
 _KEEPALIVE: collections.deque = collections.deque(maxlen=2)
 _EMPTY: dict = {}
 

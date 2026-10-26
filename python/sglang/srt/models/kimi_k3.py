@@ -3056,21 +3056,17 @@ class KimiK3DecoderLayer(nn.Module):
         # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
-        o_proj = getattr(self.self_attn, "o_proj", None)
-        # O_proj emits TP-partial sums; the
-        # layer completes the reduction fused with the MLP-side aggregation
-        # (plain all-reduce when the fused kernel does not apply)
+        # ROCm: o_proj's all-reduce runs fused with the MLP-side aggregation
         self._rocm_ar_agg = (
             _is_hip
             and not self._sp_moe
             and not self.all_reduce_fusion
             and config.attn_res_block_size is not None
-            and o_proj is not None
             and get_parallel().attn_tp_size == 8
             and get_parallel().attn_tp_size == get_parallel().tp_size
         )
-        # set per forward by the model loop: the next decoder layer whose
-        # attention-side aggregation rides this layer's MoE all-gather
+        # set per forward: the next layer whose attention-side aggregation
+        # rides this layer's MoE all-gather
         self._ag_agg_next = None
 
         # MLP / MoE
@@ -3154,7 +3150,7 @@ class KimiK3DecoderLayer(nn.Module):
             (ffn, self.post_attention_layernorm),
         )
 
-    def _ffn_input_fusions(self, attn_bank=None):
+    def _ffn_input_fusions(self, attn_bank):
         """K3's kernels that complete the attention output's sum with the
         pending residual add ahead of the bank's FFN read: the fused
         all-reduce on every row, or the tuned reduce-scatter onto this rank's
@@ -3178,9 +3174,6 @@ class KimiK3DecoderLayer(nn.Module):
     def _rocm_ar_agg_read(
         self, attn_bank, hidden_states, residual, forward_batch, norm
     ):
-        """ROCm: o_proj's attention-TP all-reduce, the pending residual add
-        and the bank's FFN-side aggregation and norm in one kernel, on every
-        row; None when the kernel does not take the batch."""
         bank = attn_bank.require()
         if hidden_states.shape[0] != bank.block_residual.shape[0]:
             return None
@@ -3248,8 +3241,6 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         nxt = self._ag_agg_next
         if nxt is not None:
-            # ROCm: the MoE up_proj all-gather also runs the next layer's
-            # attention-side aggregation (see AttnResidual.forward_ag_fused).
             self.mlp._ag_agg_ctx = (self._attn_bank.require(), nxt)
         try:
             if self._ffn_writes_stream:
@@ -3278,9 +3269,6 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
-        # Fused AllReduce + aggregation with the up_proj all-gather tail: the
-        # next layer's attention-side aggregation rides the MoE all-gather
-        self._ag_agg_fused = _is_hip
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -3440,7 +3428,7 @@ class KimiK3LinearModel(nn.Module):
                     )
                 )
         for i in range(self.start_layer, self.end_layer):
-            if self._ag_agg_fused and self.attn_bank is not None:
+            if _is_hip and self.attn_bank is not None:
                 self.layers[i]._ag_agg_next = self._ag_agg_next_layer(i)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states = self.layers[i](
@@ -3513,23 +3501,13 @@ class KimiK3LinearModel(nn.Module):
         )
 
     def _ag_agg_next_layer(self, i: int):
-        """Layer i + 1 when its attention-side aggregation can be computed by
-        layer i's MoE all-gather kernel, else
-        None. dspark capture layers keep the unfused path (their stream
-        capture rides the next aggregation itself)."""
-        if i + 1 >= self.end_layer:
-            return None
-        if (
-            self.dspark_layers_to_capture is not None
-            and i in self.dspark_layers_to_capture
-        ):
+        """Layer i + 1 if layer i's MoE all-gather can compute its
+        attention-side aggregation. Capture layers defer their stream capture
+        to that aggregation instead (_dspark_defer_capture)."""
+        if i + 1 >= self.end_layer or i in (self.dspark_layers_to_capture or ()):
             return None
         nxt = self.layers[i + 1]
-        if not getattr(nxt, "_rocm_ar_agg", False) or not getattr(
-            nxt, "use_attn_residuals", False
-        ):
-            return None
-        return nxt
+        return nxt if nxt._rocm_ar_agg else None
 
     def _dspark_defer_capture(
         self,
@@ -3538,11 +3516,8 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         aux_hidden_states,
     ) -> bool:
-        """Instead of a standalone aggregate_stream
-        launch plus the packer's copy, claim the packed aux slot and let the
-        next layer's attention-side aggregation (same stream head, same
-        weights, same rows) write the pre-norm mixture into it in place.
-        Returns False when the capture must run eagerly."""
+        """Let the next layer's attention-side aggregation write this capture
+        into its packed aux slot; False when it must run eagerly."""
         if (
             not _is_hip
             or self.attn_bank is None

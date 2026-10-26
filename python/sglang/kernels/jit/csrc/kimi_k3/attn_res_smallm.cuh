@@ -1,21 +1,10 @@
-// K3 attention-residual aggregation for decode/verify token counts (ROCm).
+// K3 attention-residual aggregation for decode/verify token counts (ROCm):
+// the contract of the Triton _agg_kernel (attn_res_hip.py), plus an optional
+// bf16 pre-norm mixture output (dspark aux capture).
 //
-// Same contract as the Triton _agg_kernel in
-// sglang/kernels/ops/attention/attn_res_hip.py: per token, score the nvb bank
-// rows and the (optionally residual-added, bf16-rounded) prefix row against
-// cw with an RMS-normalized dot product, take a global-max softmax over the
-// nvb + 1 scores, mix the rows, then optionally apply the output RMSNorm and
-// emit a saturating E4M3 copy. Also optionally writes the bf16 pre-norm
-// mixture (the dspark aux-capture value) to a strided buffer.
-//
-// One block per token, every bank row held in registers (kNVB is a template
-// parameter so the row arrays stay in VGPRs): each thread owns kVPT 8-wide
-// bf16 vectors of every row, so the whole step is
-//   issue all loads -> per-thread partials -> ONE block reduction of the
-//   2 * (nvb + 1) score partials -> softmax (redundant per thread, scalar)
-//   -> mix in registers -> ONE block reduction of ||acc||^2 -> stores.
-// The Triton kernel spends ~1 us per bank row on layout round trips through
-// LDS (45 s_barrier at nvb = 8); this one has two barriers regardless of nvb.
+// One block per token; each thread holds kVPT 8-wide vectors of every row in
+// registers, so there are two block reductions (score partials, ||acc||^2)
+// regardless of nvb, instead of the Triton kernel's per-row LDS round trips.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -56,10 +45,8 @@ namespace attn_res_smallm {
 constexpr int kVec = 8;
 using vec_t = device::AlignedVector<bf16_t, kVec>;
 
-// All-reduce N per-thread values over the block, leaving the totals in every
-// thread. Transposes through LDS so the cross-lane work is one shuffle tree
-// per value-group instead of one per value (a wave64 shuffle is an LDS
-// permute; 2 * (nvb + 1) separate trees cost ~2 us at nvb = 8).
+// All-reduce N per-thread values over the block (totals in every thread),
+// transposed through LDS: one shuffle tree per value group, not per value.
 // smem: N * kThreads + N floats.
 template <int N, int kThreads>
 __device__ __forceinline__ void block_sum(float (&v)[N], float* smem) {

@@ -1,18 +1,14 @@
 """K3 ROCm TP8: a TP collective fused with the attention-residual aggregation
-that consumes it.
+that consumes it, in one launch (see ``jit/csrc/kimi_k3/comm/ar_agg_hip.cuh``).
 
 ``ar_agg``  o_proj all-reduce (AITER 2-stage summation order) + the MLP-side
-            aggregation point (score / softmax / mix / output RMSNorm / E4M3).
+            aggregation.
 ``ag_agg``  MoE up_proj column all-gather + 3-way add (AITER
             all_gather_lastdim_add math) + the next layer's attention-side
-            aggregation (with its bank snapshot).
+            aggregation and bank snapshot.
 
-Two cross-GPU barriers (ar_agg) / one (ag_agg) and one launch instead of the
-collective plus attn_res_smallm_hip; the aggregation is spread over
-T x 4 blocks, its score / norm statistics riding the collective's barrier
-(see ``jit/csrc/kimi_k3/comm/ar_agg_hip.cuh``). The AR / add3 row and the bank
-snapshot are bit-identical to the unfused path; the normalized output matches
-up to rare 1-ulp bf16 flips (fp32 reduction order). Token counts 1..80.
+The collective's row and the bank snapshot are bit-identical to the unfused
+path; the normalized output matches up to rare 1-ulp bf16 flips.
 """
 
 from __future__ import annotations
@@ -28,6 +24,7 @@ MAX_T = 80
 MAX_NVB = 8
 THREADS = 256
 REGION_BYTES = 1 << 20
+MIN_MAX_SIZE = 32 << 20
 
 _PARITY = [0]
 
@@ -41,12 +38,6 @@ def _next_parity() -> int:
     p = _PARITY[0]
     _PARITY[0] = p ^ 1
     return p
-
-
-def _region_off(ca) -> int:
-    # tail of AITER's 2 x max_size tmp area (its kernels use the head)
-    assert ca.max_size >= 32 << 20, "ar_agg needs AITER max_size >= 32 MiB"
-    return 2 * ca.max_size - REGION_BYTES
 
 
 @cache_once
@@ -73,28 +64,26 @@ def supported(num_tokens: int, hidden_size: int, nvb: int) -> bool:
 
 
 def usable(ca, num_tokens: int, hidden_size: int, nvb: int) -> bool:
-    """Whether the fused kernels can run now on this AITER communicator (TP8,
-    not disabled, not in the collective-free graph warm-up pass)."""
+    """Whether the kernels can run now on this AITER TP8 communicator (not in
+    the collective-free graph warm-up pass)."""
     return (
         ca is not None
         and not getattr(ca, "disabled", True)
         and hasattr(ca, "_pool")
         and getattr(ca, "world_size", 0) == WORLD_SIZE
-        and getattr(ca, "max_size", 0) >= 32 << 20
+        and getattr(ca, "max_size", 0) >= MIN_MAX_SIZE
         and supported(num_tokens, hidden_size, nvb)
         and not (ca._IS_CAPTURING and not torch.cuda.is_current_stream_capturing())
     )
 
 
-def _flags(a, c, write_bank, ow, out_fp8, stream_out) -> int:
-    return (
-        (1 if a is not None else 0)
-        | (2 if c is not None else 0)
-        | (4 if write_bank else 0)
-        | (8 if ow is not None else 0)
-        | (16 if out_fp8 is not None else 0)
-        | (32 if stream_out is not None else 0)
-    )
+def _out8(out: torch.Tensor, out_fp8: Optional[torch.Tensor]) -> torch.Tensor:
+    return out_fp8.view(torch.uint8) if out_fp8 is not None else out
+
+
+def _region_off(ca) -> int:
+    # tail of AITER's 2 x max_size tmp area (its kernels use the head)
+    return 2 * ca.max_size - REGION_BYTES
 
 
 def ar_agg(
@@ -103,7 +92,7 @@ def ar_agg(
     prefix_sum: Optional[torch.Tensor],
     bank: torch.Tensor,
     cw: torch.Tensor,
-    ow: Optional[torch.Tensor],
+    ow: torch.Tensor,
     nvb: int,
     score_eps: float,
     out_eps: float,
@@ -111,13 +100,10 @@ def ar_agg(
     out: torch.Tensor,
     prefix_out: torch.Tensor,
     out_fp8: Optional[torch.Tensor] = None,
-    write_bank: bool = False,
-    stream_out: Optional[torch.Tensor] = None,
 ) -> None:
-    """prefix_out = AR(partial) [+ prefix_sum] (bf16, AITER 2-stage sums);
-    out = attn_res_smallm_hip(prefix_out, bank, ...) (normed when ow given).
-    Graph capture (inside AITER's capture()) registers ``partial``; eager
-    calls stage it through AITER's input pool like AITER's all_reduce."""
+    """prefix_out = AR(partial) [+ prefix_sum]; out = the normed aggregation of
+    prefix_out. Eager calls stage ``partial`` through AITER's input pool, as
+    AITER's all_reduce does; graph capture registers it."""
     T, H = partial.shape
     assert supported(T, H, nvb), (T, H, nvb)
     assert partial.is_contiguous() and cw.dtype == torch.float32
@@ -128,6 +114,9 @@ def ar_agg(
         reg_ptr, reg_bytes = 0, 0
     else:
         reg_ptr, reg_bytes = ca._pool["input"].data_ptr, ca._pool["input"].max_size
+    flags = (
+        8 | (1 if prefix_sum is not None else 0) | (16 if out_fp8 is not None else 0)
+    )
     _module().run(
         ca._ptr,
         0,
@@ -138,12 +127,11 @@ def ar_agg(
         prefix_out,
         bank,
         cw,
-        ow if ow is not None else partial,
+        ow,
         out,
-        out_fp8.view(torch.uint8) if out_fp8 is not None else out,
-        stream_out if stream_out is not None else out,
+        _out8(out, out_fp8),
         nvb,
-        _flags(prefix_sum, None, write_bank, ow, out_fp8, stream_out),
+        flags,
         float(score_eps),
         float(out_eps),
         reg_ptr,
@@ -161,7 +149,7 @@ def ag_agg(
     add_c: Optional[torch.Tensor],
     bank: torch.Tensor,
     cw: torch.Tensor,
-    ow: Optional[torch.Tensor],
+    ow: torch.Tensor,
     nvb: int,
     score_eps: float,
     out_eps: float,
@@ -170,16 +158,20 @@ def ag_agg(
     prefix_out: torch.Tensor,
     out_fp8: Optional[torch.Tensor] = None,
     write_bank: bool = False,
-    stream_out: Optional[torch.Tensor] = None,
 ) -> None:
-    """prefix_out = bf16(bf16(all_gather(y, -1) + add_b) [+ add_c]);
-    out = attn_res_smallm_hip(prefix_out, bank, ...). Each rank reads only its
-    own y (the exchange goes through the private tmp region): no input
-    registration, eager or graph."""
+    """prefix_out = bf16(bf16(all_gather(y, -1) + add_b) [+ add_c]); out = the
+    normed aggregation of prefix_out. Peers exchange through the private tmp
+    region, so ``y`` needs no registration."""
     T, ld = y.shape
     H = ld * WORLD_SIZE
     assert supported(T, H, nvb), (T, H, nvb)
     assert y.is_contiguous() and cw.dtype == torch.float32
+    flags = (
+        8
+        | (2 if add_c is not None else 0)
+        | (4 if write_bank else 0)
+        | (16 if out_fp8 is not None else 0)
+    )
     _module().run(
         ca._ptr,
         1,
@@ -190,12 +182,11 @@ def ag_agg(
         prefix_out,
         bank,
         cw,
-        ow if ow is not None else add_b,
+        ow,
         out,
-        out_fp8.view(torch.uint8) if out_fp8 is not None else out,
-        stream_out if stream_out is not None else out,
+        _out8(out, out_fp8),
         nvb,
-        _flags(None, add_c, write_bank, ow, out_fp8, stream_out),
+        flags,
         float(score_eps),
         float(out_eps),
         0,

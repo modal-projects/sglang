@@ -15,7 +15,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.lora import deepseek_v4_targets as v4_lora
+from sglang.srt.lora.layers import BaseLayerWithLoRA, check_lora_input
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -244,8 +247,70 @@ class TestModelHooks(unittest.TestCase):
                 self.model.validate_lora_target_modules(targets)
             parallel.attn_cp_size = 1
             self.model.quant_config = object()
-            with self.assertRaisesRegex(ValueError, "BF16"):
+            with mock.patch("sglang.srt.models.deepseek_v4._is_cuda", True):
                 self.model.validate_lora_target_modules(targets)
+            with mock.patch("sglang.srt.models.deepseek_v4._is_cuda", False):
+                with self.assertRaisesRegex(ValueError, "requires CUDA"):
+                    self.model.validate_lora_target_modules(targets)
+
+
+def _mxfp8_linear():
+    linear = torch.nn.Linear(16, 8, bias=False)
+    linear.quant_method = SimpleNamespace(
+        mxfp8_dense_backend=Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL, use_mxfp8=True
+    )
+    return linear
+
+
+def _mqa_layer(**linears):
+    from sglang.srt.models.deepseek_v4 import MQALayer
+
+    layer = object.__new__(MQALayer)
+    torch.nn.Module.__init__(layer)
+    layer.fuse_wqa_wkv = True
+    for name, linear in linears.items():
+        setattr(layer, name, linear)
+    return layer
+
+
+class TestQuantizedBaseHandoffs(unittest.TestCase):
+    """A LoRA-wrapped projection on a quantized base must receive BF16 activations."""
+
+    def test_fused_mxfp8_producers_skip_lora_consumers(self):
+        base = _mqa_layer(wqkv_a=_mxfp8_linear(), wo_b=_mxfp8_linear())
+        self.assertTrue(base.accepts_mxfp8_swizzled_input())
+        self.assertTrue(base.use_flashinfer_mxfp8_wo_b)
+
+        wrapped = _mqa_layer(
+            wqkv_a=BaseLayerWithLoRA(_mxfp8_linear(), None),
+            wo_b=BaseLayerWithLoRA(_mxfp8_linear(), None),
+        )
+        self.assertFalse(wrapped.accepts_mxfp8_swizzled_input())
+        self.assertFalse(wrapped.use_flashinfer_mxfp8_wo_b)
+
+    def test_quantized_activation_into_lora_layer_fails(self):
+        lora = BaseLayerWithLoRA(_mxfp8_linear(), None)
+        bf16 = torch.zeros(2, 16, dtype=torch.bfloat16)
+        fp8 = bf16.to(torch.float8_e4m3fn)
+        swizzled = Mxfp8SwizzledInput(fp8, torch.zeros(2, 1, dtype=torch.uint8))
+
+        check_lora_input(lora, bf16)
+        check_lora_input(lora.base_layer, swizzled)
+        for x in (swizzled, fp8):
+            with self.assertRaisesRegex(RuntimeError, "quantized activation"):
+                check_lora_input(lora, x)
+
+    def test_shared_expert_keeps_lora_input_bf16(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
+
+        mlp = object.__new__(DeepseekV2MLP)
+        torch.nn.Module.__init__(mlp)
+        mlp.tp_size = 1
+        mlp.gate_up_proj = BaseLayerWithLoRA(torch.nn.Linear(16, 32, bias=False), None)
+        x = torch.zeros(2, 16, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(RuntimeError, "quantized activation"):
+            mlp.forward(x, gateup_pre_quant=(x.to(torch.float8_e4m3fn), x))
 
 
 class TestFusedQkvAFirstOutputDim(unittest.TestCase):

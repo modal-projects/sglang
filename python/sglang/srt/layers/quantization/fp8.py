@@ -205,17 +205,18 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
 
 
 def cast_e2m1fn_to_e4m3fn(
-    x: torch.Tensor, scale: torch.Tensor
+    x: torch.Tensor, scale: torch.Tensor, fp8_block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Casts a tensor from e2m1fn to e4m3fn losslessly.
+    Casts a tensor from e2m1fn to e4m3fn losslessly, with square
+    ``fp8_block_size`` scale blocks.
     """
     assert x.dtype == torch.int8
     assert x.ndim == 2
     out_dim, in_dim = x.size()
     in_dim *= 2
-    fp8_block_size = 128
     fp4_block_size = 32
+    assert fp8_block_size % fp4_block_size == 0
     assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
     assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size
 
@@ -2075,6 +2076,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+                # The MoE runner reads scales at the checkpoint's block size
+                # (128 for DeepSeek-V4, 32 for DeepSeek-V4.1).
+                block_n, block_k = self.quant_config.weight_block_size or [128, 128]
+                assert block_n == block_k, self.quant_config.weight_block_size
                 for weight_param, scale_param in [
                     (layer.w13_weight, layer.w13_weight_scale_inv),
                     (layer.w2_weight, layer.w2_weight_scale_inv),
@@ -2084,7 +2089,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     new_scales = []
                     for e in range(num_experts):
                         w, s = cast_e2m1fn_to_e4m3fn(
-                            weight_param.data[e], scale_param.data[e]
+                            weight_param.data[e],
+                            scale_param.data[e],
+                            fp8_block_size=block_n,
                         )
                         new_weights.append(w)
                         new_scales.append(s)

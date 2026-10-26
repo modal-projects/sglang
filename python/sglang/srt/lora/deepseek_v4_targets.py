@@ -101,6 +101,7 @@ def validate_target_modules(
     target_modules: Iterable[str],
     *,
     quantized: bool,
+    cuda: bool,
     attn_cp_size: int,
     fuse_wqa_wkv: bool,
     fused_shared_experts: bool,
@@ -113,10 +114,10 @@ def validate_target_modules(
             "supported targets are wq_a, wkv, wq_b, wo_b and the shared-expert "
             "w1, w2, w3."
         )
-    if quantized:
-        # Quantized linears can hand FP8/MXFP8 activations to the wrapped
-        # projections, which the LoRA kernels cannot consume.
-        raise ValueError("DeepSeek-V4 LoRA requires BF16 (unquantized) weights.")
+    if quantized and not cuda:
+        # ROCm and NPU fuse FP8 activation quantization into the norms ahead of
+        # wqkv_a and wq_b regardless of LoRA wrapping.
+        raise ValueError("DeepSeek-V4 LoRA on a quantized base requires CUDA.")
     if attn_cp_size > 1:
         raise ValueError(
             "DeepSeek-V4 LoRA does not support attention context parallelism."

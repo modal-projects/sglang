@@ -1,19 +1,8 @@
 """Kimi-K3 (NoPE MLA) absorbed-q concat + latent KV-cache write, one launch (ROCm).
 
-K3's MLA layers have no rotary embedding, so the aiter
-``fused_qk_rope_cat_and_cache_mla`` path does not apply and the absorbed
-decode / target-verify step runs four launch-bound data-movement kernels:
-
-    q = torch.cat([q_nope_out, q_pe], -1)            CatArrayBatchedCopy
-    k = torch.cat([k_nope, k_pe], -1)                CatArrayBatchedCopy
-    MLATokenToKVPool.set_kv_buffer(k): k.to(fp8)     elementwise cast
-                                       kv[loc] = k   index_put
-
-This kernel does all of it in one launch:
-programs (m, h < H) copy one query row, program (m, H) casts and scatters the
-latent row into the paged KV buffer. Bit-identical to the unfused chain: the
-copies are exact and the cache cast is the same round-to-nearest-even
-bf16 -> e4m3fn conversion (no scale, as set_kv_buffer).
+K3 has no rotary embedding, so ``fused_qk_rope_cat_and_cache_mla`` does not
+apply. Bit-identical to torch.cat + set_kv_buffer (same RNE bf16 -> e4m3fn cast,
+no scale).
 """
 
 from __future__ import annotations

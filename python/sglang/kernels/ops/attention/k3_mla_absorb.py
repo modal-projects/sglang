@@ -1,23 +1,14 @@
-"""Kimi-K3 MLA absorbed W_UK / W_UV for small decode / target-verify batches (ROCm).
+"""Kimi-K3 MLA absorbed W_UK / W_UV for decode / target-verify batches (ROCm).
 
-At decode sizes (M = bs * draft tokens = 8..64 rows, 12 local heads) the two
-absorbed MLA BMMs run as hipBLASLt batched GEMMs that only launch 12..192
-workgroups and are pure latency (1.5 MB of weight each). Two fused Triton
-launches replace them:
+At these sizes the hipBLASLt batched GEMMs launch too few workgroups, so two
+fused Triton launches replace them:
 
-* ``k3_mla_absorb_q_cat_cache``: q_out[:, h, :DN_L] = q_nope[:, h] @ W_UK[h],
-  q_out[:, h, DN_L:] = q_pe[:, h], and the latent KV row cast/scatter into the
-  paged MLA cache -- i.e. ``rocm_absorb_q_bmm`` + ``k3_mla_cat_cache`` (the
-  k3_mla_cat_cache kernel) in one launch.
-* ``k3_mla_absorb_v_gate``: out[:, h*DV:(h+1)*DV] = bf16(bf16(attn[:, h] @
-  W_UV[h]) * bf16(sigmoid(gate))) -- ``rocm_absorb_v_bmm`` + the K3 output gate
-  (``mla_output_gate``) in one launch; ``gate`` may be None (plain BMM).
+* ``k3_mla_absorb_q_cat_cache``: ``rocm_absorb_q_bmm`` + ``k3_mla_cat_cache``.
+* ``k3_mla_absorb_v_gate``: ``rocm_absorb_v_bmm`` + the K3 output gate.
 
-Numerics: fp32 MFMA accumulation over the full K of one head, one rounding to
-bf16 -- same contract as the hipBLASLt BMM (only the fp32 summation order can
-differ, i.e. <= 1 bf16 ulp on a small fraction of outputs). Copies and the
-cache cast are bit-identical to the cat-cache kernel; the gate keeps the
-double rounding of the unfused sigmoid + mul pair.
+fp32 accumulation over the full K of one head with one rounding to bf16, like
+the BMM (only summation order differs); the gate keeps the double rounding of
+the unfused sigmoid + mul.
 """
 
 from __future__ import annotations

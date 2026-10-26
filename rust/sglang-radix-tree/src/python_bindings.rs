@@ -2680,6 +2680,17 @@ macro_rules! tree_core_binding {
                 })
             }
 
+            fn routing_snapshot_delta(&self, py: Python<'_>, known: HashMap<usize, usize>)
+                -> PyResult<(usize, Vec<(usize, usize, Option<String>, Option<Py<PyBytes>>, bool, i64, usize)>)> {
+                catch_native_panic(|| {
+                    let (root, rows) = py.allow_threads(|| self.inner.core().routing_snapshot_delta(&known));
+                    Ok((root, rows.into_iter().map(|(id, parent, adapter, tokens, mamba, accessed, length)| {
+                        (id, parent, adapter, tokens.map(|bytes| PyBytes::new_bound(py, &bytes).unbind()),
+                            mamba, accessed, length)
+                    }).collect()))
+                })
+            }
+
             /// Drop the entire tree and reinitialize empty state.
             fn reset(&self, py: Python<'_>) -> PyResult<()> {
                 catch_native_panic(|| {

@@ -29,6 +29,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt import spindle_routing_observer
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -3697,6 +3698,7 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        spindle_routing_observer.snapshot(self, running_batch, last_batch)
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 

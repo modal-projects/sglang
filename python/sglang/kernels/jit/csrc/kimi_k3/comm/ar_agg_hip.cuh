@@ -1,58 +1,27 @@
 // K3 ROCm (TP8): a TP collective fused with the attention-residual aggregation
 // that consumes it.
 //
-// Why not "collective, then one block per token": the aggregation itself is
-// per-CU throughput bound at decode token counts (one block streams nvb + 1
-// rows of 14 KB: 4.8 us at nvb 1, 7.5 us at nvb 8 for M = 8), so fusing it
-// behind the collective's barrier saves only the launch (measured: no gain).
-// The aggregation has to be spread over many CUs, which needs a cross-CTA
-// reduction of the score / norm statistics. A cross-GPU barrier already sits
-// in the middle of the collective, so the statistics ride it:
+// The aggregation is spread over T x split blocks, so its score / norm
+// statistics need a cross-CTA reduction; it rides the collective's barrier.
+// Block (t, 0) of rank r PRODUCES column slice r of token t's row (kAR: AITER
+// 2-stage all-reduce of the registered o_proj partials + pending prefix; kAG:
+// AITER all_gather_lastdim_add math on this rank's up_proj columns), stores it
+// with its partial statistics dot_i = <x_i, cw> and G_ij = <x_i, x_j> in the
+// private tmp region, and flags all 8 x split consumers of token t. Every block
+// (t, k) CONSUMES 1/split of the columns: it sums the 8 slices' statistics in
+// rank order (identical on every rank), takes the global-max softmax and
+// ||mix||^2 = w^T G w, and writes prefix_out / bank snapshot / out / E4M3.
 //
-//   grid = T tokens x split blocks (split = ceil(H / 8 / 256) = 4 at H = 7168). Block (t, 0) of rank r is the PRODUCER
-//   of column slice r (H / 8 columns) of token t:
-//     kAR  start barrier (AITER per-block slot t), reduce slice r over the 8
-//          peers' registered o_proj partials in AITER 2-stage order (fp32 sum
-//          starting at the rank that owns the element in AITER's flat
-//          partition), add the pending prefix -> the final row slice.
-//     kAG  the slice is local: bf16(bf16(y_r + b) [+ c]) (AITER
-//          all_gather_lastdim_add math on this rank's up_proj columns), no
-//          start barrier (see "buffers" below).
-//   It stores the bf16 slice and the slice's partial statistics
-//     dot_i = <x_i, cw>, G_ij = <x_i, x_j>   (rows i, j in bank[0..nvb) + row)
-//   (fp32, (nvb + 1) + (nvb + 1)(nvb + 2) / 2 values) in its own tmp area and
-//   flags all 8 x split consumer blocks of token t (one remote store each).
-//   Every block (t, k) is a CONSUMER of 1/split of token t's columns: it waits
-//   for the 8 producers' flags, sums the 8 slices' statistics in rank order
-//   (identical on every rank), takes score_i = dot_i / rms_i, the global-max
-//   softmax, ||mix||^2 = w^T G w for the output RMSNorm, gathers its columns
-//   of the row from the producers' tmp areas, mixes with its bank columns and
-//   writes prefix_out / bank snapshot / out (normed) / E4M3 / pre-norm stream.
+// Buffers: a 1 MiB region at the tail of AITER's 2 x max_size tmp area,
+// double-buffered by launch parity; flags are reset by their consumer. Launch n
+// writes parity n % 2 only after every rank started launch n - 1, so all
+// readers of launch n - 2 are done. Two consecutive launches with equal parity
+// need a TP collective between them (always present in K3: the MoE
+// all-reduce). No end barrier: kAR inputs are read before the producer
+// signals, and kAG reads no peer input.
 //
-// Buffers: a private 1 MiB region at the tail of AITER's 2 x max_size tmp area
-// (AITER kernels use its head), double-buffered by launch parity (data,
-// statistics, flags). Flags are reset by their consumer. Launch n writes
-// parity n % 2 only after every rank has started launch n - 1 (its consumers
-// waited for all ranks' producers), so every reader of launch n - 2 is done;
-// kAR additionally starts with AITER's start barrier (its peers' inputs). A
-// TP collective between two consecutive launches with equal parity (graph
-// replay boundary) is required and always present in K3 (MoE all-reduce).
-// No end barrier anywhere: kAR inputs are read before the producer signals;
-// kAG reads no peer input at all (no registration, no keep-alive).
-//
-// Numerics: prefix_out (the AR / add3 row) and the bank snapshot are
-// bit-identical to the unfused path. Scores and the norm use the same fp32
-// formulas with a different reduction order, ||mix||^2 via the Gram form and
-// hardware rsq / exp2 / rcp, so out / E4M3 / stream match attn_res_smallm up
-// to rare 1-ulp bf16 flips (~1e-4 of elements). Every rank sums the 8
-// slices' statistics in rank order: outputs are identical on all ranks.
-//
-// Latency notes (8x MI355X, M = 8): consumers poll their flags with relaxed
-// loads and take one acquire fence after (acquire-per-spin invalidates caches
-// every iteration: 2-3x slower at M = 64); local operands are loaded before
-// the kAR start barrier (computing on them before the wait was slower); the
-// weights use packed / hardware-approximate math (a wave64 IEEE div / sqrt /
-// exp chain over nvb + 1 rows cost ~0.8 us).
+// Numerics: prefix_out and the bank snapshot are bit-identical to the unfused
+// path; out / E4M3 match attn_res_smallm up to rare 1-ulp bf16 flips.
 #pragma once
 
 #ifndef USE_ROCM
@@ -109,8 +78,7 @@ struct Params {
   const bf16_t* __restrict__ ow;      // [H] or null
   bf16_t* __restrict__ out;           // [T, H]
   uint8_t* __restrict__ out8;         // [T, H] or null
-  bf16_t* __restrict__ stream;        // [T, H] or null
-  int64_t stride_p, stride_b, stride_c, stride_po, stride_bm, stride_bb, stride_o, stride_o8, stride_s;
+  int64_t stride_p, stride_b, stride_c, stride_po, stride_bm, stride_bb, stride_o, stride_o8;
   int32_t hidden, n_vecs, slice_vecs, chunk_vecs;
   int32_t write_bank;
   float score_eps, out_eps;
@@ -455,13 +423,6 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
     for (int e = 0; e < kVec; ++e)
       acc[e] = xb[e] * w[kNVB] + acc[e];
   }
-  if (p.stream != nullptr) {
-    vec_t o;
-#pragma unroll
-    for (int e = 0; e < kVec; ++e)
-      o[e] = cast<bf16_t>(acc[e]);
-    o.store(p.stream + t * p.stride_s, v);
-  }
   vec_t o;
   if (p.ow != nullptr) {
 #pragma unroll
@@ -531,7 +492,7 @@ struct ArAgg {
   //   prefix [T, H]; b, c unused.
   // mode 1 (AG): x = this rank's up_proj column slice y [T, H/8]; b = add_b
   //   [T, H]; c = optional add_c [T, H]; a unused.
-  // flags: bit0 a, bit1 c, bit2 write_bank, bit3 out norm, bit4 out8, bit5 stream.
+  // flags: bit0 a, bit1 c, bit2 write_bank, bit3 out norm, bit4 out8.
   // reg_inp_ptr != 0 (AR, eager / copy-in capture): x is first staged into
   // AITER's registered input pool at that address, as AITER's all_reduce does.
   static void
@@ -547,7 +508,6 @@ struct ArAgg {
       const tvm::ffi::TensorView ow,
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView out8,
-      const tvm::ffi::TensorView stream_out,
       int64_t nvb,
       int64_t flags,
       double score_eps,
@@ -625,10 +585,6 @@ struct ArAgg {
     if (flags & 16) {
       p.out8 = static_cast<uint8_t*>(out8.data_ptr());
       p.stride_o8 = out8.stride(0);
-    }
-    if (flags & 32) {
-      p.stream = static_cast<bf16_t*>(stream_out.data_ptr());
-      p.stride_s = stream_out.stride(0);
     }
     p.hidden = static_cast<int32_t>(H);
     p.n_vecs = static_cast<int32_t>(n_vecs);

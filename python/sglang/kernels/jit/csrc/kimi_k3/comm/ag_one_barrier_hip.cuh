@@ -1,18 +1,12 @@
 // K3 ROCm (TP8): AITER's allgather_lastdim_add with one cross-GPU barrier.
 //
-// AITER's kernel (csrc/include/custom_all_reduce.cuh) is start_sync, remote
-// reads of every peer's registered input, end_sync. The trailing end_sync only
-// keeps a rank from overwriting its input while a slower peer still reads it.
-// Here the caller instead keeps the input alive (the graph allocator cannot
-// reuse it) until after the next collective, whose start barrier already
-// implies every peer finished this kernel (kernels on a stream are ordered).
-// The per-element math is AITER's verbatim, so the output is bit-identical:
+// AITER's trailing end_sync only keeps a rank from overwriting its input while
+// a slower peer still reads it. The caller instead keeps the input alive until
+// after the next collective, whose start barrier implies every peer finished
+// this kernel. The per-element math is AITER's verbatim (bit-identical):
 //   out[row, s*ld + x] = bf16(bf16(y_s[row, x] + b) [+ c]).
-// AITER's per-block _flag counters stay consistent across ranks: every rank
-// launches the same kernel sequence with the same grids.
-//
-// Graph capture only: eager calls stage the input through AITER's shared
-// input pool, which the next collective overwrites before its barrier.
+// Graph capture only: eager calls stage the input through AITER's shared input
+// pool, which the next collective overwrites before its barrier.
 #pragma once
 
 #ifndef USE_ROCM
@@ -112,38 +106,9 @@ struct AgOneBarrier {
     const T16* c = has_c ? static_cast<const T16*>(add_c.data_ptr()) : nullptr;
     auto* out = static_cast<T16*>(output.data_ptr());
     const auto* b = static_cast<const T16*>(add_b.data_ptr());
-    if (has_c)
-      hipLaunchKernelGGL(
-          (ag_add_one_barrier_kernel<true>),
-          dim3(blocks),
-          dim3(512),
-          0,
-          stream,
-          rd,
-          ca->sg_,
-          ca->self_sg_,
-          out,
-          ca->rank_,
-          size,
-          int(ld),
-          b,
-          c);
-    else
-      hipLaunchKernelGGL(
-          (ag_add_one_barrier_kernel<false>),
-          dim3(blocks),
-          dim3(512),
-          0,
-          stream,
-          rd,
-          ca->sg_,
-          ca->self_sg_,
-          out,
-          ca->rank_,
-          size,
-          int(ld),
-          b,
-          c);
+    const auto kernel = has_c ? ag_add_one_barrier_kernel<true> : ag_add_one_barrier_kernel<false>;
+    hipLaunchKernelGGL(
+        kernel, dim3(blocks), dim3(512), 0, stream, rd, ca->sg_, ca->self_sg_, out, ca->rank_, size, int(ld), b, c);
     RuntimeDeviceCheck(hipGetLastError());
   }
 };

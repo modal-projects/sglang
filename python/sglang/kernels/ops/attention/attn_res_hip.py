@@ -22,8 +22,6 @@ import triton.language as tl
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
 
-_AGG_NUM_WARPS = 4
-
 
 @cache
 def supports_attn_res_hip(hidden_size: int, nvb: int) -> bool:
@@ -146,14 +144,8 @@ def _agg_kernel(
         )
 
 
-# Token count from which attn_res_hip switches to _agg_stream_kernel. Below it
-# the launch is a few CTAs and _agg_kernel's all-rows-in-flight shape wins on
-# latency (T=64, NVB=8: 15 vs 16.5us); from ~T=128 the two tie and by T=256 the
-# stream kernel is ahead at every NVB (NVB=8: 19.5 vs 22.5us, T=512: 18.5 vs
-# 32us, T=8192: 284 vs 411us). 256 keeps decode batches on the old kernel.
-# Measured on MI355X (H=7168).
+# From this token count _agg_stream_kernel beats _agg_kernel (MI355X, H=7168).
 _STREAM_MIN_T = 256
-_STREAM_NUM_WARPS = 4
 
 
 @triton.jit
@@ -183,28 +175,10 @@ def _agg_stream_kernel(
     APPLY_OUT_NORM: tl.constexpr,
     HAS_OUT8: tl.constexpr,
 ):
-    """Prefill shape: one CTA per token, rows streamed one at a time through an
-    online softmax, so every byte is read once and the CTA holds only ~4 rows
-    of registers (~144 VGPRs at 4 warps, no spills).
-
-    At prefill T is in the thousands, every CU is full, and the bound is HBM
-    bandwidth, not one CU's latency. _agg_kernel's [next_pow2(NVB), 8192] fp32
-    tile then costs occupancy (one or two CTAs per CU at NVB=8), so loads,
-    reductions and stores of different tokens stop overlapping: measured at
-    ~3.9 TB/s at T=8192, NVB=8. Re-reading the bank for an exact two-pass
-    softmax instead misses L2 (the in-flight working set is ~100 KB per token)
-    and lands at ~4.6 TB/s. Reading once lands at the copy roofline (~5.5 TB/s,
-    same as torch's copy_ on this part).
-
-    The price is the softmax: it rescales by a running max instead of taking
-    the global max first. Each weight is then exp(s_r - m_r) times the
-    rescale factors exp(m_r - m), equal to _agg_kernel's exp(s_r - m) up to
-    fp32 rounding (a few ulp of fp32, ~1e-4 of a bf16 ulp), so the bf16
-    outputs agree except for rare round-half flips (<= 1 bf16 ulp). Everything
-    else matches _agg_kernel: the prefix is rounded to bf16 before scoring, the
-    score and output RMSNorms use the same eps placement, and out8 is the
-    saturating E4M3 cast of the rounded out.
-    """
+    """Bandwidth-bound prefill variant of _agg_kernel: rows stream through an
+    online softmax so the bank is read once with a small register tile (the
+    full [next_pow2(NVB), 8192] tile costs occupancy at large T). Outputs match
+    _agg_kernel up to rare 1-ulp bf16 flips from the running-max rescale."""
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
@@ -217,7 +191,6 @@ def _agg_stream_kernel(
                 tl.float32
             )
         ).to(prefix_out_ptr.dtype.element_ty)
-        # Streaming stores (.cs): nothing in this launch reads these back.
         tl.store(
             prefix_out_ptr + t * stride_om + offs, row, mask=mask, cache_modifier=".cs"
         )
@@ -231,8 +204,7 @@ def _agg_stream_kernel(
     pv = row.to(tl.float32)
 
     cw = tl.load(cw_ptr + offs, mask=mask, other=0.0)
-    # The prefix row seeds the running softmax: max m, unnormalized mix acc,
-    # denominator den (= exp(m - m) = 1).
+    # the prefix row seeds the running max, mix and denominator
     m = tl.sum(pv * cw) / tl.sqrt(tl.sum(pv * pv) / H + score_eps)
     acc = pv
     den = 1.0
@@ -282,11 +254,6 @@ def attn_res_hip(
     """Single-kernel attention-residual aggregation for ROCm.
 
     Restrictions: nvb >= 1, and the shape must pass supports_attn_res_hip().
-
-    Dispatch: T < _STREAM_MIN_T runs _agg_kernel (latency-bound decode shape,
-    exact global-max softmax); T >= _STREAM_MIN_T runs _agg_stream_kernel
-    (bandwidth-bound prefill shape, online softmax; outputs agree with
-    _agg_kernel to within bf16 rounding, see its docstring).
 
     Parameters
     ----------
@@ -351,7 +318,7 @@ def attn_res_hip(
             WRITE_BANK=write_prefix,
             APPLY_OUT_NORM=ow is not None,
             HAS_OUT8=out_fp8 is not None,
-            num_warps=_STREAM_NUM_WARPS,
+            num_warps=4,
         )
         return
 
@@ -381,5 +348,5 @@ def attn_res_hip(
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
         HAS_OUT8=out_fp8 is not None,
-        num_warps=_AGG_NUM_WARPS,
+        num_warps=4,
     )

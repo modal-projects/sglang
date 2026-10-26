@@ -1441,16 +1441,14 @@ class KimiK3MoE(nn.Module):
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
-            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
-                # ROCm aiter runner: the fused small-batch sort+quant reads the
-                # strided front slice directly and the patched fused_moe densifies
-                # it only when it falls back to aiter's own quant, so skip the copy.
-                pass
-            else:
-                # off an fp32 front the cast allocates the dense buffer, so the
-                # contiguous() behind it is free; off a bf16 front it is the copy
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        # the ROCm fused sort + quant reads the strided bf16 slice; the patched
+        # fused_moe densifies it if it falls back to aiter's quant
+        if self._moe_front_needs_dense_bf16 and not (
+            _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype
+        ):
+            # off an fp32 front the cast allocates the dense buffer, so the
+            # contiguous() behind it is free; off a bf16 front it is the copy
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1558,11 +1556,7 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _rocm_epi_fuse_ok(self) -> bool:
-        """Static eligibility for the ROCm fused MoE prologue/epilogue
-        (kernels/ops/moe/k3_moe_epi.py):
-          * SiTU + shared down GEMM + router top-k in one launch
-          * latent RMSNorm + up_proj + add3 in one launch
-        Only the plain single-collective tail of _forward_fused is replaced."""
+        """Static eligibility for _forward_fused_rocm_epi (k3_moe_epi kernels)."""
         if not _is_hip:
             return False
         if not self._eligible_for_fused_front or self._front_fp32:
@@ -1609,9 +1603,8 @@ class KimiK3MoE(nn.Module):
         )
 
     def _aiter_standard_topk_ok(self) -> bool:
-        """The routing contract the aiter STANDARD top-k path implements and the
-        fused K3 routing kernels reproduce: sigmoid + bias, one group,
-        renormalized weights, scale 1, power-of-two top-k."""
+        """Routing the fused K3 top-k kernels reproduce: sigmoid + bias, one
+        group, scale 1, power-of-two top-k."""
         cfg = self.topk.topk_config
         if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
             return False
@@ -1639,7 +1632,6 @@ class KimiK3MoE(nn.Module):
         n = hidden_states.shape[0]
         return (
             0 < n <= 256
-            and getattr(self, "_up_norm_folded", False)
             and not k3_ar_fusion.enabled()
             and (
                 prefix_sum is None
@@ -1652,8 +1644,7 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _rocm_route_mid_ok(self) -> bool:
-        """Static eligibility for the 2-launch top-k + sort + quant routing glue
-        (kernels/ops/moe/k3_route_sort_mid.py)."""
+        """Static eligibility for k3_route_sort_mid."""
         return (
             _is_hip
             and get_moe_runner_backend().is_aiter()
@@ -1662,11 +1653,8 @@ class KimiK3MoE(nn.Module):
         )
 
     def _rocm_route_mid(self, router_logits, routed_input):
-        """Launch A of k3_route_sort_mid (aiter-exact top-k + expert counts +
-        mxfp8 quant) for 16 < M <= 128;
-        returns (topk_output, state) or None. The patched
-        aiter sort consumes the state (launch B) inside self.experts; run the
-        experts under k3_sort_plan(K3SortPlan(route_state=state))."""
+        """k3_route_sort_mid launch A (top-k + expert counts + mxfp8 quant);
+        returns (topk_output, state) for K3SortPlan(route_state=state), or None."""
         if not self._rocm_route_mid_ok:
             return None
         from sglang.kernels.ops.moe import k3_route_sort_mid
@@ -1698,7 +1686,6 @@ class KimiK3MoE(nn.Module):
             logits=router_logits,
             correction_bias=cfg.correction_bias,
             renormalize=cfg.renormalize,
-            routed_scale=1.0,
         )
         return build_precomputed_topk_output(
             topk_weights, topk_ids, cfg, self.layer_idx
@@ -1707,15 +1694,10 @@ class KimiK3MoE(nn.Module):
     def _forward_fused_rocm_epi(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """_forward_fused (single-collective tail) with 3 fewer launches:
-
-          front GEMM -> [SiTU+shared down GEMM | router top-k] (1 launch)
-          -> routed experts (sort+quant, stage1, stage2) -> all-reduce
-          -> [latent RMSNorm + up_proj + add3] (1 launch)
-
-        Numerically equal to the unfused chain up to bf16 rounding: the up
-        GEMM consumes bf16(x * norm_w) and applies the per-row rstd in its
-        fp32 epilogue instead of rounding bf16(x * rstd * norm_w)."""
+        """_forward_fused's single-collective tail with the shared GEMM and
+        top-k fused into the routing launches and a fused norm + add3 tail.
+        Equal up to bf16 rounding: w_up carries the norm weight (see
+        _fold_latent_norm_into_up_proj) and the tail applies the row rstd."""
         from sglang.kernels.ops.moe import k3_moe_epi
 
         num_tokens, hidden_size = hidden_states.shape
@@ -1739,10 +1721,7 @@ class KimiK3MoE(nn.Module):
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
 
         sort_plan = K3SortPlan()
-        # pre-activated variant beats the situ + GEMM + top-k fallback up
-        # to M=64 on MI355X (7.6-11.2 vs 13.4-15.3 us)
         if num_tokens <= _K3_EPI_SHARED_TOPK_PREACT_MAX_TOKENS:
-            # SiTU + shared down GEMM + router top-k in one launch
             cfg = self.topk.topk_config
             topk_ids = torch.empty(
                 (num_tokens, cfg.top_k), dtype=torch.int32, device=hidden_states.device
@@ -1754,9 +1733,7 @@ class KimiK3MoE(nn.Module):
             )
             act = self.shared_experts.act_fn
             w_down = self.shared_experts.down_proj.weight
-            # [SiTU | top-k] here; the shared
-            # down GEMM rides the experts' sort + quant launch (the runner's
-            # small-sort path: M * top_k <= 256), see k3_moe_epi
+            # the shared down GEMM rides the small-sort launch (M * top_k <= 256)
             if num_tokens * cfg.top_k <= 256 and w_down.is_contiguous():
                 shared_act = torch.empty(
                     (num_tokens, w_down.shape[1]),
@@ -1773,7 +1750,6 @@ class KimiK3MoE(nn.Module):
                     topk_ids,
                     topk_weights,
                     renormalize=cfg.renormalize,
-                    routed_scale=1.0,
                 )
                 sort_plan.shared_gemm = (topk_ids, shared_act, w_down, shared_output)
             else:
@@ -1788,7 +1764,6 @@ class KimiK3MoE(nn.Module):
                     topk_ids,
                     topk_weights,
                     renormalize=cfg.renormalize,
-                    routed_scale=1.0,
                 )
             topk_output = build_precomputed_topk_output(
                 topk_weights, topk_ids, cfg, self.layer_idx
@@ -1800,7 +1775,6 @@ class KimiK3MoE(nn.Module):
                 topk_output, sort_plan.route_state = mid
             else:
                 topk_output = self.topk(hidden_states, router_logits)
-        # the plan runs an untaken shared GEMM on exit, before the all-reduce
         with k3_sort_plan(sort_plan), zero_copy_context.set_moe_output(latent):
             expert_output = self.experts(routed_input, topk_output)
         if expert_output.data_ptr() != latent.data_ptr():
@@ -1810,14 +1784,9 @@ class KimiK3MoE(nn.Module):
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if _rocm_up_ag_fits(num_tokens, hidden_size):
-            # column-shard up_proj + fused all-gather/add3
-            # already folds add3 into its collective; it takes the normed latent
             return self._rocm_up_proj_all_gather(
                 self._latent_norm(latent), shared_output, prefix_sum
             )
-        # norm weight folded into w_up (see _fold_latent_norm_into_up_proj): the
-        # tuned up GEMM reads the raw latent and one tail kernel applies the
-        # per-row rstd and the 3-way add
         up, _ = self.routed_expert_up_proj(latent)
         return k3_moe_epi.norm_add3(
             up, latent, self._up_norm_eps, shared_output, prefix_sum
@@ -1825,10 +1794,8 @@ class KimiK3MoE(nn.Module):
 
     @torch.no_grad()
     def _fold_latent_norm_into_up_proj(self) -> None:
-        """w_up <- bf16(w_up * norm_w), norm_w <- 1, so rmsnorm(x) @ w_up^T ==
-        rstd(x) * (x @ w_up'^T) (up to bf16 rounding). Every other consumer
-        (unfused norm + up_proj, the column-shard all-gather tail) stays exact
-        with the unit norm weight. Done once after loading."""
+        """w_up <- bf16(w_up * norm_w), norm_w <- 1, so the norm + add3 tail
+        can apply only the row rstd; unfused consumers see the unit norm."""
         if getattr(self, "_up_norm_folded", False):
             return
         norm = self.routed_expert_norm
@@ -1845,9 +1812,8 @@ class KimiK3MoE(nn.Module):
         self._up_norm_folded = True
 
     def _rocm_up_proj_all_gather(self, latent, shared_output, prefix_sum):
-        """ROCm decode: each rank computes only its hidden/tp output columns of
-        the replicated up_proj (1/tp of the weight read), and one fused
-        all-gather + add3 assembles bf16(bf16(up + shared) + prefix)."""
+        """Each rank computes its hidden/tp columns of the replicated up_proj;
+        one fused all-gather + add3 assembles bf16(bf16(up + shared) + prefix)."""
         from aiter.tuned_gemm import tgemm
 
         group = get_parallel().tp_group
@@ -1908,8 +1874,7 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        # K3's route/sort/quant kernels inside the AITER MoE runner (no-op
-        # elsewhere); paths with model-side inputs enter their own plan.
+        # opts the AITER runner into the K3 sort kernels
         with k3_sort_plan() if _is_hip else nullcontext():
             if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
                 out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)

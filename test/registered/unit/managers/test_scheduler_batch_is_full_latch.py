@@ -24,7 +24,6 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
-        s.is_hybrid_swa = False
         s.waiting_queue = [SimpleNamespace(rid="req-0")]
         s.chunked_req = None
         s.min_free_slots_delayer = None

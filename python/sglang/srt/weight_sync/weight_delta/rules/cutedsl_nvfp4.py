@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sglang.srt.weight_sync.stitch_delta.map import Copy, Place
+from sglang.srt.weight_sync.weight_delta.map import Copy, Place
 
 GROUP = 64  # interleave_w13_halves: [Up, Gate] in 64-row groups
 

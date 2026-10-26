@@ -28,7 +28,7 @@ def _driver():
 def _check(result, operation):
     code = result[0]
     if code:
-        raise RuntimeError(f"GPU delta {operation} failed: CUDA {code}")
+        raise RuntimeError(f"Weight delta {operation} failed: CUDA {code}")
     return result[1] if len(result) > 1 else None
 
 
@@ -85,9 +85,9 @@ class _DeviceAllocation:
         self.streams = {stream.cuda_stream: stream}
         self.context = _check(driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
         if not int(self.context):
-            raise RuntimeError("GPU delta device allocation needs a current context")
+            raise RuntimeError("Weight delta device allocation needs a current context")
         if int(_check(driver.cuCtxGetDevice(), "cuCtxGetDevice")) != device.index:
-            raise RuntimeError("GPU delta device allocation context/device mismatch")
+            raise RuntimeError("Weight delta device allocation context/device mismatch")
         self.size = size
         self.address = int(_check(driver.cuMemAlloc(size), "cuMemAlloc"))
         try:
@@ -123,7 +123,7 @@ class _DeviceAllocation:
         try:
             self._release()
         except Exception:
-            logger.exception("GPU delta device allocation cleanup failed")
+            logger.exception("Weight delta device allocation cleanup failed")
 
 
 def device_empty(shape, dtype, device):
@@ -139,7 +139,7 @@ def device_empty(shape, dtype, device):
         owner = _DeviceAllocation(size, device, torch.cuda.current_stream(device))
         value = torch.as_tensor(owner, dtype=torch.uint8, device=device)
         if value.data_ptr() != owner.address:
-            raise RuntimeError("GPU delta device allocation import moved the storage")
+            raise RuntimeError("Weight delta device allocation import moved the storage")
         return value.view(dtype).reshape(shape)
 
 
@@ -167,7 +167,7 @@ class HostAllocation:
                 ),
                 "HOST_NUMA_VMM_SUPPORTED",
             ):
-                raise RuntimeError("GPU delta needs CUDA HOST_NUMA VMM support")
+                raise RuntimeError("Weight delta needs CUDA HOST_NUMA VMM support")
             numa = _check(
                 driver.cuDeviceGetAttribute(
                     attributes.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device

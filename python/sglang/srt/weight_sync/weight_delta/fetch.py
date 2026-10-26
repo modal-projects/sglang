@@ -14,11 +14,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from sglang.srt.weight_sync.stitch_delta.manifest import Manifest, read_manifest
-from sglang.srt.weight_sync.stitch_delta.map import TORCH_DTYPES, DeltaMap, Place
-from sglang.srt.weight_sync.stitch_delta.memory import HostArena
-from sglang.srt.weight_sync.stitch_delta.nvcomp import DecodePlan, SnappyDecoder
-from sglang.srt.weight_sync.stitch_delta.xor_kernel import (
+from sglang.srt.weight_sync.weight_delta.manifest import Manifest, read_manifest
+from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES, DeltaMap, Place
+from sglang.srt.weight_sync.weight_delta.memory import HostArena
+from sglang.srt.weight_sync.weight_delta.nvcomp import DecodePlan, SnappyDecoder
+from sglang.srt.weight_sync.weight_delta.xor_kernel import (
     ByteApplyGroup,
     plan_xor,
     prepare_status_check,
@@ -232,7 +232,7 @@ def fetch(
 ) -> Fetched:
     """Any failure here leaves the engine as it was. `plans` is the previous prepare's."""
     started = time.perf_counter()
-    with torch.cuda.nvtx.range("gpu_delta.prepare.check"):
+    with torch.cuda.nvtx.range("weight_delta.prepare.check"):
         manifests = [read_manifest(path) for path in manifest_paths]
         if not manifests:
             raise ValueError("no deltas given")
@@ -264,7 +264,7 @@ def fetch(
     host_tensor = arena.fit(host_bytes)
     allocated = time.perf_counter()
 
-    with torch.cuda.nvtx.range("gpu_delta.prepare.outer_zstd"):
+    with torch.cuda.nvtx.range("weight_delta.prepare.outer_zstd"):
         files = [_map_files(manifest) for manifest in manifests]
         chunks = []
         for (index, entry), offset in zip(xor_work, arenas):
@@ -284,7 +284,7 @@ def fetch(
                         chunk["decoded_bytes"],
                     )
                 )
-        with ThreadPoolExecutor(workers, thread_name_prefix="gpu-delta-zstd") as pool:
+        with ThreadPoolExecutor(workers, thread_name_prefix="weight-delta-zstd") as pool:
             _undo_outer_zstd(chunks, host_tensor.numpy(), pool, workers)
         raw = []
         for name, (index, entry) in newest_raw.items():
@@ -305,7 +305,7 @@ def fetch(
         del chunks, files
     decoded = time.perf_counter()
 
-    with torch.cuda.nvtx.range("gpu_delta.prepare.plan"):
+    with torch.cuda.nvtx.range("weight_delta.prepare.plan"):
         # Batches fill in order up to BATCH_BYTES of scratch; a bigger tensor is a batch
         # of its own. A batch never spans versions, so no tensor appears twice in one.
         groups, size = [], 0

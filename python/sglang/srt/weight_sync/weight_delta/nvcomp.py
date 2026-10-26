@@ -15,7 +15,7 @@ import importlib.metadata
 import numpy as np
 import torch
 
-from sglang.srt.weight_sync.stitch_delta.memory import (
+from sglang.srt.weight_sync.weight_delta.memory import (
     _driver,
     device_empty,
     has_decompression_engine,
@@ -68,7 +68,7 @@ class SnappyDecoder:
         package = importlib.metadata.distribution(f"nvidia-libnvcomp-cu{cuda_major}")
         version = tuple(int(v) for v in package.version.split(".")[:2])
         if not (5, 3) <= version < (6, 0):
-            raise RuntimeError(f"GPU delta needs nvCOMP 5.3+, found {package.version}")
+            raise RuntimeError(f"Weight delta needs nvCOMP 5.3+, found {package.version}")
         self.hardware = has_decompression_engine(self.device.index)
         if self.hardware:
             self.maximum_frame_bytes = min(MAX_FRAME_BYTES, _hardware_limit(self.device))

@@ -109,7 +109,7 @@ def read_inventory(runner) -> dict[str, CanonicalTensor]:
 
     folder = Path(runner.model_config.model_path)
     if not folder.is_dir():
-        raise ValueError(f"GPU delta needs a local checkpoint directory: {folder}")
+        raise ValueError(f"Weight delta needs a local checkpoint directory: {folder}")
     index = "model.safetensors.index.json"
     files = filter_duplicate_safetensors_files(
         [str(path) for path in folder.glob("*.safetensors")], str(folder), index
@@ -136,13 +136,13 @@ def read_inventory(runner) -> dict[str, CanonicalTensor]:
 
 def model_rule(models, inventory):
     """The rule for the target's model class; the draft is part of the same family."""
-    from sglang.srt.weight_sync.stitch_delta.rules.deepseek_mla import DeepSeekMla
+    from sglang.srt.weight_sync.weight_delta.rules.deepseek_mla import DeepSeekMla
 
     architecture = models["target"].config.architectures[0]
     for rule in (DeepSeekMla,):
         if architecture in rule.architectures:
             return rule(models, inventory)
-    raise ValueError(f"GPU delta has no rules for {architecture}")
+    raise ValueError(f"Weight delta has no rules for {architecture}")
 
 
 def _checkpoint_reader(runner):
@@ -159,7 +159,7 @@ def _checkpoint_reader(runner):
 
 
 def build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
-    from sglang.srt.weight_sync.stitch_delta.rules import placement
+    from sglang.srt.weight_sync.weight_delta.rules import placement
 
     models = {role: runner.model for role, runner in runners}
     rule = model_rule(models, inventory)

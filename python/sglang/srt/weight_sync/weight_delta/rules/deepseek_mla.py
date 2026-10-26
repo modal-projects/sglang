@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.weight_sync.stitch_delta.map import Copy, Derived, Ignored
+from sglang.srt.weight_sync.weight_delta.map import Copy, Derived, Ignored
 
 # (shard 0, shard 1, fused parameter), as the loader stacks them along dim 0.
 FUSED = (

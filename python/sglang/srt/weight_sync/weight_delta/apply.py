@@ -12,9 +12,9 @@ import time
 import numpy as np
 import torch
 
-from sglang.srt.weight_sync.stitch_delta.fetch import Fetched
-from sglang.srt.weight_sync.stitch_delta.map import DeltaMap
-from sglang.srt.weight_sync.stitch_delta.memory import (
+from sglang.srt.weight_sync.weight_delta.fetch import Fetched
+from sglang.srt.weight_sync.weight_delta.map import DeltaMap
+from sglang.srt.weight_sync.weight_delta.memory import (
     device_empty,
     record_device_stream,
 )
@@ -26,7 +26,7 @@ def apply(fetched: Fetched, delta_map: DeltaMap, device: torch.device) -> dict:
     torch.cuda.synchronize(device)
     synced = time.perf_counter()
     try:
-        with torch.cuda.nvtx.range("gpu_delta.apply"):
+        with torch.cuda.nvtx.range("weight_delta.apply"):
             return _apply(fetched, delta_map, device, started, synced)
     except BaseException:
         # Nothing may be freed under a running decode or copy.

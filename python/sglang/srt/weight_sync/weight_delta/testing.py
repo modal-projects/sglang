@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from sglang.srt.weight_sync.stitch_delta.map import Ignored, OtherGpu
+from sglang.srt.weight_sync.weight_delta.map import Ignored, OtherGpu
 
 
 def _reachable(runners):
@@ -249,11 +249,11 @@ def _cpu_reference(manifest, entry):
 def check_fetch(receiver, manifest_paths: list[str], version: str) -> dict:
     """Fetch, then decode three batches with their prepared plans (zero ranges, frame
     table) and compare the scratch with a CPU decode of the same tensors."""
-    from sglang.srt.weight_sync.stitch_delta.fetch import fetch
-    from sglang.srt.weight_sync.stitch_delta.manifest import read_manifest
-    from sglang.srt.weight_sync.stitch_delta.memory import device_empty
+    from sglang.srt.weight_sync.weight_delta.fetch import fetch
+    from sglang.srt.weight_sync.weight_delta.manifest import read_manifest
+    from sglang.srt.weight_sync.weight_delta.memory import device_empty
 
-    from sglang.srt.weight_sync.stitch_delta.memory import HostArena
+    from sglang.srt.weight_sync.weight_delta.memory import HostArena
 
     arena = HostArena(receiver.device.index)
     fetched = fetch(
@@ -318,8 +318,8 @@ def check_fetch(receiver, manifest_paths: list[str], version: str) -> dict:
 
 def check_apply(receiver, manifest_paths: list[str], version: str) -> dict:
     """Fetch, then apply, outside any pause: the test sends no traffic."""
-    from sglang.srt.weight_sync.stitch_delta.apply import apply
-    from sglang.srt.weight_sync.stitch_delta.fetch import fetch
+    from sglang.srt.weight_sync.weight_delta.apply import apply
+    from sglang.srt.weight_sync.weight_delta.fetch import fetch
 
     fetched = fetch(
         receiver.delta_map,
@@ -352,8 +352,8 @@ def check_version(receiver, digests_path: str, manifest_paths: list[str]) -> dic
 
     import numpy as np
 
-    from sglang.srt.weight_sync.stitch_delta.manifest import read_manifest
-    from sglang.srt.weight_sync.stitch_delta.map import TORCH_DTYPES
+    from sglang.srt.weight_sync.weight_delta.manifest import read_manifest
+    from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES
 
     started = time.perf_counter()
     digests = json.loads(Path(digests_path).read_text())

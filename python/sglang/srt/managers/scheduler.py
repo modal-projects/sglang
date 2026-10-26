@@ -150,10 +150,10 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
-    GpuDeltaReqInput,
-    GpuDeltaReqOutput,
-    GpuDeltaTestReqInput,
-    GpuDeltaTestReqOutput,
+    WeightDeltaReqInput,
+    WeightDeltaReqOutput,
+    WeightDeltaTestReqInput,
+    WeightDeltaTestReqOutput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -691,7 +691,7 @@ class Scheduler(
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
-        self.init_gpu_delta()
+        self.init_weight_delta()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1827,8 +1827,8 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
-                (GpuDeltaReqInput, self.handle_gpu_delta),
-                (GpuDeltaTestReqInput, self.handle_gpu_delta_test),
+                (WeightDeltaReqInput, self.handle_weight_delta),
+                (WeightDeltaTestReqInput, self.handle_weight_delta_test),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
@@ -2308,13 +2308,13 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
-    def init_gpu_delta(self) -> None:
+    def init_weight_delta(self) -> None:
         # After the model workers, so the serving tensors are final.
-        self.gpu_delta = None
-        if get_model().enable_gpu_delta:
-            from sglang.srt.weight_sync.stitch_delta.receiver import GpuDeltaReceiver
+        self.weight_delta = None
+        if get_model().enable_weight_delta:
+            from sglang.srt.weight_sync.weight_delta.receiver import WeightDeltaReceiver
 
-            self.gpu_delta = GpuDeltaReceiver(self)
+            self.weight_delta = WeightDeltaReceiver(self)
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:
@@ -5458,23 +5458,23 @@ class Scheduler(
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 
-    def handle_gpu_delta(self, recv_req: GpuDeltaReqInput) -> GpuDeltaReqOutput:
-        if self.gpu_delta is None:
-            return GpuDeltaReqOutput(
+    def handle_weight_delta(self, recv_req: WeightDeltaReqInput) -> WeightDeltaReqOutput:
+        if self.weight_delta is None:
+            return WeightDeltaReqOutput(
                 success=False,
-                message="start the engine with --enable-gpu-delta",
+                message="start the engine with --enable-weight-delta",
                 state="disabled",
             )
-        return self.gpu_delta.handle(recv_req)
+        return self.weight_delta.handle(recv_req)
 
-    def handle_gpu_delta_test(
-        self, recv_req: GpuDeltaTestReqInput
-    ) -> GpuDeltaTestReqOutput:
-        if self.gpu_delta is None:
-            return GpuDeltaTestReqOutput(
-                success=False, message="start the engine with --enable-gpu-delta"
+    def handle_weight_delta_test(
+        self, recv_req: WeightDeltaTestReqInput
+    ) -> WeightDeltaTestReqOutput:
+        if self.weight_delta is None:
+            return WeightDeltaTestReqOutput(
+                success=False, message="start the engine with --enable-weight-delta"
             )
-        return self.gpu_delta.test(recv_req)
+        return self.weight_delta.test(recv_req)
 
     def record_weight_version_change(self, new_version: Optional[str]) -> None:
         if new_version is None or new_version == get_serving().weight_version:

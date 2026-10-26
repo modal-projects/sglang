@@ -10,13 +10,13 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.weight_sync.stitch_delta.map import (
+from sglang.srt.weight_sync.weight_delta.map import (
     OTHER_GPU,
     TORCH_DTYPES,
     CanonicalTensor,
     Place,
 )
-from sglang.srt.weight_sync.stitch_delta.rules import cutedsl_nvfp4, fp8_block, plain
+from sglang.srt.weight_sync.weight_delta.rules import cutedsl_nvfp4, fp8_block, plain
 
 BACKENDS = (cutedsl_nvfp4, fp8_block, plain)
 
@@ -62,13 +62,13 @@ def backend_for(layer):
     for backend in BACKENDS:
         if backend.handles(layer):
             return backend
-    raise ValueError(f"GPU delta has no layout for {type(layer.quant_method).__name__}")
+    raise ValueError(f"Weight delta has no layout for {type(layer.quant_method).__name__}")
 
 
 def expert_places(layer, target, tensor: CanonicalTensor):
     """A routed expert lives whole on the GPU that owns it."""
     if layer.moe_tp_size != 1:
-        raise ValueError("GPU delta needs expert TP 1")
+        raise ValueError("Weight delta needs expert TP 1")
     slot = layer._map_global_expert_id_to_local_expert_id(target.expert)
     if slot < 0:
         return OTHER_GPU

@@ -380,9 +380,9 @@ class Envs:
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
-    # --enable-gpu-delta engines skip building the delta map and refuse updates, so a
-    # config the map has no rules for yet still starts and /gpu_delta_test can dump it.
-    SGLANG_GPU_DELTA_INVENTORY_ONLY = EnvBool(False)
+    # --enable-weight-delta engines skip building the delta map and refuse updates, so a
+    # config the map has no rules for yet still starts and /weight_delta_test can dump it.
+    SGLANG_WEIGHT_DELTA_INVENTORY_ONLY = EnvBool(False)
 
     # ===================================================================
     # Crash diagnostics and shutdown

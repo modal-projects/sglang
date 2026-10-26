@@ -2267,7 +2267,7 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
     payload: Optional[List[ChecksumInfo]] = None
 
 
-class GpuDeltaTestReqInput(BaseReq, kw_only=True):
+class WeightDeltaTestReqInput(BaseReq, kw_only=True):
     action: Literal[
         "dump", "check_map", "check_fetch", "apply", "state_hashes", "check_version"
     ]
@@ -2276,13 +2276,13 @@ class GpuDeltaTestReqInput(BaseReq, kw_only=True):
     digests: Optional[str] = None
 
 
-class GpuDeltaTestReqOutput(BaseReq, kw_only=True):
+class WeightDeltaTestReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     payload: Optional[str] = None
 
 
-class PrepareWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
+class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     # The deltas to apply, in order. A stand-in until the layer above (Miles/Stitch)
     # decides what this call carries.
     manifests: List[str]
@@ -2290,7 +2290,7 @@ class PrepareWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
     verify_sha256: bool = False
 
 
-class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
+class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
@@ -2301,8 +2301,8 @@ class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class GpuDeltaReqInput(BaseReq, kw_only=True):
-    """One step of prepare/update_weights_from_gpu_delta, sent to every GPU."""
+class WeightDeltaReqInput(BaseReq, kw_only=True):
+    """One step of prepare/update_weights_from_delta, sent to every GPU."""
 
     action: Literal["fetch", "status", "discard", "apply", "release"]
     manifests: Optional[List[str]] = None
@@ -2312,7 +2312,7 @@ class GpuDeltaReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class GpuDeltaReqOutput(BaseReq, kw_only=True):
+class WeightDeltaReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     state: str

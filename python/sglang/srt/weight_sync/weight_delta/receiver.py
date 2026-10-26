@@ -10,10 +10,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
-    GpuDeltaReqInput,
-    GpuDeltaReqOutput,
-    GpuDeltaTestReqInput,
-    GpuDeltaTestReqOutput,
+    WeightDeltaReqInput,
+    WeightDeltaReqOutput,
+    WeightDeltaTestReqInput,
+    WeightDeltaTestReqOutput,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -23,9 +23,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.weight_sync.stitch_delta.map import build_map, read_inventory
-from sglang.srt.weight_sync.stitch_delta.memory import HostArena
-from sglang.srt.weight_sync.stitch_delta.xor_kernel import warm_up
+from sglang.srt.weight_sync.weight_delta.map import build_map, read_inventory
+from sglang.srt.weight_sync.weight_delta.memory import HostArena
+from sglang.srt.weight_sync.weight_delta.xor_kernel import warm_up
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def _cpu_budget() -> int:
 
 
 def check_scope(runners) -> None:
-    """Refuse, at startup, every configuration GPU delta does not cover."""
+    """Refuse, at startup, every configuration weight delta does not cover."""
     from sglang.srt.model_executor.model_runner_components.weight_updater import (
         _unsupported_derived_weight_cache_error,
     )
@@ -90,10 +90,10 @@ def check_scope(runners) -> None:
         (_unsupported_derived_weight_cache_error(r.model) for _, r in runners),
     )
     if problems:
-        raise ValueError("--enable-gpu-delta does not support " + "; ".join(problems))
+        raise ValueError("--enable-weight-delta does not support " + "; ".join(problems))
 
 
-class GpuDeltaReceiver:
+class WeightDeltaReceiver:
     def __init__(self, scheduler):
         self.scheduler = scheduler
         self.runners = list(scheduler.tp_worker.weight_update_runners())
@@ -108,13 +108,13 @@ class GpuDeltaReceiver:
         check_scope(self.runners)
         self.inventory = read_inventory(target[0])
         read = time.perf_counter()
-        if envs.SGLANG_GPU_DELTA_INVENTORY_ONLY.get():
+        if envs.SGLANG_WEIGHT_DELTA_INVENTORY_ONLY.get():
             self.delta_map = None
-            logger.warning("GPU delta map not built (inventory only); updates are refused")
+            logger.warning("Weight delta map not built (inventory only); updates are refused")
         else:
             self.delta_map = build_map(self.runners, self.inventory)
             logger.info(
-                f"GPU delta map built for {len(self.inventory)} checkpoint tensors: "
+                f"Weight delta map built for {len(self.inventory)} checkpoint tensors: "
                 f"headers {read - started:.2f} s, map {time.perf_counter() - read:.2f} s"
             )
         self.device = next(target[0].model.parameters()).device
@@ -124,7 +124,7 @@ class GpuDeltaReceiver:
         compiled = time.perf_counter()
         warm_up(self.device.index)
         logger.info(
-            f"GPU delta kernels compiled in {time.perf_counter() - compiled:.2f} s; "
+            f"Weight delta kernels compiled in {time.perf_counter() - compiled:.2f} s; "
             f"{self.workers} CPU workers for the outer Zstd"
         )
         # Kept across updates: the decompression engine's host memory, the XOR plans, and the
@@ -140,14 +140,14 @@ class GpuDeltaReceiver:
     @property
     def decoder(self):
         if self._decoder is None:
-            from sglang.srt.weight_sync.stitch_delta.nvcomp import SnappyDecoder
+            from sglang.srt.weight_sync.weight_delta.nvcomp import SnappyDecoder
 
             self._decoder = SnappyDecoder(self.device)
         return self._decoder
 
-    def handle(self, req: GpuDeltaReqInput) -> GpuDeltaReqOutput:
+    def handle(self, req: WeightDeltaReqInput) -> WeightDeltaReqOutput:
         if self.delta_map is None and req.action in ("fetch", "apply"):
-            return GpuDeltaReqOutput(
+            return WeightDeltaReqOutput(
                 success=False, message="inventory-only engine", state="idle"
             )
         if req.action == "fetch":
@@ -160,7 +160,7 @@ class GpuDeltaReceiver:
         if req.action == "release":
             with self._lock:
                 if self._state == "fetching":
-                    return GpuDeltaReqOutput(
+                    return WeightDeltaReqOutput(
                         success=False, message="a prepare is running", state="fetching"
                     )
                 self._close()
@@ -168,10 +168,10 @@ class GpuDeltaReceiver:
                 self._plans = {}
         return self._status()
 
-    def _status(self) -> GpuDeltaReqOutput:
+    def _status(self) -> WeightDeltaReqOutput:
         with self._lock:
             state, error, fetched = self._state, self._error, self._fetched
-        return GpuDeltaReqOutput(
+        return WeightDeltaReqOutput(
             success=error is None,
             message=error or "",
             state=state,
@@ -181,10 +181,10 @@ class GpuDeltaReceiver:
     def _close(self) -> None:
         self._state, self._error, self._fetched = "idle", None, None
 
-    def _start_fetch(self, req: GpuDeltaReqInput) -> GpuDeltaReqOutput:
+    def _start_fetch(self, req: WeightDeltaReqInput) -> WeightDeltaReqOutput:
         with self._lock:
             if self._state == "fetching":
-                return GpuDeltaReqOutput(
+                return WeightDeltaReqOutput(
                     success=False,
                     message="a fetch is already running",
                     state="fetching",
@@ -194,13 +194,13 @@ class GpuDeltaReceiver:
         threading.Thread(
             target=self._fetch,
             args=(req.manifests, get_serving().weight_version, req.verify_sha256),
-            name="gpu-delta-fetch",
+            name="weight-delta-fetch",
             daemon=True,
         ).start()
         return self._status()
 
     def _fetch(self, manifests, version, verify_sha256) -> None:
-        from sglang.srt.weight_sync.stitch_delta.fetch import fetch
+        from sglang.srt.weight_sync.weight_delta.fetch import fetch
 
         try:
             # The engine keeps serving: this thread's GPU work goes on its own stream.
@@ -223,26 +223,26 @@ class GpuDeltaReceiver:
                 self._state, self._error = "failed", repr(error)
             return
         logger.info(
-            f"GPU deltas prepared up to version {fetched.target_version}: {fetched.stats}"
+            f"Weight deltas prepared up to version {fetched.target_version}: {fetched.stats}"
         )
         with self._lock:
             self._state, self._fetched, self._plans = "fetched", fetched, fetched.plans
 
-    def _apply(self, req: GpuDeltaReqInput) -> GpuDeltaReqOutput:
-        from sglang.srt.weight_sync.stitch_delta.apply import apply
+    def _apply(self, req: WeightDeltaReqInput) -> WeightDeltaReqOutput:
+        from sglang.srt.weight_sync.weight_delta.apply import apply
 
         # Refusals leave the weights and the prepared deltas as they are.
         with self._lock:
             state, fetched = self._state, self._fetched
             if state != "fetched":
-                return GpuDeltaReqOutput(
+                return WeightDeltaReqOutput(
                     success=False,
                     message=f"nothing prepared to apply (prepare is {state})",
                     state=state,
                 )
             target = str(fetched.target_version)
             if req.weight_version != target:
-                return GpuDeltaReqOutput(
+                return WeightDeltaReqOutput(
                     success=False,
                     message=f"the prepared deltas reach version {target}, "
                     f"not {req.weight_version}",
@@ -251,7 +251,7 @@ class GpuDeltaReceiver:
             version = get_serving().weight_version
             if str(fetched.base_version) != version:
                 self._close()
-                return GpuDeltaReqOutput(
+                return WeightDeltaReqOutput(
                     success=False,
                     message=f"the engine moved to version {version} after prepare",
                     state="idle",
@@ -260,18 +260,18 @@ class GpuDeltaReceiver:
         # From here on a failure propagates and takes the engine down.
         timings = apply(fetched, self.delta_map, self.device)
         del fetched
-        logger.info(f"GPU deltas applied up to version {target}: {timings}")
+        logger.info(f"Weight deltas applied up to version {target}: {timings}")
         updater = self.scheduler.weight_updater
         updater.record_weight_version_after_update(target)
         success, message = updater.flush_cache_after_weight_update(
-            req, True, "Succeeded to apply GPU deltas."
+            req, True, "Succeeded to apply weight deltas."
         )
-        return GpuDeltaReqOutput(
+        return WeightDeltaReqOutput(
             success=success, message=message, state="idle", target_version=target
         )
 
-    def test(self, req: GpuDeltaTestReqInput) -> GpuDeltaTestReqOutput:
-        from sglang.srt.weight_sync.stitch_delta import testing
+    def test(self, req: WeightDeltaTestReqInput) -> WeightDeltaTestReqOutput:
+        from sglang.srt.weight_sync.weight_delta import testing
 
         tp_rank = get_parallel().tp_rank
         # Every GPU must reach the gather, so a failure becomes an entry.
@@ -295,6 +295,6 @@ class GpuDeltaReceiver:
         errors = [
             f"tp_rank {e['tp_rank']}: {e['error']}" for e in entries if "error" in e
         ]
-        return GpuDeltaTestReqOutput(
+        return WeightDeltaTestReqOutput(
             success=not errors, message=" | ".join(errors), payload=json.dumps(entries)
         )

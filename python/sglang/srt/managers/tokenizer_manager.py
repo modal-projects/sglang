@@ -769,9 +769,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
-        # One GPU-delta prepare or update at a time; the version the prepared deltas reach.
-        self.gpu_delta_lock = asyncio.Lock()
-        self.gpu_delta_target: Optional[str] = None
+        # One weight-delta prepare or update at a time; the version the prepared deltas reach.
+        self.weight_delta_lock = asyncio.Lock()
+        self.weight_delta_target: Optional[str] = None
         self._weight_update_session_open = False
         # A staged session (adapter-only, deferred publications pending) runs
         # under the reader lock, concurrent with generation.

@@ -42,10 +42,10 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
-    GpuDeltaReqInput,
-    GpuDeltaReqOutput,
-    GpuDeltaTestReqInput,
-    GpuDeltaTestReqOutput,
+    WeightDeltaReqInput,
+    WeightDeltaReqOutput,
+    WeightDeltaTestReqInput,
+    WeightDeltaTestReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -57,7 +57,7 @@ from sglang.srt.managers.io_struct import (
     LoRAUpdateOutput,
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
-    PrepareWeightsFromGpuDeltaReqInput,
+    PrepareWeightsFromDeltaReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
     ProfileReqOutput,
@@ -81,7 +81,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromGpuDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -129,8 +129,8 @@ _COMMUNICATOR_SPECS = [
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
-    ("gpu_delta", GpuDeltaReqOutput),
-    ("gpu_delta_test", GpuDeltaTestReqOutput),
+    ("weight_delta", WeightDeltaReqOutput),
+    ("weight_delta_test", WeightDeltaTestReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
@@ -1012,17 +1012,17 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
-    async def prepare_weights_from_gpu_delta(
+    async def prepare_weights_from_delta(
         self: TokenizerManager,
-        obj: PrepareWeightsFromGpuDeltaReqInput,
+        obj: PrepareWeightsFromDeltaReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str, Optional[str]]:
         """Read and check the deltas on every GPU while the engine serves; no weight
-        changes. update_weights_from_gpu_delta applies them."""
+        changes. update_weights_from_delta applies them."""
         self.auto_create_handle_loop()
-        async with self.gpu_delta_lock:
-            replies = await self.gpu_delta_communicator(
-                GpuDeltaReqInput(
+        async with self.weight_delta_lock:
+            replies = await self.weight_delta_communicator(
+                WeightDeltaReqInput(
                     action="fetch",
                     manifests=obj.manifests,
                     verify_sha256=obj.verify_sha256,
@@ -1030,18 +1030,18 @@ class TokenizerControlMixin:
             )
             while any(r.state == "fetching" for r in replies):
                 await asyncio.sleep(0.05)
-                replies = await self.gpu_delta_communicator(
-                    GpuDeltaReqInput(action="status")
+                replies = await self.weight_delta_communicator(
+                    WeightDeltaReqInput(action="status")
                 )
             success, message = FanOutCommunicator.merge_results(replies)
             if not success:
-                await self.gpu_delta_communicator(GpuDeltaReqInput(action="discard"))
-            self.gpu_delta_target = replies[0].target_version if success else None
-            return success, message, self.gpu_delta_target
+                await self.weight_delta_communicator(WeightDeltaReqInput(action="discard"))
+            self.weight_delta_target = replies[0].target_version if success else None
+            return success, message, self.weight_delta_target
 
-    async def update_weights_from_gpu_delta(
+    async def update_weights_from_delta(
         self: TokenizerManager,
-        obj: UpdateWeightsFromGpuDeltaReqInput,
+        obj: UpdateWeightsFromDeltaReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         """Apply the prepared deltas, like the other update_weights_from_* calls: inside
@@ -1051,11 +1051,11 @@ class TokenizerControlMixin:
             return False, "close the weight-update session first"
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
-        version = obj.weight_version or self.gpu_delta_target
-        async with self.gpu_delta_lock:
+        version = obj.weight_version or self.weight_delta_target
+        async with self.weight_delta_lock:
             success, message = await self._weight_update_session_call(
-                self.gpu_delta_communicator,
-                GpuDeltaReqInput(
+                self.weight_delta_communicator,
+                WeightDeltaReqInput(
                     action="apply",
                     weight_version=version,
                     flush_cache=obj.flush_cache,
@@ -1063,7 +1063,7 @@ class TokenizerControlMixin:
                 ),
             )
             if success:
-                self.gpu_delta_target = None
+                self.weight_delta_target = None
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success:
@@ -1071,22 +1071,22 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {version}."
         return success, message
 
-    async def release_gpu_delta_memory(self: TokenizerManager) -> Tuple[bool, str]:
-        """Free the host memory GPU-delta engines keep between updates, and any prepared
+    async def release_weight_delta_memory(self: TokenizerManager) -> Tuple[bool, str]:
+        """Free the host memory weight-delta engines keep between updates, and any prepared
         deltas not yet applied; the next prepare allocates again."""
         self.auto_create_handle_loop()
-        async with self.gpu_delta_lock:
-            replies = await self.gpu_delta_communicator(
-                GpuDeltaReqInput(action="release")
+        async with self.weight_delta_lock:
+            replies = await self.weight_delta_communicator(
+                WeightDeltaReqInput(action="release")
             )
-            self.gpu_delta_target = None
+            self.weight_delta_target = None
         return FanOutCommunicator.merge_results(replies)
 
-    async def gpu_delta_test(
-        self: TokenizerManager, obj: GpuDeltaTestReqInput
-    ) -> List[GpuDeltaTestReqOutput]:
+    async def weight_delta_test(
+        self: TokenizerManager, obj: WeightDeltaTestReqInput
+    ) -> List[WeightDeltaTestReqOutput]:
         self.auto_create_handle_loop()
-        return await self.gpu_delta_test_communicator(obj)
+        return await self.weight_delta_test_communicator(obj)
 
     async def check_weights(
         self: TokenizerManager,

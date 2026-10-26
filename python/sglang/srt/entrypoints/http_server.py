@@ -135,7 +135,7 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    GpuDeltaTestReqInput,
+    WeightDeltaTestReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -143,7 +143,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
-    PrepareWeightsFromGpuDeltaReqInput,
+    PrepareWeightsFromDeltaReqInput,
     ProfileReq,
     RegisterLoRAAdapterReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -155,7 +155,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromGpuDeltaReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
@@ -1586,14 +1586,14 @@ async def check_weights(
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
-@app.post("/prepare_weights_from_gpu_delta")
+@app.post("/prepare_weights_from_delta")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def prepare_weights_from_gpu_delta(
-    obj: Annotated[PrepareWeightsFromGpuDeltaReqInput, Body()], request: Request
+async def prepare_weights_from_delta(
+    obj: Annotated[PrepareWeightsFromDeltaReqInput, Body()], request: Request
 ):
-    """Read and check GPU deltas while serving; update_weights_from_gpu_delta applies them."""
+    """Read and check weight deltas while serving; update_weights_from_delta applies them."""
     success, message, target_version = (
-        await _global_state.tokenizer_manager.prepare_weights_from_gpu_delta(
+        await _global_state.tokenizer_manager.prepare_weights_from_delta(
             obj, request
         )
     )
@@ -1603,14 +1603,14 @@ async def prepare_weights_from_gpu_delta(
     )
 
 
-@app.post("/update_weights_from_gpu_delta")
+@app.post("/update_weights_from_delta")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_gpu_delta(
-    obj: Annotated[UpdateWeightsFromGpuDeltaReqInput, Body()], request: Request
+async def update_weights_from_delta(
+    obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()], request: Request
 ):
-    """Apply the prepared GPU deltas in place."""
+    """Apply the prepared weight deltas in place."""
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_gpu_delta(
+        await _global_state.tokenizer_manager.update_weights_from_delta(
             obj, request
         )
     )
@@ -1620,23 +1620,23 @@ async def update_weights_from_gpu_delta(
     )
 
 
-@app.post("/release_gpu_delta_memory")
+@app.post("/release_weight_delta_memory")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def release_gpu_delta_memory(request: Request):
-    """Free the host memory kept for GPU deltas between updates."""
-    success, message = await _global_state.tokenizer_manager.release_gpu_delta_memory()
+async def release_weight_delta_memory(request: Request):
+    """Free the host memory kept for weight deltas between updates."""
+    success, message = await _global_state.tokenizer_manager.release_weight_delta_memory()
     return ORJSONResponse(
         {"success": success, "message": message},
         status_code=200 if success else HTTPStatus.BAD_REQUEST,
     )
 
 
-@app.post("/gpu_delta_test")
+@app.post("/weight_delta_test")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def gpu_delta_test(
-    obj: Annotated[GpuDeltaTestReqInput, Body()], request: Request
+async def weight_delta_test(
+    obj: Annotated[WeightDeltaTestReqInput, Body()], request: Request
 ):
-    results = await _global_state.tokenizer_manager.gpu_delta_test(obj)
+    results = await _global_state.tokenizer_manager.weight_delta_test(obj)
     gpus = sorted(
         (entry for r in results if r.payload for entry in orjson.loads(r.payload)),
         key=lambda entry: entry["tp_rank"],

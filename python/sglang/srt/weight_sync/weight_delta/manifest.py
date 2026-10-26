@@ -5,7 +5,7 @@ from pathlib import Path
 
 import orjson
 
-FORMAT, CODEC = "stitch-delta/v1", "snappy-zstd"
+FORMAT, CODEC = "weight-delta/v1", "snappy-zstd"
 
 
 @dataclass(frozen=True)

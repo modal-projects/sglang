@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.weight_sync.stitch_delta.map import Copy, Place
+from sglang.srt.weight_sync.weight_delta.map import Copy, Place
 
 
 def handles(layer) -> bool:

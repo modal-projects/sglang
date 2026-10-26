@@ -19,7 +19,6 @@ Q0 = 48
 SBUF = (120, 152)
 P0 = 184
 KR = 192
-VR = 224
 T = 240  # temps (QK block exp sums: v240..255; K ring uses v192..239)
 KSLOTS = 6  # K ring slots (v192.. during QK, V ring unused)
 PDK = 4  # K reads issued this many MFMAs ahead
@@ -68,15 +67,6 @@ for cb in range(16):
     w("  float x[16];")
     w(asm_block(l, outs=outs))
     w("  return v16f{" + ", ".join(f"x[{r}]" for r in range(16)) + "};")
-    w("}")
-
-# ------------------------------------------------------------------ Q set
-w("template <int KS> __device__ __forceinline__ void q_set(v8i q);")
-for ks in range(9):
-    l = [f"v_mov_b32 v{Q0 + 8 * ks + k}, %[q{k}]" for k in range(8)]
-    ins = ", ".join(f'[q{k}] "v"(q[{k}])' for k in range(8))
-    w(f"template <> __device__ __forceinline__ void q_set<{ks}>(v8i q) {{")
-    w(asm_block(l, ins=ins, clob=clob_v(Q0 + 8 * ks, Q0 + 8 * ks + 7)))
     w("}")
 
 
@@ -160,10 +150,9 @@ def decide_valu(cur, tmp):
 
 
 def exp_valu(cur):
-    """p = 2^(s*sc + nb) (x kPScale folded into nb) -> fp8 P; l = l*al + sum(p).
+    """p = 2^(s*sc + nb) (x kPScale folded into nb) -> fp8 P (row sums: pv_tile ones-MFMA).
     Software-pipelined order so no instruction consumes a result produced < 4 slots before."""
     s = [cur + k for k in range(32)]
-    t = [T + i for i in range(16)]
     fma = [f"v_fma_f32 v{s[k]}, v{s[k]}, %[sc], %[nb]" for k in range(32)]
     ex = [f"v_exp_f32_e32 v{s[k]}, v{s[k]}" for k in range(32)]
     grp = []
@@ -171,14 +160,12 @@ def exp_valu(cur):
         kb = 4 * g8
         tb, a = kb // 16, (kb % 16) // 4
         pd = P0 + 4 * tb + a
-        gg = [
-            f"v_cvt_pk_fp8_f32 v{pd}, v{s[kb]}, v{s[kb + 1]}",
-            f"v_add_f32_e32 v{t[g8]}, v{s[kb]}, v{s[kb + 1]}",
-            f"v_cvt_pk_fp8_f32 v{pd}, v{s[kb + 2]}, v{s[kb + 3]} op_sel:[0,0,1]",
-            f"v_add_f32_e32 v{t[8 + g8]}, v{s[kb + 2]}, v{s[kb + 3]}",
-        ]
-        gg = [gg[0], gg[2]]
-        grp.append(gg)
+        grp.append(
+            [
+                f"v_cvt_pk_fp8_f32 v{pd}, v{s[kb]}, v{s[kb + 1]}",
+                f"v_cvt_pk_fp8_f32 v{pd}, v{s[kb + 2]}, v{s[kb + 3]} op_sel:[0,0,1]",
+            ]
+        )
     v = []
     # stage: fma k at step k, exp k at step k+4, group g after exp of its last element + 4
     for step in range(32 + 4 + 8 * 1 + 8):
@@ -190,15 +177,6 @@ def exp_valu(cur):
         for g8 in range(8):
             if step == 4 * g8 + 3 + 4 + 3:
                 v += grp[g8]
-    return v
-    for i in range(8):
-        v.append(f"v_add_f32_e32 v{t[i]}, v{t[i]}, v{t[8 + i]}")
-    for i in range(4):
-        v.append(f"v_add_f32_e32 v{t[i]}, v{t[i]}, v{t[4 + i]}")
-    v.append(f"v_add_f32_e32 v{t[0]}, v{t[0]}, v{t[2]}")
-    v.append(f"v_add_f32_e32 v{t[1]}, v{t[1]}, v{t[3]}")
-    v.append(f"v_add_f32_e32 v{t[0]}, v{t[0]}, v{t[1]}")
-    v.append(f"v_fma_f32 %[l], %[l], %[al], v{t[0]}")
     return v
 
 
@@ -342,41 +320,9 @@ for D in (0, 1):
     w("}")
 
 # ------------------------------------------------------------------ loader: one tile of LDS DMA
-# (loader wave only; its own register use: v48..v55 temps, v56..v59 kv-index ring)
-w(
-    "template <int R> __device__ __forceinline__ void issue_tile_asm(v4u_ rs, uint32_t slot, uint32_t st, uint32_t ba, uint32_t co);"
-)
+# kv-index ring of the loader wave (v56..v63)
 w("template <int R> __device__ __forceinline__ void load_idx_asm(v4u_ rs, int off);")
 for R in range(8):
-    l = []
-    for tg in range(4):
-        off = f" offset:{64 * tg}" if tg else ""
-        l.append(f"ds_bpermute_b32 v{48 + tg}, %[ba], v{56 + R}{off}")
-    l.append("s_waitcnt lgkmcnt(0)")
-    for tg in range(4):
-        l.append(f"v_mad_u32_u24 v{48 + tg}, v{48 + tg}, %[st], %[co]")
-    for k in range(36):
-        tg, cg = divmod(k, 9)
-        tmp = 52 + (k % 4)
-        if cg:
-            l.append(f"v_add_u32_e32 v{tmp}, {64 * cg}, v{48 + tg}")
-            va = tmp
-        else:
-            va = 48 + tg
-        l.append(f"s_add_u32 m0, %[slot], {1024 * k}")
-        l.append("s_nop 0")
-        l.append(f"buffer_load_dwordx4 v{va}, %[rs], 0 offen lds")
-    w(
-        f"template <> __device__ __forceinline__ void issue_tile_asm<{R}>(v4u_ rs, uint32_t slot, uint32_t st, uint32_t ba, uint32_t co) {{"
-    )
-    w(
-        asm_block(
-            l,
-            ins='[rs] "s"(rs), [slot] "s"(slot), [st] "s"(st), [ba] "v"(ba), [co] "v"(co)',
-            clob=clob_v(48, 55) + ', "m0", "scc", "memory"',
-        )
-    )
-    w("}")
     w(
         f"template <> __device__ __forceinline__ void load_idx_asm<{R}>(v4u_ rs, int off) {{"
     )
@@ -496,57 +442,6 @@ def q_prologue(lds=False, part=0):
             t = 196 + 4 * (idx % 4)
             l.append(f"v_cvt_pk_fp8_f32 v{48 + idx}, v{t + 2}, v{t + 3} op_sel:[0,0,1]")
     return l
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            t = 196 + 4 * ((8 * ks + k) % 4)
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_dot2_f32_bf16 v{t}, v{r0}, v194, 0",
-                f"v_dot2_f32_bf16 v{t + 1}, v{r0}, v195, 0",
-                f"v_dot2_f32_bf16 v{t + 2}, v{r0 + 1}, v194, 0",
-                f"v_dot2_f32_bf16 v{t + 3}, v{r0 + 1}, v195, 0",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{t + 1}",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t + 2}, v{t + 3} op_sel:[0,0,1]",
-            ]
-    return l
-    # exact per-row scale (amax -> 448), like v2: q8 = fp8(q * 448 / amax)
-    l.append("v_mul_f32_e32 v193, 0x3b124925, v192")  # amax / 448 (= qscale)
-    l.append("v_mov_b32_e32 %[am], v193")
-    l.append("v_rcp_f32_e32 v194, v192")
-    l.append("s_nop 1")
-    l.append("v_mul_f32_e32 v194, 0x43e00000, v194")  # q_inv = 448 / amax
-    l.append("v_mov_b32_e32 v195, v194")
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            t = 196 + 4 * ((8 * ks + k) % 4)
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_lshlrev_b32_e32 v{t}, 16, v{r0}",
-                f"v_and_b32_e32 v{t + 1}, 0xffff0000, v{r0}",
-                f"v_lshlrev_b32_e32 v{t + 2}, 16, v{r0 + 1}",
-                f"v_and_b32_e32 v{t + 3}, 0xffff0000, v{r0 + 1}",
-                f"v_pk_mul_f32 v[{t}:{t + 1}], v[{t}:{t + 1}], v[194:195]",
-                f"v_pk_mul_f32 v[{t + 2}:{t + 3}], v[{t + 2}:{t + 3}], v[194:195]",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t}, v{t + 1}",
-                f"v_cvt_pk_fp8_f32 v{d}, v{t + 2}, v{t + 3} op_sel:[0,0,1]",
-            ]
-    return l
-    # power-of-two scale >= amax / 448 (fp8 relative precision is scale-invariant)
-    l.append("v_mul_f32_e32 v192, 0x3b124925, v192")  # amax / 448
-    l.append("v_add_u32_e32 v192, 0x7fffff, v192")
-    l.append("v_and_b32_e32 v192, 0x7f800000, v192")  # 2^ceil(log2(amax / 448))
-    l.append("v_mov_b32_e32 %[am], v192")
-    for ks in range(9):
-        for k in range(8):
-            r0 = 48 + 16 * ks + 2 * k
-            d = 48 + 8 * ks + k
-            l += [
-                f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0}, v192",
-                f"v_cvt_scalef32_pk_fp8_bf16 v{d}, v{r0 + 1}, v192 op_sel:[0,0,1]",
-            ]
-    return l
 
 
 w("__device__ __forceinline__ float q_prologue_asm(const uint16_t* qa) {")
@@ -562,29 +457,12 @@ w(
 w("  return am;")
 w("}")
 w(
-    "__device__ __forceinline__ float q_prologue_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la, uint32_t rot) {"
+    "__device__ __forceinline__ void q_load_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la) {"
 )
-w("  float am;")
-w("  uint32_t t0, t1;")
-w(
-    asm_block(
-        q_prologue(True),
-        outs='[am] "=v"(am), [t0] "=&s"(t0), [t1] "=&s"(t1)',
-        ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la), [rot] "s"(rot)',
-        clob=ALL_V + ', "m0", "scc", "memory"',
-    )
-)
-w("  return am;")
-w("}")
-w(
-    "__device__ __forceinline__ void q_load_lds_asm(v4u_ rs, uint32_t sl, uint32_t v16, uint32_t la, uint32_t rot) {"
-)
-w("  uint32_t t0, t1;")
 w(
     asm_block(
         q_prologue(True, 1),
-        outs='[t0] "=&s"(t0), [t1] "=&s"(t1)',
-        ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la), [rot] "s"(rot)',
+        ins='[rs] "s"(rs), [sl] "s"(sl), [v16] "v"(v16), [la] "v"(la)',
         clob=ALL_V + (", " + ALL_A) + ', "m0", "scc", "memory"',
     )
 )
@@ -594,95 +472,6 @@ w("  float am;")
 w(asm_block(q_prologue(None, 2), outs='[am] "=v"(am)', clob=ALL_V))
 w("  return am;")
 w("}")
-
-# ------------------------------------------------------------------ shared DMA (compute waves issue their token group)
-# mailbox: mb[t % 4][tg][lane] u32 voffsets written by the loader.
-w(
-    "template <int R> __device__ __forceinline__ void mbox_write_asm(uint32_t mb, uint32_t ba, uint32_t st, uint32_t co);"
-)
-w(
-    "template <int R> __device__ __forceinline__ void issue_tg3_asm(v4u_ rs, uint32_t slot, uint32_t st, uint32_t ba, uint32_t co);"
-)
-for R in range(8):
-    l = []
-    for tg in range(3):
-        off = f" offset:{64 * tg}" if tg else ""
-        l.append(f"ds_bpermute_b32 v{48 + tg}, %[ba], v{56 + R}{off}")
-    l.append("s_waitcnt lgkmcnt(0)")
-    for tg in range(3):
-        l.append(f"v_mad_u32_u24 v{48 + tg}, v{48 + tg}, %[st], %[co]")
-    for tg in range(3):
-        off = f" offset:{256 * tg}" if tg else ""
-        l.append(f"ds_write_b32 %[mb], v{48 + tg}{off}")
-    w(
-        f"template <> __device__ __forceinline__ void mbox_write_asm<{R}>(uint32_t mb, uint32_t ba, uint32_t st, uint32_t co) {{"
-    )
-    w(
-        asm_block(
-            l,
-            ins='[mb] "v"(mb), [ba] "v"(ba), [st] "s"(st), [co] "v"(co)',
-            clob=clob_v(48, 55) + ', "memory"',
-        )
-    )
-    w("}")
-    l = [
-        f"ds_bpermute_b32 v51, %[ba], v{56 + R} offset:192",
-        "s_waitcnt lgkmcnt(0)",
-        "v_mad_u32_u24 v51, v51, %[st], %[co]",
-    ]
-    for cg in range(9):
-        k = 27 + cg
-        if cg:
-            l.append(f"v_add_u32_e32 v{52 + cg % 4}, {64 * cg}, v51")
-            va = 52 + cg % 4
-        else:
-            va = 51
-        l += [
-            f"s_add_u32 m0, %[slot], {1024 * k}",
-            "s_nop 0",
-            f"buffer_load_dwordx4 v{va}, %[rs], 0 offen lds",
-        ]
-    w(
-        f"template <> __device__ __forceinline__ void issue_tg3_asm<{R}>(v4u_ rs, uint32_t slot, uint32_t st, uint32_t ba, uint32_t co) {{"
-    )
-    w(
-        asm_block(
-            l,
-            ins='[rs] "s"(rs), [slot] "s"(slot), [st] "s"(st), [ba] "v"(ba), [co] "v"(co)',
-            clob=clob_v(48, 55) + ', "m0", "scc", "memory"',
-        )
-    )
-    w("}")
-
-# compute wave w: read its voffset from the mailbox, issue 9 LDS-DMA loads (token group w)
-w(
-    "template <int W> __device__ __forceinline__ void cdma_asm(uint32_t mb, v4u_ rs, uint32_t slot);"
-)
-for W in range(3):
-    l = ["ds_read_b32 v240, %[mb]", "s_waitcnt lgkmcnt(0)"]
-    for cg in range(9):
-        k = 9 * W + cg
-        if cg:
-            l.append(f"v_add_u32_e32 v{241 + cg % 4}, {64 * cg}, v240")
-            va = 241 + cg % 4
-        else:
-            va = 240
-        l += [
-            f"s_add_u32 m0, %[slot], {1024 * k}",
-            "s_nop 0",
-            f"buffer_load_dwordx4 v{va}, %[rs], 0 offen lds",
-        ]
-    w(
-        f"template <> __device__ __forceinline__ void cdma_asm<{W}>(uint32_t mb, v4u_ rs, uint32_t slot) {{"
-    )
-    w(
-        asm_block(
-            l,
-            ins='[mb] "v"(mb), [rs] "s"(rs), [slot] "s"(slot)',
-            clob=clob_v(240, 244) + ', "m0", "scc", "memory"',
-        )
-    )
-    w("}")
 
 # ------------------------------------------------------------------ row-linear loader
 # Instruction k / lane i fills LDS bytes 16 n, n = 64 k + i = 36 t + p: token t, position p,

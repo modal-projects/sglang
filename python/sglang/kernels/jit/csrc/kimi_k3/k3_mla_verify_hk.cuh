@@ -13,12 +13,12 @@
 //   wave 3      loader: streams 64-token KV tiles global -> LDS with
 //               buffer_load_dwordx4 ... lds (one kv index per lane, 36
 //               instructions per tile), 4-stage ring, one s_barrier per tile.
-// LDS tile layout: chunk-major [36 chunks of 16 B][64 tokens][16 B]; odd
-// chunks store token t at position t ^ 4 (bank spread for the V transposed
-// reads). K is read with ds_read_b128, V with ds_read_b64_tr_b8.
+// LDS tile layout: token-major 576 B rows, 16 B chunk c of token t at
+// c ^ ((t >> 2) & 3). K is read with ds_read_b128, V with ds_read_b64_tr_b8.
 //
-// Output: per-split normalized partial O (bf16) + base-2 LSE, merged by the
-// v2 Triton reduce (same split formula), or written directly when NSPLIT = 1.
+// Output: per-split normalized partial O (bf16, fp8 for long requests) + base-2
+// LSE, merged by k3_mla_verify_hk_reduce1 or the Triton reduce in
+// k3_mla_verify_auto.py.
 
 #pragma once
 
@@ -46,9 +46,7 @@ constexpr int kBN = 64;
 constexpr int kNCh = kD / 16;  // 36 chunks of 16 B
 constexpr int kTileBytes = kNCh * 1024;
 constexpr int kStages = 4;
-constexpr int kMboxBytes = 4 * 768;  // DMA voffset mailbox: [tile % 4][tg 0..2][lane] u32
 constexpr int kThreads = 256;
-constexpr float kTau = 2.0f;
 constexpr float kPScale = 64.0f;  // p <= 2^tau = 4 -> 256 < 448
 
 struct Params {
@@ -59,18 +57,15 @@ struct Params {
   const float* kv_scale;  // [1]
   uint16_t* o_part;       // bf16 [bs, nsplit, 96, 512]
   float* lse_part;        // [bs, nsplit, 96]
-  uint16_t* o_final;      // bf16 [bs*8, 12, 512] (strided), used when nsplit == 1
+  uint16_t* o_final;      // bf16 [bs*8, 12, 512] (strided), merge output
   int64_t stride_q_tok, stride_q_h, stride_o_tok, stride_o_h;
   int32_t kv_stride;
   uint32_t kv_bytes;  // buffer num_records
   int32_t nsplit, min_chunk;
   float sm_scale_log2;
   int32_t q_lds;  // 1: q rows are contiguous ([tok][12][576] dense) -> coalesced LDS staging of Q
-  int32_t bs;
-  // auto path (Gluon-or-HK regime switch on the GPU): kv_indptr above is the regime-selected
-  // indptr (all zero in the Gluon regime).
-  const int32_t* regime;     // nullptr, or the use-HK flag written by the Gluon prologue
-  const int32_t* g_indptr;   // true kv_indptr (Gluon split formula)
+  // stage 1 gets the regime-selected indptr (all zero in the Gluon regime), the merge the true one.
+  const int32_t* regime;     // use-HK flag written by the Gluon prologue
   const uint16_t* g_logits;  // bf16 [bs, qlen, H, g_ns, 512] (strided)
   const float* g_lse;        // fp32 [bs, qlen, H, g_ns] (strided)
   int64_t g_sl_b, g_sl_qs, g_sl_h, g_sl_s;
@@ -82,10 +77,6 @@ struct Params {
   int32_t part8_min;
 };
 
-__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_rsrc(const void* p, uint32_t bytes) {
-  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), (short)0, (int)bytes, 0x00020000);
-}
-
 __device__ __forceinline__ float bf16_to_f(uint32_t bits16) {
   return __uint_as_float(bits16 << 16);
 }
@@ -94,20 +85,6 @@ __device__ __forceinline__ uint32_t pack_fp8x4(float a, float b, float c, float 
   int r = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
   r = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, r, true);
   return (uint32_t)r;
-}
-
-// max / sum of x over lanes l and l ^ 32 (result in every lane)
-__device__ __forceinline__ float xhalf_max(float x) {
-  auto r = __builtin_amdgcn_permlane32_swap(__float_as_uint(x), __float_as_uint(x), false, false);
-  return fmaxf(__uint_as_float(r[0]), __uint_as_float(r[1]));
-}
-__device__ __forceinline__ float xhalf_sum(float x) {
-  auto r = __builtin_amdgcn_permlane32_swap(__float_as_uint(x), __float_as_uint(x), false, false);
-  return __uint_as_float(r[0]) + __uint_as_float(r[1]);
-}
-
-__device__ __forceinline__ v16f mfma(v8i a, v8i b, v16f c) {
-  return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, c, 0, 0, 0, 127, 0, 127);
 }
 
 typedef uint32_t v4u_ __attribute__((ext_vector_type(4)));
@@ -139,25 +116,6 @@ __device__ __forceinline__ v4u make_rsrc_s(const void* ptr, uint32_t bytes) {
   r[2] = __builtin_amdgcn_readfirstlane(bytes);
   r[3] = 0x00020000u;
   return r;
-}
-
-// LDS tile layout ("16 tokens x 4 chunks" blocks): instruction k (0..35) covers token
-// group tg = k / 9 (16 tokens) and chunk group cg = k % 9 (4 x 16 B); lane i -> token
-// 16 tg + i / 4, LDS slot i % 4 holding chunk 4 cg + ((i % 4) ^ (i >> 4)). So
-//   LDS(t, c) = 9216 (t / 16) + 1024 (c / 4) + 64 (t % 16) + 16 ((c % 4) ^ ((t % 16) >> 2)).
-// Every instruction touches 16 KV rows x 64 B; the XOR spreads banks for both the
-// K row reads and the V transposed reads. Loads are inline asm so the compiler's
-// waitcnt pass never inserts a vmcnt(0) (the loader manages vmcnt by hand).
-template <int R>
-__device__ __forceinline__ void issue_tile(v4u kv_rs, uint32_t slot, uint32_t stride, uint32_t ba, uint32_t co) {
-  issue_tile_asm<R>(kv_rs, slot, stride, ba, co);
-}
-
-// kv index of token `lane` of the tile -> hardcoded v[56 + R] (async asm load: the
-// destination must not be a compiler-managed register).
-template <int R>
-__device__ __forceinline__ void load_idx(v4u idx_rs, int pos) {
-  load_idx_asm<R>(idx_rs, pos * 4);
 }
 
 #define K3_RING_SWITCH(r, F, ...) \
@@ -196,19 +154,14 @@ loader_wave(const Params& p, uint8_t K3_LDS* smem, int kv_start, int start, int 
   const v4u kv_rs = make_rsrc_s(p.kv, p.kv_bytes);
   const v4u idx_rs = make_rsrc_s(p.kv_indices + kv_start, (uint32_t)end * 4u);
   const uint32_t stride = (uint32_t)p.kv_stride;
-  const uint32_t ba = (uint32_t)(lane >> 2) << 2;                  // bpermute source lane (t % 16) * 4
-  const uint32_t co = 16u * (uint32_t)((lane & 3) ^ (lane >> 4));  // chunk-in-group byte offset
   const uint32_t base = (uint32_t)(uintptr_t)smem;
-  bool skip = false;
   auto pos_of = [&](int t) {
     int pos = start + t * kBN + lane;
     return pos < end ? pos : end - 1;  // tail tokens re-read the last valid one (masked)
   };
   auto idx = [&](int t) { K3_RING_SWITCH(t, load_idx_asm, idx_rs, pos_of(t) * 4); };
   rl_precompute((uint32_t)lane);
-  auto dma = [&](int t) {
-    if (!skip) K3_RING_SWITCH(t, issue_tile_rl_asm, kv_rs, base + (t % kStages) * kTileBytes, stride);
-  };
+  auto dma = [&](int t) { K3_RING_SWITCH(t, issue_tile_rl_asm, kv_rs, base + (t % kStages) * kTileBytes, stride); };
   // prologue: idx(0 .. 3), DMA tiles 0..2
   for (int t = 0; t < 4 && t < ntiles; ++t)
     idx(t);
@@ -256,62 +209,6 @@ loader_wave(const Params& p, uint8_t K3_LDS* smem, int kv_start, int start, int 
       }
       dma(i + 3);
     }
-  }
-}
-
-// Shared-DMA loader: tiles 0..2 entirely by the loader (prologue); from tile 3 on,
-// compute wave w issues token group w (9 loads) itself and the loader only token
-// group 3, so per-wave vmcnt (max 63) no longer caps the bytes in flight.
-// Iteration i (after B_i): load idx(i+5); mailbox(i+4) <- voffsets of token groups 0..2;
-// DMA tg3 of tile i+3. Compute iteration i: read mailbox(i+3), DMA its group of tile i+3.
-__device__ __forceinline__ void
-loader_wave_sd(const Params& p, uint8_t K3_LDS* smem, int kv_start, int start, int end, int ntiles, int lane) {
-  const v4u kv_rs = make_rsrc_s(p.kv, p.kv_bytes);
-  const v4u idx_rs = make_rsrc_s(p.kv_indices + kv_start, (uint32_t)end * 4u);
-  const uint32_t stride = (uint32_t)p.kv_stride;
-  const uint32_t ba = (uint32_t)(lane >> 2) << 2;
-  const uint32_t co = 16u * (uint32_t)((lane & 3) ^ (lane >> 4));
-  const uint32_t base = (uint32_t)(uintptr_t)smem;
-  const uint32_t mb = base + kStages * kTileBytes + 4u * lane;
-  auto pos_of = [&](int t) {
-    int pos = start + t * kBN + lane;
-    return pos < end ? pos : end - 1;
-  };
-  auto idx = [&](int t) { K3_RING_SWITCH(t, load_idx_asm, idx_rs, pos_of(t) * 4); };
-  auto dma = [&](int t) {
-    K3_RING_SWITCH(t, issue_tile_asm, kv_rs, base + (t % kStages) * kTileBytes, stride, ba, co);
-  };
-  auto tg3 = [&](int t) { K3_RING_SWITCH(t, issue_tg3_asm, kv_rs, base + (t % kStages) * kTileBytes, stride, ba, co); };
-  auto mbox = [&](int t) { K3_RING_SWITCH(t, mbox_write_asm, mb + 768u * (t & 3), ba, stride, co); };
-  for (int t = 0; t < 5 && t < ntiles; ++t)
-    idx(t);
-  wait_vm<0>();
-  for (int t = 0; t < 3 && t < ntiles; ++t)
-    dma(t);
-  if (ntiles > 3) mbox(3);
-  if (ntiles > 2) {
-    wait_vm<36>();
-  } else {
-    wait_vm<0>();
-  }
-  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_pre
-  for (int i = 0; i < ntiles; ++i) {
-    if (i > 0) {
-      // own part of tile i+1 (DMA(2) in the prologue for i = 1, else tg3 of iteration i-2);
-      // younger: iteration i-1's idx(i+4) and tg3(i+2)
-      if (i + 2 < ntiles) {
-        wait_vm<9>();
-      } else {
-        wait_vm<0>();
-      }
-    }
-    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_i
-    if (i + 5 < ntiles) idx(i + 5);
-    if (i + 4 < ntiles) {
-      if (i > 0) wait_vm<9>();  // idx(i+4) (iteration i-1); younger: tg3(i+2) (+ idx(i+5))
-      mbox(i + 4);
-    }
-    if (i + 3 < ntiles) tg3(i + 3);
   }
 }
 
@@ -366,27 +263,6 @@ __device__ __forceinline__ void stage_o8(uint8_t K3_LDS* buf, int l32, int h, fl
   if constexpr (CB + 1 < 16) stage_o8<CB + 1>(buf, l32, h, o_mul);
 }
 
-template <int KS>
-__device__ __forceinline__ void load_q(const uint16_t* qrow, float q_inv) {
-  v4i r[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j)
-    r[j] = *(const v4i*)(qrow + 64 * KS + 8 * j);
-  v8i qf;
-#pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    const uint32_t u0 = (uint32_t)r[k >> 1][(k & 1) * 2];
-    const uint32_t u1 = (uint32_t)r[k >> 1][(k & 1) * 2 + 1];
-    qf[k] = (int)pack_fp8x4(
-        bf16_to_f(u0 & 0xffffu) * q_inv,
-        bf16_to_f(u0 >> 16) * q_inv,
-        bf16_to_f(u1 & 0xffffu) * q_inv,
-        bf16_to_f(u1 >> 16) * q_inv);
-  }
-  q_set<KS>(qf);
-  if constexpr (KS + 1 < 9) load_q<KS + 1>(qrow, q_inv);
-}
-
 struct WaveState {
   float m_i;  // running max (log2 units, scaled) used for p
   float nb;   // 6 - m_i (log2 kPScale folded in)
@@ -398,13 +274,6 @@ struct WaveState {
 //   QK(i+1) -> S[1-D]  ||  p = exp(S[D]) -> P, l update
 //   [mask S[1-D] if tile i+1 needs it]
 //   PV(i)  ||  max / rescale decision of tile i+1;  O *= alpha if any row wants it.
-struct DmaCtx {
-  v8i ones;  // fp8 1.0 x 32 (A operand of the P row-sum MFMA)
-  v4u rs;
-  uint32_t base, mb;
-  int w, i, ntiles;
-};
-
 template <int D>
 __device__ __forceinline__ void iteration(
     WaveState& st,
@@ -418,19 +287,19 @@ __device__ __forceinline__ void iteration(
     bool has_next,
     int next_thr,
     bool next_mask,
-    const DmaCtx& dc) {
+    v8i ones) {
   // own DMA part of tile i+1 (issued in iteration i-2) must have landed; younger: part of tile i+2
   asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_i
   qk_exp<D>(nslot + koff_e, nslot + koff_o, s_scale, st.nb, st.al, st.l_i);
   if (has_next) {
     if (next_mask) mask_s<1 - D>(next_thr);
     uint64_t rs;
-    pv_decide<1 - D>(slot + voff, slot + voff_o, s_scale, st.m_i, st.nb, st.al, rs, dc.ones, st.l_i);
+    pv_decide<1 - D>(slot + voff, slot + voff_o, s_scale, st.m_i, st.nb, st.al, rs, ones, st.l_i);
     if (rs != 0) {
       o_scale(st.al);
     }
   } else {
-    pv_tile_asm<D>(slot + voff, slot + voff_o, dc.ones, st.al, st.l_i);
+    pv_tile_asm<D>(slot + voff, slot + voff_o, ones, st.al, st.l_i);
   }
 }
 
@@ -453,11 +322,7 @@ __device__ __forceinline__ void compute_wave(
     const uint16_t* qblk = p.q + ((int64_t)b * kRows + 32 * w) * kD;
     const uint32_t sl = (uint32_t)(uintptr_t)smem + (uint32_t)((1 + w) * kTileBytes);
     q_load_lds_asm(
-        make_rsrc_s(qblk, 32 * kD * 2),
-        sl,
-        16u * (uint32_t)lane,
-        sl + 1152u * (uint32_t)l32 + 64u * (uint32_t)h,
-        1024u * (uint32_t)__builtin_amdgcn_readfirstlane((blockIdx.x >> 3) % 36));
+        make_rsrc_s(qblk, 32 * kD * 2), sl, 16u * (uint32_t)lane, sl + 1152u * (uint32_t)l32 + 64u * (uint32_t)h);
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_q: Q staging slots free
     qscale = q_quant_asm();
   } else {
@@ -481,14 +346,8 @@ __device__ __forceinline__ void compute_wave(
   auto thr_of = [&](int t) { return lim - (start + t * kBN) - 4 * h; };
   auto mask_of = [&](int t) { return start + t * kBN + kBN - 1 > mask_from; };
 
-  DmaCtx dc{
-      v8i{0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838},
-      make_rsrc_s(p.kv, p.kv_bytes),
-      base,
-      base + kStages * kTileBytes + 256u * (uint32_t)w + 4u * (uint32_t)lane,
-      w,
-      0,
-      ntiles};
+  // fp8 1.0 x 32: A operand of the P row-sum MFMA
+  const v8i ones = {0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838, 0x38383838};
   asm volatile("s_waitcnt vmcnt(0)\n\ts_barrier" ::: "memory");  // B_pre: tiles 0, 1 landed
   qk_first(base + koff_e, base + koff_o);
   if (mask_of(0)) mask_s<0>(thr_of(0));
@@ -498,11 +357,20 @@ __device__ __forceinline__ void compute_wave(
   }
   int i = 0;
   for (; i + 2 <= ntiles; i += 2) {
-    dc.i = i;
     iteration<0>(
-        st, slot_of(i), slot_of(i + 1), koff_e, koff_o, voff, voff_o, s_scale, true, thr_of(i + 1), mask_of(i + 1), dc);
+        st,
+        slot_of(i),
+        slot_of(i + 1),
+        koff_e,
+        koff_o,
+        voff,
+        voff_o,
+        s_scale,
+        true,
+        thr_of(i + 1),
+        mask_of(i + 1),
+        ones);
     const bool nx = i + 2 < ntiles;
-    dc.i = i + 1;
     iteration<1>(
         st,
         slot_of(i + 1),
@@ -515,11 +383,10 @@ __device__ __forceinline__ void compute_wave(
         nx,
         thr_of(i + 2),
         nx && mask_of(i + 2),
-        dc);
+        ones);
   }
   if (i < ntiles) {
-    dc.i = i;
-    iteration<0>(st, slot_of(i), slot_of(i), koff_e, koff_o, voff, voff_o, s_scale, false, 0, false, dc);
+    iteration<0>(st, slot_of(i), slot_of(i), koff_e, koff_o, voff, voff_o, s_scale, false, 0, false, ones);
   }
 
   // ---- epilogue
@@ -529,11 +396,11 @@ __device__ __forceinline__ void compute_wave(
   const bool has = l_tot > 0.f;
   const float o_mul = has ? kv_scale / l_tot : 0.f;
   bool part8 = false;
-  if (p.part8_min > 0 && p.nsplit != 1) {
+  if (p.part8_min > 0) {
     const int chunk = split_chunk(L, p.nsplit, p.min_chunk);
     part8 = min((L + chunk - 1) / chunk, p.nsplit) >= p.part8_min;
   }
-  if (p.nsplit != 1 && h == 0) {
+  if (h == 0) {
     const int64_t prow = ((int64_t)b * p.nsplit + split) * kRows + row;
     const float lse = has ? st.m_i + __builtin_amdgcn_logf(l_tot) - 6.0f : -INFINITY;
     p.lse_part[prow] = lse;
@@ -563,13 +430,7 @@ __device__ __forceinline__ void compute_wave(
 #pragma unroll 4
   for (int r = 0; r < 32; ++r) {
     const int rr = 32 * w + r;
-    uint16_t* dst;
-    if (p.nsplit == 1) {
-      const int qp = rr / kH;
-      dst = p.o_final + (int64_t)(b * kQLen + qp) * p.stride_o_tok + (int64_t)(rr - qp * kH) * p.stride_o_h;
-    } else {
-      dst = p.o_part + (((int64_t)b * p.nsplit + split) * kRows + rr) * kDV;
-    }
+    uint16_t* dst = p.o_part + (((int64_t)b * p.nsplit + split) * kRows + rr) * kDV;
     const v4i v = *(const v4i K3_LDS*)(buf + r * kOPitch + 8 * lane);
     *(v4i*)(dst + 8 * lane) = v;
   }
@@ -580,7 +441,7 @@ __device__ __forceinline__ void compute_wave(
 
 __global__ __launch_bounds__(kThreads, 1)
     __attribute__((amdgpu_num_vgpr(48))) void k3_mla_verify_hk_kernel(const Params p) {
-  __shared__ __attribute__((aligned(1024))) uint8_t smem_raw[kStages * kTileBytes + kMboxBytes];
+  __shared__ __attribute__((aligned(1024))) uint8_t smem_raw[kStages * kTileBytes];
   uint8_t K3_LDS* smem = (uint8_t K3_LDS*)smem_raw;
   const int cid = blockIdx.x;
   const int b = cid / p.nsplit, split = cid - b * p.nsplit;
@@ -600,104 +461,14 @@ __global__ __launch_bounds__(kThreads, 1)
   }
 }
 
-// ---------------------------------------------------------------- split merge
-// One workgroup (4 waves) per (row, request); wave w merges splits w, w+4, ...;
-// lane L owns columns 8L..8L+7; the 4 partial sums are combined through LDS.
-// Same split formula as stage 1; base-2 LSE merge of the active splits.
-constexpr int kRedWaves = 4;
-// CC: column chunks per row (1: lane owns 8 cols, 16 B loads; 4: lane owns 2 cols of a
-// 128-col chunk, for small batches where rows x requests alone cannot fill the GPU).
-template <int CC>
-__global__ __launch_bounds__(64 * kRedWaves) void k3_mla_verify_hk_reduce(const Params p) {
-  constexpr int NC = 8 / CC;  // columns per lane
-  __shared__ float red_acc[kRedWaves][NC][64];
-  __shared__ float red_w[kRedWaves];
-  const int lane = threadIdx.x & 63, w = threadIdx.x >> 6;
-  const int row = blockIdx.x / CC, cc = blockIdx.x % CC, b = blockIdx.y;
-  const int L = p.kv_indptr[b + 1] - p.kv_indptr[b];
-  const int chunk = split_chunk(L, p.nsplit, p.min_chunk);
-  const int nact = L > 0 ? min((L + chunk - 1) / chunk, p.nsplit) : 0;
-  const float* lse = p.lse_part + (int64_t)b * p.nsplit * kRows + row;
-  float m = -INFINITY;
-  for (int s = lane; s < nact; s += 64)
-    m = fmaxf(m, lse[(int64_t)s * kRows]);
-#pragma unroll
-  for (int o = 32; o > 0; o >>= 1)
-    m = fmaxf(m, __shfl_xor(m, o, 64));
-  if (m == -INFINITY) m = 0.f;
-  const int col0 = (kDV / CC) * cc + NC * lane;
-  const uint16_t* src = p.o_part + ((int64_t)b * p.nsplit * kRows + row) * kDV + col0;
-  float acc[NC];
-#pragma unroll
-  for (int e = 0; e < NC; ++e)
-    acc[e] = 0.f;
-  float wsum = 0.f;
-  typedef int vec_t __attribute__((ext_vector_type(NC / 2)));
-  constexpr int U = 4;
-  int s = w;
-  for (; s + kRedWaves * (U - 1) < nact; s += kRedWaves * U) {
-    float wt[U];
-    vec_t x[U];
-#pragma unroll
-    for (int u = 0; u < U; ++u) {
-      const int ss = s + kRedWaves * u;
-      wt[u] = lse[(int64_t)ss * kRows];
-      x[u] = *(const vec_t*)(src + (int64_t)ss * kRows * kDV);
-    }
-#pragma unroll
-    for (int u = 0; u < U; ++u) {
-      const float wu = __builtin_amdgcn_exp2f(wt[u] - m);
-      wsum += wu;
-#pragma unroll
-      for (int e = 0; e < NC / 2; ++e) {
-        const uint32_t v = (uint32_t)x[u][e];
-        acc[2 * e] += wu * bf16_to_f(v & 0xffffu);
-        acc[2 * e + 1] += wu * bf16_to_f(v >> 16);
-      }
-    }
-  }
-  for (; s < nact; s += kRedWaves) {
-    const float wu = __builtin_amdgcn_exp2f(lse[(int64_t)s * kRows] - m);
-    const vec_t x = *(const vec_t*)(src + (int64_t)s * kRows * kDV);
-    wsum += wu;
-#pragma unroll
-    for (int e = 0; e < NC / 2; ++e) {
-      const uint32_t v = (uint32_t)x[e];
-      acc[2 * e] += wu * bf16_to_f(v & 0xffffu);
-      acc[2 * e + 1] += wu * bf16_to_f(v >> 16);
-    }
-  }
-#pragma unroll
-  for (int e = 0; e < NC; ++e)
-    red_acc[w][e][lane] = acc[e];
-  if (lane == 0) red_w[w] = wsum;
-  __syncthreads();
-  if (w != 0) return;
-  wsum = red_w[0] + red_w[1] + red_w[2] + red_w[3];
-  const float inv = wsum > 0.f ? 1.f / wsum : 0.f;
-  vec_t o;
-#pragma unroll
-  for (int e = 0; e < NC / 2; ++e) {
-    const float a0 =
-        red_acc[0][2 * e][lane] + red_acc[1][2 * e][lane] + red_acc[2][2 * e][lane] + red_acc[3][2 * e][lane];
-    const float a1 = red_acc[0][2 * e + 1][lane] + red_acc[1][2 * e + 1][lane] + red_acc[2][2 * e + 1][lane] +
-                     red_acc[3][2 * e + 1][lane];
-    const bf16x2 pk = __builtin_convertvector((v2f{a0 * inv, a1 * inv}), bf16x2);
-    o[e] = __builtin_bit_cast(int, pk);
-  }
-  const int qp = row / kH;
-  *(vec_t*)(p.o_final + (int64_t)(b * kQLen + qp) * p.stride_o_tok + (int64_t)(row - qp * kH) * p.stride_o_h + col0) =
-      o;
-}
-
 // ---------------------------------------------------------------- split merge, one round trip
 // Workgroup (128-column chunk cc, row, request b); thread t = (g = t / 16, c = t % 16): splits
 // s = g + 16 j (j < J), columns 128 cc + 8 c .. + 7. All partial / lse loads are issued at once
 // (addresses do not depend on kv_indptr: o_part / lse_part are allocated for all nsplit splits;
 // inactive splits are masked by selects, so their uninitialised contents never matter), so the
 // merge costs one memory round trip instead of indptr -> lse -> max -> partials.
-// regime != nullptr (auto path): *regime == 0 -> merge the Gluon splits instead (natural-log
-// LSE, = aiter _mla_softmax_reducev_kernel), g_ns == 1 -> nothing to do.
+// *regime == 0 -> merge the Gluon splits instead (natural-log LSE, = aiter
+// _mla_softmax_reducev_kernel).
 
 // fp8-partial variant of reduce1_body (o_part rows = 512 fp8 bytes of O / kv_scale); thread loads 8 B
 template <int J>
@@ -871,63 +642,40 @@ __device__ __forceinline__ void reduce1_gluon(const Params& p, float* s_m, float
   const int row = blockIdx.x >> 2, cc = blockIdx.x & 3, b = blockIdx.y;
   const int qp = row / kH, h = row - qp * kH;
   const int col = 128 * cc + 8 * c;
-  const int gL = p.g_indptr[b + 1] - p.g_indptr[b];
+  const int gL = p.kv_indptr[b + 1] - p.kv_indptr[b];
   const int gper = max(p.g_block_n, gL / p.g_ns);
   const int gnact = gL > 0 ? min((gL + gper - 1) / gper, p.g_ns) : 0;
   const uint16_t* lg = p.g_logits + b * p.g_sl_b + qp * p.g_sl_qs + h * p.g_sl_h + col;
   const float* ls = p.g_lse + b * p.g_ml_b + qp * p.g_ml_qs + h * p.g_ml_h;
   float acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   float m = -INFINITY;
-  if (p.g_ns <= 32) {
-    // one round trip: all (<= 2 per thread) splits loaded before kv_indptr is known
-    float lv[2];
-    v4i x[2];
+  // g_ns <= 32: all (<= 2 per thread) splits loaded before kv_indptr is known
+  float lv[2];
+  v4i x[2];
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const int s = min(g + 16 * j, p.g_ns - 1);
-      lv[j] = ls[s * p.g_ml_s];
-      x[j] = *(const v4i*)(lg + s * p.g_sl_s);
-    }
+  for (int j = 0; j < 2; ++j) {
+    const int s = min(g + 16 * j, p.g_ns - 1);
+    lv[j] = ls[s * p.g_ml_s];
+    x[j] = *(const v4i*)(lg + s * p.g_sl_s);
+  }
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
-      if (g + 16 * j < gnact) m = fmaxf(m, lv[j]);
-    m = fmaxf(m, __shfl_xor(m, 16, 64));
-    m = fmaxf(m, __shfl_xor(m, 32, 64));
-    if (lane == 0) s_m[w] = m;
-    __syncthreads();
-    m = fmaxf(fmaxf(s_m[0], s_m[1]), fmaxf(s_m[2], s_m[3]));
+  for (int j = 0; j < 2; ++j)
+    if (g + 16 * j < gnact) m = fmaxf(m, lv[j]);
+  m = fmaxf(m, __shfl_xor(m, 16, 64));
+  m = fmaxf(m, __shfl_xor(m, 32, 64));
+  if (lane == 0) s_m[w] = m;
+  __syncthreads();
+  m = fmaxf(fmaxf(s_m[0], s_m[1]), fmaxf(s_m[2], s_m[3]));
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const bool ok = g + 16 * j < gnact && lv[j] != -INFINITY;
-      const float wk = ok ? __expf(lv[j] - m) : 0.f;
-      acc[8] += wk;
+  for (int j = 0; j < 2; ++j) {
+    const bool ok = g + 16 * j < gnact && lv[j] != -INFINITY;
+    const float wk = ok ? __expf(lv[j] - m) : 0.f;
+    acc[8] += wk;
 #pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const uint32_t u = ok ? (uint32_t)x[j][e] : 0u;
-        acc[2 * e] += wk * bf16_to_f(u & 0xffffu);
-        acc[2 * e + 1] += wk * bf16_to_f(u >> 16);
-      }
-    }
-  } else {
-    for (int s = g; s < gnact; s += 16)
-      m = fmaxf(m, ls[s * p.g_ml_s]);
-    m = fmaxf(m, __shfl_xor(m, 16, 64));
-    m = fmaxf(m, __shfl_xor(m, 32, 64));
-    if (lane == 0) s_m[w] = m;
-    __syncthreads();
-    m = fmaxf(fmaxf(s_m[0], s_m[1]), fmaxf(s_m[2], s_m[3]));
-    for (int s = g; s < gnact; s += 16) {
-      const float l = ls[s * p.g_ml_s];
-      const v4i x = *(const v4i*)(lg + s * p.g_sl_s);
-      if (l == -INFINITY) continue;
-      const float wk = __expf(l - m);
-      acc[8] += wk;
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const uint32_t u = (uint32_t)x[e];
-        acc[2 * e] += wk * bf16_to_f(u & 0xffffu);
-        acc[2 * e + 1] += wk * bf16_to_f(u >> 16);
-      }
+    for (int e = 0; e < 4; ++e) {
+      const uint32_t u = ok ? (uint32_t)x[j][e] : 0u;
+      acc[2 * e] += wk * bf16_to_f(u & 0xffffu);
+      acc[2 * e + 1] += wk * bf16_to_f(u >> 16);
     }
   }
 #pragma unroll
@@ -960,27 +708,11 @@ template <int J>
 __global__ __launch_bounds__(256) void k3_mla_verify_hk_reduce1(const Params p) {
   __shared__ float s_m[4];
   __shared__ float s_acc[64 * 9];
-  if (p.regime != nullptr && *p.regime == 0) {
-    if (p.g_ns > 1) reduce1_gluon(p, s_m, s_acc);
+  if (*p.regime == 0) {
+    reduce1_gluon(p, s_m, s_acc);
     return;
   }
   reduce1_body<J>(p, s_m, s_acc);
-}
-
-// launch: grid (96 * 4, bs), 256 threads; J = ceil(nsplit / 16) rounded up to a power of two
-inline void launch_reduce1(const Params& p, int bs, hipStream_t st) {
-  const dim3 grid(kRows * 4, bs), blk(256);
-  const int J = (p.nsplit + 15) / 16;
-  if (J <= 1)
-    hipLaunchKernelGGL(k3_mla_verify_hk_reduce1<1>, grid, blk, 0, st, p);
-  else if (J <= 2)
-    hipLaunchKernelGGL(k3_mla_verify_hk_reduce1<2>, grid, blk, 0, st, p);
-  else if (J <= 4)
-    hipLaunchKernelGGL(k3_mla_verify_hk_reduce1<4>, grid, blk, 0, st, p);
-  else if (J <= 8)
-    hipLaunchKernelGGL(k3_mla_verify_hk_reduce1<8>, grid, blk, 0, st, p);
-  else
-    hipLaunchKernelGGL(k3_mla_verify_hk_reduce1<16>, grid, blk, 0, st, p);
 }
 
 }  // namespace k3hk
@@ -997,7 +729,7 @@ namespace sglang {
 struct K3MlaVerifyHK {
   // q [bs*8, 12, 576] bf16 (row stride arbitrary, inner contiguous); kv fp8 [N, 576] (any row stride);
   // kv_indptr [>= bs+1] int32; kv_indices int32; kv_scale fp32 [1];
-  // o_part bf16 [bs, nsplit, 96, 512]; lse_part fp32 [bs, nsplit, 96]; out bf16 [bs*8, 12, 512].
+  // o_part bf16 [bs, nsplit, 96, 512]; lse_part fp32 [bs, nsplit, 96].
   static void
   run(const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView kv,
@@ -1006,7 +738,6 @@ struct K3MlaVerifyHK {
       const tvm::ffi::TensorView kv_scale,
       const tvm::ffi::TensorView o_part,
       const tvm::ffi::TensorView lse_part,
-      const tvm::ffi::TensorView out,
       int64_t nsplit,
       int64_t min_chunk,
       double sm_scale_log2,
@@ -1017,8 +748,7 @@ struct K3MlaVerifyHK {
     RuntimeCheck(bs * k3hk::kQLen == ntok, "token count must be a multiple of 8");
     RuntimeCheck(q.size(1) == k3hk::kH && q.size(2) == k3hk::kD && q.stride(2) == 1, "q must be [*, 12, 576]");
     RuntimeCheck(kv.size(kv.dim() - 1) == k3hk::kD && kv.stride(kv.dim() - 1) == 1, "kv must be [N, 576]");
-    RuntimeCheck(out.size(1) == k3hk::kH && out.size(2) == k3hk::kDV && out.stride(2) == 1, "bad out");
-    RuntimeCheck(nsplit >= 1 && min_chunk % k3hk::kBN == 0, "bad split config");
+    RuntimeCheck(nsplit >= 2 && min_chunk % k3hk::kBN == 0, "bad split config");
     if (bs == 0) return;
     k3hk::Params p{};
     p.q = static_cast<const uint16_t*>(q.data_ptr());
@@ -1028,11 +758,8 @@ struct K3MlaVerifyHK {
     p.kv_scale = static_cast<const float*>(kv_scale.data_ptr());
     p.o_part = static_cast<uint16_t*>(o_part.data_ptr());
     p.lse_part = static_cast<float*>(lse_part.data_ptr());
-    p.o_final = static_cast<uint16_t*>(out.data_ptr());
     p.stride_q_tok = q.stride(0);
     p.stride_q_h = q.stride(1);
-    p.stride_o_tok = out.stride(0);
-    p.stride_o_h = out.stride(1);
     const int64_t kv_rows = kv.size(0);
     const int64_t kv_stride = kv.stride(0);
     const int64_t kv_bytes = (kv_rows - 1) * kv_stride + k3hk::kD;
@@ -1043,15 +770,13 @@ struct K3MlaVerifyHK {
     p.min_chunk = static_cast<int32_t>(min_chunk);
     p.sm_scale_log2 = static_cast<float>(sm_scale_log2);
     p.q_lds = (q.stride(1) == k3hk::kD && q.stride(0) == k3hk::kH * k3hk::kD) ? 1 : 0;
-    p.bs = static_cast<int32_t>(bs);
     p.part8_min = static_cast<int32_t>(part8_min);
     LaunchKernel(dim3(static_cast<uint32_t>(nsplit * bs)), k3hk::kThreads, q.device())(
         k3hk::k3_mla_verify_hk_kernel, p);
   }
 
-  // split merge (one memory round trip, k3_mla_verify_hk_reduce1). use_regime != 0 (auto path):
-  // regime [1] int32 (0 = Gluon ran: merge g_logits [bs, qlen, H, g_ns, 512] / g_lse
-  // [bs, qlen, H, g_ns] with g_indptr's split formula; else merge o_part / lse_part).
+  // split merge (k3_mla_verify_hk_reduce1): *regime == 0 (Gluon ran) merges g_logits
+  // [bs, qlen, H, g_ns, 512] / g_lse [bs, qlen, H, g_ns], else o_part / lse_part.
   static void reduce(
       const tvm::ffi::TensorView o_part,
       const tvm::ffi::TensorView lse_part,
@@ -1063,7 +788,6 @@ struct K3MlaVerifyHK {
       const tvm::ffi::TensorView kv_scale,
       int64_t nsplit,
       int64_t min_chunk,
-      int64_t use_regime,
       int64_t g_ns,
       int64_t g_block_n,
       int64_t part8_min) {
@@ -1071,7 +795,8 @@ struct K3MlaVerifyHK {
     const int64_t ntok = out.size(0);
     const int64_t bs = ntok / k3hk::kQLen;
     RuntimeCheck(out.size(1) == k3hk::kH && out.size(2) == k3hk::kDV && out.stride(2) == 1, "bad out");
-    RuntimeCheck(nsplit >= 1 && nsplit <= 256, "reduce: nsplit must be in [1, 256]");
+    RuntimeCheck(nsplit == 128 || nsplit == 256, "reduce: nsplit must be 128 or 256");
+    RuntimeCheck(g_ns >= 2 && g_ns <= 32, "reduce: g_ns must be in [2, 32]");
     if (bs == 0) return;
     k3hk::Params p{};
     p.kv_indptr = static_cast<const int32_t*>(kv_indptr.data_ptr());
@@ -1082,38 +807,24 @@ struct K3MlaVerifyHK {
     p.stride_o_h = out.stride(1);
     p.nsplit = static_cast<int32_t>(nsplit);
     p.min_chunk = static_cast<int32_t>(min_chunk);
-    p.bs = static_cast<int32_t>(bs);
     p.kv_scale = static_cast<const float*>(kv_scale.data_ptr());
     p.part8_min = static_cast<int32_t>(part8_min);
-    p.regime = nullptr;
-    if (use_regime) {
-      p.regime = static_cast<const int32_t*>(regime.data_ptr());
-      p.g_indptr = p.kv_indptr;
-      p.g_ns = static_cast<int32_t>(g_ns);
-      p.g_block_n = static_cast<int32_t>(g_block_n);
-      if (g_ns > 1) {
-        p.g_logits = static_cast<const uint16_t*>(g_logits.data_ptr());
-        p.g_lse = static_cast<const float*>(g_lse.data_ptr());
-        p.g_sl_b = g_logits.stride(0);
-        p.g_sl_qs = g_logits.stride(1);
-        p.g_sl_h = g_logits.stride(2);
-        p.g_sl_s = g_logits.stride(3);
-        p.g_ml_b = g_lse.stride(0);
-        p.g_ml_qs = g_lse.stride(1);
-        p.g_ml_h = g_lse.stride(2);
-        p.g_ml_s = g_lse.stride(3);
-      }
-    }
+    p.regime = static_cast<const int32_t*>(regime.data_ptr());
+    p.g_ns = static_cast<int32_t>(g_ns);
+    p.g_block_n = static_cast<int32_t>(g_block_n);
+    p.g_logits = static_cast<const uint16_t*>(g_logits.data_ptr());
+    p.g_lse = static_cast<const float*>(g_lse.data_ptr());
+    p.g_sl_b = g_logits.stride(0);
+    p.g_sl_qs = g_logits.stride(1);
+    p.g_sl_h = g_logits.stride(2);
+    p.g_sl_s = g_logits.stride(3);
+    p.g_ml_b = g_lse.stride(0);
+    p.g_ml_qs = g_lse.stride(1);
+    p.g_ml_h = g_lse.stride(2);
+    p.g_ml_s = g_lse.stride(3);
     const dim3 grid(k3hk::kRows * 4, static_cast<uint32_t>(bs));
-    const int J = static_cast<int>((nsplit + 15) / 16);
     auto L = LaunchKernel(grid, 256, out.device());
-    if (J <= 1)
-      L(k3hk::k3_mla_verify_hk_reduce1<1>, p);
-    else if (J <= 2)
-      L(k3hk::k3_mla_verify_hk_reduce1<2>, p);
-    else if (J <= 4)
-      L(k3hk::k3_mla_verify_hk_reduce1<4>, p);
-    else if (J <= 8)
+    if (nsplit == 128)
       L(k3hk::k3_mla_verify_hk_reduce1<8>, p);
     else
       L(k3hk::k3_mla_verify_hk_reduce1<16>, p);

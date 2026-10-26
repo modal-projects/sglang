@@ -1076,7 +1076,9 @@ def build_speculative_verify_target_probs(
             torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             max_top_k=(
-                sampling_info.max_top_k if sampling_info.sampling_seed is None else None
+                getattr(sampling_info, "max_top_k", None)
+                if getattr(sampling_info, "sampling_seed", None) is None
+                else None
             ),
         )
         return target_probs.view(bs, draft_token_num, -1).contiguous()

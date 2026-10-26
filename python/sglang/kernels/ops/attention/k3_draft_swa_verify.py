@@ -286,15 +286,18 @@ def can_handle(
     sinks,
     logit_cap,
     xai_temperature_len,
+    score_mod,
 ) -> bool:
-    if not causal or sinks is not None:
+    if not causal or sinks is not None or score_mod is not None:
         return False
     if logit_cap and logit_cap > 0:
         return False
     if xai_temperature_len is not None and xai_temperature_len > 0:
         return False
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        return False
     hq, hkv, d, dv = q.shape[1], k.shape[1], q.shape[2], v.shape[2]
-    if hq % hkv:
+    if hkv == 0 or hq % hkv:
         return False
     if k.shape[2] != d or k_buffer.shape[2] != d or v_buffer.shape[2] != dv:
         return False
@@ -308,7 +311,10 @@ def can_handle(
         return False
     if k_buffer.dtype not in (torch.bfloat16, torch.float16):
         return False
-    mle = int(max_len_extend)
+    try:
+        mle = int(max_len_extend)
+    except (TypeError, ValueError):
+        return False
     bs = qo_indptr.shape[0] - 1
     if bs < 1 or mle < 1 or mle > 16 or q.shape[0] != bs * mle:
         return False
@@ -330,6 +336,8 @@ def draft_swa_verify_fwd(
     sliding_window_size,
     max_bs,
     n_splits=None,
+    block_n=64,
+    num_warps=4,
 ):
     """q: [T, Hq, D]; k/v: [T, Hkv, D] (may be strided column slices);
     o: [T, Hq, Dv] output. kv_indptr/kv_indices describe the (window) prefix.
@@ -340,7 +348,7 @@ def draft_swa_verify_fwd(
     l_pad = triton.next_power_of_2(int(max_len_extend))
     if n_splits is None:
         n_splits = 16 if bs <= 8 else 8
-    max_bs = max(max_bs, bs)
+    max_bs = max(int(max_bs or bs), bs)
     att_out, att_lse = _scratch(max_bs, hq, n_splits + 1, l_pad, dv, q.device)
     sw = (
         int(sliding_window_size)
@@ -382,9 +390,9 @@ def draft_swa_verify_fwd(
         N_SPLITS=n_splits,
         D=d,
         DV=dv,
-        BLOCK_N=64,
+        BLOCK_N=block_n,
         LB=max(16, l_pad),
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=1,
         **_AMD_KW,
     )

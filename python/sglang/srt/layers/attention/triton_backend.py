@@ -1917,6 +1917,7 @@ class TritonAttnBackend(AttentionBackend):
                 sinks=sinks,
                 logit_cap=logits_soft_cap,
                 xai_temperature_len=layer.xai_temperature_len,
+                score_mod=score_mod,
             ):
                 _dsv.draft_swa_verify_fwd(
                     q3,

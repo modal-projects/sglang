@@ -548,7 +548,9 @@ def _build_verify_target_probs(
             top_ks,
             top_ps,
             max_top_k=(
-                sampling_info.max_top_k if sampling_info.sampling_seed is None else None
+                getattr(sampling_info, "max_top_k", None)
+                if getattr(sampling_info, "sampling_seed", None) is None
+                else None
             ),
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_top_p")

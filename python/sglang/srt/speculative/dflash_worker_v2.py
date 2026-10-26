@@ -1570,13 +1570,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         return tokens.view(bs, num_pred)
 
     def _broadcast_selector_draft(self, draft_next: torch.Tensor) -> torch.Tensor:
-        """Make every TP rank verify and commit rank 0's selector draft.
-
-        Each rank walks the selector lattice with its own uniforms and its own
-        scores, so ranks can draw different tokens and q rows. Only rank 0's
-        accept length and bonus are broadcast, so without this a rank commits a
-        token rank 0 never emitted and the ranks' token histories split.
-        """
+        # Ranks sample the selector with their own uniforms and scores, but only
+        # rank 0's accept length and bonus are broadcast; verify rank 0's draft
+        # everywhere so token histories cannot split.
         draft_next = self._tp_sync.sync(
             SpecTpSyncSite.DFLASH_SELECTOR, draft_next.contiguous()
         )

@@ -1,12 +1,4 @@
-"""Mixed batches whose decode rows carry a grammar must see the previous result.
-
-The decode rows of a mixed batch are sampled in the target extend, not in verify(),
-so the verify grammar barrier never runs for them. If their bitmask is built while
-the previous decode batch's result is still queued, it misses that batch's committed
-tokens; the sampled token is then rejected by accept_token and the request is
-aborted mid-stream. Workers that run the barrier before the extend sampling keep
-overlapping; the others take the sync path.
-"""
+"""Mixed batches whose decode rows carry a grammar must see the previous result."""
 
 import unittest
 from collections import deque

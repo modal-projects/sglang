@@ -1355,15 +1355,12 @@ class KimiK3MoE(nn.Module):
             mid = self._rocm_route_mid(router_logits, routed_input)
             if mid is not None:
                 topk_output, mid_state = mid
-                with (
-                    k3_sort_plan(K3SortPlan(route_state=mid_state)),
-                    zero_copy_context.set_moe_output(latent),
-                ):
-                    expert_output = self.experts(routed_input, topk_output)
+                plan = k3_sort_plan(K3SortPlan(route_state=mid_state))
             else:
                 topk_output = self.topk(hidden_states, router_logits)
-                with zero_copy_context.set_moe_output(latent):
-                    expert_output = self.experts(routed_input, topk_output)
+                plan = nullcontext()
+            with plan, zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():

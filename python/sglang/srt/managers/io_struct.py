@@ -2267,6 +2267,58 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
     payload: Optional[List[ChecksumInfo]] = None
 
 
+class GpuDeltaTestReqInput(BaseReq, kw_only=True):
+    action: Literal[
+        "dump", "check_map", "check_fetch", "apply", "state_hashes", "check_version"
+    ]
+    manifests: Optional[List[str]] = None
+    version: Optional[str] = None
+    digests: Optional[str] = None
+
+
+class GpuDeltaTestReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    payload: Optional[str] = None
+
+
+class PrepareWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
+    # The deltas to apply, in order. A stand-in until the layer above (Miles/Stitch)
+    # decides what this call carries.
+    manifests: List[str]
+    # Whether to check every payload file's SHA-256 (sizes and decode status always are)
+    verify_sha256: bool = False
+
+
+class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: the version the prepared deltas reach (the default); any other is refused
+    weight_version: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class GpuDeltaReqInput(BaseReq, kw_only=True):
+    """One step of prepare/update_weights_from_gpu_delta, sent to every GPU."""
+
+    action: Literal["fetch", "status", "discard", "apply", "release"]
+    manifests: Optional[List[str]] = None
+    verify_sha256: bool = False
+    weight_version: Optional[str] = None
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+
+
+class GpuDeltaReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    state: str
+    target_version: Optional[str] = None
+
+
 class SlowDownReqInput(BaseReq, kw_only=True):
     forward_sleep_time: Optional[float]
 

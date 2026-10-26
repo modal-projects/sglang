@@ -366,6 +366,16 @@ class Model(msgspec.Struct):
     ] = False
 
     # -------------------------------------------------------------------------
+    # GPU delta
+    # -------------------------------------------------------------------------
+    enable_gpu_delta: A[
+        bool,
+        "Accept weight updates as XOR deltas of the loaded checkpoint, applied on the GPU "
+        "(/update_weights_from_gpu_delta). At startup the engine checks that its config is "
+        "supported and maps every checkpoint tensor onto its serving tensors.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Weight cache
     # -------------------------------------------------------------------------
     weight_cache_mode: A[

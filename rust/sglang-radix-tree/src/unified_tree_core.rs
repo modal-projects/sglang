@@ -3858,6 +3858,60 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// The NodeId anchoring matches; the single root serves every namespace.
+    /// Export all residency metadata, but token bytes only for changed keys.
+    /// Node handles survive arena-slot reuse and reset. In this pinned core a
+    /// live key changes only by a split, which strictly shortens it. Therefore
+    /// (handle, key length) identifies its immutable token segment. The consumer
+    /// supplies its acknowledged inventory; this method holds no export cursor.
+    /// No tensors, match operations, access counters or eviction state are touched.
+    pub fn routing_snapshot_delta(
+        &self,
+        known: &std::collections::HashMap<usize, usize>,
+    ) -> (
+        usize,
+        Vec<(
+            usize,
+            usize,
+            Option<String>,
+            Option<Vec<u8>>,
+            bool,
+            i64,
+            usize,
+        )>,
+    ) {
+        let rows = self
+            .collect_all_nodes_()
+            .into_iter()
+            .filter_map(|idx| {
+                let node = self.arena.node(idx);
+                if node.is_root()
+                    || !node.has_device_value(FULL)
+                    || K::IS_BIGRAM
+                    || node.namespace.cache_salt().is_some()
+                {
+                    return None;
+                }
+                let length = node.key.atom_len();
+                let tokens = (known.get(&node.id) != Some(&length)).then(|| {
+                    K::raw_token_ids(node.key.as_ref())
+                        .iter()
+                        .flat_map(|token| token.to_le_bytes())
+                        .collect()
+                });
+                Some((
+                    node.id,
+                    self.arena.node(node.parent()).id,
+                    node.namespace.extra_key().map(str::to_string),
+                    tokens,
+                    node.has_device_value(MAMBA),
+                    node.last_access_counter,
+                    length,
+                ))
+            })
+            .collect();
+        (self.arena.node(self.arena.root()).id, rows)
+    }
+
     pub fn root_node_handle(&self, _extra_key: Option<&str>) -> NodeId {
         self.arena.node(self.arena.root()).id
     }

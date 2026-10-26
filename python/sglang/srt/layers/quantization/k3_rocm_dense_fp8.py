@@ -1,26 +1,15 @@
-"""Static per-tensor FP8 for selected Kimi-K3 dense linears on ROCm.
+"""Static per-tensor FP8 (amax / 448 weight scale, unit activation scale) for
+Kimi-K3 BF16 dense linears on ROCm; decode GEMMs there are weight-bandwidth bound.
 
-K3 checkpoints keep attention and shared experts in BF16, and at decode those
-skinny GEMMs are weight-bandwidth bound, so serving them from E4M3 halves the
-bytes read per step.
-
-Representation: one fp32 weight scale per merged linear (amax / 448) and a unit
-activation scale, i.e. activations are saturating-cast to E4M3 (aiter static
-quant) and the GEMM is aiter's pre-shuffled FP8 GEMM.
-
-Scopes (``SGLANG_K3_TARGET_DENSE_FP8``): ``off`` | ``front`` (merged MoE front:
-shared gate_up + router + latent down) | ``wide`` (front + KDA q/k/v/g).
+``SGLANG_K3_TARGET_DENSE_FP8``: ``off`` | ``front`` (merged MoE front) |
+``wide`` (front + KDA q/k/v/g).
 """
 
 from __future__ import annotations
 
-import logging
-
 import torch
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 _FP8 = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8).max
@@ -67,9 +56,8 @@ def offer_prequantized(x: torch.Tensor, xq: torch.Tensor) -> None:
 
 
 def _same_data(src: torch.Tensor, x: torch.Tensor) -> bool:
-    """x is src, or a same-sized view of it. The slot holds a strong reference
-    to src, so its storage cannot be freed and reused while offered: any tensor
-    with the same address, element count and dtype must alias src's data."""
+    # The slot holds a strong reference to src, so a tensor with the same
+    # address, size and dtype must alias its data.
     return x is src or (
         x.dtype == src.dtype
         and x.numel() == src.numel()
@@ -88,13 +76,7 @@ def _take_prequantized(x: torch.Tensor) -> torch.Tensor | None:
 
 
 class StaticFP8Weight:
-    """An E4M3 [N, K] weight with one scale; ``__call__`` computes x @ W^T.
-
-    ROCm kernels: aiter.static_per_tensor_quant (unit activation scale) and the
-    FlyDSL/CK pre-shuffled FP8 GEMM aiter.gemm_a8w8_bpreshuffle, which at decode
-    sizes is ~1.4-2.3x faster than the bf16 GEMM it replaces on gfx950. The
-    per-tensor weight scale is broadcast to the per-channel scale the kernel takes.
-    """
+    """E4M3 [N, K] weight for aiter.gemm_a8w8_bpreshuffle; ``__call__`` is x @ W^T."""
 
     _MAX_TOKENS = 1 << 15
 
@@ -107,7 +89,6 @@ class StaticFP8Weight:
         # placeholders (their layers are routed here and never read them directly).
         self.weight = shuffle_weight(q, layout=(16, 16))
         del q
-        self.scale = scale
         self.w_scale = scale.reshape(1, 1).expand(1, self.n).contiguous()
         self.unit = torch.ones(1, dtype=torch.float32, device=weight.device)
         self.x_scale = torch.ones(

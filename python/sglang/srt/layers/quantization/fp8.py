@@ -497,9 +497,8 @@ _ROCM_BPRE_MAX_TOKENS = 1024
 
 @dataclass(frozen=True)
 class _RocmBpreshuffleFp8:
-    """Static per-tensor FP8 weight pre-shuffled for aiter.gemm_a8w8_bpreshuffle,
-    with both scalar scales folded into the per-column ``w_scale`` and a unit
-    per-row ``x_scale`` for up to _ROCM_BPRE_MAX_TOKENS rows."""
+    """Pre-shuffled weight for aiter.gemm_a8w8_bpreshuffle; both scalar scales
+    are folded into the per-column ``w_scale``."""
 
     weight: torch.Tensor
     w_scale: torch.Tensor
@@ -1205,11 +1204,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     else None
                 )
                 if _use_aiter and layer.input_scale is not None:
-                    # ROCm static per-tensor FP8 (DFlash draft): keep a
-                    # pre-shuffled [N, K] copy for AITER's bpreshuffle GEMM
-                    # (FlyDSL/CK rows in a8w8_bpreshuffle_tuned_gemm_kimik3*.csv),
-                    # 1.1-1.6x faster than torch._scaled_mm/hipBLASLt at decode
-                    # sizes. Both scalar scales fold into the per-column w_scale.
+                    # Faster than torch._scaled_mm at decode sizes (tuned rows in
+                    # a8w8_bpreshuffle_tuned_gemm_kimik3*.csv).
                     n_out = qweight.shape[0]
                     layer.rocm_bpreshuffle_fp8 = _RocmBpreshuffleFp8(
                         weight=shuffle_weight(qweight.contiguous(), (16, 16)),

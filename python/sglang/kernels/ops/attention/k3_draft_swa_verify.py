@@ -1,29 +1,11 @@
 """Split-KV, GQA-packed sliding-window attention for the DFlash draft block.
 
-The DFlash draft forward runs in TARGET_VERIFY mode on the Triton backend: a
-fixed block of L query tokens per request (L = speculative block size, 8 for
-K3) attends causally to itself plus a sliding window (W = 4096) of the draft
-KV cache. ``extend_attention_fwd`` serves this with one program per
-(request, q-head, 64-row m-block): at bs=1 with 4 TP-local q heads that is 4
-programs, each sweeping the whole 4096-token window serially (~240 us/layer on
-MI355X, ~1.4 ms per draft step for 6 layers).
-
-This kernel instead
-  * packs all ``G = Hq / Hkv`` q heads that share a KV head into one tile of
-    G * L_PAD rows, so each K/V tile is loaded once per KV head;
-  * splits the window across ``N_SPLITS`` programs (flash-decode) and merges
-    the partials with a log-sum-exp combine that also runs the small causal
-    block-block attention.
-
-Masking is identical to ``extend_attention_fwd``'s ``_fwd_kernel`` with
-``SLIDING_WINDOW_SIZE = W`` and ``IS_CAUSAL``: for query row l of a request
-with P prefix (window) keys, prefix key n is visible iff ``P + l <= n + W``;
-block key j is visible iff ``j <= l`` (and ``l <= j + W``, always true here).
-Results equal the baseline up to fp32 summation order.
-
-K/V of the current block are read through explicit strides, so the caller can
-pass the non-contiguous q/k/v column slices of the fused qkv projection
-without ``.contiguous()`` copies. All shapes are static; no host syncs.
+All q heads sharing a KV head are packed into one tile, and the window is split
+across programs whose partials are merged with a log-sum-exp combine (which
+also runs the causal block-block part). Masking matches ``extend_attention_fwd``
+with ``SLIDING_WINDOW_SIZE = W`` and ``IS_CAUSAL``: query row l of a request
+with P window keys sees prefix key n iff ``P + l <= n + W``, block key j iff
+``j <= l``. Results equal it up to fp32 summation order.
 """
 
 from __future__ import annotations
@@ -304,18 +286,15 @@ def can_handle(
     sinks,
     logit_cap,
     xai_temperature_len,
-    score_mod,
 ) -> bool:
-    if not causal or sinks is not None or score_mod is not None:
+    if not causal or sinks is not None:
         return False
     if logit_cap and logit_cap > 0:
         return False
     if xai_temperature_len is not None and xai_temperature_len > 0:
         return False
-    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
-        return False
     hq, hkv, d, dv = q.shape[1], k.shape[1], q.shape[2], v.shape[2]
-    if hkv == 0 or hq % hkv:
+    if hq % hkv:
         return False
     if k.shape[2] != d or k_buffer.shape[2] != d or v_buffer.shape[2] != dv:
         return False
@@ -329,10 +308,7 @@ def can_handle(
         return False
     if k_buffer.dtype not in (torch.bfloat16, torch.float16):
         return False
-    try:
-        mle = int(max_len_extend)
-    except (TypeError, ValueError):
-        return False
+    mle = int(max_len_extend)
     bs = qo_indptr.shape[0] - 1
     if bs < 1 or mle < 1 or mle > 16 or q.shape[0] != bs * mle:
         return False
@@ -354,8 +330,6 @@ def draft_swa_verify_fwd(
     sliding_window_size,
     max_bs,
     n_splits=None,
-    block_n=64,
-    num_warps=4,
 ):
     """q: [T, Hq, D]; k/v: [T, Hkv, D] (may be strided column slices);
     o: [T, Hq, Dv] output. kv_indptr/kv_indices describe the (window) prefix.
@@ -366,7 +340,7 @@ def draft_swa_verify_fwd(
     l_pad = triton.next_power_of_2(int(max_len_extend))
     if n_splits is None:
         n_splits = 16 if bs <= 8 else 8
-    max_bs = max(int(max_bs or bs), bs)
+    max_bs = max(max_bs, bs)
     att_out, att_lse = _scratch(max_bs, hq, n_splits + 1, l_pad, dv, q.device)
     sw = (
         int(sliding_window_size)
@@ -408,9 +382,9 @@ def draft_swa_verify_fwd(
         N_SPLITS=n_splits,
         D=d,
         DV=dv,
-        BLOCK_N=block_n,
+        BLOCK_N=64,
         LB=max(16, l_pad),
-        num_warps=num_warps,
+        num_warps=4,
         num_stages=1,
         **_AMD_KW,
     )

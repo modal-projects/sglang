@@ -1,12 +1,6 @@
 """One-launch TARGET_VERIFY metadata fill for the DFlash draft (Triton backend).
 
-Replaces the ~15 small launches of ``TritonAttnBackend._update_target_verify_
-buffers`` (arange, cumsum x3, copies, minimum, create_flashinfer_kv_indices x2,
-mask lengths) on the draft runner. These run eagerly on the host-latency-bound
-draft-prep path, so each removed launch is ~15-20 us of exposed CPU time per
-decode step at small batch.
-
-Outputs (identical integer values to the baseline):
+Outputs:
   qo_indptr[0..bs]         = b * L
   kv_indptr[0..bs]         = cumsum(seq_lens)
   kv_indices[kv_indptr[b] + i] = req_to_token[rpi[b], i],          i < seq[b]

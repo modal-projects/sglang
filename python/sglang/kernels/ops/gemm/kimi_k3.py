@@ -18,10 +18,8 @@ _K3_TINY_GEMM_MAX_TOKENS = {
     (1536, 128): 12,
 }
 
-# Tuned decode GEMMs (gfx950, graph replay, cold weights): the
-# tiny kernel only wins at <= 8 tokens for these shapes; above that the AITER
-# tgemm rows (FlyDSL split-K for [f_a|b], Triton for f_b) are 1.3-2x faster
-# than both the tiny kernel and the F.linear/hipBLASLt fallback.
+# gfx950: the tiny kernel only wins up to these token counts; above them the
+# AITER tuned GEMM rows beat both it and F.linear.
 _K3_ROCM_TUNED_TINY_MAX_TOKENS = {
     (144, 7168): 8,
     (1536, 128): 8,

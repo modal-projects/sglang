@@ -2747,9 +2747,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
 
     def mixed_decode_rows_have_grammar(self) -> bool:
-        """Whether a mixed batch carries decode rows under a grammar. Those rows are
-        sampled in the extend forward, so their bitmask must see the previous
-        batch's committed tokens."""
+        # These rows are sampled in the extend forward, so their bitmask must see
+        # the previous batch's committed tokens.
         return self.forward_mode.is_mixed() and any(
             req.grammar is not None for req in self.decoding_reqs or ()
         )

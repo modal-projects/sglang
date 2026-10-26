@@ -1,23 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """K3 decode MoE kernel configs for the AITER A8W4 runner.
 
-aiter's kimik3_a8w4_tuned_fmoe.csv was tuned on uniform-random routing. DFlash verify
-batches are 8 consecutive tokens per request, which route to ~40% fewer distinct experts
-(M=16: ~139 vs 224), and at that shape the tuned M=16 stage1 (``_xcd4`` swizzle) is ~11 us
-slower than the plain variant. These rows were re-tuned on real K3 routing:
-same activation/weight quantization, same layouts, only the
-tile schedule changes, so outputs match the default kernels to fp32-reference noise.
-
-Installed by patching the K3 shape's rows in aiter's in-memory tuned table the first time
-fused_moe looks one up; every other shape is untouched.
+aiter's kimik3_a8w4_tuned_fmoe.csv was tuned on uniform-random routing. DFlash
+verify batches route to ~40% fewer distinct experts, where the tuned M=16 stage 1
+(``_xcd4`` swizzle) is ~11 us slower than the plain variant. These rows were
+re-tuned on real K3 routing; only the tile schedule changes, so outputs match.
 """
 
 from __future__ import annotations
 
 import functools
-import logging
-
-logger = logging.getLogger(__name__)
 
 # K3 TP8 routed experts: (model_dim, inter_dim, experts, topk)
 _K3_SHAPE = (3584, 384, 896, 16)
@@ -55,29 +47,23 @@ def _patch_table(fm) -> int:
 
 @functools.cache
 def apply_k3_moe_decode_cfg() -> None:
+    """Patch the K3 rows of aiter's in-memory tuned table the first time
+    fused_moe looks the K3 shape up (that lookup loads the table)."""
     try:
         import aiter.fused_moe as fm
     except ImportError:
         return
     orig = fm.get_2stage_cfgs
-    if getattr(orig, "_k3_decode_cfg", False):
-        return
-    state = {"done": False}
+    patched = False
 
     def get_2stage_cfgs(token, model_dim, inter_dim, expert, topk, *args, **kwargs):
-        if not state["done"] and (model_dim, inter_dim, expert, topk) == _K3_SHAPE:
-            res = orig(
-                token, model_dim, inter_dim, expert, topk, *args, **kwargs
-            )  # loads the table
-            n = _patch_table(fm)
-            state["done"] = True
-            if n:
+        nonlocal patched
+        if not patched and (model_dim, inter_dim, expert, topk) == _K3_SHAPE:
+            orig(token, model_dim, inter_dim, expert, topk, *args, **kwargs)
+            patched = True
+            if _patch_table(fm):
                 orig.cache_clear()
-                logger.info("K3 MoE decode configs applied to %d aiter tuned rows", n)
-            else:
-                return res
         return orig(token, model_dim, inter_dim, expert, topk, *args, **kwargs)
 
-    get_2stage_cfgs._k3_decode_cfg = True
     get_2stage_cfgs.cache_clear = orig.cache_clear
     fm.get_2stage_cfgs = get_2stage_cfgs

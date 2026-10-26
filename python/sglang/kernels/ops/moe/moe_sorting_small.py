@@ -18,17 +18,15 @@ import functools
 import logging
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.moe import k3_route_sort
+from sglang.kernels.ops.moe import k3_route_sort_mid as mid
 from sglang.kernels.ops.moe.k3_route_sort import _mx_e8m0, _mx_scale_col, _mx_scale_row
 from sglang.srt.utils import is_gfx95_supported
-
-if TYPE_CHECKING:
-    from sglang.kernels.ops.moe.k3_route_sort_mid import RouteState
 
 logger = logging.getLogger(__name__)
 
@@ -363,28 +361,23 @@ def _moe_sorting_small_kernel_sorted(
 def _mid_sort_supported(
     topk_ids, block_size, expert_mask, num_local_tokens, num_experts, qx
 ):
-    from sglang.kernels.ops.moe import k3_route_sort_mid
-
-    if qx is None:
-        return False
     m, topk = topk_ids.shape
     return (
-        expert_mask is None
+        qx is not None
+        and expert_mask is None
         and num_local_tokens is None
         and m * topk > 256  # smaller batches take _run_small_sort
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
         and qx.shape[0] == m
         and qx.dtype in (torch.bfloat16, torch.float16)
-        and k3_route_sort_mid.supported(m, topk, num_experts, block_size, qx.shape[-1])
+        and mid.supported(m, topk, num_experts, block_size, qx.shape[-1])
     )
 
 
 def _run_mid_sort(topk_ids, topk_weights, num_experts, block_size, moe_buf, qx):
-    """16 < M <= 512: (launch A, unless the model already ran it with top-k
-    fused in) + launch B of k3_route_sort_mid. Buffer sizes as aiter's."""
-    from sglang.kernels.ops.moe import k3_route_sort_mid as mid
-
+    """k3_route_sort_mid launch A (unless the model already ran it with top-k
+    fused in) + launch B; buffer sizes as aiter's."""
     device = topk_ids.device
     m, topk = topk_ids.shape
     max_blocks = (
@@ -439,8 +432,7 @@ def _small_sort_supported(
         # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
         # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
         # does not scan per expert chunk (measured up to E=385, i.e. E_POW2 <= 512).
-        # A K3 sort plan fuses the shared GEMM and quant into this sort, which wins
-        # at any E.
+        # A K3 sort plan fuses the shared GEMM and quant into this sort: wins at any E
         and (
             (p <= 64 and p <= 2 * block_size)
             or num_experts <= 256
@@ -485,15 +477,11 @@ def _run_small_sort(
         qout = qscale = moe_buf  # unused placeholder pointers
     plan = _k3_sort_plan.get()
     if emit_mx and plan is not None:
-        from sglang.kernels.ops.moe import k3_route_sort
-
         if k3_route_sort.sort_quant_supported(m, topk, block_size, n_cols) and (
             moe_buf.numel() in (0, m * n_cols)
         ):
             from sglang.kernels.ops.moe import k3_moe_epi
 
-            # The model planned its shared down GEMM for this top-k; run it in
-            # the sort's launch
             pending = plan.take_shared_gemm(topk_ids)
             if pending is not None:
                 k3_moe_epi.shared_gemm_sort_quant(
@@ -621,42 +609,25 @@ def _run_small_sort(
 
 
 def _mx_quant_chunk(n_cols: int) -> int | None:
-    """Largest power-of-two column chunk (32..2048) that tiles n_cols exactly.
-
-    The quant loop needs N_COLS % QCHUNK == 0 and a power-of-two tl.arange; K3's
-    3584-wide latent tiles with 512 (7 chunks), which the old min(2048, n_cols)
-    choice could not express."""
-    for chunk in (2048, 1024, 512, 256, 128, 64, 32):
-        if chunk <= n_cols and n_cols % chunk == 0:
-            return chunk
-    return None
-
-
-@functools.cache
-def _mid_max_tokens() -> int:
-    from sglang.kernels.ops.moe import k3_route_sort_mid
-
-    return k3_route_sort_mid.max_tokens()
+    return k3_route_sort.mx_quant_chunk(n_cols, 2048)
 
 
 @dataclass
 class K3SortPlan:
-    """What the K3 route/sort/quant kernels need from the model for one aiter
-    ``fused_moe`` call. aiter runs the sort internally and forwards none of it,
-    so the model enters the plan with ``k3_sort_plan`` around its experts call;
-    an active plan also opts that call into the K3 kernels.
+    """Model-side inputs of the K3 sort kernels for the aiter fused_moe calls
+    under ``k3_sort_plan``; an active plan also opts them into those kernels.
 
-    route_state: launch-A products of k3_route_sort_mid (top-k, counts, quant).
-    shared_gemm: (topk_ids, act, w_down, out) of the shared down GEMM to run in
-        the small-batch sort launch (k3_moe_epi.shared_gemm_sort_quant).
-    Both belong to the top-k tensor they were computed for, and the sort takes
-    them only for that tensor; ``finish`` resolves whatever was not taken.
+    route_state: k3_route_sort_mid launch-A products.
+    shared_gemm: (topk_ids, act, w_down, out) of the shared down GEMM to fuse
+        into the small-batch sort (k3_moe_epi.shared_gemm_sort_quant).
+    The sort takes each only for its own top-k tensor; ``finish`` resolves
+    whatever was not taken.
     """
 
-    route_state: RouteState | None = None
+    route_state: mid.RouteState | None = None
     shared_gemm: tuple | None = None
 
-    def take_route_state(self, topk_ids, qx) -> RouteState | None:
+    def take_route_state(self, topk_ids, qx) -> mid.RouteState | None:
         st = self.route_state
         if (
             st is None
@@ -693,17 +664,7 @@ class K3SortPlan:
 
             _, act, w_down, out = self.shared_gemm
             self.shared_gemm = None
-            _warn_shared_gemm_untaken(act.shape[0])
             k3_moe_epi.shared_gemm_preact(act, w_down, out)
-
-
-@functools.cache
-def _warn_shared_gemm_untaken(m: int) -> None:
-    logger.warning(
-        "The MoE sort did not take the shared GEMM (M=%d); running it "
-        "standalone (correct, no launch saved)",
-        m,
-    )
 
 
 _k3_sort_plan: ContextVar[K3SortPlan | None] = ContextVar(
@@ -713,8 +674,6 @@ _k3_sort_plan: ContextVar[K3SortPlan | None] = ContextVar(
 
 @contextlib.contextmanager
 def k3_sort_plan(plan: K3SortPlan | None = None):
-    """Run the enclosed aiter fused_moe calls with the K3 sort kernels and
-    ``plan``'s inputs; resolves the untaken parts of the plan on exit."""
     plan = K3SortPlan() if plan is None else plan
     token = _k3_sort_plan.set(plan)
     try:
@@ -765,7 +724,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 hidden_states.dim() == 2
                 and hidden_states.stride(-1) == 1
                 and _mx_quant_chunk(hidden_states.shape[-1]) is not None
-                and (topk_ids.numel() <= 256 or topk_ids.shape[0] <= _mid_max_tokens())
+                and (topk_ids.numel() <= 256 or topk_ids.shape[0] <= mid.MID_MAX_TOKENS)
                 if k3
                 else hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 2048 == 0
@@ -773,8 +732,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             )
         )
         if k3 and not emit and not hidden_states.is_contiguous():
-            # Only the fused sort+quant reads strided rows; aiter's own path
-            # wants a dense activation (callers may hand in a column slice).
+            # only the fused sort + quant reads strided rows
             hidden_states = hidden_states.contiguous()
         input_token = _pending_quant_input.set(hidden_states if emit else None)
         emitted_token = _emitted_quant.set(None)
@@ -807,6 +765,14 @@ def apply_aiter_small_moe_sort_patch() -> None:
         k3 = _k3_sort_plan.get() is not None
         output = orig_kwargs.get("output")
         own_output = output is None or (k3 and accumulate)
+        qx = _pending_quant_input.get()
+
+        def _moe_buf(M):
+            if output is not None:
+                return output
+            shape = (M, model_dim) if accumulate else (0, 0)
+            return torch.empty(shape, dtype=moebuf_dtype, device=topk_ids.device)
+
         if (
             k3
             and not output_aux
@@ -818,21 +784,11 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 expert_mask,
                 num_local_tokens,
                 int(num_experts),
-                _pending_quant_input.get(),
+                qx,
             )
         ):
             M = topk_ids.shape[0]
-            if output is not None:
-                moe_buf = output
-            elif accumulate:
-                moe_buf = torch.empty(
-                    (M, model_dim), dtype=moebuf_dtype, device=topk_ids.device
-                )
-            else:
-                moe_buf = torch.empty(
-                    (0, 0), dtype=moebuf_dtype, device=topk_ids.device
-                )
-            qx = _pending_quant_input.get()
+            moe_buf = _moe_buf(M)
             if moe_buf.numel() == 0 or (
                 moe_buf.is_contiguous() and moe_buf.numel() == M * qx.shape[-1]
             ):
@@ -842,7 +798,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                     int(num_experts),
                     int(block_size),
                     moe_buf,
-                    _pending_quant_input.get(),
+                    qx,
                 )
                 _emitted_quant.set(quant_ret)
                 return ret
@@ -856,7 +812,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 expert_mask,
                 num_local_tokens,
                 int(num_experts),
-                emit_mx=_pending_quant_input.get() is not None,
+                emit_mx=qx is not None,
             )
         ):
             device = topk_ids.device
@@ -877,12 +833,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 max_num_m_blocks, dtype=dtypes.i32, device=device
             )
             num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-            if output is not None:
-                moe_buf = output
-            elif accumulate:
-                moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-            else:
-                moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+            moe_buf = _moe_buf(M)
             quant_ret = _run_small_sort(
                 topk_ids,
                 topk_weights,
@@ -892,7 +843,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 num_valid_ids,
                 moe_buf,
                 int(block_size),
-                _pending_quant_input.get(),
+                qx,
                 int(num_experts),
             )
             if quant_ret is not None:
@@ -932,7 +883,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and input.dim() == 2
             and not input.is_contiguous()
         ):
-            # fused_moe_wrapper skips the densify when it expects the fused sort+quant
             input = input.contiguous()
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)
 

@@ -1,41 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two-launch MoE routing glue for mid-sized batches.
+"""Two-launch MoE route + sort + mxfp8 quant for 16 < M <= MID_MAX_TOKENS on
+the ROCm aiter a8w4 path (K3 DFlash verify); replaces aiter's top-k, opus sort
+and fused mx quant + sort.
 
-Replaces, for 16 < M <= the dispatch cap (128,
-kernel limit 512; it loses to aiter from M = 256) on the ROCm aiter a8w4 MoE
-path (K3 DFlash verify),
-  aiter topk_reg (or any top-k) + opus_moe_sorting P0_v2 + P23
-  + fused_mx_quant_moe_sort (M <= 128) / per_1x32_mx_quant + mxfp4_moe_sort (M > 128)
-with two launches:
+  A  _k3_mid_route_kernel, one CTA per token: [top-k,] atomic per-expert pair
+     counts, mxfp8 quant of the token row (fp8 row + e8m0 bytes [M, G]).
+  B  _k3_mid_sort_kernel, one CTA per token + one per expert chunk: block
+     prefix from counts; token CTAs write their pairs (stable rank among
+     earlier tokens), scale bytes and moe_buf row zeros; expert-chunk CTAs
+     write block expert ids, tail padding and num_valid_ids; the last CTA
+     re-zeroes counts.
 
-  A  _k3_mid_route_kernel, one CTA per token:
-       [sigmoid + bias top-k ->] topk_ids / topk_weights
-       atomic per-expert pair counts (int32, counts[E])
-       mxfp8 quant of the token's activation row -> fp8 row + e8m0 bytes [M, G]
-  B  _k3_mid_sort_kernel, one CTA per token + one CTA per expert chunk:
-       every CTA reads counts -> block prefix (blocks of smaller experts)
-       token CTA t: stable rank of each of its pairs among earlier tokens' pairs
-         of the same expert -> sorted_ids / sorted_weights at dest, its e8m0
-         bytes scattered to the dest rows' swizzled scale slots, moe_buf row zero
-       expert-chunk CTA: sorted_expert_ids, block-tail padding, num_valid_ids
-       the last CTA to finish (atomic ticket, no waiting) re-zeroes counts
-
-Output layout (identical to aiter's opus sort, moe_sorting_small, k3_route_sort):
-  sorted_ids[i]        = (topk_slot << 24) | token   (padding: (topk << 24) | M)
-  sorted_weights       = pair weight                 (padding: 0)
-  sorted_expert_ids[b] = expert of block b
-  num_valid_ids        = [num_blocks * block_size, M]
-  pairs of one expert in (token, slot) order, experts ascending, one block run each
-  a1                   = per-token fp8 rows; scale byte per (sorted_row, group) at
-                         aiter's mx_scale_shuffle_idx (RoundUp e8m0, as aiter)
-
-Only the valid region (< num_valid_ids[0]) is defined, as in aiter: padding rows'
-scale bytes are left unwritten (aiter's fused M <= 128 quant leaves them too).
-A pair with routed weight exactly 0 gets scale byte 0, as aiter's fused quant does
-(ZERO_W_SCALE; aiter's M > 128 split path does not do this).
-
-The counts buffer must be all-zero before launch A; kernel B leaves it zeroed.
-If A runs and B does not (the MoE runner took another path), moe_sorting_small.K3SortPlan.finish re-zeroes it.
+Layouts as k3_route_sort. Only the valid region is defined, as in aiter, and a
+pair with routed weight 0 gets scale byte 0 like aiter's fused quant. counts
+must be zero before A; B (or K3SortPlan.finish when B does not run) re-zeroes it.
 """
 
 from __future__ import annotations
@@ -46,19 +24,17 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.k3_route_sort import _mx_e8m0, _mx_scale_col, _mx_scale_row
+from sglang.kernels.ops.moe.k3_route_sort import (
+    _mx_e8m0,
+    _mx_scale_col,
+    _mx_scale_row,
+    mx_quant_chunk,
+)
 
-MID_MAX_TOKENS = 512  # kernel limit; dispatch cap is 128 tokens
-# aiter fused_dynamic_mx_quant_moe_sort uses its fused (zero-weight aware)
-# kernel at stage 1 up to M = 8 * 256 / topk tokens, the split path above
+# loses to aiter from M = 256 (kernel limit 512)
+MID_MAX_TOKENS = 128
+# aiter's fused (zero-weight aware) stage-1 quant covers up to this many pairs
 _AITER_FUSED_QUANT_PAIRS = 8 * 256
-
-
-def _quant_chunk(n_cols: int) -> int | None:
-    for chunk in (1024, 512, 256, 128, 64, 32):
-        if chunk <= n_cols and n_cols % chunk == 0:
-            return chunk
-    return None
 
 
 @triton.jit
@@ -96,9 +72,7 @@ def _aiter_biased_topk(
     RENORM: tl.constexpr,
     routed_scale,
 ):
-    """Bit-exact aiter biased_grouped_topk (topk_reg_kernel, one group): ids in
-    (score desc, legacy tie rank asc) order, weights = pre-bias sigmoid times
-    routed_scale / serial-sum."""
+    """Bit-exact aiter biased_grouped_topk (topk_reg_kernel, one group)."""
     lg = tl.load(logits_ptr + offs_e, mask=me, other=0.0).to(tl.float32)
     bias = (
         tl.load(bias_ptr + offs_e, mask=me, other=0.0)
@@ -149,7 +123,6 @@ def _k3_mid_route_kernel(
     DO_TOPK: tl.constexpr,
     N_COLS: tl.constexpr,
     QCHUNK: tl.constexpr,
-    COUNT_QUANT: tl.constexpr = True,
 ):
     t = tl.program_id(0).to(tl.int64)
     offs_k = tl.arange(0, TOPK)
@@ -168,8 +141,6 @@ def _k3_mid_route_kernel(
         tl.store(topk_weights_ptr + t * TOPK + offs_k, w)
     else:
         ids = tl.load(topk_ids_ptr + t * TOPK + offs_k)
-    if not COUNT_QUANT:
-        return
     tl.atomic_add(counts_ptr + ids, tl.full((TOPK,), 1, tl.int32), sem="relaxed")
 
     G: tl.constexpr = N_COLS // 32
@@ -226,12 +197,10 @@ def _k3_mid_sort_kernel(
     xc = tl.maximum(pid - M, 0)
     offs_x = xc * XC + tl.arange(0, XC)
     mx = offs_x < E
-    # the chunk's own counts, read before the ticket like everything else
     cnt_x = tl.load(counts_ptr + offs_x, mask=mx & (pid >= M), other=0)
 
-    # ticket: once every CTA has read counts, the last one re-zeroes them
-    # (data-dependent increment keeps the counts reads ahead of the atomic)
-    # (vector form, one active lane: the result is only waited on at the end)
+    # ticket: the last CTA re-zeroes counts; the data-dependent increment keeps
+    # the counts reads ahead of the atomic
     dep = tl.sum(cnt, axis=0) + tl.sum(cnt_x, axis=0)
     offs_one = tl.arange(0, 2)
     tick = tl.atomic_add(
@@ -247,8 +216,7 @@ def _k3_mid_sort_kernel(
         offs_k = tl.arange(0, TOPK)
         ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
         wk = tl.load(topk_weights_ptr + t * TOPK + offs_k)
-        # stable rank: pairs of earlier tokens on the same expert (a token
-        # picks an expert at most once)
+        # stable rank: pairs of earlier tokens on the same expert
         rank = tl.zeros((TOPK,), tl.int32)
         n_prev = t * TOPK
         for s in range(0, n_prev, RANK_TILE):
@@ -317,20 +285,13 @@ def _k3_mid_sort_kernel(
         tl.store(counts_ptr + E_POW2, 0)
 
 
-# ---------------------------------------------------------------------------
-# host side
-
 _COUNTS: dict = {}
 
 
-def counts_buffer(
-    device: torch.device, key=None, num_experts: int = 896
-) -> torch.Tensor:
-    """Persistent zeroed counts (+ ticket) buffer; one per (device, key).
-
-    Allocated once (zeroed) and kept zero by the sort kernel, so it is safe to
-    capture into CUDA graphs. Distinct keys (e.g. per MoE layer) keep
-    concurrently-captured streams from sharing one buffer."""
+def counts_buffer(device: torch.device, key, num_experts: int) -> torch.Tensor:
+    """Persistent counts (+ ticket) buffer per (device, key), kept zero by the
+    sort kernel so it is graph-capture safe; per-layer keys keep concurrently
+    captured streams apart."""
     e_pow2 = triton.next_power_of_2(num_experts)
     k = (str(device), key, e_pow2)
     buf = _COUNTS.get(k)
@@ -340,29 +301,21 @@ def counts_buffer(
     return buf
 
 
-def max_tokens() -> int:
-
-    return min(MID_MAX_TOKENS, 128)
-
-
 def supported(
     m: int, topk: int, num_experts: int, block_size: int, n_cols: int
 ) -> bool:
     return (
-        0 < m <= max_tokens()
+        0 < m <= MID_MAX_TOKENS
         and topk & (topk - 1) == 0
         and topk <= 64
         and num_experts < 0xFFFF
         and block_size & (block_size - 1) == 0
-        and n_cols % 32 == 0
-        and _quant_chunk(n_cols) is not None
+        and mx_quant_chunk(n_cols, 1024) is not None
     )
 
 
 @dataclass
 class RouteState:
-    """Launch-A products handed to the sort launch inside fused_moe."""
-
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     qx: torch.Tensor
@@ -381,7 +334,6 @@ def route_quant(
     logits: torch.Tensor | None = None,  # [M, E] router logits (row-strided ok)
     correction_bias: torch.Tensor | None = None,
     renormalize: bool = True,
-    routed_scale: float = 1.0,
     num_experts: int | None = None,
 ) -> RouteState:
     """Launch A: [top-k +] per-expert counts + per-token mxfp8 quant."""
@@ -400,7 +352,7 @@ def route_quant(
         correction_bias if do_topk else qx,
         topk_ids,
         topk_weights,
-        float(routed_scale),
+        1.0,
         counts,
         qx,
         qx.stride(0),
@@ -412,7 +364,7 @@ def route_quant(
         RENORM=bool(renormalize),
         DO_TOPK=do_topk,
         N_COLS=n,
-        QCHUNK=_quant_chunk(n),
+        QCHUNK=mx_quant_chunk(n, 1024),
         num_warps=4,
     )
     return RouteState(topk_ids, topk_weights, qx, qout, exps, counts)

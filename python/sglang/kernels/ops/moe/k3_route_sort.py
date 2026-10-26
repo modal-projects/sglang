@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode routing kernels for the ROCm aiter MoE runner.
+"""Decode MoE sort + stage-1 mxfp8 activation quant + moe_buf zeroing in one
+launch, for M <= block_size (every used expert owns exactly one block).
 
-_k3_sort_quant_kernel: MoE sorting + stage-1 mxfp8 activation quant + moe_buf
-zeroing in one launch for M <= block_size, where every used expert owns exactly
-one block, so there is no cross-CTA ordering (replaces moe_sorting_small's
-distributed kernel at decode sizes).
-
-Output layouts are identical to moe_sorting_small (and therefore aiter):
+Output layouts match moe_sorting_small (and aiter):
   sorted_ids[i]        = (topk_slot << 24) | token   (padding: (topk << 24) | M)
   sorted_weights       = pair weight                 (padding: 0)
   sorted_expert_ids[b] = expert of block b
@@ -64,12 +60,10 @@ def _sort_quant_program(
     SCALEN_PAD: tl.constexpr,
     MOE_BUF_ZERO: tl.constexpr,
 ):
-    # M <= BLOCK_SIZE: a token picks an expert at most once, so every used
-    # expert owns exactly one block, indexed by the number of used experts
-    # below it. CTA (t, c) quantizes token t's column chunk c and scatters its
-    # e8m0 scales to the token's TOPK sorted rows; the c == 0 CTA also writes
-    # the token's sorted entries and, for each expert the token is first to
-    # pick, that block's expert id and tail padding. Every byte has one writer.
+    # A used expert's block index is the number of used experts below it.
+    # CTA (t, c) quantizes token t's column chunk c and scatters its scales to
+    # the token's TOPK sorted rows; the c == 0 CTA also writes the token's
+    # sorted entries and the block heads/padding of experts it picks first.
     CHUNKS: tl.constexpr = N_COLS // QCHUNK
     t = pid // CHUNKS
     c0 = (pid % CHUNKS) * QCHUNK
@@ -190,6 +184,16 @@ def _k3_sort_quant_kernel(
 SORT_QCHUNK = 512
 
 
+def mx_quant_chunk(n_cols: int, max_chunk: int) -> int | None:
+    """Largest power-of-two chunk in [32, max_chunk] that tiles n_cols."""
+    chunk = max_chunk
+    while chunk >= 32:
+        if chunk <= n_cols and n_cols % chunk == 0:
+            return chunk
+        chunk //= 2
+    return None
+
+
 def sort_quant_supported(m: int, topk: int, block_size: int, n_cols: int) -> bool:
     return (
         0 < m <= block_size
@@ -212,8 +216,6 @@ def sort_quant(
     qout,  # [M, N] fp8 out
     qscale,  # u8 [ceil(max_padded/32)*32, scalen_pad] out
 ):
-    """Sort (one block per used expert, needs M <= block_size) + stage-1 mxfp8
-    quant + moe_buf zero in one launch; layouts as moe_sorting_small."""
     m, topk = topk_ids.shape
     n = mx_quant_input.shape[1]
     _k3_sort_quant_kernel[(m * (n // SORT_QCHUNK),)](

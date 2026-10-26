@@ -1,21 +1,10 @@
 """Vocab-parallel greedy argmax with one packed 32-bit key per row.
 
-Replaces (per draft step, TP>1)
-    torch.max(logits) -> add(offset) -> NCCL all_gather(max) -> NCCL
-    all_gather(ids) -> argmax over ranks -> gather -> copy
-with
-    pack kernel -> custom all-gather (one fp32-typed buffer) -> select kernel.
-
-Key layout (uint32): ``orderable(bf16 max) << 16 | (0xFFFF - local_argmax)``.
-``orderable`` maps bf16 bits to an unsigned total order (-0 is canonicalized
-to +0, so -0 == +0 as in a float compare). Within a rank the max key is the
-max value with the FIRST index on ties, matching torch.max / torch.argmax.
-Across ranks the select kernel compares only the value half and keeps the
-lowest rank on ties, matching ``torch.argmax(gathered_max, dim=0)`` over
-contiguous ascending vocab shards. Only the bit pattern travels through the
-all-gather (a pure copy); nothing is computed on it as a float.
-
-Requires a local vocab shard <= 65536 entries and uniform, unpadded shards.
+Key (uint32): ``orderable(bf16 max) << 16 | (0xFFFF - local_argmax)``, with -0
+canonicalized to +0, so the max key is the max value with the first index on
+ties. ``select_from_gathered`` keeps the lowest rank on value ties, matching
+``torch.argmax`` over contiguous ascending vocab shards. Requires uniform,
+unpadded local shards of at most 65536 entries.
 """
 
 import torch

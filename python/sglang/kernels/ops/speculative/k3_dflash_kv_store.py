@@ -1,12 +1,7 @@
-"""Fused RoPE + prefix-valid KV-cache write for DFlash draft KV materialization.
+"""Fused RoPE + prefix-valid KV-cache write for the DFlash draft KV.
 
-Replaces, per draft layer, ``rotary_embedding`` (on K and a dummy Q) +
-``v.contiguous()`` + ``set_kv_buffer_prefix_valid_tiled`` with one kernel.
-
-RoPE is bit-exact with sgl-kernel's ``rotary_embedding_kernel<c10::BFloat16,
-IS_NEOX=true>``: every BFloat16 product/sum there rounds to bf16, so this kernel
-rounds after each multiply and after the add/sub as well. cos/sin come from the
-same bf16 copy of the cache the baseline kernel reads.
+Bit-exact with sgl-kernel's bf16 NeoX ``rotary_embedding_kernel``, which rounds
+every product and sum to bf16.
 """
 
 import torch

@@ -479,9 +479,6 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
-# A grammar that ends at the tools close must still admit the turn's
-# MESSAGE_CLOSE: K3 emits it before EOS, which is masked until the grammar
-# completes, so without it the model can never finish the turn.
 # Text outside a tools section is limited to the response channel, whose body
 # admits no control token. The model also emits near-miss markers
 # (<|close|>Message, <|close|>_message, a stray TOOLS_CLOSE), so excluding known
@@ -498,6 +495,9 @@ _NONEMPTY_RESPONSE = TagFormat(
     end=RESPONSE_CLOSE,
 )
 
+# A grammar that ends at the tools close must still admit the turn's
+# MESSAGE_CLOSE: K3 emits it before EOS, which is masked until the grammar
+# completes, so without it the model can never finish the turn.
 _OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
 
 

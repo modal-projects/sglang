@@ -96,9 +96,7 @@ def _aiter_biased_topk(
     RENORM: tl.constexpr,
     routed_scale,
 ):
-    """Bit-exact aiter biased_grouped_topk (topk_reg_kernel, one group): ids in
-    (score desc, legacy tie rank asc) order, weights = pre-bias sigmoid times
-    routed_scale / serial-sum."""
+    """Bit-exact aiter biased_grouped_topk (topk_reg_kernel, one group)."""
     lg = tl.load(logits_ptr + offs_e, mask=me, other=0.0).to(tl.float32)
     bias = (
         tl.load(bias_ptr + offs_e, mask=me, other=0.0)
@@ -226,12 +224,10 @@ def _k3_mid_sort_kernel(
     xc = tl.maximum(pid - M, 0)
     offs_x = xc * XC + tl.arange(0, XC)
     mx = offs_x < E
-    # the chunk's own counts, read before the ticket like everything else
     cnt_x = tl.load(counts_ptr + offs_x, mask=mx & (pid >= M), other=0)
 
-    # ticket: once every CTA has read counts, the last one re-zeroes them
-    # (data-dependent increment keeps the counts reads ahead of the atomic)
-    # (vector form, one active lane: the result is only waited on at the end)
+    # ticket: the last CTA re-zeroes counts; the data-dependent increment keeps
+    # the counts reads ahead of the atomic
     dep = tl.sum(cnt, axis=0) + tl.sum(cnt_x, axis=0)
     offs_one = tl.arange(0, 2)
     tick = tl.atomic_add(
@@ -247,8 +243,7 @@ def _k3_mid_sort_kernel(
         offs_k = tl.arange(0, TOPK)
         ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
         wk = tl.load(topk_weights_ptr + t * TOPK + offs_k)
-        # stable rank: pairs of earlier tokens on the same expert (a token
-        # picks an expert at most once)
+        # stable rank: pairs of earlier tokens on the same expert
         rank = tl.zeros((TOPK,), tl.int32)
         n_prev = t * TOPK
         for s in range(0, n_prev, RANK_TILE):

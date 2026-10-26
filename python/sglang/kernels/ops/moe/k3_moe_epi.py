@@ -477,12 +477,10 @@ def _k3_situ_topk_kernel(
 
 @triton.jit(do_not_specialize=["M", "stride_out", "stride_qx"])
 def _k3_shared_sortq_kernel(
-    # shared down GEMM (pre-activated): out[M, N] = act[M, I] @ wd[N, I]^T
     act_ptr,
     wd_ptr,
     out_ptr,
     stride_out,
-    # sort + mxfp8 quant (k3_route_sort._sort_quant_program)
     topk_ids_ptr,
     topk_weights_ptr,
     sorted_ids_ptr,
@@ -671,9 +669,8 @@ def shared_gemm_sort_quant(
         m == M and act.is_contiguous() and w_down.is_contiguous() and out.stride(1) == 1
     )
     bm, bn, bk, nw, ns = _shared_preact_cfg(M)
-    # wider N tiles than the standalone GEMM (fewer CTAs next to the sort
-    # programs; MI355X M=8: 6.3 vs 6.7 us). N tiling only: every element keeps
-    # the same K loop and MFMA order, so the output stays bit-identical.
+    # wider N tiles leave fewer CTAs next to the sort programs; the K loop and
+    # MFMA order are unchanged, so the output stays bit-identical
     bn = 64 if M <= 16 else bn
     n_gemm = (N // bn) * triton.cdiv(M, bm)
     _k3_shared_sortq_kernel[(n_gemm + m * (n // SORT_QCHUNK),)](

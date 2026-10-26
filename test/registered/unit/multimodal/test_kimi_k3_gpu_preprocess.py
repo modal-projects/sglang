@@ -1,13 +1,14 @@
 """K3 GPU preprocess: shared batched pipeline hook contract (CPU parts)."""
 
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
-from sglang.srt.multimodal.processors import kimi_k25
+from sglang.srt.multimodal.processors import kimi_k3, kimi_k25
 from sglang.srt.multimodal.processors.kimi_k3 import _fill_transparent_bg
 from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -130,10 +131,6 @@ def test_fill_transparent_bg_no_config_drops_alpha():
     assert torch.equal(out, batch[:, :3])
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 def _cpu_chw(image) -> torch.Tensor:
     return torch.from_numpy(np.asarray(image)).permute(2, 0, 1).contiguous()
 
@@ -153,7 +150,7 @@ def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
     args = (images, configs, scale, bias, 14)
     whole, whole_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
 
-    monkeypatch.setenv("SGLANG_MM_GPU_PREPROCESS_CHUNK_BYTES", "1")
+    monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 1)
     assert len(kimi_k25._byte_bounded_chunks(list(range(5)), 56 * 84)) == 5
     chunked, chunked_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
 
@@ -163,10 +160,6 @@ def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
 
 def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
     """A tokenizer-side GPU OOM is served by the CPU path, not surfaced."""
-    from types import SimpleNamespace
-
-    from sglang.srt.multimodal.processors import kimi_k3
-
     images = [Image.fromarray(_natural_image(56, 84))] * 2
     scale, bias = _norm_tensors()
     cpu_calls = []
@@ -205,3 +198,7 @@ def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
 
     assert cpu_calls == [2]
     assert len(features) == len(grids) == 2
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

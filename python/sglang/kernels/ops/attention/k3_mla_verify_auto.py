@@ -1,17 +1,10 @@
-"""K3 MLA target-verify (QLEN=8, 12 heads, FP8 KV latent 576) with an on-device
-regime switch between the bf16 Gluon kernel (aiter mla_gluon bh16bn128, best at
-short context / small batch) and the HipKittens kernel (k3_mla_verify_hk, best
-at long context or larger batches). Graph capturable: the grid depends only on
-the batch size; the regime is decided at replay time from kv_indptr.
+"""K3 MLA target verify (QLEN=8, 12 heads, FP8 KV latent 576) on gfx950.
 
-  1. _mla_gluon       aiter stage 1 with REGIME_SEL=True: a prologue computes
-                      eff = bs * max_b(L_b), publishes the regime and exits in
-                      the HK regime.
-  2. hk_stage1        HK split-KV stage 1 (no-op in the Gluon regime).
-  3. hk_reduce        merges whichever splits ran (_k3_auto_reduce when the HIP
-                      reduce does not apply).
-
-thresh(bs) comes from graph-replayed crossovers of the two kernels.
+An on-device switch picks per batch between AITER's Gluon MLA kernel (short
+context) and the HipKittens kernel k3_mla_verify_hk (long context): the Gluon
+prologue computes bs * max(L), publishes the regime and exits in the HK regime,
+and the HK stage 1 is a no-op in the Gluon regime. The grid depends only on bs,
+so this is CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -22,27 +15,22 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.gluon.mla_gluon import _mla_gluon
 
-# gfx950-only module, imported lazily by the backend.
-from aiter.ops.triton.gluon.mla_gluon import _mla_gluon  # noqa: E402
-
-from sglang.kernels.ops.attention.k3_mla_verify_common import (
-    _HAS_GLUON,
-)
-from sglang.kernels.ops.attention.k3_mla_verify_common import (
-    _MIN_CHUNK as _SPLIT_MIN_CHUNK,
-)
-from sglang.kernels.ops.attention.k3_mla_verify_common import (
-    _ones,
-    _split_chunk,
-    default_num_splits,
+from sglang.kernels.ops.attention.k3_mla_verify_hk import (
+    PART8_MIN_SPLITS,
+    hk_reduce,
+    hk_stage1,
 )
 
+H, QLEN, D, DV = 12, 8, 576, 512
 _GLUON_BLOCK_H = 16
 _GLUON_BLOCK_N = 128
-_INT32_MAX = 2**31 - 1
+_HK_BLOCK_N = 64
+_MIN_CHUNK = 256  # min KV tokens per HK split
+_TARGET_CTAS = 256  # one HK CTA per CU
 
-# Gluon vs HK crossover (bs * max_L tokens; HK regime iff eff >= thresh).
+# HK regime iff bs * max(L) >= threshold (graph-replay crossovers on MI355X).
 _THRESH_HK = {1: 27000, 2: 28000, 4: 27000, 8: 29000, 16: 30000}
 _THRESH_HK_DEFAULT = 30000
 
@@ -52,6 +40,20 @@ def auto_threshold_hk(bs: int) -> int:
         if bs <= k:
             return _THRESH_HK[k]
     return _THRESH_HK_DEFAULT
+
+
+def hk_num_splits(bs: int) -> int:
+    """Power-of-two splits per request, bs * nsplit ~ _TARGET_CTAS, at least 2."""
+    return max(2, min(triton.next_power_of_2(-(-_TARGET_CTAS // bs)), 256))
+
+
+@triton.jit
+def _split_chunk(
+    L, NSPLIT: tl.constexpr, BLOCK_N: tl.constexpr, MIN_CHUNK: tl.constexpr
+):
+    per = tl.cdiv(L, NSPLIT)
+    per = tl.cdiv(per, BLOCK_N) * BLOCK_N
+    return tl.maximum(per, MIN_CHUNK)
 
 
 @triton.jit
@@ -86,7 +88,6 @@ def _k3_auto_reduce(
     G_BLOCK_N: tl.constexpr,
     D_BLK: tl.constexpr,
 ):
-    """One program per (request, row = q_pos*H + h, D_BLK columns)."""
     ROWS: tl.constexpr = H * QLEN
     b = tl.program_id(0)
     r = tl.program_id(1)
@@ -95,9 +96,8 @@ def _k3_auto_reduce(
     qpos = r // H
     h = r % H
     o_off = (b * QLEN + qpos).to(tl.int64) * stride_o_tok + h * stride_o_h
-    use_v2 = tl.load(FLAG)
-    if use_v2 != 0:
-        # base-2 LSE merge of the v2/v3 splits
+    if tl.load(FLAG) != 0:
+        # HK splits, base-2 LSE
         L = tl.load(KV_INDPTR + b + 1) - tl.load(KV_INDPTR + b)
         chunk = _split_chunk(L, NSPLIT, BLOCK_N, MIN_CHUNK)
         nact = tl.minimum(tl.cdiv(L, chunk), NSPLIT)
@@ -127,7 +127,7 @@ def _k3_auto_reduce(
         o = acc / tl.where(wsum > 0.0, wsum, 1.0)
         tl.store(O + o_off + offs_d, o.to(O.dtype.element_ty))
     elif G_NSPLIT > 1:
-        # == aiter _mla_softmax_reducev_kernel for this row / column block
+        # Gluon splits, as aiter _mla_softmax_reducev_kernel
         gL = tl.load(KV_INDPTR + b + 1) - tl.load(KV_INDPTR + b)
         gper = tl.maximum(G_BLOCK_N, gL // G_NSPLIT)
         gnact = tl.minimum(tl.cdiv(gL, gper), G_NSPLIT)
@@ -160,98 +160,59 @@ def _k3_auto_reduce(
         tl.store(O + o_off + offs_d, go.to(O.dtype.element_ty))
 
 
-def gluon_num_splits(bs: int, qlen: int, num_heads: int) -> int:
-    """aiter mla_gluon bh16bn128 split budget (256 workgroups)."""
-    return max(1, 256 // (bs * qlen * triton.cdiv(num_heads, _GLUON_BLOCK_H)))
-
-
 def k3_mla_verify_auto(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     sm_scale: float,
-    kv_scale=None,
-    kv_scale_float: Optional[float] = None,
-    *,
-    num_heads: int = 12,
-    qlen: int = 8,
-    v_head_dim: int = 512,
-    out: Optional[torch.Tensor] = None,
+    kv_scale: torch.Tensor,
+    kv_scale_float: float,
     thresh: Optional[int] = None,
 ) -> torch.Tensor:
-    """MLA target verify with on-device Gluon/HipKittens regime selection.
-
-    kv_scale: fp32 [1] tensor (or float / None); kv_scale_float: the same scale
-    as a host float for the Gluon body. thresh: HK regime iff
-    bs * max(L) >= thresh (default auto_threshold_hk(bs))."""
-    assert _HAS_GLUON, "k3_mla_verify_auto needs triton.experimental.gluon (gfx950)"
-    D = kv_buffer.shape[-1]
-    assert D == 576 and v_head_dim == 512 and num_heads * qlen <= 128
+    """kv_scale: fp32 [1]; kv_scale_float: the same value as a host float (Gluon).
+    thresh overrides auto_threshold_hk(bs)."""
+    assert kv_buffer.shape[-1] == D
     kv = kv_buffer.view(-1, D)
-    q = q.view(-1, num_heads, D)
-    assert q.stride(-1) == 1 and kv.stride(-1) == 1
+    q = q.view(-1, H, D)
     ntok = q.shape[0]
-    bs = ntok // qlen
-    assert bs * qlen == ntok
-    if out is None:
-        out = q.new_empty((ntok, num_heads, v_head_dim))
-    assert out.is_contiguous()
-    if kv_scale_float is None:
-        kv_scale_float = (
-            1.0
-            if isinstance(kv_scale, torch.Tensor) or kv_scale is None
-            else float(kv_scale)
-        )
-    if kv_scale is None:
-        kv_scale = _ones(q.device)
-    elif not isinstance(kv_scale, torch.Tensor):
-        kv_scale = torch.full(
-            (1,), float(kv_scale), dtype=torch.float32, device=q.device
-        )
+    bs = ntok // QLEN
+    out = q.new_empty((ntok, H, DV))
     if bs == 0:
         return out
     if thresh is None:
         thresh = auto_threshold_hk(bs)
-    thresh = int(min(max(thresh, 0), _INT32_MAX))
     dev = q.device
-    rows = num_heads * qlen
+    rows = H * QLEN
 
-    # Gluon (bh16bn128) operands / partials
-    g_ns = gluon_num_splits(bs, qlen, num_heads)
-    q4 = q.view(bs, qlen, num_heads, D)
-    q_nope = q4[..., :v_head_dim]
-    q_pe = q4[..., v_head_dim:]
-    o4 = out.view(bs, qlen, num_heads, v_head_dim)
-    if g_ns == 1:  # Gluon stores the final output directly
-        g_logits = o4.view(bs, qlen, num_heads, 1, v_head_dim)
+    # Gluon (bh16bn128): 256 workgroups; with one split it writes out directly.
+    g_ns = max(1, 256 // (bs * QLEN * triton.cdiv(H, _GLUON_BLOCK_H)))
+    q4 = q.view(bs, QLEN, H, D)
+    q_nope = q4[..., :DV]
+    q_pe = q4[..., DV:]
+    if g_ns == 1:
+        g_logits = out.view(bs, QLEN, H, 1, DV)
         g_lse = None
         g_ml = (0, 0, 0, 0)
     else:
-        g_logits = torch.empty(
-            (bs, qlen, num_heads, g_ns, v_head_dim), dtype=out.dtype, device=dev
-        )
-        g_lse = torch.empty(
-            (bs, qlen, num_heads, g_ns), dtype=torch.float32, device=dev
-        )
+        g_logits = torch.empty((bs, QLEN, H, g_ns, DV), dtype=out.dtype, device=dev)
+        g_lse = torch.empty((bs, QLEN, H, g_ns), dtype=torch.float32, device=dev)
         g_ml = g_lse.stride()
     g_sl = g_logits.stride()[:4]
     g_within_2gb = kv.shape[0] * kv.stride(0) * kv.element_size() <= 0x80000000
 
-    # v2 operands / partials
-    min_chunk = _SPLIT_MIN_CHUNK
-    nsplit = max(2, default_num_splits(bs))
-    block_n = 64
-    o_part = torch.empty(
-        (bs, nsplit, rows, v_head_dim), dtype=torch.bfloat16, device=dev
-    )
+    nsplit = hk_num_splits(bs)
+    # The HIP merge (bs <= 3) also reads fp8 partials; the Triton merge is faster at bs >= 4.
+    hip_reduce = nsplit >= 128
+    part8_min = PART8_MIN_SPLITS if hip_reduce else 0
+    o_part = torch.empty((bs, nsplit, rows, DV), dtype=torch.bfloat16, device=dev)
     lse_part = torch.empty((bs, nsplit, rows), dtype=torch.float32, device=dev)
     sel_p2 = max(256, triton.next_power_of_2(bs + 2))
 
-    # ---------------- 1. Gluon stage 1 with the regime prologue
+    # sel: HK-regime kv_indptr (all zero in the Gluon regime) + regime flag.
     sel = torch.empty((bs + 2,), dtype=torch.int32, device=dev)
     flag = sel[bs + 1 :]
-    _mla_gluon[(bs, g_ns, triton.cdiv(num_heads, _GLUON_BLOCK_H) * qlen)](
+    _mla_gluon[(bs, g_ns, triton.cdiv(H, _GLUON_BLOCK_H) * QLEN)](
         q_nope,
         q_pe,
         kv,
@@ -288,16 +249,16 @@ def k3_mla_verify_auto(
         BLOCK_N=_GLUON_BLOCK_N,
         NUM_KV_SPLITS=g_ns,
         PAGE_SIZE=1,
-        HEAD_DIM_CKV=v_head_dim,
-        HEAD_DIM_KPE=D - v_head_dim,
-        KV_PE_OFFSET=v_head_dim,
+        HEAD_DIM_CKV=DV,
+        HEAD_DIM_KPE=D - DV,
+        KV_PE_OFFSET=DV,
         USE_2D_VIEW=False,
         WITHIN_2GB=g_within_2gb,
         NUM_XCDS=1,
-        NHEAD=num_heads,
+        NHEAD=H,
         REGIME="bh16bn128",
         RETURN_LSE=False,
-        QLEN=qlen,
+        QLEN=QLEN,
         HAS_PE=True,
         HAS_ATTN_SINK=False,
         Sel_buf=sel,
@@ -306,14 +267,6 @@ def k3_mla_verify_auto(
         SEL_P2=sel_p2,
         REGIME_SEL=True,
     )
-    # ---------------- 2. HK / v2 / v3 stage 1 on sel (all-empty in the Gluon regime)
-    from sglang.kernels.ops.attention.k3_mla_verify_hk import (
-        PART8_MIN_SPLITS,
-        hip_reduce_enabled,
-        hk_stage1,
-    )
-
-    hk_p8 = PART8_MIN_SPLITS if hip_reduce_enabled(nsplit) else 0
     hk_stage1(
         q,
         kv,
@@ -322,42 +275,35 @@ def k3_mla_verify_auto(
         kv_scale,
         o_part,
         lse_part,
-        out,
         nsplit,
-        min_chunk,
+        _MIN_CHUNK,
         sm_scale,
-        hk_p8,
+        part8_min,
     )
-    from sglang.kernels.ops.attention.k3_mla_verify_hk import (
-        hip_reduce_enabled,
-        hk_reduce,
-    )
-
-    if hip_reduce_enabled(nsplit):
+    if hip_reduce:
         hk_reduce(
             o_part,
             lse_part,
             kv_indptr,
             out,
             nsplit,
-            min_chunk,
+            _MIN_CHUNK,
             kv_scale,
-            hk_p8,
-            regime=flag,
-            g_logits=g_logits,
-            g_lse=g_lse,
-            g_ns=g_ns,
-            g_block_n=_GLUON_BLOCK_N,
+            part8_min,
+            flag,
+            g_logits,
+            g_lse,
+            g_ns,
+            _GLUON_BLOCK_N,
         )
         return out
-    g_lse_arg = g_lse if g_lse is not None else lse_part
-    _k3_auto_reduce[(bs, rows, v_head_dim // 128)](
+    _k3_auto_reduce[(bs, rows, DV // 128)](
         flag,
         kv_indptr,
         o_part,
         lse_part,
         g_logits,
-        g_lse_arg,
+        g_lse if g_lse is not None else lse_part,
         out,
         out.stride(0),
         out.stride(1),
@@ -369,13 +315,13 @@ def k3_mla_verify_auto(
         g_ml[1],
         g_ml[2],
         g_ml[3],
-        H=num_heads,
-        QLEN=qlen,
-        D_V=v_head_dim,
+        H=H,
+        QLEN=QLEN,
+        D_V=DV,
         NSPLIT=nsplit,
         NSPLIT_P2=triton.next_power_of_2(nsplit),
-        BLOCK_N=block_n,
-        MIN_CHUNK=min_chunk,
+        BLOCK_N=_HK_BLOCK_N,
+        MIN_CHUNK=_MIN_CHUNK,
         S_BLK=min(64, triton.next_power_of_2(nsplit)),
         G_NSPLIT=g_ns,
         G_S_BLK=min(64, triton.next_power_of_2(g_ns)),

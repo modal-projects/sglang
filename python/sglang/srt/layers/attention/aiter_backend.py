@@ -714,20 +714,17 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+            # prefer_mla_gluon_decode implies 12 heads and an FP8 KV cache.
             self.use_k3_mla_verify = (
                 is_gfx95_supported()
                 and self.dcp_world_size <= 1
-                and self.kv_cache_dtype == fp8_dtype
                 and self.num_draft_tokens == 8
-                and getattr(self, "num_head", None) == 12
                 and prefer_mla_gluon_decode(
                     head_pad_mode=self.head_pad_mode,
                     num_head=self.num_head,
                     kv_cache_dtype=self.kv_cache_dtype,
                 )
             )
-            if self.use_k3_mla_verify:
-                logger.info("aiter MLA target_verify: K3 Gluon/HipKittens kernels")
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -1338,25 +1335,16 @@ class AiterAttnBackend(AttentionBackend):
     def _forward_k3_mla_verify(
         self, q: torch.Tensor, layer: RadixAttention, k_descale
     ) -> torch.Tensor:
-        args = (
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        from sglang.kernels.ops.attention.k3_mla_verify_auto import k3_mla_verify_auto
+
+        return k3_mla_verify_auto(
+            q,
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             layer.scaling,
             k_descale if k_descale is not None else self.k_scale,
-        )
-        kwargs = dict(
-            num_heads=layer.tp_q_head_num,
-            qlen=self.num_draft_tokens,
-            v_head_dim=layer.v_head_dim,
-        )
-        from sglang.kernels.ops.attention.k3_mla_verify_auto import k3_mla_verify_auto
-
-        return k3_mla_verify_auto(
-            *args,
-            kv_scale_float=self._resolve_fp8_kv_scale_float(layer, k_descale),
-            **kwargs,
+            self._resolve_fp8_kv_scale_float(layer, k_descale),
         )
 
     def _asm_context_prefill_indices(

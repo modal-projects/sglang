@@ -93,7 +93,6 @@ class TestK3DraftSwaVerify(CustomTestCase):
                     sinks=None,
                     logit_cap=0.0,
                     xai_temperature_len=-1,
-                    score_mod=None,
                 )  # fmt: skip
             )
             err = self._ref(q, k, v, qo, kvp, kvi) - self._fused(q, k, v, qo, kvp, kvi)

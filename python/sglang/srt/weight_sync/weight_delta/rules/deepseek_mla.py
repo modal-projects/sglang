@@ -95,6 +95,10 @@ class DeepSeekMla:
             rest = match[2]
             if rest.startswith(("embed_tokens.", "shared_head.head.")):
                 return Ignored("the draft uses the target's embedding and lm_head")
+            if "draft" not in self.models:
+                return Ignored(
+                    "the engine runs no draft model (speculative decoding is off)"
+                )
             runner = "draft"
             path = (
                 f"model.{rest}" if rest.startswith(MTP_TOP) else f"model.decoder.{rest}"

@@ -1,7 +1,7 @@
 """Before the pause, while the engine serves: read this GPU's part of deltas N+1..M from
-their files, undo the outer Zstd on CPU into decompression-engine memory, put the raw
-values on the GPU, and plan every decode and XOR, so the pause only binds the decode slots
-and launches."""
+their files, undo the outer Zstd on CPU into pinned host memory, put the raw values on the
+GPU, and plan every decode and XOR, so the pause only binds the decode slots (and, without a
+decompression engine, the staging buffers) and launches."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ class Fetched:
         tuple[torch.Tensor, tuple[Place, ...]]
     ]  # newest value, already on the GPU; its places
     scratch_bytes: int
+    staging_bytes: int  # largest batch's frames; 0 when the decompression engine reads host
     error: torch.Tensor
     plans: dict  # XOR plans by batch membership, reused by the next prepare
     stats: dict = field(default_factory=dict)
@@ -337,6 +338,9 @@ def fetch(
         batches=batches,
         raw=raw,
         scratch_bytes=max((batch.scratch_bytes for batch in batches), default=0),
+        staging_bytes=0
+        if decoder.hardware
+        else max((batch.decode.input_bytes for batch in batches), default=0),
         error=error,
         plans=used,
         stats={
@@ -345,6 +349,7 @@ def fetch(
             "raw_tensors": len(raw),
             "host_bytes": host_bytes,
             "frames": sum(batch.decode.count for batch in batches),
+            "decode_temp_bytes": sum(batch.decode.temp.numel() for batch in batches),
             "batches": len(batches),
             "xor_pairs": sum(len(batch.xor.sources) for batch in batches),
             "plans_reused": sum(1 for key in used if key in known),

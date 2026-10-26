@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -40,6 +42,15 @@ class Copy:
     dst: torch.Tensor
 
 
+@dataclass(frozen=True)
+class Derived:
+    """Serving tensors SGLang computes from checkpoint tensors at load (e.g. dequantized from
+    FP8), recomputed after apply with SGLang's own function: `values()` returns (value,
+    destination) pairs."""
+
+    values: Callable[[], list[tuple[torch.Tensor, torch.Tensor]]]
+
+
 class OtherGpu:
     pass
 
@@ -58,6 +69,10 @@ class DeltaMap:
     inventory: dict[str, CanonicalTensor]
     entries: dict[str, Entry]
     copies: list[Copy]
+    derived: list[Derived] = field(default_factory=list)
+    # Checkpoint tensors SGLang reads at load but does not keep (it serves only something
+    # computed from them): a GPU copy the deltas XOR into, by (runner, serving path).
+    shadows: dict[tuple[str, str], torch.Tensor] = field(default_factory=dict)
 
     def check_manifest(self, manifest) -> None:
         """Every delta tensor is one the map covers, with the checkpoint's dtype and shape;
@@ -119,22 +134,37 @@ def read_inventory(runner) -> dict[str, CanonicalTensor]:
     return inventory
 
 
-def model_rule(model):
+def model_rule(models, inventory):
     """The rule for the target's model class; the draft is part of the same family."""
     from sglang.srt.weight_sync.stitch_delta.rules.deepseek_mla import DeepSeekMla
 
-    architecture = model.config.architectures[0]
+    architecture = models["target"].config.architectures[0]
     for rule in (DeepSeekMla,):
         if architecture in rule.architectures:
-            return rule(model.config)
+            return rule(models, inventory)
     raise ValueError(f"GPU delta has no rules for {architecture}")
+
+
+def _checkpoint_reader(runner):
+    folder = Path(runner.model_config.model_path)
+    weight_map = json.loads((folder / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+
+    def read(name: str) -> torch.Tensor:
+        with safe_open(str(folder / weight_map[name]), framework="pt") as source:
+            return source.get_tensor(name)
+
+    return read
 
 
 def build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
     from sglang.srt.weight_sync.stitch_delta.rules import placement
 
     models = {role: runner.model for role, runner in runners}
-    rule = model_rule(models["target"])
+    rule = model_rule(models, inventory)
+    read_checkpoint = _checkpoint_reader(dict(runners)["target"])
+    shadows: dict[tuple[str, str], torch.Tensor] = {}
     # Every path, so aliases (e.g. attn_mha.kv_b_proj) don't hide the loader's name.
     modules = {
         role: dict(model.named_modules(remove_duplicate=False))
@@ -149,6 +179,11 @@ def build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
         target = rule.target(name)
         if isinstance(target, Ignored):
             entries[name] = target
+        elif target.shadow:
+            device = next(models[target.runner].parameters()).device
+            shadow = read_checkpoint(name).to(device)
+            shadows[(target.runner, target.param)] = shadow
+            entries[name] = (Place((slice(None),) * shadow.dim(), shadow),)
         elif target.expert is not None:
             layer = modules[target.runner][target.module]
             entries[name] = placement.expert_places(layer, target, tensor)
@@ -166,4 +201,10 @@ def build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
         for module in model.modules()
         for copy in (*rule.copies(module), *placement.expert_copies(module))
     ]
-    return DeltaMap(inventory, entries, copies)
+    derived = [
+        item
+        for role, model in models.items()
+        for path, module in model.named_modules()
+        for item in rule.derived(role, path, module, shadows)
+    ]
+    return DeltaMap(inventory, entries, copies, derived, shadows)

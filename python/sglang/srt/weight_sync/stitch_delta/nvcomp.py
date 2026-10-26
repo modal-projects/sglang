@@ -1,8 +1,10 @@
-"""Batched Snappy decode on the Blackwell decompression engine, through nvCOMP's C API.
+"""Batched Snappy decode through nvCOMP's C API: on the decompression engine where the GPU
+has one (Blackwell), reading the frames from pinned host memory; otherwise (Hopper) with
+nvCOMP's CUDA kernels, reading them from a GPU staging buffer the copy engine fills.
 
-Adapted from sglang#42210 (weight_sync/gpu_delta/codec.py). The hardware backend is
-forced: nvCOMP's default may silently pick its software decoder. A plan is built before
-the pause; only the output addresses are filled in once the scratch buffer exists.
+Adapted from sglang#42210 (weight_sync/gpu_delta/codec.py). The backend is always named:
+nvCOMP's default may silently pick its software decoder on a GPU that has the engine. A plan
+is built before the pause; the GPU addresses are filled in once the buffers exist.
 """
 
 from __future__ import annotations
@@ -16,11 +18,13 @@ import torch
 from sglang.srt.weight_sync.stitch_delta.memory import (
     _driver,
     device_empty,
+    has_decompression_engine,
     record_device_stream,
     require_de_capable,
 )
 
 MAX_FRAME_BYTES = 4 << 20
+HARDWARE, CUDA_KERNELS = 1, 2  # nvcompDecompressBackend_t
 
 
 class _Options(ctypes.Structure):
@@ -65,8 +69,12 @@ class SnappyDecoder:
         version = tuple(int(v) for v in package.version.split(".")[:2])
         if not (5, 3) <= version < (6, 0):
             raise RuntimeError(f"GPU delta needs nvCOMP 5.3+, found {package.version}")
-        self.maximum_frame_bytes = min(MAX_FRAME_BYTES, _hardware_limit(self.device))
-        self._options = _Options(backend=1)  # 1 = hardware decompression engine
+        self.hardware = has_decompression_engine(self.device.index)
+        if self.hardware:
+            self.maximum_frame_bytes = min(MAX_FRAME_BYTES, _hardware_limit(self.device))
+        else:
+            self.maximum_frame_bytes = MAX_FRAME_BYTES
+        self._options = _Options(backend=HARDWARE if self.hardware else CUDA_KERNELS)
         library = ctypes.CDLL(
             str(package.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
         )
@@ -103,24 +111,29 @@ class SnappyDecoder:
             )
         )
 
-    @staticmethod
-    def _check(status):
+    def _check(self, status):
         if status != 0:
-            raise RuntimeError(f"nvCOMP Snappy (hardware) failed: status {status}")
+            backend = "hardware" if self.hardware else "CUDA"
+            raise RuntimeError(f"nvCOMP Snappy ({backend}) failed: status {status}")
 
     def plan(self, frames: np.ndarray, host: torch.Tensor) -> DecodePlan:
         """frames: int64 rows (input offset, encoded bytes, decoded bytes, output offset),
         one column per frame; input offsets are into `host`, output offsets into the
-        output buffer given to DecodePlan.bind."""
+        output buffer given to DecodePlan.bind. Without the engine the frames are read from
+        a staging copy of host[first input : last input end] instead."""
         inputs, encoded, decoded, outputs = frames
         count = frames.shape[1]
+        base = int(inputs.min()) if count else 0
         if count and (
             np.any(encoded <= 0)
             or np.any(decoded <= 0)
             or np.any(decoded > self.maximum_frame_bytes)
             or np.any(inputs < 0)
             or np.any(inputs + encoded > host.numel())
-            or np.any((inputs + host.data_ptr()) % self.alignments.input)
+            or np.any(
+                (inputs + (host.data_ptr() if self.hardware else -base))
+                % self.alignments.input
+            )
             or np.any(outputs % self.alignments.output)
             or np.any(outputs[1:] < outputs[:-1] + decoded[:-1])
         ):
@@ -145,6 +158,12 @@ class DecodePlan:
         self.decoder, self.host, self.count = decoder, host, frames.shape[1]
         self.output_offsets = frames[3].copy()
         self.output_bound = int((frames[3] + frames[2]).max()) if self.count else 0
+        # The host bytes the frames span: what the copy engine stages without the engine.
+        self.input_start = int(frames[0].min()) if self.count else 0
+        self.input_bytes = (
+            int((frames[0] + frames[1]).max()) - self.input_start if self.count else 0
+        )
+        self.input_offsets = frames[0] - self.input_start
         device = decoder.device
         rows = np.empty((4, self.count), dtype=np.int64)
         rows[0] = frames[0] + host.data_ptr()
@@ -157,13 +176,28 @@ class DecodePlan:
         self.expected_sizes = self.rows[2]
         self.rows[:3].copy_(self.host_rows[:3], non_blocking=True)
 
-    def bind(self, output: torch.Tensor) -> None:
-        """Point every frame at `output` (a decompression-engine buffer) plus its offset."""
+    def bind(self, output: torch.Tensor, staging: torch.Tensor | None = None) -> None:
+        """Point every frame at `output` plus its offset; without the engine, also read
+        every frame from `staging` (see stage) instead of host memory."""
         if output.numel() < self.output_bound:
             raise ValueError("decode output buffer is too small")
-        require_de_capable(output.data_ptr())
+        if self.decoder.hardware:
+            require_de_capable(output.data_ptr())
+        else:
+            if staging is None or staging.numel() < self.input_bytes:
+                raise ValueError("decode staging buffer is missing or too small")
+            self.host_rows[0] = torch.from_numpy(self.input_offsets + staging.data_ptr())
+            self.rows[0].copy_(self.host_rows[0], non_blocking=True)
         self.host_rows[3] = torch.from_numpy(self.output_offsets + output.data_ptr())
         self.rows[3].copy_(self.host_rows[3], non_blocking=True)
+
+    def stage(self, staging: torch.Tensor) -> None:
+        """Copy this batch's frames to the GPU on the current stream (no engine only)."""
+        if self.input_bytes:
+            end = self.input_start + self.input_bytes
+            staging[: self.input_bytes].copy_(
+                self.host[self.input_start : end], non_blocking=True
+            )
 
     def enqueue(self, stream: torch.cuda.Stream) -> None:
         """Launch only; check statuses and actual sizes on the device afterwards."""

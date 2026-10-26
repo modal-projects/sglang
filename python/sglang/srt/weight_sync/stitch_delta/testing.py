@@ -142,6 +142,10 @@ def check_map(receiver) -> dict:
         for i, copy in enumerate(delta_map.copies)
         if not torch.equal(_bytes(copy.dst), _bytes(copy.src.to(copy.dst.dtype)))
     ]
+    bad_derived = _bad_derived(delta_map)
+    for derived in delta_map.derived:
+        for _, dst in derived.values():
+            written[dst.untyped_storage().data_ptr()].append(dst)
     coverage, sizes = {}, {}
     for storage_ptr, views in written.items():
         storage = views[0].untyped_storage()
@@ -149,8 +153,14 @@ def check_map(receiver) -> dict:
         # On the host: one serving storage can be larger than the GPU's free memory.
         counts = torch.zeros(storage.nbytes(), dtype=torch.uint8)
         for view in views:
-            u8 = view.reshape(view.shape or (1,)).view(torch.uint8)
-            torch.as_strided(counts, u8.shape, u8.stride(), u8.storage_offset()).add_(1)
+            # Every byte of every element, whatever the view's strides.
+            size = view.element_size()
+            torch.as_strided(
+                counts,
+                (*view.shape, size),
+                (*(stride * size for stride in view.stride()), 1),
+                view.storage_offset() * size,
+            ).add_(1)
         # count_nonzero: a mask's .sum() promotes it to int64 first (8x its size).
         missing = counts.numel() - int(torch.count_nonzero(counts))
         repeated = int(torch.count_nonzero(counts > 1))
@@ -181,6 +191,9 @@ def check_map(receiver) -> dict:
         "mismatched": mismatched,
         "copies": len(delta_map.copies),
         "bad_copies": bad_copies,
+        "derived": len(delta_map.derived),
+        "bad_derived": bad_derived,
+        "shadows": len(delta_map.shadows),
         "coverage_issues": list(coverage.values()),
         "unmapped_serving_tensors": unmapped,
         "largest_storages": [
@@ -188,6 +201,18 @@ def check_map(receiver) -> dict:
             for s in largest
         ],
     }
+
+
+def _bad_derived(delta_map) -> list[int]:
+    """Derived tensors whose serving bytes differ from a fresh recompute."""
+    return [
+        i
+        for i, derived in enumerate(delta_map.derived)
+        if not all(
+            torch.equal(_bytes(dst), _bytes(value.to(dst.dtype)))
+            for value, dst in derived.values()
+        )
+    ]
 
 
 def _cpu_reference(manifest, entry):
@@ -247,7 +272,11 @@ def check_fetch(receiver, manifest_paths: list[str], version: str) -> dict:
             for offset, length in batch.zero_ranges:
                 scratch[offset : offset + length].zero_()
             stream = torch.cuda.current_stream(receiver.device)
-            batch.decode.bind(scratch)
+            staging = None
+            if fetched.staging_bytes:
+                staging = device_empty(batch.decode.input_bytes, torch.uint8, receiver.device)
+                batch.decode.stage(staging)
+            batch.decode.bind(scratch, staging)
             batch.decode.enqueue(stream)
             stream.synchronize()
             manifest = manifests[batch.target_version]
@@ -376,7 +405,7 @@ def check_version(receiver, digests_path: str, manifest_paths: list[str]) -> dic
         i
         for i, copy in enumerate(receiver.delta_map.copies)
         if not torch.equal(_bytes(copy.dst), _bytes(copy.src.to(copy.dst.dtype)))
-    ]
+    ] + [f"derived {i}" for i in _bad_derived(receiver.delta_map)]
     return {
         "checked": dict(counts),
         "mismatched": mismatched,

@@ -1,8 +1,10 @@
-"""Memory the Blackwell decompression engine can read and write.
+"""Memory the Snappy decode reads and writes.
 
-Adapted from sglang#42210 (weight_sync/gpu_delta/memory.py). Host buffers are pinned
-HOST_NUMA allocations created for hardware decompression; device buffers come from
-cuMemAlloc, outside PyTorch's allocator. Every pointer is checked before use.
+Adapted from sglang#42210 (weight_sync/gpu_delta/memory.py). On a GPU with a hardware
+decompression engine (Blackwell), host buffers are pinned HOST_NUMA allocations created for
+it and every pointer is checked before use; without one (Hopper), host buffers are plain
+pinned memory the copy engine reads. Device buffers come from cuMemAlloc, outside PyTorch's
+allocator.
 """
 
 import ctypes
@@ -40,6 +42,22 @@ def _pointer_attribute_query():
     return query
 
 
+@cache
+def has_decompression_engine(device: int) -> bool:
+    """Whether the GPU decodes Snappy in hardware (Blackwell's decompression engine)."""
+    driver = _driver()
+    mask = _check(
+        driver.cuDeviceGetAttribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MEM_DECOMPRESS_ALGORITHM_MASK,
+            device,
+        ),
+        "MEM_DECOMPRESS_ALGORITHM_MASK",
+    )
+    return bool(
+        mask & driver.CUmemDecompressAlgorithm.CU_MEM_DECOMPRESS_ALGORITHM_SNAPPY
+    )
+
+
 def require_de_capable(pointer: int) -> None:
     driver = _driver()
     attribute = driver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_IS_HW_DECOMPRESS_CAPABLE
@@ -73,7 +91,8 @@ class _DeviceAllocation:
         self.size = size
         self.address = int(_check(driver.cuMemAlloc(size), "cuMemAlloc"))
         try:
-            require_de_capable(self.address)
+            if has_decompression_engine(device.index):
+                require_de_capable(self.address)
         except BaseException:
             self._release()
             raise
@@ -108,7 +127,7 @@ class _DeviceAllocation:
 
 
 def device_empty(shape, dtype, device):
-    """A tensor the decompression engine can write, outside PyTorch's allocator."""
+    """A tensor the Snappy decode can write, outside PyTorch's allocator."""
     import torch
 
     device = torch.device(device)
@@ -230,8 +249,30 @@ class HostAllocation:
             self.handle = 0
 
 
+class PinnedAllocation:
+    """Plain pinned host memory, for GPUs without a decompression engine: the copy engine
+    moves each batch's frames to the GPU. Allocated by the GPU's scheduler process, which
+    SGLang binds to the GPU's NUMA node."""
+
+    def __init__(self, capacity, device: int):
+        self.driver = _driver()
+        self.capacity = capacity
+        self.address = int(_check(self.driver.cuMemHostAlloc(capacity, 0), "cuMemHostAlloc"))
+        self.view = memoryview(
+            (ctypes.c_ubyte * capacity).from_address(self.address)
+        ).cast("B")
+
+    def close(self):
+        if self.view is not None:
+            self.view.release()
+            self.view = None
+        if self.address:
+            _check(self.driver.cuMemFreeHost(self.address), "cuMemFreeHost")
+            self.address = 0
+
+
 class HostArena:
-    """One GPU's decompression-engine host memory, kept across updates: refitted only when a
+    """One GPU's host memory for Snappy frames, kept across updates: refitted only when a
     prepare needs more than it holds, or less than half of it (after a larger catch-up).
     """
 
@@ -248,7 +289,12 @@ class HostArena:
         if nbytes > capacity or 2 * nbytes < capacity:
             self.release()
             if nbytes:
-                self.allocation = HostAllocation(nbytes, self.device)
+                kind = (
+                    HostAllocation
+                    if has_decompression_engine(self.device)
+                    else PinnedAllocation
+                )
+                self.allocation = kind(nbytes, self.device)
                 self.tensor = torch.frombuffer(self.allocation.view, dtype=torch.uint8)
         if self.tensor is None:
             return torch.empty(0, dtype=torch.uint8).pin_memory()

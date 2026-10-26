@@ -16,9 +16,9 @@ from sglang.srt.weight_sync.stitch_delta.map import (
     CanonicalTensor,
     Place,
 )
-from sglang.srt.weight_sync.stitch_delta.rules import cutedsl_nvfp4, plain
+from sglang.srt.weight_sync.stitch_delta.rules import cutedsl_nvfp4, fp8_block, plain
 
-BACKENDS = (cutedsl_nvfp4, plain)
+BACKENDS = (cutedsl_nvfp4, fp8_block, plain)
 
 
 def linear_places(

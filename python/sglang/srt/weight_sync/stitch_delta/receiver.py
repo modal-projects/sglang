@@ -8,6 +8,7 @@ import time
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     GpuDeltaReqInput,
     GpuDeltaReqOutput,
@@ -74,6 +75,9 @@ def check_scope(runners) -> None:
             parallel.enable_dp_attention_local_control_broadcast
         ),
         "the zero-copy weight cache": get_model().weight_cache_mode != "off",
+        "MoE gate/up rows permuted in place (SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED)": (
+            envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get()
+        ),
         "a draft model from another checkpoint": any(
             runner.model_config.model_path != target.model_config.model_path
             for role, runner in runners
@@ -104,11 +108,15 @@ class GpuDeltaReceiver:
         check_scope(self.runners)
         self.inventory = read_inventory(target[0])
         read = time.perf_counter()
-        self.delta_map = build_map(self.runners, self.inventory)
-        logger.info(
-            f"GPU delta map built for {len(self.inventory)} checkpoint tensors: "
-            f"headers {read - started:.2f} s, map {time.perf_counter() - read:.2f} s"
-        )
+        if envs.SGLANG_GPU_DELTA_INVENTORY_ONLY.get():
+            self.delta_map = None
+            logger.warning("GPU delta map not built (inventory only); updates are refused")
+        else:
+            self.delta_map = build_map(self.runners, self.inventory)
+            logger.info(
+                f"GPU delta map built for {len(self.inventory)} checkpoint tensors: "
+                f"headers {read - started:.2f} s, map {time.perf_counter() - read:.2f} s"
+            )
         self.device = next(target[0].model.parameters()).device
         # The container's CPUs, split across its GPUs, undo the outer Zstd.
         self.workers = max(1, _cpu_budget() // get_parallel().tp_size)
@@ -119,9 +127,12 @@ class GpuDeltaReceiver:
             f"GPU delta kernels compiled in {time.perf_counter() - compiled:.2f} s; "
             f"{self.workers} CPU workers for the outer Zstd"
         )
-        # Kept across updates: the decompression engine's host memory and the XOR plans.
+        # Kept across updates: the decompression engine's host memory, the XOR plans, and the
+        # stream prepare runs on (PyTorch caches freed GPU memory per stream, so a new stream
+        # per prepare would strand what the last one used).
         self.arena = HostArena(self.device.index)
         self._plans = {}
+        self._stream = torch.cuda.Stream(self.device)
         self._decoder = None
         self._lock = threading.Lock()
         self._state, self._error, self._fetched = "idle", None, None
@@ -135,6 +146,10 @@ class GpuDeltaReceiver:
         return self._decoder
 
     def handle(self, req: GpuDeltaReqInput) -> GpuDeltaReqOutput:
+        if self.delta_map is None and req.action in ("fetch", "apply"):
+            return GpuDeltaReqOutput(
+                success=False, message="inventory-only engine", state="idle"
+            )
         if req.action == "fetch":
             return self._start_fetch(req)
         if req.action == "apply":
@@ -190,7 +205,7 @@ class GpuDeltaReceiver:
         try:
             # The engine keeps serving: this thread's GPU work goes on its own stream.
             torch.cuda.set_device(self.device)
-            stream = torch.cuda.Stream(self.device)
+            stream = self._stream
             with torch.cuda.stream(stream):
                 fetched = fetch(
                     self.delta_map,

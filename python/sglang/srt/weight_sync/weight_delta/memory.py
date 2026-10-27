@@ -272,8 +272,9 @@ class PinnedAllocation:
 
 
 class HostArena:
-    """One GPU's host memory for Snappy frames, kept across updates: refitted only when a
-    prepare needs more than it holds, or less than half of it (after a larger catch-up).
+    """One GPU's host memory for the inner frames, kept across updates: refitted only when a
+    prepare needs more than it holds, less than half of it (after a larger catch-up), or the
+    other kind of memory.
     """
 
     def __init__(self, device: int):
@@ -281,19 +282,20 @@ class HostArena:
         self.allocation = None
         self.tensor = None
 
-    def fit(self, nbytes: int):
-        """A uint8 tensor over at least `nbytes` of pinned host memory."""
+    def fit(self, nbytes: int, hardware: bool):
+        """A uint8 tensor over at least `nbytes` of pinned host memory, which the decompression
+        engine can read if `hardware` (only the decoders it runs read host memory directly)."""
         import torch
 
+        kind = HostAllocation if hardware else PinnedAllocation
         capacity = self.allocation.capacity if self.allocation is not None else 0
-        if nbytes > capacity or 2 * nbytes < capacity:
+        if (
+            nbytes > capacity
+            or 2 * nbytes < capacity
+            or not isinstance(self.allocation, kind)
+        ):
             self.release()
             if nbytes:
-                kind = (
-                    HostAllocation
-                    if has_decompression_engine(self.device)
-                    else PinnedAllocation
-                )
                 self.allocation = kind(nbytes, self.device)
                 self.tensor = torch.frombuffer(self.allocation.view, dtype=torch.uint8)
         if self.tensor is None:

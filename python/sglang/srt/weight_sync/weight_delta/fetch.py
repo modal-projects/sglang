@@ -269,7 +269,7 @@ def fetch(
     for _, entry in xor_work:
         arenas.append(host_bytes)
         host_bytes += _aligned(entry["outer"]["decoded_bytes"])
-    host_tensor = arena.fit(host_bytes)
+    host_tensor = arena.fit(host_bytes, decoder.hardware)
     allocated = time.perf_counter()
 
     with torch.cuda.nvtx.range("weight_delta.prepare.outer_zstd"):

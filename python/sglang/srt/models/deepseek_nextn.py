@@ -290,10 +290,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
+        # Unquantized under modelopt_fp4 like the NextN layer itself: the head serves the
+        # target's BF16 head, and an NVFP4 setup on it breaks the post-load step that a
+        # weight update re-runs.
+        head_quant_config = (
+            None
+            if quant_config is not None and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=head_quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )

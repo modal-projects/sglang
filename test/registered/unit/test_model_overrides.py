@@ -2869,9 +2869,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
                 with self.assertRaises(ValueError):
                     _deepseek_spec_moe_resolution(_view(ep_size=1))
-        # the arm is HIP-only
+        # CUDA fills only what is unset, and leaves the FP8 NextN opt-in alone
         with override_platform(is_hip=False):
-            self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
+            ):
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view()),
+                    {
+                        "speculative_moe_runner_backend": "triton",
+                        "speculative_moe_a2a_backend": "none",
+                    },
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(
+                        _view(speculative_moe_runner_backend="flashinfer_trtllm")
+                    ),
+                    {"speculative_moe_a2a_backend": "none"},
+                )
+                self.assertEqual(
+                    _deepseek_spec_moe_resolution(_view(quantization="fp8")), {}
+                )
+            with patch.object(
+                envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=True
+            ):
+                self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
         from sglang.srt.arg_groups.overrides import (

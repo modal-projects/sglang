@@ -845,13 +845,11 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_spec_moe_resolution(view: Any) -> dict:
-    """Resolve HIP draft MoE backends after quantization and before A2A adjusts EP size."""
+    """Resolve an NVFP4 checkpoint's draft (BF16 NextN) MoE backends after quantization, before A2A sets EP."""
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
-        return {}
-    if not get_platform().is_hip:
         return {}
     if not (
         view.quantization == "modelopt_fp4"
@@ -862,6 +860,20 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
         )
     ):
         return {}
+    if not get_platform().is_hip:
+        # The draft's BF16 experts cannot run every runner it would inherit from the target: fill only
+        # what is unset, and leave the FP8 NextN opt-in on the target's runner.
+        if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
+            return {}
+        defaults = {
+            "speculative_moe_runner_backend": "triton",
+            "speculative_moe_a2a_backend": "none",
+        }
+        return {
+            field: value
+            for field, value in defaults.items()
+            if getattr(view, field) is None
+        }
     if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
         logger.info(
             "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."

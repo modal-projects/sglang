@@ -427,8 +427,8 @@ def handle_model_specific_adjustments(server_args: Any):
         # moved to the resolution pipeline (arg_groups/overrides.py:
         # _deepseek_moe_quant_resolution -- a slot pass, because the DSA
         # kv-cache-dtype default above must read the pristine
-        # quantization). The HIP arm (fusion log + spec_moe writes, the
-        # latter awaiting the speculative-hook migration) stays below.
+        # quantization). The HIP arm (fusion log) stays below, then the
+        # spec_moe writes (awaiting the speculative-hook migration).
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
@@ -454,12 +454,12 @@ def handle_model_specific_adjustments(server_args: Any):
                         "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
                     )
 
-            # The fp4-checkpoint draft spec-MoE resolution moved to the
-            # resolution pipeline (arg_groups/overrides.py:
-            # _deepseek_spec_moe_resolution), invoked here at its legacy
-            # slot.
+        # The fp4-checkpoint draft spec-MoE resolution moved to the
+        # resolution pipeline (arg_groups/overrides.py:
+        # _deepseek_spec_moe_resolution), invoked here at its legacy
+        # slot, after the HIP arm, on every platform.
 
-            run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
+        run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
 
     elif model_arch in [
         "DeepseekV4ForCausalLM",

@@ -146,7 +146,7 @@ def _apply(fetched, delta_map, device, started, synced) -> dict:
     finished = time.perf_counter()
     if fetched.error.item():
         raise RuntimeError(
-            "a Snappy frame failed to decode or decoded to the wrong size"
+            "a frame failed to decode or decoded to the wrong size"
         )
     return {
         "batches": len(batches),

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from sglang.srt.weight_sync.weight_delta.gap import GapDecoder
 from sglang.srt.weight_sync.weight_delta.manifest import Manifest, read_manifest
 from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES, DeltaMap, Place
 from sglang.srt.weight_sync.weight_delta.memory import HostArena
@@ -84,6 +85,7 @@ def _check_chain(manifests: list[Manifest], version: str) -> None:
         if (
             current.stream_id != previous.stream_id
             or current.base_version != previous.target_version
+            or current.codec != previous.codec
         ):
             raise ValueError(
                 f"delta {current.base_version}->{current.target_version} does not follow "
@@ -159,6 +161,8 @@ def _undo_outer_zstd(
 def _plan_batch(
     target_version, members, delta_map, decoder, host, error, plans
 ) -> Batch:
+    # A Snappy frame decodes whole; a gap frame writes only its changed bytes.
+    whole_frames = not isinstance(decoder, GapDecoder)
     offsets, size = [], 0
     for entry, _ in members:
         size = _aligned(size)
@@ -166,9 +170,11 @@ def _plan_batch(
         size += entry["nbytes"]
     columns, zero_ranges = [], []
     for (entry, arena), offset in zip(members, offsets):
+        if not whole_frames:
+            zero_ranges.append((offset, entry["nbytes"]))
         cursor = 0
         for frame in entry["frames"]:
-            if frame["decoded_offset"] > cursor:
+            if whole_frames and frame["decoded_offset"] > cursor:
                 zero_ranges.append((offset + cursor, frame["decoded_offset"] - cursor))
             columns.append(
                 (
@@ -179,7 +185,7 @@ def _plan_batch(
                 )
             )
             cursor = frame["decoded_offset"] + frame["decoded_bytes"]
-        if cursor < entry["nbytes"]:
+        if whole_frames and cursor < entry["nbytes"]:
             zero_ranges.append((offset + cursor, entry["nbytes"] - cursor))
     frames = np.ascontiguousarray(np.array(columns, dtype=np.int64).reshape(-1, 4).T)
     decode = decoder.plan(frames, host)
@@ -237,6 +243,8 @@ def fetch(
         if not manifests:
             raise ValueError("no deltas given")
         _check_chain(manifests, version)
+        if manifests[0].codec == "gap-zstd":
+            decoder = GapDecoder(decoder.device)
         encodings = {}
         for manifest in manifests:
             delta_map.check_manifest(manifest)

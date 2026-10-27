@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
+from sglang.srt.weight_sync.weight_delta import gap
 from sglang.srt.weight_sync.weight_delta.map import build_map, read_inventory
 from sglang.srt.weight_sync.weight_delta.memory import HostArena
 from sglang.srt.weight_sync.weight_delta.xor_kernel import warm_up
@@ -123,6 +124,7 @@ class WeightDeltaReceiver:
         # Compiled now, so the first update does not pay for it.
         compiled = time.perf_counter()
         warm_up(self.device.index)
+        gap.warm_up(self.device.index)
         logger.info(
             f"Weight delta kernels compiled in {time.perf_counter() - compiled:.2f} s; "
             f"{self.workers} CPU workers for the outer Zstd"

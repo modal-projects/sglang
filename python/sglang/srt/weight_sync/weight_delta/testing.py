@@ -235,6 +235,13 @@ def _cpu_reference(manifest, entry):
             max_output_size=chunk["decoded_bytes"],
         )
     xor = np.zeros(entry["nbytes"], dtype=np.uint8)
+    if manifest.codec == "gap-zstd":
+        for frame in entry["frames"]:
+            n, start = frame["encoded_bytes"] // 5, frame["encoded_offset"]
+            record = np.frombuffer(bytes(arena[start : start + 5 * n]), dtype=np.uint8)
+            gaps = sum(record[k * n : (k + 1) * n].astype(np.int64) << (8 * k) for k in range(4))
+            xor[frame["decoded_offset"] + np.cumsum(gaps)] = record[4 * n :]
+        return xor
     for frame in entry["frames"]:
         start = frame["encoded_offset"]
         decoded = snappy.uncompress(

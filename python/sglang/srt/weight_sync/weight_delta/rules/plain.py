@@ -1,4 +1,7 @@
-"""Unquantized MoE whose post-load leaves the loaded layout (e.g. the BF16 Triton draft)."""
+"""Unquantized MoE on the Triton runner, whose post-load leaves the loaded layout (e.g. the BF16
+draft). Other runners rearrange the experts after loading (TRT-LLM swaps gate and up, permutes
+rows and converts to its block layout; the fused-SwiGLU option interleaves gate and up rows), so
+no rule claims them and the map refuses them at startup."""
 
 from __future__ import annotations
 
@@ -6,7 +9,15 @@ from sglang.srt.weight_sync.weight_delta.map import Copy, Place
 
 
 def handles(layer) -> bool:
-    return type(layer.quant_method).__name__ == "UnquantizedFusedMoEMethod"
+    method = layer.quant_method
+    if type(method).__name__ != "UnquantizedFusedMoEMethod":
+        return False
+    runner = getattr(method, "runner", None)
+    return (
+        runner is not None
+        and runner.runner_backend.is_triton()
+        and not getattr(method, "w13_swiglu_interleaved", False)
+    )
 
 
 def expert_place(layer, slot: int, projection: str, kind: str, tensor) -> Place:

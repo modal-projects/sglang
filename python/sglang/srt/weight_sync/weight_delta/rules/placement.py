@@ -62,7 +62,11 @@ def backend_for(layer):
     for backend in BACKENDS:
         if backend.handles(layer):
             return backend
-    raise ValueError(f"Weight delta has no layout for {type(layer.quant_method).__name__}")
+    runner = getattr(getattr(layer.quant_method, "runner", None), "runner_backend", None)
+    raise ValueError(
+        f"Weight delta has no layout for {type(layer.quant_method).__name__}"
+        + (f" on the {runner} MoE runner" if runner is not None else "")
+    )
 
 
 def expert_places(layer, target, tensor: CanonicalTensor):

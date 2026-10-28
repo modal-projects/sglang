@@ -1044,6 +1044,11 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # Keep the router gate in BF16 weights with an FP32 logit output when the
+    # merged MoE front runs in FP8 (SGLANG_K3_TARGET_DENSE_FP8=front|wide).
+    SGLANG_K3_ROUTER_GATE_HIGH_PREC = EnvBool(False)
+    # Debug: rank-0 eager dumps of the router input hidden states, per MoE layer.
+    SGLANG_K3_ROUTER_DUMP_DIR = EnvStr("")
     SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")

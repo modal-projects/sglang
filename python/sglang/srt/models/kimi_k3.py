@@ -471,6 +471,27 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+_ROUTER_DUMP_MAX_TOKENS = 4096
+_router_dump_counts: dict = {}
+
+
+def _maybe_dump_router_input(layer_idx: int, hidden_states: torch.Tensor) -> None:
+    """Debug (SGLANG_K3_ROUTER_DUMP_DIR): save rank 0's eager router inputs, up
+    to _ROUTER_DUMP_MAX_TOKENS rows per MoE layer, for offline router checks."""
+    out_dir = envs.SGLANG_K3_ROUTER_DUMP_DIR.get()
+    if not out_dir or torch.cuda.is_current_stream_capturing():
+        return
+    if get_parallel().tp_group.rank_in_group != 0:
+        return
+    seen = _router_dump_counts.get(layer_idx, 0)
+    if seen >= _ROUTER_DUMP_MAX_TOKENS or hidden_states.shape[0] < 16:
+        return
+    rows = hidden_states[: _ROUTER_DUMP_MAX_TOKENS - seen].detach().cpu()
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(rows, os.path.join(out_dir, f"layer{layer_idx:03d}_{seen:05d}.pt"))
+    _router_dump_counts[layer_idx] = seen + rows.shape[0]
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -497,6 +518,8 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_fp8 = None  # k3_rocm_dense_fp8.StaticFP8Weight on ROCm
+        # bf16 router gate kept beside an FP8 front (SGLANG_K3_ROUTER_GATE_HIGH_PREC)
+        self._gate_hp_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -783,6 +806,8 @@ class KimiK3MoE(nn.Module):
             from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
             if k3_rocm_dense_fp8.front_enabled():
+                if envs.SGLANG_K3_ROUTER_GATE_HIGH_PREC.get():
+                    self._gate_hp_w = self.gate.weight.data.clone()
                 # One E4M3 copy of the merged front; the bf16 component weights
                 # become row views of it (the fused front is their only reader).
                 fp8 = k3_rocm_dense_fp8.StaticFP8Weight(self._front_w)
@@ -1420,6 +1445,7 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
+        _maybe_dump_router_input(self.layer_idx, hidden_states)
         if self._rocm_epi_fuse_ok and self._rocm_epi_fuse_fits(
             hidden_states, prefix_sum
         ):
@@ -1439,6 +1465,10 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        if self._gate_hp_w is not None:
+            router_logits = _k3_bf16_gemm(
+                hidden_states, self._gate_hp_w, out_dtype=torch.float32
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1726,6 +1756,10 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        if self._gate_hp_w is not None:
+            router_logits = _k3_bf16_gemm(
+                hidden_states, self._gate_hp_w, out_dtype=torch.float32
+            )
         if self._moe_front_needs_dense_bf16 and not (
             _aiter_k3_opt and routed_input.dtype == hidden_states.dtype
         ):

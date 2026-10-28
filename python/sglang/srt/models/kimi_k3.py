@@ -475,7 +475,7 @@ _ROUTER_DUMP_MAX_TOKENS = 4096
 _router_dump_counts: dict = {}
 
 
-def _maybe_dump_router_input(layer_idx: int, hidden_states: torch.Tensor) -> None:
+def _maybe_dump_router_input(moe: "KimiK3MoE", hidden_states: torch.Tensor) -> None:
     """Debug (SGLANG_K3_ROUTER_DUMP_DIR): save rank 0's eager router inputs, up
     to _ROUTER_DUMP_MAX_TOKENS rows per MoE layer, for offline router checks."""
     out_dir = envs.SGLANG_K3_ROUTER_DUMP_DIR.get()
@@ -483,12 +483,21 @@ def _maybe_dump_router_input(layer_idx: int, hidden_states: torch.Tensor) -> Non
         return
     if get_parallel().tp_group.rank_in_group != 0:
         return
+    layer_idx = moe.layer_idx
     seen = _router_dump_counts.get(layer_idx, 0)
     if seen >= _ROUTER_DUMP_MAX_TOKENS or hidden_states.shape[0] < 16:
         return
     rows = hidden_states[: _ROUTER_DUMP_MAX_TOKENS - seen].detach().cpu()
     os.makedirs(out_dir, exist_ok=True)
-    torch.save(rows, os.path.join(out_dir, f"layer{layer_idx:03d}_{seen:05d}.pt"))
+    fp8 = moe._front_fp8
+    torch.save(
+        {
+            "x": rows,
+            "front_scale": None if fp8 is None else float(fp8.scale),
+            "front_sizes": moe._front_sizes,
+        },
+        os.path.join(out_dir, f"layer{layer_idx:03d}_{seen:05d}.pt"),
+    )
     _router_dump_counts[layer_idx] = seen + rows.shape[0]
 
 
@@ -1445,7 +1454,7 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
-        _maybe_dump_router_input(self.layer_idx, hidden_states)
+        _maybe_dump_router_input(self, hidden_states)
         if self._rocm_epi_fuse_ok and self._rocm_epi_fuse_fits(
             hidden_states, prefix_sum
         ):

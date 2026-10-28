@@ -2091,6 +2091,9 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # ROCm TP8: run the K3 shared-expert MLP on a side stream concurrently with
+    # the routed experts; both still land in one [latent | shared] all-reduce.
+    SGLANG_K3_ROCM_SHARED_OVERLAP = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See

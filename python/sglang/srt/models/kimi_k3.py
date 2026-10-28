@@ -1526,8 +1526,21 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            if _is_hip and self.alt_stream is not None:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                gate_up.record_stream(self.alt_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                self._forward_routed(
+                    hidden_states, router_logits, routed_input, latent
+                )
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self._forward_shared(gate_up, shared_output)
+                self._forward_routed(
+                    hidden_states, router_logits, routed_input, latent
+                )
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
@@ -3309,8 +3322,13 @@ class KimiK3LinearModel(nn.Module):
         #   [0] MoE dual-stream shared-expert tail
         #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
         #   [2] MLA output-gate GEMM, overlaps the attention core
-        # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        # HIP only gets the MoE slot, and only with SGLANG_K3_ROCM_SHARED_OVERLAP.
+        if not _is_hip:
+            self.alt_streams = [torch.cuda.Stream() for _ in range(3)]
+        elif envs.SGLANG_K3_ROCM_SHARED_OVERLAP.get():
+            self.alt_streams = [torch.cuda.Stream(), None, None]
+        else:
+            self.alt_streams = None
 
         # The attention-residual bank of one forward, which every layer's
         # stage boundaries read.

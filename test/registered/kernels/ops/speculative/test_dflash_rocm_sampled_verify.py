@@ -201,5 +201,32 @@ def test_emitted_tokens_follow_target(top_k, top_p):
     assert _chi2_pvalue(counts, probs[1], int(acc.sum())) > 1e-4
 
 
+def test_bf16_ties_match_pytorch_filter():
+    """Exact bf16 ties at the top-p pivot: keep only the ties the sampler's sort keeps."""
+    rows, vocab = 4000 // SCALE, 512
+    g = torch.Generator().manual_seed(0)
+    logits = torch.round(torch.randn(rows, vocab, generator=g) * 8) / 4
+    logits = logits.bfloat16().float().to(DEVICE)
+    temps = torch.ones(rows, device=DEVICE)
+    top_ks = torch.full((rows,), 1 << 30, dtype=torch.int32, device=DEVICE)
+    top_ps = torch.full((rows,), 0.95, device=DEVICE)
+    kept = _target_probs(logits, temps, top_ks, top_ps, 1) > 0
+    probs = torch.softmax(logits, dim=-1)
+    pivot = torch.where(kept, probs, torch.inf).min(dim=-1, keepdim=True).values
+    r, t = torch.nonzero(probs == pivot, as_tuple=True)
+    assert (~kept[r, t]).any(), "no dropped ties at the pivot; test is vacuous"
+    q = r.numel()
+    len_, _ = _fused(
+        logits[r].repeat_interleave(2, dim=0),
+        torch.stack([torch.zeros_like(t), t], dim=1),
+        temps[r],
+        top_ks[r],
+        top_ps[r],
+        torch.zeros(q, 2, device=DEVICE),  # coin 0 accepts iff the draft is kept
+        torch.rand(q, device=DEVICE),
+    )
+    assert torch.equal(len_ >= 1, kept[r, t])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

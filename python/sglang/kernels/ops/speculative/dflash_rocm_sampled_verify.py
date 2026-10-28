@@ -21,6 +21,8 @@ _TOPK_ALL = 2**30
 @triton.jit
 def _sort_key(s):
     bits = s.to(tl.int32, bitcast=True)
+    # -0.0 and +0.0 compare equal, so they must share a key to tie.
+    bits = tl.where(s == 0.0, 0, bits)
     return tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
 
 
@@ -232,16 +234,16 @@ def _kept_prob_unnorm(
     s = tl.load(row_ptr + tok).to(tl.float32) * inv_temp
     k = _sort_key(s).to(tl.int64)
     e = tl.exp(s - row_max)
-    kept = k > v_key
-    if k == v_key:
-        rank = 0
-        for start in range(0, tok, BLOCK):
-            offs = start + tl.arange(0, BLOCK)
-            m = offs < tok
-            sp = tl.load(row_ptr + offs, mask=m, other=-float("inf")).to(tl.float32)
-            kp = _sort_key(sp * inv_temp).to(tl.int64)
-            rank += tl.sum((m & (kp == v_key)).to(tl.int32), axis=0)
-        kept = rank < n_keep
+    is_tie = k == v_key
+    # Ties keep the first n_keep in index order; only a tied token scans its prefix.
+    rank = tl.zeros([], dtype=tl.int32)
+    for start in range(0, tl.where(is_tie, tok, 0), BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        m = offs < tok
+        sp = tl.load(row_ptr + offs, mask=m, other=-float("inf")).to(tl.float32)
+        kp = _sort_key(sp * inv_temp).to(tl.int64)
+        rank += tl.sum((m & (kp == v_key)).to(tl.int32), axis=0)
+    kept = (k > v_key) | (is_tie & (rank < n_keep))
     return tl.where(kept, e, 0.0)
 
 

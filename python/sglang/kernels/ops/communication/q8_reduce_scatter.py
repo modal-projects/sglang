@@ -16,7 +16,10 @@ GROUP = 32
 # Widths in multiples of 16 groups keep every size argument a multiple of 16, so
 # each kernel compiles once.
 WIDTH_MULTIPLE = 16 * GROUP
-_BLOCK = 64
+# (groups per program, num_warps) of each kernel, from an MI355X sweep at 4K-16K
+# rows x 3584 and 7168 columns.
+_PACK_CFG = (32, 1)
+_UNPACK_CFG = (32, 2)
 
 
 @triton.jit
@@ -131,7 +134,8 @@ def pack(partial: torch.Tensor, rows: int, world: int, out: torch.Tensor) -> Non
     local = rows // world * width
     chunk_bytes = _chunk_bytes(local)
     n_groups = rows * width // GROUP
-    _pack_kernel[(triton.cdiv(n_groups, _BLOCK),)](
+    block, warps = _PACK_CFG
+    _pack_kernel[(triton.cdiv(n_groups, block),)](
         partial.contiguous(),
         out,
         n_groups,
@@ -139,8 +143,9 @@ def pack(partial: torch.Tensor, rows: int, world: int, out: torch.Tensor) -> Non
         local // GROUP,
         chunk_bytes,
         local,
-        BLOCK=_BLOCK,
+        BLOCK=block,
         GROUP_SIZE=GROUP,
+        num_warps=warps,
     )
 
 
@@ -148,15 +153,17 @@ def unpack_sum(received: torch.Tensor, world: int, out: torch.Tensor) -> None:
     """Sum the ``world`` received chunks into ``out`` [rows / world, width]."""
     local = out.numel()
     chunk_bytes = _chunk_bytes(local)
-    _unpack_sum_kernel[(triton.cdiv(local // GROUP, _BLOCK),)](
+    block, warps = _UNPACK_CFG
+    _unpack_sum_kernel[(triton.cdiv(local // GROUP, block),)](
         received,
         out,
         local // GROUP,
         chunk_bytes,
         local,
         WORLD=world,
-        BLOCK=_BLOCK,
+        BLOCK=block,
         GROUP_SIZE=GROUP,
+        num_warps=warps,
     )
 
 

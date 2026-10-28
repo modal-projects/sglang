@@ -430,6 +430,44 @@ def test_split_k_compact_replay_uses_current_metadata():
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("input_dim", "expected_split"),
+    [(512, None), (2560, 4), (4096, 8), (5120, 8), (12288, 16), (17408, 16)],
+)
+def test_automatic_split_k_scales_with_input_dim(input_dim, expected_split):
+    batch_info = _make_batch_info()
+    _set_mixed_segment_state(batch_info, active=True)
+    inputs = torch.randn(BS, input_dim, device="cuda", dtype=torch.bfloat16)
+    weights = (
+        torch.randn(NUM_LORAS, 96, input_dim, device="cuda", dtype=torch.bfloat16) / 64
+    )
+    split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
+    with (
+        patch.object(
+            shrink_module,
+            "get_lora_shrink_config",
+            return_value={"BLOCK_N": 16, "BLOCK_K": 256},
+        ),
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
+    ):
+        with envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False):
+            expected = chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
+        with (
+            envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(True),
+            patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
+        ):
+            actual = chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
+    if expected_split is None:
+        assert launches.call_count == 0
+    else:
+        assert launches.call_args.kwargs["SPLIT_K"] == expected_split
+    for adapter, rank in enumerate((8, 16, 32), start=1):
+        rows = batch_info.permutation[2 * (adapter - 1) : 2 * adapter].long()
+        torch.testing.assert_close(
+            actual[rows, : 3 * rank], expected[rows, : 3 * rank], rtol=2e-2, atol=2e-2
+        )
+
+
 def test_deterministic_mode_keeps_original_shrink_path():
     """Deterministic mode must suppress both automatic and explicit split-K launches."""
     batch_info = _make_batch_info()

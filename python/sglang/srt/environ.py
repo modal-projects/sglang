@@ -1645,6 +1645,9 @@ class Envs:
     SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
+    # ROCm DFLASH sampled verify: fused Triton chain verify instead of dense
+    # softmax + sort-based top-k/top-p + chain rejection sampling.
+    SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY = EnvBool(True)
     # Mint capture's measured footprint as one span so the graph pool is carved
     # out of a single contiguous region instead of grown segment by segment.
     SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)

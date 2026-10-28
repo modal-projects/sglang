@@ -13,6 +13,7 @@ from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_p
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -44,6 +45,9 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 
 
 if is_hip():
+    from sglang.kernels.ops.speculative.dflash_rocm_sampled_verify import (
+        dflash_sampled_verify_rocm,
+    )
     from sglang.kernels.ops.speculative.verify_sampling import (
         chain_speculative_sampling_triton,
     )
@@ -55,6 +59,18 @@ if is_hip():
         chain_speculative_sampling_triton(
             candidates=candidates, draft_probs=draft_probs, **kwargs
         )
+
+
+def _use_rocm_fused_sampled_verify(sampling_info: Any, logits: torch.Tensor) -> bool:
+    """The fused kernel implements the pytorch backend's top-k/top-p filter."""
+    if not (is_hip() and envs.SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY.get()):
+        return False
+    if logits.stride(-1) != 1:
+        return False
+    filtering = bool(getattr(sampling_info, "need_top_k_sampling", True)) or bool(
+        getattr(sampling_info, "need_top_p_sampling", False)
+    )
+    return not filtering or get_exec().kernel.sampling_backend == "pytorch"
 
 
 # DFlash does not run sampling verify on NPU, even where the op exists.
@@ -973,6 +989,29 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(
             "uniform_samples_for_final_sampling shape mismatch. "
             f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+        )
+
+    if _use_rocm_fused_sampled_verify(sampling_info, next_token_logits):
+        coins = (
+            torch.rand((bs, draft_token_num), dtype=torch.float32, device=device)
+            if uniform_samples is None
+            else uniform_samples
+        )
+        coins_final = (
+            torch.rand((bs,), dtype=torch.float32, device=device)
+            if uniform_samples_for_final_sampling is None
+            else uniform_samples_for_final_sampling
+        )
+        return dflash_sampled_verify_rocm(
+            logits=next_token_logits,
+            candidates=candidates,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            coins=coins,
+            coins_final=coins_final,
+            apply_top_k=bool(getattr(sampling_info, "need_top_k_sampling", True)),
+            apply_top_p=bool(getattr(sampling_info, "need_top_p_sampling", False)),
         )
 
     # Cached across steps, and `correct_len` below aliases `accept_token_num`,

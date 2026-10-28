@@ -121,6 +121,8 @@ def validate_layernorm_sp(
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
+        MODEL_COLLECTIVE_SP_ARCHITECTURES,
+        MUSE_SP_ARCHITECTURES,
         SP_SUPPORTED_ARCHITECTURES,
         is_muse_spark_architecture,
     )
@@ -169,6 +171,12 @@ def validate_layernorm_sp(
                 "Muse Spark --enable-layernorm-sp requires "
                 "--moe-runner-backend flashinfer_trtllm."
             )
+    model_collectives = architecture in MODEL_COLLECTIVE_SP_ARCHITECTURES
+    if model_collectives and (moe_a2a_backend != "none" or ep_size != 1):
+        raise ValueError(
+            f"{architecture} --enable-layernorm-sp gathers into a tensor-parallel "
+            "MoE: it requires --moe-a2a-backend none and ep_size 1."
+        )
     if attn_dp_enabled:
         raise ValueError(
             "--enable-layernorm-sp is not compatible with attention DP: "
@@ -176,12 +184,14 @@ def validate_layernorm_sp(
             "attention spans data-parallel groups holding different sequences."
         )
     if speculative_algorithm is not None and not (
-        is_muse_spark_architecture(architecture) and speculative_algorithm == "DFLASH"
+        speculative_algorithm == "DFLASH"
+        and (is_muse_spark_architecture(architecture) or model_collectives)
     ):
         raise ValueError(
-            "--enable-layernorm-sp supports speculative decoding only with "
-            "Muse Spark DFLASH: other models/algorithms do not gather the "
-            "sequence-sharded auxiliary hidden states."
+            "--enable-layernorm-sp supports speculative decoding only with DFLASH "
+            f"on {sorted(MUSE_SP_ARCHITECTURES | MODEL_COLLECTIVE_SP_ARCHITECTURES)}: "
+            "other models/algorithms do not gather the sequence-sharded auxiliary "
+            "hidden states."
         )
     if pp_size > 1:
         raise ValueError(

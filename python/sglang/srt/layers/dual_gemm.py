@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.layers import layernorm_sp
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -105,7 +106,7 @@ class DualGemm:
             self.mode is not None
             and 1 <= input_tensor.shape[0] <= self.max_tokens
             and not hasattr(gate_up_proj, "base_layer")
-            and not (self.tp_size > 1 and get_forward().sp_active)
+            and not (self.tp_size > 1 and layernorm_sp.participants_active())
         )
 
     def __call__(self, x, gate_up_proj: "MergedColumnParallelLinear"):

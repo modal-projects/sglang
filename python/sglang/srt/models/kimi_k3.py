@@ -33,7 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
@@ -143,6 +143,8 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
+    get_forward,
     get_parallel,
     get_platform,
     get_spec,
@@ -1429,6 +1431,61 @@ class KimiK3MoE(nn.Module):
         assert self.fuse_ar_norm and norm is not None
         return norm.weight, norm.variance_epsilon
 
+    def _front_outputs(self, hidden_states: torch.Tensor):
+        """The merged front's (shared gate_up, router logits, routed input)."""
+        if self._front_fp8 is not None:
+            fused = self._front_fp8(
+                hidden_states,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
+            router_logits = router_logits.contiguous()
+        if self._moe_front_needs_dense_bf16:
+            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
+                # ROCm aiter runner: the fused small-batch sort+quant reads the
+                # strided front slice directly and the patched fused_moe densifies
+                # it only when it falls back to aiter's own quant, so skip the copy.
+                pass
+            else:
+                # off an fp32 front the cast allocates the dense buffer, so the
+                # contiguous() behind it is free; off a bf16 front it is the copy
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        return gate_up, router_logits, routed_input
+
+    def _forward_sp(
+        self, hidden_states: torch.Tensor, prefix_sum: torch.Tensor
+    ) -> torch.Tensor:
+        """A sequence-parallel extend on this rank's rows: every token goes through
+        the TP front and experts, [latent | shared] is reduce-scattered by rows, and
+        the latent norm, up_proj and residual add run on this rank's rows."""
+        rows, hidden_size = hidden_states.shape
+        assert prefix_sum.shape[0] == rows
+        num_tokens = layernorm_sp.sp_num_tokens()
+        padded = rows * get_parallel().tp_group.world_size
+        x = layernorm_sp.sp_exit_gather(hidden_states, num_tokens)
+        gate_up, router_logits, routed_input = self._front_outputs(x)
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            buf = x.new_empty(padded * (self.moe_hidden_size + hidden_size))
+        latent = buf[: padded * self.moe_hidden_size].view(padded, self.moe_hidden_size)
+        shared = buf[padded * self.moe_hidden_size :].view(padded, hidden_size)
+        self._forward_shared(gate_up, shared[:num_tokens])
+        self._forward_routed(x, router_logits, routed_input, latent[:num_tokens])
+        latent = layernorm_sp.sp_reduce_scatter(latent, num_tokens)
+        shared = layernorm_sp.sp_reduce_scatter(shared, num_tokens)
+        up, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        return _add3(up, shared, prefix_sum, prefetch_bc=True)
+
     def _forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -1454,32 +1511,7 @@ class KimiK3MoE(nn.Module):
         ):
             return self._forward_fused_rocm_epi(hidden_states, prefix_sum=prefix_sum)
         num_tokens, hidden_size = hidden_states.shape
-        if self._front_fp8 is not None:
-            fused = self._front_fp8(
-                hidden_states,
-                out_dtype=torch.float32 if self._front_fp32 else None,
-            )
-        else:
-            fused = _k3_bf16_gemm(
-                hidden_states,
-                self._front_w,
-                out_dtype=torch.float32 if self._front_fp32 else None,
-            )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
-            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
-                # ROCm aiter runner: the fused small-batch sort+quant reads the
-                # strided front slice directly and the patched fused_moe densifies
-                # it only when it falls back to aiter's own quant, so skip the copy.
-                pass
-            else:
-                # off an fp32 front the cast allocates the dense buffer, so the
-                # contiguous() behind it is free; off a bf16 front it is the copy
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        gate_up, router_logits, routed_input = self._front_outputs(hidden_states)
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1940,6 +1972,8 @@ class KimiK3MoE(nn.Module):
         # K3's route/sort/quant kernels inside the AITER MoE runner (no-op
         # elsewhere); paths with model-side inputs enter their own plan.
         with k3_sort_plan() if _is_hip else nullcontext():
+            if get_forward().sp_active:
+                return self._forward_sp(hidden_states, prefix_sum)
             if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
                 out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
             else:
@@ -2947,6 +2981,14 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
+def _k3_sp_attn_gather(hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    """A sequence-parallel extend's attention input, gathered from every rank's
+    rows, or None (the boundary's own gather) outside one."""
+    if not get_forward().sp_active:
+        return None
+    return layernorm_sp.sp_all_gather(hidden_states)
+
+
 def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
@@ -2999,6 +3041,7 @@ def _stage_facts(
     builds a layer. ``bank`` is the layer's own reads and updates of the
     attention-residual bank; without it, the stages declare what those do."""
     is_moe = _is_moe_layer(config, layer_idx)
+    layer_sp = layernorm_sp.layernorm_sp_enabled()
     # Under attention DP the FFN input is read on this rank's rows
     # once the attention's sum is complete, then gathered.
     attn_ops = {}
@@ -3006,7 +3049,7 @@ def _stage_facts(
     if config.attn_res_block_size is not None:
         if bank is None:
             bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
+                reads_slices=_carries_bank_slices(config, sp_collective) or layer_sp
             )
         attn_ops = dict(
             read=bank.attn_readout,
@@ -3020,6 +3063,8 @@ def _stage_facts(
                 if sp_collective
                 and _shards_moe_rows()
                 and _is_moe_layer(config, layer_idx - 1)
+                else _k3_sp_attn_gather
+                if layer_sp
                 else None
             ),
         )
@@ -3031,6 +3076,10 @@ def _stage_facts(
                 else bank.ffn_update
             ),
         )
+    if layer_sp:
+        # A sequence-parallel extend's attention input arrives on this rank's
+        # rows and is gathered at the boundary.
+        attn_ops["gathers_attn_tp_input"] = False
     return (
         declare_attn(**attn_ops),
         declare_ffn(
@@ -3190,7 +3239,8 @@ class KimiK3DecoderLayer(nn.Module):
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config, sp_collective)
+                or layernorm_sp.layernorm_sp_enabled(),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -3260,6 +3310,9 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
         qkv_latent_func = getattr(self.self_attn, "prepare_qkv_latent", None)
+        sp = get_forward().sp_active
+        if sp:
+            hidden_states = hidden_states[: layernorm_sp.sp_num_tokens()]
         if qkv_latent_func is not None:
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
@@ -3274,7 +3327,7 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
-        return result
+        return layernorm_sp.sp_reduce_scatter(result) if sp else result
 
     def forward(
         self,
@@ -3302,6 +3355,14 @@ class KimiK3DecoderLayer(nn.Module):
                 hidden_states = self.mlp(
                     hidden_states,
                     prefix_sum=residual_batch.written_residual(forward_batch),
+                )
+            elif get_forward().sp_active:
+                hidden_states = layernorm_sp.sp_reduce_scatter(
+                    self.mlp(
+                        layernorm_sp.sp_exit_gather(
+                            hidden_states, layernorm_sp.sp_num_tokens()
+                        )
+                    )
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
@@ -3423,6 +3484,7 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        sp: bool = False,
     ) -> torch.Tensor:
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
@@ -3457,7 +3519,13 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            bank_rows = hidden_states
+            if sp:
+                # The bank holds this rank's slice of the padded rows, and open
+                # reads only the shape.
+                world_size = get_parallel().tp_group.world_size
+                bank_rows = hidden_states[: _cdiv(hidden_states.shape[0], world_size)]
+            self.attn_bank.open(bank_rows, attn_res_block_num, inherited)
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -3750,13 +3818,30 @@ class KimiK3LinearForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+        num_tokens = (input_ids if input_ids is not None else embeds).shape[0]
+        sp = get_flags().sp.model_collectives and layernorm_sp.runs_sp(
+            forward_batch.forward_mode, num_tokens
         )
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, embeds, pp_proxy_tensors, sp=sp
+        )
+        if get_forward().sp_active != sp:
+            raise RuntimeError(
+                "Kimi-K3 and its stack disagree on whether this forward is "
+                "sequence-parallel"
+            )
         if self.pp_group.is_last_rank:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+            if sp:
+                # The logits read every token, as do DFlash's captures.
+                hidden_states = layernorm_sp.sp_exit_gather(hidden_states, num_tokens)
+                if aux_hidden_states is not None:
+                    aux_hidden_states = layernorm_sp.sp_exit_gather(
+                        aux_hidden_states, num_tokens
+                    )
+                get_forward().set("sp_active", False)
             return self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -3991,6 +4076,29 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.post_load_weights()
         return loaded_params
 
+    def _check_layernorm_sp(self) -> None:
+        """Startup check for --enable-layernorm-sp: Kimi-K3's sequence-parallel
+        path runs on ROCm, with every MoE layer a latent MoE whose fused front
+        writes the stream."""
+        problems = []
+        if not _is_hip:
+            problems.append("it runs on ROCm only")
+        if envs.SGLANG_USE_AG_AFTER_QLORA.get():
+            problems.append("SGLANG_USE_AG_AFTER_QLORA must be off")
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer) or not layer._is_moe_layer:
+                continue
+            if not (layer._ffn_writes_stream and layer.mlp._eligible_for_fused_front):
+                problems.append(
+                    f"MoE layer {layer.layer_idx} needs a latent MoE with the fused "
+                    "front that writes the stream"
+                )
+                break
+        if problems:
+            raise ValueError(
+                "Kimi-K3 --enable-layernorm-sp: " + "; ".join(problems) + "."
+            )
+
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
@@ -4084,6 +4192,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+        if layernorm_sp.layernorm_sp_enabled():
+            self._check_layernorm_sp()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

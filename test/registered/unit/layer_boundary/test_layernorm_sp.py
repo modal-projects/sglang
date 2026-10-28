@@ -92,6 +92,44 @@ class TestLayerNormSPGating(CustomTestCase):
             self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
         reset_context()
 
+    def test_mixed_batches_run_sp_only_with_model_collectives(self):
+        """Mixed batches shard only on a model that places its own collectives."""
+        with get_flags().sp.override(enabled=True):
+            self.assertFalse(layernorm_sp.runs_sp(ForwardMode.MIXED))
+        with get_flags().sp.override(enabled=True, model_collectives=True):
+            self.assertTrue(layernorm_sp.runs_sp(ForwardMode.MIXED))
+
+    def test_token_minimum(self):
+        """A token minimum shards only forwards at or above it."""
+        with get_flags().sp.override(
+            enabled=True, model_collectives=True, min_tokens=4097
+        ):
+            self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 4096))
+            self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 4097))
+            with self.assertRaises(ValueError):
+                layernorm_sp.runs_sp(ForwardMode.EXTEND)
+
+    def test_model_collectives_keep_participant_linears_unsharded(self):
+        """An SP forward of a model with its own collectives leaves the linears alone."""
+        with get_flags().sp.override(enabled=True, model_collectives=True):
+            get_forward().set("sp_active", True)
+            self.assertFalse(layernorm_sp.participants_active())
+        with get_flags().sp.override(enabled=True):
+            get_forward().set("sp_active", True)
+            self.assertTrue(layernorm_sp.participants_active())
+
+    def test_initialize_sets_minimum_above_prefill_graphs(self):
+        """Kimi-K3's token minimum sits one above its largest prefill graph."""
+        for prefill, minimum in (
+            (SimpleNamespace(backend="breakable", bs=[128, 1024, 4096]), 4097),
+            (SimpleNamespace(backend="disabled", bs=[128, 1024, 4096]), 1),
+        ):
+            with patch.object(layernorm_sp, "get_exec") as get_exec:
+                get_exec.return_value.graph.cuda_graph_config.prefill = prefill
+                _initialize(arch="KimiK3ForConditionalGeneration")
+            self.assertTrue(get_flags().sp.model_collectives)
+            self.assertEqual(get_flags().sp.min_tokens, minimum)
+
 
 class TestLayerNormSPValidation(CustomTestCase):
     """``validate_layernorm_sp`` is pure; pass config in directly."""
@@ -125,6 +163,22 @@ class TestLayerNormSPValidation(CustomTestCase):
     def test_rejects_pipeline_parallelism(self):
         with self.assertRaisesRegex(ValueError, "pipeline"):
             validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
+
+    def test_kimi_k3_needs_tensor_parallel_moe_and_dflash(self):
+        """Kimi-K3 takes a TP MoE and DFLASH, and rejects EP, A2A, and EAGLE."""
+        k3 = {
+            **self.VALID,
+            "architecture": "KimiK3ForConditionalGeneration",
+            "tp_size": 8,
+        }
+        validate_layernorm_sp(**k3)
+        validate_layernorm_sp(**{**k3, "speculative_algorithm": "DFLASH"})
+        with self.assertRaisesRegex(ValueError, "ep_size 1"):
+            validate_layernorm_sp(**{**k3, "ep_size": 8})
+        with self.assertRaisesRegex(ValueError, "moe-a2a-backend none"):
+            validate_layernorm_sp(**{**k3, "moe_a2a_backend": "deepep"})
+        with self.assertRaisesRegex(ValueError, "speculative"):
+            validate_layernorm_sp(**{**k3, "speculative_algorithm": "EAGLE3"})
 
 
 class _Norm:

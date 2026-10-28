@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_lora,
     get_parallel,
     get_platform,
@@ -92,7 +92,7 @@ class DenseSiluAndMulQuant:
             or deterministic.rl_on_policy_target is not None
             or is_batch_invariant_mode_enabled()
             or get_lora().enable_lora
-            or get_forward().sp_active
+            or layernorm_sp.participants_active()
             or x.dtype != torch.bfloat16
             or not x.is_cuda
             or x.ndim != 2

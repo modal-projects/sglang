@@ -41,7 +41,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -616,7 +616,7 @@ class ColumnParallelLinear(LinearBase):
         # all-gather to the full sequence and matmul. Participants (qkv/gate_up)
         # have gather_output=False, so there is no output all-gather to reconcile.
         _, tp_size = get_group_rank_size(self.tp_group)
-        if get_forward().sp_active and tp_size > 1:
+        if layernorm_sp.participants_active() and tp_size > 1:
             output = layernorm_sp.column_parallel_g_matmul(self, input_, bias)
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
@@ -1766,7 +1766,7 @@ class RowParallelLinear(LinearBase):
         # Fires regardless of reduce_results: o_proj / down are built
         # reduce_results=False, so under SP the linear owns the reduction.
         if (
-            get_forward().sp_active
+            layernorm_sp.participants_active()
             and tp_size > 1
             and not skip_all_reduce
             and output_tensor is None

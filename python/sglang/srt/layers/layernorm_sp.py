@@ -20,17 +20,19 @@ each rank holds 1/tp of the tokens -- which cuts the transient activation memory
 of long-context prefill with no extra communication volume (all_reduce and
 reduce_scatter+all_gather move the same bytes).
 
-Everything SP lives here so the feature stays decoupled from model code and from
-``dp_attention.py``:
+The shared SP machinery lives here, decoupled from ``dp_attention.py``:
 
-  - which models opt in (the Qwen3-dense allowlist) and config validation,
+  - which models opt in and config validation,
   - the per-forward ``sp_active`` flag (a ForwardFlags bool) read at depth by the
     participant linears and the layer-boundary batch selector,
   - the entry-scatter / exit-gather collectives, and
   - the fused matmul + collective fast-paths for the participant linears.
 
-SP runs for prefill (EXTEND) only and is off by default; with the flag off,
-nothing in this module executes.
+Models in ``MODEL_COLLECTIVE_SP_ARCHITECTURES`` place their own collectives
+around attention and the FFN, and the participant linears stay unsharded for them.
+
+SP runs for prefill (EXTEND), plus mixed batches for those models. It is off by
+default, and with the flag off nothing in this module executes.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_forward,
     get_parallel,
@@ -51,7 +54,12 @@ from sglang.srt.utils.common import ceil_align
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
 MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
-SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset({"Qwen3ForCausalLM"})
+MODEL_COLLECTIVE_SP_ARCHITECTURES = frozenset({"KimiK3ForConditionalGeneration"})
+SP_SUPPORTED_ARCHITECTURES = (
+    MUSE_SP_ARCHITECTURES
+    | MODEL_COLLECTIVE_SP_ARCHITECTURES
+    | frozenset({"Qwen3ForCausalLM"})
+)
 
 
 def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
@@ -62,19 +70,43 @@ def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
-    get_flags().sp.enabled = bool(
+    flags = get_flags().sp
+    flags.enabled = bool(
         get_parallel().enable_layernorm_sp
         and architectures
         and architectures[0] in SP_SUPPORTED_ARCHITECTURES
     )
+    flags.model_collectives = (
+        flags.enabled and architectures[0] in MODEL_COLLECTIVE_SP_ARCHITECTURES
+    )
+    if flags.model_collectives:
+        flags.min_tokens = _largest_prefill_graph_tokens() + 1
+
+
+def _largest_prefill_graph_tokens() -> int:
+    """Token count of the largest captured prefill CUDA graph, 0 without one.
+
+    Models that place their own collectives decide SP in Python per forward, and a
+    replayed prefill graph cannot switch to the SP layout, so they shard only
+    forwards larger than this.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.utils.common import get_cuda_graph_max_batch_size
+
+    prefill = get_exec().graph.cuda_graph_config.prefill
+    if prefill.backend == Backend.DISABLED or not prefill.bs:
+        return 0
+    return max(get_cuda_graph_max_batch_size(n) for n in prefill.bs)
 
 
 def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
-    """Whether this forward runs SP: an enabled model, prefill only.
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
+    """Whether this forward of ``num_tokens`` tokens runs SP: an enabled model,
+    prefill (or a mixed batch for a model that places its own collectives), and
+    at least ``flags.sp.min_tokens`` tokens.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
@@ -82,7 +114,23 @@ def runs_sp(forward_mode) -> bool:
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not layernorm_sp_enabled():
+        return False
+    flags = get_flags().sp
+    if forward_mode != ForwardMode.EXTEND and not (
+        flags.model_collectives and forward_mode == ForwardMode.MIXED
+    ):
+        return False
+    if not flags.min_tokens:
+        return True
+    if num_tokens is None:
+        raise ValueError("runs_sp needs the token count under a token minimum")
+    return num_tokens >= flags.min_tokens
+
+
+def participants_active() -> bool:
+    """Whether the participant linears gather and reduce-scatter themselves."""
+    return get_forward().sp_active and not get_flags().sp.model_collectives
 
 
 class _SPForwardState:
@@ -128,19 +176,50 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
 
 
-def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """g: all-gather the per-rank shards back to the full sequence along dim 0,
-    then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
+def sp_all_gather(hidden_states: torch.Tensor) -> torch.Tensor:
+    """g: all-gather the per-rank shards back to the padded sequence along dim 0."""
     tp_group = get_parallel().tp_group
     tp_size = tp_group.world_size
     if tp_size == 1:
-        return hidden_states[:num_tokens]
+        return hidden_states
     hidden_states = hidden_states.contiguous()
     output = hidden_states.new_empty(
         (hidden_states.shape[0] * tp_size, *hidden_states.shape[1:])
     )
     tp_group.all_gather_into_tensor(output, hidden_states)
-    return output[:num_tokens]
+    return output
+
+
+def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """g: all-gather the per-rank shards back to the full sequence along dim 0,
+    then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
+    return sp_all_gather(hidden_states)[:num_tokens]
+
+
+def sp_reduce_scatter(
+    partial: torch.Tensor, num_valid: Optional[int] = None
+) -> torch.Tensor:
+    """g-bar: this rank's rows of the TP sum of a TP-partial ``[rows, h]`` tensor.
+
+    Without ``num_valid`` every row is valid and the rows are zero-padded to a
+    multiple of the TP size. With it, ``partial`` already has such padded rows,
+    and the rows from ``num_valid`` on are zeroed in place.
+    """
+    tp_group = get_parallel().tp_group
+    tp_size = tp_group.world_size
+    if num_valid is None:
+        num_valid = partial.shape[0]
+        padded = ceil_align(num_valid, tp_size)
+        if padded != num_valid:
+            partial = torch.nn.functional.pad(partial, (0, 0, 0, padded - num_valid))
+    elif num_valid < partial.shape[0]:
+        partial[num_valid:].zero_()
+    if tp_size == 1:
+        return partial
+    partial = partial.contiguous()
+    output = partial.new_empty((partial.shape[0] // tp_size, *partial.shape[1:]))
+    tp_group.reduce_scatter_tensor(output, partial)
+    return output
 
 
 def maybe_exit_gather(
@@ -152,11 +231,16 @@ def maybe_exit_gather(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Undo the sequence sharding before the LM head, and leave the region.
 
-    No-op unless this forward runs SP. The token count comes from ``input_ids``
+    No-op unless this forward runs SP on a model that uses the participant
+    linears. The token count comes from ``input_ids``
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if (
+        input_ids is None
+        or get_flags().sp.model_collectives
+        or not runs_sp(forward_mode, input_ids.shape[0])
+    ):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)

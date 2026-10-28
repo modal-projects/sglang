@@ -616,6 +616,11 @@ class SpFlags(_FlagGroupBase):
     config). See ``layers.layernorm_sp``."""
 
     enabled: bool = False
+    # The model places its own gathers and reduce-scatters around attention and
+    # the FFN, so the participant linears keep their unsharded behavior.
+    model_collectives: bool = False
+    # Forwards with fewer tokens stay unsharded (0 = no minimum).
+    min_tokens: int = 0
 
 
 class Flags(_FlagGroupBase):

@@ -1431,9 +1431,14 @@ class KimiK3MoE(nn.Module):
         assert self.fuse_ar_norm and norm is not None
         return norm.weight, norm.variance_epsilon
 
-    def _front_outputs(self, hidden_states: torch.Tensor):
-        """The merged front's (shared gate_up, router logits, routed input)."""
-        if self._front_fp8 is not None:
+    def _front_outputs(
+        self, hidden_states: torch.Tensor, dtype: torch.dtype, quantized: bool = False
+    ):
+        """The merged front's (shared gate_up, router logits, routed input) for
+        ``dtype`` activations or, ``quantized``, their unit-scale E4M3 copy."""
+        if quantized:
+            fused = self._front_fp8.matmul_quantized(hidden_states, dtype)
+        elif self._front_fp8 is not None:
             fused = self._front_fp8(
                 hidden_states,
                 out_dtype=torch.float32 if self._front_fp32 else None,
@@ -1450,7 +1455,7 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
-            if _is_hip and _aiter_k3_opt and routed_input.dtype == hidden_states.dtype:
+            if _is_hip and _aiter_k3_opt and routed_input.dtype == dtype:
                 # ROCm aiter runner: the fused small-batch sort+quant reads the
                 # strided front slice directly and the patched fused_moe densifies
                 # it only when it falls back to aiter's own quant, so skip the copy.
@@ -1458,7 +1463,7 @@ class KimiK3MoE(nn.Module):
             else:
                 # off an fp32 front the cast allocates the dense buffer, so the
                 # contiguous() behind it is free; off a bf16 front it is the copy
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+                routed_input = routed_input.to(dtype).contiguous()
         return gate_up, router_logits, routed_input
 
     def _forward_sp(
@@ -1471,12 +1476,25 @@ class KimiK3MoE(nn.Module):
         assert prefix_sum.shape[0] == rows
         num_tokens = layernorm_sp.sp_num_tokens()
         padded = rows * get_parallel().tp_group.world_size
-        x = layernorm_sp.sp_exit_gather(hidden_states, num_tokens)
-        gate_up, router_logits, routed_input = self._front_outputs(x)
+        quantized = self._front_fp8 is not None
+        if quantized:
+            from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+            # The FP8 front reads only the E4M3 copy of the rows, so gather that.
+            xq = k3_rocm_dense_fp8.take_prequantized(hidden_states)
+            if xq is None:
+                xq = self._front_fp8.quantize(hidden_states)
+            x = xq.view(hidden_states.shape)
+        else:
+            x = hidden_states
+        x = layernorm_sp.sp_exit_gather(x, num_tokens)
+        gate_up, router_logits, routed_input = self._front_outputs(
+            x, hidden_states.dtype, quantized
+        )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
-            buf = x.new_empty(padded * (self.moe_hidden_size + hidden_size))
+            buf = hidden_states.new_empty(padded * (self.moe_hidden_size + hidden_size))
         latent = buf[: padded * self.moe_hidden_size].view(padded, self.moe_hidden_size)
         shared = buf[padded * self.moe_hidden_size :].view(padded, hidden_size)
         self._forward_shared(gate_up, shared[:num_tokens])
@@ -1511,7 +1529,9 @@ class KimiK3MoE(nn.Module):
         ):
             return self._forward_fused_rocm_epi(hidden_states, prefix_sum=prefix_sum)
         num_tokens, hidden_size = hidden_states.shape
-        gate_up, router_logits, routed_input = self._front_outputs(hidden_states)
+        gate_up, router_logits, routed_input = self._front_outputs(
+            hidden_states, hidden_states.dtype
+        )
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -2315,7 +2335,9 @@ class KimiK3DeltaAttention(nn.Module):
             if k3_rocm_dense_fp8.qkvg_enabled():
                 # E4M3 q/k/v/g like the CUDA "wide" scope; f_a/b stay bf16, so the
                 # whole-in-proj merge below no longer applies (dtype mismatch).
-                k3_rocm_dense_fp8.convert_linear(self.fused_qkvg_proj)
+                self._qkvg_fp8 = k3_rocm_dense_fp8.convert_linear(self.fused_qkvg_proj)
+                if layernorm_sp.layernorm_sp_enabled():
+                    self._merge_sp_bfa_weights()
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
@@ -2516,6 +2538,59 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
+    def _merge_sp_bfa_weights(self) -> None:
+        """[f_a | b of every head] for sp_gather_input, from bf16 weights only."""
+        weights = [self.f_a_proj.weight, self.b_proj.weight]
+        if any(w.dtype != torch.bfloat16 for w in weights):
+            return
+        group = get_parallel().tp_group
+        b = weights[1].contiguous()
+        b_all = b.new_empty((b.shape[0] * group.world_size, b.shape[1]))
+        group.all_gather_into_tensor(b_all, b)
+        self._sp_bfa_w = torch.cat([weights[0], b_all]).contiguous()
+
+    def sp_gather_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A sequence-parallel extend's input as every token's E4M3 rows, which
+        the q/k/v/g projection reads, and [f_a | b], computed on this rank's rows
+        and gathered in the same collective."""
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+        from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+        xq = k3_rocm_dense_fp8.take_prequantized(hidden_states)
+        if xq is None:
+            xq = self._qkvg_fp8.quantize(hidden_states)
+        xq = xq.view(hidden_states.shape)
+        bfa = gemm(hidden_states, self._sp_bfa_w)
+        width = xq.shape[1]
+        packed = torch.empty(
+            (xq.shape[0], width + bfa.shape[1] * bfa.element_size()),
+            dtype=torch.uint8,
+            device=xq.device,
+        )
+        packed[:, :width].copy_(xq.view(torch.uint8))
+        packed[:, width:].copy_(bfa.view(torch.uint8))
+        packed = layernorm_sp.sp_exit_gather(packed, layernorm_sp.sp_num_tokens())
+        return (
+            packed[:, :width].contiguous().view(xq.dtype),
+            packed[:, width:].contiguous().view(bfa.dtype),
+        )
+
+    def _qkvbfg_sp(self, xq: torch.Tensor, bfa: torch.Tensor):
+        """forward_qkvbfg_fused's outputs from sp_gather_input's E4M3 rows and
+        [f_a | b]."""
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+        fused_states = self._qkvg_fp8.matmul_quantized(xq, bfa.dtype)
+        qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+        n_fa = self.f_a_proj.weight.shape[0]
+        n_b = self.b_proj.weight.shape[0]
+        beta_start = n_fa + get_parallel().tp_group.rank_in_group * n_b
+        beta = bfa[:, beta_start : beta_start + n_b]
+        forget_gate = gemm(bfa[:, :n_fa], self._bfa_f_b_w)
+        return qkv, beta, forget_gate, g_proj_states
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2597,11 +2672,16 @@ class KimiK3DeltaAttention(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        sp_bfa: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
-        if self.do_fuse_qkvbfg or self.use_full_rank_gate:
+        if sp_bfa is not None:
+            mixed_qkv, beta, forget_gate, g_proj_states = self._qkvbfg_sp(
+                hidden_states, sp_bfa
+            )
+        elif self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, defer_f_b=defer_f_b
             )
@@ -2989,6 +3069,20 @@ def _k3_sp_attn_gather(hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
     return layernorm_sp.sp_all_gather(hidden_states)
 
 
+def _kda_gathers_sp_input(config: KimiLinearConfig, layer_idx: int) -> bool:
+    """Whether this KDA layer gathers a sequence-parallel extend's input itself
+    (KimiK3DeltaAttention.sp_gather_input)."""
+    if not (
+        _is_hip
+        and layernorm_sp.layernorm_sp_enabled()
+        and config.is_kda_layer(layer_idx)
+    ):
+        return False
+    from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+    return k3_rocm_dense_fp8.qkvg_enabled()
+
+
 def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
@@ -3042,6 +3136,7 @@ def _stage_facts(
     attention-residual bank; without it, the stages declare what those do."""
     is_moe = _is_moe_layer(config, layer_idx)
     layer_sp = layernorm_sp.layernorm_sp_enabled()
+    boundary_gathers_sp = layer_sp and not _kda_gathers_sp_input(config, layer_idx)
     # Under attention DP the FFN input is read on this rank's rows
     # once the attention's sum is complete, then gathered.
     attn_ops = {}
@@ -3064,7 +3159,7 @@ def _stage_facts(
                 and _shards_moe_rows()
                 and _is_moe_layer(config, layer_idx - 1)
                 else _k3_sp_attn_gather
-                if layer_sp
+                if boundary_gathers_sp
                 else None
             ),
         )
@@ -3076,7 +3171,7 @@ def _stage_facts(
                 else bank.ffn_update
             ),
         )
-    if layer_sp:
+    if boundary_gathers_sp:
         # A sequence-parallel extend's attention input arrives on this rank's
         # rows and is gathered at the boundary.
         attn_ops["gathers_attn_tp_input"] = False
@@ -3115,6 +3210,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
+        self._attn_gathers_sp_input = _kda_gathers_sp_input(config, layer_idx)
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
@@ -3311,7 +3407,12 @@ class KimiK3DecoderLayer(nn.Module):
 
         qkv_latent_func = getattr(self.self_attn, "prepare_qkv_latent", None)
         sp = get_forward().sp_active
-        if sp:
+        sp_args = {}
+        if sp and self._attn_gathers_sp_input:
+            hidden_states, sp_args["sp_bfa"] = self.self_attn.sp_gather_input(
+                hidden_states
+            )
+        elif sp:
             hidden_states = hidden_states[: layernorm_sp.sp_num_tokens()]
         if qkv_latent_func is not None:
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
@@ -3322,6 +3423,7 @@ class KimiK3DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            **sp_args,
         )
 
         if qkv_latent_func is not None:
@@ -4092,6 +4194,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 problems.append(
                     f"MoE layer {layer.layer_idx} needs a latent MoE with the fused "
                     "front that writes the stream"
+                )
+                break
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer) or not layer._attn_gathers_sp_input:
+                continue
+            if any(
+                getattr(layer.self_attn, name, None) is None
+                for name in ("_sp_bfa_w", "_bfa_f_b_w")
+            ):
+                problems.append(
+                    f"KDA layer {layer.layer_idx} needs the full-rank gate with bf16 "
+                    "f_a and b weights"
                 )
                 break
         if problems:

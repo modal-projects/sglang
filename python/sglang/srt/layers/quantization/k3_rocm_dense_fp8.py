@@ -79,7 +79,7 @@ def _same_data(src: torch.Tensor, x: torch.Tensor) -> bool:
     )
 
 
-def _take_prequantized(x: torch.Tensor) -> torch.Tensor | None:
+def take_prequantized(x: torch.Tensor) -> torch.Tensor | None:
     global _prequant_slot
     slot, _prequant_slot = _prequant_slot, None
     if slot is not None and _same_data(slot[0], x):
@@ -119,28 +119,37 @@ class StaticFP8Weight:
         x: torch.Tensor,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        x2 = x.reshape(-1, x.shape[-1])
+        xq = take_prequantized(x)
+        xq = self.quantize(x2) if xq is None else xq.reshape(x2.shape)
+        y = self.matmul_quantized(xq, out_dtype or x.dtype)
+        return y.reshape(*x.shape[:-1], self.n)
+
+    def quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """The unit-scale E4M3 copy of a [M, K] x that matmul_quantized reads."""
         import aiter
 
-        x2 = x.reshape(-1, x.shape[-1])
-        m = x2.shape[0]
-        dtype = out_dtype or x.dtype
-        if dtype not in (torch.bfloat16, torch.float16) or m > self._MAX_TOKENS:
+        xq = torch.empty(x.shape, dtype=_FP8, device=x.device)
+        if x.shape[0]:
+            aiter.static_per_tensor_quant(xq, x.contiguous(), self.unit)
+        return xq
+
+    def matmul_quantized(
+        self, xq: torch.Tensor, out_dtype: torch.dtype = torch.bfloat16
+    ) -> torch.Tensor:
+        """xq @ W^T for an E4M3 [M, K] activation at unit scale."""
+        import aiter
+
+        m = xq.shape[0]
+        if out_dtype not in (torch.bfloat16, torch.float16) or m > self._MAX_TOKENS:
             raise ValueError(
-                f"K3 ROCm FP8 linear: unsupported out dtype {dtype} or M={m}"
+                f"K3 ROCm FP8 linear: unsupported out dtype {out_dtype} or M={m}"
             )
         if m == 0:
-            y = x2.new_empty((0, self.n), dtype=dtype)
-        else:
-            xq = _take_prequantized(x)
-            if xq is None:
-                xq = torch.empty(x2.shape, dtype=_FP8, device=x2.device)
-                aiter.static_per_tensor_quant(xq, x2.contiguous(), self.unit)
-            else:
-                xq = xq.reshape(x2.shape)
-            y = aiter.gemm_a8w8_bpreshuffle(
-                xq, self.weight, self.x_scale[:m], self.w_scale, dtype=dtype
-            )
-        return y.reshape(*x.shape[:-1], self.n)
+            return xq.new_empty((0, self.n), dtype=out_dtype)
+        return aiter.gemm_a8w8_bpreshuffle(
+            xq, self.weight, self.x_scale[:m], self.w_scale, dtype=out_dtype
+        )
 
 
 class StaticFP8LinearMethod:

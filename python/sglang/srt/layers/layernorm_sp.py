@@ -182,6 +182,11 @@ def sp_all_gather(hidden_states: torch.Tensor) -> torch.Tensor:
     tp_size = tp_group.world_size
     if tp_size == 1:
         return hidden_states
+    if hidden_states.element_size() == 1:
+        # One-byte rows travel as 16-bit words: the TP group's custom all-gather
+        # takes 16- and 32-bit types only.
+        words = sp_all_gather(hidden_states.contiguous().view(torch.bfloat16))
+        return words.view(hidden_states.dtype)
     hidden_states = hidden_states.contiguous()
     output = hidden_states.new_empty(
         (hidden_states.shape[0] * tp_size, *hidden_states.shape[1:])

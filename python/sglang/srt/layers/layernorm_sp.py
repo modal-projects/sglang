@@ -196,17 +196,55 @@ def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor
     return sp_all_gather(hidden_states)[:num_tokens]
 
 
+def int8_reduce_scatter() -> bool:
+    """Whether SP reduce-scatters carry INT8 payloads: when the TP group's
+    all-reduces run INT8 QuickReduce, so the reduction keeps the precision already
+    accepted for them."""
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        QuickReduceRegime,
+    )
+
+    qr = getattr(get_parallel().tp_group, "qr_comm", None)
+    return (
+        qr is not None
+        and not qr.disabled
+        and qr.qr_quant_level is QuickReduceRegime.INT8
+    )
+
+
+def _int8_payload_applies(partial: torch.Tensor) -> bool:
+    from sglang.kernels.ops.communication.q8_reduce_scatter import GROUP
+
+    return (
+        int8_reduce_scatter()
+        and partial.dtype in (torch.bfloat16, torch.float16)
+        and partial.dim() == 2
+        and partial.shape[1] % GROUP == 0
+    )
+
+
 def sp_reduce_scatter(
     partial: torch.Tensor, num_valid: Optional[int] = None
 ) -> torch.Tensor:
-    """g-bar: this rank's rows of the TP sum of a TP-partial ``[rows, h]`` tensor.
+    """g-bar: this rank's rows of the TP sum of a TP-partial ``[rows, h]`` tensor,
+    with INT8 payloads under ``int8_reduce_scatter()``.
 
     Without ``num_valid`` every row is valid and the rows are zero-padded to a
     multiple of the TP size. With it, ``partial`` already has such padded rows,
-    and the rows from ``num_valid`` on are zeroed in place.
+    and the rows from ``num_valid`` on count as zeros.
     """
     tp_group = get_parallel().tp_group
     tp_size = tp_group.world_size
+    if tp_size > 1 and _int8_payload_applies(partial):
+        from sglang.kernels.ops.communication.q8_reduce_scatter import (
+            reduce_scatter_q8,
+        )
+
+        if num_valid is None:
+            return reduce_scatter_q8(
+                partial, tp_group, ceil_align(partial.shape[0], tp_size)
+            )
+        return reduce_scatter_q8(partial[:num_valid], tp_group, partial.shape[0])
     if num_valid is None:
         num_valid = partial.shape[0]
         padded = ceil_align(num_valid, tp_size)

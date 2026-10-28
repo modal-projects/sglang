@@ -94,6 +94,15 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
     )
 del _fn
 
+register_kernel(
+    KernelSpec(
+        op="communication.q8_reduce_scatter",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.communication.q8_reduce_scatter:reduce_scatter_q8",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+
 # Kimi-K3 ROCm fused collective + attention-residual kernels (HIP JIT).
 for _mod, _fn in [
     ("k3_ar_agg_hip", "ar_agg"),

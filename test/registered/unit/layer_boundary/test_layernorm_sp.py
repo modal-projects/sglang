@@ -13,6 +13,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
+from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+    QuickReduceRegime,
+)
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
@@ -129,6 +132,19 @@ class TestLayerNormSPGating(CustomTestCase):
                 _initialize(arch="KimiK3ForConditionalGeneration")
             self.assertTrue(get_flags().sp.model_collectives)
             self.assertEqual(get_flags().sp.min_tokens, minimum)
+
+    def test_int8_reduce_scatter_follows_quick_reduce(self):
+        """INT8 reduce-scatters run only while the TP group's QuickReduce runs INT8."""
+        int8, int4 = QuickReduceRegime.INT8, QuickReduceRegime.INT4
+        for qr_comm, expected in (
+            (SimpleNamespace(disabled=False, qr_quant_level=int8), True),
+            (SimpleNamespace(disabled=False, qr_quant_level=int4), False),
+            (SimpleNamespace(disabled=True, qr_quant_level=int8), False),
+            (None, False),
+        ):
+            with patch.object(layernorm_sp, "get_parallel") as get_parallel:
+                get_parallel.return_value.tp_group.qr_comm = qr_comm
+                self.assertEqual(layernorm_sp.int8_reduce_scatter(), expected)
 
 
 class TestLayerNormSPValidation(CustomTestCase):

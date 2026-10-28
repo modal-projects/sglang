@@ -155,6 +155,36 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
         )
         torch.testing.assert_close(eager_gate, expected_gate)
 
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only fused path")
+    def test_quant_model_gate_is_opt_in(self):
+        """K3's MXFP4 checkpoint sets quant_config (do_fuse_qkvbfg False) while
+        the in-proj stays BF16; the merge then needs the opt-in flag."""
+        from sglang.srt.environ import envs
+
+        attn = SimpleNamespace(
+            use_full_rank_gate=True,
+            do_fuse_qkvbfg=False,
+            attn_tp_size=8,
+            tp_size=8,
+            _bfa_uses_block_fp8=False,
+            fused_qkvg_proj=self.qkvg,
+            f_a_proj=self.f_a,
+            b_proj=self.b,
+        )
+        may_fuse = KimiK3DeltaAttention._may_fuse_kda_inproj
+        with envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_QUANT_MODEL.override(False):
+            self.assertFalse(may_fuse(attn))
+        with envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_QUANT_MODEL.override(True):
+            self.assertTrue(may_fuse(attn))
+            attn.attn_tp_size = 4
+            self.assertFalse(may_fuse(attn))
+            attn.attn_tp_size = 8
+            fp8 = SimpleNamespace(
+                weight=self.qkvg.weight.data.to(torch.float8_e4m3fn)
+            )
+            attn.fused_qkvg_proj = fp8
+            self.assertFalse(may_fuse(attn))
+
 
 if __name__ == "__main__":
     unittest.main()

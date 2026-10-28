@@ -2321,7 +2321,18 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        if not self.use_full_rank_gate:
+            return False
+        # do_fuse_qkvbfg is False for any quant_config, including K3's MXFP4
+        # MoE checkpoint whose attention stays BF16; the weight checks below
+        # still reject anything carrying scales.
+        if not (
+            self.do_fuse_qkvbfg
+            or (
+                envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_QUANT_MODEL.get()
+                and self.attn_tp_size == self.tp_size
+            )
+        ):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.

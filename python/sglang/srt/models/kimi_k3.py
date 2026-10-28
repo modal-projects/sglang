@@ -1526,7 +1526,13 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            if _is_hip and self.alt_stream is not None:
+            # graph-captured decode/verify only: eager prefill + RCCL on the
+            # side stream hit HSA_STATUS_ERROR_OUT_OF_RESOURCES
+            if (
+                _is_hip
+                and self.alt_stream is not None
+                and torch.cuda.is_current_stream_capturing()
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 gate_up.record_stream(self.alt_stream)

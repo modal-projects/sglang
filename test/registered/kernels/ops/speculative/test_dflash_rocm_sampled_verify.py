@@ -155,7 +155,7 @@ def test_top_k_ties_keep_exactly_k():
 
 def _chi2_pvalue(counts, probs, trials):
     scipy_stats = pytest.importorskip("scipy.stats")
-    expected = probs * trials
+    expected = probs / probs.sum() * trials
     keep = expected > 0
     assert counts[~keep].sum() == 0
     return scipy_stats.chisquare(counts[keep], expected[keep]).pvalue

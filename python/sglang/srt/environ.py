@@ -1649,6 +1649,8 @@ class Envs:
     # ROCm DFLASH sampled verify: fused Triton chain verify instead of dense
     # softmax + sort-based top-k/top-p + chain rejection sampling.
     SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY = EnvBool(True)
+    # Below this batch size the dense path is faster (both are exact).
+    SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY_MIN_BS = EnvInt(12)
     # Mint capture's measured footprint as one span so the graph pool is carved
     # out of a single contiguous region instead of grown segment by segment.
     SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)

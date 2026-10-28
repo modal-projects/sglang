@@ -61,9 +61,13 @@ if is_hip():
         )
 
 
-def _use_rocm_fused_sampled_verify(sampling_info: Any, logits: torch.Tensor) -> bool:
+def _use_rocm_fused_sampled_verify(
+    sampling_info: Any, logits: torch.Tensor, bs: int
+) -> bool:
     """The fused kernel implements the pytorch backend's top-k/top-p filter."""
     if not (is_hip() and envs.SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY.get()):
+        return False
+    if bs < envs.SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY_MIN_BS.get():
         return False
     if logits.stride(-1) != 1:
         return False
@@ -991,7 +995,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
         )
 
-    if _use_rocm_fused_sampled_verify(sampling_info, next_token_logits):
+    if _use_rocm_fused_sampled_verify(sampling_info, next_token_logits, bs):
         coins = (
             torch.rand((bs, draft_token_num), dtype=torch.float32, device=device)
             if uniform_samples is None

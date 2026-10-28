@@ -14,13 +14,13 @@ def _reduce_scatter_on_one_gpu(partials, rows):
     """pack, the all-to-all, and unpack_sum for len(partials) ranks on one GPU."""
     world = len(partials)
     width = partials[0].shape[1]
-    local = rows // world * width
-    chunk = local + local // q8.GROUP * 4
     sends = []
     for partial in partials:
-        send = torch.empty(world * chunk, dtype=torch.int8, device=partial.device)
+        send = torch.empty(
+            q8.send_bytes(rows, width, world), dtype=torch.int8, device=partial.device
+        )
         q8.pack(partial, rows, world, send)
-        sends.append(send.view(world, chunk))
+        sends.append(send.view(world, -1))
     outs = []
     for rank in range(world):
         received = torch.stack([sends[src][rank] for src in range(world)]).view(-1)
@@ -57,7 +57,7 @@ class TestQ8ReduceScatter(CustomTestCase):
 
     def test_nan_and_inf_groups_arrive_as_nan(self):
         """A group holding a NaN or an infinity arrives as NaN, the rest stay finite."""
-        world, rows, width = 4, 8, 128
+        world, rows, width = 4, 8, 512
         partials = [
             torch.ones(rows, width, dtype=torch.bfloat16, device="cuda")
             for _ in range(world)
@@ -67,23 +67,23 @@ class TestQ8ReduceScatter(CustomTestCase):
         out = _reduce_scatter_on_one_gpu(partials, rows)
         nan = out.isnan()
         self.assertTrue(bool(nan[3, 0:32].all() and nan[6, 32:64].all()))
-        self.assertEqual(int(nan.sum()), 64)
+        self.assertEqual(int(nan.sum()), 2 * q8.GROUP)
 
     def test_zero_groups_stay_zero(self):
         """All-zero partials reduce to exact zeros."""
-        world, rows, width = 8, 16, 64
+        world, rows, width = 8, 16, 512
         partials = [
             torch.zeros(rows, width, dtype=torch.bfloat16, device="cuda")
             for _ in range(world)
         ]
         self.assertTrue(bool((_reduce_scatter_on_one_gpu(partials, rows) == 0).all()))
 
-    def test_width_must_be_whole_groups(self):
-        """A width that is not a multiple of the group size is rejected."""
+    def test_width_must_be_whole_multiples(self):
+        """A width that is not a multiple of WIDTH_MULTIPLE is rejected."""
+        partial = torch.zeros(8, 3 * q8.GROUP, dtype=torch.bfloat16, device="cuda")
+        self.assertFalse(q8.supports(partial))
         with self.assertRaises(AssertionError):
-            q8.reduce_scatter_q8(
-                torch.zeros(8, 33, device="cuda"), SimpleNamespace(world_size=8)
-            )
+            q8.reduce_scatter_q8(partial, SimpleNamespace(world_size=8))
 
 
 if __name__ == "__main__":

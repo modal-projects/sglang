@@ -218,14 +218,9 @@ def int8_reduce_scatter() -> bool:
 
 
 def _int8_payload_applies(partial: torch.Tensor) -> bool:
-    from sglang.kernels.ops.communication.q8_reduce_scatter import GROUP
+    from sglang.kernels.ops.communication import q8_reduce_scatter
 
-    return (
-        int8_reduce_scatter()
-        and partial.dtype in (torch.bfloat16, torch.float16)
-        and partial.dim() == 2
-        and partial.shape[1] % GROUP == 0
-    )
+    return int8_reduce_scatter() and q8_reduce_scatter.supports(partial)
 
 
 def sp_reduce_scatter(

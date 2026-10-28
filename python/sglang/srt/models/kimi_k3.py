@@ -4313,7 +4313,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # serving.
                 world_size = get_parallel().tp_group.world_size
                 layernorm_sp.sp_reduce_scatter(
-                    torch.zeros((world_size, 32), dtype=torch.bfloat16, device="cuda")
+                    torch.zeros((world_size, 512), dtype=torch.bfloat16, device="cuda")
                 )
 
         for layer in self.model.layers:

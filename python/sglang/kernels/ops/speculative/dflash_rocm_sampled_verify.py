@@ -6,7 +6,8 @@ residual / bonus sampling. Never materializes probabilities or sorts the
 vocabulary. Every vocab pass is split into chunks across programs:
 
 1. per-chunk max / partition function;
-2. per-chunk histogram of (row_max - s) in buckets of width _BW;
+2. per-chunk histogram of (row_max - s) in buckets of width _BW, plus
+   per-bucket mass (atomics; only used to pick the bracket);
 3. per row: pick a bucket bracket that must contain the top-k/top-p cutoff;
 4. per chunk: exact mass above the bracket, compact bracket tokens (index order);
 5. per row: exact cutoff by bisection on order-preserving keys inside the
@@ -99,6 +100,7 @@ def _chunk_hist_kernel(
     temps_ptr,
     cmax_ptr,
     hist_ptr,
+    mhist_ptr,
     V,
     C,
     D: tl.constexpr,
@@ -118,8 +120,16 @@ def _chunk_hist_kernel(
         offs = start + tl.arange(0, BLOCK)
         valid = offs < V
         s = tl.load(row_ptr + offs, mask=valid, other=-float("inf")).to(tl.float32)
-        bk = tl.where(valid, _bucket(s * inv_temp, row_max, INV_BW, NB), NB - 1)
+        s = s * inv_temp
+        bk = tl.where(valid, _bucket(s, row_max, INV_BW, NB), NB - 1)
         h += tl.histogram(bk, NB)
+        # Bracket hint only: the cutoff is still found from exact sums.
+        tl.atomic_add(
+            mhist_ptr + row.to(tl.int64) * NB + bk,
+            tl.exp(s - row_max),
+            mask=bk < NB - 1,
+            sem="relaxed",
+        )
     tl.store(hist_ptr + (row * C + c).to(tl.int64) * NB + tl.arange(0, NB), h)
 
 
@@ -131,6 +141,7 @@ def _select_kernel(
     cmax_ptr,
     cz_ptr,
     hist_ptr,
+    mhist_ptr,
     row_max_ptr,
     z_ptr,
     blo_ptr,
@@ -160,11 +171,10 @@ def _select_kernel(
         H = tl.zeros([NB], dtype=tl.int32)
         for c in range(C):
             H += tl.load(hrow + c * NB + bidx)
-        Hf = H.to(tl.float32)
-        lo_m = Hf * tl.exp(-(bidx + 1).to(tl.float32) * BW)
-        hi_m = Hf * tl.exp(-bidx.to(tl.float32) * BW)
-        lo_above = tl.cumsum(lo_m, axis=0) - lo_m
-        hi_above = tl.cumsum(hi_m, axis=0) - hi_m
+        M = tl.load(mhist_ptr + row.to(tl.int64) * NB + bidx)
+        m_above = tl.cumsum(M, axis=0) - M
+        lo_above = m_above
+        hi_above = m_above
         cnt_above = tl.cumsum(H, axis=0) - H
         p_mass = top_p * z
         sure = (hi_above * 1.0001 <= p_mass) & (cnt_above < top_k)
@@ -574,6 +584,7 @@ def dflash_sampled_verify_rocm(
     i32 = dict(dtype=torch.int32, device=dev)
     cmax, cz, amass = (torch.empty((R, C), **f32) for _ in range(3))
     hist = torch.empty((R, C, _NB), **i32)
+    mhist = torch.zeros((R, _NB), **f32)
     off = torch.empty((R, C), **i32)
     row_max, z, z_kept = (torch.empty((R,), **f32) for _ in range(3))
     b_lo, b_hi, base_cnt, n_br, last = (torch.empty((R,), **i32) for _ in range(5))
@@ -589,6 +600,7 @@ def dflash_sampled_verify_rocm(
         temps,
         cmax,
         hist,
+        mhist,
         V,
         C,
         D=D,
@@ -604,6 +616,7 @@ def dflash_sampled_verify_rocm(
         cmax,
         cz,
         hist,
+        mhist,
         row_max,
         z,
         b_lo,

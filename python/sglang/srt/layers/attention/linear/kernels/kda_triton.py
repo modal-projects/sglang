@@ -5,7 +5,10 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
+
+_is_hip = is_hip()
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -17,6 +20,10 @@ if not is_cpu():
     )
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
+    )
+    from sglang.kernels.ops.attention.fla.kda_verify_closed_form import (
+        kda_verify_closed_form,
+        kda_verify_closed_form_supported,
     )
 
 
@@ -188,6 +195,43 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
+        if (
+            _is_hip
+            and cache_ring
+            and envs.SGLANG_KDA_VERIFY_CLOSED_FORM.get()
+            and kda_verify_closed_form_supported(
+                k,
+                v,
+                lower_bound,
+                cache_steps,
+                intermediate_states_buffer,
+                retrieve_parent_token,
+            )
+        ):
+            n = query_start_loc.numel() - 1
+            return kda_verify_closed_form(
+                A_log,
+                a,
+                dt_bias,
+                q,
+                k,
+                v,
+                b,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                lower_bound,
+                replayssm_rawv,
+                replayssm_rawk,
+                replayssm_g,
+                replayssm_beta,
+                # ring slots follow the committed-state slot, like the recurrent kernel
+                cache_indices,
+                block_v=64 if n <= 8 else 128,
+                num_warps=4,
+                num_stages=1,
+                block_k=64,
+            )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,

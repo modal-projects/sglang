@@ -63,6 +63,18 @@ def _select_recurrent_launch_config(
     ):
         # GLM TP8 DFlash verification: 256 CTAs instead of 32.
         return 4, 1
+    if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and target_verify
+        and 0 < n <= 8
+        and k == 128
+        and v == 128
+    ):
+        # gfx950 chain verify: more CTAs per request at small batch. Bit-identical
+        # to BV=32 at one warp (the V tiling leaves the K reduction order alone).
+        return (8, 1) if n <= 4 else (16, 1)
     return min(triton.next_power_of_2(v), 32), 1
 
 

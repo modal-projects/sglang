@@ -14,7 +14,7 @@ import triton.language as tl
 _NUM_COARSE = 32
 _COARSE_STEP = 0.5
 _SCRATCH_CAP = 16384
-_KEY_MIN = -(2**31)
+_KEY_MIN = tl.constexpr(-(2**31))
 _TOPK_ALL = 2**30
 
 
@@ -368,7 +368,8 @@ def dflash_sampled_verify_rocm(
     z_kept = torch.empty((R,), dtype=torch.float32, device=device)
     v_key = torch.empty((R,), dtype=torch.int64, device=device)
     n_keep = torch.empty((R,), dtype=torch.int32, device=device)
-    scratch = torch.empty((R, _SCRATCH_CAP), dtype=torch.float32, device=device)
+    scratch_cap = min(_SCRATCH_CAP, V)
+    scratch = torch.empty((R, scratch_cap), dtype=torch.float32, device=device)
     _nucleus_row_kernel[(R,)](
         logits,
         logits.stride(0),
@@ -384,7 +385,7 @@ def dflash_sampled_verify_rocm(
         D=D,
         NUM_COARSE=_NUM_COARSE,
         COARSE_STEP=_COARSE_STEP,
-        SCRATCH_CAP=_SCRATCH_CAP,
+        SCRATCH_CAP=scratch_cap,
         BLOCK=1024,
         COARSE_BLOCK=256,
         num_warps=8,

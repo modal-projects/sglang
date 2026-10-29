@@ -18,7 +18,9 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
+    set_custom_all_reduce,
 )
+from sglang.test.test_utils import publish_build_topology
 
 H = 7168
 
@@ -191,13 +193,15 @@ def main():
     args = ap.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=8,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=8)
+    publish_build_topology(world_rank=rank, tp_size=8)
+    initialize_model_parallel()
     tp = get_tp_group()
     ca = tp.ca_comm
     from sglang.kernels.ops.communication import k3_ar_agg_hip
@@ -301,6 +305,55 @@ def main():
                             args.reps,
                         )
                         row["ar_agg80_us"] = round(t_old, 2)
+                    if mode == "ar":
+                        from sglang.kernels.ops.attention.attn_res_hip import (
+                            attn_res_hip,
+                        )
+                        from sglang.kernels.ops.attention.attn_res_smallm_hip import (
+                            attn_res_smallm_hip,
+                        )
+                        from sglang.srt.layers.attn_residual import use_hip_smallm
+
+                        kk = (
+                            attn_res_smallm_hip
+                            if use_hip_smallm(T, H, nvb)
+                            else attn_res_hip
+                        )
+                        o1, o2 = torch.empty_like(prefix), torch.empty_like(prefix)
+                        o8 = (
+                            torch.empty(
+                                o1.shape, dtype=torch.float8_e4m3fn, device="cuda"
+                            )
+                            if fp8
+                            else None
+                        )
+                        row["ar_only_us"] = round(
+                            time_graph(
+                                lambda: tp.all_reduce(partial), args.iters, args.reps
+                            ),
+                            2,
+                        )
+                        row["agg_only_us"] = round(
+                            time_graph(
+                                lambda: kk(
+                                    prefix,
+                                    bank,
+                                    cw,
+                                    ow,
+                                    o1,
+                                    nvb,
+                                    1e-6,
+                                    1e-6,
+                                    addend=partial,
+                                    prefix_out=o2,
+                                    write_prefix=False,
+                                    out_fp8=o8,
+                                ),
+                                args.iters,
+                                args.reps,
+                            ),
+                            2,
+                        )
                     rows.append(row)
                     if rank == 0:
                         print(json.dumps(row), flush=True)

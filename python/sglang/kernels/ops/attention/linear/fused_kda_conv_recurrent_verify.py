@@ -124,6 +124,14 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    # Deferred f_b (SGLANG_K3_KDA_VERIFY_FB): `a` is ignored and the gate input
+    # is bf16(f_a @ f_b_w^T) computed here, replacing the tiny_k_gemm launch.
+    f_a=None,  # [seq_len, FA] (row stride stride_fa_tok)
+    f_b_w=None,  # [HV*K, FA] contiguous
+    stride_fa_tok: tl.constexpr = 0,
+    HAS_FB: tl.constexpr = False,
+    FA: tl.constexpr = 128,
+    TP: tl.constexpr = 16,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -217,6 +225,23 @@ def fused_kda_conv_gating_verify_kernel(
 
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
+    if HAS_FB:
+        o_t = tl.arange(0, TP)
+        o_j = tl.arange(0, 32)
+        b_ga = tl.zeros([TP, BK], dtype=tl.float32)
+        for jc in tl.static_range(FA // 32):
+            b_fa = tl.load(
+                f_a + (bos + o_t[:, None]) * stride_fa_tok + jc * 32 + o_j[None, :],
+                mask=o_t[:, None] < T,
+                other=0.0,
+            )
+            b_fw = tl.load(
+                f_b_w + (i_hv * K + o_k[None, :]) * FA + jc * 32 + o_j[:, None],
+                mask=mask_k[None, :],
+                other=0.0,
+            )
+            b_ga = tl.dot(b_fa, b_fw, b_ga)
+        b_ga = b_ga.to(o.dtype.element_ty).to(tl.float32)
     for t in tl.static_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
         # then silu; accumulation order and dtypes mirror the unfused kernel) ----
@@ -311,9 +336,12 @@ def fused_kda_conv_gating_verify_kernel(
 
         # ---- sigmoid-gating delta rule step (mirrors the reference kernel) ----
         b_b = tl.load(b_gate + (bos + t) * stride_b_tok + i_hv).to(tl.float32)
-        b_a = tl.load(
-            a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
-        ).to(tl.float32)
+        if HAS_FB:
+            b_a = tl.sum(tl.where(o_t[:, None] == t, b_ga, 0.0), 0)
+        else:
+            b_a = tl.load(
+                a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
+            ).to(tl.float32)
 
         gx = b_a + b_dt_bias
         if USE_LOWER_BOUND:
@@ -454,6 +482,7 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    f_b_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -502,7 +531,19 @@ def fused_kda_conv_gating_verify(
         BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
-    a2 = a.reshape(seq_len, HV * K)
+    has_fb = f_b_weight is not None
+    if has_fb:
+        # `a` is f_a [seq_len, FA]; the gate input is bf16(f_a @ f_b_weight^T).
+        fa_dim = a.shape[-1]
+        assert a.stride(-1) == 1 and fa_dim % 32 == 0
+        assert f_b_weight.is_contiguous() and tuple(f_b_weight.shape) == (
+            HV * K,
+            fa_dim,
+        )
+        f_a2 = a.reshape(seq_len, fa_dim) if a.dim() != 2 else a
+        a2 = f_a2
+    else:
+        a2 = a.reshape(seq_len, HV * K)
     b2 = b.reshape(seq_len, HV)
     assert a2.stride(-1) == 1 and b2.stride(-1) == 1
     o = mixed_qkv.new_empty(seq_len, HV, V)
@@ -624,6 +665,12 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        f_a=a2 if has_fb else None,
+        f_b_w=f_b_weight,
+        stride_fa_tok=a2.stride(0) if has_fb else 0,
+        HAS_FB=has_fb,
+        FA=a2.shape[-1] if has_fb else 128,
+        TP=max(16, triton.next_power_of_2(T)),
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,

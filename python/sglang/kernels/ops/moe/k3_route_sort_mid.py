@@ -129,8 +129,9 @@ def _aiter_biased_topk(
     return ids, w
 
 
-@triton.jit(do_not_specialize=["stride_lg", "stride_qx"])
-def _k3_mid_route_kernel(
+@triton.jit
+def _mid_route_program(
+    t,
     logits_ptr,  # [M, E] bf16/fp32, row stride stride_lg (DO_TOPK only)
     stride_lg,
     bias_ptr,  # [E] correction bias (DO_TOPK only)
@@ -151,7 +152,7 @@ def _k3_mid_route_kernel(
     QCHUNK: tl.constexpr,
     COUNT_QUANT: tl.constexpr = True,
 ):
-    t = tl.program_id(0).to(tl.int64)
+    # one token of launch A (shared by the fused SiTU + route launch)
     offs_k = tl.arange(0, TOPK)
     if DO_TOPK:
         offs_e = tl.arange(0, E_POW2)
@@ -188,8 +189,56 @@ def _k3_mid_route_kernel(
         tl.store(exps_ptr + t * G + c0 // 32 + offs_g, exp.to(tl.uint8))
 
 
-@triton.jit(do_not_specialize=["M"])
-def _k3_mid_sort_kernel(
+@triton.jit(do_not_specialize=["stride_lg", "stride_qx"])
+def _k3_mid_route_kernel(
+    logits_ptr,  # [M, E] bf16/fp32, row stride stride_lg (DO_TOPK only)
+    stride_lg,
+    bias_ptr,  # [E] correction bias (DO_TOPK only)
+    topk_ids_ptr,  # [M, TOPK] i32 (out if DO_TOPK, else in)
+    topk_weights_ptr,  # [M, TOPK] fp32 (out if DO_TOPK)
+    routed_scale,
+    counts_ptr,  # [>= E] i32, zero on entry; += pairs per expert
+    qx_ptr,  # [M, N_COLS] activations, row stride stride_qx
+    stride_qx,
+    qout_ptr,  # [M, N_COLS] fp8 out
+    exps_ptr,  # [M, G] u8 out (e8m0 per (token, group))
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    TOPK: tl.constexpr,
+    RENORM: tl.constexpr,
+    DO_TOPK: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    COUNT_QUANT: tl.constexpr = True,
+):
+    _mid_route_program(
+        tl.program_id(0).to(tl.int64),
+        logits_ptr,
+        stride_lg,
+        bias_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        routed_scale,
+        counts_ptr,
+        qx_ptr,
+        stride_qx,
+        qout_ptr,
+        exps_ptr,
+        E,
+        E_POW2,
+        TOPK,
+        RENORM,
+        DO_TOPK,
+        N_COLS,
+        QCHUNK,
+        COUNT_QUANT,
+    )
+
+
+@triton.jit
+def _mid_sort_program(
+    pid,
+    nprog,  # sort CTAs in the launch (the ticket counts only these)
     topk_ids_ptr,  # [M, TOPK] i32
     topk_weights_ptr,  # [M, TOPK] fp32
     counts_ptr,  # [E_POW2 + 1] i32: counts[0:E], ticket at [E_POW2]; re-zeroed here
@@ -216,8 +265,6 @@ def _k3_mid_sort_kernel(
     BUF_COLS: tl.constexpr,
     BUF_CHUNK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    nprog = tl.num_programs(0)
     offs_e = tl.arange(0, E_POW2)
     me = offs_e < E
     cnt = tl.load(counts_ptr + offs_e, mask=me, other=0)
@@ -315,6 +362,65 @@ def _k3_mid_sort_kernel(
     if last:
         tl.store(counts_ptr + offs_e, tl.zeros((E_POW2,), tl.int32), mask=me)
         tl.store(counts_ptr + E_POW2, 0)
+
+
+@triton.jit(do_not_specialize=["M"])
+def _k3_mid_sort_kernel(
+    topk_ids_ptr,  # [M, TOPK] i32
+    topk_weights_ptr,  # [M, TOPK] fp32
+    counts_ptr,  # [E_POW2 + 1] i32: counts[0:E], ticket at [E_POW2]; re-zeroed here
+    exps_ptr,  # [M, G] u8
+    sorted_ids_ptr,
+    sorted_weights_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    qscale_ptr,  # u8, swizzled, one byte per (sorted_row, group)
+    moe_buf_ptr,  # [M, BUF_COLS] zeroed here (MOE_BUF_ZERO)
+    M,
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAXB_POW2: tl.constexpr,  # >= max blocks of one expert (cdiv(M, BLOCK_SIZE))
+    XC: tl.constexpr,  # experts per expert-chunk CTA
+    G: tl.constexpr,
+    G_POW2: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
+    RANK_TILE: tl.constexpr,
+    ZERO_W_SCALE: tl.constexpr,
+    MOE_BUF_ZERO: tl.constexpr,
+    BUF_COLS: tl.constexpr,
+    BUF_CHUNK: tl.constexpr,
+):
+    _mid_sort_program(
+        tl.program_id(0),
+        tl.num_programs(0),
+        topk_ids_ptr,
+        topk_weights_ptr,
+        counts_ptr,
+        exps_ptr,
+        sorted_ids_ptr,
+        sorted_weights_ptr,
+        sorted_expert_ids_ptr,
+        num_valid_ids_ptr,
+        qscale_ptr,
+        moe_buf_ptr,
+        M,
+        E,
+        E_POW2,
+        TOPK,
+        BLOCK_SIZE,
+        MAXB_POW2,
+        XC,
+        G,
+        G_POW2,
+        SCALEN_PAD,
+        RANK_TILE,
+        ZERO_W_SCALE,
+        MOE_BUF_ZERO,
+        BUF_COLS,
+        BUF_CHUNK,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +533,11 @@ def sort_scatter(
     moe_buf: torch.Tensor,
     block_size: int,
     num_experts: int,
+    shared_gemm: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch B: sort + scale scatter + moe_buf zero; returns (a1, a1_scale)."""
+    """Launch B: sort + scale scatter + moe_buf zero; returns (a1, a1_scale).
+    shared_gemm (act, w_down, out): run that pre-activated shared down GEMM in
+    the same launch (k3_moe_epi.launch_sort_shared)."""
     m, topk = state.topk_ids.shape
     n = state.qout.shape[1]
     g = n // 32
@@ -446,7 +555,7 @@ def sort_scatter(
     buf_cols = moe_buf.shape[-1] if buf_zero else 32
     if buf_zero:
         assert moe_buf.is_contiguous() and moe_buf.numel() == m * buf_cols
-    _k3_mid_sort_kernel[(m + n_xc,)](
+    sort_args = (
         state.topk_ids,
         state.topk_weights,
         state.counts,
@@ -457,7 +566,8 @@ def sort_scatter(
         num_valid_ids,
         qscale,
         moe_buf,
-        m,
+    )
+    sort_meta = dict(
         E=num_experts,
         E_POW2=e_pow2,
         TOPK=topk,
@@ -472,7 +582,12 @@ def sort_scatter(
         MOE_BUF_ZERO=buf_zero,
         BUF_COLS=buf_cols,
         BUF_CHUNK=min(1024, triton.next_power_of_2(buf_cols)),
-        num_warps=4,
     )
+    if shared_gemm is not None:
+        from sglang.kernels.ops.moe import k3_moe_epi
+
+        k3_moe_epi.launch_sort_shared(sort_args, sort_meta, shared_gemm)
+    else:
+        _k3_mid_sort_kernel[(m + n_xc,)](*sort_args, m, **sort_meta, num_warps=4)
     state.consumed = True
     return state.qout, qscale.view(torch.float8_e8m0fnu)

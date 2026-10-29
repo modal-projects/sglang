@@ -396,7 +396,12 @@ def _run_mid_sort(topk_ids, topk_weights, num_experts, block_size, moe_buf, qx):
     )
     sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
     num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-    st = _k3_sort_plan.get().take_route_state(topk_ids, qx)
+    plan = _k3_sort_plan.get()
+    st = plan.take_route_state(topk_ids, qx)
+    shared_gemm = None
+    if st is not None:
+        # the model planned its shared down GEMM next to this sort (route fuse)
+        shared_gemm = plan.take_shared_gemm(topk_ids)
     if st is None:
         st = mid.route_quant(
             qx,
@@ -416,6 +421,7 @@ def _run_mid_sort(topk_ids, topk_weights, num_experts, block_size, moe_buf, qx):
         moe_buf,
         block_size,
         num_experts,
+        shared_gemm=shared_gemm,
     )
     return (
         sorted_ids,

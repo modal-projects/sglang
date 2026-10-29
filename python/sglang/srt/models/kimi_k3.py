@@ -1661,6 +1661,24 @@ class KimiK3MoE(nn.Module):
             and self._aiter_standard_topk_ok()
         )
 
+    def _rocm_route_mid_fits(self, router_logits, routed_input) -> bool:
+        from sglang.kernels.ops.moe import k3_route_sort_mid
+
+        if not self._rocm_route_mid_ok:
+            return False
+        cfg = self.topk.topk_config
+        m = router_logits.shape[0]
+        e = router_logits.shape[1]
+        return (
+            m * cfg.top_k > 256
+            and router_logits.dtype == torch.bfloat16
+            and router_logits.stride(1) == 1
+            and routed_input.dtype == torch.bfloat16
+            and routed_input.dim() == 2
+            and routed_input.stride(1) == 1
+            and k3_route_sort_mid.supported(m, cfg.top_k, e, 32, routed_input.shape[1])
+        )
+
     def _rocm_route_mid(self, router_logits, routed_input):
         """Launch A of k3_route_sort_mid (aiter-exact top-k + expert counts +
         mxfp8 quant) for 16 < M <= 128;
@@ -1674,15 +1692,7 @@ class KimiK3MoE(nn.Module):
         cfg = self.topk.topk_config
         m = router_logits.shape[0]
         e = router_logits.shape[1]
-        if not (
-            m * cfg.top_k > 256
-            and router_logits.dtype == torch.bfloat16
-            and router_logits.stride(1) == 1
-            and routed_input.dtype == torch.bfloat16
-            and routed_input.dim() == 2
-            and routed_input.stride(1) == 1
-            and k3_route_sort_mid.supported(m, cfg.top_k, e, 32, routed_input.shape[1])
-        ):
+        if not self._rocm_route_mid_fits(router_logits, routed_input):
             return None
         topk_ids = torch.empty(
             (m, cfg.top_k), dtype=torch.int32, device=router_logits.device
@@ -1754,10 +1764,42 @@ class KimiK3MoE(nn.Module):
             )
             act = self.shared_experts.act_fn
             w_down = self.shared_experts.down_proj.weight
-            # [SiTU | top-k] here; the shared
-            # down GEMM rides the experts' sort + quant launch (the runner's
-            # small-sort path: M * top_k <= 256), see k3_moe_epi
-            if num_tokens * cfg.top_k <= 256 and w_down.is_contiguous():
+            if (
+                envs.SGLANG_K3_ROUTE_FUSE.get()
+                and num_tokens * cfg.top_k > 256
+                and w_down.is_contiguous()
+                and self._rocm_route_mid_fits(router_logits, routed_input)
+            ):
+                from sglang.kernels.ops.moe import k3_route_sort_mid
+
+                # [top-k + counts + quant | SiTU] here; the shared down GEMM
+                # rides the runner's mid sort launch, see k3_moe_epi
+                shared_act = torch.empty(
+                    (num_tokens, w_down.shape[1]),
+                    dtype=w_down.dtype,
+                    device=hidden_states.device,
+                )
+                sort_plan.route_state = k3_moe_epi.route_situ(
+                    gate_up,
+                    shared_act,
+                    act.beta,
+                    act.linear_beta,
+                    router_logits,
+                    cfg.correction_bias,
+                    topk_ids,
+                    topk_weights,
+                    routed_input,
+                    k3_route_sort_mid.counts_buffer(
+                        router_logits.device, self.layer_idx, router_logits.shape[1]
+                    ),
+                    renormalize=cfg.renormalize,
+                    routed_scale=1.0,
+                )
+                sort_plan.shared_gemm = (topk_ids, shared_act, w_down, shared_output)
+            elif num_tokens * cfg.top_k <= 256 and w_down.is_contiguous():
+                # [SiTU | top-k] here; the shared
+                # down GEMM rides the experts' sort + quant launch (the runner's
+                # small-sort path: M * top_k <= 256), see k3_moe_epi
                 shared_act = torch.empty(
                     (num_tokens, w_down.shape[1]),
                     dtype=w_down.dtype,

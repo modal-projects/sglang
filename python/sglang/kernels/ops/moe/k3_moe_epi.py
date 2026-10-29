@@ -22,7 +22,11 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.k3_route_sort import _sort_quant_program
-from sglang.kernels.ops.moe.k3_route_sort_mid import _aiter_biased_topk
+from sglang.kernels.ops.moe.k3_route_sort_mid import (
+    _aiter_biased_topk,
+    _mid_route_program,
+    _mid_sort_program,
+)
 
 # --------------------------------------------------------------------------
 # shared-expert down GEMM (SiTU prologue) + router top-k
@@ -705,6 +709,282 @@ def shared_gemm_sort_quant(
         QCHUNK=SORT_QCHUNK,
         SCALEN_PAD=qscale.shape[1],
         MOE_BUF_ZERO=moe_buf.numel() > 0,
+        num_warps=nw,
+        num_stages=ns,
+    )
+
+
+# --------------------------------------------------------------------------
+# Same regrouping for the mid-batch routing glue (16 < M <= 64, M * top_k > 256;
+# opt-in SGLANG_K3_ROUTE_FUSE):
+#
+#   before:  [SiTU] -> [shared down GEMM | top-k] -> [route: counts + mxfp8 quant]
+#            -> [sort + scale scatter] -> stage1
+#   after:   [route with top-k | SiTU]  ->  [sort + scale scatter | shared down GEMM]
+#            -> stage1
+#
+# Same bodies, tiling and reduction order as _k3_situ_kernel,
+# _k3_shared_topk_kernel (top-k + pre-activated GEMM) and k3_route_sort_mid's
+# launches A and B, so every output is bit-identical; two launches fewer per layer.
+# --------------------------------------------------------------------------
+
+
+@triton.jit(do_not_specialize=["M", "stride_gu", "stride_lg", "stride_qx"])
+def _k3_route_situ_kernel(
+    lg_ptr,
+    stride_lg,
+    bias_ptr,
+    topk_ids_ptr,
+    topk_w_ptr,
+    routed_scale,
+    counts_ptr,
+    qx_ptr,
+    stride_qx,
+    qout_ptr,
+    exps_ptr,
+    gu_ptr,
+    stride_gu,
+    act_ptr,
+    M,
+    beta,
+    inv_beta,
+    lin_beta,
+    inv_lin_beta,
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    TOPK: tl.constexpr,
+    RENORM: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    I: tl.constexpr,
+    HAS_LIN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # route programs first: they gate the sort and stage 1, SiTU only the GEMM
+    pid = tl.program_id(0)
+    if pid < M:
+        _mid_route_program(
+            pid.to(tl.int64),
+            lg_ptr,
+            stride_lg,
+            bias_ptr,
+            topk_ids_ptr,
+            topk_w_ptr,
+            routed_scale,
+            counts_ptr,
+            qx_ptr,
+            stride_qx,
+            qout_ptr,
+            exps_ptr,
+            E,
+            E_POW2,
+            TOPK,
+            RENORM,
+            True,
+            N_COLS,
+            QCHUNK,
+            True,
+        )
+    else:
+        # == _k3_situ_kernel, program (m, blk)
+        NB: tl.constexpr = (I + BLOCK - 1) // BLOCK
+        q = pid - M
+        m = q // NB
+        offs = (q % NB) * BLOCK + tl.arange(0, BLOCK)
+        mk = offs < I
+        g = tl.load(gu_ptr + m * stride_gu + offs, mask=mk, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + m * stride_gu + I + offs, mask=mk, other=0.0).to(
+            tl.float32
+        )
+        a = _situ(g, u, beta, inv_beta, lin_beta, inv_lin_beta, HAS_LIN)
+        tl.store(act_ptr + m * I + offs, a.to(act_ptr.dtype.element_ty), mask=mk)
+
+
+@triton.jit(do_not_specialize=["M", "stride_out"])
+def _k3_sort_shared_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    counts_ptr,
+    exps_ptr,
+    sorted_ids_ptr,
+    sorted_weights_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    qscale_ptr,
+    moe_buf_ptr,
+    act_ptr,
+    wd_ptr,
+    out_ptr,
+    stride_out,
+    M,
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAXB_POW2: tl.constexpr,
+    XC: tl.constexpr,
+    N_XC: tl.constexpr,
+    G: tl.constexpr,
+    G_POW2: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
+    RANK_TILE: tl.constexpr,
+    ZERO_W_SCALE: tl.constexpr,
+    MOE_BUF_ZERO: tl.constexpr,
+    BUF_COLS: tl.constexpr,
+    BUF_CHUNK: tl.constexpr,
+    N: tl.constexpr,
+    I: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    # sort programs first: they gate stage 1, the GEMM only the all-reduce
+    pid = tl.program_id(0)
+    n_sort = M + N_XC
+    if pid < n_sort:
+        _mid_sort_program(
+            pid,
+            n_sort,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            counts_ptr,
+            exps_ptr,
+            sorted_ids_ptr,
+            sorted_weights_ptr,
+            sorted_expert_ids_ptr,
+            num_valid_ids_ptr,
+            qscale_ptr,
+            moe_buf_ptr,
+            M,
+            E,
+            E_POW2,
+            TOPK,
+            BLOCK_SIZE,
+            MAXB_POW2,
+            XC,
+            G,
+            G_POW2,
+            SCALEN_PAD,
+            RANK_TILE,
+            ZERO_W_SCALE,
+            MOE_BUF_ZERO,
+            BUF_COLS,
+            BUF_CHUNK,
+        )
+    else:
+        _shared_down_tile(
+            pid - n_sort,
+            act_ptr,
+            I,
+            wd_ptr,
+            out_ptr,
+            stride_out,
+            M,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            N,
+            I,
+            False,
+            BM,
+            BN,
+            BK,
+            True,
+        )
+
+
+def route_situ(
+    gate_up: torch.Tensor,  # [M, 2I]
+    act: torch.Tensor,  # [M, I] out
+    beta: float,
+    linear_beta: Optional[float],
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    qx: torch.Tensor,  # [M, N] routed activations
+    counts: torch.Tensor,
+    renormalize: bool = True,
+    routed_scale: float = 1.0,
+):
+    """Launch A': k3_route_sort_mid launch A with top-k + the SiTU
+    pre-activation; returns the RouteState for the sort."""
+    from sglang.kernels.ops.moe import k3_route_sort_mid as mid
+
+    M, two_i = gate_up.shape
+    I = two_i // 2
+    E = router_logits.shape[1]
+    topk = topk_ids.shape[1]
+    n = qx.shape[1]
+    assert (
+        gate_up.stride(1) == 1
+        and router_logits.stride(1) == 1
+        and qx.stride(1) == 1
+        and act.is_contiguous()
+    )
+    lin = linear_beta is not None
+    qout = torch.empty(M, n, dtype=torch.float8_e4m3fn, device=qx.device)
+    exps = torch.empty(M, n // 32, dtype=torch.uint8, device=qx.device)
+    blk = 256
+    _k3_route_situ_kernel[(M + M * triton.cdiv(I, blk),)](
+        router_logits,
+        router_logits.stride(0),
+        correction_bias,
+        topk_ids,
+        topk_weights,
+        float(routed_scale),
+        counts,
+        qx,
+        qx.stride(0),
+        qout,
+        exps,
+        gate_up,
+        gate_up.stride(0),
+        act,
+        M,
+        float(beta),
+        1.0 / float(beta),
+        float(linear_beta) if lin else 1.0,
+        1.0 / float(linear_beta) if lin else 1.0,
+        E=E,
+        E_POW2=triton.next_power_of_2(E),
+        TOPK=topk,
+        RENORM=bool(renormalize),
+        N_COLS=n,
+        QCHUNK=mid._quant_chunk(n),
+        I=I,
+        HAS_LIN=lin,
+        BLOCK=blk,
+        num_warps=4,
+    )
+    return mid.RouteState(topk_ids, topk_weights, qx, qout, exps, counts)
+
+
+def launch_sort_shared(sort_args: tuple, sort_meta: dict, pending) -> None:
+    """Launch B': k3_route_sort_mid launch B + the pending pre-activated shared
+    down GEMM (same tiling as shared_gemm_preact)."""
+    act, w_down, out = pending
+    M, I = act.shape
+    N = w_down.shape[0]
+    assert act.is_contiguous() and w_down.is_contiguous() and out.stride(1) == 1
+    bm, bn, bk, nw, ns = _shared_preact_cfg(M)
+    n_xc = triton.cdiv(sort_meta["E"], sort_meta["XC"])
+    n_gemm = (N // bn) * triton.cdiv(M, bm)
+    _k3_sort_shared_kernel[(M + n_xc + n_gemm,)](
+        *sort_args,
+        act,
+        w_down,
+        out,
+        out.stride(0),
+        M,
+        **sort_meta,
+        N_XC=n_xc,
+        N=N,
+        I=I,
+        BM=bm,
+        BN=bn,
+        BK=bk,
         num_warps=nw,
         num_stages=ns,
     )

@@ -2091,6 +2091,10 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # ROCm K3 MoE, 16 < M <= 64: run router top-k + counts + mxfp8 quant
+    # with the shared SiTU, and the sort with the shared down GEMM (2 launches
+    # instead of 4, bit-identical). See kernels/ops/moe/k3_moe_epi.py.
+    SGLANG_K3_ROUTE_FUSE = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See

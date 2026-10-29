@@ -382,6 +382,16 @@ class Model(msgspec.Struct):
     ] = False
 
     # -------------------------------------------------------------------------
+    # Weight delta
+    # -------------------------------------------------------------------------
+    enable_weight_delta: A[
+        bool,
+        "Accept weight updates as XOR deltas of the loaded checkpoint. At startup the engine "
+        "checks that its config is supported and maps every checkpoint tensor onto its "
+        "serving tensors.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Weight cache
     # -------------------------------------------------------------------------
     weight_cache_mode: A[

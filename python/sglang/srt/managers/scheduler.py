@@ -685,6 +685,7 @@ class Scheduler(
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
+        self.init_weight_delta()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -2307,6 +2308,17 @@ class Scheduler(
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+
+    def init_weight_delta(self) -> None:
+        # After the model workers, so the serving tensors are final.
+        self.weight_delta_map = None
+        if get_model().enable_weight_delta:
+            from sglang.srt.weight_sync.weight_delta.map import load_map
+
+            runners = self.tp_worker.weight_update_runners()
+            if self.draft_worker is not None:
+                runners += self.draft_worker.weight_update_runners()
+            self.weight_delta_map = load_map(runners)
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:

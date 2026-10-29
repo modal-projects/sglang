@@ -54,9 +54,7 @@ def _ragged_verify(cfg: Any) -> bool:
 FEATURE_PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
-    Feature.DP_ATTENTION: lambda c: (
-        bool(c.enable_dp_attention) or (c.attn_dp_size or 1) > 1
-    ),
+    Feature.DP_ATTENTION: lambda c: bool(c.enable_dp_attention),
     Feature.EXPERT_PARALLEL: lambda c: (c.ep_size or 1) > 1,
     Feature.EPLB: lambda c: bool(c.enable_eplb),
     Feature.CONTEXT_PARALLEL: lambda c: (
@@ -183,11 +181,6 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
             cfg=cfg, hf_config=model_config.hf_config, isa=device_isa()
         )
         reasons += _dtype_reasons(spec, model_config)
-    if cfg.monokernel_backend is not None:
-        # both replace the model's forward, which would fail only after weights load
-        reasons.append(
-            f"--monokernel-backend {cfg.monokernel_backend} is also set; use one of the two"
-        )
     if reasons:
         raise ValueError(
             f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)

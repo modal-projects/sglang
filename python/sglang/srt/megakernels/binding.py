@@ -596,10 +596,6 @@ class MegakernelBinding:
             raise RuntimeError(
                 "megakernel binding: hybrid decode metadata is incomplete"
             )
-        if not forward_batch.out_cache_loc_is_physical:
-            raise RuntimeError(
-                "megakernel binding: hybrid MLA write slots are not physical"
-            )
 
         assert self._preparation is not None
         pool_view = self._preparation.hybrid

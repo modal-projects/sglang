@@ -285,6 +285,8 @@ class EngramHasher(nn.Module):
             dtype=torch.int32,
             device=device,
         )
+        # Request state, not a weight.
+        self.history._skip_weight_check = True
         self.pad_row = num_req_slots
 
     def history_row(self, ids: list[int]) -> list[int]:

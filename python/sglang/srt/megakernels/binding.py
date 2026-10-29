@@ -108,11 +108,25 @@ class KvPoolView:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
 
 
+class KdaRingView(msgspec.Struct, frozen=True):
+    """One KDA layer's ReplaySSM spec-verify ring, which the commit folds into
+    ``temporal``: raw v and pre-norm k (activation dtype), log-decay and beta (FP32)."""
+
+    rawv: torch.Tensor  # [slots, HV, L, V]
+    rawk: torch.Tensor  # [slots, H, L, K]
+    g: torch.Tensor  # [slots, HV, L, K]
+    beta: torch.Tensor  # [slots, HV, L]
+
+
 class KdaStateView(msgspec.Struct, frozen=True):
-    """One KDA layer's SGLang-owned, non-ReplaySSM recurrent state."""
+    """One KDA layer's SGLang-owned recurrent state, with its speculative-verify
+    scratch when SGLang serves speculative decoding."""
 
     conv: tuple[torch.Tensor, ...]
     temporal: torch.Tensor
+    # [rows, draft tokens, width, dim]: each verify token's conv window, by row
+    conv_window: Optional[torch.Tensor] = None
+    ring: Optional[KdaRingView] = None
 
 
 class MlaPoolView:
@@ -184,16 +198,21 @@ class MlaStepView(msgspec.Struct, frozen=True):
 
 
 class KdaStepView:
-    """One step's KDA slots and SGLang-owned state-tracking operation."""
+    """One step's KDA slots and SGLang-owned state-tracking operation. A verify step
+    also names each request's conv-window scratch row."""
 
     def __init__(
         self,
         *,
         state_indices: torch.Tensor,
         track_decode_state: Callable[[int], None],
+        verify_rows: Optional[torch.Tensor] = None,
+        draft_tokens: int = 1,
     ):
         self.state_indices = state_indices
         self._track_decode_state = track_decode_state
+        self.verify_rows = verify_rows
+        self.draft_tokens = int(draft_tokens)
 
     def track_decode_state(self, layer_id: int) -> None:
         """Track one completed layer; SGLang coalesces this at the last layer."""
@@ -342,6 +361,9 @@ class MegakernelBinding:
                 lambda: kda_metadata.mamba_cache_indices,
             ),
         )
+        if kda.verify_rows is not None:
+            rows = sources.linear_backend.verify_intermediate_state_indices
+            tensors += (("kda.verify_rows", rows, lambda: rows),)
         for name, tensor, getter in tensors:
             if _identity(getter()) != _identity(tensor):
                 raise RuntimeError(
@@ -466,22 +488,35 @@ class MegakernelBinding:
                 ),
             )
 
+        if getattr(mamba_pool, "enable_linear_replayssm", False):
+            raise ValueError(
+                "megakernel binding: the hybrid state view requires "
+                "--enable-linear-replayssm to be disabled"
+            )
         states: dict[int, KdaStateView] = {}
         for layer_id in mamba_map:
             state = request_pool.mamba2_layer_cache(layer_id)
-            if state.replayssm_d is not None:
-                raise ValueError(
-                    f"megakernel binding: KDA layer {layer_id} has ReplaySSM state; "
-                    "the hybrid state view requires --enable-linear-replayssm "
-                    "and --enable-linear-replayssm-spec to be disabled"
-                )
             conv = tuple(state.conv)
             if len(conv) != 1:
                 raise ValueError(
                     f"megakernel binding: KDA layer {layer_id} has {len(conv)} "
                     "convolution states, expected one"
                 )
-            states[layer_id] = KdaStateView(conv=conv, temporal=state.temporal)
+            windows = getattr(state, "intermediate_conv_window", None)
+            ring = None
+            if state.replayssm_rawv is not None:
+                ring = KdaRingView(
+                    rawv=state.replayssm_rawv,
+                    rawk=state.replayssm_rawk,
+                    g=state.replayssm_g,
+                    beta=state.replayssm_beta,
+                )
+            states[layer_id] = KdaStateView(
+                conv=conv,
+                temporal=state.temporal,
+                conv_window=None if windows is None else windows[0],
+                ring=ring,
+            )
             self._seal(
                 f"kda_conv[{layer_id}]",
                 conv[0],
@@ -611,6 +646,10 @@ class MegakernelBinding:
                 layer_id,
             )
 
+        verify_rows, draft_tokens = None, 1
+        if forward_batch.forward_mode.is_target_verify():
+            verify_rows = sources.linear_backend.verify_intermediate_state_indices
+            draft_tokens = int(forward_batch.spec_info.draft_token_num)
         return HybridStepView(
             mla=MlaStepView(
                 block_table=block_table,
@@ -618,7 +657,10 @@ class MegakernelBinding:
                 write_slots=write_slots,
             ),
             kda=KdaStepView(
-                state_indices=state_indices, track_decode_state=track_decode_state
+                state_indices=state_indices,
+                track_decode_state=track_decode_state,
+                verify_rows=verify_rows,
+                draft_tokens=draft_tokens,
             ),
         )
 

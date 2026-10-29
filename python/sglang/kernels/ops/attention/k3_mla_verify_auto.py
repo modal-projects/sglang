@@ -35,6 +35,7 @@ from sglang.kernels.ops.attention.k3_mla_verify_common import (
 from sglang.kernels.ops.attention.k3_mla_verify_common import (
     _ones,
     _split_chunk,
+    cta_fit_num_splits,
     default_num_splits,
 )
 
@@ -241,8 +242,7 @@ def k3_mla_verify_auto(
 
     # v2 operands / partials
     min_chunk = _SPLIT_MIN_CHUNK
-    # cta_fit: floor(256 / bs) splits so bs * nsplit never exceeds one CTA per CU.
-    nsplit = max(2, min(256, 256 // bs)) if cta_fit else max(2, default_num_splits(bs))
+    nsplit = cta_fit_num_splits(bs) if cta_fit else max(2, default_num_splits(bs))
     block_n = 64
     o_part = torch.empty(
         (bs, nsplit, rows, v_head_dim), dtype=torch.bfloat16, device=dev

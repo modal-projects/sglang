@@ -37,6 +37,12 @@ _MAX_SPLITS = 256
 _MIN_CHUNK = 256  # min KV tokens per split
 
 
+def cta_fit_num_splits(bs: int) -> int:
+    """floor(_TARGET_CTAS / bs) splits: for bs <= _TARGET_CTAS / 2 the split-KV grid
+    (bs * NSPLIT CTAs) fits one wave instead of spilling a partial second one."""
+    return max(2, min(_MAX_SPLITS, _TARGET_CTAS // bs))
+
+
 def default_num_splits(bs: int) -> int:
     """Power-of-two splits per request so that bs * NSPLIT ~ _TARGET_CTAS."""
     n = max(1, -(-_TARGET_CTAS // bs))

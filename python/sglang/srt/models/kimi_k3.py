@@ -158,6 +158,7 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+_LOGGED_KDA_INPROJ_MERGE = False
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
@@ -2310,6 +2311,14 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_b_size,
             merged.shape[0] - sum(sizes),  # alignment pad
         ]
+        global _LOGGED_KDA_INPROJ_MERGE
+        if not _LOGGED_KDA_INPROJ_MERGE:
+            _LOGGED_KDA_INPROJ_MERGE = True
+            logger.info(
+                "K3 ROCm: merged [q,k,v,g|f_a|b] in-proj, sizes=%s, max_tokens=%d",
+                self._qkvgbfa_sizes,
+                self._qkvgbfa_bs_limit,
+            )
         return True
 
     def _may_fuse_kda_inproj(self) -> bool:

@@ -645,6 +645,220 @@ def shared_gemm_preact(act, w_down, out) -> None:
     )
 
 
+@triton.jit(do_not_specialize=["M", "stride_gu", "stride_lg", "stride_out", "stride_qx"])
+def _k3_route_one_kernel(
+    gu_ptr,
+    stride_gu,
+    wd_ptr,
+    out_ptr,
+    stride_out,
+    beta,
+    inv_beta,
+    lin_beta,
+    inv_lin_beta,
+    lg_ptr,
+    stride_lg,
+    bias_ptr,
+    routed_scale,
+    sync_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    sorted_ids_ptr,
+    sorted_weights_ptr,
+    sorted_expert_ids_ptr,
+    num_valid_ids_ptr,
+    moe_buf_ptr,
+    qx_ptr,
+    stride_qx,
+    qout_ptr,
+    qscale_ptr,
+    M,
+    N: tl.constexpr,
+    I: tl.constexpr,
+    HAS_LIN: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    TOPK: tl.constexpr,
+    RENORM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    P_POW2: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
+    MOE_BUF_ZERO: tl.constexpr,
+):
+    """situ_topk + shared_gemm_sort_quant in one launch.
+
+    Programs [0, M) run the router top-k and bump sync_ptr[0]; the sort/quant
+    programs spin on it (they are dispatched after every top-k program, so no
+    co-residency is needed). The shared down GEMM tiles apply SiTU in their
+    K loop (same fp32 math and bf16 rounding as the pre-activated path). The
+    last sort program resets both counters for the next launch."""
+    pid = tl.program_id(0)
+    n_sort = M * (N_COLS // QCHUNK)
+    if pid < M:
+        _topk_body(
+            pid,
+            lg_ptr,
+            stride_lg,
+            bias_ptr,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            routed_scale,
+            E,
+            E_POW2,
+            TOPK,
+            RENORM,
+        )
+        tl.atomic_add(sync_ptr, 1, sem="release", scope="gpu")
+    elif pid < M + n_sort:
+        while tl.atomic_add(sync_ptr, 0, sem="relaxed", scope="gpu") < M:
+            pass
+        tl.atomic_add(sync_ptr, 0, sem="acquire", scope="gpu")
+        _sort_quant_program(
+            pid - M,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            sorted_ids_ptr,
+            sorted_weights_ptr,
+            sorted_expert_ids_ptr,
+            num_valid_ids_ptr,
+            moe_buf_ptr,
+            qx_ptr,
+            stride_qx,
+            qout_ptr,
+            qscale_ptr,
+            M,
+            TOPK,
+            BLOCK_SIZE,
+            P_POW2,
+            N_COLS,
+            QCHUNK,
+            SCALEN_PAD,
+            MOE_BUF_ZERO,
+        )
+        if tl.atomic_add(sync_ptr + 1, 1, sem="acq_rel", scope="gpu") == n_sort - 1:
+            tl.atomic_xchg(sync_ptr + 1, 0, sem="relaxed", scope="gpu")
+            tl.atomic_xchg(sync_ptr, 0, sem="release", scope="gpu")
+    else:
+        _shared_down_tile(
+            pid - M - n_sort,
+            gu_ptr,
+            stride_gu,
+            wd_ptr,
+            out_ptr,
+            stride_out,
+            M,
+            beta,
+            inv_beta,
+            lin_beta,
+            inv_lin_beta,
+            N,
+            I,
+            HAS_LIN,
+            BM,
+            BN,
+            BK,
+            False,
+        )
+
+
+_ROUTE_ONE_SYNC: dict = {}
+
+
+def route_one_launch(
+    gate_up: torch.Tensor,  # [M, 2I]
+    beta: float,
+    linear_beta: Optional[float],
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    w_down: torch.Tensor,  # [N, I]
+    out: torch.Tensor,  # [M, N]
+    topk_ids,
+    topk_weights,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_buf,
+    block_size,
+    mx_quant_input,
+    qout,
+    qscale,
+    renormalize: bool = True,
+    routed_scale: float = 1.0,
+) -> None:
+    """situ_topk(...) followed by shared_gemm_sort_quant(...), as one launch."""
+    from sglang.kernels.ops.moe.k3_route_sort import SORT_QCHUNK
+
+    M, two_i = gate_up.shape
+    I = two_i // 2
+    N = w_down.shape[0]
+    E = router_logits.shape[1]
+    topk = topk_ids.shape[1]
+    n = mx_quant_input.shape[1]
+    assert gate_up.stride(1) == 1 and router_logits.stride(1) == 1
+    assert w_down.is_contiguous() and out.stride(1) == 1 and w_down.shape[1] == I
+    assert E < 0xFFFF and topk & (topk - 1) == 0
+    dev = gate_up.device
+    sync = _ROUTE_ONE_SYNC.get(dev)
+    if sync is None:
+        sync = _ROUTE_ONE_SYNC[dev] = torch.zeros(2, dtype=torch.int32, device=dev)
+    bm, bn, bk, nw, ns = _shared_preact_cfg(M)
+    bn = 64 if M <= 16 else bn
+    n_gemm = (N // bn) * triton.cdiv(M, bm)
+    lin = linear_beta is not None
+    _k3_route_one_kernel[(M + M * (n // SORT_QCHUNK) + n_gemm,)](
+        gate_up,
+        gate_up.stride(0),
+        w_down,
+        out,
+        out.stride(0),
+        float(beta),
+        1.0 / float(beta),
+        float(linear_beta) if lin else 1.0,
+        1.0 / float(linear_beta) if lin else 1.0,
+        router_logits,
+        router_logits.stride(0),
+        correction_bias,
+        float(routed_scale),
+        sync,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        mx_quant_input,
+        mx_quant_input.stride(0),
+        qout,
+        qscale,
+        M,
+        N=N,
+        I=I,
+        HAS_LIN=lin,
+        BM=bm,
+        BN=bn,
+        BK=bk,
+        E=E,
+        E_POW2=triton.next_power_of_2(E),
+        TOPK=topk,
+        RENORM=renormalize,
+        BLOCK_SIZE=block_size,
+        P_POW2=triton.next_power_of_2(M * topk),
+        N_COLS=n,
+        QCHUNK=SORT_QCHUNK,
+        SCALEN_PAD=qscale.shape[1],
+        MOE_BUF_ZERO=moe_buf.numel() > 0,
+        num_warps=nw,
+        num_stages=ns,
+    )
+
+
 def shared_gemm_sort_quant(
     pending,
     topk_ids,

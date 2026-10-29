@@ -1046,6 +1046,10 @@ class Envs:
     # Also merge when the checkpoint is quantized elsewhere (MoE MXFP4) but the
     # attention in-proj itself is plain bf16.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_QUANT_CKPT = EnvBool(False)
+    # TunableOp (hipBLASLt/rocBLAS) solution table for the merged MoE front GEMM
+    # [shared gate_up | router | latent down]: "1" = the in-tree MI355X table,
+    # any other non-empty value = path to a TunableOp CSV. Off by default.
+    SGLANG_ROCM_K3_FRONT_GEMM_TABLE = EnvStr("")
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)

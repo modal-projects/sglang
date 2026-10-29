@@ -208,6 +208,34 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+_K3_FRONT_GEMM_TABLE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "kimi_k3_configs",
+    "mi355x_front_bf16_tunableop.csv",
+)
+
+
+@functools.cache
+def _install_rocm_front_gemm_table() -> None:
+    """Load hipBLASLt/rocBLAS picks for the merged front GEMM (N=6016, K=7168)
+    into TunableOp, lookup-only. Only the listed (M, N, K) change kernel; every
+    other torch GEMM keeps the default heuristic pick (bit-identical)."""
+    table = envs.SGLANG_ROCM_K3_FRONT_GEMM_TABLE.get()
+    if not _is_hip or not table:
+        return
+    path = _K3_FRONT_GEMM_TABLE if table == "1" else table
+    tunable = torch.cuda.tunable
+    tunable.tuning_enable(False)
+    tunable.enable(True)
+    if not tunable.read_file(path):
+        tunable.enable(False)
+        logger.warning("K3 front GEMM table %s failed to load; using defaults", path)
+        return
+    rank0_log(
+        f"K3 ROCm front GEMM table: {len(tunable.get_results())} rows from {path}"
+    )
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3653,6 +3681,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                         **self.packed_modules_mapping,
                     }
                 )
+        _install_rocm_front_gemm_table()
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )

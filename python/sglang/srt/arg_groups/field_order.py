@@ -566,5 +566,6 @@ POSITIONAL_FIELD_ORDER = (
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
     "enable_weight_delta",
+    "weight_delta_codec",
 )
 # fmt: on

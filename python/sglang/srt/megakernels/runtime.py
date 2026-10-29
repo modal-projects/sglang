@@ -60,6 +60,22 @@ def megakernel_enabled() -> bool:
     return get_exec().kernel.enable_nvidia_megakernel
 
 
+def prepare_megakernel_weights(
+    model: torch.nn.Module, hf_config: PretrainedConfig
+) -> None:
+    """Run the served model's prepare_weights unless install would refuse the setup."""
+    if not megakernel_enabled():
+        return
+    spec, _ = find_spec(architectures=hf_config.architectures, isa=device_isa())
+    if spec is None or spec.prepare_weights is None:
+        return
+    if _requirement_reasons(spec=spec, hf_config=hf_config) or _model_disable_reasons(
+        spec=spec, model=model, hf_config=hf_config
+    ):
+        return
+    spec.prepare_weights(model, hf_config)
+
+
 def install_megakernel(
     *,
     model: torch.nn.Module,

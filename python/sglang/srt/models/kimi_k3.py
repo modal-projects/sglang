@@ -91,6 +91,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.megakernels.runtime import prepare_megakernel_weights
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -3613,6 +3614,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+            prepare_megakernel_weights(self, self.config)
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
@@ -3954,6 +3956,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         if self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())
+            prepare_megakernel_weights(self, self.config)
         else:
             # The vision weights are loaded as a side effect of advancing this
             # streaming iterator.  Encoder-only mode must therefore drain it

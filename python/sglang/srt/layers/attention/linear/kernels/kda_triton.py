@@ -189,6 +189,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # K3 may defer f_b on verify: `a` is then f_a and the gate GEMM is folded
+        # into the closed-form kernel, or materialized for every other path.
+        f_b_weight = kwargs.pop("k3_f_b_weight", None)
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
         # mirroring the GDN triton verify path. Reads the committed state, writes
         # per-draft-token intermediate states to the scratch buffer, does NOT mutate
@@ -231,6 +234,14 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 num_warps=4,
                 num_stages=1,
                 block_k=64,
+                **({} if f_b_weight is None else dict(f_a=a, f_b_weight=f_b_weight)),
+            )
+        if f_b_weight is not None:
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+            n = a.shape[-3]
+            a = kimi_k3_tiny_gemm(a.reshape(n, -1), f_b_weight).view(
+                1, n, -1, f_b_weight.shape[-1]
             )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,

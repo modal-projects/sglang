@@ -44,6 +44,9 @@ def _kda_verify_closed_form_kernel(
     stride_k,
     stride_v,
     stride_b,
+    fa,
+    wfb,
+    stride_fa,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -52,6 +55,8 @@ def _kda_verify_closed_form_kernel(
     BV: tl.constexpr,
     KC: tl.constexpr,
     L: tl.constexpr,
+    FUSE_FB: tl.constexpr,
+    R: tl.constexpr,
 ):
     i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h = i_hv // (HV // H)
@@ -92,6 +97,11 @@ def _kda_verify_closed_form_kernel(
 
     p = tl.zeros([BT, BV], dtype=tl.float32)
     r = tl.zeros([BT, BV], dtype=tl.float32)
+    if FUSE_FB:
+        o_r = tl.arange(0, R)
+        b_fa = tl.load(
+            fa + tok[:, None] * stride_fa + o_r[None, :], mask=m_t[:, None], other=0
+        )
     akk = tl.zeros([BT, BT], dtype=tl.float32)
     aqk = tl.zeros([BT, BT], dtype=tl.float32)
     p_h = h0 + tl.maximum(idx, 0) * stride_h0 + i_hv * K * V + o_v[:, None] * K
@@ -107,11 +117,16 @@ def _kda_verify_closed_form_kernel(
             mask=m_t[:, None],
             other=0,
         ).to(tl.float32)
-        a_c = tl.load(
-            a + tok[:, None] * stride_a + i_hv * K + o_c[None, :],
-            mask=m_t[:, None],
-            other=0,
-        ).to(tl.float32)
+        if FUSE_FB:
+            # forget gate = f_a @ f_b^T, rounded to bf16 like the standalone GEMM
+            w_c = tl.load(wfb + (i_hv * K + o_c)[None, :] * R + o_r[:, None])
+            a_c = tl.dot(b_fa, w_c).to(tl.bfloat16).to(tl.float32)
+        else:
+            a_c = tl.load(
+                a + tok[:, None] * stride_a + i_hv * K + o_c[None, :],
+                mask=m_t[:, None],
+                other=0,
+            ).to(tl.float32)
         dt_c = tl.load(dt_bias + i_hv * K + o_c).to(tl.float32)
         g_c = lower_bound * tl.sigmoid(a_exp * (a_c + dt_c[None, :]))
         g_c = tl.where(m_t[:, None], g_c, 0.0)
@@ -201,7 +216,10 @@ def kda_verify_closed_form(
     num_warps=4,
     num_stages=None,
     block_k=32,
+    f_a=None,
+    f_b_weight=None,
 ):
+    """If f_a/f_b_weight are given, the forget gate is computed in-kernel and `a` is ignored."""
     H, K, HV, V = k.shape[2], k.shape[3], v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1
     BV = block_v if block_v is not None else (64 if N <= 4 else 128)
@@ -231,11 +249,14 @@ def kda_verify_closed_form(
         scale if scale is not None else K**-0.5,
         lower_bound,
         v.shape[1],
-        a.stride(1) if a.ndim == 4 else a.stride(-2),
+        0 if f_a is not None else (a.stride(1) if a.ndim == 4 else a.stride(-2)),
         q.stride(1),
         k.stride(1),
         v.stride(1),
         b.stride(-2),
+        f_a if f_a is not None else a,
+        f_b_weight if f_b_weight is not None else a,
+        (f_a.stride(1) if f_a.ndim == 4 else f_a.stride(-2)) if f_a is not None else 0,
         H=H,
         HV=HV,
         K=K,
@@ -244,6 +265,8 @@ def kda_verify_closed_form(
         BV=BV,
         KC=block_k,
         L=replayssm_rawv.shape[-2],
+        FUSE_FB=f_a is not None,
+        R=f_b_weight.shape[-1] if f_b_weight is not None else 16,
         num_warps=num_warps,
         num_stages=num_stages if num_stages is not None else (2 if BV == 64 else 1),
     )

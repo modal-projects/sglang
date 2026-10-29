@@ -1247,6 +1247,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         speculative `intermediate_ssm` scratch so the central post-verify rollback
         (update_mamba_state_after_mtp_verify) can commit the accepted-length state.
         """
+        k3_f_b = {}
+        if getattr(layer, "_k3_deferred_f_b_verify", False):
+            a, k3_f_b = self._k3_verify_f_b(layer, forward_batch, a)
         fm = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = fm.query_start_loc
@@ -1469,6 +1472,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **k3_f_b,
             **(
                 dict(
                     zip(
@@ -1492,6 +1496,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _k3_verify_f_b(self, layer, forward_batch, f_a):
+        """K3 deferred f_b on verify: hand f_b to the Triton verify kernel, which
+        folds it into the closed-form path; materialize the gate for other paths."""
+        f_b_weight = layer._k3_hip_fused_decode_args[0].view(
+            layer.num_v_heads * layer.head_v_dim, -1
+        )
+        if (
+            isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
+            and not envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None
+        ):
+            return f_a, {"k3_f_b_weight": f_b_weight}
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+        n = f_a.shape[-3]
+        a = kimi_k3_tiny_gemm(f_a.reshape(n, -1), f_b_weight)
+        return a.view(1, n, layer.num_v_heads, layer.head_v_dim), {}
 
     def _can_run_fused_chain_verify(
         self,

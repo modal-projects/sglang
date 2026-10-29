@@ -202,11 +202,11 @@ def run_unfused(x, i, B, T):
     return o.view(B * T, HV, V)
 
 
-def run_closed(x, i, B, T, **kw):
+def run_closed(x, i, B, T, a=None, **kw):
     q, k, v = run_conv(x, i, B, T)
     o = kda_verify_closed_form(
         x["A_log"],
-        x["a"][i],
+        x["a"][i] if a is None else a,
         x["dt_bias"],
         q,
         k,
@@ -225,6 +225,40 @@ def run_closed(x, i, B, T, **kw):
         **kw,
     )
     return o.view(B * T, HV, V)
+
+
+def load_fb(x, layer, tp_rank=0):
+    """Real f_a_proj/f_b_proj of a checkpoint KDA layer; f_a from rmsnormed random hidden."""
+    import json
+
+    from safetensors import safe_open
+
+    pre = f"language_model.model.layers.{layer}.self_attn."
+    wm = json.load(open(f"{HF_SNAP}/model.safetensors.index.json"))["weight_map"]
+
+    def get(name):
+        with safe_open(f"{HF_SNAP}/{wm[pre + name]}", "pt", device="cpu") as f:
+            return f.get_tensor(pre + name)
+
+    wfa = get("f_a_proj.weight").to("cuda", torch.bfloat16)
+    lo, hi = tp_rank * HV * K, (tp_rank + 1) * HV * K
+    x["wfb"] = get("f_b_proj.weight")[lo:hi].to("cuda", torch.bfloat16).contiguous()
+    x["fa"] = []
+    for a in x["a"]:
+        h = torch.randn(a.shape[0], wfa.shape[1], device="cuda")
+        h = (h / h.pow(2).mean(-1, keepdim=True).sqrt()).to(torch.bfloat16)
+        x["fa"].append((h @ wfa.T).contiguous())
+
+
+def run_closed_fb_sep(x, i, B, T, **kw):
+    from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+    a = kimi_k3_tiny_gemm(x["fa"][i], x["wfb"])
+    return run_closed(x, i, B, T, a=a, **kw)
+
+
+def run_closed_fb_fold(x, i, B, T, **kw):
+    return run_closed(x, i, B, T, f_a=x["fa"][i], f_b_weight=x["wfb"], **kw)
 
 
 def _frozen_unfused(sel):
@@ -304,6 +338,7 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--ssm", default="bf16", choices=["bf16", "fp32"])
     ap.add_argument("--real-layers", default="", help="checkpoint KDA layer ids")
+    ap.add_argument("--fb-fold", type=int, default=-1, help="KDA layer id for f_b fold")
     args = ap.parse_args()
     T = args.T
     out = []
@@ -315,6 +350,24 @@ def main():
             ssm_dtype=torch.float32 if args.ssm == "fp32" else torch.bfloat16,
         )
         row = {"B": B, "ssm": args.ssm}
+        if args.fb_fold >= 0:
+            load_real_layer(x, args.fb_fold)
+            load_fb(x, args.fb_fold)
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as tiny
+
+            kw = dict(
+                block_v=64 if B <= 8 else 128, num_warps=4, num_stages=1, block_k=64
+            )
+            sep = lambda x, i, B, T: run_closed_fb_sep(x, i, B, T, **kw)  # noqa: E731
+            fold = lambda x, i, B, T: run_closed_fb_fold(x, i, B, T, **kw)  # noqa: E731
+            row["sep_us"] = round(time_us(lambda i: sep(x, i, B, T)), 2)
+            row["fold_us"] = round(time_us(lambda i: fold(x, i, B, T)), 2)
+            row["tiny_gemm_us"] = round(
+                time_us(lambda i: tiny(x["fa"][i], x["wfb"])), 2
+            )
+            row["fold_vs_sep"] = parity(x, B, T, sep, fold)
+            print(json.dumps(row), flush=True)
+            continue
         if args.real_layers:
             for layer in [int(v) for v in args.real_layers.split(",")]:
                 load_real_layer(x, layer)

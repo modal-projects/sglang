@@ -2521,9 +2521,16 @@ class KimiK3DeltaAttention(nn.Module):
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
+        defer_f_b_verify = (
+            self._kda_hip_fused_decode_ready
+            and self.use_full_rank_gate
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_KDA_VERIFY_CLOSED_FORM.get()
+            and envs.SGLANG_K3_KDA_VERIFY_FOLD_FB.get()
+        )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states, defer_f_b=defer_f_b
+                hidden_states, defer_f_b=defer_f_b or defer_f_b_verify
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
@@ -2549,6 +2556,8 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_onorm_consumed = False
         if defer_f_b:
             self.attn._k3_deferred_f_b = True
+        if defer_f_b_verify:
+            self.attn._k3_deferred_f_b_verify = True
 
         core_attn_out = self.attn(
             forward_batch,
@@ -2562,6 +2571,8 @@ class KimiK3DeltaAttention(nn.Module):
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False
+        if defer_f_b_verify:
+            self.attn._k3_deferred_f_b_verify = False
         if not fused_onorm and forward_batch.forward_mode.is_target_verify():
             # Gated o_norm + o_proj, one launch
             partial = self._k3_onorm_oproj(core_attn_out, g_proj_states)

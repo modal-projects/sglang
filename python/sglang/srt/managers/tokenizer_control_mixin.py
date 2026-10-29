@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -54,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PrepareWeightsFromDeltaReqInput,
+    PrepareWeightsFromDeltaReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -76,6 +79,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -126,6 +131,8 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("pull_weights", PullWeightsReqOutput),
+    ("prepare_weights_from_delta", PrepareWeightsFromDeltaReqOutput),
+    ("update_weights_from_delta", UpdateWeightsFromDeltaReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
@@ -1015,6 +1022,36 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.pull_weights_communicator(obj)
         return FanOutCommunicator.merge_results(results)
+
+    async def prepare_weights_from_delta(
+        self: TokenizerManager,
+        obj: PrepareWeightsFromDeltaReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Optional[Dict]]]:
+        self.auto_create_handle_loop()
+        results = await self.prepare_weights_from_delta_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        return success, message, [result.stats for result in results]
+
+    async def update_weights_from_delta(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromDeltaReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, List[Optional[Dict]]]:
+        self.auto_create_handle_loop()
+        # As update_weights_from_disk: paused, the update goes straight in; serving, it waits
+        # for running requests behind the writer lock.
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+        lock = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        async with lock:
+            results = await self.update_weights_from_delta_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        if success:
+            self._update_weight_version_if_provided(obj.weight_version)
+        return success, message, [result.stats for result in results]
 
     async def check_weights(
         self: TokenizerManager,

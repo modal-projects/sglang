@@ -390,6 +390,11 @@ class Model(msgspec.Struct):
         "checks that its config is supported and maps every checkpoint tensor onto its "
         "serving tensors.",
     ] = False
+    weight_delta_codec: A[
+        Literal["gap-zstd", "snappy-zstd"],
+        "The frame encoding of the weight deltas this engine applies; a version written with "
+        "another codec is refused.",
+    ] = "gap-zstd"
 
     # -------------------------------------------------------------------------
     # Weight cache

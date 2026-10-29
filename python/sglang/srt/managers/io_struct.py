@@ -2043,6 +2043,33 @@ class PullWeightsReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class PrepareWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    # The weight-delta version's manifest.json
+    manifest: str
+
+
+class PrepareWeightsFromDeltaReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    stats: Optional[Dict[str, Any]] = None
+
+
+class UpdateWeightsFromDeltaReqInput(BaseReq, kw_only=True):
+    # The prepared version's manifest.json, and the version it brings the weights to
+    manifest: str
+    weight_version: str
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromDeltaReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    stats: Optional[Dict[str, Any]] = None
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]

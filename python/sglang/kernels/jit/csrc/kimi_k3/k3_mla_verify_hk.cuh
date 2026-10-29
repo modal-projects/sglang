@@ -434,11 +434,24 @@ __device__ __forceinline__ void iteration(
   }
 }
 
+#ifdef K3HK_TS
+__device__ unsigned long long g_k3hk_ts[4096 * 8];
+#define K3HK_STAMP(i)                                                                                \
+  do {                                                                                               \
+    if ((threadIdx.x & 63) == 0) g_k3hk_ts[blockIdx.x * 8 + (i)] = __builtin_amdgcn_s_memrealtime(); \
+  } while (0)
+#else
+#define K3HK_STAMP(i) \
+  do {                \
+  } while (0)
+#endif
+
 __device__ __forceinline__ void compute_wave(
     const Params& p, uint8_t K3_LDS* smem, int b, int split, int L, int start, int end, int ntiles, int w, int lane) {
   const int h = lane >> 5, l32 = lane & 31;
   const int row = 32 * w + l32;
   const int qpos = row / kH, head = row - qpos * kH;
+  if (w == 0) K3HK_STAMP(0);
 
   // ---- Q: this lane owns d = 64 ks + 32 h + [0, 32) of its row, ks = 0..8.
   // Pass 1: per-row amax (over all 576 dims); pass 2 (L2 hits): quantize into v[48:119].
@@ -465,6 +478,7 @@ __device__ __forceinline__ void compute_wave(
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");  // B_q
   }
   const float s_scale = qscale * (kv_scale * p.sm_scale_log2);
+  if (w == 0) K3HK_STAMP(1);
 
   const uint32_t base = (uint32_t)(uintptr_t)smem;
   // K fragment (ks, tb) of lane (l32, h): token t = 32 tb + l32, chunks 4 ks + 2h (+1)
@@ -490,6 +504,7 @@ __device__ __forceinline__ void compute_wave(
       0,
       ntiles};
   asm volatile("s_waitcnt vmcnt(0)\n\ts_barrier" ::: "memory");  // B_pre: tiles 0, 1 landed
+  if (w == 0) K3HK_STAMP(2);
   qk_first(base + koff_e, base + koff_o);
   if (mask_of(0)) mask_s<0>(thr_of(0));
   {
@@ -522,6 +537,7 @@ __device__ __forceinline__ void compute_wave(
     iteration<0>(st, slot_of(i), slot_of(i), koff_e, koff_o, voff, voff_o, s_scale, false, 0, false, dc);
   }
 
+  if (w == 0) K3HK_STAMP(3);
   // ---- epilogue
   // l: sum of the fp8-rounded P (x kPScale) from the row-sum MFMA -> already the full row
   // in both lane halves (gen_asm LSUM8); otherwise per-half partial sums of the unrounded p.
@@ -555,6 +571,7 @@ __device__ __forceinline__ void compute_wave(
     }
     if (w == 0) {
       __builtin_amdgcn_s_waitcnt(0);
+      K3HK_STAMP(4);
     }
     return;
   }
@@ -594,7 +611,9 @@ __global__ __launch_bounds__(kThreads, 1)
   const int w = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
   const int lane = threadIdx.x & 63;
   if (w == 3) {
+    K3HK_STAMP(5);
     loader_wave(p, smem, kv_start, start, end, ntiles, lane);
+    K3HK_STAMP(6);
   } else {
     compute_wave(p, smem, b, split, L, start, end, ntiles, w, lane);
   }
@@ -1047,6 +1066,19 @@ struct K3MlaVerifyHK {
     p.part8_min = static_cast<int32_t>(part8_min);
     LaunchKernel(dim3(static_cast<uint32_t>(nsplit * bs)), k3hk::kThreads, q.device())(
         k3hk::k3_mla_verify_hk_kernel, p);
+  }
+
+  // debug (K3HK_TS builds only): copy the per-CTA s_memrealtime stamps into out
+  // (uint64 [4096 * 8]) and clear them.
+  static void ts_dump(const tvm::ffi::TensorView out) {
+#ifdef K3HK_TS
+    void* sym = nullptr;
+    (void)hipGetSymbolAddress(&sym, HIP_SYMBOL(k3hk::g_k3hk_ts));
+    (void)hipMemcpy(out.data_ptr(), sym, sizeof(k3hk::g_k3hk_ts), hipMemcpyDeviceToDevice);
+    (void)hipMemset(sym, 0, sizeof(k3hk::g_k3hk_ts));
+#else
+    (void)out;
+#endif
   }
 
   // split merge (one memory round trip, k3_mla_verify_hk_reduce1). use_regime != 0 (auto path):

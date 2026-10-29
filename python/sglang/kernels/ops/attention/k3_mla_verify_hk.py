@@ -62,15 +62,18 @@ def _asm_include_dir(tag: str) -> str:
 @cache_once
 def _module():
     tag = _src_hash()
+    ts = bool(os.environ.get("K3HK_TS"))
     return load_jit(
-        "kimi_k3_mla_verify_hk",
+        "kimi_k3_mla_verify_hk" + ("_ts" if ts else ""),
         tag,
         cuda_files=["kimi_k3/k3_mla_verify_hk.cuh"],
         cuda_wrappers=[
             ("run", "K3MlaVerifyHK::run"),
             ("reduce", "K3MlaVerifyHK::reduce"),
+            ("ts_dump", "K3MlaVerifyHK::ts_dump"),
         ],
-        extra_cuda_cflags=["-O3", "-mllvm", "-amdgpu-spill-vgpr-to-agpr=0"],
+        extra_cuda_cflags=["-O3", "-mllvm", "-amdgpu-spill-vgpr-to-agpr=0"]
+        + (["-DK3HK_TS"] if ts else []),
         extra_include_paths=[_asm_include_dir(tag)],
     )
 

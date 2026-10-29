@@ -2,10 +2,11 @@
 the dense path the selector uses today (scatter q -> DSpark accept_sampling's
 pytorch filter + chain_speculative_sampling_triton)."""
 
-import os, sys, time, json
+import json
+import sys
+
 import pytest
 import torch
-
 from sglang.kernels.ops.speculative.dflash_rocm_sampled_verify import (
     dflash_sampled_verify_rocm,
 )
@@ -311,9 +312,6 @@ def test_full_vocab_chi2_k3():
 def bench():
     """ms per verify call: fused sparse-q vs today's selector path (dense q
     scatter + accept_sampling with the pytorch filter)."""
-    from sglang.kernels.ops.speculative.dspark.dspark_accept import (
-        _accept_sampling_core,
-    )  # noqa
 
     out = {}
     for bs in (1, 4, 16, 32, 64):
@@ -329,7 +327,6 @@ def bench():
             seed=bs,
             dtype=torch.bfloat16,
         )
-        logits = args[0].bfloat16().float()
 
         def ref():
             # mirrors _selector_sampling_accept (scatter, filter, chain kernel, zero)

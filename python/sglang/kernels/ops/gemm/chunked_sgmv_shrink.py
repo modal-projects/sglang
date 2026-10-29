@@ -7,6 +7,8 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
+_MAX_SPLIT_K = 16
+
 
 @cached_triton_kernel(
     lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
@@ -320,17 +322,18 @@ def chunked_sgmv_lora_shrink_forward(
     if "num_stages" in config:
         extra_kwargs["num_stages"] = config["num_stages"]
 
-    # Opt-in policy measured on H200 with BF16 rank-32 adapters. Keep other
-    # shapes and deterministic inference on the original accumulation order.
+    # The low-rank output leaves few CTAs, so split the reduction dimension
+    # instead. About two K tiles per split matches the H200 measurements
+    # (8 splits at K=4096, 16 at K=12288 with BLOCK_K=256). Deterministic
+    # inference keeps the original accumulation order.
     if (
         split_k is None
         and envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.get()
-        and MAX_RANK == 32
-        and K in (4096, 12288)
-        and x.dtype == torch.bfloat16
-        and (BLOCK_M, BLOCK_N, BLOCK_K) == (16, 16, 256)
+        and x.dtype in (torch.bfloat16, torch.float16)
     ):
-        split_k = 16 if K == 12288 else 8
+        split_k = 1
+        while split_k * 2 <= min(_MAX_SPLIT_K, triton.cdiv(K, BLOCK_K) // 2):
+            split_k *= 2
     if split_k is None or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
         split_k = 1
 

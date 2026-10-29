@@ -500,6 +500,43 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+_ROUTER_DUMP_MAX_TOKENS = 4096
+_ROUTER_DUMP_LAYERS = (3, 30, 60, 91)
+_router_dump_counts: dict = {}
+
+
+def _maybe_dump_router_input(moe: "KimiK3MoE", hidden_states: torch.Tensor) -> None:
+    """Debug (SGLANG_K3_ROUTER_DUMP_DIR): rank 0's eager front inputs, up to
+    _ROUTER_DUMP_MAX_TOKENS rows per layer, plus the merged front weight and
+    router bias, for offline front-GEMM routing checks."""
+    out_dir = envs.SGLANG_K3_ROUTER_DUMP_DIR.get()
+    if not out_dir or torch.cuda.is_current_stream_capturing():
+        return
+    if not os.path.exists(os.path.join(out_dir, "ARM")):
+        return
+    if get_parallel().tp_group.rank_in_group != 0:
+        return
+    layer_idx = moe.layer_idx
+    if layer_idx not in _ROUTER_DUMP_LAYERS:
+        return
+    seen = _router_dump_counts.get(layer_idx, 0)
+    if seen >= _ROUTER_DUMP_MAX_TOKENS or hidden_states.shape[0] < 16:
+        return
+    if seen == 0:
+        bias = getattr(moe.gate, "e_score_correction_bias", None)
+        torch.save(
+            {
+                "front_w": moe._front_w.detach().cpu(),
+                "front_sizes": moe._front_sizes,
+                "bias": None if bias is None else bias.detach().float().cpu(),
+            },
+            os.path.join(out_dir, f"layer{layer_idx:03d}_w.pt"),
+        )
+    rows = hidden_states[: _ROUTER_DUMP_MAX_TOKENS - seen].detach().cpu()
+    torch.save(rows, os.path.join(out_dir, f"layer{layer_idx:03d}_x{seen:05d}.pt"))
+    _router_dump_counts[layer_idx] = seen + rows.shape[0]
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -1460,6 +1497,7 @@ class KimiK3MoE(nn.Module):
                 out_dtype=torch.float32 if self._front_fp32 else None,
             )
         else:
+            _maybe_dump_router_input(self, hidden_states)
             fused = _k3_bf16_gemm(
                 hidden_states,
                 self._front_w,

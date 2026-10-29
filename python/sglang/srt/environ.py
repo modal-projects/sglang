@@ -1050,6 +1050,8 @@ class Envs:
     # [shared gate_up | router | latent down]: "1" = the in-tree MI355X table,
     # any other non-empty value = path to a TunableOp CSV. Off by default.
     SGLANG_ROCM_K3_FRONT_GEMM_TABLE = EnvStr("")
+    # Debug: rank 0 dumps eager MoE front inputs + weights here once <dir>/ARM exists.
+    SGLANG_K3_ROUTER_DUMP_DIR = EnvStr("")
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)

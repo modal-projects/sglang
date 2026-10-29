@@ -423,12 +423,29 @@ class FusedKVMaterializeHelper:
         )
         cos_sin_cache = self._ensure_rope_cache(max_position)
 
-        self._ensure_workspace(total_ctx, ctx_hidden.dtype)
-        assert self._proj_workspace is not None
-        assert self._k_workspace is not None
-        assert self._v_workspace is not None
+        if torch.cuda.is_current_stream_capturing():
+            # A captured graph keeps these addresses, but a later larger eager
+            # call regrows (frees) the shared workspace: give the graph its own.
+            proj_ws = torch.empty(
+                (total_ctx, self.n_layers * self.layer_out_dim),
+                dtype=ctx_hidden.dtype,
+                device=self.device,
+            )
+            k_ws = torch.empty(
+                (self.n_layers, total_ctx, self.num_kv_heads, self.head_dim),
+                dtype=ctx_hidden.dtype,
+                device=self.device,
+            )
+            v_ws = torch.empty_like(k_ws)
+        else:
+            self._ensure_workspace(total_ctx, ctx_hidden.dtype)
+            proj_ws, k_ws, v_ws = (
+                self._proj_workspace,
+                self._k_workspace,
+                self._v_workspace,
+            )
 
-        proj_out_2d = self._proj_workspace[:total_ctx]
+        proj_out_2d = proj_ws[:total_ctx]
         if self._mm_out_supported:
             try:
                 torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
@@ -439,8 +456,8 @@ class FusedKVMaterializeHelper:
             proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
 
         proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
-        tmp_k = self._k_workspace[:, :total_ctx]
-        tmp_v = self._v_workspace[:, :total_ctx]
+        tmp_k = k_ws[:, :total_ctx]
+        tmp_v = v_ws[:, :total_ctx]
         cache_k, cache_v = _fused_norm_rope_stacked(
             proj_out,
             self.k_norm_weights,

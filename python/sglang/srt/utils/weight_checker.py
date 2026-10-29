@@ -147,6 +147,8 @@ class WeightChecker:
             return self._compute_checksum(skip_tensor_list, role=role)
         elif action == "raw_checksum":
             return self._compute_raw_checksum(names, role=role)
+        elif action == "state_checksum":
+            return self._compute_state_checksum(role=role)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -251,6 +253,22 @@ class WeightChecker:
         )
         return info.model_dump()
 
+    def _compute_state_checksum(self, *, role: str) -> Dict:
+        """The bytes of every tensor the model holds, tensor attributes included: two engines
+        hash the same only when their serving state is bit-identical."""
+        torch.cuda.synchronize()
+        checksums = {
+            name: f"{tensor.dtype}{list(tensor.shape)}:{_hash_tensor(tensor.detach())}"
+            for name, tensor in _held_tensors(self._get_model())
+            if not _is_skip_weight_check(name, tensor)
+        }
+        info = ChecksumInfo(
+            checksums=checksums,
+            per_gpu_checksum=overall_checksum(checksums),
+            parallelism_info=self._parallelism_info(role=role),
+        )
+        return info.model_dump()
+
     def _parallelism_info(self, *, role: str) -> ParallelismInfo:
         # Read the current WORLD rank because elastic scale-up can change it.
         return ParallelismInfo(
@@ -264,6 +282,22 @@ class WeightChecker:
         model = self._get_model()
         yield from model.named_parameters()
         yield from model.named_buffers()
+
+
+def _held_tensors(model) -> Iterable[tuple[str, torch.Tensor]]:
+    """Parameters, buffers, and the tensors modules keep as attributes, alone or in a tuple
+    or list (kernel layouts and derived weights built after loading)."""
+    yield from model.named_parameters()
+    yield from model.named_buffers()
+    for module_name, module in model.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        for key, value in vars(module).items():
+            if isinstance(value, torch.Tensor):
+                yield prefix + key, value
+            elif isinstance(value, (tuple, list)):
+                for index, item in enumerate(value):
+                    if isinstance(item, torch.Tensor):
+                        yield f"{prefix}{key}.{index}", item
 
 
 def _hash_tensor(t: torch.Tensor) -> str:

@@ -75,3 +75,29 @@ Removable pieces (not implemented):
 | fuse/cheapen reduce1 (grid-barrier merge when bs*nsplit <= 256) | 2-3 | moderate: co-residency assumption |
 
 Total ~9 us/layer x 24 layers ~ 0.2 ms/step at bs1, less at bs4: below the 0.3 ms gate.
+
+## 4. Small-message decode AR epilogue fusion, bs1-16 (parked)
+
+Targets from the 17bfcaa bs16 rocprof (Instinct config, t=0.7): `attn_res_smallm` 1.45 ms/step (186 calls), `add_rmsnorm_quant` 0.54 ms (92 of 113 calls follow `cross_device_reduce_2stage`). Code: modal-projects/sglang `devin/k3-mi355-arres-epi` (off 17bfcaafa), opt-in and unwired; defaults unchanged. MI355X:8, HIP graphs, us/call, ms/step = 92 calls.
+
+**4a. AG + attn_res, one block per token** (53ab301f3, `SGLANG_K3_AR_AGG_MAX_T>64`). Bit-exact (prefix, bank, out, FP8). Extending the existing paired-producer `k3_ar_agg` past 64 tokens hit a cliff (AR T=128: ~51 vs ~21 us), so this is a new row kernel that pulls peers' registered y directly.
+
+| T (bs) | nvb1 | nvb4 | nvb8 |
+|---|---|---|---|
+| 64 (8) | 11.0->10.8 | 12.1->11.7 | 13.7->13.1 |
+| 128 (16) | 13.1->15.1 | 14.3->16.3 | 16.3->17.6 |
+
+bs16: -0.12 to -0.18 ms/step. bs1/4/8 are already fused by `k3_ar_agg` (T<=64), which beats this kernel. It loses because each block has to pull its token's 14 KB row before the agg math can start.
+
+**4b. MoE [latent|shared] AR + latent RMSNorm** (`k3_ar_norm`, 98b3bfe3e). The AR output is bitwise equal to AITER's 2-stage AR: work is split per token, but each element is summed in AITER's owner-rank order. With the folded norm weight (=1, as in prod) the norm is bitwise equal too. With a random weight it is <=1 bf16 ulp off on 2e-6..3.5e-5 of elements (RMS sum order).
+
+| bs (T) | unfused AR+norm | fused | ms/step |
+|---|---:|---:|---:|
+| 1 (8) | 9.27 | 11.87 | -0.24 |
+| 4 (32) | 12.2 | 13.6 | -0.12 |
+| 8 (64) | 15.0 | 17.2 | -0.20 |
+| 16 (128) | 21.1 | 26.6 | -0.51 |
+
+It loses because cross-GPU visibility after AITER `end_sync` holds only per block id, so each token stays in one block: 8-64 blocks vs AITER's 80x512. Ceiling if the fusion were free: standalone norm ~4.8 us x 92 ~ 0.44 ms/step at bs16, realistic 0.2-0.3. Not worth a multi-block-per-token rebuild.
+
+MI355 comm-kernel notes: spin on peer flags with relaxed device-scope loads plus one system acquire fence (an acquire on every spin was ~2x slower). Pull registered IPC inputs rather than AITER's uncached tmp (~1.5-2x). Remote stores + `__threadfence_system` were worst.

@@ -114,7 +114,7 @@ class TestMegakernelRuntime(CustomTestCase):
                 return_value=False,
             ),
         ):
-            base_runner.BaseRunner._warmup(runner)
+            base_runner.BaseRunner.warmup(runner)
 
     def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
         lm = install(tokens=1)

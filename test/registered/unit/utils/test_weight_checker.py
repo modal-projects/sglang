@@ -823,5 +823,39 @@ class TestComputeChecksum(_ChecksumTestBase):
         self.assertIsInstance(info.parallelism_info, ParallelismInfo)
 
 
+class TestComputeStateChecksum(_ChecksumTestBase):
+    def setUp(self):
+        super().setUp()
+        # Tensors a quant method keeps beside its parameters after loading.
+        self.model.kernel_scales = torch.arange(16, dtype=torch.uint8, device="cuda")
+        self.model.derived = (torch.ones(4, device="cuda"), "not a tensor")
+
+    def test_hashes_parameters_buffers_and_tensor_attributes(self):
+        names = set(self.checker._compute_state_checksum(role="target")["checksums"])
+        self.assertTrue(
+            {"w", "b", "running_mean", "kernel_scales", "derived.0"} <= names
+        )
+        self.assertNotIn("rotary_emb_cos_sin_cache", names)
+
+    def test_one_flipped_bit_in_an_attribute_changes_its_checksum(self):
+        first = self.checker._compute_state_checksum(role="target")
+        self.model.kernel_scales[3] ^= 1
+        second = self.checker._compute_state_checksum(role="target")
+        changed = {
+            name
+            for name in first["checksums"]
+            if first["checksums"][name] != second["checksums"][name]
+        }
+        self.assertEqual(changed, {"kernel_scales"})
+        self.assertNotEqual(first["per_gpu_checksum"], second["per_gpu_checksum"])
+
+    def test_a_negative_zero_differs_from_zero(self):
+        # Values compare equal; bytes do not.
+        first = self.checker._compute_state_checksum(role="target")["checksums"]
+        self.model.b.data[0] = -0.0
+        second = self.checker._compute_state_checksum(role="target")["checksums"]
+        self.assertNotEqual(first["b"], second["b"])
+
+
 if __name__ == "__main__":
     unittest.main()

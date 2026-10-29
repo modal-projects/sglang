@@ -31,6 +31,12 @@ _KEY_MAX = tl.constexpr(2**31)
 _TOPK_ALL = 2**30
 
 
+def _mass_per_chunk() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DFLASH_ROCM_HIST_MASS_PER_CHUNK.get()
+
+
 @triton.jit
 def _sort_key(s):
     bits = s.to(tl.int32, bitcast=True)
@@ -110,12 +116,15 @@ def _chunk_hist_kernel(
     INV_BW: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
+    MASS_PER_CHUNK: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     c = tl.program_id(1)
     row_ptr = logits_ptr + row.to(tl.int64) * logits_stride
     inv_temp = 1.0 / tl.load(temps_ptr + row // D).to(tl.float32)
     row_max = _row_max(cmax_ptr, row, C, C_PAD)
+    # Per-chunk mass rows keep the atomics of different programs apart.
+    mrow = (row * C + c) if MASS_PER_CHUNK else row
     h = tl.zeros([NB], dtype=tl.int32)
     for start in range(c * CHUNK, c * CHUNK + CHUNK, BLOCK):
         offs = start + tl.arange(0, BLOCK)
@@ -126,7 +135,7 @@ def _chunk_hist_kernel(
         h += tl.histogram(bk, NB)
         # Bracket hint only: the cutoff is still found from exact sums.
         tl.atomic_add(
-            mhist_ptr + row.to(tl.int64) * NB + bk,
+            mhist_ptr + mrow.to(tl.int64) * NB + bk,
             tl.exp(s - row_max),
             mask=bk < NB - 1,
             sem="relaxed",
@@ -156,6 +165,7 @@ def _select_kernel(
     C_PAD: tl.constexpr,
     NB: tl.constexpr,
     BW: tl.constexpr,
+    MASS_PER_CHUNK: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     _, top_k, top_p = _row_params(temps_ptr, top_ks_ptr, top_ps_ptr, row // D, V)
@@ -172,7 +182,13 @@ def _select_kernel(
         H = tl.zeros([NB], dtype=tl.int32)
         for c in range(C):
             H += tl.load(hrow + c * NB + bidx)
-        M = tl.load(mhist_ptr + row.to(tl.int64) * NB + bidx)
+        if MASS_PER_CHUNK:
+            mrow = mhist_ptr + row.to(tl.int64) * C * NB
+            M = tl.zeros([NB], dtype=tl.float32)
+            for c in range(C):
+                M += tl.load(mrow + c * NB + bidx)
+        else:
+            M = tl.load(mhist_ptr + row.to(tl.int64) * NB + bidx)
         m_above = tl.cumsum(M, axis=0) - M
         lo_above = m_above
         hi_above = m_above
@@ -688,7 +704,8 @@ def dflash_sampled_verify_rocm(
     i32 = dict(dtype=torch.int32, device=dev)
     cmax, cz, amass = (torch.empty((R, C), **f32) for _ in range(3))
     hist = torch.empty((R, C, _NB), **i32)
-    mhist = torch.zeros((R, _NB), **f32)
+    per_chunk = _mass_per_chunk()
+    mhist = torch.zeros((R * C if per_chunk else R, _NB), **f32)
     off = torch.empty((R, C), **i32)
     row_max, z, z_kept = (torch.empty((R,), **f32) for _ in range(3))
     b_lo, b_hi, base_cnt, n_br, last = (torch.empty((R,), **i32) for _ in range(5))
@@ -711,6 +728,7 @@ def dflash_sampled_verify_rocm(
         C_PAD=C_PAD,
         NB=_NB,
         INV_BW=1.0 / _BW,
+        MASS_PER_CHUNK=per_chunk,
         **common,
     )
     _select_kernel[(R,)](
@@ -734,6 +752,7 @@ def dflash_sampled_verify_rocm(
         C_PAD=C_PAD,
         NB=_NB,
         BW=_BW,
+        MASS_PER_CHUNK=per_chunk,
         num_warps=4,
     )
     _compact_kernel[(R, C)](

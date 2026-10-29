@@ -1663,6 +1663,8 @@ class Envs:
     SGLANG_DFLASH_ROCM_FUSED_SELECTOR_VERIFY = EnvBool(False)
     # Debug: log per-phase GPU ms of DFlash steps every N steps (0 = off).
     SGLANG_DFLASH_STEP_TIMING = EnvInt(0)
+    # ROCm fused sampled verify: per-chunk top-p mass histogram (fewer atomic collisions).
+    SGLANG_DFLASH_ROCM_HIST_MASS_PER_CHUNK = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
     # out of a single contiguous region instead of grown segment by segment.
     SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)

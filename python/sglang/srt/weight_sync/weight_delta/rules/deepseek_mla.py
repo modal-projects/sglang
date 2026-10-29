@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.weight_sync.weight_delta.map import Copy, Derived, Ignored
+from sglang.srt.weight_sync.weight_delta.map import Copy, Derived, Destination, Ignored
 
 # (shard 0, shard 1, fused parameter), as the loader stacks them along dim 0.
 FUSED = (
@@ -42,21 +41,6 @@ INDEXER = re.compile(
 LAYER = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 # MTP tensors the draft keeps at its top level instead of under model.decoder.
 MTP_TOP = ("eh_proj.", "enorm.", "hnorm.", "shared_head.norm.")
-
-
-@dataclass(frozen=True)
-class Destination:
-    role: str
-    param: str = ""
-    shards: tuple[str, ...] = ()
-    shard: int = 0
-    module: str = ""
-    expert: int | None = None
-    projection: str = ""
-    kind: str = ""
-    # Applied to a GPU copy of the checkpoint tensor (map.DeltaMap.shadows), from which
-    # a Derived recomputes what SGLang serves.
-    shadow: bool = False
 
 
 class DeepSeekMla:

@@ -66,6 +66,24 @@ class Derived:
     values: Callable[[], list[tuple[torch.Tensor, torch.Tensor]]]
 
 
+@dataclass(frozen=True)
+class Destination:
+    """Where a model rule sends a checkpoint tensor: a parameter (or one shard of a fused
+    one), or one projection of a routed expert."""
+
+    role: str
+    param: str = ""
+    shards: tuple[str, ...] = ()
+    shard: int = 0
+    module: str = ""
+    expert: int | None = None
+    projection: str = ""
+    kind: str = ""
+    # Applied to a GPU copy of the checkpoint tensor (DeltaMap.shadows), from which
+    # a Derived recomputes what SGLang serves.
+    shadow: bool = False
+
+
 class OtherGpu:
     pass
 
@@ -201,7 +219,7 @@ def _build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
     from sglang.srt.weight_sync.weight_delta.rules import placement
 
     models = {role: runner.model for role, runner in runners}
-    rule = _model_rule(models, inventory)
+    rule = _model_rule(dict(runners)["target"], models, inventory)
     shadows: dict[tuple[str, str], torch.Tensor] = {}
     # Every path, so aliases (e.g. attn_mha.kv_b_proj) don't hide the loader's name.
     modules = {
@@ -243,7 +261,10 @@ def _build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
         item
         for role, model in models.items()
         for path, module in model.named_modules()
-        for item in rule.derived(role, path, module, shadows)
+        for item in (
+            *rule.derived(role, path, module, shadows),
+            *placement.layer_derived(module),
+        )
     ]
     return DeltaMap(
         inventory, entries, copies, _table(inventory, entries), derived, shadows
@@ -283,11 +304,13 @@ def _table(
     )
 
 
-def _model_rule(models, inventory):
+def _model_rule(runner, models, inventory):
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_mla import DeepSeekMla
+    from sglang.srt.weight_sync.weight_delta.rules.qwen3_5 import Qwen3_5
 
-    architecture = models["target"].config.architectures[0]
-    for rule in (DeepSeekMla,):
+    # The checkpoint's config: a multimodal model's own config may be its text part's.
+    architecture = runner.model_config.hf_config.architectures[0]
+    for rule in (DeepSeekMla, Qwen3_5):
         if architecture in rule.architectures:
             return rule(models, inventory)
     raise ValueError(f"Weight delta has no rules for {architecture}")

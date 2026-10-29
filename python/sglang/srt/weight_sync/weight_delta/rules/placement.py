@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 
+import torch
+
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -14,6 +16,7 @@ from sglang.srt.weight_sync.weight_delta.map import (
     OTHER_GPU,
     TORCH_DTYPES,
     CanonicalTensor,
+    Derived,
     Place,
 )
 from sglang.srt.weight_sync.weight_delta.rules import (
@@ -96,3 +99,10 @@ def expert_copies(module):
     if not hasattr(module, "w13_weight") or not hasattr(module, "quant_method"):
         return []
     return _backend_for(module).copies(module)
+
+
+def layer_derived(module) -> list[Derived]:
+    """GemmaRMSNorm serves gemma_weight = weight + 1 (refresh_gemma_weight)."""
+    if not hasattr(module, "refresh_gemma_weight"):
+        return []
+    return [Derived(lambda: [(torch.add(module.weight, 1.0), module.gemma_weight)])]

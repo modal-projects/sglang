@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareWeightsFromDeltaReqInput,
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
@@ -160,6 +161,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1335,6 +1337,40 @@ async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Req
     success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
 
     content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/prepare_weights_from_delta")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_weights_from_delta(
+    obj: Annotated[PrepareWeightsFromDeltaReqInput, Body()], request: Request
+):
+    """Stage a weight-delta version on every GPU while serving; replies once every GPU holds it."""
+    (
+        success,
+        message,
+        stats,
+    ) = await _global_state.tokenizer_manager.prepare_weights_from_delta(obj, request)
+    content = {"success": success, "message": message, "stats": stats}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_delta")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_delta(
+    obj: Annotated[UpdateWeightsFromDeltaReqInput, Body()], request: Request
+):
+    """Apply the prepared weight-delta version, inside the caller's pause."""
+    (
+        success,
+        message,
+        stats,
+    ) = await _global_state.tokenizer_manager.update_weights_from_delta(obj, request)
+    content = {"success": success, "message": message, "stats": stats}
     return ORJSONResponse(
         content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
     )

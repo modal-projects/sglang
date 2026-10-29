@@ -165,6 +165,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareWeightsFromDeltaReqInput,
+    PrepareWeightsFromDeltaReqOutput,
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
@@ -188,6 +190,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1914,6 +1918,8 @@ class Scheduler(
                     PullWeightsReqInput,
                     self.weight_updater.pull_weights,
                 ),
+                (PrepareWeightsFromDeltaReqInput, self.prepare_weights_from_delta),
+                (UpdateWeightsFromDeltaReqInput, self.update_weights_from_delta),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
@@ -2272,6 +2278,8 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        if self.weight_delta_receiver is not None:
+            self.weight_delta_receiver.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2412,14 +2420,35 @@ class Scheduler(
 
     def init_weight_delta(self) -> None:
         # After the model workers, so the serving tensors are final.
-        self.weight_delta_map = None
+        self.weight_delta_map = self.weight_delta_receiver = None
         if get_model().enable_weight_delta:
             from sglang.srt.weight_sync.weight_delta.map import load_map
+            from sglang.srt.weight_sync.weight_delta.receiver import Receiver
 
             runners = self.tp_worker.weight_update_runners()
             if self.draft_worker is not None:
                 runners += self.draft_worker.weight_update_runners()
             self.weight_delta_map = load_map(runners)
+            self.weight_delta_receiver = Receiver(
+                self.weight_delta_map,
+                get_model().weight_delta_codec,
+                torch.device("cuda", torch.cuda.current_device()),
+                self.send_control_output,
+            )
+
+    def prepare_weights_from_delta(self, req: PrepareWeightsFromDeltaReqInput):
+        if self.weight_delta_receiver is None:
+            return PrepareWeightsFromDeltaReqOutput(
+                success=False, message="--enable-weight-delta is not set"
+            )
+        return self.weight_delta_receiver.prepare(req)
+
+    def update_weights_from_delta(self, req: UpdateWeightsFromDeltaReqInput):
+        if self.weight_delta_receiver is None:
+            return UpdateWeightsFromDeltaReqOutput(
+                success=False, message="--enable-weight-delta is not set"
+            )
+        return self.weight_delta_receiver.update(req, self.weight_updater)
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:

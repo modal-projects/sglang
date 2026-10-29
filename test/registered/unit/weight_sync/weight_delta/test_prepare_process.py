@@ -96,6 +96,14 @@ class TestPrepareProcess(CustomTestCase):
                 _write_version(self.directory, ["a.bias"], base_version=3), "4"
             )
 
+    def test_a_dead_process_raises_instead_of_waiting_for_a_reply(self):
+        process = PrepareProcess(_table_of_loaded(), threads=1)
+        process._process.kill()
+        process._process.join(timeout=30)
+        with self.assertRaisesRegex(RuntimeError, "prepare process exited"):
+            process.prepare(_write_version(self.directory, ["a.bias"]), "4")
+        process.close()
+
     def test_the_process_stops_with_close(self):
         process = PrepareProcess(_table_of_loaded(), threads=1)
         process.close()

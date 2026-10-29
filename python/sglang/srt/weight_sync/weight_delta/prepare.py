@@ -116,18 +116,33 @@ class PrepareProcess:
         self, manifest_path: str | Path, engine_version: str
     ) -> tuple[Prepared, torch.Tensor]:
         """The version's preparation and its staged bytes, pinned, valid until the next prepare."""
+        self.start(manifest_path, engine_version)
+        while (result := self.poll()) is None:
+            self.check_alive()
+            self._socket.poll(1000)
+        return result
+
+    def start(self, manifest_path: str | Path, engine_version: str) -> None:
+        self.check_alive()
         self._socket.send_pyobj((str(manifest_path), engine_version))
-        while not self._socket.poll(1000):
-            if not self._process.is_alive():
-                raise RuntimeError(
-                    f"the weight-delta prepare process exited with {self._process.exitcode}"
-                )
+
+    def poll(self) -> tuple[Prepared, torch.Tensor] | None:
+        """What prepare returns once the started preparation is done, else None."""
+        if not self._socket.poll(0):
+            return None
         prepared = self._socket.recv_pyobj()
         if isinstance(prepared, BaseException):
             raise prepared
         if prepared.staging_capacity != len(self._staged):
             self._pin(prepared.staging_capacity)
         return prepared, self._staged[: prepared.staged_end]
+
+    def check_alive(self) -> None:
+        """Without the process, a send waits forever and no reply comes."""
+        if not self._process.is_alive():
+            raise RuntimeError(
+                f"the weight-delta prepare process exited with {self._process.exitcode}"
+            )
 
     def close(self) -> None:
         self._process.terminate()

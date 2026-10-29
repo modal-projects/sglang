@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.megakernels import binding as mb
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -100,6 +101,7 @@ class RequestPool(HybridReqToTokenPool):
             conv=[self.mamba_pool.conv[0][dense]],
             temporal=self.mamba_pool.temporal[dense],
             replayssm_d=None,
+            replayssm_rawv=None,
         )
 
 
@@ -153,9 +155,8 @@ def hybrid_backend():
 def forward_batch():
     return SimpleNamespace(
         batch_size=2,
-        forward_mode="decode",
+        forward_mode=ForwardMode.DECODE,
         out_cache_loc=torch.zeros(2, dtype=torch.int32),
-        out_cache_loc_is_physical=True,
     )
 
 
@@ -236,29 +237,25 @@ class TestMegakernelBinding(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "kv_pool"):
                 binding.assert_live()
 
-    def test_hybrid_preparation_rejects_replayssm_on_any_kda_layer(self):
-        for layer_id in (0, 2):
-            with self.subTest(layer_id=layer_id):
-                fixture = hybrid_backend()
-                binding = mb.MegakernelBinding(model=torch.nn.Module())
-                layer_cache = fixture.request_pool.mamba2_layer_cache
-                replay_state = layer_cache(layer_id)
-                replay_state.replayssm_d = torch.zeros(1)
-                with (
-                    patch.object(
-                        fixture.request_pool,
-                        "mamba2_layer_cache",
-                        side_effect=lambda current_layer: (
-                            replay_state
-                            if current_layer == layer_id
-                            else layer_cache(current_layer)
-                        ),
-                    ),
-                    self.assertRaisesRegex(
-                        ValueError, f"KDA layer {layer_id}.*ReplaySSM"
-                    ),
-                ):
-                    binding.preparation_view(fixture.runner)
+    def test_hybrid_preparation_exposes_the_replayssm_ring_per_kda_layer(self):
+        fixture = hybrid_backend()
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        layer_cache = fixture.request_pool.mamba2_layer_cache
+        ring_state = layer_cache(2)
+        ring = {name: torch.zeros(1) for name in ("rawv", "rawk", "g", "beta")}
+        for name, tensor in ring.items():
+            setattr(ring_state, f"replayssm_{name}", tensor)
+        with patch.object(
+            fixture.request_pool,
+            "mamba2_layer_cache",
+            side_effect=lambda layer_id: (
+                ring_state if layer_id == 2 else layer_cache(layer_id)
+            ),
+        ):
+            kda = binding.preparation_view(fixture.runner).hybrid.kda
+        self.assertIsNone(kda.state(0).ring)
+        for name, tensor in ring.items():
+            self.assertIs(getattr(kda.state(2).ring, name), tensor)
 
     def test_hybrid_preparation_is_typed_stable_and_capacity_is_live(self):
         fixture = hybrid_backend()
@@ -365,13 +362,6 @@ class TestMegakernelBinding(CustomTestCase):
         self.assertIs(args[2], state.temporal)
         self.assertIs(args[3], view.hybrid.kda.state_indices)
         self.assertEqual(args[4], 2)
-
-        batch.out_cache_loc_is_physical = False
-        with (
-            patch(BACKEND, return_value=fixture.backend),
-            self.assertRaisesRegex(RuntimeError, "write slots are not physical"),
-        ):
-            binding.forward_view(batch)
 
     def test_capture_metadata_allows_content_updates_but_not_replacement(self):
         fixture = hybrid_backend()

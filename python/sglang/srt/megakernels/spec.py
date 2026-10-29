@@ -144,6 +144,9 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     backends and pools exist, before autotune and graph capture. It receives a
     typed PreparationView rather than the model runner and must be idempotent:
     preparation may repeat when the warmup lifecycle resets for recapture.
+
+    Optional prepare_weights(model, hf_config) lays out weights as weight loading
+    finishes, before a loader can publish them to peers, and must be idempotent.
     """
 
     name: str
@@ -158,6 +161,8 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     # (cfg, hf_config), before load: the checks requires cannot state
     config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # (model, hf_config), as weight loading finishes
+    prepare_weights: Optional[Callable[[torch.nn.Module, Any], None]] = None
 
 
 # HF architecture -> the "module:attribute" path of its spec

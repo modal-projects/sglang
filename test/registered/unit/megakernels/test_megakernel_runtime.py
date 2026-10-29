@@ -114,7 +114,7 @@ class TestMegakernelRuntime(CustomTestCase):
                 return_value=False,
             ),
         ):
-            base_runner.BaseRunner._warmup(runner)
+            base_runner.BaseRunner.warmup(runner)
 
     def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
         lm = install(tokens=1)
@@ -312,6 +312,25 @@ class TestMegakernelRuntime(CustomTestCase):
         capture([2, 8], capture_bs=[2, 8])
         with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
             capture([8, 16], capture_bs=[8, 16])
+
+    def test_prepare_weights_runs_unless_install_would_refuse(self):
+        prepare_weights = Mock()
+        spec = replace(SPEC, prepare_weights=prepare_weights)
+        refused = replace(spec, model_disable_reasons=lambda model, hf: ["refused"])
+        model, hf_config = Lm(), SimpleNamespace(architectures=[ARCH])
+        gpu = SimpleNamespace(multi_processor_count=160)
+        with (
+            patch.object(runtime, "device_isa", return_value=ISA),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(torch.cuda, "get_device_properties", return_value=gpu),
+        ):
+            for found in (spec, refused, SPEC, None):
+                with patch.object(runtime, "find_spec", return_value=(found, "")):
+                    runtime.prepare_megakernel_weights(model, hf_config)
+            publish(server_args(enable_nvidia_megakernel=False), role="test")
+            with patch.object(runtime, "find_spec", return_value=(spec, "")):
+                runtime.prepare_megakernel_weights(model, hf_config)
+        prepare_weights.assert_called_once_with(model, hf_config)
 
 
 if __name__ == "__main__":

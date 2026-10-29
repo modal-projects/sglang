@@ -421,7 +421,8 @@ class MegakernelBinding:
             HybridReqToTokenPool,
         )
 
-        full_backend = backend.full_attn_backend
+        full_attention = backend.full_attn_backend
+        full_backend = _decode_backend(full_attention)
         linear_backend = backend.linear_attn_backend
         token_pool = backend.token_to_kv_pool
         request_pool = backend.req_to_token_pool
@@ -445,7 +446,7 @@ class MegakernelBinding:
                 raise ValueError(
                     f"megakernel binding: {role} backend request pool differs"
                 )
-        if tuple(backend.attn_backend_list) != (full_backend, linear_backend):
+        if tuple(backend.attn_backend_list) != (full_attention, linear_backend):
             raise ValueError("megakernel binding: hybrid backend children differ")
 
         sources = _HybridSources(
@@ -600,7 +601,7 @@ class MegakernelBinding:
         return _HybridSources(
             model_runner=sources.model_runner,
             backend=backend,
-            full_backend=backend.full_attn_backend,
+            full_backend=_decode_backend(backend.full_attn_backend),
             linear_backend=backend.linear_attn_backend,
             token_pool=backend.token_to_kv_pool,
             full_pool=backend.token_to_kv_pool.full_kv_pool,
@@ -679,6 +680,13 @@ class MegakernelBinding:
         # only models with Engram layers have a hasher
         hasher = getattr(self._model, "engram_hasher", None)
         return None if hasher is None else hasher.history
+
+
+def _decode_backend(backend: Any) -> Any:
+    """The backend serving decode and verify steps of a prefill/decode split."""
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+    return backend.decode_backend if isinstance(backend, HybridAttnBackend) else backend
 
 
 def _identity(value: Any) -> tuple:

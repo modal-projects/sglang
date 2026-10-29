@@ -1730,7 +1730,7 @@ class KimiK3MoE(nn.Module):
         e = router_logits.shape[1]
         if not (
             m * cfg.top_k > 256
-            and router_logits.dtype in (torch.bfloat16, torch.float32)
+            and router_logits.dtype == torch.bfloat16
             and router_logits.stride(1) == 1
             and routed_input.dtype == torch.bfloat16
             and routed_input.dim() == 2

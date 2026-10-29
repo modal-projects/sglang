@@ -817,13 +817,26 @@ class KimiK3MoE(nn.Module):
             from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
             if k3_rocm_dense_fp8.front_enabled():
+                fp8_mods, fp8_sizes, scale = mods, self._front_sizes, None
                 if envs.SGLANG_K3_ROUTER_GATE_HIGH_PREC.get():
-                    self._gate_hp_w = self.gate.weight.data.clone()
+                    # The gate stays bf16 outside the E4M3 front (its split slot is
+                    # empty). Keep the full-front scale so the other rows quantize
+                    # exactly as without the flag.
+                    g0, ng = self._front_sizes[0], self._front_sizes[1]
+                    scale = k3_rocm_dense_fp8.weight_scale(self._front_w)
+                    self._gate_hp_w = self._front_w[g0 : g0 + ng].clone()
+                    self.gate.weight.data = self._gate_hp_w
+                    self._front_w = torch.cat(
+                        [self._front_w[:g0], self._front_w[g0 + ng :]]
+                    )
+                    fp8_mods = [m for m in mods if m is not self.gate]
+                    fp8_sizes = [s for i, s in enumerate(self._front_sizes) if i != 1]
+                    self._front_sizes = [self._front_sizes[0], 0, *self._front_sizes[2:]]
                 # One E4M3 copy of the merged front; the bf16 component weights
                 # become row views of it (the fused front is their only reader).
-                fp8 = k3_rocm_dense_fp8.StaticFP8Weight(self._front_w)
+                fp8 = k3_rocm_dense_fp8.StaticFP8Weight(self._front_w, scale)
                 off = 0
-                for mod, rows in zip(mods, self._front_sizes):
+                for mod, rows in zip(fp8_mods, fp8_sizes):
                     mod.weight.data = fp8.weight[off : off + rows]
                     off += rows
                 self._front_w = fp8.weight

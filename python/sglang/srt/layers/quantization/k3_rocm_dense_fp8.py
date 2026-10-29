@@ -44,11 +44,20 @@ def qkvg_enabled() -> bool:
 
 
 @torch.no_grad()
-def quantize_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """[N, K] bf16/fp16 -> ([N, K] E4M3, scalar fp32 scale) with scale = amax / 448."""
+def weight_scale(weight: torch.Tensor) -> torch.Tensor:
+    """Per-tensor E4M3 scale amax / 448 (scalar fp32)."""
+    amax = weight.abs().amax().float().clamp(min=1e-12)
+    return (amax / _FP8_MAX).reshape(())
+
+
+def quantize_weight(
+    weight: torch.Tensor, scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[N, K] bf16/fp16 -> ([N, K] E4M3, scalar fp32 scale) with scale = amax / 448
+    unless ``scale`` is given."""
     w = weight.float()
-    amax = w.abs().amax().clamp(min=1e-12)
-    scale = (amax / _FP8_MAX).reshape(())
+    if scale is None:
+        scale = weight_scale(weight)
     q = (w / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8).contiguous()
     return q, scale.to(torch.float32)
 
@@ -98,10 +107,10 @@ class StaticFP8Weight:
 
     _MAX_TOKENS = 1 << 15
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor, scale: torch.Tensor | None = None):
         from aiter.ops.shuffle import shuffle_weight
 
-        q, scale = quantize_weight(weight)
+        q, scale = quantize_weight(weight, scale)
         self.n, self.k = q.shape
         # Only the pre-shuffled copy is kept; module-weight views that alias it are
         # placeholders (their layers are routed here and never read them directly).

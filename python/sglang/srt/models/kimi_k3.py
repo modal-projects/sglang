@@ -481,6 +481,9 @@ def _maybe_dump_router_input(moe: "KimiK3MoE", hidden_states: torch.Tensor) -> N
     out_dir = envs.SGLANG_K3_ROUTER_DUMP_DIR.get()
     if not out_dir or torch.cuda.is_current_stream_capturing():
         return
+    # Armed by creating <dir>/ARM after warmup, so dumps hold real traffic.
+    if not os.path.exists(os.path.join(out_dir, "ARM")):
+        return
     if get_parallel().tp_group.rank_in_group != 0:
         return
     layer_idx = moe.layer_idx
@@ -488,7 +491,6 @@ def _maybe_dump_router_input(moe: "KimiK3MoE", hidden_states: torch.Tensor) -> N
     if seen >= _ROUTER_DUMP_MAX_TOKENS or hidden_states.shape[0] < 16:
         return
     rows = hidden_states[: _ROUTER_DUMP_MAX_TOKENS - seen].detach().cpu()
-    os.makedirs(out_dir, exist_ok=True)
     fp8 = moe._front_fp8
     torch.save(
         {

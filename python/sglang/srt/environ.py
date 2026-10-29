@@ -2091,6 +2091,10 @@ class Envs:
     # CustomAllReduceV2 with multicast is available; set 0/1 to override in
     # either direction. See srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
+    # ROCm K3 TP8: take the fused AllReduce / AllGather + attention-residual
+    # aggregation (k3_ar_agg_lt_hip) for 65..512 tokens too, instead of the
+    # collective plus a separate aggregation kernel.
+    SGLANG_K3_AR_AGG_LT = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See

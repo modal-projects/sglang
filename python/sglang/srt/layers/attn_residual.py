@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -90,6 +91,29 @@ def fused_max_t() -> int:
     """Token ceiling of the fused AllReduce + aggregation (0 when disabled), the
     same for the all-reduce and the all-gather variant."""
     return 64 if is_hip() else 0
+
+
+def fused_kernel(ca, num_tokens: int, hidden_size: int, nvb: int):
+    """The fused AllReduce / AllGather + aggregation module for this shape, or
+    None: k3_ar_agg_hip up to fused_max_t() tokens, then (opt-in,
+    SGLANG_K3_AR_AGG_LT) the single-launch large-T k3_ar_agg_lt_hip."""
+    if num_tokens <= fused_max_t():
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        return (
+            k3_ar_agg_hip
+            if k3_ar_agg_hip.usable(ca, num_tokens, hidden_size, nvb)
+            else None
+        )
+    if not (is_hip() and envs.SGLANG_K3_AR_AGG_LT.get()):
+        return None
+    from sglang.kernels.ops.communication import k3_ar_agg_lt_hip
+
+    return (
+        k3_ar_agg_lt_hip
+        if k3_ar_agg_lt_hip.usable(ca, num_tokens, hidden_size, nvb)
+        else None
+    )
 
 
 def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:
@@ -614,17 +638,16 @@ class AttnResidual:
         (o_proj output) and aggregate in one kernel. Same result as
         forward(all_reduce(partial), prefix_sum, ...) (no bank write). None
         when the fused kernel does not apply; the caller then reduces."""
-        from sglang.kernels.ops.communication import k3_ar_agg_hip
-
         nvb = self.num_valid_blocks
         T, H = partial.shape
-        if T > fused_max_t() or not k3_ar_agg_hip.usable(ca, T, H, nvb):
+        kernel = fused_kernel(ca, T, H, nvb)
+        if kernel is None:
             return None
         if prefix_sum is not None and prefix_sum.shape != partial.shape:
             return None
         self.flush_stream()
         out, prefix, out_fp8 = self._fused_outputs(partial)
-        k3_ar_agg_hip.ar_agg(
+        kernel.ar_agg(
             ca,
             partial.contiguous(),
             prefix_sum,
@@ -661,20 +684,17 @@ class AttnResidual:
         out_norm / write are that layer's). Returns h; the aggregation is
         stashed and handed out by the next forward() on exactly (h, None,
         score_proj, write). None when the fused kernel does not apply."""
-        from sglang.kernels.ops.communication import k3_ar_agg_hip
-
         nvb = self.num_valid_blocks
         T = y.shape[0]
         H = add_b.shape[1]
         if (
-            T > fused_max_t()
-            or not k3_ar_agg_hip.usable(ca, T, H, nvb)
+            (kernel := fused_kernel(ca, T, H, nvb)) is None
             or (write and self.block_residual.shape[1] <= nvb)
             or self._stream_pending is not None
         ):
             return None
         out, h, out_fp8 = self._fused_outputs(add_b)
-        k3_ar_agg_hip.ag_agg(
+        kernel.ag_agg(
             ca,
             y.contiguous(),
             add_b,

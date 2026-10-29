@@ -124,6 +124,13 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    # f_b prologue: `a` holds the rank-R f_a rows and the gate is
+    # f_a @ fb_w[i_hv*K:(i_hv+1)*K].T, rounded to a's dtype like the
+    # standalone f_b GEMM output.
+    fb_w=None,  # [HV*K, FB_R]
+    FB_PROLOGUE: tl.constexpr = False,
+    FB_R: tl.constexpr = 128,
+    FB_ROWS: tl.constexpr = 16,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -162,6 +169,19 @@ def fused_kda_conv_gating_verify_kernel(
     if cs_idx < 0:
         return
     cs_base = conv_state + cs_idx * stride_cs_line
+
+    if FB_PROLOGUE:
+        o_fr = tl.arange(0, FB_ROWS)
+        o_r = tl.arange(0, FB_R)
+        b_fa = tl.load(
+            a + (bos + o_fr)[:, None] * stride_a_tok + o_r[None, :],
+            mask=(o_fr < T)[:, None],
+            other=0.0,
+        )
+        b_fbw = tl.load(fb_w + (i_hv * K + o_k)[None, :] * FB_R + o_r[:, None])
+        b_gate_all = (
+            tl.dot(b_fa, b_fbw).to(a.dtype.element_ty).to(tl.float32)
+        )  # [FB_ROWS, K]
 
     # Conv history (state_len = W-1 columns, oldest -> newest). Matches the
     # reference kernel's col0..col2 preload (KERNEL_WIDTH == 4).
@@ -311,9 +331,12 @@ def fused_kda_conv_gating_verify_kernel(
 
         # ---- sigmoid-gating delta rule step (mirrors the reference kernel) ----
         b_b = tl.load(b_gate + (bos + t) * stride_b_tok + i_hv).to(tl.float32)
-        b_a = tl.load(
-            a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
-        ).to(tl.float32)
+        if FB_PROLOGUE:
+            b_a = tl.sum(tl.where((o_fr == t)[:, None], b_gate_all, 0.0), axis=0)
+        else:
+            b_a = tl.load(
+                a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
+            ).to(tl.float32)
 
         gx = b_a + b_dt_bias
         if USE_LOWER_BOUND:
@@ -454,6 +477,8 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    # Deferred f_b: `a` is f_a [seq_len, R] and the kernel applies f_b itself.
+    f_b_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -502,7 +527,14 @@ def fused_kda_conv_gating_verify(
         BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
-    a2 = a.reshape(seq_len, HV * K)
+    if f_b_weight is not None:
+        a2 = a.reshape(seq_len, -1)
+        assert f_b_weight.is_contiguous() and f_b_weight.shape == (HV * K, a2.shape[1])
+        assert f_b_weight.dtype == a2.dtype and T <= 16
+        fb_kwargs = dict(fb_w=f_b_weight, FB_PROLOGUE=True, FB_R=a2.shape[1])
+    else:
+        a2 = a.reshape(seq_len, HV * K)
+        fb_kwargs = {}
     b2 = b.reshape(seq_len, HV)
     assert a2.stride(-1) == 1 and b2.stride(-1) == 1
     o = mixed_qkv.new_empty(seq_len, HV, V)
@@ -624,6 +656,7 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        **fb_kwargs,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,

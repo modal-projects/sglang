@@ -179,6 +179,7 @@ def k3_mla_verify_auto(
     v_head_dim: int = 512,
     out: Optional[torch.Tensor] = None,
     thresh: Optional[int] = None,
+    cta_fit: bool = False,
 ) -> torch.Tensor:
     """MLA target verify with on-device Gluon/HipKittens regime selection.
 
@@ -240,7 +241,8 @@ def k3_mla_verify_auto(
 
     # v2 operands / partials
     min_chunk = _SPLIT_MIN_CHUNK
-    nsplit = max(2, default_num_splits(bs))
+    # cta_fit: floor(256 / bs) splits so bs * nsplit never exceeds one CTA per CU.
+    nsplit = max(2, min(256, 256 // bs)) if cta_fit else max(2, default_num_splits(bs))
     block_n = 64
     o_part = torch.empty(
         (bs, nsplit, rows, v_head_dim), dtype=torch.bfloat16, device=dev
@@ -313,7 +315,8 @@ def k3_mla_verify_auto(
         hk_stage1,
     )
 
-    hk_p8 = PART8_MIN_SPLITS if hip_reduce_enabled(nsplit) else 0
+    use_hip_reduce = hip_reduce_enabled(nsplit)
+    hk_p8 = PART8_MIN_SPLITS if use_hip_reduce else 0
     hk_stage1(
         q,
         kv,
@@ -333,7 +336,7 @@ def k3_mla_verify_auto(
         hk_reduce,
     )
 
-    if hip_reduce_enabled(nsplit):
+    if use_hip_reduce:
         hk_reduce(
             o_part,
             lse_part,

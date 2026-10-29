@@ -1356,6 +1356,7 @@ class AiterAttnBackend(AttentionBackend):
         return k3_mla_verify_auto(
             *args,
             kv_scale_float=self._resolve_fp8_kv_scale_float(layer, k_descale),
+            cta_fit=envs.SGLANG_K3_MLA_VERIFY_CTA_SPLITS.get(),
             **kwargs,
         )
 

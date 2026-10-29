@@ -12,7 +12,7 @@ collective plus attn_res_smallm_hip; the aggregation is spread over
 T x 4 blocks, its score / norm statistics riding the collective's barrier
 (see ``jit/csrc/kimi_k3/comm/ar_agg_hip.cuh``). The AR / add3 row and the bank
 snapshot are bit-identical to the unfused path; the normalized output matches
-up to rare 1-ulp bf16 flips (fp32 reduction order). Token counts 1..80.
+up to rare 1-ulp bf16 flips (fp32 reduction order). Token counts 1..128.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import torch
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 WORLD_SIZE = 8
-MAX_T = 80
+MAX_T = 128
 MAX_NVB = 8
 THREADS = 256
 REGION_BYTES = 1 << 20

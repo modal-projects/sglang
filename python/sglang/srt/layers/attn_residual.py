@@ -88,8 +88,13 @@ def smallm_max_t() -> int:
 @functools.cache
 def fused_max_t() -> int:
     """Token ceiling of the fused AllReduce + aggregation (0 when disabled), the
-    same for the all-reduce and the all-gather variant."""
-    return 64 if is_hip() else 0
+    same for the all-reduce and the all-gather variant. SGLANG_K3_AR_AGG_MAX_T
+    (<= 128) opts larger decode batches into the fused kernel."""
+    if not is_hip():
+        return 0
+    from sglang.srt.utils import get_int_env_var
+
+    return min(get_int_env_var("SGLANG_K3_AR_AGG_MAX_T", 64), 128)
 
 
 def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:

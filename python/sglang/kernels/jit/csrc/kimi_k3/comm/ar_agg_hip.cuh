@@ -80,12 +80,17 @@ namespace k3_ar_agg {
 constexpr int kNG = 8;
 constexpr int kVec = 8;
 constexpr int kThreads = 256;
-constexpr int kMaxT = aiter::kMaxBlocks;  // start-barrier slots
+constexpr int kMaxT = 128;
+// Above aiter::kMaxBlocks start-barrier slots, producers t and t + kPairT share
+// slot t: t takes the AITER barrier, then opens a device-local gate for t + kPairT.
+constexpr int kPairT = 64;
 constexpr int64_t kRegionBytes = 1 << 20;
 constexpr int64_t kDataOff = 0, kDataPar = 256 << 10;         // [T][slice] packs
 constexpr int64_t kStatOff = 512 << 10, kStatPar = 64 << 10;  // [T][64] fp32
 constexpr int64_t kFlagOff = 768 << 10, kFlagPar = 64 << 10;  // [T * split][8] u32
+constexpr int64_t kGateOff = 960 << 10;                       // [kPairT] u32, this rank only
 constexpr int kStatStride = 64;
+static_assert(kMaxT <= 2 * kPairT && kPairT <= aiter::kMaxBlocks);
 
 using vec_t = device::AlignedVector<bf16_t, kVec>;
 using OP = opus::vector_t<opus::bf16_t, kVec>;
@@ -138,6 +143,29 @@ __device__ __forceinline__ void start_wait(const Params& p, int slot, uint32_t f
   }
   __syncthreads();
   if (threadIdx.x == 0) p.self_sg->_flag[slot] = flag;
+}
+
+// Gate between producers t and t + kPairT (T > aiter::kMaxBlocks). Kernels on
+// one stream do not overlap, so a set-by-t / reset-by-(t + kPairT) flag needs
+// no parity; t + kPairT has the higher block index (dispatched later).
+__device__ __forceinline__ uint32_t* gate(const Params& p, int slot) {
+  return reinterpret_cast<uint32_t*>(region(p, p.rank) + kGateOff) + slot;
+}
+
+__device__ __forceinline__ void producer_start(const Params& p, int t) {
+  if (p.T <= aiter::kMaxBlocks || t < kPairT) {
+    start_wait(p, t, start_arrive(p, t));
+    if (p.T > aiter::kMaxBlocks && t + kPairT < p.T && threadIdx.x == 0)
+      __scoped_atomic_store_n(gate(p, t), 1u, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+  } else {
+    if (threadIdx.x == 0) {
+      uint32_t* g = gate(p, t - kPairT);
+      while (__scoped_atomic_load_n(g, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) == 0u)
+        ;
+      __scoped_atomic_store_n(g, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+    __syncthreads();
+  }
 }
 
 __device__ __forceinline__ uint8_t to_e4m3(float x) {
@@ -222,9 +250,7 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
     }
     // kAR: post this rank's start flag now, wait after the local loads were
     // issued (the bank / cw / prefix loads above overlap the barrier)
-    uint32_t sflag = 0;
-    if constexpr (kMode == kAR) sflag = start_arrive(p, t);
-    if constexpr (kMode == kAR) start_wait(p, t, sflag);
+    if constexpr (kMode == kAR) producer_start(p, t);
     // kAR: issue the peer loads first; the bank statistics below overlap them
     OP xin[kNG];
     int flat = 0;
@@ -562,7 +588,7 @@ struct ArAgg {
     RuntimeCheck(ca->world_size_ == kNG, "ar_agg is TP8 only");
     const int64_t T = prefix_out.size(0);
     const int64_t H = prefix_out.size(1);
-    RuntimeCheck(T >= 1 && T <= kMaxT, "ar_agg: 1 <= T <= 80");
+    RuntimeCheck(T >= 1 && T <= kMaxT, "ar_agg: 1 <= T <= 128");
     RuntimeCheck(H % (kVec * kNG) == 0, "ar_agg: H must be a multiple of 64");
     const int64_t n_vecs = H / kVec, sv = n_vecs / kNG;
     const int64_t chunk = (n_vecs + split - 1) / split;

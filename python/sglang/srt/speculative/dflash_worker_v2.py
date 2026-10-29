@@ -67,6 +67,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dense_head_weight,
+    rocm_fused_selector_sampled_verify,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -1670,6 +1671,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        fused = rocm_fused_selector_sampled_verify(
+            candidates=candidates,
+            next_token_logits=next_token_logits,
+            candidate_ids=candidate_ids,
+            q_rows=q_rows,
+            sampling_info=sampling_info,
+            block_verification=self._block_verification,
+        )
+        if fused is not None:
+            return fused[0].to(torch.int32), fused[1].to(torch.int64)
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])

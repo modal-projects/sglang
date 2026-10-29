@@ -1651,6 +1651,9 @@ class Envs:
     SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY = EnvBool(True)
     # Dense below this batch size; fused measured faster at every bs >= 1.
     SGLANG_DFLASH_ROCM_FUSED_SAMPLED_VERIFY_MIN_BS = EnvInt(1)
+    # Also route selector (sampled-q) drafts through the fused verify, instead
+    # of a dense q scatter + sort-based filter + chain rejection sampling.
+    SGLANG_DFLASH_ROCM_FUSED_SELECTOR_VERIFY = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
     # out of a single contiguous region instead of grown segment by segment.
     SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)

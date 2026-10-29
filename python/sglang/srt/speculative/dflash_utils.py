@@ -77,6 +77,62 @@ def _use_rocm_fused_sampled_verify(
     return not filtering or get_exec().kernel.sampling_backend == "pytorch"
 
 
+_selector_dispatch_logged = False
+
+
+def rocm_fused_selector_sampled_verify(
+    *,
+    candidates: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    q_rows: torch.Tensor,
+    sampling_info: Any,
+    block_verification: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fused verify of a sampled selector draft (sparse q over K candidates).
+
+    Returns (accept_len int32 [bs], bonus int64 [bs]), or None to take the
+    dense path (q scatter + accept_sampling).
+    """
+    global _selector_dispatch_logged
+    bs = int(candidates.shape[0])
+    enabled = envs.SGLANG_DFLASH_ROCM_FUSED_SELECTOR_VERIFY.get()
+    use = (
+        enabled
+        and not block_verification
+        and _use_rocm_fused_sampled_verify(sampling_info, next_token_logits, bs)
+    )
+    if not _selector_dispatch_logged:
+        _selector_dispatch_logged = True
+        logger.info(
+            "DFlash selector sampled verify: fused_rocm=%s (flag=%s, hip=%s, "
+            "block_verification=%s, sampling_backend=%s, logits_stride=%s)",
+            use,
+            enabled,
+            is_hip(),
+            block_verification,
+            get_exec().kernel.sampling_backend,
+            next_token_logits.stride(-1),
+        )
+    if not use:
+        return None
+    device = candidates.device
+    block = int(candidates.shape[1])
+    return dflash_sampled_verify_rocm(
+        logits=next_token_logits,
+        candidates=candidates,
+        temperatures=sampling_info.temperatures,
+        top_ks=sampling_info.top_ks,
+        top_ps=sampling_info.top_ps,
+        coins=torch.rand((bs, block), dtype=torch.float32, device=device),
+        coins_final=torch.rand((bs,), dtype=torch.float32, device=device),
+        apply_top_k=bool(getattr(sampling_info, "need_top_k_sampling", True)),
+        apply_top_p=bool(getattr(sampling_info, "need_top_p_sampling", False)),
+        draft_ids=candidate_ids,
+        draft_q=q_rows,
+    )
+
+
 # DFlash does not run sampling verify on NPU, even where the op exists.
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
     tree_speculative_sampling_target_only is not None and not is_npu()

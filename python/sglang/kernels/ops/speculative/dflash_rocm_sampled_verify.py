@@ -1,9 +1,10 @@
 """Fused target-only sampled verify for DFLASH chains (Triton, ROCm).
 
 Equivalent to: softmax(logits / T) -> top-k/top-p renorm (sorted order, ties by
-index) -> speculative rejection sampling of a greedy (one-hot) draft chain ->
-residual / bonus sampling. Never materializes probabilities or sorts the
-vocabulary. Every vocab pass is split into chunks across programs:
+index) -> speculative rejection sampling of a draft chain (greedy one-hot, or a
+sampled draft with sparse q over K candidates) -> residual / bonus sampling.
+Never materializes probabilities or sorts the vocabulary. Every vocab pass is
+split into chunks across programs:
 
 1. per-chunk max / partition function;
 2. per-chunk histogram of (row_max - s) in buckets of width _BW, plus
@@ -429,6 +430,47 @@ def _kept(s, idx, v_key, last):
 
 
 @triton.jit
+def _draft_q(ids_ptr, q_ptr, qrow, K, tok, K_PAD: tl.constexpr):
+    """q(tok) for one draft row stored sparsely as K (id, q) pairs."""
+    kk = tl.arange(0, K_PAD)
+    km = kk < K
+    base = qrow.to(tl.int64) * K
+    ids = tl.load(ids_ptr + base + kk, mask=km, other=-1)
+    qs = tl.load(q_ptr + base + kk, mask=km, other=0.0)
+    return tl.sum(tl.where(ids == tok, qs, 0.0), axis=0)
+
+
+@triton.jit
+def _residual(
+    s,
+    offs,
+    valid,
+    row_max,
+    inv_zk,
+    v_key,
+    last,
+    ids_ptr,
+    q_ptr,
+    qrow,
+    K,
+    all_acc,
+    K_PAD: tl.constexpr,
+):
+    """max(p - q, 0) over a block (p alone once every draft is accepted)."""
+    kept = valid & _kept(s, offs, v_key, last)
+    p = tl.where(kept, tl.exp(s - row_max) * inv_zk, 0.0)
+    kk = tl.arange(0, K_PAD)
+    km = kk < K
+    base = qrow.to(tl.int64) * K
+    ids = tl.load(ids_ptr + base + kk, mask=km, other=-1)
+    qs = tl.load(q_ptr + base + kk, mask=km, other=0.0)
+    q = tl.sum(tl.where(offs[:, None] == ids[None, :], qs[None, :], 0.0), axis=1)
+    q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+    diff = p - q
+    return tl.where(all_acc, p, tl.where(diff > 0.0, diff, 0.0))
+
+
+@triton.jit
 def _accept_kernel(
     logits_ptr,
     logits_stride,
@@ -439,12 +481,17 @@ def _accept_kernel(
     vkey_ptr,
     last_ptr,
     coins_ptr,
+    ids_ptr,
+    q_ptr,
     part_ptr,
     acc_ptr,
     rej_ptr,
     V,
     C,
+    K,
     D: tl.constexpr,
+    HAS_Q: tl.constexpr,
+    K_PAD: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -463,21 +510,46 @@ def _accept_kernel(
         p = e / tl.load(zkept_ptr + row)
         coin = tl.load(coins_ptr + b * D + (j - 1))
         alive = n_acc == j - 1
-        rej_tok = tl.where(alive & (coin >= p), tok, rej_tok)
-        n_acc = n_acc + (alive & (coin < p)).to(tl.int32)
+        if HAS_Q:
+            q = _draft_q(ids_ptr, q_ptr, b * (D - 1) + (j - 1), K, tok, K_PAD)
+            ok = (q > 0.0) & (q <= 1.0) & (coin * q < p)
+        else:
+            ok = coin < p
+        rej_tok = tl.where(alive & ~ok, tok, rej_tok)
+        n_acc = n_acc + (alive & ok).to(tl.int32)
     row = b * D + n_acc
     row_ptr = logits_ptr + row.to(tl.int64) * logits_stride
     row_max = tl.load(row_max_ptr + row)
     v_key = tl.load(vkey_ptr + row)
     last = tl.load(last_ptr + row)
+    inv_zk = 1.0 / tl.load(zkept_ptr + row)
+    q_row = b * (D - 1) + tl.minimum(n_acc, D - 2)
+    all_acc = n_acc == D - 1
     mass = tl.zeros([BLOCK], dtype=tl.float32)
     for start in range(c * CHUNK, c * CHUNK + CHUNK, BLOCK):
         offs = start + tl.arange(0, BLOCK)
         valid = offs < V
         s = tl.load(row_ptr + offs, mask=valid, other=-float("inf")).to(tl.float32)
         s = s * inv_temp
-        kept = valid & _kept(s, offs, v_key, last) & (offs != rej_tok)
-        mass += tl.where(kept, tl.exp(s - row_max), 0.0)
+        if HAS_Q:
+            mass += _residual(
+                s,
+                offs,
+                valid,
+                row_max,
+                inv_zk,
+                v_key,
+                last,
+                ids_ptr,
+                q_ptr,
+                q_row,
+                K,
+                all_acc,
+                K_PAD,
+            )
+        else:
+            kept = valid & _kept(s, offs, v_key, last) & (offs != rej_tok)
+            mass += tl.where(kept, tl.exp(s - row_max), 0.0)
     tl.store(part_ptr + b * C + c, tl.sum(mass, axis=0))
     if c == 0:
         tl.store(acc_ptr + b, n_acc)
@@ -497,9 +569,15 @@ def _bonus_kernel(
     acc_ptr,
     rej_ptr,
     bonus_ptr,
+    zkept_ptr,
+    ids_ptr,
+    q_ptr,
     V,
     C,
+    K,
     D: tl.constexpr,
+    HAS_Q: tl.constexpr,
+    K_PAD: tl.constexpr,
     C_PAD: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -522,6 +600,9 @@ def _bonus_kernel(
     row_max = tl.load(row_max_ptr + row)
     v_key = tl.load(vkey_ptr + row)
     last = tl.load(last_ptr + row)
+    inv_zk = 1.0 / tl.load(zkept_ptr + row)
+    q_row = b * (D - 1) + tl.minimum(n_acc, D - 2)
+    all_acc = n_acc == D - 1
     chosen = -1
     last_valid = -1
     for start in range(c * CHUNK, c * CHUNK + CHUNK, BLOCK):
@@ -530,8 +611,25 @@ def _bonus_kernel(
             valid = offs < V
             s = tl.load(row_ptr + offs, mask=valid, other=-float("inf")).to(tl.float32)
             s = s * inv_temp
-            kept = valid & _kept(s, offs, v_key, last) & (offs != rej_tok)
-            val = tl.where(kept, tl.exp(s - row_max), 0.0)
+            if HAS_Q:
+                val = _residual(
+                    s,
+                    offs,
+                    valid,
+                    row_max,
+                    inv_zk,
+                    v_key,
+                    last,
+                    ids_ptr,
+                    q_ptr,
+                    q_row,
+                    K,
+                    all_acc,
+                    K_PAD,
+                )
+            else:
+                kept = valid & _kept(s, offs, v_key, last) & (offs != rej_tok)
+                val = tl.where(kept, tl.exp(s - row_max), 0.0)
             run = cum + tl.cumsum(val, axis=0)
             first = tl.min(tl.where((run > target) & (val > 0), offs, V), axis=0)
             if first < V:
@@ -556,8 +654,14 @@ def dflash_sampled_verify_rocm(
     coins_final: torch.Tensor,
     apply_top_k: bool = True,
     apply_top_p: bool = True,
+    draft_ids: torch.Tensor = None,
+    draft_q: torch.Tensor = None,
 ):
     """Returns (accept_len int32 [bs], bonus int64 [bs]).
+
+    draft_ids/draft_q: optional sparse draft distribution [bs, D-1, K] (global
+    token ids, q values) for a sampled draft such as the DFlash2 selector; the
+    chain is then verified against q instead of a one-hot draft.
 
     logits: [bs * D, V] post-processing target logits (before temperature).
     candidates: [bs, D]; column 0 is the verified root, 1..D-1 the draft chain.
@@ -687,6 +791,17 @@ def dflash_sampled_verify_rocm(
     coins = coins.to(torch.float32).contiguous()
     coins_final = coins_final.reshape(bs).to(torch.float32).contiguous()
     cand = candidates.contiguous()
+    has_q = draft_q is not None
+    if has_q:
+        K = draft_q.shape[-1]
+        assert draft_q.shape == (bs, D - 1, K) and draft_ids.shape == draft_q.shape
+        ids = draft_ids.to(torch.int32).contiguous()
+        qv = draft_q.to(torch.float32).contiguous()
+    else:
+        K = 1
+        ids = cand
+        qv = coins
+    K_PAD = triton.next_power_of_2(K)
     _accept_kernel[(bs, C)](
         logits,
         st,
@@ -697,12 +812,17 @@ def dflash_sampled_verify_rocm(
         v_key,
         last,
         coins,
+        ids,
+        qv,
         part,
         accept_len,
         rej,
         V,
         C,
+        K,
         D=D,
+        HAS_Q=has_q,
+        K_PAD=K_PAD,
         **common,
     )
     _bonus_kernel[(bs,)](
@@ -717,9 +837,15 @@ def dflash_sampled_verify_rocm(
         accept_len,
         rej,
         bonus,
+        z_kept,
+        ids,
+        qv,
         V,
         C,
+        K,
         D=D,
+        HAS_Q=has_q,
+        K_PAD=K_PAD,
         C_PAD=C_PAD,
         **common,
     )

@@ -196,6 +196,7 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--reps", type=int, default=7)
     ap.add_argument("--out", default="")
+    ap.add_argument("--ag-row-min-t", type=int, default=65)
     args = ap.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -212,6 +213,7 @@ def main():
     from sglang.kernels.ops.communication import k3_ar_agg_hip
 
     lt = k3_ar_agg_hip
+    lt.AG_ROW_MIN_T = args.ag_row_min_t
 
     if rank == 0:
         print(

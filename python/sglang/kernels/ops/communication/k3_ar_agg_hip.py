@@ -30,6 +30,8 @@ THREADS = 256
 REGION_BYTES = 1 << 20
 
 _PARITY = [0]
+# ag_agg above 64 tokens: one block per token (bit-identical to the unfused path)
+AG_ROW_MIN_T = 65
 
 
 def _split(hidden_size: int) -> int:
@@ -175,14 +177,24 @@ def ag_agg(
     """prefix_out = bf16(bf16(all_gather(y, -1) + add_b) [+ add_c]);
     out = attn_res_smallm_hip(prefix_out, bank, ...). Each rank reads only its
     own y (the exchange goes through the private tmp region): no input
-    registration, eager or graph."""
+    registration, eager or graph. T >= AG_ROW_MIN_T runs one block per token
+    that pulls peers' y directly (registered in capture, staged eagerly) and
+    is bit-identical to ag_add_one_barrier + attn_res_smallm_hip."""
     T, ld = y.shape
     H = ld * WORLD_SIZE
     assert supported(T, H, nvb), (T, H, nvb)
     assert y.is_contiguous() and cw.dtype == torch.float32
+    row = T >= AG_ROW_MIN_T
+    if not row or (
+        torch.cuda.is_current_stream_capturing()
+        and getattr(ca, "enable_register_for_capturing", True)
+    ):
+        reg_ptr, reg_bytes = 0, 0
+    else:
+        reg_ptr, reg_bytes = ca._pool["input"].data_ptr, ca._pool["input"].max_size
     _module().run(
         ca._ptr,
-        1,
+        2 if row else 1,
         y,
         add_b,
         add_b,
@@ -198,8 +210,8 @@ def ag_agg(
         _flags(None, add_c, write_bank, ow, out_fp8, stream_out),
         float(score_eps),
         float(out_eps),
-        0,
-        0,
+        reg_ptr,
+        reg_bytes,
         _region_off(ca),
         _next_parity(),
         _split(H),

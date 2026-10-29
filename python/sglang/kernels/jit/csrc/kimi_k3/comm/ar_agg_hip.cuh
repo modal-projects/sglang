@@ -71,6 +71,7 @@
 #include <hip/hip_runtime.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../attn_res_smallm.cuh"
 #include <cstdint>
 #include <custom_all_reduce.cuh>  // AITER: CustomAllreduce, RankData, Signal
 
@@ -96,7 +97,7 @@ using vec_t = device::AlignedVector<bf16_t, kVec>;
 using OP = opus::vector_t<opus::bf16_t, kVec>;
 using OA = opus::vector_t<opus::fp32_t, kVec>;
 
-enum Mode : int { kAR = 0, kAG = 1 };
+enum Mode : int { kAR = 0, kAG = 1, kAGRow = 2 };
 
 struct Params {
   aiter::RankData* dp;  // kAR: peer addresses of the registered partials
@@ -515,10 +516,241 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
   }
 }
 
+// ======================= kAGRow: one block per token =======================
+// Same exchange as kAG (each rank publishes its y slice in its own region and
+// flags the peers; consumers pull), but block t then runs attn_res_smallm's
+// per-token math verbatim (448 x 2 vectors, same reductions), so every output
+// is bit-identical to all_gather_lastdim_add + attn_res_smallm_hip.
+// Flags are set by the producer and reset by the consumer (as kAG's).
+constexpr int64_t kRowFlagOff = 896 << 10, kRowFlagPar = 16 << 10;  // [T][8] u32
+constexpr int kRowThreads = 448, kRowVPT = 2;
+static_assert(kMaxT * kNG * 4 <= kRowFlagPar && kRowFlagOff + 2 * kRowFlagPar <= kGateOff);
+
+template <int kNVB>
+__global__ void __launch_bounds__(kRowThreads) ag_row_kernel(const Params __grid_constant__ p) {
+  using namespace device;
+  namespace sm = attn_res_smallm;
+  using F2 = f2_t;
+  constexpr int kR = kNVB + 1;
+  constexpr int kThr = kRowThreads, kVPT = kRowVPT;
+  __shared__ float smem_a[2 * kR * kThr + 2 * kR];
+  __shared__ float smem_b[kThr / 64];
+
+  const int t = blockIdx.x;
+  const int sv = p.slice_vecs;
+  char* mine = region(p, p.rank);
+  const int64_t fpar = kRowFlagOff + p.parity * kRowFlagPar;
+
+  // y is registered (graph) or staged (eager): it is ready at kernel start
+  if (threadIdx.x < kNG)
+    __scoped_atomic_store_n(
+        reinterpret_cast<uint32_t*>(region(p, threadIdx.x) + fpar) + t * kNG + p.rank,
+        1u,
+        __ATOMIC_RELEASE,
+        __MEMORY_SCOPE_SYSTEM);
+
+  // ---- local operands (overlap the exchange) ----
+  const bf16_t* bank_t = p.bank + static_cast<int64_t>(t) * p.stride_bm;
+  const bool has_c = p.add_c != nullptr;
+  vec_t rows[kR][kVPT];
+  vec_t bv[kVPT], cv[kVPT];
+  float cwv[kVPT][kVec];
+#pragma unroll
+  for (int j = 0; j < kVPT; ++j) {
+    const int v = threadIdx.x + j * kThr;
+    if (v < p.n_vecs) {
+#pragma unroll
+      for (int r = 0; r < kNVB; ++r)
+        rows[r][j].load(bank_t + r * p.stride_bb, v);
+      bv[j].load(p.add_b + t * p.stride_b, v);
+      if (has_c) cv[j].load(p.add_c + t * p.stride_c, v);
+#pragma unroll
+      for (int i = 0; i < kVec; ++i)
+        cwv[j][i] = p.cw[v * kVec + i];
+    } else {
+#pragma unroll
+      for (int r = 0; r < kR; ++r)
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+          rows[r][j][i] = cast<bf16_t>(0.f);
+#pragma unroll
+      for (int i = 0; i < kVec; ++i)
+        cwv[j][i] = 0.f;
+    }
+  }
+
+  // ---- wait for the 8 slices of row t ----
+  if (threadIdx.x < kNG) {
+    uint32_t* f = reinterpret_cast<uint32_t*>(mine + fpar) + t * kNG + threadIdx.x;
+    while (__scoped_atomic_load_n(f, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) == 0u)
+      ;
+    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(f, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+  }
+  __syncthreads();
+
+  // ---- gather + add3 (all_gather_lastdim_add rounding) ----
+#pragma unroll
+  for (int j = 0; j < kVPT; ++j) {
+    const int v = threadIdx.x + j * kThr;
+    if (v < p.n_vecs) {
+      const int g = v / sv;
+      vec_t yv;
+      yv.load(reinterpret_cast<const bf16_t*>(p.dp->ptrs[g]) + static_cast<int64_t>(t) * sv * kVec, v - g * sv);
+      OA acc = aiter::upcast(*reinterpret_cast<const OP*>(&yv));
+      aiter::packed_assign_add<opus::fp32_t, kVec>(acc, aiter::upcast(*reinterpret_cast<const OP*>(&bv[j])));
+      OP o = aiter::downcast<OP>(acc);
+      if (has_c) {
+        OA acc2 = aiter::upcast(o);
+        aiter::packed_assign_add<opus::fp32_t, kVec>(acc2, aiter::upcast(*reinterpret_cast<const OP*>(&cv[j])));
+        o = aiter::downcast<OP>(acc2);
+      }
+      rows[kNVB][j] = *reinterpret_cast<const vec_t*>(&o);
+      rows[kNVB][j].store(p.prefix_out + t * p.stride_po, v);
+    }
+  }
+
+  // ---- attn_res_smallm_kernel, verbatim ----
+  if (p.write_bank) {
+#pragma unroll
+    for (int j = 0; j < kVPT; ++j) {
+      const int v = threadIdx.x + j * kThr;
+      if (v < p.n_vecs) rows[kNVB][j].store(p.bank + t * p.stride_bm + kNVB * p.stride_bb, v);
+    }
+  }
+
+  // ---- score partials: <x_r, cw> and <x_r, x_r> (packed fp32 math) ----
+  float part[2 * kR];
+  F2 xf[kR][kVPT][kVec / 2];  // fp32 copies, reused by the mix
+#pragma unroll
+  for (int r = 0; r < kR; ++r) {
+    F2 d = {0.f, 0.f}, s = {0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < kVPT; ++j) {
+      const uint32_t* u = reinterpret_cast<const uint32_t*>(&rows[r][j]);
+#pragma unroll
+      for (int i = 0; i < kVec / 2; ++i) {
+        const F2 x = sm::bf2_to_f2(u[i]);
+        xf[r][j][i] = x;
+        const F2 c = {cwv[j][2 * i], cwv[j][2 * i + 1]};
+        d = x * c + d;
+        s = x * x + s;
+      }
+    }
+    part[2 * r] = d.x + d.y;
+    part[2 * r + 1] = s.x + s.y;
+  }
+  sm::block_sum<2 * kR, kThr>(part, smem_a);
+
+  // ---- global-max softmax (redundantly per thread) ----
+  const float inv_h = 1.0f / static_cast<float>(p.hidden);
+  float score[kR];
+#pragma unroll
+  for (int r = 0; r < kR; ++r)
+    score[r] = part[2 * r] / sqrtf(part[2 * r + 1] * inv_h + p.score_eps);
+  float m = score[kNVB];
+#pragma unroll
+  for (int r = 0; r < kNVB; ++r)
+    m = fmaxf(m, score[r]);
+  float w[kR];
+  float den = 0.f;
+#pragma unroll
+  for (int r = 0; r < kNVB; ++r) {
+    w[r] = expf(score[r] - m);
+    den += w[r];
+  }
+  w[kNVB] = expf(score[kNVB] - m);
+  const float inv = 1.0f / (den + w[kNVB]);
+#pragma unroll
+  for (int r = 0; r < kR; ++r)
+    w[r] *= inv;
+
+  // ---- mix (packed fp32, registers) ----
+  float acc[kVPT][kVec];
+  F2 asq2 = {0.f, 0.f};
+#pragma unroll
+  for (int j = 0; j < kVPT; ++j) {
+#pragma unroll
+    for (int i = 0; i < kVec / 2; ++i) {
+      F2 b = {0.f, 0.f};
+#pragma unroll
+      for (int r = 0; r < kNVB; ++r) {
+        const F2 x = xf[r][j][i];
+        const F2 wr = {w[r], w[r]};
+        b = wr * x + b;
+      }
+      const F2 pv = xf[kNVB][j][i];
+      const F2 wp = {w[kNVB], w[kNVB]};
+      const F2 a = pv * wp + b;
+      acc[j][2 * i] = a.x;
+      acc[j][2 * i + 1] = a.y;
+      asq2 = a * a + asq2;
+    }
+  }
+
+  if (p.stream != nullptr) {
+#pragma unroll
+    for (int j = 0; j < kVPT; ++j) {
+      const int v = threadIdx.x + j * kThr;
+      if (v < p.n_vecs) {
+        vec_t o;
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+          o[i] = cast<bf16_t>(acc[j][i]);
+        o.store(p.stream + t * p.stride_s, v);
+      }
+    }
+  }
+
+  float scale = 1.f;
+  const bool norm = p.ow != nullptr;
+  if (norm) {
+    const float asq = sm::block_sum1<kThr>(asq2.x + asq2.y, smem_b);
+    scale = 1.0f / sqrtf(asq * inv_h + p.out_eps);
+  }
+#pragma unroll
+  for (int j = 0; j < kVPT; ++j) {
+    const int v = threadIdx.x + j * kThr;
+    if (v < p.n_vecs) {
+      vec_t o;
+      if (norm) {
+        vec_t owv;
+        owv.load(p.ow, v);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+          o[i] = cast<bf16_t>(acc[j][i] * scale * cast<fp32_t>(owv[i]));
+      } else {
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+          o[i] = cast<bf16_t>(acc[j][i]);
+      }
+      o.store(p.out + t * p.stride_o, v);
+      if (p.out8 != nullptr) {
+        uint32_t q[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          uint32_t packed = 0;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float x = fminf(fmaxf(cast<fp32_t>(o[h * 4 + i]), -448.f), 448.f);
+            packed |= static_cast<uint32_t>(sm::to_e4m3(x)) << (8 * i);
+          }
+          q[h] = packed;
+        }
+        *reinterpret_cast<uint2*>(p.out8 + t * p.stride_o8 + v * kVec) = make_uint2(q[0], q[1]);
+      }
+    }
+  }
+}
+
 struct ArAgg {
   template <int kMode, int kNVB>
   static void launch(const Params& params, hipStream_t stream) {
-    hipLaunchKernelGGL((ar_agg_kernel<kMode, kNVB>), dim3(params.T * params.split), dim3(kThreads), 0, stream, params);
+    if constexpr (kMode == kAGRow)
+      hipLaunchKernelGGL((ag_row_kernel<kNVB>), dim3(params.T), dim3(kRowThreads), 0, stream, params);
+    else
+      hipLaunchKernelGGL(
+          (ar_agg_kernel<kMode, kNVB>), dim3(params.T * params.split), dim3(kThreads), 0, stream, params);
   }
 
   template <int kMode>
@@ -625,6 +857,17 @@ struct ArAgg {
       }
     } else {
       p.y = static_cast<const bf16_t*>(x.data_ptr());
+      if (mode == kAGRow) {  // peers pull y directly (registered like AR's input)
+        void* inp = x.data_ptr();
+        if (reg_inp_ptr != 0) {
+          const int64_t bytes = x.numel() * 2;
+          RuntimeCheck(bytes <= reg_inp_bytes, "registered buffer too small");
+          RuntimeDeviceCheck(
+              hipMemcpyAsync(reinterpret_cast<void*>(reg_inp_ptr), inp, bytes, hipMemcpyDeviceToDevice, stream));
+          inp = reinterpret_cast<void*>(reg_inp_ptr);
+        }
+        p.dp = ca->get_buffer_RD(stream, inp);
+      }
       p.add_b = static_cast<const bf16_t*>(b.data_ptr());
       p.stride_b = b.stride(0);
       if (flags & 2) {
@@ -665,8 +908,12 @@ struct ArAgg {
     p.out_eps = static_cast<float>(out_eps);
     if (mode == kAR)
       dispatch<kAR>(p, nvb, stream);
-    else
+    else if (mode == kAG)
       dispatch<kAG>(p, nvb, stream);
+    else {
+      RuntimeCheck(n_vecs <= kRowThreads * kRowVPT && sv <= kRowThreads, "ag_row: H too large");
+      dispatch<kAGRow>(p, nvb, stream);
+    }
     RuntimeDeviceCheck(hipGetLastError());
   }
 };

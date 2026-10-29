@@ -60,6 +60,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_step_timer import DFlashStepTimer
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -537,6 +538,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        self._step_timer = DFlashStepTimer(
+            envs.SGLANG_DFLASH_STEP_TIMING.get(), self._target_tp_rank
+        )
         with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -2833,6 +2837,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._step_timer.begin("extend", len(batch.seq_lens))
             self._wait_for_fused_hicache_load(batch)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
@@ -2926,6 +2931,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bonus_tokens=next_token_ids,
                 seq_lens=new_seq_lens,
             )
+            self._step_timer.mark("extend")
+            self._step_timer.end()
             return batch_output
 
         # Decode / target-verify stage.
@@ -2991,6 +2998,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self._step_timer.begin("verify", bs)
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3056,6 +3064,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
             )
 
+        self._step_timer.mark("draft")
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -3129,6 +3138,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 None if _is_npu or get_parallel().attn_dp_enabled else True
             ),
         )
+        self._step_timer.mark("verify_fwd")
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -3167,6 +3177,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if grammar_mask is not None:
             grammar_mask.apply(logits_output.next_token_logits)
 
+        self._step_timer.mark("logits")
         candidates = draft_tokens
         (
             accept_len,
@@ -3184,6 +3195,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
         )
 
+        self._step_timer.mark("accept")
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
@@ -3232,6 +3244,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if on_publish is not None and not published:
             on_publish(new_seq_lens)
 
+        self._step_timer.mark("commit")
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -3266,6 +3279,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        self._step_timer.mark("draft_kv")
+        self._step_timer.end()
 
         return GenerationBatchResult(
             logits_output=logits_output,

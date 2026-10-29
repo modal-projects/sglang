@@ -1043,6 +1043,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Also merge when the checkpoint is quantized elsewhere (MoE MXFP4) but the
+    # attention in-proj itself is plain bf16.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_QUANT_CKPT = EnvBool(False)
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)

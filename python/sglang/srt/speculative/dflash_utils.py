@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -97,13 +98,17 @@ def rocm_fused_selector_sampled_verify(
     global _selector_dispatch_logged
     bs = int(candidates.shape[0])
     enabled = envs.SGLANG_DFLASH_ROCM_FUSED_SELECTOR_VERIFY.get()
+    # A/B only: when set, the flag follows whether this file exists.
+    toggle = os.environ.get("SGLANG_DFLASH_SELECTOR_VERIFY_TOGGLE_FILE")
+    if toggle:
+        enabled = os.path.exists(toggle)
     use = (
         enabled
         and not block_verification
         and _use_rocm_fused_sampled_verify(sampling_info, next_token_logits, bs)
     )
-    if not _selector_dispatch_logged:
-        _selector_dispatch_logged = True
+    if not _selector_dispatch_logged or (toggle and use != _selector_dispatch_logged):
+        _selector_dispatch_logged = use if toggle else True
         logger.info(
             "DFlash selector sampled verify: fused_rocm=%s (flag=%s, hip=%s, "
             "block_verification=%s, sampling_backend=%s, logits_stride=%s)",

@@ -293,6 +293,19 @@ def _dense_mlp_parallel_group() -> str:
     )
 
 
+_ROCM_BFA_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _rocm_bfa_stream() -> Optional[torch.cuda.Stream]:
+    """One side stream shared by every KDA layer (they never run concurrently)."""
+    global _ROCM_BFA_STREAM
+    if not (_is_hip and envs.SGLANG_ROCM_K3_KDA_BFA_STREAM.get()):
+        return None
+    if _ROCM_BFA_STREAM is None:
+        _ROCM_BFA_STREAM = torch.cuda.Stream()
+    return _ROCM_BFA_STREAM
+
+
 def _rocm_up_ag_fits(num_tokens: int, hidden_size: int) -> bool:
     if not _is_hip:
         return False
@@ -3038,7 +3051,9 @@ class KimiK3DecoderLayer(nn.Module):
                 sp_moe=self._sp_moe,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
-                bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
+                bfa_alt_stream=(
+                    alt_streams[2] if alt_streams is not None else _rocm_bfa_stream()
+                ),
             )
         else:
             self.self_attn = KimiK3MLAAttention(

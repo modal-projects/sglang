@@ -1043,6 +1043,10 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # ROCm: run the KDA [f_a|b] + f_b tiny GEMMs on a side stream under the wide
+    # [q,k,v,g] GEMM in captured decode/verify graphs (as on CUDA), when the
+    # in-proj fusion above does not apply (e.g. block-FP8 f_a/b).
+    SGLANG_ROCM_K3_KDA_BFA_STREAM = EnvBool(False)
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
     SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     SGLANG_ROCM_NO_EXTEND_SYNC = EnvBool(False)

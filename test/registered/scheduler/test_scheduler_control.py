@@ -363,5 +363,56 @@ class TestAbortWithRunningTimeout(CustomTestCase):
         self.assertEqual(result["code"], 503)
 
 
+class TestAbortWithDeadline(CustomTestCase):
+    deadline = 5
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_REQ_DEADLINE.override(cls.deadline):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--max-running-requests=1"],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def generate(self, max_new_tokens):
+        return requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Today is ",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=60,
+        )
+
+    def test_deadline_aborts_running_and_waiting(self):
+        start = time.perf_counter()
+        with ThreadPoolExecutor(2) as executor:
+            responses = list(executor.map(self.generate, [16000, 16000]))
+        for response in responses:
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["meta_info"]["finish_reason"]["type"], "abort"
+            )
+        self.assertLess(time.perf_counter() - start, self.deadline + 10)
+        self.assertIsNone(self.process.poll())
+
+    def test_request_within_deadline_finishes(self):
+        response = self.generate(8)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["meta_info"]["finish_reason"]["type"], "length")
+
+
 if __name__ == "__main__":
     unittest.main()

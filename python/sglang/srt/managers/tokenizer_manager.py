@@ -210,6 +210,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_REQUEST_DEADLINE = envs.SGLANG_REQ_DEADLINE.get()
 
 logger = logging.getLogger(__name__)
 
@@ -2138,9 +2139,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        deadline = (
+            state.time_stats.created_time + _REQUEST_DEADLINE
+            if _REQUEST_DEADLINE > 0
+            else None
+        )
         while True:
+            if (
+                deadline is not None
+                and not state.abort_sent
+                and time.perf_counter() > deadline
+            ):
+                logger.warning(
+                    f"Abort request {obj.rid=}: unfinished {_REQUEST_DEADLINE}s after it arrived"
+                )
+                self.abort_request(obj.rid)
             try:
-                if request is None:
+                if request is None and deadline is None:
                     # Engine requests have no HTTP client to poll for disconnects.
                     await state.event.wait()
                 else:

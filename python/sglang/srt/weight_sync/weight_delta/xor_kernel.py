@@ -312,7 +312,7 @@ def _apply_record(
     metadata,
     record,
     tile,
-    tile_stride,
+    stop,
     checksums,
     WORD: tl.constexpr,
     ALIGNMENT: tl.constexpr,
@@ -337,7 +337,8 @@ def _apply_record(
     sums = tl.zeros((ELEMENTS,), tl.uint64)
     # A CTA may visit several tiles of this group. Keep record selection and
     # scalar geometry outside that loop, then search again only across END.
-    while tile < end:
+    limit = tl.minimum(end, stop)
+    while tile < limit:
         local = (tile - first).to(tl.uint32)
         item = local // per_item
         base = (local - item * per_item).to(tl.int64) * BLOCK
@@ -415,7 +416,7 @@ def _apply_record(
                 )
                 sums += _changed_terms(canonical + source_offset, value, new, WORD)
                 part += 1
-        tile += tile_stride
+        tile += 1
     if row >= 0:
         tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
     return tile
@@ -427,11 +428,14 @@ def _xor_batch(
 ):
     # No pointer or model access may precede the sticky decode-status gate.
     if tl.load(error) == 0:
-        tile = tl.program_id(0).to(tl.int64)
-        tile_stride = tl.num_programs(0).to(tl.int64)
         groups = tl.load(metadata)
         total = tl.load(metadata + groups)  # final END; metadata[0] is0 if empty
-        while tile < total:
+        # Each CTA takes one contiguous run of tiles, so it adds a tensor's checksum
+        # terms once per run rather than once per tile.
+        run = tl.cdiv(total, tl.num_programs(0))
+        tile = tl.program_id(0).to(tl.int64) * run
+        stop = tl.minimum(tile + run, total)
+        while tile < stop:
             low = tl.full((), 0, tl.int64)
             high = groups
             # First cumulative END greater than tile. Empty groups are skipped.
@@ -453,7 +457,7 @@ def _xor_batch(
                         metadata,
                         record,
                         tile,
-                        tile_stride,
+                        stop,
                         checksums,
                         4,
                         16,
@@ -466,7 +470,7 @@ def _xor_batch(
                         metadata,
                         record,
                         tile,
-                        tile_stride,
+                        stop,
                         checksums,
                         4,
                         4,
@@ -479,7 +483,7 @@ def _xor_batch(
                     metadata,
                     record,
                     tile,
-                    tile_stride,
+                    stop,
                     checksums,
                     1,
                     1,
@@ -849,12 +853,9 @@ class ByteApplyGroup:
             self.tiles += tiles
             if tiles:
                 resident = self.resident_ctas[family]
-                # Keep the fixed family policy: word-affine uses a full grid;
-                # packed/general reuse descriptors over four occupancy waves.
-                # Broader word-affine admission requires fresh measurements.
-                grid_ctas = (
-                    tiles if family == 1 else min(tiles, RESIDENT_WAVES * resident)
-                )
+                # Every family runs four occupancy waves of CTAs, each over one
+                # contiguous run of tiles.
+                grid_ctas = min(tiles, RESIDENT_WAVES * resident)
                 self.programs.append(
                     ApplyProgram(
                         ("packed", "word_affine", "general")[family],

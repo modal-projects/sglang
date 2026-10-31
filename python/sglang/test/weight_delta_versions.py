@@ -10,8 +10,49 @@ from safetensors.numpy import save_file
 FRAME_NBYTES = 1 << 20
 
 
-def raw_tensor(name: str, dtype: str, shape: tuple, data: bytes) -> dict:
-    return {"name": name, "dtype": dtype, "shape": shape, "raw": data}
+def checksum(values: bytes, counted: np.ndarray | None = None) -> int:
+    """Miles' publication.checksum: over each 4-byte word w of the bytes (the last one
+    zero-padded), the sum mod 2^64 of (murmur3's 32-bit finalizer of w mod 2^32, made odd) x the
+    word with the bytes outside `counted` zeroed; every byte counts without it."""
+    data = np.frombuffer(values, dtype=np.uint8)
+    if counted is not None:
+        data = np.where(counted, data, np.uint8(0))
+    words = np.zeros(-(-data.size // 4), dtype="<u4")
+    words.view(np.uint8)[: data.size] = data
+    h = (np.arange(words.size) % (1 << 32)).astype(np.uint32)
+    h ^= h >> np.uint32(16)
+    h *= np.uint32(0x85EBCA6B)
+    h ^= h >> np.uint32(13)
+    h *= np.uint32(0xC2B2AE35)
+    h ^= h >> np.uint32(16)
+    h |= np.uint32(1)
+    return int((h.astype(np.uint64) * words.astype(np.uint64)).sum(dtype=np.uint64))
+
+
+def region_checksum(
+    previous: bytes | None, current: bytes, itemsize: int, shape: tuple, region: tuple
+) -> int:
+    """What a GPU holding the canonical `region` computes: the bytes there that changed from
+    `previous`, or all of them for a raw tensor (no previous)."""
+    counted = np.zeros((*shape, itemsize), dtype=bool)
+    counted[region] = True
+    counted = counted.reshape(-1)
+    if previous is not None:
+        counted &= np.frombuffer(previous, np.uint8) != np.frombuffer(current, np.uint8)
+    return checksum(current, counted)
+
+
+def raw_tensor(
+    name: str, dtype: str, shape: tuple, data: bytes, expected: int | None = None
+) -> dict:
+    """expected: the checksum the engine computes, by default that of every byte."""
+    return {
+        "name": name,
+        "dtype": dtype,
+        "shape": shape,
+        "raw": data,
+        "checksum": checksum(data) if expected is None else expected,
+    }
 
 
 def xor_tensor(
@@ -21,6 +62,7 @@ def xor_tensor(
     frames: list[dict],
     inner: bytes,
     chunk_nbytes: int = 1 << 20,
+    expected: int = 0,
 ) -> dict:
     """A changed tensor's frames and inner bytes, cut into outer Zstd chunks of chunk_nbytes."""
     pieces = [
@@ -32,6 +74,7 @@ def xor_tensor(
         "shape": shape,
         "frames": frames,
         "pieces": pieces,
+        "checksum": expected,
     }
 
 
@@ -120,6 +163,9 @@ def write_owner_file(path: Path, tensors: list[dict]) -> int:
         "tensors.inner_nbytes": column([row[3] for row in rows]),
         "tensors.chunk_end": column([row[4] for row in rows]),
         "tensors.frame_end": column([row[5] for row in rows]),
+        "tensors.checksum": np.array(
+            [tensor["checksum"] for tensor, *_ in rows], dtype=np.uint64
+        ),
         "payload": np.frombuffer(bytes(payload), dtype=np.uint8),
     }
     fields = ("offset", "nbytes", "inner_offset", "inner_nbytes")

@@ -17,31 +17,32 @@ from sglang.test.test_utils import CustomTestCase
 # The same version is in Miles' tests/fast/backends/training_utils/weight_update/protocols/
 # test_weight_delta_publication.py.
 GOLDEN_MANIFEST = (
-    '{"base_version":4,"codec":"gap-zstd","files":[{"name":"owner-00000.safetensors","nbytes":1696}],'
-    '"format":"weight-delta/v1","frame_nbytes":1048576,"target_version":5}'
+    '{"base_version":4,"codec":"gap-zstd","files":[{"name":"owner-00000.safetensors","nbytes":1784}],"format":'
+    '"weight-delta/v1","frame_nbytes":1048576,"target_version":5}'
 )
 GOLDEN_OWNER_HEADER = (
-    '{"__metadata__":{"dtypes":"BF16,U8"},"tensors.name_end":{"dtype":"I64","shape":[2],"data_offsets":[0,16]'
-    '},"tensors.shape":{"dtype":"I64","shape":[3],"data_offsets":[16,40]},"tensors.shape_end":{"dtype":"I64",'
-    '"shape":[2],"data_offsets":[40,56]},"tensors.offset":{"dtype":"I64","shape":[2],"data_offsets":[56,72]},'
-    '"tensors.nbytes":{"dtype":"I64","shape":[2],"data_offsets":[72,88]},"tensors.inner_nbytes":{"dtype":"I64'
-    '","shape":[2],"data_offsets":[88,104]},"tensors.chunk_end":{"dtype":"I64","shape":[2],"data_offsets":[10'
-    '4,120]},"tensors.frame_end":{"dtype":"I64","shape":[2],"data_offsets":[120,136]},"chunks.offset":{"dtype'
-    '":"I64","shape":[1],"data_offsets":[136,144]},"chunks.nbytes":{"dtype":"I64","shape":[1],"data_offsets":'
-    '[144,152]},"chunks.inner_offset":{"dtype":"I64","shape":[1],"data_offsets":[152,160]},"chunks.inner_nbyt'
-    'es":{"dtype":"I64","shape":[1],"data_offsets":[160,168]},"frames.offset":{"dtype":"I64","shape":[1],"dat'
-    'a_offsets":[168,176]},"frames.nbytes":{"dtype":"I64","shape":[1],"data_offsets":[176,184]},"frames.inner'
-    '_offset":{"dtype":"I64","shape":[1],"data_offsets":[184,192]},"frames.inner_nbytes":{"dtype":"I64","shap'
-    'e":[1],"data_offsets":[192,200]},"tensors.name":{"dtype":"U8","shape":[14],"data_offsets":[200,214]},"te'
-    'nsors.dtype":{"dtype":"U8","shape":[2],"data_offsets":[214,216]},"tensors.raw":{"dtype":"BOOL","shape":['
-    '2],"data_offsets":[216,218]},"payload":{"dtype":"U8","shape":[22],"data_offsets":[218,240]}}    '
+    '{"__metadata__":{"dtypes":"BF16,U8"},"tensors.name_end":{"dtype":"I64","shape":[2],"data_offsets":[0,16]}'
+    ',"tensors.shape":{"dtype":"I64","shape":[3],"data_offsets":[16,40]},"tensors.shape_end":{"dtype":"I64","s'
+    'hape":[2],"data_offsets":[40,56]},"tensors.offset":{"dtype":"I64","shape":[2],"data_offsets":[56,72]},"te'
+    'nsors.nbytes":{"dtype":"I64","shape":[2],"data_offsets":[72,88]},"tensors.inner_nbytes":{"dtype":"I64","s'
+    'hape":[2],"data_offsets":[88,104]},"tensors.chunk_end":{"dtype":"I64","shape":[2],"data_offsets":[104,120'
+    ']},"tensors.frame_end":{"dtype":"I64","shape":[2],"data_offsets":[120,136]},"tensors.checksum":{"dtype":"'
+    'U64","shape":[2],"data_offsets":[136,152]},"chunks.offset":{"dtype":"I64","shape":[1],"data_offsets":[152'
+    ',160]},"chunks.nbytes":{"dtype":"I64","shape":[1],"data_offsets":[160,168]},"chunks.inner_offset":{"dtype'
+    '":"I64","shape":[1],"data_offsets":[168,176]},"chunks.inner_nbytes":{"dtype":"I64","shape":[1],"data_offs'
+    'ets":[176,184]},"frames.offset":{"dtype":"I64","shape":[1],"data_offsets":[184,192]},"frames.nbytes":{"dt'
+    'ype":"I64","shape":[1],"data_offsets":[192,200]},"frames.inner_offset":{"dtype":"I64","shape":[1],"data_o'
+    'ffsets":[200,208]},"frames.inner_nbytes":{"dtype":"I64","shape":[1],"data_offsets":[208,216]},"tensors.na'
+    'me":{"dtype":"U8","shape":[14],"data_offsets":[216,230]},"tensors.dtype":{"dtype":"U8","shape":[2],"data_'
+    'offsets":[230,232]},"tensors.raw":{"dtype":"BOOL","shape":[2],"data_offsets":[232,234]},"payload":{"dtype'
+    '":"U8","shape":[22],"data_offsets":[234,256]}}    '
 )
 GOLDEN_OWNER_DATA = (
     "06000000000000000e00000000000000020000000000000004000000000000000400000000000000010000000000000003000000"
     "00000000000000000000000010000000000000000400000000000000060000000000000000000000000000000a00000000000000"
-    "00000000000000000100000000000000000000000000000001000000000000000000000000000000060000000000000000000000"
-    "000000000a000000000000000000000000000000100000000000000000000000000000000a00000000000000612e62696173622e"
-    "77656967687400010100010203040000000000000000000000007a7374642121"
+    "000000000000000001000000000000000000000000000000010000000000000001020304000000001032547698badcfe00000000"
+    "00000000060000000000000000000000000000000a00000000000000000000000000000010000000000000000000000000000000"
+    "0a00000000000000612e62696173622e77656967687400010100010203040000000000000000000000007a7374642121"
 )
 GOLDEN_OWNER_FILE = (
     len(GOLDEN_OWNER_HEADER).to_bytes(8, "little")
@@ -77,7 +78,7 @@ class TestReadVersion(CustomTestCase):
         self.assertEqual(manifest.directory, self.directory)
         self.assertEqual((manifest.codec, manifest.frame_nbytes), ("gap-zstd", 1 << 20))
         self.assertEqual((manifest.base_version, manifest.target_version), (4, 5))
-        self.assertEqual(manifest.files, {"owner-00000.safetensors": 1696})
+        self.assertEqual(manifest.files, {"owner-00000.safetensors": 1784})
         self.assertEqual(tensors.names.tolist(), [b"a.bias", b"b.weight"])
         self.assertEqual(tensors.dtypes.tolist(), ["BF16", "U8"])
         self.assertEqual(tensors.shape.tolist(), [2, 4, 4])
@@ -94,6 +95,7 @@ class TestReadVersion(CustomTestCase):
         self.assertEqual(tensors.inner_nbytes.tolist(), [0, 10])
         self.assertEqual(tensors.chunk_end.tolist(), [0, 1])
         self.assertEqual(tensors.frame_end.tolist(), [0, 1])
+        self.assertEqual(tensors.checksum.tolist(), [0x04030201, 0xFEDCBA9876543210])
         self.assertEqual(
             {field: column.tolist() for field, column in tensors.chunks.items()},
             {
@@ -141,7 +143,7 @@ class TestReadVersion(CustomTestCase):
         self._write(["owner-00000.safetensors"])
         with open(self.directory / "owner-00000.safetensors", "ab") as owner:
             owner.write(b"\0")
-        with self.assertRaisesRegex(ValueError, "1697 bytes, the manifest says 1696"):
+        with self.assertRaisesRegex(ValueError, "1785 bytes, the manifest says 1784"):
             read_tensors(read_manifest(self.path))
 
     def test_another_format_is_refused(self):

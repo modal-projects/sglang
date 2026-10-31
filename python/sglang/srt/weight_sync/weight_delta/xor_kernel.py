@@ -5,11 +5,13 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""XOR of many (source, target) byte views in one launch per access path.
+"""XOR of many (source, target) byte views in one launch per access path, with the checksum
+of the bytes each changes.
 
-From sglang#42210 (weight_sync/gpu_delta/apply.py), unchanged except the entry points:
-plan_xor takes byte views instead of that PR's binding objects, and warm_up compiles the
-kernels at startup.
+From sglang#42210 (weight_sync/gpu_delta/apply.py), changed in the entry points (plan_xor
+takes byte views instead of that PR's binding objects, and warm_up compiles the kernels at
+startup) and by the checksum: each item also carries where its source starts in its
+canonical tensor and that tensor's checksum row.
 """
 
 import math
@@ -21,6 +23,7 @@ import triton
 import triton.language as tl
 
 BLOCK = 2048
+RAW_BLOCK = 1024
 ELEMENTS = 512
 WARPS = 4
 RESIDENT_WAVES = 4
@@ -51,9 +54,28 @@ def _resident_ctas(kernel, device_index):
 
 
 def warm_up(device_index: int) -> None:
-    """Compile the three XOR families before the first update needs them."""
+    """Compile the three XOR families and the raw checksum before the first update needs them."""
     for family in range(3):
         _compiled(device_index, family)
+    with torch.cuda.device(device_index):
+        _raw_checksum_kernel.warmup(
+            torch.uint8,
+            torch.int64,
+            torch.int64,
+            torch.int64,
+            RAW_BLOCK,
+            RAW_BLOCK,
+            grid=(1, 1, 1),
+        )
+
+
+def raw_checksums(values, positions, rows, checksums) -> None:
+    """Adds the checksum terms of tensors sent raw, every byte counted: values[i] is the byte at
+    position positions[i] of the canonical tensor whose checksum row is rows[i]."""
+    if values.numel():
+        _raw_checksum_kernel[(triton.cdiv(values.numel(), RAW_BLOCK),)](
+            values, positions, rows, checksums, values.numel(), RAW_BLOCK
+        )
 
 
 @triton.jit
@@ -140,6 +162,7 @@ def _load_source(
     if mode == 1:
         offset = tl.multiple_of(base // WORD, ELEMENTS) + lanes
         value = tl.load(source + offset, mask, other=0)
+        offset = offset.to(tl.int64) * WORD
     elif PACKED or mode == 2:
         if PACKED:
             start = _packed_row_start(base, metadata, shape, ELEMENTS * WORD)
@@ -147,6 +170,7 @@ def _load_source(
             start = _affine_offset(base, metadata, shape, shape + axes, axes)
         start = tl.multiple_of(start // WORD, ALIGNMENT // WORD)
         value = tl.load(source + start + lanes, mask, other=0)
+        offset = (start + lanes).to(tl.int64) * WORD
     else:
         offset = _affine_lanes(
             base,
@@ -158,7 +182,7 @@ def _load_source(
             (ELEMENTS - 1) * WORD,
         )
         value = tl.load(source + offset // WORD, mask, other=0)
-    return value
+    return value, offset
 
 
 @triton.jit
@@ -182,7 +206,8 @@ def _xor_target(
     if mode == 1:
         offset = tl.multiple_of(base // WORD, ELEMENTS) + lanes
         previous = tl.load(target + offset, mask, other=0)
-        tl.store(target + offset, value ^ previous, mask)
+        new = value ^ previous
+        tl.store(target + offset, new, mask)
     elif PACKED or mode == 2:
         if PACKED:
             start = _packed_row_start(base, metadata, shape, ELEMENTS * WORD)
@@ -191,7 +216,8 @@ def _xor_target(
         start = tl.multiple_of(start // WORD, ALIGNMENT // WORD)
         offset = start + lanes
         previous = tl.load(target + offset, mask, other=0)
-        tl.store(target + offset, value ^ previous, mask)
+        new = value ^ previous
+        tl.store(target + offset, new, mask)
     else:
         offset = (
             _affine_lanes(
@@ -206,7 +232,9 @@ def _xor_target(
             // WORD
         )
         previous = tl.load(target + offset, mask, other=0)
-        tl.store(target + offset, value ^ previous, mask)
+        new = value ^ previous
+        tl.store(target + offset, new, mask)
+    return new
 
 
 @triton.jit
@@ -223,12 +251,69 @@ def _packed_row_start(base, metadata, shape, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _nonzero_bytes(words):
+    """0x80 in each byte of the words that is not zero, 0 elsewhere."""
+    low = tl.full((), 0x7F7F7F7F, tl.int64).to(tl.uint32)
+    high = tl.full((), 0x80808080, tl.int64).to(tl.uint32)
+    return (((words & low) + low) | words) & high
+
+
+@triton.jit
+def _checksum_terms(positions, words):
+    """Miles' publication.checksum per lane: (murmur3's 32-bit finalizer of the word index
+    positions // 4 mod 2^32, made odd) x the word of counted bytes, as a full 64-bit product."""
+    h = (positions >> 2).to(tl.uint32)
+    h ^= h >> 16
+    h *= tl.full((), 0x85EBCA6B, tl.int64).to(tl.uint32)
+    h ^= h >> 13
+    h *= tl.full((), 0xC2B2AE35, tl.int64).to(tl.uint32)
+    h ^= h >> 16
+    h |= 1
+    return (tl.umulhi(h, words).to(tl.uint64) << 32) | (h * words).to(tl.uint64)
+
+
+@triton.jit
+def _changed_terms(positions, value, new, WORD: tl.constexpr):
+    """Checksum terms of the bytes the XOR `value` changed, `new` their result; positions are
+    the lanes' byte positions in the canonical tensor."""
+    if WORD == 4:
+        return _checksum_terms(positions, new & ((_nonzero_bytes(value) >> 7) * 255))
+    else:
+        counted = tl.where(value != 0, new, 0).to(tl.uint32)
+        return _checksum_terms(
+            positions, counted << ((positions & 3) * 8).to(tl.uint32)
+        )
+
+
+@triton.jit(do_not_specialize=["count"])
+def _raw_checksum_kernel(
+    values, positions, rows, checksums, count, BLOCK: tl.constexpr
+):
+    start = tl.program_id(0).to(tl.int64) * BLOCK
+    lanes = start + tl.arange(0, BLOCK)
+    valid = lanes < count
+    position = tl.load(positions + lanes, valid, other=0)
+    row = tl.load(rows + lanes, valid, other=0)
+    terms = _checksum_terms(
+        position,
+        tl.load(values + lanes, valid, other=0).to(tl.uint32)
+        << ((position & 3) * 8).to(tl.uint32),
+    ).to(tl.int64, bitcast=True)
+    # A block's bytes are mostly one tensor's: one add for those, one per lane for the rest.
+    first = tl.load(rows + start)
+    same = valid & (row == first)
+    tl.atomic_add(checksums + first, tl.sum(tl.where(same, terms, 0), axis=0))
+    tl.atomic_add(checksums + row, terms, valid & ~same)
+
+
+@triton.jit
 def _apply_record(
     pointers,
     metadata,
     record,
     tile,
     tile_stride,
+    checksums,
     WORD: tl.constexpr,
     ALIGNMENT: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -247,6 +332,9 @@ def _apply_record(
     per_item = tl.cdiv(size, BLOCK).to(tl.uint32)
     DTYPE: tl.constexpr = tl.uint32 if WORD == 4 else tl.uint8
     ELEMENTS: tl.constexpr = 512
+    # The CTA's checksum terms of one canonical tensor, added to its row when it moves on.
+    row = tl.full((), -1, tl.int64)
+    sums = tl.zeros((ELEMENTS,), tl.uint64)
     # A CTA may visit several tiles of this group. Keep record selection and
     # scalar geometry outside that loop, then search again only across END.
     while tile < end:
@@ -259,6 +347,15 @@ def _apply_record(
         target = tl.multiple_of(
             tl.load(pointers + position + count + item), ALIGNMENT
         ).to(tl.pointer_type(DTYPE))
+        canonical = tl.load(pointers + position + 2 * count + item)
+        item_row = tl.load(pointers + position + 3 * count + item)
+        if item_row != row:
+            if row >= 0:
+                tl.atomic_add(
+                    checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True)
+                )
+            sums = tl.zeros((ELEMENTS,), tl.uint64)
+            row = item_row
         shape = record + 11
         if FAMILY == 1:
             # This family's coordinate descriptors are uint32-word based.
@@ -279,7 +376,9 @@ def _apply_record(
             mask = base + lanes * 4 < size
             value = tl.load(source + index, mask, other=0)
             previous = tl.load(target + offset, mask, other=0)
-            tl.store(target + offset, value ^ previous, mask)
+            new = value ^ previous
+            tl.store(target + offset, new, mask)
+            sums += _changed_terms(canonical + index.to(tl.int64) * 4, value, new, 4)
         else:
             # Keep loads/stores inside their uniform access-mode branches:
             # merging row starts first loses the contiguous address proof.
@@ -287,7 +386,7 @@ def _apply_record(
             part = 0
             while part < 4 // WORD:
                 subbase = base + part * ELEMENTS * WORD
-                value = _load_source(
+                value, source_offset = _load_source(
                     source,
                     metadata,
                     shape,
@@ -300,7 +399,7 @@ def _apply_record(
                     ALIGNMENT,
                     FAMILY == 0,
                 )
-                _xor_target(
+                new = _xor_target(
                     target,
                     value,
                     metadata,
@@ -314,13 +413,18 @@ def _apply_record(
                     ALIGNMENT,
                     FAMILY == 0,
                 )
+                sums += _changed_terms(canonical + source_offset, value, new, WORD)
                 part += 1
         tile += tile_stride
+    if row >= 0:
+        tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
     return tile
 
 
 @triton.jit
-def _xor_batch(pointers, metadata, error, BLOCK: tl.constexpr, FAMILY: tl.constexpr):
+def _xor_batch(
+    pointers, metadata, error, checksums, BLOCK: tl.constexpr, FAMILY: tl.constexpr
+):
     # No pointer or model access may precede the sticky decode-status gate.
     if tl.load(error) == 0:
         tile = tl.program_id(0).to(tl.int64)
@@ -350,6 +454,7 @@ def _xor_batch(pointers, metadata, error, BLOCK: tl.constexpr, FAMILY: tl.conste
                         record,
                         tile,
                         tile_stride,
+                        checksums,
                         4,
                         16,
                         BLOCK,
@@ -362,6 +467,7 @@ def _xor_batch(pointers, metadata, error, BLOCK: tl.constexpr, FAMILY: tl.conste
                         record,
                         tile,
                         tile_stride,
+                        checksums,
                         4,
                         4,
                         BLOCK,
@@ -369,7 +475,16 @@ def _xor_batch(pointers, metadata, error, BLOCK: tl.constexpr, FAMILY: tl.conste
                     )
             else:
                 tile = _apply_record(
-                    pointers, metadata, record, tile, tile_stride, 1, 1, BLOCK, FAMILY
+                    pointers,
+                    metadata,
+                    record,
+                    tile,
+                    tile_stride,
+                    checksums,
+                    1,
+                    1,
+                    BLOCK,
+                    FAMILY,
                 )
 
 
@@ -388,6 +503,7 @@ def _compiled(device_index, family):
             torch.int64,
             torch.int64,
             torch.int32,
+            torch.int64,
             BLOCK,
             family,
             grid=(1, 1, 1),
@@ -482,7 +598,7 @@ def _record(contract, count, alignment, position):
     _validate_contract(contract, count)
     if len(alignment) != 2 or any(a not in (1, 2, 4, 8, 16) for a in alignment):
         raise ValueError("invalid GPU delta apply pointer alignment")
-    if type(position) is not int or not 0 <= position <= _INT64_MAX - 2 * count:
+    if type(position) is not int or not 0 <= position <= _INT64_MAX - 4 * count:
         raise ValueError("GPU delta apply pointer position overflow")
     size, ss, st, ts, tt = contract
     source_mode = _access_mode(ss, st, BLOCK)
@@ -572,6 +688,10 @@ class ByteApplyGroup:
 
     sources: list[int]
     targets: list[int]
+    # Per item: where its source starts in its canonical tensor, in bytes, and that tensor's
+    # checksum row.
+    canonical_starts: list[int]
+    rows: list[int]
     contracts: tuple
     kernels: tuple = ()
     _prepared_device: int | None = field(default=None, init=False, repr=False)
@@ -584,9 +704,10 @@ class ByteApplyGroup:
         self._prepared_device = None
         for contract, count in self.contracts:
             _validate_contract(contract, count)
-        if sum(count for _, count in self.contracts) != len(self.sources) or len(
-            self.sources
-        ) != len(self.targets):
+        if sum(count for _, count in self.contracts) != len(self.sources) or any(
+            len(column) != len(self.sources)
+            for column in (self.targets, self.canonical_starts, self.rows)
+        ):
             raise ValueError("GPU delta apply pointer count mismatch")
         if any(
             type(value) is not int or not 0 <= value <= _INT64_MAX
@@ -619,6 +740,10 @@ class ByteApplyGroup:
         # Snapshot geometry: no caller-owned mutable pointer lists enter the
         # preplanned descriptor template. Actual scratch addresses remain unknown.
         self.sources, self.targets = tuple(self.sources), tuple(self.targets)
+        self.canonical_starts, self.rows = (
+            tuple(self.canonical_starts),
+            tuple(self.rows),
+        )
         self.source_limit = self.source_max_offset = 0
         alignments, indices, position, pointer_position = [], [], 0, 0
         for contract, count in self.contracts:
@@ -635,7 +760,7 @@ class ByteApplyGroup:
                 (math.gcd(16, *offsets), math.gcd(16, *targets)) if count else (1, 1)
             )
             indices.extend(range(pointer_position, pointer_position + count))
-            pointer_position += 2 * count
+            pointer_position += 4 * count
             position = end
         self.source_indices = tuple(indices)
         self._plan_binding(alignments)
@@ -660,11 +785,14 @@ class ByteApplyGroup:
             self._binding_aligned = True
 
     def pointer_rows(self, origin):
+        """Per contract: its items' sources, targets, canonical starts and checksum rows."""
         position = 0
         for _, count in self.contracts:
             end = position + count
             yield from (origin + offset for offset in self.sources[position:end])
             yield from self.targets[position:end]
+            yield from self.canonical_starts[position:end]
+            yield from self.rows[position:end]
             position = end
 
     def bind(self, scratch):
@@ -712,7 +840,7 @@ class ByteApplyGroup:
             family, record = _record(contract, count, alignment, position)
             families[family].append(record)
             self.word32_contracts += record[5] == 4
-            position += 2 * count
+            position += 4 * count
         self.metadata_rows, self.programs, self.tiles = [], [], 0
         for family, records in enumerate(families):
             rows, tiles = _metadata(records)
@@ -743,7 +871,7 @@ class ByteApplyGroup:
             raise RuntimeError("GPU delta family metadata capacity exceeded")
         self.grid_ctas = sum(program.grid[0] for program in self.programs)
 
-    def bind_launch(self, pointers, metadata, error, grids=None):
+    def bind_launch(self, pointers, metadata, error, checksums, grids=None):
         """Bind retained metadata views once; optional grids support validation."""
         if grids is None:
             grids = tuple(program.grid for program in self.programs)
@@ -761,28 +889,32 @@ class ByteApplyGroup:
                 pointers,
                 metadata[program.metadata_start : program.metadata_stop],
                 error,
+                checksums,
             )
             for program, grid in zip(self.programs, grids)
         )
         return partial(_launch_prebound, calls) if calls else None
 
 
-def plan_xor(pairs):
-    """pairs: (source, target) byte views. Sources view a meta tensor that stands for the
-    decode buffer, so their storage offsets are byte offsets into it."""
+def plan_xor(items):
+    """items: (source, target, canonical start, checksum row), source and target byte views.
+    Sources view a meta tensor that stands for the decode buffer, so their storage offsets are
+    byte offsets into it."""
     groups = {}
-    for source, target in pairs:
+    for source, target, canonical_start, row in items:
         ss, st = _normalize(source.shape, source.stride())
         ts, tt = _normalize(target.shape, target.stride())
         contract = (math.prod(ss), ss, st, ts, tt)
-        sources, targets = groups.setdefault(contract, ([], []))
-        sources.append(source.storage_offset())
-        targets.append(target.data_ptr())
+        group = groups.setdefault(contract, ([], [], [], []))
+        group[0].append(source.storage_offset())
+        group[1].append(target.data_ptr())
+        group[2].append(canonical_start)
+        group[3].append(row)
     if not groups:
         return None
-    sources, targets, contracts = [], [], []
-    for contract, (group_sources, group_targets) in groups.items():
-        contracts.append((contract, len(group_sources)))
-        sources.extend(group_sources)
-        targets.extend(group_targets)
-    return ByteApplyGroup(sources, targets, tuple(contracts))
+    columns, contracts = ([], [], [], []), []
+    for contract, group in groups.items():
+        contracts.append((contract, len(group[0])))
+        for column, values in zip(columns, group):
+            column.extend(values)
+    return ByteApplyGroup(*columns, tuple(contracts))

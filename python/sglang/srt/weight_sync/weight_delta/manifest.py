@@ -24,6 +24,7 @@ _COLUMNS = (
     "tensors.inner_nbytes",
     "tensors.chunk_end",
     "tensors.frame_end",
+    "tensors.checksum",
     *(f"{table}.{field}" for table in ("chunks", "frames") for field in _REGION_FIELDS),
 )
 # Each ragged column's row ends, and the column they end into.
@@ -62,6 +63,9 @@ class Tensors:
     inner_nbytes: np.ndarray
     chunk_end: np.ndarray
     frame_end: np.ndarray
+    # Of the tensor's new bytes where they changed, every byte for a raw one (Miles'
+    # publication.checksum); the engine compares it after applying.
+    checksum: np.ndarray
     chunks: dict[str, np.ndarray]
     frames: dict[str, np.ndarray]
 
@@ -120,6 +124,7 @@ def read_tensors(manifest: Manifest) -> Tensors:
         inner_nbytes=column["tensors.inner_nbytes"],
         chunk_end=ends["tensors.chunk_end"],
         frame_end=ends["tensors.frame_end"],
+        checksum=column["tensors.checksum"],
         chunks=chunks,
         frames={field: column[f"frames.{field}"] for field in _REGION_FIELDS},
     )
@@ -163,6 +168,7 @@ def _no_rows() -> dict[str, np.ndarray]:
     column["tensors.name"] = np.zeros(0, dtype=np.uint8)
     column["tensors.dtype"] = np.zeros(0, dtype=str)
     column["tensors.raw"] = np.zeros(0, dtype=bool)
+    column["tensors.checksum"] = np.zeros(0, dtype=np.uint64)
     column["payload_offset"] = np.zeros(1, dtype=np.int64)
     return column
 

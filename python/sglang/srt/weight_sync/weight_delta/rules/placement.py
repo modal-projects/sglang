@@ -45,6 +45,10 @@ def linear_places(
         else:
             raise ValueError(f"{tensor.name}: no TP rule for {type(module).__name__}")
         local = tensor.shape[split_dim] // size
+        if local * size != tensor.shape[split_dim]:
+            raise ValueError(
+                f"{tensor.name}: dim {split_dim} does not split {size} ways"
+            )
         src[split_dim] = slice(rank * local, (rank + 1) * local)
     dst = param
     if destination.shards:
@@ -64,7 +68,7 @@ def linear_places(
         )
     if dst.dtype != TORCH_DTYPES[tensor.dtype] and len(tensor.shape) > 1:
         raise ValueError(f"{tensor.name}: loader converts a matrix to {dst.dtype}")
-    return (Place(tuple(src), dst),)
+    return (Place(tuple(src), dst, module.tp_group if size > 1 else None),)
 
 
 def _backend_for(layer):

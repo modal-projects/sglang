@@ -44,10 +44,12 @@ class CanonicalTensor:
 @dataclass(frozen=True)
 class Place:
     """Element i of the canonical region `src` (row-major) is element i of `dst`.
-    A wider `dst` dtype means a cast, so the tensor must arrive raw."""
+    A wider `dst` dtype means a cast, so the tensor must arrive raw. A region that is part of
+    the tensor names the group whose GPUs hold the other parts, once each."""
 
     src: tuple[slice, ...]
     dst: torch.Tensor
+    split_group: object = None
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from versions import gap_frames, raw_tensor, snappy_frames, write_version, xor_tensor
+from versions import (
+    gap_frames,
+    raw_tensor,
+    region_checksum,
+    snappy_frames,
+    write_version,
+    xor_tensor,
+)
 
 from sglang.srt.weight_sync.weight_delta import apply as apply_module
 from sglang.srt.weight_sync.weight_delta.apply import Applier
@@ -135,11 +142,22 @@ class TestApply(CustomTestCase):
         encode = encode or (gap_frames if codec == "gap-zstd" else snappy_frames)
         owners = [[], []]
         for index, (name, (dtype, shape)) in enumerate(CANONICAL.items()):
+            # One GPU holds these regions: the version carries their checksum.
+            (place,) = self.places[name]
+            itemsize = TORCH_DTYPES[dtype].itemsize
             if name in RAW:
-                tensor = raw_tensor(name, dtype, shape, current[name])
+                expected = region_checksum(
+                    None, current[name], itemsize, shape, place.src
+                )
+                tensor = raw_tensor(name, dtype, shape, current[name], expected)
             else:
+                expected = region_checksum(
+                    previous[name], current[name], itemsize, shape, place.src
+                )
                 frames, inner = encode(previous[name], current[name])
-                tensor = xor_tensor(name, dtype, shape, frames, inner)
+                tensor = xor_tensor(
+                    name, dtype, shape, frames, inner, expected=expected
+                )
             owners[index % 2].append(tensor)
         type(self).versions += 1
         directory = Path(self.folder.name) / f"weight_v{self.versions:06d}"
@@ -202,6 +220,16 @@ class TestApply(CustomTestCase):
         self._apply(applier, "gap-zstd", first, second)
         self._assert_serving(second)
         self.assertEqual(len(applier._xor_plans), plans)
+
+    def test_a_serving_byte_other_than_the_trainer_expects_fails_the_check(self):
+        current = _changed(self.base, 6)
+        changed = np.frombuffer(self.base["w.whole"], np.uint8) != np.frombuffer(
+            current["w.whole"], np.uint8
+        )
+        self.serving["whole"].view(-1)[int(np.flatnonzero(changed)[0])] ^= 1
+        applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
+        with self.assertRaisesRegex(RuntimeError, "differ from the trainer's.*w.whole"):
+            self._apply(applier, "gap-zstd", self.base, current)
 
     def test_a_frame_that_decodes_past_its_end_raises(self):
         def past_the_end(previous: bytes, current: bytes):

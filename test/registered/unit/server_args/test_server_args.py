@@ -4655,6 +4655,52 @@ class TestLaunchCommand(CustomTestCase):
         )
 
 
+class TestCredentialsStayHidden(CustomTestCase):
+    """The server's credentials never reach the startup log, `/server_info` or the launch
+    command: with only --admin-api-key set, `/server_info` is open to any caller."""
+
+    CREDENTIALS = {
+        "api_key": "api-secret",
+        "admin_api_key": "admin-secret",
+        "ssl_keyfile_password": "ssl-secret",
+    }
+
+    def test_the_launch_command_redacts_them(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "/tmp/x",
+                "--api-key",
+                "api-secret",
+                "--admin-api-key=admin-secret",
+            ]
+        )
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --api-key <redacted> --admin-api-key=<redacted>",
+        )
+
+    def test_what_the_server_shows_redacts_them(self):
+        from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+        server_args = ServerArgs(model_path="/tmp/x", **self.CREDENTIALS)
+        shown = redact_watermark_secrets(server_args.resolved_dict())
+        for name in self.CREDENTIALS:
+            self.assertEqual(shown[name], "<redacted>")
+        for value in self.CREDENTIALS.values():
+            self.assertNotIn(value, json.dumps(shown, default=str))
+            self.assertNotIn(value, repr(server_args))
+
+    def test_unset_ones_stay_unset(self):
+        from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+        shown = redact_watermark_secrets(
+            ServerArgs(model_path="/tmp/x").resolved_dict()
+        )
+        for name in self.CREDENTIALS:
+            self.assertIsNone(shown[name])
+
+
 class TestNoneMeansUnset(CustomTestCase):
     """A valued field the resolution rewrites carries `None` for "not set".
 

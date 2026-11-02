@@ -3061,6 +3061,13 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
+def _runs_sp(forward_batch: ForwardBatch, num_tokens: int) -> bool:
+    """Whether a K3 forward of ``num_tokens`` tokens is sequence-parallel."""
+    return get_flags().sp.model_collectives and layernorm_sp.runs_sp(
+        forward_batch.forward_mode, num_tokens
+    )
+
+
 def _k3_sp_attn_gather(hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
     """A sequence-parallel extend's attention input, gathered from every rank's
     rows, or None (the boundary's own gather) outside one."""
@@ -3586,7 +3593,6 @@ class KimiK3LinearModel(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        sp: bool = False,
     ) -> torch.Tensor:
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
@@ -3622,7 +3628,7 @@ class KimiK3LinearModel(nn.Module):
                 else pp_proxy_tensors["attn_res_bank"]
             )
             bank_rows = hidden_states
-            if sp:
+            if _runs_sp(forward_batch, hidden_states.shape[0]):
                 # The bank holds this rank's slice of the padded rows, and open
                 # reads only the shape.
                 world_size = get_parallel().tp_group.world_size
@@ -3714,6 +3720,9 @@ class KimiK3LinearModel(nn.Module):
         )
         if self.attn_bank is not None:
             self.attn_bank.close()
+        # A prefill graph captures this stack without the outer forward, so the
+        # sequence-sharded region ends here.
+        get_forward().set("sp_active", False)
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
@@ -3921,21 +3930,22 @@ class KimiK3LinearForCausalLM(nn.Module):
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
         num_tokens = (input_ids if input_ids is not None else embeds).shape[0]
-        sp = get_flags().sp.model_collectives and layernorm_sp.runs_sp(
-            forward_batch.forward_mode, num_tokens
-        )
+        sp = _runs_sp(forward_batch, num_tokens)
         hidden_states = self.model(
-            input_ids, positions, forward_batch, embeds, pp_proxy_tensors, sp=sp
+            input_ids, positions, forward_batch, embeds, pp_proxy_tensors
         )
-        if get_forward().sp_active != sp:
-            raise RuntimeError(
-                "Kimi-K3 and its stack disagree on whether this forward is "
-                "sequence-parallel"
-            )
         if self.pp_group.is_last_rank:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+            tp_size = get_parallel().tp_group.world_size
+            if hidden_states.shape[0] != (
+                _cdiv(num_tokens, tp_size) if sp else num_tokens
+            ):
+                raise RuntimeError(
+                    "Kimi-K3 and its stack disagree on whether this forward is "
+                    "sequence-parallel"
+                )
             if sp:
                 # The logits read every token, as do DFlash's captures.
                 hidden_states = layernorm_sp.sp_exit_gather(hidden_states, num_tokens)
@@ -3943,7 +3953,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                     aux_hidden_states = layernorm_sp.sp_exit_gather(
                         aux_hidden_states, num_tokens
                     )
-                get_forward().set("sp_active", False)
             return self.logits_processor(
                 input_ids,
                 hidden_states,

@@ -621,6 +621,8 @@ class SpFlags(_FlagGroupBase):
     model_collectives: bool = False
     # Forwards with fewer tokens stay unsharded (0 = no minimum).
     min_tokens: int = 0
+    # The minimum for prefill CUDA graph buckets (None = they never shard).
+    graph_min_tokens: Optional[int] = None
 
 
 class Flags(_FlagGroupBase):

@@ -60,6 +60,9 @@ SP_SUPPORTED_ARCHITECTURES = (
     | MODEL_COLLECTIVE_SP_ARCHITECTURES
     | frozenset({"Qwen3ForCausalLM"})
 )
+# Eager prefills below this run faster without SP: its extra kernel launches
+# outweigh what it saves.
+MODEL_COLLECTIVE_SP_MIN_TOKENS = 4097
 
 
 def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
@@ -80,23 +83,21 @@ def initialize_layernorm_sp(*, model_config) -> None:
         flags.enabled and architectures[0] in MODEL_COLLECTIVE_SP_ARCHITECTURES
     )
     if flags.model_collectives:
-        flags.min_tokens = _largest_prefill_graph_tokens() + 1
+        from sglang.srt.model_executor.cuda_graph_config import Backend
 
-
-def _largest_prefill_graph_tokens() -> int:
-    """Token count of the largest captured prefill CUDA graph, 0 without one.
-
-    Models that place their own collectives decide SP in Python per forward, and a
-    replayed prefill graph cannot switch to the SP layout, so they shard only
-    forwards larger than this.
-    """
-    from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.utils.common import get_cuda_graph_max_batch_size
-
-    prefill = get_exec().graph.cuda_graph_config.prefill
-    if prefill.backend == Backend.DISABLED or not prefill.bs:
-        return 0
-    return max(get_cuda_graph_max_batch_size(n) for n in prefill.bs)
+        flags.min_tokens = MODEL_COLLECTIVE_SP_MIN_TOKENS
+        flags.graph_min_tokens = get_parallel().layernorm_sp_graph_min_tokens
+        backend = get_exec().graph.cuda_graph_config.prefill.backend
+        # The full backend trims a replayed body to the unpadded rows, which
+        # breaks a sharded one.
+        if flags.graph_min_tokens is not None and backend not in (
+            Backend.BREAKABLE,
+            Backend.DISABLED,
+        ):
+            raise ValueError(
+                "--layernorm-sp-graph-min-tokens requires "
+                "--cuda-graph-backend-prefill breakable."
+            )
 
 
 def layernorm_sp_enabled() -> bool:
@@ -106,13 +107,18 @@ def layernorm_sp_enabled() -> bool:
 def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
     """Whether this forward of ``num_tokens`` tokens runs SP: an enabled model,
     prefill (or a mixed batch for a model that places its own collectives), and
-    at least ``flags.sp.min_tokens`` tokens.
+    at least ``flags.sp.min_tokens`` tokens, or ``flags.sp.graph_min_tokens`` in
+    a prefill CUDA graph.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
-    re-execute on graph replay, so the flag is stale there.
+    re-execute on graph replay, so the flag is stale there. A replayed prefill
+    graph keeps the verdict of its capture, so it passes its bucket's token count.
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner_utils.prefill_graph import (
+        is_in_prefill_graph_scope,
+    )
 
     if not layernorm_sp_enabled():
         return False
@@ -125,6 +131,9 @@ def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
         return True
     if num_tokens is None:
         raise ValueError("runs_sp needs the token count under a token minimum")
+    if is_in_prefill_graph_scope():
+        minimum = flags.graph_min_tokens
+        return minimum is not None and num_tokens >= minimum
     return num_tokens >= flags.min_tokens
 
 

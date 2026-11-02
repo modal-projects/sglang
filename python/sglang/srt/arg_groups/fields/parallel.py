@@ -250,6 +250,13 @@ class Parallel(msgspec.Struct):
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",
     ] = False
+    layernorm_sp_graph_min_tokens: A[
+        Optional[int],
+        "Smallest prefill CUDA graph bucket, in tokens, that Kimi-K3 captures "
+        "sequence-parallel under --enable-layernorm-sp; requires the breakable "
+        "prefill backend. Unset, prefill graphs never shard. Eager prefills shard "
+        "from 4,097 tokens.",
+    ] = None
     enable_megamoe_for_layernorm_sp: A[
         bool,
         "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "

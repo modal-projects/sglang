@@ -27,6 +27,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -48,9 +49,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
-def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
+def _initialize(*, enable=True, arch="Qwen3ForCausalLM", graph_min_tokens=None):
     publish(
-        ServerArgs(model_path="dummy", enable_layernorm_sp=enable), role="tokenizer"
+        ServerArgs(
+            model_path="dummy",
+            enable_layernorm_sp=enable,
+            layernorm_sp_graph_min_tokens=graph_min_tokens,
+        ),
+        role="tokenizer",
     )
     layernorm_sp.initialize_layernorm_sp(
         model_config=SimpleNamespace(
@@ -121,17 +127,37 @@ class TestLayerNormSPGating(CustomTestCase):
             get_forward().set("sp_active", True)
             self.assertTrue(layernorm_sp.participants_active())
 
-    def test_initialize_sets_minimum_above_prefill_graphs(self):
-        """Kimi-K3's token minimum sits one above its largest prefill graph."""
-        for prefill, minimum in (
-            (SimpleNamespace(backend="breakable", bs=[128, 1024, 4096]), 4097),
-            (SimpleNamespace(backend="disabled", bs=[128, 1024, 4096]), 1),
+    def test_initialize_sets_kimi_k3_minimums(self):
+        """Kimi-K3 shards eager forwards from 4,097 tokens and graphs once configured."""
+        with patch.object(layernorm_sp, "get_exec") as get_exec:
+            get_exec.return_value.graph.cuda_graph_config.prefill.backend = "breakable"
+            _initialize(arch="KimiK3ForConditionalGeneration")
+            self.assertEqual(get_flags().sp.min_tokens, 4097)
+            self.assertIsNone(get_flags().sp.graph_min_tokens)
+            _initialize(arch="KimiK3ForConditionalGeneration", graph_min_tokens=1536)
+            self.assertEqual(get_flags().sp.graph_min_tokens, 1536)
+
+    def test_graph_minimum_needs_breakable_prefill_graphs(self):
+        """A graph minimum fails loud under the full prefill graph backend."""
+        with patch.object(layernorm_sp, "get_exec") as get_exec:
+            get_exec.return_value.graph.cuda_graph_config.prefill.backend = "full"
+            with self.assertRaisesRegex(ValueError, "breakable"):
+                _initialize(
+                    arch="KimiK3ForConditionalGeneration", graph_min_tokens=1536
+                )
+
+    def test_prefill_graphs_use_the_graph_minimum(self):
+        """Prefill graph buckets shard from the graph minimum, eager forwards from 4,097."""
+        with get_flags().sp.override(
+            enabled=True, model_collectives=True, min_tokens=4097
         ):
-            with patch.object(layernorm_sp, "get_exec") as get_exec:
-                get_exec.return_value.graph.cuda_graph_config.prefill = prefill
-                _initialize(arch="KimiK3ForConditionalGeneration")
-            self.assertTrue(get_flags().sp.model_collectives)
-            self.assertEqual(get_flags().sp.min_tokens, minimum)
+            with prefill_graph_scope(full_graph=False):
+                self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 4096))
+            with get_flags().sp.override(graph_min_tokens=1024):
+                self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 2048))
+                with prefill_graph_scope(full_graph=False):
+                    self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1024))
+                    self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 768))
 
     def test_int8_reduce_scatter_follows_quick_reduce(self):
         """INT8 reduce-scatters run only while the TP group's QuickReduce runs INT8."""

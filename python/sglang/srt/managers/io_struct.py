@@ -241,8 +241,8 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
     # the full sampling support; support mode also returns each sampled token's logprob
-    # in output_token_sampling_selected_logprobs. When omitted, selected mode is used if
-    # return_sampling_mask is enabled.
+    # in output_token_sampling_selected_logprobs, unless the flat mask arrays hold it.
+    # When omitted, selected mode is used if return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
     ] = None
@@ -255,6 +255,11 @@ class GenerateReqInput:
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return output sampling masks as flat arrays plus row lengths instead of
+    # nested per-token lists, on the finished response only.
+    return_flat_sampling_mask: bool = False
+    # Base64-encode those arrays. Requires return_flat_sampling_mask.
+    return_flat_sampling_mask_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -505,6 +510,20 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
+            )
+        if self.return_flat_sampling_mask and self.stream:
+            raise ValueError(
+                "return_flat_sampling_mask is only set on the finished response and "
+                "does not support stream=True."
+            )
+        if self.return_flat_sampling_mask and self.return_outputs_via_store:
+            raise ValueError(
+                "return_flat_sampling_mask does not apply with return_outputs_via_store, "
+                "which keeps sampling masks out of the response."
+            )
+        if self.return_flat_sampling_mask_b64 and not self.return_flat_sampling_mask:
+            raise ValueError(
+                "return_flat_sampling_mask_b64 requires return_flat_sampling_mask."
             )
 
     def _determine_batch_size(self):
@@ -1040,6 +1059,8 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_flat_sampling_mask=self.return_flat_sampling_mask,
+            return_flat_sampling_mask_b64=self.return_flat_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(

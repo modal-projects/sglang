@@ -37,6 +37,7 @@ CANONICAL = {
     "w.rows": ("BF16", (128, 1024)),
     "w.cols": ("BF16", (64, 512)),
     "w.frames": ("U8", (2, 600_000)),
+    "w.parts": ("U8", (2, 600_000)),
     "e.0": ("U8", (256, 512)),
     "e.1": ("U8", (256, 512)),
     "w.strided": ("U8", (64, 256)),
@@ -55,6 +56,7 @@ def _serving_and_places():
         "rows": torch.zeros((64, 1024), dtype=torch.bfloat16, device=cuda),
         "cols": torch.zeros((64, 256), dtype=torch.bfloat16, device=cuda),
         "frames": torch.zeros((2, 600_000), dtype=torch.uint8, device=cuda),
+        "parts": torch.zeros((2, 600_000), dtype=torch.uint8, device=cuda),
         "experts": torch.zeros((2, 256, 512), dtype=torch.uint8, device=cuda),
         "strided": torch.zeros((64, 512), dtype=torch.uint8, device=cuda),
         "bias": torch.zeros(1024, dtype=torch.bfloat16, device=cuda),
@@ -67,6 +69,11 @@ def _serving_and_places():
         "w.rows": [Place((slice(32, 96), slice(None)), serving["rows"])],
         "w.cols": [Place((slice(None), slice(128, 384)), serving["cols"])],
         "w.frames": [Place(everything * 2, serving["frames"])],
+        # Two places, rows swapped: the second frame touches only one of them.
+        "w.parts": [
+            Place((slice(0, 1), slice(None)), serving["parts"][1:2]),
+            Place((slice(1, 2), slice(None)), serving["parts"][0:1]),
+        ],
         "e.0": [Place(everything * 2, serving["experts"][0])],
         "e.1": [Place(everything * 2, serving["experts"][1])],
         "w.strided": [Place(everything * 2, serving["strided"][:, 128:384])],
@@ -94,9 +101,9 @@ def _changed(values: dict[str, bytes], seed: int) -> dict[str, bytes]:
     for name, data in values.items():
         flat = np.frombuffer(data, dtype=np.uint8).copy()
         positions = rng.choice(len(flat), size=max(1, len(flat) // 100), replace=False)
-        flat[positions] ^= rng.integers(1, 256, len(positions), dtype=np.uint8)
-        if CANONICAL[name][0] == "F8_E4M3":
-            flat &= 0x77
+        # FP8 changes only its low bits, so it stays clear of NaN.
+        top = 8 if CANONICAL[name][0] == "F8_E4M3" else 256
+        flat[positions] ^= rng.integers(1, top, len(positions), dtype=np.uint8)
         changed[name] = flat.tobytes()
     return changed
 
@@ -142,18 +149,25 @@ class TestApply(CustomTestCase):
         encode = encode or (gap_frames if codec == "gap-zstd" else snappy_frames)
         owners = [[], []]
         for index, (name, (dtype, shape)) in enumerate(CANONICAL.items()):
+            # Like Miles, a version carries only the tensors that changed.
+            if current[name] == previous[name]:
+                continue
             # One GPU holds these regions: the version carries their checksum.
-            (place,) = self.places[name]
+            raw = name in RAW
             itemsize = TORCH_DTYPES[dtype].itemsize
-            if name in RAW:
-                expected = region_checksum(
-                    None, current[name], itemsize, shape, place.src
+            expected = sum(
+                region_checksum(
+                    None if raw else previous[name],
+                    current[name],
+                    itemsize,
+                    shape,
+                    place.src,
                 )
+                for place in self.places[name]
+            ) % (1 << 64)
+            if raw:
                 tensor = raw_tensor(name, dtype, shape, current[name], expected)
             else:
-                expected = region_checksum(
-                    previous[name], current[name], itemsize, shape, place.src
-                )
                 frames, inner = encode(previous[name], current[name])
                 tensor = xor_tensor(
                     name, dtype, shape, frames, inner, expected=expected
@@ -207,19 +221,48 @@ class TestApply(CustomTestCase):
         self._apply(applier, "snappy-zstd", self.base, current)
         self._assert_serving(current)
 
-    def test_batches_split_across_slots_and_plans_are_reused(self):
-        slot_nbytes = apply_module.SLOT_NBYTES
-        apply_module.SLOT_NBYTES = 64 << 10
-        self.addCleanup(setattr, apply_module, "SLOT_NBYTES", slot_nbytes)
+    def test_gap_chunks_take_whichever_tensors_a_version_carries(self):
+        chunk_nbytes = apply_module.CHUNK_NBYTES
+        apply_module.CHUNK_NBYTES = 4 << 10
+        self.addCleanup(setattr, apply_module, "CHUNK_NBYTES", chunk_nbytes)
         applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
         first = _changed(self.base, 3)
         stats = self._apply(applier, "gap-zstd", self.base, first)
         self.assertGreater(stats["batches"], 2)
-        plans = len(applier._xor_plans)
-        second = _changed(first, 4)
+        second = {**_changed(first, 4), "w.rows": first["w.rows"], "e.1": first["e.1"]}
         self._apply(applier, "gap-zstd", first, second)
         self._assert_serving(second)
-        self.assertEqual(len(applier._xor_plans), plans)
+
+    def test_snappy_layouts_take_whichever_tensors_a_version_carries(self):
+        slot_nbytes = apply_module.SLOT_NBYTES
+        apply_module.SLOT_NBYTES = 64 << 10
+        self.addCleanup(setattr, apply_module, "SLOT_NBYTES", slot_nbytes)
+        applier = Applier(self.delta_map, "snappy-zstd", torch.device("cuda", 0))
+        first = _changed(self.base, 3)
+        stats = self._apply(applier, "snappy-zstd", self.base, first)
+        self.assertGreater(stats["batches"], 2)
+        # e.1 shares its layout with tensors the version carries; w.frames has one of its own,
+        # which the version then skips.
+        second = {
+            **_changed(first, 4),
+            "e.1": first["e.1"],
+            "w.frames": first["w.frames"],
+        }
+        layouts = stats["batches"]
+        stats = self._apply(applier, "snappy-zstd", first, second)
+        self._assert_serving(second)
+        self.assertEqual(stats["batches"], layouts - 1)
+
+    def test_a_version_of_raw_tensors_only_lands(self):
+        previous = self.base
+        for seed, codec in enumerate(("gap-zstd", "snappy-zstd"), 8):
+            changed = _changed(previous, seed)
+            current = {**previous, **{name: changed[name] for name in RAW}}
+            applier = Applier(self.delta_map, codec, torch.device("cuda", 0))
+            stats = self._apply(applier, codec, previous, current)
+            self._assert_serving(current)
+            self.assertEqual((stats["batches"], stats["raw"]), (0, 3))
+            previous = current
 
     def test_a_serving_byte_other_than_the_trainer_expects_fails_the_check(self):
         current = _changed(self.base, 6)

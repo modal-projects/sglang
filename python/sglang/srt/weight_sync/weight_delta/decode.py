@@ -1,9 +1,10 @@
-"""Inside the pause: decode a batch's frames from a GPU input buffer into its decode slot."""
+"""Inside the pause: XOR gap frames into serving tensors, or decode Snappy frames into slots."""
 
 from __future__ import annotations
 
 import ctypes
 import importlib.metadata
+from dataclasses import dataclass
 from functools import cache
 
 import numpy as np
@@ -11,57 +12,144 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES, DeltaMap
+from sglang.srt.weight_sync.weight_delta.xor_kernel import checksum_terms
+
 GAP_NBYTES = 3
 MAX_FRAME_NBYTES = 4 << 20
 HARDWARE, CUDA_KERNELS = 1, 2  # nvcompDecompressBackend_t
+SCATTER_BLOCK = 1024
 
 
-class GapDecoder:
-    """Codec gap-zstd. A frame of n changes is 4n bytes: each changed position's gap from the
-    previous one (the first from 0) as a little-endian u24 in three byte planes, then the XOR
-    value at each. Decoding writes the values into a zeroed slot, which is then XORed like a
-    Snappy-decoded one; a position past the frame flags its status."""
+@dataclass(frozen=True)
+class Places:
+    """The places a held tensor can arrive XORed to; row r's are [start[r], start[r] + count[r])."""
 
-    whole_frames = False
-    temp_nbytes = 0
-
-    def check(self, frames: np.ndarray) -> None:
-        """frames: int64 rows (input offset, encoded bytes, decoded bytes, output offset)."""
-        _check_frames(frames)
-        if np.any(frames[1] % (GAP_NBYTES + 1)):
-            raise ValueError("a gap frame's length is not a whole number of changes")
-
-    def metadata(self, frames: np.ndarray, input_address: int, output_address: int):
-        metadata = frames.copy()
-        metadata[0] += input_address
-        metadata[1] //= GAP_NBYTES + 1
-        metadata[2], metadata[3] = frames[3] + output_address, frames[2]
-        return metadata
-
-    def expected_sizes(self, metadata: torch.Tensor) -> torch.Tensor:
-        return metadata[3]
-
-    def enqueue(self, metadata, statuses, actual_sizes, temp, count: int) -> None:
-        actual_sizes.copy_(metadata[3])
-        _gap_decode[(count,)](metadata, statuses, count, BLOCK=1024)
+    # Per place, int64: table row, serving address, item size, region axes, view axes, then
+    # (extent, first, length, step) per region axis and (size, stride) per view axis.
+    records: torch.Tensor
+    record: np.ndarray  # where each place's record starts
+    low: np.ndarray  # each place holds the canonical bytes [low, high)
+    high: np.ndarray
+    start: np.ndarray
+    count: np.ndarray
 
 
-# The decode kernels' pointers are slices at offsets each version's frames set: specialized on
-# alignment, a version with a new alignment would compile a kernel in the pause.
+def gap_places(delta_map: DeltaMap, device: torch.device) -> Places:
+    """Once at startup."""
+    table = delta_map.table
+    words, record, low, high = [], [], [], []
+    start = np.zeros(len(table.names), np.int64)
+    count = np.zeros(len(table.names), np.int64)
+    shape_start = np.concatenate(([0], table.shape_end[:-1]))
+    for row, entry in enumerate(table.entries):
+        start[row] = len(record)
+        if not isinstance(entry, tuple) or table.raw_only[row]:
+            continue
+        shape = tuple(table.shape[shape_start[row] : table.shape_end[row]].tolist())
+        itemsize = TORCH_DTYPES[table.dtypes[row]].itemsize
+        for place in entry:
+            region, first, last = _region_axes(shape, place.src)
+            view = _view_axes(place.dst)
+            record.append(len(words))
+            low.append(first * itemsize)
+            high.append((last + 1) * itemsize)
+            words += [row, place.dst.data_ptr(), itemsize, len(region), len(view)]
+            words += [value for axis in region + view for value in axis]
+        count[row] = len(record) - start[row]
+    return Places(
+        torch.tensor(words or [0], dtype=torch.int64, device=device),
+        np.array(record, np.int64),
+        np.array(low, np.int64),
+        np.array(high, np.int64),
+        start,
+        count,
+    )
+
+
+def _region_axes(shape, src) -> tuple[list[list[int]], int, int]:
+    """(extent, first, length, step) axes, a wholly covered axis folded into the one outside it."""
+    axes = []
+    for extent, part in zip(shape, src, strict=True):
+        first, stop, step = part.indices(extent)
+        if step != 1:
+            raise ValueError("a place's region must step by one along every axis")
+        if extent != 1:
+            axes.append([extent, first, stop - first])
+    axis = len(axes) - 1
+    while axis > 0:
+        extent, first, length = axes[axis]
+        if first == 0 and length == extent:
+            outer = axes.pop(axis - 1)
+            axes[axis - 1] = [outer[0] * extent, outer[1] * extent, outer[2] * extent]
+        axis -= 1
+    axes = axes or [[1, 0, 1]]
+    first = last = 0
+    for extent, start, length in axes:
+        first, last = first * extent + start, last * extent + start + length - 1
+    step = 1
+    for axis in reversed(axes):
+        axis.append(step)
+        step *= axis[2]
+    return axes, first, last
+
+
+def _view_axes(view: torch.Tensor) -> list[list[int]]:
+    """A serving view as (size, stride) axes in elements, contiguous neighbours merged."""
+    axes = []
+    for size, stride in zip(view.shape, view.stride()):
+        if size == 1:
+            continue
+        if stride == 0:
+            raise ValueError("a serving view repeats an element")
+        if axes and axes[-1][1] == size * stride:
+            axes[-1] = [axes[-1][0] * size, stride]
+        else:
+            axes.append([size, stride])
+    return axes or [[1, 1]]
+
+
+def check_gap_frames(inner_nbytes: np.ndarray, nbytes: np.ndarray) -> None:
+    if np.any(inner_nbytes <= 0) or np.any(nbytes <= 0):
+        raise ValueError("a gap frame is empty")
+    if np.any(inner_nbytes % (GAP_NBYTES + 1)):
+        raise ValueError("a gap frame's length is not a whole number of changes")
+
+
+def gap_scatter(items: torch.Tensor, places: Places, error, checksums, count: int):
+    """items: int64 rows of inner address, changes, frame offset, frame nbytes, record."""
+    if count:
+        _gap_scatter[(count,)](
+            items, places.records, error, checksums, count, BLOCK=SCATTER_BLOCK
+        )
+
+
+# The items' pointers are slices at offsets each version sets: specialized on alignment, a
+# version with a new alignment would compile a kernel in the pause.
 @triton.jit(
     do_not_specialize=["count"],
-    do_not_specialize_on_alignment=["metadata", "statuses"],
+    do_not_specialize_on_alignment=["items", "records", "error", "checksums"],
 )
-def _gap_decode(metadata, statuses, count, BLOCK: tl.constexpr):
-    frame = tl.program_id(0)
-    source = tl.load(metadata + frame).to(tl.pointer_type(tl.uint8))
-    changes = tl.load(metadata + count + frame)
-    target = tl.load(metadata + 2 * count + frame).to(tl.pointer_type(tl.uint8))
-    limit = tl.load(metadata + 3 * count + frame)
+def _gap_scatter(items, records, error, checksums, count, BLOCK: tl.constexpr):
+    """A frame of n changes: n little-endian u24 gaps in three byte planes, then n XOR values."""
+    item = tl.program_id(0)
+    source = tl.load(items + item).to(tl.pointer_type(tl.uint8))
+    changes = tl.load(items + count + item)
+    start = tl.load(items + 2 * count + item)
+    limit = tl.load(items + 3 * count + item)
+    record = tl.load(items + 4 * count + item)
+    row = tl.load(records + record)
+    target = tl.load(records + record + 1).to(tl.pointer_type(tl.uint8))
+    itemsize = tl.load(records + record + 2)
+    region_axes = tl.load(records + record + 3)
+    view_axes = tl.load(records + record + 4)
+    region = record + 5
+    view = region + 4 * region_axes
     base = changes * 0
     bad = (changes * 0).to(tl.int32)
-    for start in range(0, changes, BLOCK):
-        index = start + tl.arange(0, BLOCK)
+    sums = tl.zeros((BLOCK,), tl.uint64)
+    for first in range(0, changes, BLOCK):
+        index = first + tl.arange(0, BLOCK)
         live = index < changes
         gap = tl.load(source + index, mask=live, other=0).to(tl.int64)
         gap |= tl.load(source + changes + index, mask=live, other=0).to(tl.int64) << 8
@@ -69,11 +157,49 @@ def _gap_decode(metadata, statuses, count, BLOCK: tl.constexpr):
             tl.load(source + 2 * changes + index, mask=live, other=0).to(tl.int64) << 16
         )
         value = tl.load(source + 3 * changes + index, mask=live, other=0)
-        position = base + tl.cumsum(gap, 0)
-        tl.store(target + position, value, mask=live & (position < limit))
-        bad |= tl.max((live & (position >= limit)).to(tl.int32), 0)
+        local = base + tl.cumsum(gap, 0)
+        bad |= tl.max((live & (local >= limit)).to(tl.int32), 0)
+        position = start + local
+        element = position // itemsize
+        # The element's row-major index in the place's region, if the region holds it.
+        member = live & (local < limit)
+        rest = element
+        offset = element * 0
+        axis = region_axes - 1
+        while axis > 0:
+            extent = tl.load(records + region + 4 * axis)
+            coordinate = rest % extent - tl.load(records + region + 4 * axis + 1)
+            member &= (coordinate >= 0) & (
+                coordinate < tl.load(records + region + 4 * axis + 2)
+            )
+            offset += coordinate * tl.load(records + region + 4 * axis + 3)
+            rest = rest // extent
+            axis -= 1
+        coordinate = rest - tl.load(records + region + 1)
+        member &= (coordinate >= 0) & (coordinate < tl.load(records + region + 2))
+        offset += coordinate * tl.load(records + region + 3)
+        # That index's element of the serving view, row-major over the view's own shape.
+        rest = offset
+        address = offset * 0
+        axis = view_axes - 1
+        while axis > 0:
+            size = tl.load(records + view + 2 * axis)
+            address += (rest % size) * tl.load(records + view + 2 * axis + 1)
+            rest = rest // size
+            axis -= 1
+        address += rest * tl.load(records + view + 1)
+        address = address * itemsize + position - element * itemsize
+        previous = tl.load(target + address, mask=member, other=0)
+        new = previous ^ value
+        tl.store(target + address, new, mask=member)
+        terms = checksum_terms(
+            position, new.to(tl.uint32) << ((position & 3) * 8).to(tl.uint32)
+        )
+        sums += terms * (member & (value != 0)).to(tl.uint64)
         base += tl.sum(gap, 0)
-    tl.store(statuses + frame, bad)
+    if bad != 0:
+        tl.atomic_or(error, 1)
+    tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
 
 
 class _Options(ctypes.Structure):
@@ -97,8 +223,6 @@ class SnappyDecoder:
     one (Blackwell), otherwise on nvCOMP's CUDA kernels. The backend is always named: nvCOMP's
     default may silently pick its software decoder on a GPU that has the engine. Adapted from
     sglang#42210 (weight_sync/gpu_delta/codec.py)."""
-
-    whole_frames = True
 
     def __init__(self, device: torch.device):
         self.device = torch.device(device)
@@ -214,17 +338,22 @@ def check_decode(
 
 
 def warm_up(device: torch.device) -> None:
-    """Compile the decode kernels before the first update needs them."""
-    encoded = torch.zeros(4, dtype=torch.uint8, device=device)
-    decoded = torch.zeros(4, dtype=torch.uint8, device=device)
-    metadata = torch.tensor(
-        [[encoded.data_ptr()], [1], [decoded.data_ptr()], [4]],
+    """Compile the gap scatter and the decode check before the first update needs them."""
+    inner = torch.zeros(4, dtype=torch.uint8, device=device)
+    target = torch.zeros(4, dtype=torch.uint8, device=device)
+    records = torch.tensor(
+        [0, target.data_ptr(), 1, 1, 1, 4, 0, 4, 1, 4, 1],
         dtype=torch.int64,
         device=device,
     )
-    statuses = torch.zeros(1, dtype=torch.int32, device=device)
-    _gap_decode[(1,)](metadata, statuses, 1, BLOCK=1024)
-    check_decode[(1,)](statuses, metadata[3], metadata[3], statuses, 1, BLOCK=1024)
+    items = torch.tensor(
+        [inner.data_ptr(), 1, 0, 4, 0], dtype=torch.int64, device=device
+    )
+    error = torch.zeros(1, dtype=torch.int32, device=device)
+    checksums = torch.zeros(1, dtype=torch.int64, device=device)
+    _gap_scatter[(1,)](items, records, error, checksums, 1, BLOCK=SCATTER_BLOCK)
+    sizes = torch.zeros(1, dtype=torch.int64, device=device)
+    check_decode[(1,)](error, sizes, sizes, error, 1, BLOCK=1024)
     torch.cuda.synchronize(device)
 
 

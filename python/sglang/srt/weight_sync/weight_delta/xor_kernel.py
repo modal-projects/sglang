@@ -259,7 +259,7 @@ def _nonzero_bytes(words):
 
 
 @triton.jit
-def _checksum_terms(positions, words):
+def checksum_terms(positions, words):
     """Miles' publication.checksum per lane: (murmur3's 32-bit finalizer of the word index
     positions // 4 mod 2^32, made odd) x the word of counted bytes, as a full 64-bit product."""
     h = (positions >> 2).to(tl.uint32)
@@ -277,12 +277,10 @@ def _changed_terms(positions, value, new, WORD: tl.constexpr):
     """Checksum terms of the bytes the XOR `value` changed, `new` their result; positions are
     the lanes' byte positions in the canonical tensor."""
     if WORD == 4:
-        return _checksum_terms(positions, new & ((_nonzero_bytes(value) >> 7) * 255))
+        return checksum_terms(positions, new & ((_nonzero_bytes(value) >> 7) * 255))
     else:
         counted = tl.where(value != 0, new, 0).to(tl.uint32)
-        return _checksum_terms(
-            positions, counted << ((positions & 3) * 8).to(tl.uint32)
-        )
+        return checksum_terms(positions, counted << ((positions & 3) * 8).to(tl.uint32))
 
 
 @triton.jit(do_not_specialize=["count"])
@@ -294,7 +292,7 @@ def _raw_checksum_kernel(
     valid = lanes < count
     position = tl.load(positions + lanes, valid, other=0)
     row = tl.load(rows + lanes, valid, other=0)
-    terms = _checksum_terms(
+    terms = checksum_terms(
         position,
         tl.load(values + lanes, valid, other=0).to(tl.uint32)
         << ((position & 3) * 8).to(tl.uint32),

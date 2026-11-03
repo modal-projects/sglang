@@ -331,6 +331,8 @@ class Envs:
     # ===================================================================
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
+    # Compress response bodies for clients whose `Accept-Encoding` lists zstd.
+    SGLANG_ENABLE_RESPONSE_COMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)

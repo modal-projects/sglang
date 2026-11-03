@@ -3857,7 +3857,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         filled
     }
 
-    /// The NodeId anchoring matches; the single root serves every namespace.
     /// Export all residency metadata, but token bytes only for changed keys.
     /// Node handles survive arena-slot reuse and reset. In this pinned core a
     /// live key changes only by a split, which strictly shortens it. Therefore
@@ -3912,6 +3911,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         (self.arena.node(self.arena.root()).id, rows)
     }
 
+    /// The NodeId anchoring matches; the single root serves every namespace.
     pub fn root_node_handle(&self, _extra_key: Option<&str>) -> NodeId {
         self.arena.node(self.arena.root()).id
     }

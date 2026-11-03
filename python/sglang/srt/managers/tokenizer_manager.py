@@ -375,6 +375,9 @@ class ReqState:
     output_token_sampling_selected_logprobs: List[float] = dataclasses.field(
         default_factory=list
     )
+    output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -477,6 +480,29 @@ def _build_flat_top_logprobs_fields(
         f"{side}_top_logprobs_shape": [len(top_logprobs_val) - null_prefix, k],
         f"{side}_top_logprobs_null_prefix": null_prefix,
     }
+
+
+def _build_flat_sampling_mask_fields(
+    chunks: Sequence[SamplingMaskChunk], return_b64: bool
+) -> Dict[str, Any]:
+    """A finished request's sampling masks as flat arrays, base64 with dtype markers if ``return_b64``."""
+    fields: Dict[str, Any] = {
+        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
+    }
+    for name, attr, dtype in (
+        ("output_token_sampling_mask_flat", "token_ids", np.int32),
+        ("output_token_sampling_mask_lengths", "lengths", np.int32),
+        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+    ):
+        values = np.concatenate(
+            [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
+        ).astype(dtype, copy=False)
+        if return_b64:
+            fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
+            fields[f"{name}_b64_dtype"] = np.dtype(dtype).name
+        else:
+            fields[name] = values.tolist()
+    return fields
 
 
 def _build_flat_top_logprobs_fields_from_arrays(
@@ -2077,6 +2103,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         chunk: SamplingMaskChunk,
         output_ids: Sequence[int],
     ) -> None:
+        if state.obj.return_flat_sampling_mask:
+            # The flat arrays hold the sampled tokens' logprobs too.
+            state.output_token_sampling_mask_chunks.append(chunk)
+            return
         support_logprobs = state.obj.sampling_logprobs_mode == "support"
         # The sampled tokens' logprobs, one per token, always stay in meta_info;
         # only the support-sized rows move to the output store.
@@ -2786,6 +2816,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state=state,
                         chunk=output_sampling_mask[i],
                         output_ids=recv_obj.output_ids[i],
+                    )
+                # Built once on the finished response, the abort path included;
+                # streaming is rejected.
+                if (
+                    state.obj.return_flat_sampling_mask
+                    and recv_obj.finished_reasons[i] is not None
+                ):
+                    meta_info.update(
+                        _build_flat_sampling_mask_fields(
+                            state.output_token_sampling_mask_chunks,
+                            return_b64=state.obj.return_flat_sampling_mask_b64,
+                        )
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):

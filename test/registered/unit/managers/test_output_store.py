@@ -151,9 +151,10 @@ class TestTokenizerSupportLogprobs(CustomTestCase):
     support; with the store only the support-sized rows are stored."""
 
     def _add(self, *, via_store):
-        state = ReqState(
-            [], False, None, SimpleNamespace(sampling_logprobs_mode="support"), None
+        obj = SimpleNamespace(
+            sampling_logprobs_mode="support", return_flat_sampling_mask=False
         )
+        state = ReqState([], False, None, obj, None)
         if via_store:
             state.token_output_collector = TokenOutputCollector(
                 sampling_support_logprobs=True

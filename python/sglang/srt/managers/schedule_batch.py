@@ -1046,6 +1046,7 @@ class Req(ReqDllmMixin):
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
         sampling_logprobs_mode: SamplingLogprobsMode = "selected",
+        return_sampling_logprobs: bool = False,
         return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
@@ -1296,6 +1297,8 @@ class Req(ReqDllmMixin):
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
+        # A mask request returns its sampling logprobs too.
+        self.return_sampling_logprobs = return_sampling_mask or return_sampling_logprobs
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
@@ -1319,7 +1322,7 @@ class Req(ReqDllmMixin):
             self.logprob.output_token_ids_logprobs_val = []
             self.logprob.output_token_ids_logprobs_idx = []
         self.sampling_mask_rows: Optional[SamplingMaskRows] = (
-            SamplingMaskRows() if return_sampling_mask else None
+            SamplingMaskRows() if self.return_sampling_logprobs else None
         )
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP

@@ -323,7 +323,7 @@ class SchedulerBatchResultProcessor:
                 if (
                     should_commit_output
                     and discard_finish_reason is None
-                    and req.return_sampling_mask
+                    and req.return_sampling_logprobs
                 ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
@@ -420,7 +420,7 @@ class SchedulerBatchResultProcessor:
                     if discard_finish_reason is not None:
                         continue
 
-                    if req.return_sampling_mask:
+                    if req.return_sampling_logprobs:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if req.grammar is not None:
@@ -1045,7 +1045,7 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
-            if req.return_sampling_mask:
+            if req.return_sampling_logprobs:
                 statuses = logits_output.next_token_sampling_mask_status
                 status = None if statuses is None else statuses[i]
                 sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
@@ -1076,7 +1076,7 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
-            if req.return_sampling_mask:
+            if req.return_sampling_logprobs:
                 self.add_sampling_mask_return_values(
                     i, req, logits_output, accept_len=new_accept_len
                 )
@@ -1243,14 +1243,19 @@ class SchedulerBatchResultProcessor:
         assert len(batch_indices) == len(num_accept_tokens)
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
+            req = reqs[batch_index]
             returns_support_logprobs = (
-                reqs[batch_index].sampling_logprobs_mode == "support"
+                req.return_sampling_mask and req.sampling_logprobs_mode == "support"
             )
             num_tokens = num_accept_tokens[row]
             status = max(statuses[row][:num_tokens])
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                row_lengths = lengths[row][:num_tokens]
+                row_lengths = (
+                    lengths[row][:num_tokens]
+                    if req.return_sampling_mask
+                    else [0] * num_tokens
+                )
                 masks[batch_index] = [
                     token_ids[row, token, :length]
                     for token, length in enumerate(row_lengths)
@@ -1278,7 +1283,9 @@ class SchedulerBatchResultProcessor:
             return
 
         sampling_output = output.sampling_mask_output
-        batch_indices = [i for i, req in enumerate(reqs) if req.return_sampling_mask]
+        batch_indices = [
+            i for i, req in enumerate(reqs) if req.return_sampling_logprobs
+        ]
         lengths = sampling_output.lengths.tolist()
         statuses = sampling_output.statuses.tolist()
         assert len(batch_indices) == len(lengths)
@@ -1316,11 +1323,17 @@ class SchedulerBatchResultProcessor:
 
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
+            req = reqs[batch_index]
             returns_support_logprobs = (
-                reqs[batch_index].sampling_logprobs_mode == "support"
+                req.return_sampling_mask and req.sampling_logprobs_mode == "support"
             )
             status = int(statuses[row])
             length = int(lengths[row])
+            if not req.return_sampling_mask:
+                # Without the support there is nothing to overflow or return.
+                if status == SamplingMaskStatus.OVERFLOW:
+                    status = SamplingMaskStatus.OK
+                length = 0
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
                 masks[batch_index] = token_ids[row, :length]

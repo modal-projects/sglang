@@ -313,6 +313,7 @@ class Session:
             token_ids_logprob=req.token_ids_logprob,
             return_sampling_mask=req.return_sampling_mask,
             sampling_logprobs_mode=req.sampling_logprobs_mode,
+            return_sampling_logprobs=req.return_sampling_logprobs,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,

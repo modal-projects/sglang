@@ -758,3 +758,45 @@ class SpecSamplingMaskKit:
                 if request_idx % 2 == 0:
                     self.assertEqual(mask, [output_id])
                     self.assertEqual(logprob, [0.0] if request_idx >= 2 else 0.0)
+
+    def test_selected_logprobs_without_mask(self):
+        """sampling_logprobs_mode alone on a mixed greedy/sampling batch: the sampler's
+        logprob of every committed token, no support, the softmax logprob where nothing
+        is filtered, and no lower where top-p filters. A greedy row samples uniformly
+        among the tokens tied for the largest logit (top-k keeps cutoff ties)."""
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is"] * 3,
+                "sampling_params": [
+                    {"temperature": 0.0, "top_k": 1},
+                    {"temperature": 1.0, "top_p": 0.95},
+                    {"temperature": 1.0},
+                ],
+                "return_logprob": True,
+                "top_logprobs_num": 4,
+                "sampling_logprobs_mode": "selected",
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        outputs = response.json()
+        self.assertEqual(len(outputs), 3)
+        for request_idx, output in enumerate(outputs):
+            meta_info = output["meta_info"]
+            self.assertNotIn("output_token_sampling_mask", meta_info)
+            sampling = meta_info["output_token_sampling_logprobs"]
+            softmax = [item[0] for item in meta_info["output_token_logprobs"]]
+            self.assertEqual(len(sampling), len(output["output_ids"]))
+            for position, (sampled, full) in enumerate(zip(sampling, softmax)):
+                if request_idx == 0:
+                    top = [
+                        item[0] for item in meta_info["output_top_logprobs"][position]
+                    ]
+                    ties = sum(value == top[0] for value in top)
+                    self.assertAlmostEqual(sampled, -math.log(ties), places=5)
+                elif request_idx == 1:
+                    self.assertGreaterEqual(sampled, full - 1e-4)
+                    self.assertLessEqual(sampled, 0.0)
+                else:
+                    self.assertAlmostEqual(sampled, full, delta=1e-4)

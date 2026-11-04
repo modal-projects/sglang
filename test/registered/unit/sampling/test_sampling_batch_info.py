@@ -98,6 +98,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_and_merge_preserve_support_logprob_modes(self):
         info = _make_info(
             batch_size=3,
+            return_sampling_logprobs=[True, True, False],
             return_sampling_masks=[True, True, False],
             return_sampling_support_logprobs=[False, True, False],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
@@ -108,6 +109,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
         other = _make_info(
             batch_size=2,
+            return_sampling_logprobs=[True, True],
             return_sampling_masks=[True, True],
             return_sampling_support_logprobs=[False, True],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
@@ -124,6 +126,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
         info = _make_info(
             batch_size=2,
+            return_sampling_logprobs=[False, True],
             return_sampling_masks=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
@@ -131,6 +134,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         self.assertIsNone(info.sampling_mask_batch_indices)
         other = _make_info(
             batch_size=1,
+            return_sampling_logprobs=[True],
             return_sampling_masks=[True],
             sampling_mask_batch_indices=torch.tensor([0]),
         )
@@ -141,6 +145,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_rebuilds_row_indices(self):
         info = _make_info(
             batch_size=4,
+            return_sampling_logprobs=[False, True, False, True],
             return_sampling_masks=[False, True, False, True],
             sampling_mask_batch_indices=torch.tensor([1, 3]),
         )
@@ -153,11 +158,13 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_merge_offsets_rhs_row_indices(self):
         lhs = _make_info(
             batch_size=2,
+            return_sampling_logprobs=[False, True],
             return_sampling_masks=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
         rhs = _make_info(
             batch_size=3,
+            return_sampling_logprobs=[True, False, True],
             return_sampling_masks=[True, False, True],
             sampling_mask_batch_indices=torch.tensor([0, 2]),
         )
@@ -166,6 +173,34 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
         self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
+
+    def test_rows_without_the_mask_stay_captured_through_filter_and_merge(self):
+        """A row that returns only sampling logprobs is captured but returns no support."""
+        info = _make_info(
+            batch_size=3,
+            return_sampling_logprobs=[True, True, False],
+            return_sampling_masks=[False, True, False],
+            return_sampling_support_logprobs=[False, True, False],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.filter_batch([0, 2], torch.tensor([0, 2]))
+        self.assertEqual(info.return_sampling_logprobs, [True, False])
+        self.assertEqual(info.return_sampling_masks, [False, False])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0])
+        self.assertIsNone(info.sampling_support_logprobs_capture_indices)
+
+        other = _make_info(
+            batch_size=2,
+            return_sampling_logprobs=[True, True],
+            return_sampling_masks=[True, False],
+            return_sampling_support_logprobs=[True, False],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(info.return_sampling_logprobs, [True, False, True, True])
+        self.assertEqual(info.return_sampling_masks, [False, False, True, False])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2, 3])
+        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [1])
 
 
 class TestMergeCustomLogitProcessor(CustomTestCase):

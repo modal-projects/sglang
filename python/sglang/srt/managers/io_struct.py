@@ -242,7 +242,9 @@ class GenerateReqInput:
     # Return either the selected token's behavior logprob or behavior logprobs for
     # the full sampling support; support mode also returns each sampled token's logprob
     # in output_token_sampling_selected_logprobs, unless the flat mask arrays hold it.
-    # When omitted, selected mode is used if return_sampling_mask is enabled.
+    # Selected mode alone returns the behavior logprobs without the support; support
+    # mode requires return_sampling_mask. When omitted, selected mode is used if
+    # return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
     ] = None
@@ -1248,6 +1250,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Whether the request set sampling_logprobs_mode; without return_sampling_mask
+    # it returns only output_token_sampling_logprobs.
+    return_sampling_logprobs: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

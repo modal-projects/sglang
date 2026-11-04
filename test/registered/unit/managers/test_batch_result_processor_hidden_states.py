@@ -76,10 +76,12 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="selected",
                 ),
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="support",
                 ),
             ],
@@ -109,6 +111,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="selected",
                 )
             ],
@@ -135,6 +138,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=x,
+                    return_sampling_logprobs=x,
                     sampling_logprobs_mode="support",
                 )
                 for x in (True, False, True)
@@ -178,6 +182,93 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertEqual(finished.sampling_mask_rows.take().lengths.tolist(), [])
         self.assertEqual(running.sampling_mask_rows.take().lengths.tolist(), [2])
 
+    def test_rows_without_the_mask_return_only_selected_logprobs(self):
+        """Selected mode without the mask returns no support ids and cannot overflow
+        the support cap; a mask row keeps both."""
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SamplingMaskOutput(
+                token_ids=torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32),
+                lengths=torch.tensor([2, 2, 2]),
+                selected_logprobs=torch.tensor([-0.5, -0.25, -0.75]),
+                support_logprobs=None,
+                statuses=torch.tensor(
+                    [
+                        SamplingMaskStatus.OK,
+                        SamplingMaskStatus.OVERFLOW,
+                        SamplingMaskStatus.OVERFLOW,
+                    ]
+                ),
+            ),
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[
+                SimpleNamespace(
+                    return_sampling_mask=mask,
+                    return_sampling_logprobs=True,
+                    sampling_logprobs_mode="selected",
+                )
+                for mask in (True, False, True)
+            ],
+            output=output,
+        )
+        self.assertEqual(
+            output.next_token_sampling_mask_status,
+            [SamplingMaskStatus.OK, SamplingMaskStatus.OK, SamplingMaskStatus.OVERFLOW],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[7, 8], [], None],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
+            [[-0.5], [-0.25], None],
+        )
+
+    def test_speculative_rows_without_the_mask_keep_one_logprob_per_token(self):
+        """A speculative row without the mask keeps its accepted tokens' logprobs only."""
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SamplingMaskOutput(
+                token_ids=torch.tensor(
+                    [[[7, 8], [9, 0], [0, 0]], [[1, 2], [3, 4], [5, 6]]],
+                    dtype=torch.int32,
+                ),
+                lengths=torch.tensor([[2, 1, 0], [2, 2, 2]]),
+                selected_logprobs=torch.tensor(
+                    [[-0.5, -0.25, 0.0], [-0.1, -0.2, -0.3]]
+                ),
+                support_logprobs=None,
+                statuses=torch.full((2, 3), SamplingMaskStatus.OK),
+                num_accept_tokens=torch.tensor([2, 3]),
+            ),
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[
+                SimpleNamespace(
+                    return_sampling_mask=mask,
+                    return_sampling_logprobs=True,
+                    sampling_logprobs_mode="selected",
+                )
+                for mask in (True, False)
+            ],
+            output=output,
+        )
+        masks, logprobs = (
+            output.next_token_sampling_mask_idx,
+            output.next_token_sampling_logprobs,
+        )
+        self.assertEqual([row.tolist() for row in masks[0]], [[7, 8], [9]])
+        self.assertEqual([row.tolist() for row in masks[1]], [[], [], []])
+        self.assertEqual([row.tolist() for row in logprobs[0]], [[-0.5], [-0.25]])
+        np.testing.assert_allclose(np.concatenate(logprobs[1]), [-0.1, -0.2, -0.3])
+
 
 class _PrefillReq:
     def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_states):
@@ -190,6 +281,7 @@ class _PrefillReq:
         self.time_stats = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
+        self.return_sampling_logprobs = False
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
@@ -212,6 +304,7 @@ class _DecodeReq:
         self.is_retracted = False
         self.return_logprob = False
         self.return_sampling_mask = False
+        self.return_sampling_logprobs = False
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
@@ -307,6 +400,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             return_hidden_states=False,
         )
         req.return_sampling_mask = True
+        req.return_sampling_logprobs = True
         batch = SimpleNamespace(
             reqs=[req],
             return_logprob=False,
@@ -444,6 +538,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         req = _DecodeReq()
         req.output_ids = [7]
         req.return_sampling_mask = True
+        req.return_sampling_logprobs = True
         req.multimodal_inputs = None
         req.update_finish_state = Mock()
         batch = SimpleNamespace(

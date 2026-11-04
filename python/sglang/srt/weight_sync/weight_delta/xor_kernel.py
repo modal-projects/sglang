@@ -6,7 +6,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 """XOR of many (source, target) byte views in one launch per access path, with the checksum
-of the bytes each changes.
+of the bytes each changes when the version carries checksums.
 
 From sglang#42210 (weight_sync/gpu_delta/apply.py), changed in the entry points (plan_xor
 takes byte views instead of that PR's binding objects, and warm_up compiles the kernels at
@@ -56,7 +56,8 @@ def _resident_ctas(kernel, device_index):
 def warm_up(device_index: int) -> None:
     """Compile the three XOR families and the raw checksum before the first update needs them."""
     for family in range(3):
-        _compiled(device_index, family)
+        for checked in (True, False):
+            _compiled(device_index, family, checked)
     with torch.cuda.device(device_index):
         _raw_checksum_kernel.warmup(
             torch.uint8,
@@ -316,6 +317,7 @@ def _apply_record(
     ALIGNMENT: tl.constexpr,
     BLOCK: tl.constexpr,
     FAMILY: tl.constexpr,
+    CHECKSUM: tl.constexpr,
 ):
     size = tl.load(metadata + record)
     source_mode = tl.load(metadata + record + 1)
@@ -346,15 +348,17 @@ def _apply_record(
         target = tl.multiple_of(
             tl.load(pointers + position + count + item), ALIGNMENT
         ).to(tl.pointer_type(DTYPE))
-        canonical = tl.load(pointers + position + 2 * count + item)
-        item_row = tl.load(pointers + position + 3 * count + item)
-        if item_row != row:
-            if row >= 0:
-                tl.atomic_add(
-                    checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True)
-                )
-            sums = tl.zeros((ELEMENTS,), tl.uint64)
-            row = item_row
+        if CHECKSUM:
+            canonical = tl.load(pointers + position + 2 * count + item)
+            item_row = tl.load(pointers + position + 3 * count + item)
+            if item_row != row:
+                if row >= 0:
+                    tl.atomic_add(
+                        checksums + row,
+                        tl.sum(sums, axis=0).to(tl.int64, bitcast=True),
+                    )
+                sums = tl.zeros((ELEMENTS,), tl.uint64)
+                row = item_row
         shape = record + 11
         if FAMILY == 1:
             # This family's coordinate descriptors are uint32-word based.
@@ -377,7 +381,10 @@ def _apply_record(
             previous = tl.load(target + offset, mask, other=0)
             new = value ^ previous
             tl.store(target + offset, new, mask)
-            sums += _changed_terms(canonical + index.to(tl.int64) * 4, value, new, 4)
+            if CHECKSUM:
+                sums += _changed_terms(
+                    canonical + index.to(tl.int64) * 4, value, new, 4
+                )
         else:
             # Keep loads/stores inside their uniform access-mode branches:
             # merging row starts first loses the contiguous address proof.
@@ -412,17 +419,27 @@ def _apply_record(
                     ALIGNMENT,
                     FAMILY == 0,
                 )
-                sums += _changed_terms(canonical + source_offset, value, new, WORD)
+                if CHECKSUM:
+                    sums += _changed_terms(canonical + source_offset, value, new, WORD)
                 part += 1
         tile += 1
-    if row >= 0:
-        tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
+    if CHECKSUM:
+        if row >= 0:
+            tl.atomic_add(
+                checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True)
+            )
     return tile
 
 
 @triton.jit
 def _xor_batch(
-    pointers, metadata, error, checksums, BLOCK: tl.constexpr, FAMILY: tl.constexpr
+    pointers,
+    metadata,
+    error,
+    checksums,
+    BLOCK: tl.constexpr,
+    FAMILY: tl.constexpr,
+    CHECKSUM: tl.constexpr,
 ):
     # No pointer or model access may precede the sticky decode-status gate.
     if tl.load(error) == 0:
@@ -461,6 +478,7 @@ def _xor_batch(
                         16,
                         BLOCK,
                         FAMILY,
+                        CHECKSUM,
                     )
                 else:
                     tile = _apply_record(
@@ -474,6 +492,7 @@ def _xor_batch(
                         4,
                         BLOCK,
                         FAMILY,
+                        CHECKSUM,
                     )
             else:
                 tile = _apply_record(
@@ -487,12 +506,13 @@ def _xor_batch(
                     1,
                     BLOCK,
                     FAMILY,
+                    CHECKSUM,
                 )
 
 
 @lru_cache(maxsize=None, typed=True)
-def _compiled(device_index, family):
-    """Three fixed access families per device, all loaded before pause."""
+def _compiled(device_index, family, checked):
+    """Three fixed access families per device, with and without checksum terms, loaded before pause."""
     if (
         type(device_index) is not int
         or not 0 <= device_index < torch.cuda.device_count()
@@ -508,6 +528,7 @@ def _compiled(device_index, family):
             torch.int64,
             BLOCK,
             family,
+            checked,
             grid=(1, 1, 1),
             num_warps=WARPS,
         )
@@ -672,6 +693,7 @@ def _metadata(records):
 class ApplyProgram:
     family: str
     kernel: object
+    unchecked_kernel: object
     metadata_start: int
     metadata_stop: int
     tiles: int
@@ -735,7 +757,12 @@ class ByteApplyGroup:
             + sum(11 + 4 * max(len(c[1]), len(c[3])) for c, _ in self.contracts)
         )
         self.metadata_size = words + words % 2 + 4
-        self.kernels = tuple(_compiled(device_index, family) for family in range(3))
+        self.kernels = tuple(
+            _compiled(device_index, family, True) for family in range(3)
+        )
+        self.unchecked_kernels = tuple(
+            _compiled(device_index, family, False) for family in range(3)
+        )
         self.resident_ctas = tuple(
             _resident_ctas(kernel, device_index) for kernel in self.kernels
         )
@@ -858,6 +885,7 @@ class ByteApplyGroup:
                     ApplyProgram(
                         ("packed", "word_affine", "general")[family],
                         self.kernels[family],
+                        self.unchecked_kernels[family],
                         start,
                         len(self.metadata_rows),
                         tiles,
@@ -870,7 +898,7 @@ class ByteApplyGroup:
             raise RuntimeError("GPU delta family metadata capacity exceeded")
         self.grid_ctas = sum(program.grid[0] for program in self.programs)
 
-    def bind_launch(self, pointers, metadata, error, checksums, grids=None):
+    def bind_launch(self, pointers, metadata, error, checksums, checked, grids=None):
         """Bind retained metadata views once; optional grids support validation."""
         if grids is None:
             grids = tuple(program.grid for program in self.programs)
@@ -884,7 +912,7 @@ class ByteApplyGroup:
             raise ValueError("invalid GPU delta family launch grids")
         calls = tuple(
             partial(
-                program.kernel[grid],
+                (program.kernel if checked else program.unchecked_kernel)[grid],
                 pointers,
                 metadata[program.metadata_start : program.metadata_stop],
                 error,

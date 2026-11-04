@@ -78,7 +78,8 @@ class RawPlan:
     # copy is exact, then each cast by its dtype pair.
     copies: list[tuple[list[torch.Tensor], list[torch.Tensor]]]
     # Each target as the canonical region it holds, cast back to the checkpoint dtype (casts
-    # only widen, so exactly), and per byte its canonical position and checksum row.
+    # only widen, so exactly), and per byte its canonical position and checksum row; none
+    # for a version without checksums.
     checked: list[tuple[torch.Tensor, torch.dtype]]
     positions: np.ndarray
     rows: np.ndarray
@@ -93,7 +94,7 @@ class Plan:
     # The checksum rows (MapTable rows) of the version's tensors this GPU holds, and the
     # trainer's checksum of each; the rows of tensors split across a group, per group.
     rows: np.ndarray
-    expected: np.ndarray
+    expected: np.ndarray | None  # None: the version carries no checksums
     split: list[tuple[object, np.ndarray]]
 
 
@@ -121,7 +122,9 @@ class Applier:
                     self._groups.append(group)
                 self._group_of[row] = self._groups.index(group)
         # Which tensors arrive raw is the trainer's choice: their positions are found on arrival.
-        self._raw_places: dict[int, list[tuple[object, np.ndarray]]] = {}
+        self._raw_positions_of: dict[int, list[np.ndarray]] = {}
+        # What a version without checksums hands the kernels, which never touch it.
+        self._no_checksums = torch.zeros(1, dtype=torch.int64, device=self.device)
         warm_up_decode(self.device)
         warm_up_xor(self.device.index)
 
@@ -145,7 +148,9 @@ class Applier:
             [
                 (self._groups[index], prepared.table_rows[group == index])
                 for index in np.unique(group[group >= 0]).tolist()
-            ],
+            ]
+            if prepared.checksum is not None
+            else [],
         )
 
     def _gap_chunks(self, prepared: Prepared, xor: np.ndarray) -> list[Chunk]:
@@ -264,33 +269,39 @@ class Applier:
                 arena.free()
 
     def _apply(self, plan, staged, arena, started, synced) -> dict:
-        device = self.device
+        device, raw, split = self.device, plan.raw, plan.split
         error = torch.zeros(1, dtype=torch.int32, device=device)
-        checksums = arena.take(8 * len(self.delta_map.table.names)).view(torch.int64)
-        checksums.zero_()
-        raw, split = plan.raw, plan.split
-        lengths = [
-            len(raw.positions),
-            len(raw.rows),
-            len(plan.rows),
-            len(plan.expected),
-        ]
-        lengths += [len(rows) for _, rows in split]
-        host = np.concatenate(
-            [raw.positions, raw.rows, plan.rows, plan.expected.view(np.int64)]
-            + [rows for _, rows in split]
-        ).astype(np.int64)
-        raw_positions, raw_rows, rows, expected, *split_rows = (
-            torch.from_numpy(host).to(device).split(lengths)
-        )
+        checked = plan.expected is not None
+        checksums = self._no_checksums
+        if checked:
+            checksums = arena.take(8 * len(self.delta_map.table.names)).view(
+                torch.int64
+            )
+            checksums.zero_()
+            lengths = [
+                len(raw.positions),
+                len(raw.rows),
+                len(plan.rows),
+                len(plan.expected),
+            ]
+            lengths += [len(rows) for _, rows in split]
+            host = np.concatenate(
+                [raw.positions, raw.rows, plan.rows, plan.expected.view(np.int64)]
+                + [rows for _, rows in split]
+            ).astype(np.int64)
+            raw_positions, raw_rows, rows, expected, *split_rows = (
+                torch.from_numpy(host).to(device).split(lengths)
+            )
         current = torch.cuda.current_stream(device)
         apply_stream = torch.cuda.Stream(device)
         begin, applied = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         if self.places is not None:
-            enqueue = self._scatter(plan, staged, arena, error, checksums, apply_stream)
+            enqueue = self._scatter(
+                plan, staged, arena, error, checksums, checked, apply_stream
+            )
         else:
             enqueue = self._decode_and_xor(
-                plan, staged, arena, error, checksums, apply_stream
+                plan, staged, arena, error, checksums, checked, apply_stream
             )
         bound = time.perf_counter()
 
@@ -302,19 +313,21 @@ class Applier:
                 raw.buffer.copy_(staged[: plan.raw_nbytes], non_blocking=True)
                 for targets, sources in raw.copies:
                     torch._foreach_copy_(targets, sources)
-                values = [
-                    target.to(dtype).reshape(-1).view(torch.uint8)
-                    for target, dtype in raw.checked
-                ]
-                raw_checksums(torch.cat(values), raw_positions, raw_rows, checksums)
+                if checked:
+                    values = [
+                        target.to(dtype).reshape(-1).view(torch.uint8)
+                        for target, dtype in raw.checked
+                    ]
+                    raw_checksums(torch.cat(values), raw_positions, raw_rows, checksums)
         enqueue(current)
         with torch.cuda.stream(apply_stream):
             # A split tensor's parts are summed over the group whose GPUs hold them, on every
             # GPU before any can raise, so none waits in a collective.
-            for (group, _), split_at in zip(split, split_rows):
-                parts = checksums[split_at]
-                torch.distributed.all_reduce(parts, group=group.device_group)
-                checksums[split_at] = parts
+            if checked:
+                for (group, _), split_at in zip(split, split_rows):
+                    parts = checksums[split_at]
+                    torch.distributed.all_reduce(parts, group=group.device_group)
+                    checksums[split_at] = parts
             for copied in self.delta_map.copies:
                 copied.dst.copy_(copied.src)
         # Recomputing derived tensors allocates temporaries: on the caller's stream, whose cached
@@ -329,14 +342,15 @@ class Applier:
         finished = time.perf_counter()
         if error.item():
             raise RuntimeError("a frame failed to decode or decoded to the wrong size")
-        wrong = torch.nonzero(checksums[rows] != expected).flatten().tolist()
-        if wrong:
-            names = [
-                self.delta_map.table.names[plan.rows[i]].decode() for i in wrong[:3]
-            ]
-            raise RuntimeError(
-                f"{len(wrong)} tensors differ from the trainer's after applying, e.g. {names}"
-            )
+        if checked:
+            wrong = torch.nonzero(checksums[rows] != expected).flatten().tolist()
+            if wrong:
+                names = [
+                    self.delta_map.table.names[plan.rows[i]].decode() for i in wrong[:3]
+                ]
+                raise RuntimeError(
+                    f"{len(wrong)} tensors differ from the trainer's after applying, e.g. {names}"
+                )
         return {
             "batches": len(plan.chunks) + len(plan.batches),
             "raw": sum(len(targets) for targets, _ in raw.copies),
@@ -353,7 +367,7 @@ class Applier:
             "gpu_s": begin.elapsed_time(applied) / 1e3,
         }
 
-    def _scatter(self, plan, staged, arena, error, checksums, apply_stream):
+    def _scatter(self, plan, staged, arena, error, checksums, checked, apply_stream):
         """Binds the gap chunks; the returned call queues their copies and scatters."""
         device, chunks = self.device, plan.chunks
         buffers = min(2, len(chunks))
@@ -397,6 +411,7 @@ class Applier:
                         error,
                         checksums,
                         chunk.items.shape[1],
+                        checked,
                     )
                     input_free[index % 2].record(apply_stream)
                 # Queued only now: a stream waits on an event's latest record at queue time.
@@ -405,7 +420,9 @@ class Applier:
 
         return enqueue
 
-    def _decode_and_xor(self, plan, staged, arena, error, checksums, apply_stream):
+    def _decode_and_xor(
+        self, plan, staged, arena, error, checksums, checked, apply_stream
+    ):
         """Binds the Snappy batches; the returned call queues their copies, decodes and XORs."""
         batches, device = plan.batches, self.device
         buffers = min(2, len(batches))
@@ -445,7 +462,7 @@ class Applier:
             view = xor_tables[table_at : table_at + len(xor_table)]
             launches.append(
                 batch.xor.bind_launch(
-                    view[:pointers], view[pointers:], error, checksums
+                    view[:pointers], view[pointers:], error, checksums, checked
                 )
             )
             table_at += len(xor_table)
@@ -525,7 +542,7 @@ class Applier:
         return enqueue
 
     def _arena_nbytes(self, plan: Plan) -> int:
-        tables = 8 * len(self.delta_map.table.names)
+        tables = 8 * len(self.delta_map.table.names) if plan.expected is not None else 0
         if self.places is not None:
             buffers = min(2, len(plan.chunks))
             return (
@@ -559,12 +576,14 @@ class Applier:
                 int(prepared.nbytes[index]),
             )
             value = buffer[offset : offset + size].view(dtype).reshape(tensor.shape)
-            for place, held in self._raw_place_positions(row):
+            for at, place in enumerate(self.delta_map.table.entries[row]):
                 source = value[place.src]
                 target = place.dst.view(source.shape)
-                checked.append((target, dtype))
-                positions.append(held)
-                rows.append(np.full(len(held), row, np.int64))
+                if prepared.checksum is not None:
+                    held = self._raw_positions(row)[at]
+                    checked.append((target, dtype))
+                    positions.append(held)
+                    rows.append(np.full(len(held), row, np.int64))
                 if source.dtype == target.dtype:
                     source, target = _bytes(source), _bytes(target)
                 targets, sources = copies.setdefault(
@@ -580,17 +599,18 @@ class Applier:
             np.concatenate(rows),
         )
 
-    def _raw_place_positions(self, row: int) -> list[tuple[object, np.ndarray]]:
-        if row not in self._raw_places:
+    def _raw_positions(self, row: int) -> list[np.ndarray]:
+        """Per place of a raw tensor, the canonical positions of the bytes it holds."""
+        if row not in self._raw_positions_of:
             tensor = self.delta_map.inventory[self.delta_map.table.names[row].decode()]
             itemsize = TORCH_DTYPES[tensor.dtype].itemsize
             size = int(self.delta_map.table.nbytes[row])
             byte_positions = torch.arange(size).view(*tensor.shape, itemsize)
-            self._raw_places[row] = [
-                (place, byte_positions[place.src].reshape(-1).numpy())
+            self._raw_positions_of[row] = [
+                byte_positions[place.src].reshape(-1).numpy()
                 for place in self.delta_map.table.entries[row]
             ]
-        return self._raw_places[row]
+        return self._raw_positions_of[row]
 
 
 def _layouts(delta_map: DeltaMap, device: torch.device) -> list[_Layout]:

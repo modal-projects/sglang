@@ -116,11 +116,19 @@ def check_gap_frames(inner_nbytes: np.ndarray, nbytes: np.ndarray) -> None:
         raise ValueError("a gap frame's length is not a whole number of changes")
 
 
-def gap_scatter(items: torch.Tensor, places: Places, error, checksums, count: int):
+def gap_scatter(
+    items: torch.Tensor, places: Places, error, checksums, count: int, checked: bool
+):
     """items: int64 rows of inner address, changes, frame offset, frame nbytes, record."""
     if count:
         _gap_scatter[(count,)](
-            items, places.records, error, checksums, count, BLOCK=SCATTER_BLOCK
+            items,
+            places.records,
+            error,
+            checksums,
+            count,
+            BLOCK=SCATTER_BLOCK,
+            CHECKSUM=checked,
         )
 
 
@@ -130,7 +138,9 @@ def gap_scatter(items: torch.Tensor, places: Places, error, checksums, count: in
     do_not_specialize=["count"],
     do_not_specialize_on_alignment=["items", "records", "error", "checksums"],
 )
-def _gap_scatter(items, records, error, checksums, count, BLOCK: tl.constexpr):
+def _gap_scatter(
+    items, records, error, checksums, count, BLOCK: tl.constexpr, CHECKSUM: tl.constexpr
+):
     """A frame of n changes: n little-endian u24 gaps in three byte planes, then n XOR values."""
     item = tl.program_id(0)
     source = tl.load(items + item).to(tl.pointer_type(tl.uint8))
@@ -192,14 +202,16 @@ def _gap_scatter(items, records, error, checksums, count, BLOCK: tl.constexpr):
         previous = tl.load(target + address, mask=member, other=0)
         new = previous ^ value
         tl.store(target + address, new, mask=member)
-        terms = checksum_terms(
-            position, new.to(tl.uint32) << ((position & 3) * 8).to(tl.uint32)
-        )
-        sums += terms * (member & (value != 0)).to(tl.uint64)
+        if CHECKSUM:
+            terms = checksum_terms(
+                position, new.to(tl.uint32) << ((position & 3) * 8).to(tl.uint32)
+            )
+            sums += terms * (member & (value != 0)).to(tl.uint64)
         base += tl.sum(gap, 0)
     if bad != 0:
         tl.atomic_or(error, 1)
-    tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
+    if CHECKSUM:
+        tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
 
 
 class _Options(ctypes.Structure):
@@ -351,7 +363,10 @@ def warm_up(device: torch.device) -> None:
     )
     error = torch.zeros(1, dtype=torch.int32, device=device)
     checksums = torch.zeros(1, dtype=torch.int64, device=device)
-    _gap_scatter[(1,)](items, records, error, checksums, 1, BLOCK=SCATTER_BLOCK)
+    for checked in (True, False):
+        _gap_scatter[(1,)](
+            items, records, error, checksums, 1, BLOCK=SCATTER_BLOCK, CHECKSUM=checked
+        )
     sizes = torch.zeros(1, dtype=torch.int64, device=device)
     check_decode[(1,)](error, sizes, sizes, error, 1, BLOCK=1024)
     torch.cuda.synchronize(device)

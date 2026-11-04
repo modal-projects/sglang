@@ -24,7 +24,6 @@ _COLUMNS = (
     "tensors.inner_nbytes",
     "tensors.chunk_end",
     "tensors.frame_end",
-    "tensors.checksum",
     *(f"{table}.{field}" for table in ("chunks", "frames") for field in _REGION_FIELDS),
 )
 # Each ragged column's row ends, and the column they end into.
@@ -65,7 +64,7 @@ class Tensors:
     frame_end: np.ndarray
     # Of the tensor's new bytes where they changed, every byte for a raw one (Miles'
     # publication.checksum); the engine compares it after applying.
-    checksum: np.ndarray
+    checksum: np.ndarray | None  # None: the version carries no checksums
     chunks: dict[str, np.ndarray]
     frames: dict[str, np.ndarray]
 
@@ -95,6 +94,9 @@ def read_tensors(manifest: Manifest) -> Tensors:
         _read_owner_file(manifest.directory / name, nbytes)
         for name, nbytes in manifest.files.items()
     ] or [_no_rows()]
+    checksummed = {"tensors.checksum" in owner for owner in owners}
+    if len(checksummed) > 1:
+        raise ValueError(f"{manifest.directory}: only some owner files carry checksums")
     column = {
         key: np.concatenate([owner[key] for owner in owners]) for key in owners[0]
     }
@@ -124,7 +126,7 @@ def read_tensors(manifest: Manifest) -> Tensors:
         inner_nbytes=column["tensors.inner_nbytes"],
         chunk_end=ends["tensors.chunk_end"],
         frame_end=ends["tensors.frame_end"],
-        checksum=column["tensors.checksum"],
+        checksum=column.get("tensors.checksum"),
         chunks=chunks,
         frames={field: column[f"frames.{field}"] for field in _REGION_FIELDS},
     )
@@ -142,6 +144,8 @@ def _read_owner_file(path: Path, nbytes: int) -> dict[str, np.ndarray]:
         if missing or dtypes is None:
             raise ValueError(f"{path}: no {missing or 'dtypes metadata'}")
         column = {key: owner.get_tensor(key) for key in _COLUMNS}
+        if "tensors.checksum" in owner.keys():
+            column["tensors.checksum"] = owner.get_tensor("tensors.checksum")
     with path.open("rb") as source:
         header_nbytes = int.from_bytes(source.read(8), "little")
         payload_start, payload_end = orjson.loads(source.read(header_nbytes))[
@@ -168,7 +172,6 @@ def _no_rows() -> dict[str, np.ndarray]:
     column["tensors.name"] = np.zeros(0, dtype=np.uint8)
     column["tensors.dtype"] = np.zeros(0, dtype=str)
     column["tensors.raw"] = np.zeros(0, dtype=bool)
-    column["tensors.checksum"] = np.zeros(0, dtype=np.uint64)
     column["payload_offset"] = np.zeros(1, dtype=np.int64)
     return column
 

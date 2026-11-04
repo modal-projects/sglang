@@ -56,7 +56,7 @@ class Prepared:
     staging_capacity: int
     frame_end: np.ndarray
     frames: dict[str, np.ndarray]
-    checksum: np.ndarray
+    checksum: np.ndarray | None
     stats: dict = field(default_factory=dict)
 
     @property
@@ -250,7 +250,7 @@ def prepare(
         staging_capacity=staging.capacity,
         frame_end=frame_end,
         frames={key: column[frame_rows] for key, column in tensors.frames.items()},
-        checksum=tensors.checksum[held],
+        checksum=None if tensors.checksum is None else tensors.checksum[held],
         stats={
             "files": len(paths),
             "tensors": len(rows),

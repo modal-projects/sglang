@@ -145,7 +145,9 @@ class TestApply(CustomTestCase):
                 place.dst.copy_(canonical[place.src])
         self.before = {key: tensor.cpu() for key, tensor in self.serving.items()}
 
-    def _apply(self, applier, codec, previous, current, encode=None) -> dict:
+    def _apply(
+        self, applier, codec, previous, current, encode=None, checksums=True
+    ) -> dict:
         encode = encode or (gap_frames if codec == "gap-zstd" else snappy_frames)
         owners = [[], []]
         for index, (name, (dtype, shape)) in enumerate(CANONICAL.items()):
@@ -175,7 +177,7 @@ class TestApply(CustomTestCase):
             owners[index % 2].append(tensor)
         type(self).versions += 1
         directory = Path(self.folder.name) / f"weight_v{self.versions:06d}"
-        manifest = write_version(directory, owners, 4, codec)
+        manifest = write_version(directory, owners, 4, codec, checksums)
         prepared, staged = self.process.prepare(manifest, "4")
         return applier.apply(applier.plan(prepared), staged)
 
@@ -273,6 +275,23 @@ class TestApply(CustomTestCase):
         applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
         with self.assertRaisesRegex(RuntimeError, "differ from the trainer's.*w.whole"):
             self._apply(applier, "gap-zstd", self.base, current)
+
+    def test_a_version_without_checksums_lands_unchecked(self):
+        previous = self.base
+        for seed, codec in enumerate(("gap-zstd", "snappy-zstd"), 10):
+            current = _changed(previous, seed)
+            applier = Applier(self.delta_map, codec, torch.device("cuda", 0))
+            self._apply(applier, codec, previous, current, checksums=False)
+            self._assert_serving(current)
+            previous = current
+        # A serving byte other than the trainer's: without checksums, nothing catches it.
+        current = _changed(previous, 12)
+        changed = np.frombuffer(previous["w.whole"], np.uint8) != np.frombuffer(
+            current["w.whole"], np.uint8
+        )
+        self.serving["whole"].view(-1)[int(np.flatnonzero(changed)[0])] ^= 1
+        applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
+        self._apply(applier, "gap-zstd", previous, current, checksums=False)
 
     def test_a_frame_that_decodes_past_its_end_raises(self):
         def past_the_end(previous: bytes, current: bytes):

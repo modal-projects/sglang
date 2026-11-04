@@ -107,13 +107,15 @@ def write_version(
     owners: list[list[dict]],
     base_version: int,
     codec: str = "gap-zstd",
+    checksums: bool = True,
 ) -> Path:
     """One owner file per list of tensors, then the manifest; returns the manifest's path."""
     directory.mkdir(parents=True, exist_ok=True)
     files = []
     for index, tensors in enumerate(owners):
         path = directory / f"owner-{index:05d}.safetensors"
-        files.append({"name": path.name, "nbytes": write_owner_file(path, tensors)})
+        nbytes = write_owner_file(path, tensors, checksums)
+        files.append({"name": path.name, "nbytes": nbytes})
     manifest = {
         "format": "weight-delta/v1",
         "codec": codec,
@@ -126,7 +128,7 @@ def write_version(
     return directory / "manifest.json"
 
 
-def write_owner_file(path: Path, tensors: list[dict]) -> int:
+def write_owner_file(path: Path, tensors: list[dict], checksums: bool = True) -> int:
     """An owner file as Miles writes it: payload, then where each tensor's bytes lie."""
     payload, rows, chunks, frames = bytearray(), [], [], []
     dtypes = list(dict.fromkeys(tensor["dtype"] for tensor in tensors))
@@ -163,11 +165,12 @@ def write_owner_file(path: Path, tensors: list[dict]) -> int:
         "tensors.inner_nbytes": column([row[3] for row in rows]),
         "tensors.chunk_end": column([row[4] for row in rows]),
         "tensors.frame_end": column([row[5] for row in rows]),
-        "tensors.checksum": np.array(
-            [tensor["checksum"] for tensor, *_ in rows], dtype=np.uint64
-        ),
         "payload": np.frombuffer(bytes(payload), dtype=np.uint8),
     }
+    if checksums:
+        columns["tensors.checksum"] = np.array(
+            [tensor["checksum"] for tensor, *_ in rows], dtype=np.uint64
+        )
     fields = ("offset", "nbytes", "inner_offset", "inner_nbytes")
     for table, records in (("chunks", chunks), ("frames", frames)):
         for index, field in enumerate(fields):

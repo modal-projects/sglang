@@ -13,6 +13,11 @@ import numpy as np
 
 from sglang.srt.weight_sync.weight_delta.manifest import read_manifest, read_tensors
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.weight_delta_versions import (
+    raw_tensor,
+    write_owner_file,
+    write_version,
+)
 
 # The same version is in Miles' tests/fast/backends/training_utils/weight_update/protocols/
 # test_weight_delta_publication.py.
@@ -138,6 +143,27 @@ class TestReadVersion(CustomTestCase):
             ),
             (0, 0, 0),
         )
+
+    def test_a_version_without_checksums_has_none(self):
+        owners = [[raw_tensor("a.bias", "BF16", (2,), b"\x01\x02\x03\x04")]] * 2
+        tensors = read_tensors(
+            read_manifest(write_version(self.directory, owners, 4, checksums=False))
+        )
+        self.assertEqual(tensors.names.tolist(), [b"a.bias"] * 2)
+        self.assertIsNone(tensors.checksum)
+
+    def test_a_version_checksummed_in_only_some_owner_files_is_refused(self):
+        owners = [[raw_tensor("a.bias", "BF16", (2,), b"\x01\x02\x03\x04")]] * 2
+        manifest = write_version(self.directory, owners, 4)
+        listed = json.loads(manifest.read_text())
+        listed["files"][1]["nbytes"] = write_owner_file(
+            self.directory / "owner-00001.safetensors", owners[1], checksums=False
+        )
+        manifest.write_text(json.dumps(listed))
+        with self.assertRaisesRegex(
+            ValueError, "only some owner files carry checksums"
+        ):
+            read_tensors(read_manifest(manifest))
 
     def test_an_owner_file_of_another_size_is_refused(self):
         self._write(["owner-00000.safetensors"])

@@ -287,6 +287,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    exclusive_queue_stream,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -1152,7 +1153,9 @@ class Scheduler(
                 ),
             )
         device_module = torch.get_device_module(model_runner.device)
-        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        self.schedule_stream = (
+            None if use_mlx() else exclusive_queue_stream(model_runner.device)
+        )
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream

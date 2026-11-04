@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.utils import exclusive_queue_stream
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
@@ -27,7 +28,7 @@ def _get_overlap_plan_stream(
     device_str = str(device)
     stream = _OVERLAP_PLAN_STREAMS.get(device_str)
     if stream is None:
-        stream = torch.get_device_module(device_str).Stream()
+        stream = exclusive_queue_stream(device_str)
         _OVERLAP_PLAN_STREAMS[device_str] = stream
     return stream, torch.get_device_module(device_str).stream(stream)
 

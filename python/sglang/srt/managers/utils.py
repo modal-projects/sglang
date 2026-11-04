@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import logging
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import msgspec
@@ -22,6 +24,7 @@ from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
+from sglang.srt.utils.common import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
@@ -50,6 +53,41 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def exclusive_queue_stream(device) -> torch.Stream:
+    """A new stream on a hardware queue that no other stream shares.
+
+    ROCm binds ordinary streams to a few shared in-order queues, where one stream's
+    work waits behind another's, but it gives every CU-masked stream its own queue.
+    """
+    device = torch.device(device)
+    device_module = torch.get_device_module(device)
+    if not is_hip():
+        return device_module.Stream()
+    index = device.index if device.index is not None else device_module.current_device()
+    num_cus = device_module.get_device_properties(index).multi_processor_count
+    mask = (ctypes.c_uint32 * ((num_cus + 31) // 32))()
+    for cu in range(num_cus):
+        mask[cu // 32] |= 1 << (cu % 32)
+    handle = ctypes.c_void_p()
+    with device_module.device(index):
+        err = _hip_runtime().hipExtStreamCreateWithCUMask(
+            ctypes.byref(handle), len(mask), mask
+        )
+    if err != 0:
+        raise RuntimeError(f"hipExtStreamCreateWithCUMask failed with error {err}")
+    return device_module.ExternalStream(
+        handle.value, device=torch.device(device.type, index)
+    )
+
+
+@lru_cache(maxsize=1)
+def _hip_runtime():
+    """The HIP runtime torch loaded, whose streams torch can use."""
+    with open("/proc/self/maps") as maps:
+        path = next(line.split()[-1] for line in maps if "libamdhip64.so" in line)
+    return ctypes.CDLL(path)
 
 
 @dataclasses.dataclass

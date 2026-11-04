@@ -97,6 +97,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.managers.utils import exclusive_queue_stream
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -466,7 +467,7 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = exclusive_queue_stream(self.device)
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

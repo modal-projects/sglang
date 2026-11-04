@@ -37,7 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.managers.utils import _async_d2h
+from sglang.srt.managers.utils import _async_d2h, exclusive_queue_stream
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
@@ -1274,7 +1274,7 @@ def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
+        plan_stream = exclusive_queue_stream(device)
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
     else:

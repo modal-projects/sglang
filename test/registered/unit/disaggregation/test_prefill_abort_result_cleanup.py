@@ -33,6 +33,7 @@ class _Req:
         self.discard_output_reason = None
         self.return_logprob = False
         self.return_sampling_mask = False
+        self.return_sampling_logprobs = False
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))

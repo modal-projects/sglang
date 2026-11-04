@@ -24,6 +24,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -124,6 +125,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=i in requested_rows,
+                    return_sampling_logprobs=i in requested_rows,
                     sampling_logprobs_mode="support",
                 )
                 for i in range(len(sampled))
@@ -156,6 +158,72 @@ class TestSamplingMaskCapture(CustomTestCase):
                     math.log(expected),
                     places=6,
                 )
+
+    def test_selected_logprobs_without_support_are_the_filtered_samplers(self):
+        """Rows returning only sampling logprobs get the mask path's renormalized logprob, no support, no overflow."""
+        base = torch.tensor([0.4, 0.25, 0.15, 0.12, 0.08], device="cuda")
+        probs = base.repeat(8, 1)
+        sorted_probs = base.sort(descending=True).values
+        self.sampler.sampling_mask_max_tokens = 2
+        backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
+        for backend in backends:
+            for top_k, top_p in ((2, 1.0), (TOP_K_ALL, 0.7), (TOP_K_ALL, 1.0)):
+                with self.subTest(backend=backend, top_k=top_k, top_p=top_p):
+                    sampled, capture = self._sample(
+                        probs, backend, top_k=top_k, top_p=top_p
+                    )
+                    packed = self.sampler._build_sampling_mask_output(
+                        sampled, capture, support_capture_indices=None
+                    )
+                    output = self.sampler._build_sampling_mask_output(
+                        sampled,
+                        capture,
+                        support_capture_indices=None,
+                        return_support=False,
+                    )
+                    self.assertEqual(tuple(output.token_ids.shape), (len(probs), 0))
+                    self.assertTrue(
+                        torch.equal(output.selected_logprobs, packed.selected_logprobs)
+                    )
+                    mass_before = sorted_probs.cumsum(-1) - sorted_probs
+                    kept_count = min(top_k, int((mass_before < top_p).sum().item()))
+                    kept_mass = sorted_probs[:kept_count].sum()
+                    torch.testing.assert_close(
+                        output.selected_logprobs, torch.log(base[sampled] / kept_mass)
+                    )
+
+                    logits_output = LogitsProcessorOutput(
+                        next_token_logits=None, sampling_mask_output=output
+                    )
+                    output.map_device_tensors(lambda tensor: tensor.cpu())
+                    SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+                        [
+                            SimpleNamespace(
+                                return_sampling_mask=False,
+                                return_sampling_logprobs=True,
+                                sampling_logprobs_mode="selected",
+                            )
+                        ]
+                        * len(probs),
+                        logits_output,
+                    )
+                    self.assertEqual(
+                        logits_output.next_token_sampling_mask_status,
+                        [SamplingMaskStatus.OK] * len(probs),
+                    )
+                    self.assertTrue(
+                        all(
+                            len(mask) == 0
+                            for mask in logits_output.next_token_sampling_mask_idx
+                        )
+                    )
+                    self.assertEqual(
+                        [
+                            float(row[0])
+                            for row in logits_output.next_token_sampling_logprobs
+                        ],
+                        packed.selected_logprobs.cpu().tolist(),
+                    )
 
     def test_hard_exclusion_replay_in_mixed_batch(self):
         backends = ["pytorch"] if is_hip() else ["pytorch", "flashinfer"]
@@ -465,7 +533,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 response = self._post_generate(params, custom_logit_processor=processor)
                 self.assertEqual(response.status_code, 400, response.text)
                 self.assertIn(
-                    "only supports DisallowedTokensLogitsProcessor", response.text
+                    "only support DisallowedTokensLogitsProcessor", response.text
                 )
                 recovery = self._post_generate(params)
                 self.assertEqual(recovery.status_code, 200, recovery.text)
@@ -574,6 +642,49 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             self._assert_sampling_masks(output_ids, chunk["meta_info"])
 
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
+
+    def _post_selected_logprobs(self, sampling_params, mode="selected"):
+        """Ask for sampling logprobs without the sampling mask."""
+        return requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is"] * len(sampling_params),
+                "sampling_params": [
+                    {
+                        "temperature": 1.0,
+                        "max_new_tokens": _MAX_NEW_TOKENS,
+                        "ignore_eos": True,
+                        **params,
+                    }
+                    for params in sampling_params
+                ],
+                "return_logprob": True,
+                "sampling_logprobs_mode": mode,
+            },
+            timeout=60,
+        )
+
+    def test_generate_returns_selected_logprobs_without_mask(self):
+        """Selected mode alone: each output token's sampler logprob, no support, no top_k; never below the softmax's."""
+        response = self._post_selected_logprobs([{"top_p": _TOP_P}, {}])
+        self.assertEqual(response.status_code, 200, response.text)
+        for output, filtered in zip(response.json(), (True, False), strict=True):
+            meta_info = output["meta_info"]
+            self.assertNotIn("output_token_sampling_mask", meta_info)
+            sampling = meta_info["output_token_sampling_logprobs"]
+            softmax = [item[0] for item in meta_info["output_token_logprobs"]]
+            self.assertEqual(len(sampling), len(output["output_ids"]))
+            for sampled, full in zip(sampling, softmax, strict=True):
+                self.assertLessEqual(sampled, 0.0)
+                if filtered:
+                    self.assertGreaterEqual(sampled, full - 1e-5)
+                else:
+                    self.assertAlmostEqual(sampled, full, delta=1e-5)
+
+    def test_support_logprobs_without_mask_are_rejected(self):
+        response = self._post_selected_logprobs([{"top_k": _TOP_K}], mode="support")
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("'support' requires return_sampling_mask=true", response.text)
 
     def test_generate_rejects_unbounded_sampling_mask(self):
         for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"top_p": 1.0}):
@@ -713,6 +824,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=flag,
+                    return_sampling_logprobs=flag,
                     sampling_logprobs_mode="support",
                 )
                 for flag in (True, False, True)
@@ -758,6 +870,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="support",
                 )
             ],
@@ -796,6 +909,40 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             output = response.json()
             outputs.append((output["output_ids"], output["text"]))
         self.assertEqual(outputs[0], outputs[1])
+
+    def test_selected_logprobs_without_mask_match_the_mask(self):
+        """For the same seeded tokens, selected mode alone returns the mask's selected logprobs."""
+        sampling_params = {
+            "top_k": _TOP_K,
+            "top_p": 1.0,
+            "sampling_seed": _SAMPLING_SEED,
+            "max_new_tokens": 64,
+        }
+        with_mask = self._post_generate(
+            sampling_params, sampling_logprobs_mode="selected"
+        )
+        self.assertEqual(with_mask.status_code, 200, with_mask.text)
+        without = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "ignore_eos": True,
+                    **sampling_params,
+                },
+                "sampling_logprobs_mode": "selected",
+            },
+            timeout=60,
+        )
+        self.assertEqual(without.status_code, 200, without.text)
+        with_mask, without = with_mask.json(), without.json()
+        self.assertEqual(without["output_ids"], with_mask["output_ids"])
+        self.assertNotIn("output_token_sampling_mask", without["meta_info"])
+        self.assertEqual(
+            without["meta_info"]["output_token_sampling_logprobs"],
+            with_mask["meta_info"]["output_token_sampling_logprobs"],
+        )
 
     def test_modes_and_streaming_return_identical_sampling_masks(self):
         """For the same seeded tokens, selected and support mode report the same

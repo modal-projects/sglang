@@ -200,7 +200,7 @@ class Sampler(nn.Module):
                 )
             target_logprobs.clamp_(min=torch.finfo(target_logprobs.dtype).min)
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
-        return_sampling_mask = sampling_mask_batch_indices is not None
+        capture_sampling_mask = sampling_mask_batch_indices is not None
         sampling_support_logprobs_capture_indices = (
             sampling_info.sampling_support_logprobs_capture_indices
         )
@@ -331,7 +331,7 @@ class Sampler(nn.Module):
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         _trace_e2e_sampler("token_sync_returned")
 
-        if return_sampling_mask:
+        if capture_sampling_mask:
             assert sampling_mask_batch_indices is not None
             if sampling_info.is_all_greedy:
                 logits_output.sampling_mask_output = (
@@ -352,6 +352,7 @@ class Sampler(nn.Module):
                     batch_next_token_ids,
                     sampling_mask_capture,
                     sampling_support_logprobs_capture_indices,
+                    return_support=any(sampling_info.return_sampling_masks),
                 )
 
         _trace_e2e_sampler("forward_returned")
@@ -368,12 +369,12 @@ class Sampler(nn.Module):
 
         Used for standard sampling with flashinfer/pytorch backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
-        Capture work is performed only when return_sampling_mask is enabled.
+        Capture work is performed only for rows that return sampling logprobs.
         """
         capture_rows = sampling_info.sampling_mask_batch_indices
-        return_sampling_mask = capture_rows is not None
+        capture_sampling_mask = capture_rows is not None
         sampling_mask_capture = None
-        if return_sampling_mask:
+        if capture_sampling_mask:
             select_capture_rows = partial(
                 _select_sampling_mask_rows, batch_indices=capture_rows
             )
@@ -384,7 +385,7 @@ class Sampler(nn.Module):
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
             )
-            if return_sampling_mask:
+            if capture_sampling_mask:
                 capture_probs = select_capture_rows(probs)
                 capture_tokens = select_capture_rows(batch_next_token_ids)
                 selected_weight = torch.gather(
@@ -408,7 +409,7 @@ class Sampler(nn.Module):
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
-                    if return_sampling_mask:
+                    if capture_sampling_mask:
                         capture_probs = select_capture_rows(probs)
                         capture_min_ps = select_capture_rows(sampling_info.min_ps)
                         capture_tokens = select_capture_rows(batch_next_token_ids)
@@ -436,7 +437,7 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="joint",
                     )
-                    if return_sampling_mask:
+                    if capture_sampling_mask:
                         # Correctness invariant: the fused joint sampler and these
                         # separate renormalization primitives must share cutoff,
                         # tie, and joint-support semantics so captured positive
@@ -479,10 +480,10 @@ class Sampler(nn.Module):
                     sampling_info.need_min_p_sampling,
                     sampling_info.sampling_seed,
                     positions,
-                    return_filtered_probs=return_sampling_mask,
+                    return_filtered_probs=capture_sampling_mask,
                     max_top_k=sampling_info.max_top_k,
                 )
-                if return_sampling_mask:
+                if capture_sampling_mask:
                     (
                         batch_next_token_ids,
                         filtered_probs,
@@ -539,6 +540,7 @@ class Sampler(nn.Module):
         batch_next_token_ids: torch.Tensor,
         sampling_mask_capture: _SamplingMaskCapture,
         support_capture_indices: Optional[torch.Tensor],
+        return_support: bool = True,
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
         batch_indices = sampling_mask_capture.batch_rows
@@ -603,7 +605,12 @@ class Sampler(nn.Module):
                 )
 
         packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
-        if token_ids is None:
+        if not return_support:
+            packed_token_ids = torch.empty(
+                (weights.shape[0], 0), dtype=torch.int32, device=weights.device
+            )
+            packed_weights = weights[:, :0]
+        elif token_ids is None:
             packed_weights, packed_positions = torch.topk(
                 weights, k=packed_size, dim=-1, largest=True, sorted=True
             )

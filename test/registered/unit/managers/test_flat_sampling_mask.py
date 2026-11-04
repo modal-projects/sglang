@@ -172,5 +172,39 @@ class TestFlatSamplingMaskFields(CustomTestCase):
                 self.assertEqual(len(values), 0)
 
 
+class TestSelectedLogprobsWithoutMask(CustomTestCase):
+    def test_selected_mode_alone_returns_only_the_sampled_tokens_logprobs(self):
+        """Without the mask the response has per-token logprobs and no support, even with flat arrays requested."""
+        obj = GenerateReqInput(
+            text="hello",
+            sampling_logprobs_mode="selected",
+            return_flat_sampling_mask=True,
+        )
+        obj.normalize_batch_and_arguments()
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=APIServerReqTimeStats(),
+        )
+        meta_info = {}
+        for logprobs in ([-0.5, -0.25], [-1.0]):
+            TokenizerManager._add_sampling_mask_output(
+                meta_info=meta_info,
+                state=state,
+                chunk=SamplingMaskChunk(
+                    lengths=np.zeros(len(logprobs), dtype=np.int32),
+                    token_ids=np.empty(0, dtype=np.int32),
+                    logprobs=np.asarray(logprobs, dtype=np.float32),
+                ),
+                output_ids=[0] * len(logprobs),
+            )
+        self.assertEqual(
+            meta_info, {"output_token_sampling_logprobs": [-0.5, -0.25, -1.0]}
+        )
+        self.assertEqual(state.output_token_sampling_mask_chunks, [])
+
+
 if __name__ == "__main__":
     unittest.main()

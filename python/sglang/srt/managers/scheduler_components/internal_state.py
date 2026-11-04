@@ -279,7 +279,9 @@ class SchedulerInternalStateController:
             )
             queued.extend(prealloc_queue.retracted_queue)
             queued.extend(prealloc_queue.held_rebootstrap_reqs)
-        return any(req.return_sampling_mask and not req.finished() for req in queued)
+        return any(
+            req.return_sampling_logprobs and not req.finished() for req in queued
+        )
 
 
 class _UpdateHandler:

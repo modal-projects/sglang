@@ -67,27 +67,35 @@ class TestSamplingMaskValidation(CustomTestCase):
         ):
             with self.subTest(processor=processor):
                 with self.assertRaisesRegex(
-                    ValueError, "only supports DisallowedTokensLogitsProcessor"
+                    ValueError, "only support DisallowedTokensLogitsProcessor"
                 ):
                     self._validate(processor)
+                with self.assertRaisesRegex(
+                    ValueError, "only support DisallowedTokensLogitsProcessor"
+                ):
+                    self._validate(
+                        processor,
+                        return_sampling_mask=False,
+                        sampling_logprobs_mode="selected",
+                    )
 
     def test_other_processors_still_work_without_sampling_masks(self):
         self._validate(
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
 
-    def test_sampling_logprobs_mode_requires_sampling_mask(self):
+    def test_only_support_logprobs_require_the_sampling_mask(self):
+        """Only support mode needs the mask: its logprobs are per support entry, selected mode's per sampled token."""
         self._validate(None, return_sampling_mask=False)
-        for mode in ("selected", "support"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(
-                    ValueError, "can only be set when return_sampling_mask=true"
-                ):
-                    self._validate(
-                        None,
-                        return_sampling_mask=False,
-                        sampling_logprobs_mode=mode,
-                    )
+        self._validate(
+            None, return_sampling_mask=False, sampling_logprobs_mode="selected"
+        )
+        with self.assertRaisesRegex(
+            ValueError, "'support' requires return_sampling_mask=true"
+        ):
+            self._validate(
+                None, return_sampling_mask=False, sampling_logprobs_mode="support"
+            )
 
         for mode in (None, "selected", "support"):
             with self.subTest(mode=mode):

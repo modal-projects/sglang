@@ -497,6 +497,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self.has_mha_companion_layers
             and model_runner.prefill_attention_backend_str == "aiter"
         )
+        self._rocm_bcg_chunked_prefix = self._rocm_bcg_prefix_extend and getattr(
+            getattr(model_runner.attn_backend, "full_attn_backend", None)
+            or model_runner.attn_backend,
+            "k3_chunked_prefix",
+            False,
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -1391,8 +1397,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable
         # unless _rocm_bcg_prefix_extend. DSA is exempt: it stays on sparse MLA under
-        # BCG. Over the KV chunk capacity eager aiter switches to chunked KV, so
-        # those batches stay eager.
+        # BCG. Over the KV chunk capacity only aiter's K3 FP8 prefill chunks the
+        # prefix inside the attention break, so other batches stay eager.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
@@ -1402,7 +1408,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not self._attn_backend_is_dsa
         ):
             if not self._rocm_bcg_prefix_extend or (
-                num_tokens is not None
+                not self._rocm_bcg_chunked_prefix
+                and num_tokens is not None
                 and int(sum(prefix_lens)) + int(num_tokens)
                 > envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
             ):

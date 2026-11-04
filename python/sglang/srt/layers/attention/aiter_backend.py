@@ -220,6 +220,8 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # K3 FP8 MLA prefill (k3_mla_prefill_fp8.K3Fp8PrefillPlan)
     k3_fp8_prefill_plan: Optional[object] = None
+    # k3_mla_prefill_fp8.K3Fp8ChunkedPlan, built by the first MLA layer
+    k3_fp8_chunked_plan: Optional[object] = None
 
 
 def _build_paged_kv_view(
@@ -1961,6 +1963,64 @@ class AiterAttnBackend(AttentionBackend):
             q8, k8, v8, plan, layer.scaling, out_dtype=q.dtype
         )
 
+    @property
+    def k3_chunked_prefix(self) -> bool:
+        """Whether the K3 FP8 prefill attends a prefix over the KV chunk capacity in chunks."""
+        return self.k3_mla_prefill_fmha and not (
+            self.use_fp8_prefill_attn and self.head_pad_mode != "zero"
+        )
+
+    def _k3_use_chunked_prefix(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.k3_chunked_prefix
+            and forward_batch.seq_lens_sum > forward_batch.get_max_chunk_capacity()
+        )
+
+    def _k3_fp8_prefill_chunked(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        K_Buffer: torch.Tensor,
+        plan,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        qk_nope_head_dim: int,
+    ) -> torch.Tensor:
+        """_k3_fp8_prefill with the prefix K/V rebuilt and attended one chunk at a time."""
+        from sglang.kernels.ops.attention import k3_mla_prefill_fp8
+
+        cache2d = K_Buffer.view(K_Buffer.shape[0], -1)
+
+        def chunk_kv(kv_indices):
+            kvc = k3_mla_prefill_fp8.gather_latent(
+                cache2d, kv_indices, kv_lora_rank, q.dtype
+            )
+            kv = layer.kv_b_proj(kvc)[0]
+            return k3_mla_prefill_fp8.kvb_to_fp8(
+                kv.view(kv.shape[0], -1),
+                cache2d,
+                kv_indices,
+                layer.tp_k_head_num,
+                qk_nope_head_dim,
+                layer.v_head_dim,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                fp8_dtype,
+            )
+
+        return k3_mla_prefill_fp8.chunked_attention(
+            k3_mla_prefill_fp8.cast_fp8(q, fp8_dtype),
+            k3_mla_prefill_fp8.cast_fp8(k, fp8_dtype),
+            k3_mla_prefill_fp8.cast_fp8(v, fp8_dtype),
+            plan,
+            chunk_kv,
+            layer.scaling,
+            out_dtype=q.dtype,
+        )
+
     def mla_fp8_prefill_attn(
         self,
         q: torch.Tensor,
@@ -2654,8 +2714,15 @@ class AiterAttnBackend(AttentionBackend):
 
                     qo_lens = list(forward_batch.extend_seq_lens_cpu)
                     kv_lens = forward_batch.seq_lens_cpu[:bs].tolist()
-                    if sum(qo_lens) > 0 and k3_mla_prefill_fp8.supported(
-                        self.num_head, 192, 128, sum(kv_lens)
+                    if (
+                        sum(qo_lens) > 0
+                        and (
+                            extend_no_prefix
+                            or not self._k3_use_chunked_prefix(forward_batch)
+                        )
+                        and k3_mla_prefill_fp8.supported(
+                            self.num_head, 192, 128, sum(kv_lens)
+                        )
                     ):
                         k3_fp8_prefill_plan = k3_mla_prefill_fp8.make_plan(
                             qo_lens, kv_lens, self.num_head, self.device
@@ -3969,13 +4036,42 @@ class AiterAttnBackend(AttentionBackend):
                         causal=True,
                     )
                 k3_plan = self.forward_metadata.k3_fp8_prefill_plan
-                if (
-                    k3_plan is not None
-                    and q.shape[-1] == 192
+                k3_mha = (
+                    q.shape[-1] == 192
                     and v.shape[-1] == 128
                     and layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim)
                     and not (self.use_fp8_prefill_attn and self.head_pad_mode != "zero")
+                )
+                if (
+                    k3_mha
+                    and not extend_no_prefix
+                    and self._k3_use_chunked_prefix(forward_batch)
                 ):
+                    if self.forward_metadata.k3_fp8_chunked_plan is None:
+                        from sglang.kernels.ops.attention import k3_mla_prefill_fp8
+
+                        forward_batch.prepare_chunked_prefix_cache_info(q.device)
+                        self.forward_metadata.k3_fp8_chunked_plan = (
+                            k3_mla_prefill_fp8.make_chunked_plan(
+                                list(forward_batch.extend_seq_lens_cpu),
+                                forward_batch.prefix_chunk_seq_lens_cpu.tolist(),
+                                forward_batch.prefix_chunk_kv_indices,
+                                layer.tp_k_head_num,
+                                q.device,
+                            )
+                        )
+                    return self._k3_fp8_prefill_chunked(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        K_Buffer,
+                        self.forward_metadata.k3_fp8_chunked_plan,
+                        kv_lora_rank=kv_lora_rank,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        qk_nope_head_dim=qk_nope_head_dim,
+                    )
+                if k3_plan is not None and k3_mha:
                     return self._k3_fp8_prefill(
                         q,
                         k,

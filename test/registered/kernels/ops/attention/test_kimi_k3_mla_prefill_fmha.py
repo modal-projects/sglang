@@ -2,8 +2,8 @@
 (12 heads, d_qk 192, d_v 128) vs an fp32 reference and vs a reference on
 E4M3-rounded Q/K/V/P (the error of TRT-LLM's FP8 prefill).
 
-Runs AiterAttnBackend._k3_fp8_prefill (prefix + no-prefix branches) on varlen
-batches. gfx950 only.
+Runs AiterAttnBackend._k3_fp8_prefill (prefix + no-prefix branches) and
+_k3_fp8_prefill_chunked on varlen batches. gfx950 only.
 """
 
 import math
@@ -55,7 +55,7 @@ def _rel(a, b):
     "gfx950 only",
 )
 class TestK3MlaPrefillFmha(CustomTestCase):
-    def _run(self, qo_lens, prefix_lens, seed=0):
+    def _run(self, qo_lens, prefix_lens, seed=0, chunk_len=None):
         from sglang.kernels.ops.attention import k3_mla_prefill_fp8 as K
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
@@ -134,6 +134,46 @@ class TestK3MlaPrefillFmha(CustomTestCase):
         e_k, e_sim = _rel(out, ref), _rel(sim, ref)
         # the kernel must not be worse than ideal E4M3 Q/K/V/P attention (+20%)
         self.assertLess(e_k, 1.2 * e_sim + 1e-3)
+        if chunk_len is None:
+            return
+        starts = [sum(kv_lens[:r]) for r in range(len(kv_lens))]
+        chunk_lens = [
+            [max(0, min(p, (c + 1) * chunk_len) - c * chunk_len) for p in prefix_lens]
+            for c in range(-(-max(prefix_lens) // chunk_len))
+        ]
+        chunk_indices = [
+            torch.cat(
+                [
+                    kv_indices[s + c * chunk_len : s + c * chunk_len + n]
+                    for s, n in zip(starts, lens)
+                ]
+            )
+            for c, lens in enumerate(chunk_lens)
+        ]
+        new_rows = torch.cat(
+            [
+                torch.arange(s + p, s + p + a, device=dev)
+                for s, p, a in zip(starts, prefix_lens, qo_lens)
+            ]
+        )
+        chunked = AiterAttnBackend._k3_fp8_prefill_chunked(
+            None,
+            q,
+            kref[new_rows],
+            vref[new_rows],
+            layer,
+            cache,
+            K.make_chunked_plan(
+                qo_lens, chunk_lens, chunk_indices, H, torch.device(dev)
+            ),
+            kv_lora_rank=LORA,
+            qk_rope_head_dim=DR,
+            qk_nope_head_dim=DN,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(chunked.shape), (tq, H, DV))
+        self.assertTrue(torch.isfinite(chunked).all())
+        self.assertLess(_rel(chunked, ref), 1.2 * e_sim + 1e-3)
 
     def test_prefix_varlen(self):
         self._run([300, 1, 777, 64], [5000, 4096, 0, 129])
@@ -143,6 +183,12 @@ class TestK3MlaPrefillFmha(CustomTestCase):
 
     def test_no_prefix(self):
         self._run([1000, 37, 512], [0, 0, 0])
+
+    def test_chunked_prefix_varlen(self):
+        self._run([300, 1, 777, 64], [5000, 4096, 0, 129], chunk_len=1024)
+
+    def test_chunked_prefix_single(self):
+        self._run([2048], [6000], chunk_len=2048)
 
 
 if __name__ == "__main__":

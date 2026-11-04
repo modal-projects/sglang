@@ -28,7 +28,7 @@ dense, rows ordered per request exactly like kv_indptr (prefix then extend).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, List, Optional
 
 import torch
 import triton
@@ -288,8 +288,12 @@ def attention(
     plan: K3Fp8PrefillPlan,
     softmax_scale: float,
     out_dtype=torch.bfloat16,
-) -> torch.Tensor:
-    """q8 [Tq, H, 192], k8 [Tk, H, 192], v8 [Tk, H, 128] dense e4m3 (unit scale)."""
+    *,
+    causal: bool = True,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """q8 [Tq, H, 192], k8 [Tk, H, 192], v8 [Tk, H, 128] dense e4m3 (unit scale).
+    causal must match the plan, and return_lse needs a make_lse_plan plan."""
     import aiter
 
     T, H, _ = q8.shape
@@ -311,7 +315,7 @@ def attention(
         plan.work_info,
         plan.max_q_len,
         softmax_scale,
-        True,
+        causal,
         logits,
         lse,
         out,
@@ -331,4 +335,142 @@ def attention(
         out.view(-1, 4, DV),
         flse.view(-1, 4),
     )
+    return (out, flse) if return_lse else out
+
+
+def make_lse_plan(
+    qo_lens: List[int],
+    kv_lens: List[int],
+    num_heads: int,
+    device: torch.device,
+    *,
+    causal: bool,
+) -> K3Fp8PrefillPlan:
+    """make_plan for a pass whose output is merged with other passes by its LSE."""
+    import aiter
+
+    bs = len(qo_lens)
+    qo_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+    kv_cpu = torch.zeros(bs + 1, dtype=torch.int32)
+    qo_cpu[1:] = torch.cumsum(torch.tensor(qo_lens, dtype=torch.int32), 0)
+    kv_cpu[1:] = torch.cumsum(torch.tensor(kv_lens, dtype=torch.int32), 0)
+    max_q = max(qo_lens)
+    total_q = int(qo_cpu[-1])
+    total_kv = int(kv_cpu[-1])
+    info = aiter.get_ps_metadata_info_v1(
+        batch_size=bs,
+        num_head_k=num_heads,
+        max_qlen=max_q,
+        qlen_granularity=_TILE_Q,
+        total_qlen=total_q,
+    )
+    bufs = [torch.empty(sz, dtype=dt, device=device) for sz, dt in info]
+    aiter.get_ps_metadata_v1(
+        qo_cpu,
+        kv_cpu,
+        torch.tensor(kv_lens, dtype=torch.int32),
+        1,
+        num_heads,
+        *bufs,
+        qhead_granularity=1,
+        qlen_granularity=_TILE_Q,
+        kvlen_granularity=128,
+        block_size=1,
+        is_causal=causal,
+        need_lse=True,
+    )
+    _, work_indptr, work_info, red_indptr, red_final, red_partial = bufs
+    g = num_heads // 4
+    return K3Fp8PrefillPlan(
+        qo_indptr=qo_cpu.to(device, non_blocking=True),
+        kv_indptr=kv_cpu.to(device, non_blocking=True),
+        kv_page_indices=torch.arange(total_kv, dtype=torch.int32, device=device),
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=red_indptr,
+        reduce_final_map3=red_final * g,
+        reduce_partial_map3=torch.where(red_partial >= 0, red_partial * g, red_partial),
+        num_partial_rows=red_partial.size(0) * _TILE_Q,
+        max_q_len=max_q,
+        total_q=total_q,
+        total_kv=total_kv,
+        num_heads=num_heads,
+        one=torch.ones((), dtype=torch.float32, device=device),
+    )
+
+
+@dataclass
+class K3Fp8ChunkedPlan:
+    extend: K3Fp8PrefillPlan
+    # Per prefix chunk: its KV indices, its plan, and the query rows of the
+    # requests with keys in it (None when every request has some).
+    chunks: List[tuple[torch.Tensor, K3Fp8PrefillPlan, Optional[torch.Tensor]]]
+
+
+def make_chunked_plan(
+    extend_lens: List[int],
+    chunk_kv_lens: List[List[int]],
+    chunk_kv_indices: List[torch.Tensor],
+    num_heads: int,
+    device: torch.device,
+) -> K3Fp8ChunkedPlan:
+    """Plans for an extend that attends its new tokens, then its prefix chunk by chunk."""
+    extend = make_lse_plan(extend_lens, extend_lens, num_heads, device, causal=True)
+    starts = [0]
+    for n in extend_lens:
+        starts.append(starts[-1] + n)
+    chunks = []
+    for kv_lens, kv_indices in zip(chunk_kv_lens, chunk_kv_indices):
+        keep = [r for r, n in enumerate(kv_lens) if n > 0]
+        plan = make_lse_plan(
+            [extend_lens[r] for r in keep],
+            [kv_lens[r] for r in keep],
+            num_heads,
+            device,
+            causal=False,
+        )
+        rows = None
+        if len(keep) < len(kv_lens):
+            rows = torch.cat([torch.arange(starts[r], starts[r + 1]) for r in keep]).to(
+                device, non_blocking=True
+            )
+        chunks.append((kv_indices, plan, rows))
+    return K3Fp8ChunkedPlan(extend=extend, chunks=chunks)
+
+
+def chunked_attention(
+    q8: torch.Tensor,
+    k8: torch.Tensor,
+    v8: torch.Tensor,
+    plan: K3Fp8ChunkedPlan,
+    chunk_kv: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    softmax_scale: float,
+    out_dtype=torch.bfloat16,
+) -> torch.Tensor:
+    """attention over k8 / v8 of the new tokens plus a prefix whose dense K8 / V8
+    chunk_kv(kv_indices) builds one chunk at a time."""
+    from sglang.kernels.ops.attention.merge_state import merge_state_triton
+
+    out, lse = attention(
+        q8, k8, v8, plan.extend, softmax_scale, out_dtype, return_lse=True
+    )
+    for kv_indices, chunk_plan, rows in plan.chunks:
+        chunk_k8, chunk_v8 = chunk_kv(kv_indices)
+        chunk_out, chunk_lse = attention(
+            q8 if rows is None else q8.index_select(0, rows),
+            chunk_k8,
+            chunk_v8,
+            chunk_plan,
+            softmax_scale,
+            out_dtype,
+            causal=False,
+            return_lse=True,
+        )
+        del chunk_k8, chunk_v8
+        if rows is not None:
+            chunk_out = out.new_zeros(out.shape).index_copy_(0, rows, chunk_out)
+            chunk_lse = lse.new_full(lse.shape, float("-inf")).index_copy_(
+                0, rows, chunk_lse
+            )
+        out, lse = merge_state_triton(chunk_out, chunk_lse, out, lse)
     return out

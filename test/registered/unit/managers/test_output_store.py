@@ -152,7 +152,9 @@ class TestTokenizerSupportLogprobs(CustomTestCase):
 
     def _add(self, *, via_store):
         obj = SimpleNamespace(
-            sampling_logprobs_mode="support", return_flat_sampling_mask=False
+            sampling_logprobs_mode="support",
+            return_sampling_mask=True,
+            return_flat_sampling_mask=False,
         )
         state = ReqState([], False, None, obj, None)
         if via_store:

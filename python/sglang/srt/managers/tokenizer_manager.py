@@ -1531,20 +1531,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
-                obj.return_sampling_mask
+                (obj.return_sampling_mask or obj.sampling_logprobs_mode is not None)
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
             ):
                 # Reject before scheduling so aborted requests cannot execute
                 # unsupported processors during sampling batch preparation.
                 raise ValueError(
-                    "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
-                    "among custom logit processors."
+                    "return_sampling_mask and sampling_logprobs_mode only support "
+                    "DisallowedTokensLogitsProcessor among custom logit processors."
                 )
-            if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
+            if obj.sampling_logprobs_mode == "support" and not obj.return_sampling_mask:
                 raise ValueError(
-                    "sampling_logprobs_mode can only be set when "
-                    "return_sampling_mask=true."
+                    "sampling_logprobs_mode='support' requires return_sampling_mask=true."
                 )
             if obj.return_outputs_via_store:
                 if self.output_store is None:
@@ -1715,6 +1714,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
+                return_sampling_logprobs=obj.sampling_logprobs_mode is not None,
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
@@ -2102,6 +2102,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         chunk: SamplingMaskChunk,
         output_ids: Sequence[int],
     ) -> None:
+        if not state.obj.return_sampling_mask:
+            state.output_token_sampling_logprobs.extend(chunk.logprobs.tolist())
+            meta_info["output_token_sampling_logprobs"] = (
+                state.output_token_sampling_logprobs
+            )
+            return
         if state.obj.return_flat_sampling_mask:
             # The flat arrays hold the sampled tokens' logprobs too.
             state.output_token_sampling_mask_chunks.append(chunk)
@@ -2790,9 +2796,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     i,
                     finished=recv_obj.finished_reasons[i] is not None,
                 )
-            if (
-                isinstance(state.obj, GenerateReqInput)
-                and state.obj.return_sampling_mask
+            if isinstance(state.obj, GenerateReqInput) and (
+                state.obj.return_sampling_mask
+                or state.obj.sampling_logprobs_mode is not None
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
@@ -2805,7 +2811,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Built once on the finished response, the abort path included;
                 # streaming is rejected.
                 if (
-                    state.obj.return_flat_sampling_mask
+                    state.obj.return_sampling_mask
+                    and state.obj.return_flat_sampling_mask
                     and recv_obj.finished_reasons[i] is not None
                 ):
                     meta_info.update(

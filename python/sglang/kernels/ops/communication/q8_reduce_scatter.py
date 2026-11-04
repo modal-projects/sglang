@@ -96,9 +96,6 @@ def _unpack_sum_kernel(
     )
 
 
-_workspace: dict = {}
-
-
 def _chunk_bytes(local: int) -> int:
     return local + local // GROUP * 4
 
@@ -115,16 +112,6 @@ def supports(partial: torch.Tensor) -> bool:
 def send_bytes(rows: int, width: int, world: int) -> int:
     """The size of one rank's packed send buffer for a [rows, width] partial."""
     return world * _chunk_bytes(rows // world * width)
-
-
-def _buffers(device: torch.device, nbytes: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Send and receive buffers of at least nbytes, kept for later calls."""
-    send, recv = _workspace.get(device, (None, None))
-    if send is None or send.numel() < nbytes:
-        send = torch.empty(nbytes, dtype=torch.int8, device=device)
-        recv = torch.empty_like(send)
-        _workspace[device] = (send, recv)
-    return send[:nbytes], recv[:nbytes]
 
 
 def pack(partial: torch.Tensor, rows: int, world: int, out: torch.Tensor) -> None:
@@ -176,7 +163,10 @@ def reduce_scatter_q8(
     width = partial.shape[1]
     rows = partial.shape[0] if rows is None else rows
     assert supports(partial) and rows % world == 0 and partial.shape[0] <= rows
-    send, recv = _buffers(partial.device, send_bytes(rows, width, world))
+    send = torch.empty(
+        send_bytes(rows, width, world), dtype=torch.int8, device=partial.device
+    )
+    recv = torch.empty_like(send)
     pack(partial, rows, world, send)
     group.all_to_all_single(recv, send)
     out = partial.new_empty(rows // world, width)

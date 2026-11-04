@@ -1,3 +1,6 @@
+import subprocess
+import sys
+import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -77,6 +80,41 @@ class TestQ8ReduceScatter(CustomTestCase):
             for _ in range(world)
         ]
         self.assertTrue(bool((_reduce_scatter_on_one_gpu(partials, rows) == 0).all()))
+
+    def test_graph_replay_after_larger_eager_call(self):
+        """A captured reduce-scatter replays correctly after a larger eager call."""
+        script = textwrap.dedent(
+            """
+            import torch
+            from sglang.kernels.ops.communication import q8_reduce_scatter as q8
+
+            class Group:
+                world_size = 1
+
+                def all_to_all_single(self, output, input):
+                    output.copy_(input)
+
+            group = Group()
+            small = torch.randn(4096, 7168, dtype=torch.bfloat16, device="cuda")
+            expected = q8.reduce_scatter_q8(small, group).clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                out = q8.reduce_scatter_q8(small, group)
+            big = torch.randn(16384, 7168, dtype=torch.bfloat16, device="cuda")
+            q8.reduce_scatter_q8(big, group)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, expected)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=600
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
     def test_width_must_be_whole_multiples(self):
         """A width that is not a multiple of WIDTH_MULTIPLE is rejected."""

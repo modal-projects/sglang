@@ -7,10 +7,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from sglang.srt.weight_sync.weight_delta import prepare as prepare_module
+from sglang.srt.weight_sync.weight_delta.manifest import read_manifest, read_tensors
 from sglang.srt.weight_sync.weight_delta.map import (
     OTHER_GPU,
     CanonicalTensor,
@@ -21,6 +25,8 @@ from sglang.srt.weight_sync.weight_delta.map import (
 from sglang.srt.weight_sync.weight_delta.prepare import (
     STAGING_GRANULE,
     Staging,
+    _join,
+    _tensor_regions,
     prepare,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -119,6 +125,56 @@ class TestPrepare(CustomTestCase):
             (prepared.stats["tensors"], prepared.stats["held"], prepared.stats["raw"]),
             (4, 3, 2),
         )
+
+    def test_only_this_gpus_tensors_are_read_from_the_files(self):
+        owners = [
+            [_raw("d.scale", RAW_SCALE), _xor("b.weight", INNER, chunk_nbytes=500)],
+            [_xor("c.weight", b"other gpu"), _raw("a.bias", RAW_BIAS)],
+        ]
+        manifest = read_manifest(write_version(self.directory, owners, 4))
+        tensors = read_tensors(manifest)
+        paths = [manifest.directory / name for name in manifest.files]
+        rows = _join(self.table, tensors)
+        held = [i for i, row in enumerate(rows.tolist()) if self.table.held[row]]
+        regions = _tensor_regions(paths, tensors, np.array(held))
+
+        names = [name.decode() for name in tensors.names.tolist()]
+        d, b, a = (names.index(name) for name in ("d.scale", "b.weight", "a.bias"))
+        # d.scale and b.weight lie apart only by alignment: one read for both.
+        self.assertEqual(
+            regions,
+            [
+                (
+                    paths[0],
+                    tensors.offset[d],
+                    tensors.offset[b] + tensors.nbytes[b] - tensors.offset[d],
+                ),
+                (paths[1], tensors.offset[a], tensors.nbytes[a]),
+            ],
+        )
+
+    def test_staging_reads_any_byte_the_prefetch_did_not(self):
+        owners = [
+            [_raw("d.scale", RAW_SCALE), _xor("b.weight", INNER, chunk_nbytes=500)],
+            [_xor("c.weight", b"other gpu"), _raw("a.bias", RAW_BIAS)],
+        ]
+        prepared = {}
+        for case, read_nbytes, prefetch in (
+            ("4 MiB reads", prepare_module.READ_NBYTES, prepare_module._prefetch),
+            ("64-byte reads", 64, prepare_module._prefetch),
+            ("no prefetch", prepare_module.READ_NBYTES, lambda regions: None),
+        ):
+            with (
+                unittest.mock.patch.object(prepare_module, "READ_NBYTES", read_nbytes),
+                unittest.mock.patch.object(prepare_module, "_prefetch", prefetch),
+            ):
+                result = self._prepare(owners)
+            prepared[case] = (
+                result.staged_offset.tolist(),
+                os.pread(self.staging.fd, result.staged_end, 0),
+            )
+        self.assertEqual(prepared["64-byte reads"], prepared["4 MiB reads"])
+        self.assertEqual(prepared["no prefetch"], prepared["4 MiB reads"])
 
     def test_a_version_this_gpu_takes_nothing_from_stages_nothing(self):
         prepared = self._prepare([[_xor("c.weight", b"other gpu")]])

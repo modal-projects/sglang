@@ -4654,11 +4654,24 @@ _QUARK_CKPT_TO_SGLANG_MAPPER = WeightsMapper(
     orig_to_new_substr={".attn.": ".self_attn.", ".ffn.": ".mlp."},
     orig_to_new_suffix={".w1": ".gate_proj", ".w2": ".down_proj", ".w3": ".up_proj"},
 )
+# A ModelOpt NVFP4 ignore list names the same checkpoint modules, the LM head as `head`.
+_MODELOPT_NVFP4_CKPT_TO_SGLANG_MAPPER = _QUARK_CKPT_TO_SGLANG_MAPPER | WeightsMapper(
+    orig_to_new_prefix={"head": "lm_head"}
+)
 
 
 def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     quantization_config = getattr(config, "quantization_config", None) or {}
     return quantization_config.get("quant_method") == "quark"
+
+
+def _is_modelopt_nvfp4_checkpoint(config: DeepSeekV4Config) -> bool:
+    quantization_config = getattr(config, "quantization_config", None) or {}
+    # ModelConfig rewrites the checkpoint's "modelopt" to the method it resolves.
+    return (
+        quantization_config.get("quant_method") in ("modelopt", "modelopt_fp4")
+        and quantization_config.get("quant_algo") == "NVFP4"
+    )
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -4667,8 +4680,13 @@ class DeepseekV4ForCausalLM(nn.Module):
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
         # The loader hands this mapper to every quant config; other formats were
-        # written against different names, so only Quark checkpoints get it.
-        return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
+        # written against different names, so only Quark and ModelOpt NVFP4
+        # checkpoints get it.
+        if _is_quark_checkpoint(config):
+            return _QUARK_CKPT_TO_SGLANG_MAPPER
+        if _is_modelopt_nvfp4_checkpoint(config):
+            return _MODELOPT_NVFP4_CKPT_TO_SGLANG_MAPPER
+        return None
 
     def __init__(
         self,

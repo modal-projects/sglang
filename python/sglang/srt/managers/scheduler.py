@@ -25,8 +25,8 @@ import time
 from array import array
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import copy_context
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union

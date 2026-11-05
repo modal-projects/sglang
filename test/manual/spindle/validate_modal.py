@@ -54,8 +54,9 @@ UNIT_FILES = [
 
 @app.function(image=image, cpu=8, memory=32768, timeout=1800)
 def units():
-    import sglang
     import torch
+
+    import sglang
 
     print(
         json.dumps({"sglang": sglang.__file__, "torch": torch.__version__}), flush=True

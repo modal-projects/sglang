@@ -21,19 +21,19 @@
 import logging
 import re
 from pathlib import Path
-from safetensors import safe_open
 from typing import Dict, List, Optional
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.utils import get_normalized_target_modules
 
 # Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the

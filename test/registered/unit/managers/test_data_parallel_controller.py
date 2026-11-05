@@ -29,8 +29,8 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
-    run_data_parallel_controller_process,
     WorkerPortHandshake,
+    run_data_parallel_controller_process,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context

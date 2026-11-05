@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
+
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -19,6 +20,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_parallel
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_expert_local_loading_and_collective_async_install():

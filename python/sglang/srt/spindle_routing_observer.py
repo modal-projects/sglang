@@ -6,22 +6,23 @@ may be in flight. No tensors or cache access state are modified.
 Enable explicitly with SGLANG_SPINDLE_ROUTING_OBSERVATIONS=1.
 """
 
-from array import array
-import json
 import atexit
+import json
 import logging
 import os
 import pickle
-from pathlib import Path
-from queue import Empty, Queue
 import socket
-import subprocess
 import struct
+import subprocess
 import sys
 import threading
 import time
+from array import array
+from pathlib import Path
+from queue import Empty, Queue
 
 import xxhash
+
 if __name__ != "__main__":
     from sglang.srt.runtime_context import get_parallel
 

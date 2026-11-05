@@ -61,7 +61,7 @@ def _make_ctx(
     )
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=MagicMock(swa_checkpoint_windows=False),
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,

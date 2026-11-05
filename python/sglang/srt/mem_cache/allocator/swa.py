@@ -44,6 +44,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
+    _target_swa = True
 
     def __init__(
         self,
@@ -55,16 +56,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
         req_to_token_pool=None,
+        target_swa: bool = True,
     ):
-        assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
 
-        full_kv_pool = getattr(kvcache, "full_kv_pool", None)
-        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        # A target without SWA layers holds SWA slots only for a draft's SWA pool, which registers the mapping.
+        self._target_swa = target_swa
+        if target_swa:
+            assert isinstance(kvcache, BaseSWAKVPool)
+            full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+            swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        else:
+            full_kv_pool, swa_kv_pool = kvcache, None
 
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
@@ -129,7 +136,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Per-request SWA ring: the paged SWA indices built here are unused and
         # SWA capacity is bounded by req slots, not tokens.
-        ring_size = kvcache.swa_req_ring_size
+        ring_size = kvcache.swa_req_ring_size if self._target_swa else None
         self._swa_req_ring = ring_size is not None
         self._req_to_token_pool = req_to_token_pool
         if self._swa_req_ring:
@@ -150,7 +157,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._swa_ring_cost = 0
 
         self.clear()
-        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+        if self._target_swa:
+            self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    @property
+    def target_swa(self) -> bool:
+        """Whether the target's own layers use the SWA side."""
+        return self._target_swa
 
     @property
     def swa_req_ring(self) -> bool:
@@ -261,6 +274,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        if not self._target_swa:
+            return self.full_to_swa_index_mapping[kv_indices]
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 

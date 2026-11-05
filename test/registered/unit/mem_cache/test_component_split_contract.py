@@ -42,6 +42,8 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "session_ref": "copy",
             "session_ids": "reset",
             "metadata": "migrate",
+            "cover_ref": "reset",
+            "host_cover_ref": "reset",
         },
         ComponentType.SWA: {
             "value": "divide",
@@ -51,6 +53,8 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "session_ref": "copy",
             "session_ids": "reset",
             "metadata": "migrate",
+            "cover_ref": "copy",
+            "host_cover_ref": "copy",
         },
         # Mamba state is attached to one exact node, so a prefix parent owns
         # none of it.
@@ -62,6 +66,8 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "session_ref": "reset",
             "session_ids": "reset",
             "metadata": "stay",
+            "cover_ref": "reset",
+            "host_cover_ref": "reset",
         },
     }
 
@@ -105,6 +111,8 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
         cd.host_lock_ref = 2
         cd.session_ref = 4
         cd.session_ids = None
+        cd.cover_ref = 5
+        cd.host_cover_ref = 6
         cd.metadata = {"uuid": 7, "host_uuid": 9, "unrelated": "keep"}
         return node
 

@@ -61,6 +61,8 @@ class CacheInitParams:
     # Tokens back from the committed length that a fused draft reads in the
     # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
     draft_swa_window: int = 0
+    # Keep SWA KV only for the window before each cached Mamba checkpoint, and evict it with that checkpoint.
+    swa_checkpoint_windows: bool = False
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

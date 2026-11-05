@@ -174,6 +174,7 @@ def _swa_allocator(swa_req_ring):
 
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.swa_checkpoint_windows = False
     cache.tree_core = SimpleNamespace(
         enable_external_cache_linker=False,
         write_through_threshold=256,

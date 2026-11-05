@@ -379,6 +379,7 @@ class TestUnifiedTriPool(unittest.TestCase):
 
                 cache = object.__new__(UnifiedRadixCache)
                 cache.disable = False
+                cache.swa_checkpoint_windows = False
                 cache.tree_components = (
                     ComponentType.FULL,
                     ComponentType.SWA,

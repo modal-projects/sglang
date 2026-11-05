@@ -47,6 +47,7 @@ class _FakeTreeCore:
                 ComponentType.MAMBA, self.tree_components, use_host_ptr=True
             )
         }
+        self.components = ()
         self.evicted = []
         self.cascaded = []
         # The real eviction helper reports unbacked FULL evictions to the

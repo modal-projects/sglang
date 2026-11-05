@@ -14,10 +14,14 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
+from sglang.srt.speculative.dflash_utils import (
+    can_dflash_slice_qkv_weight,
+    draft_kv_write_loc,
+    draft_kv_write_loc_2d,
+    draft_swa_write_loc,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -676,6 +680,9 @@ class DSparkDraftMixin:
                 locs = cache_loc
                 write_commit_lens = None
                 locs_row_width = None
+            swa_locs = draft_swa_write_loc(pool, locs)
+            if swa_locs is not None:
+                locs = swa_locs
             fused_kv_norm_rope_write(
                 kv_all,
                 meta,
@@ -698,6 +705,10 @@ class DSparkDraftMixin:
             k_all, v_all = self._project_ctx_kv_stacked(
                 ctx_hidden=ctx_hidden, positions=positions, stacked=stacked
             )
+        if cache_loc_2d is not None and commit_lens is not None:
+            write_loc_2d = draft_kv_write_loc_2d(pool, cache_loc_2d)
+        else:
+            write_loc = draft_kv_write_loc(pool, cache_loc)
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             if stacked is not None:
@@ -712,7 +723,7 @@ class DSparkDraftMixin:
             if cache_loc_2d is not None and commit_lens is not None:
                 pool.set_kv_buffer_prefix_valid(
                     attn.attn,
-                    cache_loc_2d,
+                    write_loc_2d,
                     commit_lens,
                     k,
                     v,
@@ -724,7 +735,7 @@ class DSparkDraftMixin:
                 # already in the ids the draft pool indexes.
                 pool.set_kv_buffer(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    write_loc,
                     k,
                     v,
                     attn.attn.k_scale,

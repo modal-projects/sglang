@@ -160,6 +160,7 @@ class TRTLLMMHAMetadata:
     # so each token attends the full window despite the causal decode kernel.
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
+    encoder_swa_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
     # Prefix before trailing one-token requests in an extend-shaped batch.
     mixed_prefill_reqs: int = 0
@@ -744,6 +745,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                self.target_verify_metadata["encoder_swa_page_table"] = (
+                    self._alloc_swa_page_table(max_verify_rows, max_num_pages)
+                )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -860,6 +864,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.encoder_page_table = self.target_verify_metadata[
                     "encoder_page_table"
                 ][:verify_rows, :]
+                encoder_swa_page_table = self.target_verify_metadata[
+                    "encoder_swa_page_table"
+                ]
+                if encoder_swa_page_table is not None:
+                    metadata.encoder_swa_page_table = encoder_swa_page_table[
+                        :verify_rows, :
+                    ]
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = spec_info.num_tokens_per_req
@@ -1000,6 +1011,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.encoder_page_table.copy_(
                 metadata.page_table[metadata.encoder_row_map]
             )
+            if metadata.encoder_swa_page_table is not None:
+                metadata.encoder_swa_page_table.copy_(
+                    metadata.swa_page_table[metadata.encoder_row_map]
+                )
 
         self.forward_metadata = metadata
 
@@ -1345,6 +1360,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.encoder_row_map = row_map
             metadata.encoder_cache_seqlens = metadata.cache_seqlens_int32[row_map]
             metadata.encoder_page_table = metadata.page_table[row_map]
+            if metadata.swa_page_table is not None:
+                metadata.encoder_swa_page_table = metadata.swa_page_table[row_map]
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1774,11 +1791,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "ENCODER_ONLY target_verify requires the expanded decode "
                     "metadata (built only on the draft worker)"
                 )
+                encoder_page_table = self.forward_metadata.encoder_page_table
+                if self.forward_metadata.encoder_swa_page_table is not None:
+                    _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+                    if is_swa:
+                        encoder_page_table = (
+                            self.forward_metadata.encoder_swa_page_table
+                        )
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
                     workspace_buffer=self.workspace_buffer,
-                    block_tables=self.forward_metadata.encoder_page_table,
+                    block_tables=encoder_page_table,
                     seq_lens=self.forward_metadata.encoder_cache_seqlens,
                     max_seq_len=self.max_context_len,
                     bmm1_scale=bmm1_scale,

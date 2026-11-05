@@ -180,9 +180,10 @@ def build_fixture(
         )
 
     if cfg.has_swa:
+        swa_kv_size = cfg.kv_size if cfg.swa_kv_size is None else cfg.swa_kv_size
         kv_pool = SWAKVPool(
             size=cfg.kv_size,
-            size_swa=cfg.kv_size,
+            size_swa=swa_kv_size,
             page_size=cfg.page_size,
             dtype=cfg.dtype,
             head_num=cfg.head_num,
@@ -196,7 +197,7 @@ def build_fixture(
         with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
             allocator = SWATokenToKVPoolAllocator(
                 size=cfg.kv_size,
-                size_swa=cfg.kv_size,
+                size_swa=swa_kv_size,
                 page_size=cfg.page_size,
                 dtype=cfg.dtype,
                 device=device,
@@ -249,6 +250,7 @@ def build_fixture(
         sliding_window_size=cfg.sliding_window_size,
         draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
+        swa_checkpoint_windows=cfg.swa_checkpoint_windows,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,

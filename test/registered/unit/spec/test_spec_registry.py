@@ -222,6 +222,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
             speculative_adaptive=False,
+            speculative_draft_kv_bundling=False,
         )
 
         handle_speculative_decoding(server_args)

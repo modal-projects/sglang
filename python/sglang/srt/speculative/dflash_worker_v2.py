@@ -66,10 +66,13 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    draft_kv_write_loc,
+    draft_kv_write_loc_2d,
+    draft_swa_write_loc,
     is_dense_head_weight,
-    rocm_fused_selector_sampled_verify,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    rocm_fused_selector_sampled_verify,
 )
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
@@ -2115,6 +2118,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                write_loc_2d = draft_kv_write_loc_2d(
+                    self.draft_model_runner.token_to_kv_pool, cache_loc_2d
+                )
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -2132,7 +2138,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
-                        cache_loc_2d,
+                        write_loc_2d,
                         commit_lens,
                         k,
                         v,
@@ -2188,6 +2194,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
+        write_loc = draft_kv_write_loc(
+            self.draft_model_runner.token_to_kv_pool, ctx_cache_loc
+        )
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -2206,7 +2215,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                KVWriteLoc(ctx_cache_loc, physical=True),
+                write_loc,
                 k,
                 v,
                 attn.attn.k_scale,
@@ -2225,6 +2234,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
+        if ctx_cache_loc_2d is not None and commit_lens is not None:
+            write_loc_2d = draft_kv_write_loc_2d(token_to_kv_pool, ctx_cache_loc_2d)
+        else:
+            swa_loc = draft_swa_write_loc(token_to_kv_pool, ctx_cache_loc)
 
         def _write_layer_kv(
             layer_idx: int,
@@ -2235,7 +2248,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if ctx_cache_loc_2d is not None and commit_lens is not None:
                 token_to_kv_pool.set_kv_buffer_prefix_valid(
                     attn,
-                    ctx_cache_loc_2d,
+                    write_loc_2d,
                     commit_lens,
                     cache_k,
                     cache_v,
@@ -2245,7 +2258,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    KVWriteLoc(ctx_cache_loc, physical=True),
+                    KVWriteLoc(ctx_cache_loc, swa_loc=swa_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,

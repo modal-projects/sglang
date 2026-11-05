@@ -393,7 +393,7 @@ def snapshot(scheduler, running_batch, last_batch):
                 adapter=names.get(req.lora_id, "base"),
                 prefill_tokens=0
                 if decoded
-                else max(0, len(req.origin_input_ids) - len(req.prefix_indices)),
+                else max(0, len(req.origin_input_ids) - req.prefix_len),
                 decode_tokens=max(0, req.sampling_params.max_new_tokens - decoded),
             )
         )

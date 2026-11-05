@@ -40,6 +40,7 @@ image = (
 )
 
 UNIT_FILES = [
+    "/sgl-workspace/sglang/test/registered/unit/managers/test_spindle_routing_observer.py",
     "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8_test.py",
     "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8_utils_test.py",
     "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/kv_cache_test.py",

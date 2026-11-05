@@ -134,18 +134,7 @@ class DeepSeekMla:
         )
 
     def copies(self, module) -> list[Copy]:
-        """w_kc and w_vc are kv_b_proj's key and value parts, stored separately."""
-        if getattr(module, "w_kc", None) is None or not hasattr(module, "kv_b_proj"):
-            return []
-        weight = module.kv_b_proj.weight
-        if weight.dtype != module.w_kc.dtype:
-            return []  # computed: see derived
-        nope, v = module.qk_nope_head_dim, module.v_head_dim
-        heads = weight.unflatten(0, (-1, nope + v))
-        return [
-            Copy(heads[:, :nope], module.w_kc),
-            Copy(heads[:, nope:].transpose(1, 2), module.w_vc),
-        ]
+        return kv_b_copies(module)
 
     def derived(self, role, path, module, shadows) -> list[Derived]:
         """Computed by the loader from block FP8: w_kc/w_vc and the indexer's wk_weights_proj."""
@@ -199,3 +188,18 @@ class DeepSeekMla:
 
                 found.append(Derived(indexer_values))
         return found
+
+
+def kv_b_copies(module) -> list[Copy]:
+    """w_kc and w_vc are kv_b_proj's key and value parts, stored separately."""
+    if getattr(module, "w_kc", None) is None or not hasattr(module, "kv_b_proj"):
+        return []
+    weight = module.kv_b_proj.weight
+    if weight.dtype != module.w_kc.dtype:
+        return []  # computed: see DeepSeekMla.derived
+    nope, v = module.qk_nope_head_dim, module.v_head_dim
+    heads = weight.unflatten(0, (-1, nope + v))
+    return [
+        Copy(heads[:, :nope], module.w_kc),
+        Copy(heads[:, nope:].transpose(1, 2), module.w_vc),
+    ]

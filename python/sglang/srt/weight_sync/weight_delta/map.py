@@ -301,6 +301,7 @@ def _table(
 def _model_rule(runner, models, inventory):
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_mla import DeepSeekMla
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_v41 import DeepSeekV41
+    from sglang.srt.weight_sync.weight_delta.rules.glm5_next import Glm5Next
     from sglang.srt.weight_sync.weight_delta.rules.qwen3_5 import Qwen3_5
 
     # The checkpoint's config: a multimodal model's own config may be its text part's.
@@ -308,7 +309,7 @@ def _model_rule(runner, models, inventory):
     if hf_config.model_type in DeepSeekV41.model_types:
         return DeepSeekV41(models, inventory)
     architecture = hf_config.architectures[0]
-    for rule in (DeepSeekMla, Qwen3_5):
+    for rule in (DeepSeekMla, Glm5Next, Qwen3_5):
         if architecture in rule.architectures:
             return rule(models, inventory)
     raise ValueError(f"Weight delta has no rules for {architecture}")

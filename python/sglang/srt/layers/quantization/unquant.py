@@ -566,6 +566,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Unquantized weights take no DeepGEMM-packed MXFP8 input, whatever the model asked for.
+        if getattr(layer, "deepgemm_mxfp8_input", False):
+            layer.deepgemm_mxfp8_input = False
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 

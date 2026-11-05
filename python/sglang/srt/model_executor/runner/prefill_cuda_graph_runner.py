@@ -2356,13 +2356,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _wait_for_layer_loads(self) -> None:
-        # Full replay skips the per-layer load waits in the pool accessors; breakable
-        # replay still runs them at its eager breaks.
-        if not self._is_full_backend:
-            return
+        # Full replay skips the per-layer load waits in the pool accessors, and so does a
+        # breakable replay that captured the linear-attention extend; other breakable replays
+        # run them at their eager breaks.
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
-        if counter is not None and counter.consumer_index >= 0:
+        if counter is None or counter.consumer_index < 0:
+            return
+        if self._is_full_backend or self._captures_linear_extend:
             counter.wait_until(counter.num_layers - 1)
+
+    @property
+    def _captures_linear_extend(self) -> bool:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        return self.use_captured_attn_metadata and isinstance(
+            self.model_runner.attn_backend, HybridLinearAttnBackend
+        )
 
     def execute(
         self, forward_batch: ForwardBatch, **kwargs

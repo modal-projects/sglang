@@ -10,6 +10,9 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -815,11 +818,13 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
-    def _runner(counter, is_full_backend=True):
+    def _runner(counter, is_full_backend=True, captures_linear_extend=False):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
+        runner.use_captured_attn_metadata = captures_linear_extend
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            attn_backend=HybridLinearAttnBackend.__new__(HybridLinearAttnBackend),
         )
         return runner
 
@@ -844,6 +849,25 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
 
     def test_replay_without_a_layer_transfer_counter(self):
         self._runner(None)._wait_for_layer_loads()
+
+    def test_breakable_replay_of_a_captured_linear_extend_waits_for_every_layer(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        waiter = threading.Thread(
+            target=self._runner(
+                counter, is_full_backend=False, captures_linear_extend=True
+            )._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
 
     def test_breakable_replay_keeps_per_layer_load_overlap(self):
         counter = LayerWiseLoadCounter(num_layers=3)

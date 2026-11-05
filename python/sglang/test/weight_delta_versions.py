@@ -10,8 +10,46 @@ from safetensors.numpy import save_file
 FRAME_NBYTES = 1 << 20
 
 
-def raw_tensor(name: str, dtype: str, shape: tuple, data: bytes) -> dict:
-    return {"name": name, "dtype": dtype, "shape": shape, "raw": data}
+def checksum(values: bytes, counted: np.ndarray | None = None) -> int:
+    """Miles' publication.checksum of the bytes `counted` marks, every byte by default."""
+    data = np.frombuffer(values, dtype=np.uint8)
+    if counted is not None:
+        data = np.where(counted, data, np.uint8(0))
+    words = np.zeros(-(-data.size // 4), dtype="<u4")
+    words.view(np.uint8)[: data.size] = data
+    h = (np.arange(words.size) % (1 << 32)).astype(np.uint32)
+    h ^= h >> np.uint32(16)
+    h *= np.uint32(0x85EBCA6B)
+    h ^= h >> np.uint32(13)
+    h *= np.uint32(0xC2B2AE35)
+    h ^= h >> np.uint32(16)
+    h |= np.uint32(1)
+    return int((h.astype(np.uint64) * words.astype(np.uint64)).sum(dtype=np.uint64))
+
+
+def region_checksum(
+    previous: bytes | None, current: bytes, itemsize: int, shape: tuple, region: tuple
+) -> int:
+    """What a GPU holding `region` computes: its changed bytes, or all of them without `previous`."""
+    counted = np.zeros((*shape, itemsize), dtype=bool)
+    counted[region] = True
+    counted = counted.reshape(-1)
+    if previous is not None:
+        counted &= np.frombuffer(previous, np.uint8) != np.frombuffer(current, np.uint8)
+    return checksum(current, counted)
+
+
+def raw_tensor(
+    name: str, dtype: str, shape: tuple, data: bytes, expected: int | None = None
+) -> dict:
+    """expected: the checksum the engine computes, by default that of every byte."""
+    return {
+        "name": name,
+        "dtype": dtype,
+        "shape": shape,
+        "raw": data,
+        "checksum": checksum(data) if expected is None else expected,
+    }
 
 
 def xor_tensor(
@@ -21,6 +59,7 @@ def xor_tensor(
     frames: list[dict],
     inner: bytes,
     chunk_nbytes: int = 1 << 20,
+    expected: int = 0,
 ) -> dict:
     """A changed tensor's frames and inner bytes, cut into outer Zstd chunks of chunk_nbytes."""
     pieces = [
@@ -32,6 +71,7 @@ def xor_tensor(
         "shape": shape,
         "frames": frames,
         "pieces": pieces,
+        "checksum": expected,
     }
 
 
@@ -64,13 +104,15 @@ def write_version(
     owners: list[list[dict]],
     base_version: int,
     codec: str = "gap-zstd",
+    checksums: bool = True,
 ) -> Path:
     """One owner file per list of tensors, then the manifest; returns the manifest's path."""
     directory.mkdir(parents=True, exist_ok=True)
     files = []
     for index, tensors in enumerate(owners):
         path = directory / f"owner-{index:05d}.safetensors"
-        files.append({"name": path.name, "nbytes": write_owner_file(path, tensors)})
+        nbytes = write_owner_file(path, tensors, checksums)
+        files.append({"name": path.name, "nbytes": nbytes})
     manifest = {
         "format": "weight-delta/v1",
         "codec": codec,
@@ -83,7 +125,7 @@ def write_version(
     return directory / "manifest.json"
 
 
-def write_owner_file(path: Path, tensors: list[dict]) -> int:
+def write_owner_file(path: Path, tensors: list[dict], checksums: bool = True) -> int:
     """An owner file as Miles writes it: payload, then where each tensor's bytes lie."""
     payload, rows, chunks, frames = bytearray(), [], [], []
     dtypes = list(dict.fromkeys(tensor["dtype"] for tensor in tensors))
@@ -122,6 +164,10 @@ def write_owner_file(path: Path, tensors: list[dict]) -> int:
         "tensors.frame_end": column([row[5] for row in rows]),
         "payload": np.frombuffer(bytes(payload), dtype=np.uint8),
     }
+    if checksums:
+        columns["tensors.checksum"] = np.array(
+            [tensor["checksum"] for tensor, *_ in rows], dtype=np.uint64
+        )
     fields = ("offset", "nbytes", "inner_offset", "inner_nbytes")
     for table, records in (("chunks", chunks), ("frames", frames)):
         for index, field in enumerate(fields):

@@ -49,6 +49,7 @@ class Place:
 
     src: tuple[slice, ...]
     dst: torch.Tensor
+    split_group: object = None
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,7 @@ class MapTable:
     nbytes: np.ndarray
     held: np.ndarray  # this GPU applies it
     ignored: np.ndarray
-    raw_only: np.ndarray  # a place is wider than the checkpoint dtype: must arrive raw
+    raw_only: np.ndarray  # a place has another dtype than the checkpoint: must arrive raw
     entries: list[Entry]
 
 

@@ -25,6 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.weight_delta_versions import (
     gap_frames,
     raw_tensor,
+    region_checksum,
     snappy_frames,
     write_version,
     xor_tensor,
@@ -43,8 +44,9 @@ CANONICAL = {
     "n.bias": ("BF16", (1024,)),
     "s.scale": ("F8_E4M3", (16,)),
     "s.f32": ("F32", (4, 8)),
+    "s.narrow": ("F32", (32,)),
 }
-RAW = ("n.bias", "s.scale", "s.f32")
+RAW = ("n.bias", "s.scale", "s.f32", "s.narrow")
 
 
 def _serving_and_places():
@@ -61,6 +63,7 @@ def _serving_and_places():
         "bias": torch.zeros(1024, dtype=torch.bfloat16, device=cuda),
         "scale": torch.zeros(16, dtype=torch.float32, device=cuda),
         "f32": torch.zeros((4, 4), dtype=torch.float32, device=cuda),
+        "narrow": torch.zeros(16, dtype=torch.bfloat16, device=cuda),
     }
     everything = (slice(None),)
     places = {
@@ -79,6 +82,8 @@ def _serving_and_places():
         "n.bias": [Place(everything, serving["bias"])],
         "s.scale": [Place(everything, serving["scale"])],
         "s.f32": [Place((slice(None), slice(2, 6)), serving["f32"])],
+        # A norm its trainer keeps in FP32, served in BF16 as SGLang's loader casts it.
+        "s.narrow": [Place((slice(8, 24),), serving["narrow"])],
     }
     return serving, places
 
@@ -144,22 +149,39 @@ class TestApply(CustomTestCase):
                 place.dst.copy_(canonical[place.src])
         self.before = {key: tensor.cpu() for key, tensor in self.serving.items()}
 
-    def _apply(self, applier, codec, previous, current, encode=None) -> dict:
+    def _apply(
+        self, applier, codec, previous, current, encode=None, checksums=True
+    ) -> dict:
         encode = encode or (gap_frames if codec == "gap-zstd" else snappy_frames)
         owners = [[], []]
         for index, (name, (dtype, shape)) in enumerate(CANONICAL.items()):
             # Like Miles, a version carries only the tensors that changed.
             if current[name] == previous[name]:
                 continue
-            if name in RAW:
-                tensor = raw_tensor(name, dtype, shape, current[name])
+            # One GPU holds these regions: the version carries their checksum.
+            raw = name in RAW
+            itemsize = TORCH_DTYPES[dtype].itemsize
+            expected = sum(
+                region_checksum(
+                    None if raw else previous[name],
+                    current[name],
+                    itemsize,
+                    shape,
+                    place.src,
+                )
+                for place in self.places[name]
+            ) % (1 << 64)
+            if raw:
+                tensor = raw_tensor(name, dtype, shape, current[name], expected)
             else:
                 frames, inner = encode(previous[name], current[name])
-                tensor = xor_tensor(name, dtype, shape, frames, inner)
+                tensor = xor_tensor(
+                    name, dtype, shape, frames, inner, expected=expected
+                )
             owners[index % 2].append(tensor)
         type(self).versions += 1
         directory = Path(self.folder.name) / f"weight_v{self.versions:06d}"
-        manifest = write_version(directory, owners, 4, codec)
+        manifest = write_version(directory, owners, 4, codec, checksums)
         prepared, staged = self.process.prepare(manifest, "4")
         return applier.apply(applier.plan(prepared), staged)
 
@@ -192,7 +214,7 @@ class TestApply(CustomTestCase):
         applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
         stats = self._apply(applier, "gap-zstd", self.base, current)
         self._assert_serving(current)
-        self.assertEqual(stats["raw"], 3)
+        self.assertEqual(stats["raw"], 4)
 
     def test_a_snappy_version_lands_bit_exact(self):
         current = _changed(self.base, 2)
@@ -244,8 +266,35 @@ class TestApply(CustomTestCase):
             applier = Applier(self.delta_map, codec, torch.device("cuda", 0))
             stats = self._apply(applier, codec, previous, current)
             self._assert_serving(current)
-            self.assertEqual((stats["batches"], stats["raw"]), (0, 3))
+            self.assertEqual((stats["batches"], stats["raw"]), (0, 4))
             previous = current
+
+    def test_a_serving_byte_other_than_the_trainer_expects_fails_the_check(self):
+        current = _changed(self.base, 6)
+        changed = np.frombuffer(self.base["w.whole"], np.uint8) != np.frombuffer(
+            current["w.whole"], np.uint8
+        )
+        self.serving["whole"].view(-1)[int(np.flatnonzero(changed)[0])] ^= 1
+        applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
+        with self.assertRaisesRegex(RuntimeError, "differ from the trainer's.*w.whole"):
+            self._apply(applier, "gap-zstd", self.base, current)
+
+    def test_a_version_without_checksums_lands_unchecked(self):
+        previous = self.base
+        for seed, codec in enumerate(("gap-zstd", "snappy-zstd"), 10):
+            current = _changed(previous, seed)
+            applier = Applier(self.delta_map, codec, torch.device("cuda", 0))
+            self._apply(applier, codec, previous, current, checksums=False)
+            self._assert_serving(current)
+            previous = current
+        # A serving byte other than the trainer's: without checksums, nothing catches it.
+        current = _changed(previous, 12)
+        changed = np.frombuffer(previous["w.whole"], np.uint8) != np.frombuffer(
+            current["w.whole"], np.uint8
+        )
+        self.serving["whole"].view(-1)[int(np.flatnonzero(changed)[0])] ^= 1
+        applier = Applier(self.delta_map, "gap-zstd", torch.device("cuda", 0))
+        self._apply(applier, "gap-zstd", previous, current, checksums=False)
 
     def test_a_frame_that_decodes_past_its_end_raises(self):
         def past_the_end(previous: bytes, current: bytes):

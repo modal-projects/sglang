@@ -1,5 +1,6 @@
 """Routing snapshots use the scheduler request's CPU prefix-length counter."""
 
+import sys
 from array import array
 from types import SimpleNamespace
 
@@ -81,3 +82,7 @@ def test_snapshot_uses_current_request_prefix_counter(
     ]
     assert state["kv_used_tokens"] == 2
     assert state["kv_capacity_tokens"] == 10
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

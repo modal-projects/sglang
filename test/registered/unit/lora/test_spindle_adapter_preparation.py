@@ -1,6 +1,7 @@
 """Exercise the installed SGLang loading patch without allocating a model."""
 
 import os
+import sys
 import tempfile
 import threading
 from concurrent.futures import Future
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -177,3 +179,7 @@ def test_expert_local_loading_and_collective_async_install():
     print(
         "PASS: every TP rank must finish successfully before installation", flush=True
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

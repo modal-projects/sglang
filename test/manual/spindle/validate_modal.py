@@ -12,7 +12,13 @@ app = modal.App("spindle-sglang-v0523-validation")
 image = (
     modal.Image.from_registry("lmsysorg/sglang:v0.5.23")
     .entrypoint([])
-    .env({"SGLANG_RUST_BUILD_MODE": "auto", "SGLANG_DISABLE_CUDNN_CHECK": "1"})
+    .env(
+        {
+            "SGLANG_RUST_BUILD_MODE": "auto",
+            "SGLANG_DISABLE_CUDNN_CHECK": "1",
+            "HF_XET_HIGH_PERFORMANCE": "1",
+        }
+    )
     .add_local_dir(
         ROOT / "python",
         "/sgl-workspace/sglang/python",
@@ -61,17 +67,10 @@ def units():
 
 
 @app.function(image=image, gpu="H100", cpu=8, memory=65536, timeout=1800)
-def sampler():
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-s",
-            "/sgl-workspace/sglang/test/registered/lora/test_lora_qwen3_5_4b_logprob_diff.py",
-        ],
-        check=True,
+def sampler(backend: str = "triton"):
+    _logprob_case(
+        "/sgl-workspace/sglang/test/registered/lora/test_lora_qwen3_5_4b_logprob_diff.py",
+        backend,
     )
     return "Qwen3.5-4B sampler logprob parity passed"
 
@@ -79,17 +78,16 @@ def sampler():
 @app.function(
     image=image, gpu=["B300:4", "B200:4"], cpu=24, memory=196608, timeout=3600
 )
-def moe():
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-s",
-            "/sgl-workspace/sglang/test/registered/lora/test_lora_qwen3_5_35b_a3b_logprob_diff.py",
-        ],
-        check=True,
+def moe(backend: str = "triton"):
+    print(
+        subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
+        ),
+        flush=True,
+    )
+    _logprob_case(
+        "/sgl-workspace/sglang/test/registered/lora/test_lora_qwen3_5_35b_a3b_logprob_diff.py",
+        backend,
     )
     return "Qwen3.5-35B-A3B TP4 MoE logprob parity passed"
 
@@ -110,15 +108,40 @@ def marlin():
     return "GPT-OSS MXFP4 Marlin kernel parity passed on B200"
 
 
+def _logprob_case(path, backend):
+    program = """
+import importlib.util, sys, unittest
+spec = importlib.util.spec_from_file_location("upgrade_case", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.LORA_BACKEND = sys.argv[2]
+suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+sys.exit(0 if result.wasSuccessful() else 1)
+"""
+    subprocess.run([sys.executable, "-u", "-c", program, path, backend], check=True)
+
+
 @app.local_entrypoint()
-def main(gpu: bool = False, mode: str = "all"):
+def main(gpu: bool = False, mode: str = "all", backend: str = "triton"):
+    if backend not in {"triton", "csgmv"}:
+        raise ValueError("backend must be triton or csgmv")
     functions = {"units": units, "dense": sampler, "moe": moe, "marlin": marlin}
     selected = (
         list(functions)
         if mode == "all" and gpu
         else [mode if mode != "all" else "units"]
     )
-    calls = [(name, functions[name].spawn()) for name in selected]
+    calls = [
+        (
+            name,
+            functions[name].spawn(backend)
+            if name in {"dense", "moe"}
+            else functions[name].spawn(),
+        )
+        for name in selected
+    ]
     errors = []
     for name, call in calls:
         print("CHECK", name, call.object_id, flush=True)

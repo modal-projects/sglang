@@ -25,11 +25,12 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
-# Checkpoint dtypes the rules handle (NVFP4 and block FP8).
+# Checkpoint dtypes the rules handle (NVFP4, block FP8, E8M0-scaled FP8 tables).
 TORCH_DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,
     "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
     "U8": torch.uint8,
 }
 
@@ -242,7 +243,7 @@ def _build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
             param = params[destination.role].get(destination.param)
             if param is None:
                 raise ValueError(f"{name}: no serving parameter {destination.param}")
-            module = modules[destination.role][destination.param.rsplit(".", 1)[0]]
+            module = modules[destination.role][destination.param.rpartition(".")[0]]
             entries[name] = placement.linear_places(
                 module, param, destination, tensor, inventory
             )
@@ -299,10 +300,14 @@ def _table(
 
 def _model_rule(runner, models, inventory):
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_mla import DeepSeekMla
+    from sglang.srt.weight_sync.weight_delta.rules.deepseek_v41 import DeepSeekV41
     from sglang.srt.weight_sync.weight_delta.rules.qwen3_5 import Qwen3_5
 
     # The checkpoint's config: a multimodal model's own config may be its text part's.
-    architecture = runner.model_config.hf_config.architectures[0]
+    hf_config = runner.model_config.hf_config
+    if hf_config.model_type in DeepSeekV41.model_types:
+        return DeepSeekV41(models, inventory)
+    architecture = hf_config.architectures[0]
     for rule in (DeepSeekMla, Qwen3_5):
         if architecture in rule.architectures:
             return rule(models, inventory)

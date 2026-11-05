@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES, DeltaMap
+from sglang.srt.weight_sync.weight_delta.xor_kernel import checksum_terms
 
 GAP_NBYTES = 3
 MAX_FRAME_NBYTES = 4 << 20
@@ -24,7 +25,7 @@ SCATTER_BLOCK = 1024
 class Places:
     """The places a held tensor can arrive XORed to; row r's are [start[r], start[r] + count[r])."""
 
-    # Per place, int64: serving address, item size, region axes, view axes, then
+    # Per place, int64: table row, serving address, item size, region axes, view axes, then
     # (extent, first, length, step) per region axis and (size, stride) per view axis.
     records: torch.Tensor
     record_offset: np.ndarray  # each place's record, in records
@@ -53,7 +54,7 @@ def gap_places(delta_map: DeltaMap, device: torch.device) -> Places:
             record_offset.append(len(words))
             low.append(first * itemsize)
             high.append((last + 1) * itemsize)
-            words += [place.dst.data_ptr(), itemsize, len(region), len(view)]
+            words += [row, place.dst.data_ptr(), itemsize, len(region), len(view)]
             words += [value for axis in region + view for value in axis]
         count[row] = len(record_offset) - start[row]
     return Places(
@@ -115,18 +116,30 @@ def check_gap_frames(inner_nbytes: np.ndarray, nbytes: np.ndarray) -> None:
         raise ValueError("a gap frame's length is not a whole number of changes")
 
 
-def gap_scatter(items: torch.Tensor, places: Places, error, count: int):
+def gap_scatter(
+    items: torch.Tensor, places: Places, error, checksums, count: int, checked: bool
+):
     """items: int64 rows of inner address, changes, frame offset, frame nbytes, record."""
     if count:
-        _gap_scatter[(count,)](items, places.records, error, count, BLOCK=SCATTER_BLOCK)
+        _gap_scatter[(count,)](
+            items,
+            places.records,
+            error,
+            checksums,
+            count,
+            BLOCK=SCATTER_BLOCK,
+            CHECKSUM=checked,
+        )
 
 
 # Not specialized on alignment: a version with new offsets would compile a kernel in the pause.
 @triton.jit(
     do_not_specialize=["count"],
-    do_not_specialize_on_alignment=["items", "records", "error"],
+    do_not_specialize_on_alignment=["items", "records", "error", "checksums"],
 )
-def _gap_scatter(items, records, error, count, BLOCK: tl.constexpr):
+def _gap_scatter(
+    items, records, error, checksums, count, BLOCK: tl.constexpr, CHECKSUM: tl.constexpr
+):
     """A frame of n changes: n little-endian u24 gaps in three byte planes, then n XOR values."""
     item = tl.program_id(0)
     source = tl.load(items + item).to(tl.pointer_type(tl.uint8))
@@ -134,14 +147,16 @@ def _gap_scatter(items, records, error, count, BLOCK: tl.constexpr):
     start = tl.load(items + 2 * count + item)
     limit = tl.load(items + 3 * count + item)
     record = tl.load(items + 4 * count + item)
-    target = tl.load(records + record).to(tl.pointer_type(tl.uint8))
-    itemsize = tl.load(records + record + 1)
-    region_axes = tl.load(records + record + 2)
-    view_axes = tl.load(records + record + 3)
-    region = record + 4
+    row = tl.load(records + record)
+    target = tl.load(records + record + 1).to(tl.pointer_type(tl.uint8))
+    itemsize = tl.load(records + record + 2)
+    region_axes = tl.load(records + record + 3)
+    view_axes = tl.load(records + record + 4)
+    region = record + 5
     view = region + 4 * region_axes
     base = changes * 0
     bad = (changes * 0).to(tl.int32)
+    sums = tl.zeros((BLOCK,), tl.uint64)
     for first in range(0, changes, BLOCK):
         index = first + tl.arange(0, BLOCK)
         live = index < changes
@@ -186,9 +201,16 @@ def _gap_scatter(items, records, error, count, BLOCK: tl.constexpr):
         previous = tl.load(target + address, mask=member, other=0)
         new = previous ^ value
         tl.store(target + address, new, mask=member)
+        if CHECKSUM:
+            terms = checksum_terms(
+                position, new.to(tl.uint32) << ((position & 3) * 8).to(tl.uint32)
+            )
+            sums += terms * (member & (value != 0)).to(tl.uint64)
         base += tl.sum(gap, 0)
     if bad != 0:
         tl.atomic_or(error, 1)
+    if CHECKSUM:
+        tl.atomic_add(checksums + row, tl.sum(sums, axis=0).to(tl.int64, bitcast=True))
 
 
 class _Options(ctypes.Structure):
@@ -329,7 +351,7 @@ def warm_up(device: torch.device) -> None:
     inner = torch.zeros(4, dtype=torch.uint8, device=device)
     target = torch.zeros(4, dtype=torch.uint8, device=device)
     records = torch.tensor(
-        [target.data_ptr(), 1, 1, 1, 4, 0, 4, 1, 4, 1],
+        [0, target.data_ptr(), 1, 1, 1, 4, 0, 4, 1, 4, 1],
         dtype=torch.int64,
         device=device,
     )
@@ -337,7 +359,11 @@ def warm_up(device: torch.device) -> None:
         [inner.data_ptr(), 1, 0, 4, 0], dtype=torch.int64, device=device
     )
     error = torch.zeros(1, dtype=torch.int32, device=device)
-    _gap_scatter[(1,)](items, records, error, 1, BLOCK=SCATTER_BLOCK)
+    checksums = torch.zeros(1, dtype=torch.int64, device=device)
+    for checked in (True, False):
+        _gap_scatter[(1,)](
+            items, records, error, checksums, 1, BLOCK=SCATTER_BLOCK, CHECKSUM=checked
+        )
     sizes = torch.zeros(1, dtype=torch.int64, device=device)
     check_decode[(1,)](error, sizes, sizes, error, 1, BLOCK=1024)
     torch.cuda.synchronize(device)

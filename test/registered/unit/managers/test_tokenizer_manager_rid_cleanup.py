@@ -926,6 +926,7 @@ def _make_generate_obj(rid, is_single):
     obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
+        obj.batch_size = len(rid)
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
 

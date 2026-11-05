@@ -107,7 +107,7 @@ def _require_dense_layer_ids(
 
 def _dedup_mamba_host_ratio() -> float:
     """The Mamba host ratio build_mamba_host_pool applies when host_size is 0."""
-    ratio = get_memory().hicache_mamba_ratio
+    ratio = getattr(get_memory(), "hicache_mamba_ratio", None)
     if ratio is not None:
         return ratio
     env_ratio = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO.get()
@@ -2292,6 +2292,7 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            enable_mla_hicache_host_dedup=_mla_dedup_enabled(server_args),
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

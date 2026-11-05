@@ -762,24 +762,17 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                # GDN speculative replay is request-lifetime scratch. Size it by
+                # Speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
                 num_slots = (
-                    spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
-                    else size + 1
+                    spec_state_size + 1 if enable_linear_replayssm_spec else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
                 # records follow the activation dtype; g stays fp32.
                 ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
                 # Fold-every-commit: one verify window, no chunked (d, k)
-                # records. KDA is the exception on both counts: its window
-                # stays L-sized (the fused verify ring-write drops
-                # absorb-inflated rows past L), and d/k stay allocated --
-                # forward_decode routes on `replayssm_d is None` (fused vs
-                # decode-ring), so skipping them would flip KDA decode to the
-                # fused path, a behavior change needing its own validation
-                # (memory follow-up).
+                # records. KDA's window stays L-sized since the fused verify
+                # ring-write drops absorb-inflated rows past L.
                 if self.replayssm_spec_fold and not cache_params.is_kda:
                     record_len = (
                         speculative_num_draft_tokens
@@ -788,7 +781,7 @@ class MambaPool:
                     )
                 else:
                     record_len = L
-                if not self.replayssm_spec_fold or cache_params.is_kda:
+                if not self.replayssm_spec_fold:
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,

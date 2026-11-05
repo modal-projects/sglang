@@ -2,10 +2,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
 
 _is_hip = is_hip()
@@ -15,15 +15,15 @@ if not is_cpu():
         fused_recurrent_kda_packed_decode,
     )
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.fla.kda_verify_closed_form import (
+        kda_verify_closed_form,
+        kda_verify_closed_form_supported,
+    )
     from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
-    )
-    from sglang.kernels.ops.attention.fla.kda_verify_closed_form import (
-        kda_verify_closed_form,
-        kda_verify_closed_form_supported,
     )
 
 
@@ -225,8 +225,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 replayssm_rawk,
                 replayssm_g,
                 replayssm_beta,
-                # ring slots follow the committed-state slot, like the recurrent kernel
-                cache_indices,
+                intermediate_state_indices,
                 block_v=64 if n <= 8 else 128,
                 num_warps=4,
                 num_stages=1,
@@ -258,6 +257,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            ring_indices=intermediate_state_indices,
         )
 
     def extend(

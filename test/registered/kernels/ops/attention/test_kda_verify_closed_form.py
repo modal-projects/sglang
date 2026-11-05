@@ -3,12 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from sglang.kernels.ops.attention.fla.kda_verify_closed_form import (
     kda_verify_closed_form,
     kda_verify_closed_form_supported,
+)
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci

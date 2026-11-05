@@ -30,6 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.weight_delta_versions import (
     gap_frames,
     raw_tensor,
+    region_checksum,
     write_version,
     xor_tensor,
 )
@@ -127,11 +128,18 @@ class TestReceiver(CustomTestCase):
     def _version(self, current, base_version=4, codec="gap-zstd") -> str:
         tensors = []
         for name, (dtype, shape) in CANONICAL.items():
+            itemsize, region = TORCH_DTYPES[dtype].itemsize, self.sources[name]
             if name == "n.bias":
-                tensors.append(raw_tensor(name, dtype, shape, current[name]))
+                expected = region_checksum(None, current[name], itemsize, shape, region)
+                tensors.append(raw_tensor(name, dtype, shape, current[name], expected))
             else:
+                expected = region_checksum(
+                    self.base[name], current[name], itemsize, shape, region
+                )
                 frames, inner = gap_frames(self.base[name], current[name])
-                tensors.append(xor_tensor(name, dtype, shape, frames, inner))
+                tensors.append(
+                    xor_tensor(name, dtype, shape, frames, inner, expected=expected)
+                )
         type(self).versions += 1
         directory = Path(self.folder.name) / f"weight_v{self.versions:06d}"
         return str(write_version(directory, [tensors], base_version, codec))

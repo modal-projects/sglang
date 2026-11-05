@@ -20,7 +20,11 @@ from sglang.srt.weight_sync.weight_delta.decode import (
 from sglang.srt.weight_sync.weight_delta.decode import warm_up as warm_up_decode
 from sglang.srt.weight_sync.weight_delta.map import TORCH_DTYPES, DeltaMap
 from sglang.srt.weight_sync.weight_delta.prepare import Prepared, ragged_rows, ranges
-from sglang.srt.weight_sync.weight_delta.xor_kernel import ByteApplyGroup, plan_xor
+from sglang.srt.weight_sync.weight_delta.xor_kernel import (
+    ByteApplyGroup,
+    plan_xor,
+    raw_checksums,
+)
 from sglang.srt.weight_sync.weight_delta.xor_kernel import warm_up as warm_up_xor
 
 CHUNK_NBYTES = 64 << 20
@@ -64,13 +68,28 @@ class _Layout:
 
 
 @dataclass
+class RawPlan:
+    buffer: torch.Tensor
+    # (targets, sources) per multi-tensor copy: same dtypes as bytes, exactly; casts per dtype pair.
+    copies: list[tuple[list[torch.Tensor], list[torch.Tensor]]]
+    # For the checksum (empty without): values with their checkpoint dtypes, and per byte its
+    # canonical position and checksum row. A target casts back exactly unless it is narrower,
+    # where the received values stand in.
+    checksummed: list[tuple[torch.Tensor, torch.dtype]]
+    positions: np.ndarray
+    rows: np.ndarray
+
+
+@dataclass
 class Plan:
     chunks: list[Chunk]  # gap-zstd's
     batches: list[Batch]  # snappy-zstd's
     raw_nbytes: int  # the raw values are the staged bytes [0, raw_nbytes)
-    raw_buffer: torch.Tensor
-    # (targets, sources) per multi-tensor copy: same dtypes as bytes, exactly; casts per dtype pair.
-    raw_copies: list[tuple[list[torch.Tensor], list[torch.Tensor]]]
+    raw: RawPlan
+    # This GPU's MapTable rows of the version, the trainer's checksum of each, split rows per group.
+    table_rows: np.ndarray
+    expected: np.ndarray | None  # None: the version carries no checksums
+    split: list[tuple[object, np.ndarray]]
 
 
 class Applier:
@@ -90,6 +109,17 @@ class Applier:
         for index, layout in enumerate(self._layouts):
             self._layout_of[layout.rows] = index
             self._slot_offset[layout.rows] = layout.slot_offset
+        self._split_groups = []
+        self._split_group_of = np.full(len(table.names), -1, np.int64)
+        for row, entry in enumerate(table.entries):
+            if isinstance(entry, tuple) and (group := entry[0].split_group) is not None:
+                if group not in self._split_groups:
+                    self._split_groups.append(group)
+                self._split_group_of[row] = self._split_groups.index(group)
+        # Which tensors arrive raw is the trainer's choice: their positions are found on arrival.
+        self._raw_positions_of: dict[int, list[np.ndarray]] = {}
+        # A placeholder for versions without checksums: their kernels never touch it.
+        self._no_checksums = torch.zeros(1, dtype=torch.int64, device=self.device)
         warm_up_decode(self.device)
         warm_up_xor(self.device.index)
 
@@ -102,11 +132,20 @@ class Applier:
             if len(raw)
             else 0
         )
+        group = self._split_group_of[prepared.table_rows]
         return Plan(
             self._gap_chunks(prepared, xor) if self.places is not None else [],
             self._snappy_batches(prepared, xor) if self.decoder is not None else [],
             raw_nbytes,
-            *self._raw_plan(prepared, raw, raw_nbytes),
+            self._raw_plan(prepared, raw, raw_nbytes),
+            prepared.table_rows,
+            prepared.checksum,
+            [
+                (self._split_groups[index], prepared.table_rows[group == index])
+                for index in np.unique(group[group >= 0]).tolist()
+            ]
+            if prepared.checksum is not None
+            else [],
         )
 
     def _gap_chunks(self, prepared: Prepared, xor: np.ndarray) -> list[Chunk]:
@@ -224,15 +263,40 @@ class Applier:
                 arena.free()
 
     def _apply(self, plan, staged, arena, started, synced) -> dict:
-        device = self.device
+        device, raw, split = self.device, plan.raw, plan.split
         error = torch.zeros(1, dtype=torch.int32, device=device)
+        checked = plan.expected is not None
+        checksums = self._no_checksums
+        if checked:
+            checksums = arena.take(8 * len(self.delta_map.table.names)).view(
+                torch.int64
+            )
+            checksums.zero_()
+            lengths = [
+                len(raw.positions),
+                len(raw.rows),
+                len(plan.table_rows),
+                len(plan.expected),
+            ]
+            lengths += [len(rows) for _, rows in split]
+            host = np.concatenate(
+                [raw.positions, raw.rows, plan.table_rows, plan.expected.view(np.int64)]
+                + [rows for _, rows in split]
+            ).astype(np.int64)
+            raw_positions, raw_rows, rows, expected, *split_rows = (
+                torch.from_numpy(host).to(device).split(lengths)
+            )
         current = torch.cuda.current_stream(device)
         apply_stream = torch.cuda.Stream(device)
         begin, applied = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         if self.places is not None:
-            enqueue = self._bind_gap(plan, staged, arena, error, apply_stream)
+            enqueue = self._bind_gap(
+                plan, staged, arena, error, checksums, checked, apply_stream
+            )
         else:
-            enqueue = self._bind_snappy(plan, staged, arena, error, apply_stream)
+            enqueue = self._bind_snappy(
+                plan, staged, arena, error, checksums, checked, apply_stream
+            )
         bound = time.perf_counter()
 
         begin.record(current)
@@ -240,11 +304,23 @@ class Applier:
         with torch.cuda.stream(apply_stream):
             # The XORs' stream: a Snappy layout also XORs zeros over tensors that arrive raw.
             if plan.raw_nbytes:
-                plan.raw_buffer.copy_(staged[: plan.raw_nbytes], non_blocking=True)
-                for targets, sources in plan.raw_copies:
+                raw.buffer.copy_(staged[: plan.raw_nbytes], non_blocking=True)
+                for targets, sources in raw.copies:
                     torch._foreach_copy_(targets, sources)
+                if checked:
+                    values = [
+                        target.to(dtype).reshape(-1).view(torch.uint8)
+                        for target, dtype in raw.checksummed
+                    ]
+                    raw_checksums(torch.cat(values), raw_positions, raw_rows, checksums)
         enqueue(current)
         with torch.cuda.stream(apply_stream):
+            # Summed on every GPU before any can raise, so none waits in the collective.
+            if checked:
+                for (group, _), split_at in zip(split, split_rows):
+                    parts = checksums[split_at]
+                    torch.distributed.all_reduce(parts, group=group.device_group)
+                    checksums[split_at] = parts
             for copied in self.delta_map.copies:
                 copied.dst.copy_(copied.src)
         # Derived tensors allocate temporaries: on the caller's stream, SGLang reuses their blocks.
@@ -258,9 +334,19 @@ class Applier:
         finished = time.perf_counter()
         if error.item():
             raise RuntimeError("a frame failed to decode or decoded to the wrong size")
+        if checked:
+            wrong = torch.nonzero(checksums[rows] != expected).flatten().tolist()
+            if wrong:
+                names = [
+                    self.delta_map.table.names[plan.table_rows[i]].decode()
+                    for i in wrong[:3]
+                ]
+                raise RuntimeError(
+                    f"{len(wrong)} tensors differ from the trainer's after applying, e.g. {names}"
+                )
         return {
             "batches": len(plan.chunks) + len(plan.batches),
-            "raw": sum(len(targets) for targets, _ in plan.raw_copies),
+            "raw": sum(len(targets) for targets, _ in raw.copies),
             "slot_nbytes": max(
                 (batch.slot_nbytes for batch in plan.batches), default=0
             ),
@@ -274,7 +360,7 @@ class Applier:
             "gpu_s": begin.elapsed_time(applied) / 1e3,
         }
 
-    def _bind_gap(self, plan, staged, arena, error, apply_stream):
+    def _bind_gap(self, plan, staged, arena, error, checksums, checked, apply_stream):
         """Binds the gap chunks; the returned call queues their copies and scatters."""
         device, chunks = self.device, plan.chunks
         buffers = min(2, len(chunks))
@@ -317,7 +403,9 @@ class Applier:
                         items[item_at[index] : item_at[index + 1]],
                         self.places,
                         error,
+                        checksums,
                         chunk.items.shape[1],
+                        checked,
                     )
                     input_free[index % 2].record(apply_stream)
                 # Queued only now: a stream waits on an event's latest record at queue time.
@@ -326,7 +414,9 @@ class Applier:
 
         return enqueue
 
-    def _bind_snappy(self, plan, staged, arena, error, apply_stream):
+    def _bind_snappy(
+        self, plan, staged, arena, error, checksums, checked, apply_stream
+    ):
         """Binds the Snappy batches; the returned call queues their copies, decodes and XORs."""
         batches, device = plan.batches, self.device
         buffers = min(2, len(batches))
@@ -362,10 +452,12 @@ class Applier:
         frames_at = np.cumsum([0, *counts]).tolist()
         launches, table_at = [], 0
         for batch, xor_table in zip(batches, host_xor_tables):
-            pointers = 2 * len(batch.xor.sources)
+            pointers = 4 * len(batch.xor.sources)
             view = xor_tables[table_at : table_at + len(xor_table)]
             launches.append(
-                batch.xor.bind_launch(view[:pointers], view[pointers:], error)
+                batch.xor.bind_launch(
+                    view[:pointers], view[pointers:], error, checksums, checked
+                )
             )
             table_at += len(xor_table)
 
@@ -445,11 +537,13 @@ class Applier:
         return enqueue
 
     def _arena_nbytes(self, plan: Plan) -> int:
+        tables = 8 * len(self.delta_map.table.names) if plan.expected is not None else 0
         if self.places is not None:
             buffers = min(2, len(plan.chunks))
             return (
                 buffers * max((chunk.input_nbytes for chunk in plan.chunks), default=0)
-                + (buffers + 1) * _DeviceArena.ALIGNMENT
+                + tables
+                + (buffers + 2) * _DeviceArena.ALIGNMENT
             )
         batches = plan.batches
         buffers = min(2, len(batches))
@@ -459,13 +553,16 @@ class Applier:
             + buffers * max((batch.input_nbytes for batch in batches), default=0)
             + self.decoder.temp_nbytes
             + (32 + 4 + 8) * count
-            + (2 * buffers + 4) * _DeviceArena.ALIGNMENT
+            + tables
+            + (2 * buffers + 5) * _DeviceArena.ALIGNMENT
         )
 
-    def _raw_plan(self, prepared: Prepared, raw: np.ndarray, nbytes: int):
+    def _raw_plan(self, prepared: Prepared, raw: np.ndarray, nbytes: int) -> RawPlan:
         inventory, names = self.delta_map.inventory, self.delta_map.table.names
         buffer = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
         copies: dict[tuple, tuple[list, list]] = {}
+        checksummed = []
+        positions, rows = [np.zeros(0, np.int64)], [np.zeros(0, np.int64)]
         for index in raw.tolist():
             row = int(prepared.table_rows[index])
             tensor = inventory[names[row].decode()]
@@ -475,9 +572,15 @@ class Applier:
                 int(prepared.nbytes[index]),
             )
             value = buffer[offset : offset + size].view(dtype).reshape(tensor.shape)
-            for place in self.delta_map.table.entries[row]:
+            for at, place in enumerate(self.delta_map.table.entries[row]):
                 source = value[place.src]
                 target = place.dst.view(source.shape)
+                if prepared.checksum is not None:
+                    held = self._raw_positions(row)[at]
+                    narrower = target.dtype.itemsize < dtype.itemsize
+                    checksummed.append((source if narrower else target, dtype))
+                    positions.append(held)
+                    rows.append(np.full(len(held), row, np.int64))
                 if source.dtype == target.dtype:
                     source, target = _bytes(source), _bytes(target)
                 targets, sources = copies.setdefault(
@@ -485,7 +588,26 @@ class Applier:
                 )
                 targets.append(target)
                 sources.append(source)
-        return buffer, list(copies.values())
+        return RawPlan(
+            buffer,
+            list(copies.values()),
+            checksummed,
+            np.concatenate(positions),
+            np.concatenate(rows),
+        )
+
+    def _raw_positions(self, row: int) -> list[np.ndarray]:
+        """Per place of a raw tensor, the canonical positions of the bytes it holds."""
+        if row not in self._raw_positions_of:
+            tensor = self.delta_map.inventory[self.delta_map.table.names[row].decode()]
+            itemsize = TORCH_DTYPES[tensor.dtype].itemsize
+            size = int(self.delta_map.table.nbytes[row])
+            byte_positions = torch.arange(size).view(*tensor.shape, itemsize)
+            self._raw_positions_of[row] = [
+                byte_positions[place.src].reshape(-1).numpy()
+                for place in self.delta_map.table.entries[row]
+            ]
+        return self._raw_positions_of[row]
 
 
 def _layouts(delta_map: DeltaMap, device: torch.device) -> list[_Layout]:
@@ -516,7 +638,7 @@ def _xor_plan(delta_map, table_rows, slot_offset, device):
     end = int(slot_offset[-1] + delta_map.table.nbytes[table_rows[-1]])
     # Sources view a meta stand-in for the slot, which exists only in the pause.
     slot = torch.empty(end, dtype=torch.uint8, device="meta")
-    pairs = []
+    items = []
     for row, offset in zip(table_rows.tolist(), slot_offset.tolist()):
         tensor = inventory[names[row].decode()]
         nbytes = int(delta_map.table.nbytes[row])
@@ -526,8 +648,10 @@ def _xor_plan(delta_map, table_rows, slot_offset, device):
             .reshape(tensor.shape)
         )
         for place in entries[row]:
-            pairs.append((_bytes(canonical[place.src]), _bytes(place.dst)))
-    group = plan_xor(pairs)
+            source = _bytes(canonical[place.src])
+            start = source.storage_offset() - offset
+            items.append((source, _bytes(place.dst), start, row))
+    group = plan_xor(items)
     group.prepare_metadata(device.index)
     pointers = np.fromiter(group.pointer_rows(0), dtype=np.int64)
     return group, np.concatenate(

@@ -455,6 +455,11 @@ def test_deterministic_mode_keeps_original_shrink_path():
             chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
             assert launches.call_count == 1
             assert launches.call_args.kwargs["SPLIT_K"] == 8
+            # Model-specific tuning must not change the default policy, and
+            # should suppress only automatic dispatch above its token bound.
+            with envs.SGLANG_LORA_CSGMV_SPLIT_K_MAX_TOKENS.override(BS - 1):
+                chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
+            assert launches.call_count == 1
             chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=4)
             assert launches.call_count == 2
             assert launches.call_args.kwargs["SPLIT_K"] == 4

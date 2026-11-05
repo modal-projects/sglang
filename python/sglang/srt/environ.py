@@ -1257,6 +1257,9 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
     SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
+    # Zero preserves the upstream policy. GLM B200 measurements use 128 to
+    # avoid regressing large prefills without changing other model recipes.
+    SGLANG_LORA_CSGMV_SPLIT_K_MAX_TOKENS = EnvInt(0)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)

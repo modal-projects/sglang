@@ -56,7 +56,8 @@ def hash_tiles32_kernel_blocked(
     USE_CG: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    base = pid * TILE
+    # 64-bit offsets: a tensor may hold more than 2**31 words.
+    base = pid.to(tl.int64) * TILE
 
     s1 = tl.full((), seed1, tl.uint32)
     s2 = tl.full((), seed2, tl.uint32)

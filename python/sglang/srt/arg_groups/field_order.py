@@ -552,5 +552,8 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "weight_update_staging",
+    "weight_update_local_checkpoint_dir",
+    "weight_update_max_compile_group_gb",
 )
 # fmt: on

@@ -39,6 +39,7 @@ from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
+    FUSED_QKV_A_LORA_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -289,41 +290,62 @@ class LoRAManager:
         return result
 
     def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
-        """
-        Load a single LoRA adapter from the specified path.
-
-        Args:
-            lora_ref (LoRARef): The LoRARef object containing the LoRA name, path, and ID.
-        """
-        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
-            "LoRARef must have both lora_name and lora_path set for loading."
-        )
-        assert lora_ref.lora_id not in self.loras, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
-
         try:
-            # load configs
-            new_adapter = LoRAConfig(
-                lora_ref.lora_path,
-                base_vocab_size=self.base_hf_config.vocab_size,
-            )
-            self.validate_new_adapter(new_adapter, lora_ref)
-            self.configs[lora_ref.lora_id] = new_adapter
+            prepared = self.prepare_lora_adapter(lora_ref)
+            return self.install_prepared_lora_adapter(lora_ref, prepared)
+        except Exception as exc:
+            return self.create_lora_update_result(False, str(exc))
 
-            # load weights
-            self.load_lora_weights(lora_ref)
+    def _make_lora_adapter(self, lora_ref, config):
+        pool = getattr(self, "memory_pool", None)
+        expert_range = None
+        if pool is not None and pool.moe_use_local_expert_ids:
+            first = pool.moe_ep_rank * pool._num_experts_local
+            expert_range = (first, first + pool._num_experts_local)
+        return LoRAAdapter(
+            lora_ref.lora_id,
+            config,
+            self.base_hf_config,
+            self.load_config,
+            self.lora_backend,
+            base_model=self.base_model,
+            expert_range=expert_range,
+        )
 
-            # keep metadata for displayed messages
-            self.lora_refs[lora_ref.lora_id] = lora_ref
-            self.num_pinned_loras += int(lora_ref.pinned)
-        except Exception as e:
-            return self.create_lora_update_result(
-                success=False,
-                error_message=str(e),
-            )
+    def prepare_lora_adapter(self, lora_ref):
+        """Build CPU weights without changing the active registry or GPU buffers."""
+        config = LoRAConfig(
+            lora_ref.lora_path, base_vocab_size=self.base_hf_config.vocab_size
+        )
+        adapter = self._make_lora_adapter(lora_ref, config)
+        adapter.initialize_weights()
+        pool = getattr(self, "memory_pool", None)
+        if pool is not None:
+            pool.retain_local_expert_weights(adapter)
+        return config, adapter
 
-        return self.create_lora_update_result(success=True)
+    def install_prepared_lora_adapter(self, lora_ref, prepared):
+        """Called on the scheduler thread after every TP rank has prepared."""
+        config, adapter = prepared
+        self.validate_new_adapter(config, lora_ref)
+        if lora_ref.lora_id in self.loras:
+            raise ValueError(f"Adapter {lora_ref.lora_id} is already loaded")
+        warn_if_adapter_targets_embeddings(
+            lora_name=lora_ref.lora_name,
+            embedding_layer_names=adapter.embedding_layers.keys(),
+            speculative_algorithm=self.speculative_algorithm,
+        )
+        self.configs[lora_ref.lora_id] = config
+        self.loras[lora_ref.lora_id] = adapter
+        self.lora_refs[lora_ref.lora_id] = lora_ref
+        self.num_pinned_loras += int(lora_ref.pinned)
+        cpu_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for layer in adapter.layers
+            for tensor in layer.weights.values()
+        )
+        logger.info("LoRA prepared id=%s cpu_bytes=%d", lora_ref.lora_id, cpu_bytes)
+        return self.create_lora_update_result(True)
 
     def _validate_replicated_q_targets(self, target_modules):
         # q_proj adapter targets normalize to qkv_proj.
@@ -724,6 +746,11 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        validate_model_targets = getattr(
+            self.base_model, "validate_lora_target_modules", None
+        )
+        if validate_model_targets is not None:
+            validate_model_targets(self.target_modules)
         self._validate_replicated_q_targets(self.target_modules)
 
         if self._experts_shared_outer_override is not None:
@@ -814,7 +841,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -858,7 +887,7 @@ class LoRAManager:
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, self.base_model
             )
 
             if target_modules is not None:
@@ -875,6 +904,13 @@ class LoRAManager:
             else:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
+
+        # Normalization maps up_proj to gate_up_proj for fused MoE weights.
+        # Keep standalone dense/shared-expert up_proj modules eligible too.
+        if "gate_up_proj" in self.target_modules and any(
+            name.endswith(".up_proj") for name, _ in self.base_model.named_modules()
+        ):
+            self.target_modules.add("up_proj")
 
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
@@ -920,15 +956,10 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
         """
-        lora_adapter = LoRAAdapter(
-            lora_ref.lora_id,
-            self.configs[lora_ref.lora_id],
-            self.base_hf_config,
-            self.load_config,
-            self.lora_backend,
-            base_model=self.base_model,
-        )
+        lora_adapter = self._make_lora_adapter(lora_ref, self.configs[lora_ref.lora_id])
         lora_adapter.initialize_weights()
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -944,15 +975,10 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter from tensors to CPU memory.
         """
-        lora_adapter = LoRAAdapter(
-            lora_ref.lora_id,
-            self.configs[lora_ref.lora_id],
-            self.base_hf_config,
-            self.load_config,
-            self.lora_backend,
-            base_model=self.base_model,
-        )
+        lora_adapter = self._make_lora_adapter(lora_ref, self.configs[lora_ref.lora_id])
         lora_adapter.initialize_weights_from_tensors(tensors)
+        if hasattr(self, "memory_pool"):
+            self.memory_pool.retain_local_expert_weights(lora_adapter)
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -1028,6 +1054,9 @@ class LoRAManager:
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
+
+        for adapter in self.loras.values():
+            self.memory_pool.retain_local_expert_weights(adapter)
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
@@ -1151,9 +1180,12 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                if parts[-1] in FUSED_QKV_A_LORA_NAMES:
+                    lora_module.first_output_dim = (
+                        getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    )
+                self.lora_modules[layer_id][module_name] = lora_module
                 continue
 
             if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(

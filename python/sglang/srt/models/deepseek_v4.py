@@ -11,6 +11,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -109,6 +110,9 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.lora import deepseek_v4_targets as v4_lora
+from sglang.srt.lora.layers import check_lora_input
+from sglang.srt.lora.utils import get_default_hidden_dim, get_stacked_multiply
 from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
@@ -1287,7 +1291,6 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.attn_sink
 
-        rank = self.attn_tp_rank
         num_heads = self.n_local_heads
         padded_num_heads = 64 if num_heads <= 64 else self.n_heads
         if kernel_num_heads is None:
@@ -1303,19 +1306,44 @@ class MqaAttentionBase(nn.Module):
         # pointer.
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
-            sink = self.attn_sink.new_zeros(sink_num_heads)
-            self._attn_sink_local_slice = slice(
-                rank * num_heads, (rank + 1) * num_heads
-            )
-            sink[:num_heads] = self.attn_sink[self._attn_sink_local_slice]
-            self._attn_sink_local = sink
+            self.refresh_attn_sink_cache()
+        assert self._attn_sink_local is not None
+        assert self._attn_sink_local.shape[0] == sink_num_heads
         return self._attn_sink_local[:kernel_num_heads]
 
+    @torch.no_grad()
     def refresh_attn_sink_cache(self) -> None:
+        if self.attn_tp_size > 1:
+            rank = self.attn_tp_rank
+            tp_size = self.attn_tp_size
+        else:
+            # Context-parallel decode starts from replicated attention weights
+            # and slices them only inside the forward context. Build its local
+            # sink during post-load so staged host images include the cache.
+            ctx = get_cp_decode_attn_tp_ctx()
+            if not ctx.is_enabled:
+                return
+            rank = ctx.decode_tp_rank
+            tp_size = ctx.decode_tp_size
+
+        assert rank is not None and tp_size is not None
+        num_heads = self.n_heads // tp_size
+        sink_num_heads = 64 if num_heads <= 64 else self.n_heads
         if self._attn_sink_local is None:
-            return
-        src = self.attn_sink.data[self._attn_sink_local_slice]
-        self._attn_sink_local[: src.numel()].copy_(src)
+            self._attn_sink_local = self.attn_sink.new_zeros(sink_num_heads)
+        elif self._attn_sink_local.shape != (sink_num_heads,):
+            raise RuntimeError(
+                "local attention-sink layout changed after initialization: "
+                f"current={tuple(self._attn_sink_local.shape)} "
+                f"expected={(sink_num_heads,)}"
+            )
+        self._attn_sink_local[:num_heads].copy_(
+            self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+        )
+
+    def get_derived_weight_tensors(self):
+        if self._attn_sink_local is not None:
+            yield "attn_sink_local", self._attn_sink_local
 
     def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
         """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
@@ -1739,7 +1767,8 @@ class MQALayer(MqaAttentionBase):
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
-        method = self.wq_b.quant_method
+        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
+        method = getattr(self.wq_b, "quant_method", None)
         if (
             _is_cuda
             and self.is_dsv41
@@ -1789,6 +1818,7 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        check_lora_input(self.wq_b, q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_mega_attention:
@@ -2314,6 +2344,7 @@ class MQALayer(MqaAttentionBase):
                 q_lora_quant = q_for_wqb
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                check_lora_input(self.wq_b, q_for_wqb)
                 q, _ = self.wq_b(q_for_wqb)
 
             kv = (
@@ -2614,6 +2645,8 @@ class MQALayer(MqaAttentionBase):
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
+        if x_quant is not None:
+            check_lora_input(self.wqkv_a if self.fuse_wqa_wkv else self.wq_a, x_quant)
 
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
@@ -2652,7 +2685,11 @@ class MQALayer(MqaAttentionBase):
                     # Other MXFP8 backends may share mutable GEMM workspace.
                     and (
                         _is_gfx95_supported
-                        or getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                        or getattr(
+                            getattr(self.wq_b, "quant_method", None),
+                            "mxfp8_dense_backend",
+                            None,
+                        )
                         == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                     )
                 )
@@ -3076,6 +3113,7 @@ class MQALayer(MqaAttentionBase):
             )
             and not should_skip_mlp_all_reduce()
         )
+        check_lora_input(self.wo_b, o)
         o, _ = self.wo_b(
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
@@ -4894,6 +4932,35 @@ class DeepseekV4ForCausalLM(nn.Module):
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
 
+    # LoRA covers the attention projections and the unfused shared experts.
+    lora_target_module_aliases = v4_lora.TARGET_MODULE_ALIASES
+
+    def normalize_lora_layer_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        v4_lora.normalize_layer_weights(
+            weights, self.config.q_lora_rank, self.config.head_dim
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        dims = v4_lora.hidden_dims(module_name, self.config)
+        if dims is None:
+            return get_default_hidden_dim(module_name, self.config, layer_idx)
+        return dims
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        return v4_lora.STACKED_MULTIPLY.get(module_name) or get_stacked_multiply(
+            module_name
+        )
+
+    def validate_lora_target_modules(self, target_modules: Set[str]) -> None:
+        v4_lora.validate_target_modules(
+            target_modules,
+            quantized=self.quant_config is not None,
+            cuda=_is_cuda,
+            attn_cp_size=get_parallel().attn_cp_size,
+            fuse_wqa_wkv=envs.SGLANG_OPT_FUSE_WQA_WKV.get(),
+            fused_shared_experts=bool(self.num_fused_shared_experts),
+        )
+
     def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -5065,6 +5132,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.setup_mega_attention()
 
         if is_nextn:
+            self.model.decoder.self_attn.refresh_attn_sink_cache()
             return
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]

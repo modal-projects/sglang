@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    UpdateWeightVersionReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -77,6 +78,38 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
         )
 
+    def test_metadata_only_version_update_is_rejected_during_staging(self):
+        serving = self._serving("0")
+        scheduler = self._scheduler()
+        scheduler.weight_updater = SimpleNamespace(weight_update_staging="cpu")
+        scheduler.record_weight_version_change = lambda new_version: (
+            Scheduler.record_weight_version_change(scheduler, new_version)
+        )
+
+        result = Scheduler.handle_update_weight_version(
+            scheduler,
+            UpdateWeightVersionReqInput(new_version="1"),
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(serving.weight_version, "0")
+
+    def test_metadata_only_version_update_is_unchanged_without_staging(self):
+        serving = self._serving("v1")
+        scheduler = self._scheduler()
+        scheduler.weight_updater = SimpleNamespace(weight_update_staging=None)
+        scheduler.record_weight_version_change = lambda new_version: (
+            Scheduler.record_weight_version_change(scheduler, new_version)
+        )
+
+        result = Scheduler.handle_update_weight_version(
+            scheduler,
+            UpdateWeightVersionReqInput(new_version="v2"),
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(serving.weight_version, "v2")
+
 
 def _runner(result=(True, "ok")):
     runner = Mock()
@@ -119,6 +152,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
     def _build_manager(self, target, draft):
         return SchedulerWeightUpdaterManager(
+            tp_cpu_group=None,
             tp_worker=SimpleNamespace(
                 model_runner=target,
                 weight_update_runners=lambda: [("target", target)],

@@ -322,9 +322,11 @@ def chunked_sgmv_lora_shrink_forward(
 
     # Opt-in policy measured on H200 with BF16 rank-32 adapters. Keep other
     # shapes and deterministic inference on the original accumulation order.
+    split_k_max_tokens = envs.SGLANG_LORA_CSGMV_SPLIT_K_MAX_TOKENS.get()
     if (
         split_k is None
         and envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.get()
+        and (split_k_max_tokens <= 0 or S <= split_k_max_tokens)
         and MAX_RANK == 32
         and K in (4096, 12288)
         and x.dtype == torch.bfloat16

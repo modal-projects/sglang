@@ -1127,6 +1127,11 @@ class GemmaRMSNorm(BaseFusedOp):
         # CPU offload may move the parameter to host while the buffer stays on device.
         self.gemma_weight.copy_(self.weight.data).add_(1.0)
 
+    def get_derived_weight_tensors(self):
+        # The fused paths consume this precomputed view of ``weight``. Staged
+        # loading must therefore isolate and commit it with the parameter.
+        return (("gemma_weight", self.gemma_weight),)
+
     def _forward_impl(
         self,
         x: torch.Tensor,

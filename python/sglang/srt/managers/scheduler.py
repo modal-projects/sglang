@@ -19,15 +19,19 @@ import logging
 import math
 import os
 import signal
+import socket
 import sys
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import copy_context
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt import spindle_routing_observer
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -105,6 +109,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    create_custom_parallel_group,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -133,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CommitWeightUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -165,6 +171,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1843,6 +1850,14 @@ class Scheduler(
                     self.weight_updater.update_weights_from_disk,
                 ),
                 (
+                    PrepareWeightUpdateReqInput,
+                    self.weight_updater.prepare_weight_update,
+                ),
+                (
+                    CommitWeightUpdateReqInput,
+                    self.weight_updater.commit_weight_update,
+                ),
+                (
                     InitWeightsUpdateGroupReqInput,
                     self.weight_updater.init_weights_update_group,
                 ),
@@ -2258,7 +2273,10 @@ class Scheduler(
                 else:
                     self.send_control_output(output, recv_req)
 
+        self._poll_lora_prepares()
         self.flush_wrapper.check_pending()
+        if self.weight_updater.weight_update_staging is not None:
+            self.weight_updater.check_pending_weight_preparation()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2387,15 +2405,61 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        backend = get_model().weight_update_staging
+        weight_stage_cpu_group = self.tp_cpu_group
+        host_cpu_group = self.tp_cpu_group
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if backend is not None and tp_size > 1:
+            # Background preparation has an independent collective sequence
+            # from scheduler request broadcasts.
+            weight_stage_cpu_group = create_custom_parallel_group(
+                group_ranks=self.tp_group.ranks,
+                backend="gloo",
+            )
+            host_cpu_group = weight_stage_cpu_group
+            if backend == "cpu":
+                hosts = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    hosts,
+                    socket.gethostname(),
+                    group=self.tp_cpu_group,
+                )
+                hostname = socket.gethostname()
+                host_cpu_group = create_custom_parallel_group(
+                    group_ranks=[
+                        rank
+                        for rank, host in zip(self.tp_group.ranks, hosts, strict=True)
+                        if host == hostname
+                    ],
+                    backend="gloo",
+                )
+
+        initial_version = int(get_serving().weight_version) if backend else 0
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
+            tp_cpu_group=self.tp_cpu_group,
+            weight_stage_cpu_group=weight_stage_cpu_group,
+            host_cpu_group=host_cpu_group,
+            weight_update_staging=backend,
+            weight_update_local_checkpoint_dir=(
+                get_model().weight_update_local_checkpoint_dir
+            ),
+            weight_update_base_checkpoint_dir=self.model_config.model_path,
+            weight_update_base_version=initial_version,
+            weight_update_max_compile_group_bytes=int(
+                get_model().weight_update_max_compile_group_gb * (1 << 30)
+            ),
+            send_control_output=lambda request, output: self.send_control_output(
+                output, request
+            ),
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+        self.weight_updater.initialize_weight_staging()
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:
@@ -3894,6 +3958,7 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        spindle_routing_observer.snapshot(self, running_batch, last_batch)
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -5596,6 +5661,52 @@ class Scheduler(
             layout=msgspec_to_builtins(self._hicache_l3_layout())
         )
 
+    def _has_active_sampling_mask_request(self) -> bool:
+        """Whether any unfinished request holding a sampling mask is queued or
+        running, including PP micro-batches and PD decode queues."""
+        active_batches = [self.running_batch, self.last_batch]
+        active_batches.extend(getattr(self, "running_mbs", ()))
+        active_batches.extend(getattr(self, "mbs", ()))
+        active_batches.extend(getattr(self, "last_mbs", ()))
+        has_active_mask_request = any(
+            req.return_sampling_mask and not req.finished()
+            for batch in active_batches
+            if batch is not None
+            for req in batch.reqs
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.waiting_queue
+        )
+        has_active_mask_request |= any(
+            req.return_sampling_mask and not req.finished()
+            for req in self.grammar_manager.grammar_queue
+        )
+        has_active_mask_request |= (
+            self.chunked_req is not None
+            and self.chunked_req.return_sampling_mask
+            and not self.chunked_req.finished()
+        )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.disagg_decode_prealloc_queue
+            decode_reqs = [
+                *prealloc_queue.queue,
+                *prealloc_queue.pending_reqs,
+                *self.disagg_decode_transfer_queue.queue,
+            ]
+            has_active_mask_request |= any(
+                decode_req.req.return_sampling_mask and not decode_req.req.finished()
+                for decode_req in decode_reqs
+            )
+            has_active_mask_request |= any(
+                req.return_sampling_mask and not req.finished()
+                for req in (
+                    *prealloc_queue.retracted_queue,
+                    *prealloc_queue.held_rebootstrap_reqs,
+                )
+            )
+        return has_active_mask_request
+
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
 
@@ -5630,6 +5741,14 @@ class Scheduler(
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
+        if self.weight_updater.weight_update_staging is not None:
+            return UpdateWeightVersionReqOutput(
+                success=False,
+                message=(
+                    "update_weight_version is unavailable while staged weight "
+                    "updates are enabled; commit the prepared version instead"
+                ),
+            )
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 
@@ -6054,12 +6173,67 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = self.tp_worker.load_lora_adapter(recv_req)
-        if result.success:
-            self.kv_event_lora_names.register(
-                lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
+        if (
+            os.environ.get("SPINDLE_GLM_ASYNC_LORA_LOADING") != "1"
+            or get_parallel().pp_size != 1
+            or get_parallel().attn_dp_enabled
+        ):
+            return self.tp_worker.load_lora_adapter(recv_req)
+        if not hasattr(self, "_lora_prepare_executor"):
+            self._lora_prepare_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="lora-prepare"
             )
-        return result
+            self._pending_lora_prepares = deque()
+            self._cancelled_lora_prepares = set()
+        manager = self.tp_worker.model_runner.lora_manager
+        future = self._lora_prepare_executor.submit(
+            copy_context().run, manager.prepare_lora_adapter, recv_req.to_ref()
+        )
+        self._pending_lora_prepares.append((recv_req, future, time.monotonic()))
+        return None
+
+    def _poll_lora_prepares(self):
+        pending = getattr(self, "_pending_lora_prepares", None)
+        if not pending:
+            return
+        request, future, started = pending[0]
+        ready = torch.tensor([future.done()], dtype=torch.int32, device="cpu")
+        distributed = torch.distributed.is_initialized()
+        if distributed:
+            torch.distributed.all_reduce(
+                ready, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+        if not ready.item():
+            return
+        manager = self.tp_worker.model_runner.lora_manager
+        ref = request.to_ref()
+        error = None
+        try:
+            prepared = future.result()
+            if ref.lora_id in self._cancelled_lora_prepares:
+                raise RuntimeError("Adapter unloaded during preparation")
+            manager.validate_new_adapter(prepared[0], ref)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = [error]
+        if distributed:
+            errors = [None] * torch.distributed.get_world_size(self.tp_cpu_group)
+            torch.distributed.all_gather_object(errors, error, group=self.tp_cpu_group)
+        if any(errors):
+            output = manager.create_lora_update_result(
+                False, "; ".join(e for e in errors if e)
+            )
+        else:
+            output = manager.install_prepared_lora_adapter(ref, prepared)
+        pending.popleft()
+        self._cancelled_lora_prepares.discard(ref.lora_id)
+        logger.info(
+            "LoRA preparation completed id=%s seconds=%.3f success=%s",
+            ref.lora_id,
+            time.monotonic() - started,
+            output.success,
+        )
+        self.send_control_output(output, request)
 
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
@@ -6078,8 +6252,11 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        result = self.tp_worker.unload_lora_adapter(recv_req)
-        return result
+        for request, future, _ in getattr(self, "_pending_lora_prepares", ()):
+            if request.lora_id == recv_req.lora_id:
+                self._cancelled_lora_prepares.add(request.lora_id)
+                future.cancel()
+        return self.tp_worker.unload_lora_adapter(recv_req)
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
@@ -6158,6 +6335,9 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        if getattr(self, "_pending_lora_prepares", None):
+            time.sleep(0.005)
+            return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 
@@ -6169,6 +6349,9 @@ class Scheduler(
 
     def handle_shutdown(self, recv_req: ShutdownReq):
         # Break the event loop; the finally in run_scheduler_process releases resources.
+        executor = getattr(self, "_lora_prepare_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         self.gracefully_exit = True
         return None
 

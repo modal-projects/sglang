@@ -4698,6 +4698,11 @@ def mxfp8_block_convert_required():
 
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
+    "b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "g_a_proj",
+    "g_b_proj",
     "q_proj",
     "k_proj",
     "v_proj",
@@ -4719,6 +4724,20 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # DeepSeek-V4 attention projections and shared experts.
+    "wq_a",
+    "wkv",
+    "wo_b",
+    "w1",
+    "w2",
+    "w3",
+    "attn.wq_a",
+    "attn.wkv",
+    "attn.wq_b",
+    "attn.wo_b",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

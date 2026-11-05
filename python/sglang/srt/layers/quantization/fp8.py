@@ -72,9 +72,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     pack_mxfp8_weight_scale_for_deepgemm,
     prepare_xpu_block_scale_for_scaled_mm,
+    record_ue8m0_scale_checkpoint_layout,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
     resolve_mxfp8_dense_gemm_backend,
+    restore_ue8m0_scale_checkpoint_layout,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
 )
@@ -214,17 +216,18 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
 
 
 def cast_e2m1fn_to_e4m3fn(
-    x: torch.Tensor, scale: torch.Tensor
+    x: torch.Tensor, scale: torch.Tensor, fp8_block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Casts a tensor from e2m1fn to e4m3fn losslessly.
+    Casts a tensor from e2m1fn to e4m3fn losslessly, with square
+    ``fp8_block_size`` scale blocks.
     """
     assert x.dtype == torch.int8
     assert x.ndim == 2
     out_dim, in_dim = x.size()
     in_dim *= 2
-    fp8_block_size = 128
     fp4_block_size = 32
+    assert fp8_block_size % fp4_block_size == 0
     assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
     assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size
 
@@ -740,7 +743,41 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant and not self.use_mxfp8:
+            restore_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
+
+    def weight_staging_postprocess_device(self, layer: Module) -> str:
+        requires_cuda = (
+            not self.block_quant
+            or not self.is_checkpoint_fp8_serialized
+            or self.use_mxfp8
+            or self.convert_mxfp8_to_block
+            or self.block_fp8_as_mxfp8
+            or _is_fp8_fnuz
+            or _use_aiter_bpreshuffle_gfx95
+        )
+        if requires_cuda:
+            return "cuda"
+
+        from sglang.srt.model_loader.utils import (
+            should_deepgemm_weight_requant_ue8m0,
+        )
+
+        use_deepgemm_runner = (
+            self.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
+        if use_deepgemm_runner and should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=self.quant_config.weight_block_size,
+            output_dtype=getattr(layer, "orig_dtype", None),
+            weight_shape=layer.weight.shape,
+        ):
+            return "cuda"
+        return "cpu"
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.use_mxfp8:
+            record_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1874,7 +1911,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = False
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.block_quant and not self.use_mxfp8 and not self.is_fp4_expert:
+            restore_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
+            restore_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)
+
+    def weight_staging_postprocess_device(self, layer: Module) -> str:
+        requires_cuda = (
+            self.is_fp4_expert
+            or not self.block_quant
+            or not self.quant_config.is_checkpoint_fp8_serialized
+            or self.use_mxfp8
+            or self.convert_mxfp8_to_block
+            or _is_fp8_fnuz
+            or _use_aiter
+        )
+        if requires_cuda:
+            return "cuda"
+
+        from sglang.srt.model_loader.utils import (
+            should_deepgemm_weight_requant_ue8m0,
+        )
+
+        if (
+            self.is_deepgemm_moe_runner_backend_enabled()
+            and should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=self.quant_config.weight_block_size,
+            )
+        ):
+            return "cuda"
+        return "cpu"
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.use_mxfp8 and not self.is_fp4_expert:
+            record_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
+            record_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)
+
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -2194,6 +2266,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+                # The MoE runner reads scales at the checkpoint's block size
+                # (128 for DeepSeek-V4, 32 for DeepSeek-V4.1).
+                block_n, block_k = self.quant_config.weight_block_size or [128, 128]
+                assert block_n == block_k, self.quant_config.weight_block_size
                 for weight_param, scale_param in [
                     (layer.w13_weight, layer.w13_weight_scale_inv),
                     (layer.w2_weight, layer.w2_weight_scale_inv),
@@ -2203,7 +2279,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     new_scales = []
                     for e in range(num_experts):
                         w, s = cast_e2m1fn_to_e4m3fn(
-                            weight_param.data[e], scale_param.data[e]
+                            weight_param.data[e],
+                            scale_param.data[e],
+                            fp8_block_size=block_n,
                         )
                         new_weights.append(w)
                         new_scales.append(s)

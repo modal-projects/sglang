@@ -537,6 +537,8 @@ class TestQuarkMxfp4MoEPaddedTpLoading(CustomTestCase):
             moe_tp_size=self.TP,
         )
 
+        moe._copy_loaded_weight = FusedMoE._copy_loaded_weight.__get__(moe)
+
         def fused_moe_weight_loader(param, w, name, shard_id, expert_id):
             load = FusedMoE._load_w2 if shard_id == "w2" else FusedMoE._load_w13
             load(

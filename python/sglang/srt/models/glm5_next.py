@@ -66,6 +66,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -1228,16 +1229,28 @@ class Glm5NextModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm5NextForConditionalGeneration(nn.Module):
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.visual": "visual",
-        },
+_GLM5_NEXT_HF_TO_SGLANG_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "model.visual": "visual",
+    },
+    orig_to_new_prefix={
+        "model.language_model.": "model.",
+    },
+    orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+)
+
+
+def _glm5_next_checkpoint_name_mapper(num_hidden_layers: int) -> WeightsMapper:
+    return _GLM5_NEXT_HF_TO_SGLANG_MAPPER | WeightsMapper(
         orig_to_new_prefix={
-            "model.language_model.": "model.",
-        },
-        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+            f"model.language_model.layers.{num_hidden_layers}.": None,
+            f"model.layers.{num_hidden_layers}.": None,
+        }
     )
+
+
+class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = _GLM5_NEXT_HF_TO_SGLANG_MAPPER
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         **Glm5NextLinearAttention._PACKED_MODULES_MAPPING,
@@ -1246,6 +1259,22 @@ class Glm5NextForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        linear = self.config.linear_attn_config
+        width = linear["num_heads"] * linear["head_dim"]
+        if module_name in ("f_a_proj", "g_a_proj"):
+            return self.config.hidden_size, linear["head_dim"]
+        if module_name in ("f_b_proj", "g_b_proj"):
+            return linear["head_dim"], width
+        if module_name == "b_proj":
+            return self.config.hidden_size, linear["num_heads"]
+        if self.config.layer_types[layer_idx] == "linear_attention":
+            if module_name == "qkv_proj":
+                return self.config.hidden_size, 3 * width
+            if module_name == "o_proj":
+                return width, self.config.hidden_size
+        return get_default_hidden_dim(module_name, self.config, layer_idx)
 
     def __init__(
         self,
@@ -1257,6 +1286,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
+        self.checkpoint_name_mapper = _glm5_next_checkpoint_name_mapper(
+            text_config.num_hidden_layers
+        )
         self.encoder_only = bool(getattr(config, "encoder_only", False))
         self.language_only = bool(getattr(config, "language_only", False))
 
@@ -1718,6 +1750,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        expert_params_mapping_by_expert = FusedMoE.index_expert_params_mapping(
+            expert_params_mapping
+        )
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1834,7 +1869,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 break
             else:
                 is_expert_weight = False
-                for mapping in expert_params_mapping:
+                for mapping in FusedMoE.get_expert_params_mapping_candidates(
+                    name,
+                    expert_params_mapping,
+                    expert_params_mapping_by_expert,
+                ):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

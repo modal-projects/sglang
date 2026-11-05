@@ -74,6 +74,7 @@ class _StubFusedMoE:
     _load_model_weight_or_group_weight_scale = (
         FusedMoE._load_model_weight_or_group_weight_scale
     )
+    _copy_loaded_weight = FusedMoE._copy_loaded_weight
     _load_w13 = FusedMoE._load_w13
     _load_w2 = FusedMoE._load_w2
 

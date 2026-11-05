@@ -20,15 +20,18 @@
 
 import logging
 import re
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -60,8 +63,10 @@ class LoRAAdapter(nn.Module):
         load_config: LoadConfig,
         lora_backend: BaseLoRABackend,
         base_model: Optional[torch.nn.Module] = None,
+        expert_range: Optional[tuple[int, int]] = None,
     ):
         super().__init__()
+        self.expert_range = expert_range
         self.uid: str = uid
         self.config: LoRAConfig = config
         assert self.config.hf_config["peft_type"].lower() == "lora"
@@ -142,6 +147,16 @@ class LoRAAdapter(nn.Module):
 
     def initialize_weights(self):
         model_path = self.config.path
+        local_file = Path(model_path) / "adapter_model.safetensors"
+        if self.expert_range is not None and local_file.is_file():
+            with safe_open(local_file, framework="pt", device="cpu") as weights:
+                for name in weights.keys():
+                    if self._owns_expert(name):
+                        # Cached tensors must not retain the volume mmap.
+                        # Later publications need to refresh this mount.
+                        self._process_weight(name, weights.get_tensor(name).clone())
+            self._normalize_weights()
+            return
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
@@ -161,12 +176,17 @@ class LoRAAdapter(nn.Module):
 
         self._normalize_weights()
 
-    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
-
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+    def _owns_expert(self, name: str) -> bool:
+        expert = re.search(r"\.experts\.(\d+)\.", name)
+        return (
+            self.expert_range is None
+            or expert is None
+            or (self.expert_range[0] <= int(expert[1]) < self.expert_range[1])
         )
+
+    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
+        if not self._owns_expert(name):
+            return
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
@@ -177,6 +197,9 @@ class LoRAAdapter(nn.Module):
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
+            normalized_target_modules = get_normalized_target_modules(
+                self.config.target_modules
+            )
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
             # "all-linear"), we allow loading since the server-level
@@ -200,7 +223,12 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        normalize_model_weights = getattr(
+            self.base_model, "normalize_lora_layer_weights", None
+        )
         for layer in self.layers:
+            if normalize_model_weights is not None:
+                normalize_model_weights(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
@@ -463,7 +491,16 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         for weight_name in weight_names:
-            if "gate_proj" in weight_name:
+            if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
+                weight_name
+            ):
+                gate_name = weight_name.replace(".up_proj.", ".gate_proj.")
+                if weight_name in weights and gate_name not in weights:
+                    # Non-gated experts can export their single input projection
+                    # as up_proj. The fused MoE buffer still calls it gate_up_proj.
+                    merged_name = weight_name.replace(".up_proj.", ".gate_up_proj.")
+                    weights[merged_name] = weights.pop(weight_name)
+            elif "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 # PEFT can ship up_proj in two forms when there's no real

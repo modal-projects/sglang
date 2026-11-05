@@ -2948,6 +2948,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
             )
 
+        sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
+            sampling_info,
+            next_token_logits=logits_output.next_token_logits,
+            draft_input=draft_input,
+            draft_token_num=int(self.block_size),
+            bs=bs,
+        )
+        if sampling_mask_capture is not None:
+            logits_output.sampling_mask_output = sampling_mask_capture.build_output(
+                out_tokens=out_tokens,
+                commit_lens=commit_lens,
+            )
+
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,

@@ -96,6 +96,17 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
+def check_lora_input(linear: nn.Module, x) -> None:
+    """LoRA kernels read the activation directly, so fused producers must keep it BF16."""
+    if isinstance(linear, BaseLayerWithLoRA) and not (
+        isinstance(x, torch.Tensor) and x.element_size() >= 2
+    ):
+        raise RuntimeError(
+            f"LoRA-wrapped {type(linear.base_layer).__name__} received a quantized "
+            f"activation ({type(x).__name__}); its producer must keep it BF16."
+        )
+
+
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with LoRA support (simplified for TP=1, no extra tokens).
@@ -1086,6 +1097,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 runner_backend = MoeRunnerBackend.TRITON
 
         self._lora_runner_backend = runner_backend
+        if runner_backend.is_marlin():
+            # Marlin repacks GPT-OSS's interleaved checkpoint into split gate/up.
+            self._uses_interleaved_gate_up = False
         if (lora_backend.name == "triton_v2") != runner_backend.is_lora():
             raise ValueError(
                 "Routed MoE LoRA must pair --lora-backend triton_v2 with "
@@ -1135,14 +1149,27 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptNvFp4FusedMoEMethod,
             )
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
             assert isinstance(
                 base_layer.quant_method,
-                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
+                (
+                    CompressedTensorsFusedMoEMethod,
+                    ModelOptNvFp4FusedMoEMethod,
+                    Mxfp4MoEMethod,
+                ),
             ), (
                 f"Marlin MoE backend requires a quant method exposing "
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )
+            if isinstance(base_layer.quant_method, Mxfp4MoEMethod):
+                # MXFP4 checkpoint shards are rounded to whole groups of 32.
+                # LoRA currently shards by intermediate_size / TP instead.
+                if self.intermediate_size_per_partition % 32:
+                    raise ValueError(
+                        "MXFP4 expert LoRA requires intermediate_size / MoE TP "
+                        "to be divisible by 32 so base and adapter shards match."
+                    )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
@@ -1277,6 +1304,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
+        if self._lora_runner_backend.is_marlin():
+            # The dispatcher initializes the EP map lazily on its first dispatch.
+            quant_info.expert_map = base_layer.dispatcher.local_expert_mapping
+            quant_info.global_num_experts = (
+                base_layer.num_experts if quant_info.expert_map is not None else -1
+            )
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():

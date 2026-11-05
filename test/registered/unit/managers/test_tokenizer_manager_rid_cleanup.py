@@ -926,6 +926,7 @@ def _make_generate_obj(rid, is_single):
     obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
+        obj.batch_size = len(rid)
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
 
@@ -1060,6 +1061,50 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         for dispatched in (False, True):
             with self.subTest(dispatched=dispatched):
                 asyncio.run(drive(dispatched))
+
+
+class TestAbortBeforeDispatch(CustomTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm._dispatch_to_scheduler = Mock()
+
+    def test_abort_before_dispatch_is_resent_after_request(self):
+        rid = "job-1::0"
+        state = _make_req_state(rid)
+        state.abort_sent = True
+        self.tm.rid_to_state[rid] = state
+
+        request = Mock(rid=rid)
+        self.tm._dispatch_to_scheduler(request)
+        self.tm._mark_state_dispatched(rid)
+
+        sent = [call.args[0] for call in self.tm._dispatch_to_scheduler.call_args_list]
+        self.assertIs(sent[0], request)
+        self.assertIsInstance(sent[1], AbortReq)
+        self.assertEqual(sent[1].rid, rid)
+        self.assertTrue(state.dispatched)
+
+    def test_abort_all_marks_requests_pending_dispatch(self):
+        for rid in ("a", "b"):
+            self.tm.rid_to_state[rid] = _make_req_state(rid)
+
+        self.tm.abort_request(abort_all=True)
+
+        self.assertTrue(
+            all(state.abort_sent for state in self.tm.rid_to_state.values())
+        )
+        sent = self.tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertTrue(sent.abort_all)
+
+    def test_dispatch_failure_restores_abort_state(self):
+        state = _make_req_state("job-1::0")
+        self.tm.rid_to_state[state.obj.rid] = state
+        self.tm._dispatch_to_scheduler.side_effect = RuntimeError("send failed")
+
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            self.tm.abort_request(rid=state.obj.rid)
+
+        self.assertFalse(state.abort_sent)
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
@@ -1379,8 +1424,9 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 self.assertTrue(sent.empty())  # No samples were dispatched.
             else:
                 await asyncio.gather(*tm._lora_release_tasks)
-                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 4)
-                for remaining in (3, 2, 1, 0):
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 2)
+                # Two samples share each logical prompt's single acquisition.
+                for remaining in (2, 1, 1, 0):
                     sample = await asyncio.wait_for(sent.get(), timeout=1)
                     await tm._handle_batch_output(_make_batch_str_output(sample.rid))
                     await asyncio.gather(*tm._lora_release_tasks)

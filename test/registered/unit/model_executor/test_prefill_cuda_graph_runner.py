@@ -790,27 +790,33 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
 
         cases = (
-            # (opted in, KV chunk capacity, prefix lens, replays)
-            (False, 32768, [0], True),
-            (False, 32768, [8], False),
-            (True, 32768, [8], True),
-            (True, 12, [8], True),
-            (True, 11, [8], False),
+            # (opted in, chunked prefix, KV chunk capacity, prefix lens, replays)
+            (False, False, 32768, [0], True),
+            (False, False, 32768, [8], False),
+            (True, False, 32768, [8], True),
+            (True, False, 12, [8], True),
+            (True, False, 11, [8], False),
+            (True, True, 11, [8], True),
         )
         with patch.object(runner_module, "is_cuda", return_value=False):
-            for opted_in, capacity, prefix_lens, expected in cases:
+            for opted_in, chunked, capacity, prefix_lens, expected in cases:
                 with (
                     self.subTest(
-                        opted_in=opted_in, capacity=capacity, prefix_lens=prefix_lens
+                        opted_in=opted_in,
+                        chunked=chunked,
+                        capacity=capacity,
+                        prefix_lens=prefix_lens,
                     ),
                     envs.SGLANG_MAX_KV_CHUNK_CAPACITY.override(capacity),
                 ):
                     runner._rocm_bcg_prefix_extend = opted_in
+                    runner._rocm_bcg_chunked_prefix = chunked
                     forward_batch.extend_prefix_lens_cpu = prefix_lens
                     self.assertEqual(runner.can_run_graph(forward_batch), expected)
 
         # CUDA BCG does not route prefix extends through the MHA companion.
         runner._rocm_bcg_prefix_extend = False
+        runner._rocm_bcg_chunked_prefix = False
         forward_batch.extend_prefix_lens_cpu = [8]
         with patch.object(runner_module, "is_cuda", return_value=True):
             self.assertTrue(runner.can_run_graph(forward_batch))

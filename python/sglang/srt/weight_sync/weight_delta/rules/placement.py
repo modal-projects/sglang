@@ -54,15 +54,18 @@ def linear_places(
         src[split_dim] = slice(rank * local, (rank + 1) * local)
     dst = param
     if destination.shards:
+        if param.dim() == len(tensor.shape) + 1:
+            # A batched parameter (shard, ...) holds its shards as a row stack.
+            dst = param.view(-1, *param.shape[2:])
         rows = [
             inventory[shard].shape[0] // (size if split_dim == 0 else 1)
             for shard in destination.shards
         ]
-        if sum(rows) != param.shape[0]:
+        if sum(rows) != dst.shape[0]:
             raise ValueError(
                 f"{tensor.name}: fused shards do not fill {destination.param}"
             )
-        dst = param.narrow(0, sum(rows[: destination.shard]), rows[destination.shard])
+        dst = dst.narrow(0, sum(rows[: destination.shard]), rows[destination.shard])
     elements = math.prod(len(range(*s.indices(n))) for s, n in zip(src, tensor.shape))
     if dst.numel() != elements:
         raise ValueError(

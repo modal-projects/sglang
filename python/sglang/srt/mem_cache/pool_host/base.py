@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,14 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
+def _mla_host_dedup_enabled() -> bool:
+    """Read the dedup opt-in; pools built without a published config never dedup."""
+    try:
+        return get_memory().enable_mla_hicache_host_dedup is True
+    except ValueError:
+        return False
+
+
 def host_memory_budget_bytes(
     requested_bytes: int = 0, *, auto_size: bool = False
 ) -> int:
@@ -95,6 +103,12 @@ def host_memory_budget_bytes(
     Inside host_memory_budget_scope, requested_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
     """
+    if _mla_host_dedup_enabled():
+        # Match downstream 3fd921ea08: the dedup assembler checks the whole
+        # physical plan; individual allocations check remaining node memory.
+        # Re-dividing after peers allocate rejects valid staged Mamba pools.
+        return available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+
     available = _host_memory_budget.get()
     if available is not None:
         if requested_bytes <= available:
@@ -124,7 +138,7 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_memory, get_parallel
 
         pp_group = get_parallel().pp_group
     except RuntimeError:

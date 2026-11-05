@@ -210,7 +210,7 @@ def prepare(
     tensors = read_tensors(manifest)
     rows = _join(table, tensors)
     held = np.flatnonzero(table.held[rows])
-    held = held[np.argsort(~tensors.raw[held], kind="stable")]
+    held = held[np.lexsort((rows[held], ~tensors.raw[held]))]
     raw = tensors.raw[held]
     staged_nbytes = np.where(raw, tensors.nbytes[held], tensors.inner_nbytes[held])
     spans = -(-staged_nbytes // STAGED_ALIGNMENT) * STAGED_ALIGNMENT

@@ -41,6 +41,7 @@ def handle_hicache(server_args: Any):
         or cfg.unified_cache_external_linker_backend != "mooncake"
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
+    validate_mla_hicache_host_dedup(server_args)
     if cfg.enable_unified_cache_external_linker:
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
@@ -95,6 +96,44 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def validate_mla_hicache_host_dedup(server_args: Any):
+    """Fail-closed validation for --enable-mla-hicache-host-dedup.
+
+    Runs before the hicache-off early return: dedup requires hierarchical
+    cache, so an invalid combination must raise even when it is disabled.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_mla_hicache_host_dedup:
+        return
+    if cfg.enable_dsa_cache_layer_split:
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup cannot be used with "
+            "--enable-dsa-cache-layer-split."
+        )
+    if not cfg.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup requires --enable-hierarchical-cache."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup does not support unified memory: "
+            "receiver ranks scatter broadcast pages by controller index, "
+            "without the unified pool's index translation."
+        )
+    if cfg.dcp_size > 1:
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup requires --dcp-size=1: "
+            "DCP shards target MLA KV across ranks, while host dedup "
+            "requires replicated target KV."
+        )
+    if cfg.hicache_storage_backend not in (None, "", "file"):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup only supports L2-only "
+            "HiCache or --hicache-storage-backend=file; got "
+            f"{cfg.hicache_storage_backend!r}."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

@@ -14,13 +14,19 @@ from sglang.srt.managers.tokenizer_manager import (
     ReqState,
     TokenizerManager,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
     est_time=10,
     suite="base-a-test-cpu",
-    disabled="out of sync with TokenizerManager request-state helpers",
 )
+
+
+@pytest.fixture(autouse=True)
+def published_context():
+    with get_context().override_server_args(model_path="dummy"):
+        yield
 
 
 def manager(registry):
@@ -34,6 +40,7 @@ def manager(registry):
     m.enable_trace = False
     m.disaggregation_mode = "null"
     m.lora_ref_cache = {}
+    m.encoder_dispatch_ready = {}
     m.dump_requests_folder = None
     m.crash_dump_folder = None
     m.incremental_streaming_output = False
@@ -55,7 +62,7 @@ def state(rid, adapter, stream):
     times = SimpleNamespace(
         first_token_time=1,
         trace_ctx=SimpleNamespace(tracing_enable=False),
-        set_finished_time=lambda: None,
+        set_finished_time=lambda **kwargs: None,
         get_e2e_latency=lambda: 0,
     )
     return ReqState(
@@ -214,7 +221,11 @@ async def setup_request(*, paths="version-1", n=1):
     )
     obj.normalize_batch_and_arguments()
     m = manager(registry)
-    lifecycles = m._init_req_state(obj)
+    m._init_req_state(obj)
+    lifecycles = {
+        rid: m.rid_to_state[rid]
+        for rid in ([obj.rid] if obj.is_single else obj.rid[: obj.batch_size])
+    }
     return m, obj, lifecycles, adapters
 
 
@@ -227,7 +238,7 @@ def test_exception_cleanup_waits_for_scheduler_if_dispatched(dispatched):
         s.dispatched = dispatched
         aborts = []
         m._dispatch_to_scheduler = aborts.append
-        m._discard_pending_req_states(obj, lifecycles)
+        m._release_req_states_on_failure(lifecycles)
         await drain(m)
         adapter = adapters["version-1"]
         assert m.lora_registry._counters[adapter.lora_id].value() == int(dispatched)
@@ -239,7 +250,7 @@ def test_exception_cleanup_waits_for_scheduler_if_dispatched(dispatched):
             assert len(aborts) == 1 and obj.rid in m.rid_to_state
             m._handle_abort_req(AbortReq(rid=obj.rid))
         await asyncio.wait_for(eviction, 0.2)
-        m._discard_pending_req_states(obj, lifecycles)
+        m._release_req_states_on_failure(lifecycles)
         assert obj.rid not in m.rid_to_state
         await drain(m)
 
@@ -249,7 +260,7 @@ def test_exception_cleanup_waits_for_scheduler_if_dispatched(dispatched):
 def test_cleanup_before_acquisition_does_not_release():
     async def scenario():
         m, obj, lifecycles, adapters = await setup_request()
-        m._discard_pending_req_states(obj, lifecycles)
+        m._release_req_states_on_failure(lifecycles)
         await drain(m)
         assert m.lora_registry._counters[adapters["version-1"].lora_id].value() == 0
 
@@ -274,7 +285,7 @@ def test_cancelled_acquisition_releases_without_touching_reused_rid():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        m._discard_pending_req_states(obj, lifecycles)
+        m._release_req_states_on_failure(lifecycles)
         replacement = GenerateReqInput(input_ids=[1], rid=obj.rid)
         replacement.normalize_batch_and_arguments()
         m._init_req_state(replacement)
@@ -296,7 +307,7 @@ def test_partial_batch_cleanup_releases_only_undispatched_references():
         await m._resolve_lora_path(obj)
         m.rid_to_state[obj.rid[0]].dispatched = True
         m._dispatch_to_scheduler = lambda _: None
-        m._discard_pending_req_states(obj, lifecycles)
+        m._release_req_states_on_failure(lifecycles)
         await drain(m)
         assert m.lora_registry._counters[adapters["version-1"].lora_id].value() == 1
         assert m.lora_registry._counters[adapters["version-2"].lora_id].value() == 0
@@ -320,20 +331,24 @@ def test_parallel_samples_share_parent_reference_until_last_completion(cancel):
         # Prefix-cache child completes before the actual samples are submitted.
         child = copy.copy(obj[0])
         child.rid = "prefix"
-        m._init_child_req_state(rid, child)
-        m._remove_req_state(child.rid)
+        m._init_req_state(child)
+        m._share_lora_ref(m.rid_to_state[rid], child.rid)
+        lifecycles[child.rid] = m.rid_to_state[child.rid]
+        m._pop_req_state(child.rid)
         await drain(m)
         assert m.lora_registry._counters[ident].value() == 1
         for i in range(3):
             child = copy.copy(obj[0])
             child.rid = f"child-{i}"
-            m._init_child_req_state(rid, child)
+            m._init_req_state(child)
+            m._share_lora_ref(m.rid_to_state[rid], child.rid)
+            lifecycles[child.rid] = m.rid_to_state[child.rid]
             m.rid_to_state[child.rid].dispatched = True
         if cancel:
             m._dispatch_to_scheduler = lambda _: None
-            m._discard_pending_req_states(obj, lifecycles)
+            m._release_req_states_on_failure(lifecycles)
         else:
-            m._remove_req_state(rid)
+            m._pop_req_state(rid)
         for i in range(3):
             m._handle_abort_req(AbortReq(rid=f"child-{i}"))
             await drain(m)

@@ -54,6 +54,7 @@ def test_post_load_updates_an_existing_attention_sink():
     local_sink = attention._local_attn_sink()
     data_ptr = local_sink.data_ptr()
     model = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(model)
     model.wo_a_fp8 = False
     object.__setattr__(
         model,
@@ -133,6 +134,7 @@ def test_post_load_refreshes_attention_sink_cache():
         refresh_mhc_norm_weight_cache=lambda: None,
     )
     model = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(model)
     model.wo_a_fp8 = False
     object.__setattr__(
         model,
@@ -148,6 +150,7 @@ def test_post_load_refreshes_attention_sink_cache():
 def test_nextn_post_load_refreshes_attention_sink_cache():
     attention = SimpleNamespace(refresh_attn_sink_cache=Mock())
     model = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(model)
     model.wo_a_fp8 = False
     object.__setattr__(
         model,

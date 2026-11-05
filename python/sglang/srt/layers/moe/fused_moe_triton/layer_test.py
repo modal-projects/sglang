@@ -113,7 +113,7 @@ def test_deferred_copy_workers_share_cpus_between_local_model_workers():
     parallel = mock.Mock(
         world_group=mock.Mock(local_size=4, world_size=4),
         nnodes=1,
-        enable_dp_attention=False,
+        attn_dp_enabled=False,
         dp_size=1,
     )
     with (

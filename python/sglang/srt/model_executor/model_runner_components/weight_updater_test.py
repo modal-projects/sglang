@@ -111,6 +111,11 @@ def _make_weight_updater(model, model_config, runner, update_model_fields=None):
 class TestReloadLifecycle(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        load_group = patch.object(
+            updater_mod, "get_pp_stage_load_group", return_value=LoadConfig().load_group
+        )
+        load_group.start()
+        self.addCleanup(load_group.stop)
         weight_cache = patch.object(
             updater_mod,
             "get_model",

@@ -128,10 +128,10 @@ def _assert_weight_tensor_layout_unchanged(
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
-    tp_cpu_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    tp_cpu_group: Any
     scheduler: Optional[Any] = None
     weight_stage_cpu_group: Any = None
     host_cpu_group: Any = None
@@ -255,12 +255,20 @@ class SchedulerWeightUpdaterManager:
                     time.perf_counter() - t0, source
                 )
 
-    def flush_cache_after_weight_update(self, recv_req) -> None:
-        if recv_req.flush_cache:
-            flush_cache_success = self.flush_cache(
-                empty_cache=recv_req.torch_empty_cache
+    def flush_cache_after_weight_update(
+        self, recv_req, success: bool, message: str
+    ) -> Tuple[bool, str]:
+        """Flush the cache the old weights produced. A flush refused because
+        requests are still running or queued fails the update call."""
+        if recv_req.flush_cache and not self.flush_cache(
+            empty_cache=recv_req.torch_empty_cache
+        ):
+            return False, (
+                "Weights were updated, but the cache was not flushed because "
+                "requests are still running or queued. Retract or finish them, "
+                "then call /flush_cache."
             )
-            assert flush_cache_success, "Cache flush failed after updating weights"
+        return success, message
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
@@ -565,12 +573,14 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
-            # the served weights changed even if a draft runner failed afterwards
-            if target_updated:
-                self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
-            else:
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
+            if not success:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
@@ -647,8 +657,10 @@ class SchedulerWeightUpdaterManager:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
                 )
-                self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
@@ -681,9 +693,11 @@ class SchedulerWeightUpdaterManager:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
                 )
-                self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
-            else:
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
+            if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
@@ -704,12 +718,14 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
-            # the served weights changed even if a draft runner failed afterwards
-            if target_updated:
-                self.flush_cache_after_weight_update(recv_req)
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
-            else:
+            # the served weights changed even if a draft runner failed afterwards
+            if target_updated:
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
+            if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)

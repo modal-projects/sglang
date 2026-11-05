@@ -378,7 +378,7 @@ def test_hip_fused_kda_decode_refresh_preserves_runtime_storage():
 
     with (
         patch("sglang.srt.models.kimi_k3._is_hip", True),
-        patch.dict("os.environ", {"SGLANG_K3_KDA_FUSED_BACKEND": "aiter"}),
+        patch.dict("os.environ", {"SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "aiter"}),
         patch(
             "sglang.kernels.ops.attention.kda_fused_decode_aiter_hip.available",
             return_value=True,

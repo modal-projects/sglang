@@ -13,10 +13,10 @@ import math
 import torch
 import triton
 
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import (
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
     chunked_sgmv_lora_expand_forward,
 )
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import (
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
     chunked_sgmv_lora_shrink_forward,
 )
 from sglang.srt.environ import envs

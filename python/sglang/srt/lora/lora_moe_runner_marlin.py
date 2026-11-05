@@ -28,10 +28,10 @@ if _is_cuda:
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         moe_sum_reduce_triton,
     )
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
-        swiglu_gpt_oss_sigmoid_alpha_contiguous,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
@@ -72,8 +72,8 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
         assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
@@ -107,7 +107,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             quant_info.global_num_experts if quant_info.expert_map is not None else E
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, align_num_experts
+            topk_ids,
+            block_size_m,
+            align_num_experts,
+            return_inactive_prefix_count=quant_info.expert_map is None,
         )
 
         # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
@@ -152,6 +155,8 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             top_k=topk,
             mul_topk_weights=False,
             is_ep=quant_info.expert_map is not None,
+            expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type1,
             size_m=M,
             size_n=2 * N,
@@ -188,11 +193,12 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             dtype=hidden_states.dtype,
         )
         if runner_config.gemm1_alpha is not None:
-            swiglu_gpt_oss_sigmoid_alpha_contiguous(
-                intermediate_cache2,
+            swiglu_oai_split(
                 intermediate_cache1,
                 runner_config.gemm1_alpha,
+                1.0,
                 runner_config.gemm1_clamp_limit,
+                out=intermediate_cache2,
             )
         else:
             silu_and_mul(intermediate_cache1, intermediate_cache2)
@@ -206,8 +212,6 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         intermediate_cache3 = torch.empty(
             (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        if quant_info.expert_map is not None:
-            intermediate_cache3.zero_()
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             padded_intermediate,
@@ -227,7 +231,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             moe_block_size=block_size_m,
             top_k=1,
             mul_topk_weights=True,
+            zero_inactive_output=True,
             is_ep=quant_info.expert_map is not None,
+            expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type2,
             size_m=M * topk,
             size_n=K,

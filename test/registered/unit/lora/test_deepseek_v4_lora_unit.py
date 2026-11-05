@@ -18,7 +18,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.lora import deepseek_v4_targets as v4_lora
-from sglang.srt.lora.layers import BaseLayerWithLoRA, check_lora_input
+from sglang.srt.lora.layers import (
+    BaseLayerWithLoRA,
+    ReplicatedLinearWithLoRA,
+    check_lora_input,
+)
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -306,6 +310,7 @@ class TestQuantizedBaseHandoffs(unittest.TestCase):
         mlp = object.__new__(DeepseekV2MLP)
         torch.nn.Module.__init__(mlp)
         mlp.tp_size = 1
+        mlp.is_replicated = False
         mlp.gate_up_proj = BaseLayerWithLoRA(torch.nn.Linear(16, 32, bias=False), None)
         x = torch.zeros(2, 16, dtype=torch.bfloat16)
 
@@ -337,7 +342,9 @@ class TestFusedQkvAFirstOutputDim(unittest.TestCase):
                 with mock.patch.object(
                     manager,
                     "set_lora_module",
-                    side_effect=lambda *_: SimpleNamespace(first_output_dim=0),
+                    side_effect=lambda *_: ReplicatedLinearWithLoRA.__new__(
+                        ReplicatedLinearWithLoRA
+                    ),
                 ):
                     manager.init_lora_modules()
 

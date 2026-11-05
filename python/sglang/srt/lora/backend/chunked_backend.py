@@ -3,11 +3,15 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.chunked_embedding_lora_a import (
+from sglang.kernels.ops.lora.dense.chunked_embedding_lora_a import (
     chunked_embedding_lora_a_forward,
 )
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
+    chunked_sgmv_lora_expand_forward,
+)
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
+    chunked_sgmv_lora_shrink_forward,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
@@ -215,7 +219,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             torch.cumsum(seg_lens, dim=0, out=indptr[1:])
         return indptr
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,

@@ -20,6 +20,8 @@
 
 import logging
 import re
+from pathlib import Path
+from safetensors import safe_open
 from typing import Dict, List, Optional
 
 import torch
@@ -31,6 +33,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.lora.utils import get_normalized_target_modules
 
 # Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the
@@ -60,8 +63,10 @@ class LoRAAdapter(nn.Module):
         load_config: LoadConfig,
         lora_backend: BaseLoRABackend,
         base_model: Optional[torch.nn.Module] = None,
+        expert_range: Optional[tuple[int, int]] = None,
     ):
         super().__init__()
+        self.expert_range = expert_range
         self.uid: str = uid
         self.config: LoRAConfig = config
         assert self.config.hf_config["peft_type"].lower() == "lora"
@@ -142,6 +147,16 @@ class LoRAAdapter(nn.Module):
 
     def initialize_weights(self):
         model_path = self.config.path
+        local_file = Path(model_path) / "adapter_model.safetensors"
+        if self.expert_range is not None and local_file.is_file():
+            with safe_open(local_file, framework="pt", device="cpu") as weights:
+                for name in weights.keys():
+                    if self._owns_expert(name):
+                        # Cached tensors must not retain the volume mmap.
+                        # Later publications need to refresh this mount.
+                        self._process_weight(name, weights.get_tensor(name).clone())
+            self._normalize_weights()
+            return
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
@@ -161,8 +176,17 @@ class LoRAAdapter(nn.Module):
 
         self._normalize_weights()
 
+    def _owns_expert(self, name: str) -> bool:
+        expert = re.search(r"\.experts\.(\d+)\.", name)
+        return (
+            self.expert_range is None
+            or expert is None
+            or (self.expert_range[0] <= int(expert[1]) < self.expert_range[1])
+        )
+
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
+        if not self._owns_expert(name):
+            return
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.

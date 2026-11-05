@@ -7,7 +7,11 @@ from pathlib import Path
 
 import modal
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = (
+    Path(__file__).resolve().parents[3]
+    if modal.is_local()
+    else Path("/sgl-workspace/sglang")
+)
 app = modal.App("spindle-sglang-v0523-validation")
 image = (
     modal.Image.from_registry("lmsysorg/sglang:v0.5.23")

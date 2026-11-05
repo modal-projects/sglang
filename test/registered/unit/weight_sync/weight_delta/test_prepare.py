@@ -79,13 +79,14 @@ class TestPrepare(CustomTestCase):
         return prepare(self.table, manifest, "4", self.staging, 4)
 
     def test_this_gpus_tensors_are_staged_back_to_back(self):
+        # Out of table order across the files: staged raw first, each part in table order.
         prepared = self._prepare(
             [
                 [
-                    _raw("a.bias", RAW_BIAS),
+                    _raw("d.scale", RAW_SCALE),
                     _xor("b.weight", INNER, chunk_nbytes=500),
                 ],
-                [_xor("c.weight", b"other gpu"), _raw("d.scale", RAW_SCALE)],
+                [_xor("c.weight", b"other gpu"), _raw("a.bias", RAW_BIAS)],
             ]
         )
 

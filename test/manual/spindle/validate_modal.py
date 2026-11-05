@@ -40,6 +40,19 @@ image = (
 )
 
 UNIT_FILES = [
+    "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8_utils_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/kv_cache_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/modelopt_quant_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/mxfp4_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/utils/common_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/models/deepseek_common/deepseek_weight_loader_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/models/glm4_moe_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/models/glm4_moe_lite_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/models/registry_test.py",
+    "/sgl-workspace/sglang/python/sglang/srt/speculative/spec_sampling_mask_test.py",
+    "/sgl-workspace/sglang/test/registered/unit/managers/test_lora_update_result_merge.py",
     "/sgl-workspace/sglang/python/sglang/srt/weight_sync",
     "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler_components/weight_updater_test.py",
     "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner_components/weight_updater_test.py",
@@ -66,7 +79,15 @@ def units():
         json.dumps({"sglang": sglang.__file__, "torch": torch.__version__}), flush=True
     )
     subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--timeout=90", *UNIT_FILES], check=True
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--timeout=90",
+            "--import-mode=importlib",
+            *UNIT_FILES,
+        ], check=True
     )
     return "unit tests passed"
 

@@ -88,7 +88,8 @@ def units():
             "--timeout=90",
             "--import-mode=importlib",
             *UNIT_FILES,
-        ], check=True
+        ],
+        check=True,
     )
     return "unit tests passed"
 

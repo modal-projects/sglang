@@ -9,6 +9,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -35,7 +36,13 @@ class TestNvFp4MoeBackends(CustomTestCase):
         init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
-    def _run_backend(self, backend: str, intermediate_size: int = I):
+    def _run_backend(
+        self,
+        backend: str,
+        intermediate_size: int = I,
+        swiglu_limit: float | None = None,
+        w4a16: bool = False,
+    ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -54,6 +61,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 tp_size=1,
                 tp_rank=0,
             ),
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16),
         ):
             layer = FusedMoE(
                 num_experts=E,
@@ -63,6 +71,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 top_k=TOPK,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
+                swiglu_limit=swiglu_limit,
                 gate_up_interleaved=False,
             ).cuda()
 
@@ -137,15 +146,26 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
             ref = self._torch_moe_reference(
-                x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
+                x,
+                topk_weights,
+                topk_ids,
+                refs["w1"],
+                refs["w3"],
+                refs["w2"],
+                swiglu_limit,
+                w4a16,
             )
             assert_output_close(self, out, ref)
 
     @staticmethod
-    def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
+    def _torch_moe_reference(
+        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit, w4a16
+    ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
+            if w4a16:
+                return t2d.to(torch.bfloat16).float()
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
@@ -163,6 +183,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 e = int(topk_ids[t, j])
                 gate = x_dq[t] @ w1_ref[e].T
                 up = x_dq[t] @ w3_ref[e].T
+                if swiglu_limit is not None:
+                    gate = gate.clamp(max=swiglu_limit)
+                    up = up.clamp(-swiglu_limit, swiglu_limit)
                 act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
                 ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
@@ -182,6 +205,10 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_flashinfer_cutedsl_w4a16_swiglu_limit(self):
+        """The limit sits inside the GEMM1 outputs' spread (std ~0.3), so the clamp binds."""
+        self._run_backend("flashinfer_cutedsl", swiglu_limit=0.1, w4a16=True)
 
 
 if __name__ == "__main__":

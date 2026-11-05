@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import orjson
 import torch
 import zmq
 import zstandard
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 # Compressed bytes per Zstd call; the calls run on `threads` threads at once.
 ZSTD_GROUP_NBYTES = 64 << 20
 STAGING_GRANULE = 64 << 20
+# A volume serves each read after a round trip: reads of a few MiB, many at once.
+READ_NBYTES = 4 << 20
+READS_IN_FLIGHT = 64
 # Where each staged region starts: nvCOMP's frame inputs and every dtype's views need it.
 STAGED_ALIGNMENT = 16
 
@@ -204,13 +208,18 @@ def prepare(
             f"the engine is at {engine_version}"
         )
     paths = [manifest.directory / name for name in manifest.files]
-    _read_into_page_cache(paths, threads)
-    read = time.perf_counter()
+    _prefetch(_column_regions(paths))
+    read_s = time.perf_counter() - started
 
+    joining = time.perf_counter()
     tensors = read_tensors(manifest)
     rows = _join(table, tensors)
     held = np.flatnonzero(table.held[rows])
     held = held[np.lexsort((rows[held], ~tensors.raw[held]))]
+    prefetching = time.perf_counter()
+    _prefetch(_tensor_regions(paths, tensors, held))
+    prefetched = time.perf_counter()
+    read_s += prefetched - prefetching
     raw = tensors.raw[held]
     staged_nbytes = np.where(raw, tensors.nbytes[held], tensors.inner_nbytes[held])
     spans = -(-staged_nbytes // STAGED_ALIGNMENT) * STAGED_ALIGNMENT
@@ -243,26 +252,74 @@ def prepare(
             "held": len(held),
             "raw": int(raw.sum()),
             "staged_nbytes": int(staged_nbytes.sum()),
-            "read_s": read - started,
-            "join_s": joined - read,
+            "read_s": read_s,
+            "join_s": prefetching - joining + joined - prefetched,
             "stage_s": time.perf_counter() - joined,
         },
     )
 
 
-def _read_into_page_cache(paths: list[Path], threads: int) -> None:
-    """Large sequential reads: what a volume serves fast. Later reads of ranges then hit memory."""
+def _column_regions(paths: list[Path]) -> list[tuple[Path, int, int]]:
+    """Each owner file's header and columns: everything before its payload."""
+
+    def region(path: Path) -> tuple[Path, int, int]:
+        with path.open("rb", buffering=0) as source:
+            header_nbytes = int.from_bytes(source.read(8), "little")
+            payload = orjson.loads(source.read(header_nbytes))["payload"]
+        return path, 0, 8 + header_nbytes + payload["data_offsets"][0]
+
+    with ThreadPoolExecutor(READS_IN_FLIGHT) as pool:
+        return list(pool.map(region, paths))
+
+
+def _tensor_regions(
+    paths: list[Path], tensors: Tensors, rows: np.ndarray
+) -> list[tuple[Path, int, int]]:
+    """The bytes of `rows` in their owner files, regions apart only by alignment merged."""
+    if not len(rows):
+        return []
+    order = np.lexsort((tensors.offset[rows], tensors.file[rows]))
+    file, start = tensors.file[rows][order], tensors.offset[rows][order]
+    end = start + tensors.nbytes[rows][order]
+    first = np.ones(len(file), dtype=bool)
+    first[1:] = (file[1:] != file[:-1]) | (start[1:] > end[:-1] + STAGED_ALIGNMENT)
+    runs = np.flatnonzero(first)
+    ends = np.maximum.reduceat(end, runs)
+    return [
+        (paths[f], s, e - s)
+        for f, s, e in zip(file[runs].tolist(), start[runs].tolist(), ends.tolist())
+    ]
+
+
+def _prefetch(regions: list[tuple[Path, int, int]]) -> None:
+    """Read regions into the page cache, READS_IN_FLIGHT at a time; staging reads any byte missed."""
+    pieces = [
+        (path, at, min(READ_NBYTES, offset + nbytes - at))
+        for path, offset, nbytes in regions
+        for at in range(offset, offset + nbytes, READ_NBYTES)
+    ]
+    descriptors = {path: os.open(path, os.O_RDONLY) for path, _, _ in regions}
     buffers = threading.local()
 
-    def read(path: Path) -> None:
+    def read(piece: tuple[Path, int, int]) -> None:
+        path, at, nbytes = piece
         if not hasattr(buffers, "data"):
-            buffers.data = bytearray(64 << 20)
-        with path.open("rb", buffering=0) as source:
-            while source.readinto(buffers.data):
-                pass
+            buffers.data = memoryview(bytearray(READ_NBYTES))
+        got = 0
+        while got < nbytes:
+            count = os.preadv(descriptors[path], [buffers.data[got:nbytes]], at + got)
+            if not count:
+                return
+            got += count
 
-    with ThreadPoolExecutor(threads, thread_name_prefix="weight-delta-read") as pool:
-        list(pool.map(read, paths))
+    try:
+        with ThreadPoolExecutor(
+            READS_IN_FLIGHT, thread_name_prefix="weight-delta-read"
+        ) as pool:
+            list(pool.map(read, pieces))
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
 
 
 def _join(table: MapTable, tensors: Tensors) -> np.ndarray:

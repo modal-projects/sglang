@@ -152,6 +152,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
     def _build_manager(self, target, draft):
         return SchedulerWeightUpdaterManager(
+            tp_cpu_group=None,
             tp_worker=SimpleNamespace(
                 model_runner=target,
                 weight_update_runners=lambda: [("target", target)],

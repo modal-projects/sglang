@@ -2128,7 +2128,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     if self._kv_fuse_store(
-                        attn, k, v, positions, cache_loc_2d, commit_lens
+                        attn, k, v, positions, write_loc_2d, commit_lens
                     ):
                         continue
                     k = attn.apply_k_norm(k)
@@ -2183,7 +2183,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         covered, the caller runs _append_target_hidden_to_draft_kv_by_loc."""
         return False
 
-    def _kv_fuse_store(self, attn, k, v, positions, cache_loc_2d, commit_lens) -> bool:
+    def _kv_fuse_store(self, attn, k, v, positions, write_loc_2d, commit_lens) -> bool:
         """Fused k-norm + RoPE + KV write for one draft layer. False: not
         covered, nothing was written."""
         return False

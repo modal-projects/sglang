@@ -14,6 +14,8 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel, mamba_track_grid
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -132,7 +134,7 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
         st["graph"].replay()
         return True
 
-    def _kv_fuse_store(self, attn, k, v, positions, cache_loc_2d, commit_lens) -> bool:
+    def _kv_fuse_store(self, attn, k, v, positions, write_loc_2d, commit_lens) -> bool:
         """k-norm straight from the strided K
         slice (same AITER kernel, no .contiguous() copy) + one fused bf16-exact
         RoPE / prefix-valid KV write. Returns False (did nothing) if ineligible."""
@@ -140,6 +142,13 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
 
         rope = getattr(attn, "rotary_emb", None)
         pool = self.draft_model_runner.token_to_kv_pool
+        cache_loc_2d, swa_loc_2d, _ = unwrap_write_loc(write_loc_2d)
+        layer_idx = attn.attn.layer_id - pool.start_layer
+        if isinstance(pool, SWAKVPool):
+            layer_idx, is_swa_layer = pool.layers_mapping[attn.attn.layer_id]
+            pool = pool.swa_kv_pool if is_swa_layer else pool.full_kv_pool
+            if is_swa_layer:
+                cache_loc_2d = swa_loc_2d
         hd = int(attn.head_dim)
         norm = attn.k_norm
         if not (
@@ -176,7 +185,6 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
         k_normed = _ln.rms_norm(k, norm.weight.data, norm.variance_epsilon)
         rope.cos_sin_cache = rope.cos_sin_cache.to(k.device)
         cos_sin = rope.cos_sin_cache_as(torch.bfloat16)
-        layer_id = attn.attn.layer_id
         rope_store_prefix_valid(
             k_normed.view(-1, 1, hd),
             v.view(-1, 1, hd),
@@ -184,8 +192,8 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
             cos_sin,
             cache_loc_2d,
             commit_lens,
-            pool.k_buffer[layer_id - pool.start_layer],
-            pool.v_buffer[layer_id - pool.start_layer],
+            pool.k_buffer[layer_idx],
+            pool.v_buffer[layer_idx],
         )
         return True
 

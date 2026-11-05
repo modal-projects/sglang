@@ -36,6 +36,8 @@ from typing import Dict, Optional
 
 import torch
 
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
 logger = logging.getLogger(__name__)
 
 
@@ -261,6 +263,19 @@ class K3DFlashPrepGraph:
             global_num_token_non_padded_cpu=bs * block_size,
         )
         mr = w.draft_model_runner
+        if isinstance(mr.token_to_kv_pool, SWAKVPool):
+            w.model_runner.kv_index_translator.plan(
+                req_pool_indices=rpi,
+                seq_lens=prefix_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                write_virtual=cache_loc_2d.reshape(-1),
+                read_extent=block_size,
+            ).reads_from(
+                mr.kv_index_translator,
+                seq_lens=draft_prefix_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                read_extent=block_size,
+            ).bind(fb, mr.kv_index_translator)
         ctx = (
             contextlib.nullcontext()
             if has_forward_context()

@@ -1199,11 +1199,34 @@ class HiCacheController:
         )
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-        load_stream = self.l2_transfer_engine.host_to_device_stream
+        # On the forward stream the dedup broadcasts are totally ordered with the
+        # forward's TP collectives on every rank, so the two communicators never
+        # run concurrently.
+        on_forward_stream = (
+            envs.SGLANG_HICACHE_MLA_DEDUP_LOAD_ON_FORWARD_STREAM.get()
+            and self.load_fence_stream is not None
+        )
+        load_stream = (
+            self.load_fence_stream
+            if on_forward_stream
+            else self.l2_transfer_engine.host_to_device_stream
+        )
+        if envs.SGLANG_HICACHE_MLA_DEDUP_DEBUG.get():
+            self._mla_debug_seq = getattr(self, "_mla_debug_seq", 0) + 1
+            logger.info(
+                "MLA-DEDUP-LOAD rank=%d seq=%d producer=%d kv=%d host=%d nodes=%d fwd=%d",
+                get_parallel().tp_rank,
+                self._mla_debug_seq,
+                producer_id,
+                len(op.device_indices),
+                op.host_indices.numel(),
+                len(op.node_ids),
+                int(on_forward_stream),
+            )
 
         with device_module.stream(load_stream):
             producer_event.start_event.wait(load_stream)
-            if self.load_fence_stream is not None:
+            if self.load_fence_stream is not None and not on_forward_stream:
                 # Same fence as the generic path: reclaimed pages might still
                 # be written by in-flight forwards.
                 load_stream.wait_stream(self.load_fence_stream)

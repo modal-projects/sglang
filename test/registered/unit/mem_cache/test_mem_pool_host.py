@@ -695,8 +695,12 @@ class TestHostMemoryBudget(CustomTestCase):
         ):
             # Shared KV passes, then already-allocated peers reduce free RAM.
             for requested, remaining in ((416e9, 2844.96e9), (202.75e9, 956.24e9)):
-                free.return_value = int(remaining) + base.HICACHE_HOST_MEMORY_RESERVE_BYTES
-                self.assertGreaterEqual(base.host_memory_budget_bytes(int(requested)), requested)
+                free.return_value = (
+                    int(remaining) + base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+                )
+                self.assertGreaterEqual(
+                    base.host_memory_budget_bytes(int(requested)), requested
+                )
             free.return_value = int(100e9) + base.HICACHE_HOST_MEMORY_RESERVE_BYTES
             self.assertLess(base.host_memory_budget_bytes(int(202.75e9)), 202.75e9)
 

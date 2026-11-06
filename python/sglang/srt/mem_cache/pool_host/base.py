@@ -138,7 +138,7 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.runtime_context import get_memory, get_parallel
+        from sglang.srt.runtime_context import get_parallel
 
         pp_group = get_parallel().pp_group
     except RuntimeError:

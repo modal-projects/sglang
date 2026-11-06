@@ -25,12 +25,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import enforce_hicache_host_budget
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
@@ -2239,7 +2239,9 @@ class TestMLAHostDedupDispatch(CustomTestCase):
             ),
             mock.patch.object(hybrid_pool_assembler, "enforce_hicache_host_budget"),
             mock.patch.object(
-                hybrid_pool_assembler, "maybe_prebuild_mla_host_dedup", return_value=None
+                hybrid_pool_assembler,
+                "maybe_prebuild_mla_host_dedup",
+                return_value=None,
             ),
             mock.patch.object(
                 hybrid_pool_assembler, "is_mla_dedup_dummy_rank", return_value=False
@@ -2248,7 +2250,9 @@ class TestMLAHostDedupDispatch(CustomTestCase):
             mock.patch.object(
                 hybrid_pool_assembler, "build_mamba_host_pool"
             ) as mamba_host,
-            mock.patch.object(hybrid_pool_assembler, "_build_pool_entries", return_value=[]),
+            mock.patch.object(
+                hybrid_pool_assembler, "_build_pool_entries", return_value=[]
+            ),
             mock.patch.object(hybrid_pool_assembler, "build_pool_entry"),
             mock.patch.object(hybrid_pool_assembler, "HostPoolGroup"),
             mock.patch.object(hybrid_pool_assembler, "HybridCacheController"),
@@ -2312,9 +2316,7 @@ class TestMLAHostDedupDispatch(CustomTestCase):
                     enable_mla_hicache_host_dedup=True, **kwargs
                 )
 
-        self.assertEqual(
-            estimate_mamba.call_args.kwargs["host_to_device_ratio"], 3.0
-        )
+        self.assertEqual(estimate_mamba.call_args.kwargs["host_to_device_ratio"], 3.0)
         enforce.assert_called_once_with(
             target_bytes=100,
             rank_local_bytes={
@@ -2344,7 +2346,9 @@ class TestMLAHostDedupDispatch(CustomTestCase):
 
     def test_mamba_host_sizing_is_independent_for_dedup(self):
         memory = self._stack_memory()
-        with mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory):
+        with mock.patch.object(
+            hybrid_pool_assembler, "get_memory", return_value=memory
+        ):
             self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 3.0)
         with (
             mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
@@ -2356,7 +2360,9 @@ class TestMLAHostDedupDispatch(CustomTestCase):
         ):
             self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 4.5)
         memory = self._stack_memory(hicache_mamba_ratio=6.0)
-        with mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory):
+        with mock.patch.object(
+            hybrid_pool_assembler, "get_memory", return_value=memory
+        ):
             self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 6.0)
 
     def test_mla_dedup_requires_dense_stage_local_layer_ids(self):

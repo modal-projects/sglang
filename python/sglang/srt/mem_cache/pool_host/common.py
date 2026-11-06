@@ -328,6 +328,7 @@ def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
 
 _MPOL_INTERLEAVE = 3
 _MPOL_MF_MOVE = 1 << 1
+_MADV_NOHUGEPAGE = 15
 _SYS_MBIND = {"x86_64": 237, "aarch64": 235}
 
 
@@ -364,8 +365,12 @@ def _mbind_host_buffer(buffer: torch.Tensor, mode: str) -> None:
     if rc != 0:
         err = ctypes.get_errno()
         raise OSError(err, f"mbind of HiCache host pool failed: {os.strerror(err)}")
+    # Keep khugepaged from collapsing (migrating) these pages into THPs.
+    if libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), _MADV_NOHUGEPAGE):
+        err = ctypes.get_errno()
+        raise OSError(err, f"madvise(MADV_NOHUGEPAGE) failed: {os.strerror(err)}")
     logger.info(
-        "HiCache host pool %.2f GiB: mbind %s over NUMA nodes %s",
+        "HiCache host pool %.2f GiB: mbind %s over NUMA nodes %s, nohugepage",
         (end - start) / 1024**3,
         mode,
         nodes,

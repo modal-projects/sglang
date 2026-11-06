@@ -838,6 +838,7 @@ class Envs:
     SGLANG_HICACHE_MLA_DEDUP_SERIAL_LOAD = EnvBool(False)
     SGLANG_HICACHE_MLA_DEDUP_LOAD_ON_FORWARD_STREAM = EnvBool(False)
     SGLANG_HICACHE_MLA_DEDUP_DEBUG = EnvBool(False)
+    SGLANG_HICACHE_HOST_MBIND = EnvStr("")
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

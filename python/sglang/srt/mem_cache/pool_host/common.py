@@ -326,6 +326,51 @@ def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
 
+_MPOL_INTERLEAVE = 3
+_MPOL_MF_MOVE = 1 << 1
+_SYS_MBIND = {"x86_64": 237, "aarch64": 235}
+
+
+def _mbind_host_buffer(buffer: torch.Tensor, mode: str) -> None:
+    # An explicit mempolicy without MPOL_F_NUMA_BALANCING keeps automatic NUMA
+    # balancing from migrating these pages. On ROCm, migrating hipHostRegister
+    # (USERPTR) pages evicts every KFD queue until the range is revalidated.
+    if mode != "interleave":
+        raise ValueError(f"Unsupported SGLANG_HICACHE_HOST_MBIND={mode!r}")
+    nodes = []
+    for part in open("/sys/devices/system/node/online").read().strip().split(","):
+        lo, _, hi = part.partition("-")
+        nodes.extend(range(int(lo), int(hi or lo) + 1))
+    nbits = max(nodes) + 1
+    mask = (ctypes.c_ulong * ((nbits + 63) // 64))()
+    for n in nodes:
+        mask[n // 64] |= 1 << (n % 64)
+    page = os.sysconf("SC_PAGE_SIZE")
+    base = buffer.data_ptr()
+    start = (base + page - 1) // page * page
+    end = (base + buffer.numel() * buffer.element_size()) // page * page
+    if end <= start:
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    rc = libc.syscall(
+        _SYS_MBIND[os.uname().machine],
+        ctypes.c_void_p(start),
+        ctypes.c_ulong(end - start),
+        _MPOL_INTERLEAVE,
+        mask,
+        ctypes.c_ulong(len(mask) * 64),
+        _MPOL_MF_MOVE,
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"mbind of HiCache host pool failed: {os.strerror(err)}")
+    logger.info(
+        "HiCache host pool %.2f GiB: mbind %s over NUMA nodes %s",
+        (end - start) / 1024**3,
+        mode,
+        nodes,
+    )
+
 
 def alloc_with_host_register(
     dims: tuple,
@@ -345,6 +390,9 @@ def alloc_with_host_register(
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    mbind_mode = envs.SGLANG_HICACHE_HOST_MBIND.get()
+    if mbind_mode and _is_hip and type(allocator) is HostTensorAllocator:
+        _mbind_host_buffer(buffer, mbind_mode)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer

@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -109,6 +110,8 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    # A routing key (a session) stays on the DP rank that holds its prefix cache.
+    ROUTING_KEY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -117,6 +120,10 @@ class LoadBalanceMethod(Enum):
             return cls[method]
         except KeyError as exc:
             raise ValueError(f"Invalid load balance method: {method}") from exc
+
+
+# The routing keys ROUTING_KEY remembers.
+_MAX_ROUTING_KEYS = 1 << 16
 
 
 class DPBudget:
@@ -186,16 +193,19 @@ class DataParallelController:
         # Dispatch method
         self.round_robin_counter = 0
         self.health_round_robin_counter = 0
+        self.routing_key_ranks: OrderedDict[str, int] = OrderedDict()
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.ROUTING_KEY: self.routing_key_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.ROUTING_KEY,
         )
 
         parallel = get_parallel()
@@ -923,6 +933,23 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def routing_key_scheduler(self, req: Req):
+        """A routing key's first request goes where total_requests would send it, and every later one to that rank."""
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        key = req.routing_key
+        rank = self.routing_key_ranks.pop(key, None) if key is not None else None
+        if rank is None:
+            rank = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        else:
+            self.dp_budget.total_requests[rank] += 1
+        if key is not None:
+            # Inserted last, so the least recently used key is the first one forgotten.
+            self.routing_key_ranks[key] = rank
+            if len(self.routing_key_ranks) > _MAX_ROUTING_KEYS:
+                self.routing_key_ranks.popitem(last=False)
+        sock_send(self.workers[rank], req)
 
     def event_loop(self):
         while True:

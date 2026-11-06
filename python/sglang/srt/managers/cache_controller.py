@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -97,6 +98,7 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.wait_full_load_on_consume = False
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -107,6 +109,8 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        if self.wait_full_load_on_consume and index >= 0:
+            self.events[index].wait(self.num_layers - 1)
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
@@ -1190,6 +1194,9 @@ class HiCacheController:
             )
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        self.layer_done_counter.wait_full_load_on_consume = (
+            envs.SGLANG_HICACHE_MLA_DEDUP_SERIAL_LOAD.get()
+        )
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
         load_stream = self.l2_transfer_engine.host_to_device_stream

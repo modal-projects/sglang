@@ -14,6 +14,7 @@ is exercised as the real method, no mock. The refresh-throttle tests inject
 import threading
 import time
 import unittest
+from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -57,6 +58,7 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
+    ctl.routing_key_ranks = OrderedDict()
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
     return ctl
 
@@ -67,6 +69,7 @@ def _req(
     input_ids=None,
     rid="USER",
     time_stats=None,
+    routing_key=None,
 ):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
@@ -75,6 +78,7 @@ def _req(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        routing_key=routing_key,
     )
 
 
@@ -339,6 +343,58 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestRoutingKeyScheduler(CustomTestCase):
+    def test_a_key_stays_on_its_rank_whatever_the_load(self):
+        """Its prefix cache is on that rank, so later turns go there even when it is the busiest."""
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.routing_key_scheduler(_req(routing_key="session"))
+        first = ctl.routing_key_ranks["session"]
+        ctl.dp_budget.total_requests[first] = 100
+        for _ in range(3):
+            ctl.routing_key_scheduler(_req(routing_key="session"))
+        self.assertEqual(ctl.workers[first].send_pyobj.call_count, 4)
+
+    def test_new_keys_go_to_the_rank_with_the_fewest_requests(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        ctl.dp_budget.total_requests = [5, 0, 1]
+        ctl.routing_key_scheduler(_req(routing_key="a"))
+        ctl.routing_key_scheduler(_req(routing_key="b"))
+        # "a" lifts rank 1 to 1 request; the tie with rank 2 goes to the lower rank
+        self.assertEqual(ctl.routing_key_ranks["a"], 1)
+        self.assertEqual(ctl.routing_key_ranks["b"], 1)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 2, 1])
+
+    def test_keys_spread_over_the_ranks(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        for key in "abcd":
+            ctl.routing_key_scheduler(_req(routing_key=key))
+        self.assertEqual(sorted(ctl.routing_key_ranks.values()), [0, 1, 2, 3])
+
+    def test_a_routed_dp_rank_wins_and_is_not_remembered(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.routing_key_scheduler(_req(routing_key="session", routed_dp_rank=3))
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertNotIn("session", ctl.routing_key_ranks)
+
+    def test_a_request_without_a_key_is_balanced_and_not_remembered(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.total_requests = [3, 0]
+        ctl.routing_key_scheduler(_req())
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertEqual(len(ctl.routing_key_ranks), 0)
+
+    def test_the_least_recently_used_key_is_forgotten_first(self):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        ctl = _make_controller(num_dp_ranks=2)
+        with patch.object(module, "_MAX_ROUTING_KEYS", 2):
+            for key in ("a", "b"):
+                ctl.routing_key_scheduler(_req(routing_key=key))
+            ctl.routing_key_scheduler(_req(routing_key="a"))
+            ctl.routing_key_scheduler(_req(routing_key="c"))
+        self.assertEqual(list(ctl.routing_key_ranks), ["a", "c"])
 
 
 class TestDispatchingWithTrace(CustomTestCase):

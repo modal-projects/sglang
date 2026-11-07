@@ -8,7 +8,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers import cache_controller as manager_cache_controller
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -18,15 +20,18 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import enforce_hicache_host_budget
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -238,6 +243,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._transfer_num_bytes.return_value = 0
         controller.l2_transfer_engine = mock.Mock()
         controller.load_fence_stream = None
+        controller.mla_broadcast_enabled = False
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )
@@ -1489,6 +1495,935 @@ class TestL2TransferRecordStream(CustomTestCase):
         )
 
         self.assertEqual(device.recorded, [])
+
+
+class _FakeProducerEvent:
+    def __init__(self, operations=None):
+        self.start_event = _FakeEvent()
+        self.finish_event = _FakeEvent()
+        self._operations = operations
+        self.completed_layers = []
+
+    def complete(self, layer_index):
+        self.completed_layers.append(layer_index)
+        if self._operations is not None:
+            self._operations.append(("complete", layer_index))
+
+
+class _HostPoolTransferHooks:
+    """HostKVCache's default transfer hooks, for fake host pools."""
+
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def load_to_device_per_layer_physical(self, *args, **kwargs):
+        return self.load_to_device_per_layer(*args, **kwargs)
+
+
+def _transfer_done_events_stub():
+    return SimpleNamespace(set_hicache_transfer_done_event=lambda key, event: None)
+
+
+def _dedup_broadcaster_stub(operations=None, *, is_src):
+    return SimpleNamespace(
+        is_src=is_src,
+        prepare_broadcast=lambda device_indices, stream: (device_indices, None),
+        broadcast_loaded_layer=lambda layer_id, prepared, trace=None: (
+            operations.append(("broadcast", layer_id))
+            if operations is not None
+            else None
+        ),
+    )
+
+
+class TestMLAHostDedupDispatch(CustomTestCase):
+    """Dedup wiring on the destination's L2-transfer-engine controllers."""
+
+    def setUp(self):
+        transfer_module._timing_events_supported.cache_clear()
+        self.addCleanup(transfer_module._timing_events_supported.cache_clear)
+
+    @staticmethod
+    def _run_start_loading(controller):
+        with (
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(transfer_module, "device_module", _FakeDeviceModule),
+        ):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+            return controller.start_loading()
+
+    def test_mla_dedup_dummy_host_pools_are_allocator_only(self):
+        pool = MLATokenToKVPool(
+            size=8,
+            page_size=2,
+            layer_num=2,
+            dtype=torch.float16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            start_layer=0,
+            end_layer=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        memory = SimpleNamespace(
+            hicache_ratio=2, hicache_size=0, hicache_mem_layout="page_first"
+        )
+        with (
+            mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            dummy = hybrid_pool_assembler.build_kv_host_pool(
+                kv_pool=pool, page_size=2, use_mla=True, is_dummy=True
+            )
+            physical = hybrid_pool_assembler.build_kv_host_pool(
+                kv_pool=pool, page_size=2, use_mla=True
+            )
+        self.addCleanup(physical.destroy)
+
+        self.assertTrue(dummy._is_dummy)
+        self.assertFalse(physical._is_dummy)
+        self.assertIsNone(dummy.kv_buffer)
+        self.assertIsNone(dummy.data_ptrs)
+        self.assertEqual(dummy.get_contiguous_buf_infos(), ([], [], []))
+        # Receivers must hand out the same slot ids as the owner rank.
+        for name in ("size", "size_per_token", "page_num", "layer_num"):
+            self.assertEqual(getattr(dummy, name), getattr(physical, name), name)
+        slots = dummy.alloc(4)
+        self.assertEqual(slots.tolist(), physical.alloc(4).tolist())
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            dummy.load_to_device_per_layer(
+                pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
+    def test_mla_dedup_peer_skips_target_host_io(self):
+        writes = []
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            _is_dummy = True
+            layout = "page_first"
+            can_use_write_back_jit = False
+            size_per_token = 2
+
+            def backup_from_device_all_layer(self, *args):
+                writes.append(args)
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.ack_write_queue = []
+        controller.write_fence_stream = None
+        controller.mem_pool_device_allocator = _transfer_done_events_stub()
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+            controller.start_writing()
+
+        self.assertEqual(writes, [])
+        self.assertEqual(len(controller.ack_write_queue), 1)
+
+    def _hybrid_dedup_controller(
+        self,
+        *,
+        entries,
+        group_attrs=(),
+        broadcaster,
+        op,
+        layer_num=2,
+    ):
+        group = SimpleNamespace(
+            layout="page_first",
+            can_use_write_back_jit=False,
+            supports_per_pool_backup_indices=False,
+            anchor_entry=entries[0],
+            entry_map={entry.name: entry for entry in entries},
+            **dict(group_attrs),
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = group
+        controller.mem_pool_device = object()
+        controller.layer_num = layer_num
+        controller.mla_broadcaster = broadcaster
+        controller.ack_write_queue = []
+        controller.ack_load_queue = []
+        controller.load_queue = [op]
+        controller.write_queue = [op]
+        controller.load_fence_stream = None
+        controller.write_fence_stream = None
+        controller.mem_pool_device_allocator = _transfer_done_events_stub()
+        controller._mla_trace_pending = []
+        controller._mla_trace_issued = 0
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, op.pool_transfers)
+        )
+        return controller
+
+    def test_hybrid_mla_dedup_peer_still_writes_rank_local_mamba(self):
+        writes = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeAnchorHostPool(_HostPoolTransferHooks):
+            _is_dummy = True
+            size_per_token = 2
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                raise AssertionError("peer must not write target MLA")
+
+        class FakeMambaHostPool(_HostPoolTransferHooks):
+            can_use_write_back_jit = False
+            size_per_token = 2
+
+            def backup_from_device_all_layer(
+                self, device_pool, host_indices, device_indices, io_backend
+            ):
+                writes.append((host_indices, device_indices))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeAnchorHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.MAMBA,
+                host_pool=FakeMambaHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            ),
+        ]
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=SimpleNamespace(is_src=False),
+            op=op,
+        )
+
+        submitted = []
+        controller.l2_transfer_engine = SimpleNamespace(
+            submit_device_to_host=lambda transfers: (
+                submitted.extend(transfers)
+                or SimpleNamespace(
+                    start_event=_FakeEvent(),
+                    finish_event=_FakeEvent(),
+                    timing_enabled=False,
+                )
+            )
+        )
+        controller.start_writing()
+
+        self.assertEqual([item.host_pool for item in submitted], [entries[1].host_pool])
+        self.assertEqual(len(controller.ack_write_queue), 1)
+
+    def test_hybrid_mla_dedup_peer_still_writes_local_draft_pool(self):
+        target_writes = []
+        draft_writes = []
+        transfer = PoolTransfer(
+            name=PoolName.DRAFT,
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            indices_from_pool=PoolName.KV,
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            _is_dummy = True
+            size_per_token = 2
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                target_writes.append(args)
+
+        class FakeDraftHostPool(_HostPoolTransferHooks):
+            can_use_write_back_jit = False
+            size_per_token = 2
+
+            def backup_from_device_all_layer(
+                self, device_pool, host_indices, device_indices, io_backend
+            ):
+                draft_writes.append((host_indices, device_indices))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeTargetHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.DRAFT,
+                host_pool=FakeDraftHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            ),
+        ]
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=SimpleNamespace(is_src=False),
+            op=op,
+        )
+
+        submitted = []
+        controller.l2_transfer_engine = SimpleNamespace(
+            submit_device_to_host=lambda transfers: (
+                submitted.extend(transfers)
+                or SimpleNamespace(
+                    start_event=_FakeEvent(),
+                    finish_event=_FakeEvent(),
+                    timing_enabled=False,
+                )
+            )
+        )
+        controller.start_writing()
+
+        # The deduplicated target moves no data on a peer; the rank-local
+        # mirrored draft pool is still written on every rank.
+        self.assertEqual(target_writes, [])
+        self.assertEqual([item.host_pool for item in submitted], [entries[1].host_pool])
+
+    def test_mla_dedup_source_load_and_broadcast_are_layerwise(self):
+        operations = []
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("target", layer_id))
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        broadcaster = _dedup_broadcaster_stub(operations, is_src=True)
+        broadcaster.prepare_broadcast = lambda device_indices, stream: (
+            operations.append(("prepare", None)) or (device_indices, None)
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.layer_num = 3
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[_FakeProducerEvent(operations)]
+        )
+        controller.mla_broadcaster = broadcaster
+        controller.load_fence_stream = None
+        controller.mem_pool_device_allocator = _transfer_done_events_stub()
+        controller.ack_load_queue = []
+        controller._mla_trace_pending = []
+        controller._mla_trace_issued = 0
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        producer_id = self._run_start_loading(controller)
+
+        self.assertEqual(producer_id, 0)
+        self.assertEqual(
+            operations,
+            [
+                ("prepare", None),
+                ("target", 0),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("target", 1),
+                ("broadcast", 1),
+                ("complete", 1),
+                ("target", 2),
+                ("broadcast", 2),
+                ("complete", 2),
+            ],
+        )
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        self.assertEqual(controller.ack_load_queue[0].num_tokens, 4)
+
+    def test_mla_dedup_load_restores_draft_on_every_rank(self):
+        operations = []
+        transfer = PoolTransfer(
+            name=PoolName.DRAFT,
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            indices_from_pool=PoolName.KV,
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            _is_dummy = True
+            size_per_token = 2
+
+            def load_to_device_per_layer(self, *args, **kwargs):
+                raise AssertionError("peer must not H2D the dedup target")
+
+        class FakeDraftHostPool(_HostPoolTransferHooks):
+            layer_num = 2
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                is_draft=False,
+            ):
+                operations.append(("draft", layer_id))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeTargetHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.DRAFT,
+                host_pool=FakeDraftHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id if layer_id < 2 else None,
+            ),
+        ]
+        producer_event = _FakeProducerEvent(operations)
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=_dedup_broadcaster_stub(operations, is_src=False),
+            op=op,
+            layer_num=3,
+        )
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[producer_event]
+        )
+
+        producer_id = self._run_start_loading(controller)
+
+        self.assertEqual(producer_id, 0)
+        self.assertEqual(
+            operations,
+            [
+                ("draft", 0),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("draft", 1),
+                ("broadcast", 1),
+                ("complete", 1),
+                ("broadcast", 2),
+                ("complete", 2),
+            ],
+        )
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        ack = controller.ack_load_queue[0]
+        self.assertEqual(ack.num_tokens, 4)
+        self.assertIsNot(ack.start_event, producer_event.start_event)
+        self.assertIsNot(ack.finish_event, producer_event.finish_event)
+
+    def test_hybrid_mla_dedup_loads_extra_pools_layerwise(self):
+        operations = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("target", layer_id))
+
+        class FakeMambaHostPool(_HostPoolTransferHooks):
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                is_draft=False,
+            ):
+                operations.append(("mamba", layer_id))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeTargetHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.MAMBA,
+                host_pool=FakeMambaHostPool(),
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            ),
+        ]
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=_dedup_broadcaster_stub(operations, is_src=True),
+            op=op,
+            layer_num=2,
+        )
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[_FakeProducerEvent(operations)]
+        )
+
+        self._run_start_loading(controller)
+
+        self.assertEqual(
+            operations,
+            [
+                ("target", 0),
+                ("mamba", 0),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("target", 1),
+                ("mamba", 1),
+                ("broadcast", 1),
+                ("complete", 1),
+            ],
+        )
+
+    def test_hybrid_mla_dedup_peer_broadcasts_only_target_and_loads_mamba(self):
+        operations = []
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        op = CacheOperation(
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            node_id=1,
+            pool_transfers=[transfer],
+        )
+
+        class FakeTargetHostPool(_HostPoolTransferHooks):
+            _is_dummy = True
+            size_per_token = 2
+
+            def load_to_device_per_layer(self, *args, **kwargs):
+                raise AssertionError("peer must not H2D the dedup target")
+
+        class FakeMambaHostPool(_HostPoolTransferHooks):
+            size_per_token = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                is_draft=False,
+            ):
+                operations.append(("mamba", layer_id))
+
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=FakeTargetHostPool(),
+                device_pool=object(),
+                # Global transfer ids {1, 3} are target MLA layers.
+                layer_mapper=lambda layer_id: {1: 0, 3: 1}.get(layer_id),
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.MAMBA,
+                host_pool=FakeMambaHostPool(),
+                device_pool=object(),
+                # Mamba state lands on the interleaved transfer layers.
+                layer_mapper=lambda layer_id: layer_id if layer_id in (0, 2) else None,
+            ),
+        ]
+        controller = self._hybrid_dedup_controller(
+            entries=entries,
+            broadcaster=_dedup_broadcaster_stub(operations, is_src=False),
+            op=op,
+            layer_num=4,
+        )
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[_FakeProducerEvent(operations)]
+        )
+
+        self._run_start_loading(controller)
+
+        # Only the target MLA layers broadcast; the interleaved Mamba layers
+        # load rank-locally on every rank, including dedup peers.
+        self.assertEqual(
+            operations,
+            [
+                ("mamba", 0),
+                ("complete", 0),
+                ("broadcast", 0),
+                ("complete", 1),
+                ("mamba", 2),
+                ("complete", 2),
+                ("broadcast", 1),
+                ("complete", 3),
+            ],
+        )
+
+    def test_mla_dedup_aggregate_host_budget_is_fail_closed(self):
+        budget = mock.Mock(get=mock.Mock(return_value=1))
+        with mock.patch(
+            "sglang.srt.environ.envs.SGLANG_HICACHE_HOST_BUDGET_GIB", budget
+        ):
+            with self.assertRaisesRegex(ValueError, "requires 1.12 GiB"):
+                enforce_hicache_host_budget(
+                    target_bytes=600_000_000,
+                    rank_local_bytes={"mamba": 300_000_000},
+                    tp_size=2,
+                    context="unit-test",
+                )
+
+        budget.get.return_value = 2
+        with mock.patch(
+            "sglang.srt.environ.envs.SGLANG_HICACHE_HOST_BUDGET_GIB", budget
+        ):
+            self.assertEqual(
+                enforce_hicache_host_budget(
+                    target_bytes=600_000_000,
+                    rank_local_bytes={"mamba": 300_000_000},
+                    tp_size=2,
+                    context="unit-test",
+                ),
+                1_200_000_000,
+            )
+
+    @staticmethod
+    def _hybrid_mamba_stack_kwargs(*, draft_pool=None):
+        kv_pool = mock.Mock()
+        kv_pool.get_kv_size_bytes.return_value = 100
+        mamba_pool = mock.Mock()
+        mamba_pool.get_kv_size_bytes.return_value = 100
+        # Mamba state on model layer 1, stage-local transfer layer 1.
+        mamba_pool.get_device_pool_infos.return_value = (
+            SimpleNamespace(layer_ids=(1,), buffer_info=mock.Mock()),
+        )
+        params = SimpleNamespace(
+            page_size=64,
+            hicache_draft_kv_pool=draft_pool,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=object(),
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    alloc=lambda *args: None, free=lambda *args: None
+                )
+            ),
+        )
+        config = SimpleNamespace(
+            pools=[
+                SimpleNamespace(
+                    decl=SimpleNamespace(device_pool=kv_pool),
+                    packed_draft_device_pools=(),
+                )
+            ]
+        )
+        kwargs = dict(
+            params=params,
+            decls=(),
+            mamba_pool=mamba_pool,
+            full_layer_mapping={0: 0},
+            start_layer=0,
+            load_cache_event=None,
+            storage_backend=None,
+            use_mla=True,
+        )
+        return kwargs, config
+
+    @staticmethod
+    def _stack_memory(**overrides):
+        return SimpleNamespace(
+            **{
+                "hicache_ratio": 3.0,
+                "hicache_size": 230,
+                "hicache_mamba_ratio": None,
+                "hicache_write_policy": "write_through_selective",
+                "hicache_io_backend": "kernel",
+                "hicache_host_memory_mode": "cache",
+                "hicache_mem_layout": "page_first",
+                **overrides,
+            }
+        )
+
+    def _build_stack_sizes(self, memory, *, dedup):
+        """Return the host_size the stack passes to the KV and Mamba host pools."""
+        kwargs, config = self._hybrid_mamba_stack_kwargs()
+        with (
+            mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            mock.patch.object(
+                hybrid_pool_assembler, "prepare_host_pool_config", return_value=config
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mla_host_pool_bytes",
+                return_value=(100, 10),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mamba_host_pool_bytes",
+                return_value=(20, 2),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "mla_dedup_rank_and_size", return_value=(0, 8)
+            ),
+            mock.patch.object(hybrid_pool_assembler, "enforce_hicache_host_budget"),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "maybe_prebuild_mla_host_dedup",
+                return_value=None,
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "is_mla_dedup_dummy_rank", return_value=False
+            ),
+            mock.patch.object(hybrid_pool_assembler, "build_kv_host_pool") as kv_host,
+            mock.patch.object(
+                hybrid_pool_assembler, "build_mamba_host_pool"
+            ) as mamba_host,
+            mock.patch.object(
+                hybrid_pool_assembler, "_build_pool_entries", return_value=[]
+            ),
+            mock.patch.object(hybrid_pool_assembler, "build_pool_entry"),
+            mock.patch.object(hybrid_pool_assembler, "HostPoolGroup"),
+            mock.patch.object(hybrid_pool_assembler, "HybridCacheController"),
+        ):
+            hybrid_pool_assembler.build_hybrid_mamba_stack(
+                enable_mla_hicache_host_dedup=dedup, **kwargs
+            )
+        return (
+            kv_host.call_args.kwargs["host_size"],
+            mamba_host.call_args.kwargs["host_size"],
+        )
+
+    def test_hybrid_mla_dedup_preflight_includes_draft_before_host_alloc(self):
+        kwargs, config = self._hybrid_mamba_stack_kwargs(
+            draft_pool=mock.sentinel.draft_pool
+        )
+
+        with (
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=self._stack_memory(),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "prepare_host_pool_config", return_value=config
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mla_host_pool_bytes",
+                return_value=(100, 10),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_mamba_host_pool_bytes",
+                return_value=(20, 2),
+            ) as estimate_mamba,
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "estimate_draft_host_pool_bytes",
+                return_value=(30, 10),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "mla_dedup_rank_and_size",
+                return_value=(0, 8),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "enforce_hicache_host_budget"
+            ) as enforce,
+            mock.patch.object(
+                hybrid_pool_assembler,
+                "maybe_prebuild_mla_host_dedup",
+                side_effect=RuntimeError("stop before allocation"),
+            ),
+            mock.patch.object(
+                hybrid_pool_assembler, "build_kv_host_pool"
+            ) as build_host_pool,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop before allocation"):
+                hybrid_pool_assembler.build_hybrid_mamba_stack(
+                    enable_mla_hicache_host_dedup=True, **kwargs
+                )
+
+        self.assertEqual(estimate_mamba.call_args.kwargs["host_to_device_ratio"], 3.0)
+        enforce.assert_called_once_with(
+            target_bytes=100,
+            rank_local_bytes={
+                "mamba": 20,
+                "allocator_metadata": 218,
+                "draft": 30,
+            },
+            tp_size=8,
+            context=(
+                "hybrid MLA+Mamba L2 (target_tokens=10, mamba_slots=2, draft_tokens=10)"
+            ),
+        )
+        build_host_pool.assert_not_called()
+
+    def test_mamba_host_sizing_preserves_legacy_fixed_size_without_opt_in(self):
+        # Without dedup, a fixed --hicache-size splits across KV and Mamba.
+        self.assertEqual(
+            self._build_stack_sizes(self._stack_memory(), dedup=False), (115, 115)
+        )
+
+    def test_dedup_fixed_hicache_size_fully_sizes_target(self):
+        # The whole fixed budget sizes the single deduplicated target pool,
+        # matching the preflight estimate; Mamba sizes off its ratio.
+        self.assertEqual(
+            self._build_stack_sizes(self._stack_memory(), dedup=True), (230, 0)
+        )
+
+    def test_mamba_host_sizing_is_independent_for_dedup(self):
+        memory = self._stack_memory()
+        with mock.patch.object(
+            hybrid_pool_assembler, "get_memory", return_value=memory
+        ):
+            self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 3.0)
+        with (
+            mock.patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            mock.patch.object(
+                hybrid_pool_assembler.envs.SGLANG_HICACHE_MAMBA_HOST_RATIO,
+                "get",
+                return_value=4.5,
+            ),
+        ):
+            self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 4.5)
+        memory = self._stack_memory(hicache_mamba_ratio=6.0)
+        with mock.patch.object(
+            hybrid_pool_assembler, "get_memory", return_value=memory
+        ):
+            self.assertEqual(hybrid_pool_assembler._dedup_mamba_host_ratio(), 6.0)
+
+    def test_mla_dedup_requires_dense_stage_local_layer_ids(self):
+        hybrid_pool_assembler._require_dense_layer_ids(
+            mappings=({0: 0, 2: 1}, {1: 0, 3: 1}),
+            transfer_layer_num=4,
+            context="unit-test",
+        )
+
+        with self.assertRaisesRegex(ValueError, "dense stage-local layer ids"):
+            hybrid_pool_assembler._require_dense_layer_ids(
+                mappings=({4: 0}, {5: 0}),
+                transfer_layer_num=2,
+                context="unit-test",
+            )
+
+    def test_dedup_draft_requires_the_target_slot_domain(self):
+        controller = SimpleNamespace(
+            mla_broadcast_enabled=True,
+            mem_pool_device=SimpleNamespace(size=1024, page_size=64),
+        )
+        dflash = SimpleNamespace(is_dflash=lambda: True)
+        kv_cache_builder._validate_dedup_draft_index_domain(
+            cache_controller=controller,
+            draft_pool=SimpleNamespace(size=1024, page_size=64),
+            spec_algorithm=dflash,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires DFlash"):
+            kv_cache_builder._validate_dedup_draft_index_domain(
+                cache_controller=controller,
+                draft_pool=SimpleNamespace(size=1024, page_size=64),
+                spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+            )
+
+        with self.assertRaisesRegex(ValueError, "share one global KV slot domain"):
+            kv_cache_builder._validate_dedup_draft_index_domain(
+                cache_controller=controller,
+                draft_pool=SimpleNamespace(size=512, page_size=64),
+                spec_algorithm=dflash,
+            )
+
+    def test_mla_dedup_dummy_prefetch_reports_only_through_acks(self):
+        operation = SimpleNamespace(
+            hash_value=["p0", "p1", "p2"], completed_tokens=0, request_id="r"
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.page_size = 2
+        controller.prefetch_sync_queue = mock.Mock()
+
+        completed = controller._page_transfer_dummy(operation)
+
+        self.assertEqual(completed, 3)
+        # The optimistic count lives only in the ack stream; the ACK drain
+        # owns operation.completed_tokens after the cross-rank MIN, so a
+        # short source read cannot trip its assertion on this rank.
+        self.assertEqual(operation.completed_tokens, 0)
+        [ack] = [
+            call.args[0] for call in controller.prefetch_sync_queue.put.call_args_list
+        ]
+        self.assertEqual(ack.completed_tokens, 6)
 
 
 if __name__ == "__main__":

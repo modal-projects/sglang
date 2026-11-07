@@ -687,6 +687,23 @@ class TestHostMemoryBudget(CustomTestCase):
         ):
             return base.host_memory_budget_bytes()
 
+    def test_dedup_admission_matches_downstream_remaining_node_memory(self):
+        with (
+            get_context().override_server_args(enable_mla_hicache_host_dedup=True),
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=8),
+            unittest.mock.patch.object(base, "available_host_memory_bytes") as free,
+        ):
+            # Shared KV passes, then already-allocated peers reduce free RAM.
+            for requested, remaining in ((416e9, 2844.96e9), (202.75e9, 956.24e9)):
+                free.return_value = (
+                    int(remaining) + base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+                )
+                self.assertGreaterEqual(
+                    base.host_memory_budget_bytes(int(requested)), requested
+                )
+            free.return_value = int(100e9) + base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+            self.assertLess(base.host_memory_budget_bytes(int(202.75e9)), 202.75e9)
+
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)

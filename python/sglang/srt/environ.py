@@ -826,9 +826,16 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Fail-closed cap on the node-aggregate HiCache host plan (1x dedup
+    # target + tp_size x rank-local pools), checked at startup.
+    SGLANG_HICACHE_HOST_BUDGET_GIB = EnvInt(800)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # MLA host dedup: make the consuming forward wait for the whole load-back
+    # (H2D + broadcast) instead of per layer, so the dedup broadcast never
+    # overlaps forward-stream collectives.
+    SGLANG_HICACHE_MLA_DEDUP_SERIAL_LOAD = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

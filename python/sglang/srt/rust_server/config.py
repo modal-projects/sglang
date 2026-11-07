@@ -237,8 +237,8 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     at launch, as a JSON object: the resolved `server_args`,
     `launch_command`, `kv_events`, and the scheduler's init info less what is
     only known once initialization finishes (`startup_time`, which the Rust
-    server reports per request, and the gRPC `kv_event_sources`). Watermark
-    secrets are redacted as Python's HTTP and gRPC frontends redact them."""
+    server reports per request, and the gRPC `kv_event_sources`). Secrets are
+    redacted as Python's HTTP and gRPC frontends redact them."""
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,

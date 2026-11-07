@@ -190,6 +190,8 @@ from sglang.srt.sampling.watermarking.core import (
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    redact_secret_cli_args,
+    redact_server_args_secrets,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -2641,17 +2643,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return redact_server_args_secrets(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
 
-    def _server_args_for_dump(self) -> Union[ServerArgs, Dict[str, Any]]:
-        if not get_exec().features.enable_watermark:
-            return self.server_args
-        return redact_watermark_secrets(self.server_args.resolved_dict())
+    def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
+        # Redact even with watermarking off: the Python API accepts a server
+        # key without --enable-watermark.
+        try:
+            return redact_server_args_secrets(self.server_args.resolved_dict())
+        except Exception as e:
+            logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
+            return None
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
@@ -3771,7 +3777,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": redact_watermark_secrets(data_to_dump),
                     "launch_command": redact_watermark_command_line(
-                        sys.argv, self.server_args.watermark_config
+                        redact_secret_cli_args(sys.argv),
+                        self.server_args.watermark_config,
                     ),
                 }
                 with open(filename, "wb") as f:

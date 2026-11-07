@@ -1888,6 +1888,19 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
+ResponseIncludable = Literal[
+    "code_interpreter_call.outputs",
+    "computer_call_output.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "message.output_text.logprobs",
+    # Sent by Codex. Output text is never encrypted here, so there is nothing to add.
+    "output.encrypted_content",
+    "reasoning.encrypted_content",
+]
+_RESPONSE_INCLUDABLES = frozenset(get_args(ResponseIncludable))
+
+
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
@@ -1897,18 +1910,7 @@ class ResponsesRequest(PDRoutingFields):
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
-    include: Optional[
-        List[
-            Literal[
-                "code_interpreter_call.outputs",
-                "computer_call_output.output.image_url",
-                "file_search_call.results",
-                "message.input_image.image_url",
-                "message.output_text.logprobs",
-                "reasoning.encrypted_content",
-            ]
-        ]
-    ] = None
+    include: Optional[List[ResponseIncludable]] = None
     # Accept dict-shaped items as the loose arm; downstream normalization
     # handles replayed shapes that don't satisfy every openai TypedDict.
     input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
@@ -1972,6 +1974,23 @@ class ResponsesRequest(PDRoutingFields):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_unknown_includes(cls, values):
+        """Ignore include values this server does not know, as clients add new
+        ones (Codex sent output.encrypted_content) faster than servers learn them;
+        each only asks for extra output, so dropping one is safe."""
+        if not isinstance(values, dict):
+            return values
+        include = values.get("include")
+        if not isinstance(include, list):
+            return values
+        unknown = [v for v in include if v not in _RESPONSE_INCLUDABLES]
+        if unknown:
+            logger.warning("Ignoring unsupported Responses include values: %s", unknown)
+            values["include"] = [v for v in include if v in _RESPONSE_INCLUDABLES]
+        return values
 
     @model_validator(mode="before")
     @classmethod

@@ -233,6 +233,30 @@ class IncludeOutputLogprobsTestCase(CustomTestCase):
         self.assertFalse(has(["reasoning.encrypted_content"]))
 
 
+class IncludeValuesTestCase(CustomTestCase):
+    def test_codex_include_is_accepted(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            include=["reasoning.encrypted_content", "output.encrypted_content"],
+        )
+        self.assertTrue(request.is_include_encrypted_reasoning())
+        self.assertEqual(
+            request.include,
+            ["reasoning.encrypted_content", "output.encrypted_content"],
+        )
+
+    def test_unknown_include_is_dropped(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            include=["reasoning.encrypted_content", "some.future_value"],
+        )
+        self.assertEqual(request.include, ["reasoning.encrypted_content"])
+
+
 class ThinkingControlTestCase(CustomTestCase):
     def test_effort_none_disables_thinking(self):
         ctk = ResponsesRequest(

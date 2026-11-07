@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 # detokenized display string (that loses fragmentary bytes as U+FFFD).
 _BYTE_DECODER: dict[str, int] = {}
 
-# Tokenizer-level cache: once verified, we know whether *all* tokens from a
-# given tokenizer can safely use the byte decoder. Avoids per-token checks.
-_BYTE_LEVEL_TOKENIZERS: set = set()
+# Tokenizer-level cache: whether *all* tokens from a given tokenizer can safely
+# use the byte decoder. Probed once per tokenizer: the probe reads the whole vocabulary.
+_BYTE_LEVEL_TOKENIZERS: dict[int, bool] = {}
 
 
 def _build_byte_decoder() -> dict[str, int]:
@@ -58,14 +58,15 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
     the full character ``é`` whose UTF-8 is [195, 169].
     """
     tid = id(tokenizer)
-    if tid in _BYTE_LEVEL_TOKENIZERS:
-        return True
+    if tid not in _BYTE_LEVEL_TOKENIZERS:
+        _BYTE_LEVEL_TOKENIZERS[tid] = _probe_byte_level(tokenizer)
+    return _BYTE_LEVEL_TOKENIZERS[tid]
 
+
+def _probe_byte_level(tokenizer) -> bool:
     # Fast path: HuggingFace fast tokenizers expose is_byte_level.
     is_bl = getattr(tokenizer, "is_byte_level", None)
     if isinstance(is_bl, bool):
-        if is_bl:
-            _BYTE_LEVEL_TOKENIZERS.add(tid)
         return is_bl
 
     # Slow path: probe with a known é token.
@@ -87,7 +88,6 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
             if any(ch not in _BYTE_DECODER for ch in piece):
                 return False
         # All sampled tokens are byte-decodable → likely byte-level BPE.
-        _BYTE_LEVEL_TOKENIZERS.add(tid)
         return True
     except Exception:
         return False

@@ -924,7 +924,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        backend = get_moe_runner_backend()
+        if not (
+            backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+        ):
             return
 
         expected_shape = None

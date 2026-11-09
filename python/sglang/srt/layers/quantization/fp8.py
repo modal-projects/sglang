@@ -725,6 +725,14 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
+            layer.weight.data = torch.empty(
+                layer.output_size_per_partition,
+                layer.input_size_per_partition,
+                dtype=layer.orig_dtype,
+                device=layer.weight.device,
+            )
+            return
         if self.block_quant and not self.use_mxfp8:
             restore_ue8m0_scale_checkpoint_layout(layer.weight_scale_inv)
 
@@ -1520,6 +1528,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        if use_mxfp8 and not is_checkpoint_fp8_serialized:
+            layer._mxfp8_checkpoint_dtype = params_dtype
+            layer._mxfp8_checkpoint_shapes = {
+                "w13_weight": tuple(w13_weight.shape),
+                "w2_weight": tuple(w2_weight.shape),
+            }
 
         # BIAS (optional, e.g. GPT-OSS)
         if with_bias:
@@ -1726,6 +1740,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+            for name, shape in layer._mxfp8_checkpoint_shapes.items():
+                weight = getattr(layer, name)
+                weight.data = torch.empty(
+                    shape,
+                    dtype=layer._mxfp8_checkpoint_dtype,
+                    device=weight.device,
+                )
+            return
         if self.block_quant and not self.use_mxfp8 and not self.is_fp4_expert:
             restore_ue8m0_scale_checkpoint_layout(layer.w13_weight_scale_inv)
             restore_ue8m0_scale_checkpoint_layout(layer.w2_weight_scale_inv)

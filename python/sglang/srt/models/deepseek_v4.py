@@ -1005,6 +1005,11 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 )
 
 
+def _deepgemm_mxfp8_input(layer) -> bool:
+    # LoRA wrappers don't carry the flag: the adapter delta needs BF16 input.
+    return getattr(layer, "deepgemm_mxfp8_input", False)
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -1621,7 +1626,7 @@ class MQALayer(MqaAttentionBase):
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
     def accepts_deepgemm_mxfp8_input(self) -> bool:
-        return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
+        return self.fuse_wqa_wkv and _deepgemm_mxfp8_input(self.wqkv_a)
 
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
@@ -1667,7 +1672,7 @@ class MQALayer(MqaAttentionBase):
         )
 
     def _mega_mxfp8_output(self, rows: int) -> bool:
-        return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
+        return _deepgemm_mxfp8_input(self.wo_b) and mhc.fused_mxfp8_rows(rows)
 
     def _mega_core(
         self,

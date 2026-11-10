@@ -346,6 +346,21 @@ class LoRAMemoryPool:
         )
 
     @staticmethod
+    def _get_dense_module_layer_ids(
+        base_model: torch.nn.Module, module_name: str
+    ) -> Set[int]:
+        """Decoder layers containing this linear outside the fused experts."""
+        from sglang.srt.layers.linear import LinearBase
+
+        return {
+            layer_id
+            for name, module in base_model.named_modules()
+            if name.endswith(f".{module_name}")
+            and (layer_id := get_layer_id(name)) is not None
+            and isinstance(unwrap_lora_layer(module), LinearBase)
+        }
+
+    @staticmethod
     def _has_moe_module(base_model: torch.nn.Module) -> bool:
         # Config-only detection isn't reliable: some dense configs (e.g.
         # `Qwen3_5TextConfig`) inherit `num_experts > 1` from an MoE parent.

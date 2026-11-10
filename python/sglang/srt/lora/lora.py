@@ -490,7 +490,12 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
+
         for weight_name in weight_names:
+            if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+                # The attention output gate has no up_proj to stack with.
+                continue
             if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
                 weight_name
             ):

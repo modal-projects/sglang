@@ -198,6 +198,8 @@ def get_default_hidden_dim(
             o_head_dim * config.num_attention_heads,
             config.hidden_size,
         )
+    elif module_name == "self_attn.gate_proj":
+        return config.hidden_size, config.num_attention_heads * head_dim
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
@@ -284,6 +286,9 @@ def get_normalized_target_modules(
     A base model may define ``lora_target_module_aliases`` to map leaf names
     to its own normalized names ahead of the generic mapping.
 
+    The attention gate must be named "self_attn.gate_proj"; bare "gate_proj"
+    maps only to the MLP/MoE gate_up_proj.
+
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
     {"all"} as a sentinel value.  Callers that need a concrete module set
     should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
@@ -325,6 +330,10 @@ def get_normalized_target_modules(
     aliases = getattr(base_model, "lora_target_module_aliases", None) or {}
     result = set()
     for name in target_modules:
+        qualified_name = ".".join(name.split(".")[-2:])
+        if qualified_name in PRESERVED_LORA_TARGET_NAMES:
+            result.add(qualified_name)
+            continue
         base_name = name.split(".")[-1]
         normalized_name = aliases.get(base_name) or params_mapping.get(
             base_name, base_name
@@ -391,6 +400,8 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
+# Preserve the parent because the leaf alone names an MLP projection.
+PRESERVED_LORA_TARGET_NAMES = frozenset({"self_attn.gate_proj"})
 REPLICATED_LINEAR_LORA_NAMES = [
     "f_a_proj",
     "g_a_proj",
@@ -425,6 +436,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         # DeepSeek-V4
         "self_attn.wq_b",
         "self_attn.wo_b",
+        "self_attn.gate_proj",
     }
 )
 
@@ -456,6 +468,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "kv_b_proj",
     }
     | DSA_INDEXER_LORA_NAMES
+    | PRESERVED_LORA_TARGET_NAMES
 )
 
 
@@ -490,7 +503,9 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             parts = name.split(".")
             leaf_name = parts[-1]
             parent_qualified_name = ".".join(parts[-2:])
-            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+            if parent_qualified_name in (
+                DSA_INDEXER_LORA_NAMES | PRESERVED_LORA_TARGET_NAMES
+            ):
                 raw_names.add(parent_qualified_name)
             elif leaf_name in dsa_indexer_leaf_names:
                 # Bare DSA indexer leaf names are ambiguous across model

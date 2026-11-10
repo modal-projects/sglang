@@ -200,8 +200,8 @@ class LoRAMemoryPool:
         # Standard LoRA (3D): [num_loras, rank, hidden_dim]
         # MoE LoRA (4D): [num_loras, num_experts, rank, hidden_dim]
         # The dimensionality is determined by the module type (MoE vs standard)
-        self.A_buffer: Dict[str, List[torch.Tensor]] = {}
-        self.B_buffer: Dict[str, List[torch.Tensor]] = {}
+        self.A_buffer: Dict[str, List[Optional[torch.Tensor]]] = {}
+        self.B_buffer: Dict[str, List[Optional[torch.Tensor]]] = {}
 
         self.embedding_A_buffer: Dict[str, torch.Tensor] = {}
         self.embedding_B_buffer: Dict[str, torch.Tensor] = {}
@@ -643,9 +643,33 @@ class LoRAMemoryPool:
         # Cached once so the per-expert load path doesn't re-walk the HF
         # config for every adapter.
         self._num_experts_local: int = self._get_num_local_experts(base_model)
+        dense_layer_ids = {
+            name: self._get_dense_module_layer_ids(base_model, name)
+            for name in self.target_modules & {"gate_up_proj", "down_proj"}
+        }
+
+        def alloc_per_layer(
+            module_key: str,
+            get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
+            layer_ids: Optional[Set[int]] = None,
+        ) -> List[Optional[torch.Tensor]]:
+            return [
+                (
+                    torch.zeros(
+                        get_lora_shape_fn(
+                            module_key, base_model, self.max_lora_rank, idx
+                        ),
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                    if layer_ids is None or idx in layer_ids
+                    else None
+                )
+                for idx in range(self.num_layer)
+            ]
 
         def init_buffer(
-            buffer: Dict[str, List[torch.Tensor]],
+            buffer: Dict[str, List[Optional[torch.Tensor]]],
             target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
@@ -664,18 +688,14 @@ class LoRAMemoryPool:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
-                    # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
-                        buffer[module_name] = [
-                            torch.zeros(
-                                get_lora_shape_fn(
-                                    module_name, base_model, self.max_lora_rank, idx
-                                ),
-                                dtype=self.dtype,
-                                device=device,
-                            )
-                            for idx in range(self.num_layer)
-                        ]
+                    # Hybrid models also need 3D buffers for their dense MLPs.
+                    layer_ids = (
+                        None if has_shared_experts else dense_layer_ids[module_name]
+                    )
+                    if layer_ids is None or layer_ids:
+                        buffer[module_name] = alloc_per_layer(
+                            module_name, get_lora_shape_fn, layer_ids
+                        )
 
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
@@ -906,7 +926,9 @@ class LoRAMemoryPool:
         """Make an evicted slot safe for graph-captured base-model replay."""
         for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
             for tensor in buffers:
-                tensor[buffer_id].zero_()
+                # Hybrid layers omit dense projections they do not own.
+                if tensor is not None:
+                    tensor[buffer_id].zero_()
         for buffers in (
             self.embedding_A_buffer,
             self.embedding_B_buffer,

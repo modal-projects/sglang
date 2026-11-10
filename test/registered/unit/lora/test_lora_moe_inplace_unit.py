@@ -21,11 +21,6 @@ Usage:
     python -m pytest test/registered/unit/lora/test_lora_moe_inplace_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-# CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
 import types
 import unittest
 import unittest.mock as mock
@@ -33,6 +28,10 @@ import unittest.mock as mock
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+
+# CPU-only unit test; no CUDA/distributed dependencies.
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
@@ -111,7 +110,6 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         self.assertIs(core_config, base_layer.moe_runner_config)
         self.assertFalse(core_config.inplace)
 
-
     def test_compressed_fp8_initializes_with_real_quant_info(self):
         # The quant method delegates to the scheme, which previously lacked the getter.
         from compressed_tensors.quantization import QuantizationArgs
@@ -148,7 +146,6 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         self.assertIs(layer._quant_info.w13_scale, base_layer.w13_weight_scale)
         self.assertIs(layer._quant_info.w2_scale, base_layer.w2_weight_scale)
         self.assertFalse(layer.moe_runner_config.inplace)
-
 
 
 if __name__ == "__main__":

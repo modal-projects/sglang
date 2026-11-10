@@ -29,10 +29,7 @@ from sglang.srt.lora import lora_manager as lora_manager_module
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.utils import (
-    auto_detect_lora_target_modules,
-    get_normalized_target_modules,
-)
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -312,7 +309,6 @@ class TestAttentionGateTargets(CustomTestCase):
         torch.testing.assert_close(
             weights[mlp_key.replace("gate_proj", "gate_up_proj")], torch.cat((gate, up))
         )
-
 
 
 if __name__ == "__main__":

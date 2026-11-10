@@ -160,7 +160,6 @@ class LoRAAdapter(nn.Module):
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
-        # Get normalized target modules for filtering
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
@@ -494,7 +493,6 @@ class LoRAAdapter(nn.Module):
 
         for weight_name in weight_names:
             if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
-                # The attention output gate has no up_proj to stack with.
                 continue
             if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
                 weight_name

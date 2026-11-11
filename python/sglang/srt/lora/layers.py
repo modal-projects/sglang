@@ -62,6 +62,10 @@ class BaseLayerWithLoRA(nn.Module):
         # LoRA-wrapped.
         if hasattr(self.base_layer, "reduce_results"):
             self.reduce_results = self.base_layer.reduce_results
+        # The adapter delta needs BF16 activations, so a LoRA-wrapped layer
+        # never takes the DeepGEMM-packed MXFP8 input path that
+        # LinearBase.deepgemm_mxfp8_input enables on the base layer.
+        self.deepgemm_mxfp8_input = False
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)

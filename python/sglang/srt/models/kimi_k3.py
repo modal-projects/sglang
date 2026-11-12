@@ -143,6 +143,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_lora,
     get_parallel,
     get_platform,
     get_spec,
@@ -904,6 +905,8 @@ class KimiK3MoE(nn.Module):
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
+            # The fused front adds shared-expert LoRA in place; triton_v2 cannot.
+            and not (get_lora().enable_lora and get_lora().lora_backend == "triton_v2")
         )
 
     @cached_property
@@ -1461,11 +1464,17 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        shared_act = shared.act_fn(gate_up)
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared_act,
             shared.down_proj.weight,
             out=shared_output,
         )
+        down_proj = shared.down_proj
+        if getattr(down_proj, "lora_active", False):
+            # the base GEMM bypassed the wrapper; LoRA B must land in the same buffer the tail add reads
+            lora_output = down_proj.apply_lora(shared_output, shared_act)
+            assert lora_output.data_ptr() == shared_output.data_ptr()
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1501,6 +1510,10 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        gate_up_proj = self.shared_experts.gate_up_proj
+        if getattr(gate_up_proj, "lora_active", False):
+            # the merged front GEMM read the base shared weight through the wrapper; add its delta
+            gate_up = gate_up_proj.apply_lora(gate_up.contiguous(), hidden_states)
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -2474,9 +2487,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
-            _orig_o_proj_forward = self.o_proj.forward
+            o_proj = self.o_proj
+            _orig_o_proj_forward = o_proj.forward
 
-            def _gated_o_proj_forward(x, *args, **kwargs):
+            def _apply_output_gate(x):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
@@ -2493,9 +2507,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
-                return _orig_o_proj_forward(x, *args, **kwargs)
+                return x
 
-            self.o_proj.forward = _gated_o_proj_forward
+            def _gated_o_proj_forward(x, *args, **kwargs):
+                return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
+
+            # RowParallelLinearWithLoRA bypasses forward and applies this transform itself
+            o_proj.lora_input_transform = _apply_output_gate
+            o_proj.forward = _gated_o_proj_forward
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
 
@@ -2583,6 +2602,8 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
         and attn_tp_size == get_parallel().tp_size
         and config.attn_res_block_size is not None
         and k3_ar_fusion.enabled()
+        # The LoRA o_proj wrapper cannot write into the symmetric buffer.
+        and not (get_lora().enable_lora or get_lora().lora_paths)
     )
 
 
@@ -3175,6 +3196,12 @@ class KimiK3LinearForCausalLM(nn.Module):
     packed_modules_mapping = {
         "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
     }
+    # Miles names routed-expert targets after the checkpoint's w1/w2/w3.
+    lora_target_module_aliases = {
+        "w1": "gate_up_proj",
+        "w3": "gate_up_proj",
+        "w2": "down_proj",
+    }
 
     def __init__(
         self,
@@ -3669,13 +3696,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
-            o_proj_weight = getattr(layer.self_attn.o_proj, "weight", None)
+            # under LoRA o_proj is a BaseLayerWithLoRA; params_dtype lives on the base layer
+            o_proj = layer.self_attn.o_proj
+            o_proj = getattr(o_proj, "base_layer", o_proj)
+            o_proj_weight = getattr(o_proj, "weight", None)
             if o_proj_weight is None:
-                o_proj_weight = layer.self_attn.o_proj.qweight
+                o_proj_weight = o_proj.qweight
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=getattr(layer.self_attn.o_proj, "params_dtype", None)
-                or o_proj_weight.dtype,
+                dtype=getattr(o_proj, "params_dtype", None) or o_proj_weight.dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
@@ -3719,6 +3748,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         ],
         "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
     }
+    lora_target_module_aliases = KimiK3LinearForCausalLM.lora_target_module_aliases
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,

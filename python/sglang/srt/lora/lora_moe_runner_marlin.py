@@ -24,13 +24,12 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.activation import silu_and_mul
-    from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         moe_sum_reduce_triton,
     )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        gated_marlin_activation,
         get_scalar_type,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -46,7 +45,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
     Pipeline:
       1. moe_wna16_marlin_gemm (gate_up)
       1.5. hooks.after_gate_up
-      2. silu_and_mul
+      2. gated activation
       3. moe_wna16_marlin_gemm (down)
       3.5. hooks.after_down
       4. moe_sum_reduce
@@ -75,7 +74,9 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        assert runner_config.activation == "silu", "Only SiLU activation is supported."
+        assert runner_config.is_gated, (
+            "MarlinLoraRunnerCore only supports gated experts"
+        )
         assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
             "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
         )
@@ -192,16 +193,13 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        if runner_config.gemm1_alpha is not None:
-            swiglu_oai_split(
-                intermediate_cache1,
-                runner_config.gemm1_alpha,
-                1.0,
-                runner_config.gemm1_clamp_limit,
-                out=intermediate_cache2,
-            )
-        else:
-            silu_and_mul(intermediate_cache1, intermediate_cache2)
+        gated_marlin_activation(
+            runner_config.activation,
+            runner_config.gemm1_alpha,
+            runner_config.gemm1_clamp_limit,
+            intermediate_cache1,
+            intermediate_cache2,
+        )
         padded_intermediate = (
             torch.nn.functional.pad(intermediate_cache2, (0, N - intermediate_size))
             if N != intermediate_size

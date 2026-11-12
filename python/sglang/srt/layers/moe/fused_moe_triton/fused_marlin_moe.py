@@ -136,6 +136,33 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def gated_marlin_activation(
+    activation: str,
+    gemm1_alpha: Optional[float],
+    clamp_limit: Optional[float],
+    gate_up: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Apply the gated activation of a Marlin MoE layer to `gate_up` (`[..., 2N]`) into `output`."""
+    if activation == "silu" and gemm1_alpha is not None:
+        if clamp_limit is None:
+            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        swiglu_oai_split(gate_up, gemm1_alpha, 1.0, clamp_limit, out=output)
+    elif activation == "silu" and clamp_limit is not None:
+        swiglu_limit_func(output, gate_up, clamp_limit)
+    elif activation == "silu":
+        silu_and_mul(gate_up, output)
+    elif activation == "situ":
+        situ_and_mul(
+            output,
+            gate_up,
+            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
+            linear_beta=clamp_limit,
+        )
+    else:
+        raise ValueError(f"Unsupported gated activation: {activation=}")
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -343,30 +370,13 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and gemm1_alpha is not None:
-        if clamp_limit is None:
-            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_oai_split(
-            intermediate_cache1.view(-1, gemm1_n),
+    if is_gated:
+        gated_marlin_activation(
+            activation,
             gemm1_alpha,
-            1.0,
             clamp_limit,
-            out=intermediate_cache2,
-        )
-    elif activation == "silu" and is_gated and clamp_limit is not None:
-        swiglu_limit_func(
-            intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
-            clamp_limit,
-        )
-    elif activation == "silu" and is_gated:
-        silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
-    elif activation == "situ" and is_gated:
-        situ_and_mul(
             intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
-            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
-            linear_beta=clamp_limit,
         )
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))

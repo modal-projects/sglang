@@ -160,7 +160,6 @@ class LoRAAdapter(nn.Module):
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
-        # Get normalized target modules for filtering
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
@@ -490,7 +489,11 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
+
         for weight_name in weight_names:
+            if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+                continue
             if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
                 weight_name
             ):

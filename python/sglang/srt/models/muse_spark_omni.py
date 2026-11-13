@@ -154,7 +154,10 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         prefix: str = "",
     ) -> None:
         self.encoder_only = get_disagg().encoder_only
-        self.language_only = get_disagg().language_only
+        # --language-only (an EPD language worker) and --language-model-only (text only) both leave the towers out.
+        self.language_only = get_disagg().language_only or bool(
+            getattr(config, "language_model_only", False)
+        )
         if self.encoder_only:
             nn.Module.__init__(self)
             self.config = config.text_config

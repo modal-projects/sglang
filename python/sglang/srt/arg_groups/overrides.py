@@ -318,7 +318,11 @@ def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.kv_cache_dtype == "auto":
         logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
         overrides["kv_cache_dtype"] = "fp8_e4m3"
-    if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
+    if (
+        cfg.mm_enable_dp_encoder is None
+        and cfg.attn_dp_size > 1
+        and not cfg.language_model_only
+    ):
         # NaViT shards over the full TP group only, so attention TP narrower
         # than TP needs the replicated (data-parallel) encoder.
         logger.info(

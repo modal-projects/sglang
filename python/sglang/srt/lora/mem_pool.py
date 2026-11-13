@@ -37,6 +37,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    shared_experts_count,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
@@ -638,9 +639,8 @@ class LoRAMemoryPool:
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
             has_shared_experts = (
-                hasattr(cfg, "shared_expert_intermediate_size")
-                and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+                getattr(cfg, "shared_expert_intermediate_size", 0) or 0
+            ) > 0 or (shared_experts_count(cfg) or 0) > 0
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)

@@ -2,7 +2,7 @@
 
 Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
 available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
-1 = attempt anywhere and warn when unavailable).
+1 = attempt anywhere and warn when unavailable). Always off with LoRA.
 
 Glue between the model and the
 ``kernels.ops.communication.all_reduce_residual`` kernels. Small messages take
@@ -57,6 +57,12 @@ class _State(NamedTuple):
 
 @cache_once
 def _get_state() -> Optional[_State]:
+    lora = ctx.get_lora()
+    if lora.enable_lora or lora.lora_paths:
+        # LoRA wrappers bypass the fused buffers, and the shared-expert
+        # side stream would run LoRA kernels concurrently with the routed ones.
+        logger.info("K3 all-reduce fusion: off because LoRA is enabled.")
+        return None
     explicit = envs.SGLANG_K3_AR_FUSION.is_set()
     if explicit:
         if not envs.SGLANG_K3_AR_FUSION.get():

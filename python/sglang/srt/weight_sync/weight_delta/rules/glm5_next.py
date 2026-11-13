@@ -60,9 +60,7 @@ class Glm5Next:
             match = LAYER.match(name)
             if match and int(match[1]) >= self.num_layers:
                 if "draft" not in self.models:
-                    return Ignored(
-                        "the engine runs no draft model (speculative decoding is off)"
-                    )
+                    return Ignored("the engine runs no draft from this checkpoint")
                 role, rest = "draft", match[2]
                 path = (
                     f"model.{rest}"

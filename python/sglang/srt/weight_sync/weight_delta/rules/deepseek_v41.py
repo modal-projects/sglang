@@ -41,9 +41,7 @@ class DeepSeekV41:
         if ".engram.embed." in name:
             return Ignored("the engram table is frozen: the trainer never exports it")
         if name.startswith("mtp.") and "draft" not in self.models:
-            return Ignored(
-                "the engine runs no draft model (speculative decoding is off)"
-            )
+            return Ignored("the engine runs no draft from this checkpoint")
         path = self.remap(name)
         expert = EXPERT.match(path)
         if expert:

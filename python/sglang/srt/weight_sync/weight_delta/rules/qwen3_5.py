@@ -43,9 +43,7 @@ class Qwen3_5:
         role, path = "target", name.replace("model.language_model.", "model.", 1)
         if name.startswith("mtp."):
             if "draft" not in self.models:
-                return Ignored(
-                    "the engine runs no draft model (speculative decoding is off)"
-                )
+                return Ignored("the engine runs no draft from this checkpoint")
             role, rest = "draft", name.removeprefix("mtp.")
             path = rest if rest.startswith(MTP_TOP) else f"model.{rest}"
         path = path.replace(".self_attn.", ".")

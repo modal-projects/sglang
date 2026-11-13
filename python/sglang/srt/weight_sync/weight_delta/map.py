@@ -126,7 +126,15 @@ def load_map(runners) -> DeltaMap:
         raise ValueError(f"expected one target runner, got {roles}")
     started = time.perf_counter()
     _check_scope(runners)
-    inventory = _read_inventory(dict(runners)["target"])
+    target = dict(runners)["target"]
+    inventory = _read_inventory(target)
+    # A draft from its own checkpoint (DFlash) has no tensor in this inventory:
+    # it keeps the weights it loaded.
+    runners = [
+        (role, runner)
+        for role, runner in runners
+        if runner.model_config.model_path == target.model_config.model_path
+    ]
     headers_read = time.perf_counter()
     delta_map = _build_map(runners, inventory)
     logger.info(
@@ -162,11 +170,6 @@ def _check_scope(runners) -> None:
         "the zero-copy weight cache": get_model().weight_cache_mode != "off",
         "MoE gate/up rows permuted in place (SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED)": (
             envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get()
-        ),
-        "a draft model from another checkpoint": any(
-            runner.model_config.model_path != target.model_config.model_path
-            for role, runner in runners
-            if role != "target"
         ),
     }
     problems = [name for name, hit in refused.items() if hit]

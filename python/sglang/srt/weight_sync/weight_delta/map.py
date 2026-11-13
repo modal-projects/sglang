@@ -80,6 +80,8 @@ class Destination:
     kind: str = ""
     # XORed into a GPU copy of the checkpoint tensor, from which a Derived recomputes the served one.
     shadow: bool = False
+    # The rule places the tensor itself, for a layout no generic placement knows.
+    build: Callable[[CanonicalTensor], Entry] | None = None
 
 
 class OtherGpu:
@@ -222,8 +224,10 @@ def _build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
         role: dict(model.named_modules(remove_duplicate=False))
         for role, model in models.items()
     }
+    # Buffers too: the loader writes some checkpoint tensors into buffers (e.g. a router's bias).
     params = {
         role: dict(model.named_parameters(remove_duplicate=False))
+        | dict(model.named_buffers(remove_duplicate=False))
         for role, model in models.items()
     }
     entries: dict[str, Entry] = {}
@@ -231,6 +235,8 @@ def _build_map(runners, inventory: dict[str, CanonicalTensor]) -> DeltaMap:
         destination = rule.destination(name)
         if isinstance(destination, Ignored):
             entries[name] = destination
+        elif destination.build is not None:
+            entries[name] = destination.build(tensor)
         elif destination.shadow:
             device = next(models[destination.role].parameters()).device
             shadow = _read_checkpoint(tensor).to(device)
@@ -302,6 +308,7 @@ def _model_rule(runner, models, inventory):
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_mla import DeepSeekMla
     from sglang.srt.weight_sync.weight_delta.rules.deepseek_v41 import DeepSeekV41
     from sglang.srt.weight_sync.weight_delta.rules.glm5_next import Glm5Next
+    from sglang.srt.weight_sync.weight_delta.rules.muse_spark import MuseSpark
     from sglang.srt.weight_sync.weight_delta.rules.qwen3_5 import Qwen3_5
 
     # The checkpoint's config: a multimodal model's own config may be its text part's.
@@ -309,7 +316,7 @@ def _model_rule(runner, models, inventory):
     if hf_config.model_type in DeepSeekV41.model_types:
         return DeepSeekV41(models, inventory)
     architecture = hf_config.architectures[0]
-    for rule in (DeepSeekMla, Glm5Next, Qwen3_5):
+    for rule in (DeepSeekMla, Glm5Next, MuseSpark, Qwen3_5):
         if architecture in rule.architectures:
             return rule(models, inventory)
     raise ValueError(f"Weight delta has no rules for {architecture}")

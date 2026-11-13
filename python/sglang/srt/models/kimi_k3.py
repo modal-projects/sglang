@@ -2602,8 +2602,6 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
         and attn_tp_size == get_parallel().tp_size
         and config.attn_res_block_size is not None
         and k3_ar_fusion.enabled()
-        # The LoRA o_proj wrapper cannot write into the symmetric buffer.
-        and not (get_lora().enable_lora or get_lora().lora_paths)
     )
 
 

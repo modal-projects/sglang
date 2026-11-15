@@ -143,7 +143,6 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
-    get_lora,
     get_parallel,
     get_platform,
     get_spec,
@@ -905,8 +904,6 @@ class KimiK3MoE(nn.Module):
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
-            # The fused front adds shared-expert LoRA in place; triton_v2 cannot.
-            and not (get_lora().enable_lora and get_lora().lora_backend == "triton_v2")
         )
 
     @cached_property

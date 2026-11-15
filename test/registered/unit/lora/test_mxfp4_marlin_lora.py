@@ -1,4 +1,4 @@
-"""MXFP4 expert LoRA parity with GPT-OSS activation, biases, and tile padding."""
+"""MXFP4 expert LoRA parity for GPT-OSS and Kimi K3 activations, biases, and padding."""
 
 import sys
 from types import SimpleNamespace
@@ -27,8 +27,9 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
     reason="Marlin LoRA requires Hopper or newer",
 )
+@pytest.mark.parametrize("activation", ["swiglu_oai", "situ"])
 @pytest.mark.parametrize("M", [1, 7])
-def test_mxfp4_marlin_lora(M):
+def test_mxfp4_marlin_lora(M, activation):
     set_global_server_args_for_scheduler(
         ServerArgs(model_path="dummy", moe_runner_backend="marlin")
     )
@@ -105,12 +106,22 @@ def test_mxfp4_marlin_lora(M):
             _lora_runner_backend=MoeRunnerBackend.MARLIN,
         ),
     )
-    config = MoeRunnerConfig(
-        intermediate_size_per_partition=N,
-        activation="silu",
-        gemm1_alpha=1.702,
-        gemm1_clamp_limit=7.0,
-    )
+    if activation == "situ":
+        # Kimi K3: gemm1_alpha is the SiTU beta and w1/w3 are not interleaved.
+        config = MoeRunnerConfig(
+            intermediate_size_per_partition=N,
+            activation="situ",
+            gemm1_alpha=4.0,
+            gemm1_clamp_limit=25.0,
+            gate_up_interleaved=False,
+        )
+    else:
+        config = MoeRunnerConfig(
+            intermediate_size_per_partition=N,
+            activation="silu",
+            gemm1_alpha=1.702,
+            gemm1_clamp_limit=7.0,
+        )
     a1 = torch.randn(2, E, R, K, device=device, dtype=torch.bfloat16) * 0.03
     bb1 = torch.randn(2, E, 2 * N, R, device=device, dtype=torch.bfloat16) * 0.03
     a2 = torch.randn(2, E, R, N, device=device, dtype=torch.bfloat16) * 0.03
@@ -184,18 +195,27 @@ def test_mxfp4_marlin_lora(M):
                             torch.bfloat16
                         )
                     )
-                gate = gateup[:N].clamp(max=7)
-                up = gateup[N:].clamp(-7, 7)
-                activation = gate * torch.sigmoid(gate * 1.702) * (up + 1)
+                gate, up = gateup[:N].float(), gateup[N:].float()
+                if config.activation == "situ":
+                    act = (
+                        4.0
+                        * torch.tanh(gate / 4.0)
+                        * torch.sigmoid(gate)
+                        * (25.0 * torch.tanh(up / 25.0))
+                    )
+                else:
+                    gate, up = gate.clamp(max=7), up.clamp(-7, 7)
+                    act = gate * torch.sigmoid(gate * 1.702) * (up + 1)
+                act = act.to(torch.bfloat16)
                 down = (
-                    (ref2[e, :K, :N].float() @ activation.float() + b2[e, :K].float())
+                    (ref2[e, :K, :N].float() @ act.float() + b2[e, :K].float())
                     * weights[m, k]
                 ).to(torch.bfloat16)
                 if active:
                     down.add_(
                         (
                             bb2[s, e].float()
-                            @ (a2[s, e].float() @ activation.float())
+                            @ (a2[s, e].float() @ act.float())
                             * weights[m, k]
                         ).to(torch.bfloat16)
                     )
@@ -232,7 +252,7 @@ def test_mxfp4_marlin_lora(M):
         print("RELATIVE_L2", relative_l2.item(), flush=True)
         assert relative_l2 < 0.015
     print(
-        "PASS MXFP4 Marlin expert LoRA with GPT-OSS activation, biases, padding and two adapters",
+        f"PASS MXFP4 Marlin expert LoRA with {activation}, biases, padding and two adapters",
         flush=True,
     )
 

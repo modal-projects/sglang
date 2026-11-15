@@ -112,6 +112,13 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_len, 2)
         self.assertEqual(req.finished_reason.matched, "a.")
 
+    def test_invalid_regex_preserves_abort_at_length_cap(self):
+        req = _make_req([60, 61])
+        req.sampling_params.stop_regex_strs = ["("]
+        req.sampling_params.max_new_tokens = 1
+        req.update_finish_state(new_accepted_len=2)
+        self.assertEqual(req.finished_reason.to_json()["type"], "abort")
+
     def test_no_stop_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)

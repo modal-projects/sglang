@@ -492,6 +492,7 @@ class LoRAAdapter(nn.Module):
         from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
 
         for weight_name in weight_names:
+            # An attention gate is not the gate half of an MLP gate_up_proj.
             if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
                 continue
             if ".up_proj." in weight_name and self._is_non_gated_moe_weight(

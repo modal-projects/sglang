@@ -517,9 +517,8 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             parts = name.split(".")
             leaf_name = parts[-1]
             parent_qualified_name = ".".join(parts[-2:])
-            if parent_qualified_name in (
-                DSA_INDEXER_LORA_NAMES | PRESERVED_LORA_TARGET_NAMES
-            ):
+            # Models opt into PRESERVED_LORA_TARGET_NAMES via supported_lora_modules.
+            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
                 raw_names.add(parent_qualified_name)
             elif leaf_name in dsa_indexer_leaf_names:
                 # Bare DSA indexer leaf names are ambiguous across model

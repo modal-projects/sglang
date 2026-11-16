@@ -29,7 +29,10 @@ from sglang.srt.lora import lora_manager as lora_manager_module
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.utils import get_normalized_target_modules
+from sglang.srt.lora.utils import (
+    auto_detect_lora_target_modules,
+    get_normalized_target_modules,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -308,6 +311,27 @@ class TestAttentionGateTargets(CustomTestCase):
         torch.testing.assert_close(weights[attn_key], attn)
         torch.testing.assert_close(
             weights[mlp_key.replace("gate_proj", "gate_up_proj")], torch.cat((gate, up))
+        )
+
+    def test_all_linear_targets_attention_gate_only_when_model_opts_in(self):
+        """all-linear must not start wrapping attention gates of other models."""
+        modules = [
+            (
+                "model.layers.0.self_attn.gate_proj",
+                ReplicatedLinear.__new__(ReplicatedLinear),
+            ),
+            (
+                "model.layers.0.mlp.gate_up_proj",
+                ReplicatedLinear.__new__(ReplicatedLinear),
+            ),
+        ]
+        model = SimpleNamespace(named_modules=lambda: iter(modules))
+        self.assertEqual(auto_detect_lora_target_modules(model), {"gate_up_proj"})
+
+        model.supported_lora_modules = ["self_attn.gate_proj", "gate_up_proj"]
+        self.assertEqual(
+            auto_detect_lora_target_modules(model),
+            {"self_attn.gate_proj", "gate_up_proj"},
         )
 
 

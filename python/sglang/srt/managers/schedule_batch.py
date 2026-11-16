@@ -1914,18 +1914,23 @@ class Req(ReqDllmMixin):
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
             tail_str = self.tail_str(new_accepted_len)
+            matches = []
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
                     if stop_str_in_tail or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
+                        finished_len = (
+                            self._locate_str_stop_finished_len(
                                 new_accepted_len, stop_str=stop_str
                             )
-                        return True
+                            if stop_str_in_tail
+                            else None
+                        )
+                        matches.append(
+                            (finished_len, FINISH_MATCHED_STR(matched=stop_str))
+                        )
 
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
@@ -1950,7 +1955,7 @@ class Req(ReqDllmMixin):
                             HTTPStatus.BAD_REQUEST,
                             "BadRequestError",
                         )
-                        break
+                        return True
                     if matched:
                         finished_len = self._locate_str_stop_finished_len(
                             new_accepted_len, stop_regex=stop_regex_str
@@ -1966,11 +1971,19 @@ class Req(ReqDllmMixin):
                     else:
                         finished_len = None
                     if finished_len is not None:
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
+                        matches.append(
+                            (
+                                finished_len,
+                                FINISHED_MATCHED_REGEX(matched=stop_regex_str),
+                            )
                         )
-                        self.finished_len = finished_len
-                        return True
+
+            if matches:
+                # A speculative block can complete several stops in a different order.
+                self.finished_len, self.finished_reason = min(
+                    matches, key=lambda match: match[0] if match[0] is not None else 0
+                )
+                return True
 
         return False
 
@@ -2020,10 +2033,15 @@ class Req(ReqDllmMixin):
             self._cap_finished_len_at_max_new_tokens()
             return
 
-        # Stop string beats EOS/stop-token matched in the same step (speculative
-        # decoding can accept >1 token): token-based would trim only the last
-        # token and leak the stop string.
         if self._check_str_based_finish(new_accepted_len):
+            text_finished_len = self.finished_len
+            text_finished_reason = self.finished_reason
+            if text_finished_len is not None and self._check_token_based_finish(
+                new_accepted_tokens
+            ):
+                if self.finished_len >= text_finished_len:
+                    self.finished_len = text_finished_len
+                    self.finished_reason = text_finished_reason
             self._cap_finished_len_at_max_new_tokens()
             return
 

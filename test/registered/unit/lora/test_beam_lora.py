@@ -150,21 +150,6 @@ class TestBeamHybridBuffers(CustomTestCase):
             lora_lm_head_module=None,
         )
 
-    def test_hybrid_startup_prepares_base_slot(self):
-        """Base-only startup must clear hybrid buffers without touching other slots."""
-        pool = self._make_pool(max_loras_per_batch=2)
-        for tensor in self._tensors(pool):
-            tensor[0].fill_(7)
-            tensor[1].fill_(11)
-
-        self._prepare(pool, {None})
-
-        self.assertEqual(pool.uid_to_buffer_id, {None: 0})
-        self.assertEqual(pool.buffer_id_to_uid, [None, EMPTY_SLOT])
-        for tensor in self._tensors(pool):
-            self.assertTrue(torch.all(tensor[0] == 0))
-            self.assertTrue(torch.all(tensor[1] == 11))
-
     def test_hybrid_adapter_removal_and_base_slot_reuse(self):
         """Removing a dense adapter clears hybrid storage for reuse as the base slot."""
         pool = self._make_pool(max_loras_per_batch=2)

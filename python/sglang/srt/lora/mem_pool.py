@@ -926,7 +926,6 @@ class LoRAMemoryPool:
         """Make an evicted slot safe for graph-captured base-model replay."""
         for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
             for tensor in buffers:
-                # Hybrid layers omit dense projections they do not own.
                 if tensor is not None:
                     tensor[buffer_id].zero_()
         for buffers in (

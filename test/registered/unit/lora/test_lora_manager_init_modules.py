@@ -26,8 +26,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
+from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -265,6 +267,48 @@ class TestTargetValidation(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "DSA indexer Q/K fusion"):
             manager.init_lora_shapes(max_lora_rank=8, target_modules={"wk"})
+
+
+class TestAttentionGateTargets(CustomTestCase):
+    def test_attention_gate_is_explicit_and_never_stacked_with_mlp(self):
+        """The attention gate used to become gate_up_proj, colliding with MLP LoRA."""
+        self.assertEqual(get_normalized_target_modules(["gate_proj"]), {"gate_up_proj"})
+        self.assertEqual(
+            get_normalized_target_modules(
+                ["model.layers.0.self_attn.gate_proj", "mlp.gate_proj"]
+            ),
+            {"self_attn.gate_proj", "gate_up_proj"},
+        )
+        prefix = "base_model.model.model.layers.0."
+        attn_key = prefix + "self_attn.gate_proj.lora_A.weight"
+        mlp_key = prefix + "mlp.gate_proj.lora_A.weight"
+        up_key = prefix + "mlp.up_proj.lora_A.weight"
+        attn, gate, up = [torch.full((2, 8), x) for x in (1.0, 2.0, 3.0)]
+        adapter = LoRAAdapter(
+            uid="gate",
+            config=LoRAConfig.from_dict(
+                dict(
+                    peft_type="LORA",
+                    r=2,
+                    lora_alpha=2,
+                    target_modules=["self_attn.gate_proj", "gate_proj", "up_proj"],
+                )
+            ),
+            base_hf_config=SimpleNamespace(num_hidden_layers=1),
+            load_config=None,
+            lora_backend=None,
+        )
+        adapter.initialize_weights_from_tensors(
+            {attn_key: attn, mlp_key: gate, up_key: up}
+        )
+        weights = adapter.layers[0].weights
+        self.assertEqual(
+            set(weights), {attn_key, mlp_key.replace("gate_proj", "gate_up_proj")}
+        )
+        torch.testing.assert_close(weights[attn_key], attn)
+        torch.testing.assert_close(
+            weights[mlp_key.replace("gate_proj", "gate_up_proj")], torch.cat((gate, up))
+        )
 
 
 if __name__ == "__main__":

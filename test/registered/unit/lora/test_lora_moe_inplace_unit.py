@@ -21,11 +21,6 @@ Usage:
     python -m pytest test/registered/unit/lora/test_lora_moe_inplace_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-# CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
 import types
 import unittest
 import unittest.mock as mock
@@ -33,6 +28,10 @@ import unittest.mock as mock
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+
+# CPU-only unit test; no CUDA/distributed dependencies.
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
@@ -110,6 +109,43 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         self.assertIsNotNone(core_config)
         self.assertIs(core_config, base_layer.moe_runner_config)
         self.assertFalse(core_config.inplace)
+
+    def test_compressed_fp8_initializes_with_real_quant_info(self):
+        # The quant method delegates to the scheme, which previously lacked the getter.
+        from compressed_tensors.quantization import QuantizationArgs
+
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            CompressedTensorsW8A8Fp8MoE,
+        )
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        base_layer = _make_base_layer()
+        base_layer.quant_method = CompressedTensorsFusedMoEMethod(None)
+        base_layer.scheme = CompressedTensorsW8A8Fp8MoE(
+            weight_quant=QuantizationArgs(
+                type="float", strategy="channel", dynamic=False
+            ),
+            input_quant=QuantizationArgs(type="float", strategy="token", dynamic=True),
+        )
+        base_layer.w13_weight = torch.zeros(8, 64, 64, dtype=torch.float8_e4m3fn)
+        base_layer.w2_weight = torch.zeros(8, 64, 32, dtype=torch.float8_e4m3fn)
+        base_layer.w13_weight_scale = torch.ones(8, 64, 1)
+        base_layer.w2_weight_scale = torch.ones(8, 64, 1)
+        base_layer.w13_input_scale = base_layer.w2_input_scale = None
+
+        layer = FusedMoEWithLoRA(base_layer, types.SimpleNamespace(name="triton"))
+
+        self.assertTrue(layer._quant_info.use_fp8_w8a8)
+        self.assertTrue(layer._quant_info.per_channel_quant)
+        self.assertIsNone(layer._quant_info.block_shape)
+        self.assertIs(layer._quant_info.w13_weight, base_layer.w13_weight)
+        self.assertIs(layer._quant_info.w2_weight, base_layer.w2_weight)
+        self.assertIs(layer._quant_info.w13_scale, base_layer.w13_weight_scale)
+        self.assertIs(layer._quant_info.w2_scale, base_layer.w2_weight_scale)
+        self.assertFalse(layer.moe_runner_config.inplace)
 
 
 if __name__ == "__main__":

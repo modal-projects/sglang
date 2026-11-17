@@ -31,16 +31,22 @@ def _adapter() -> LoRAAdapter:
 
 class TestQwen3_5GDNTargetContracts(CustomTestCase):
     def test_checkpoint_targets_normalize_to_fused_runtime_modules(self):
+        fused = {"in_proj_qkvz", "in_proj_ba", "out_proj"}
         for targets in (
             ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"],
-            ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z", "in_proj_b"],
+            [
+                "in_proj_q",
+                "in_proj_k",
+                "in_proj_v",
+                "in_proj_z",
+                "in_proj_b",
+                "in_proj_a",
+                "out_proj",
+            ],
             ["in_proj_qkvz", "in_proj_ba", "out_proj"],
         ):
             with self.subTest(targets=targets):
-                self.assertTrue(
-                    get_normalized_target_modules(targets)
-                    <= {"in_proj_qkvz", "in_proj_ba", "out_proj"}
-                )
+                self.assertEqual(get_normalized_target_modules(targets), fused)
 
     def test_fused_runtime_modules_are_declared_and_sized(self):
         self.assertIn("in_proj_ba", Qwen3_5ForCausalLM.supported_lora_modules)

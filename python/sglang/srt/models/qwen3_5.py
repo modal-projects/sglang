@@ -1716,6 +1716,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
+    lora_target_module_aliases = {
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+    }
+
     supported_lora_modules = [
         "qkv_proj",
         "o_proj",
@@ -2396,6 +2404,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     hf_to_sglang_mapper = None
     checkpoint_name_mapper = _QWEN3_5_CHECKPOINT_NAME_MAPPER
 
+    lora_target_module_aliases = Qwen3_5ForCausalLM.lora_target_module_aliases
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
     def __init__(
@@ -2611,6 +2620,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     hf_to_sglang_mapper = None
     checkpoint_name_mapper = _QWEN3_5_CHECKPOINT_NAME_MAPPER
 
+    lora_target_module_aliases = Qwen3_5ForCausalLM.lora_target_module_aliases
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
     def __init__(

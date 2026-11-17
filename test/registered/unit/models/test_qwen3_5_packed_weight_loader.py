@@ -17,9 +17,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
-
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.srt.lora.utils import get_normalized_target_modules
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+)
 
 
 def _make_mock_module(output_sizes):
@@ -210,6 +216,25 @@ class TestMakePackedWeightLoader(unittest.TestCase):
             # .view(-1) should flatten to [1]
             self.assertEqual(chunk.shape, torch.Size([1]))
             self.assertAlmostEqual(chunk.item(), 0.75, places=5)
+
+
+class TestGdnLoRATargetAliases(unittest.TestCase):
+    def test_trainer_and_split_adapter_targets_share_the_gdn_buffer(self):
+        for model in (
+            Qwen3_5ForCausalLM,
+            Qwen3_5MoeForCausalLM,
+            Qwen3_5ForConditionalGeneration,
+            Qwen3_5MoeForConditionalGeneration,
+        ):
+            for targets in (
+                ["in_proj_qkv", "in_proj_z"],
+                ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z"],
+            ):
+                with self.subTest(model=model.__name__, targets=targets):
+                    self.assertEqual(
+                        get_normalized_target_modules(targets, model),
+                        {"in_proj_qkvz"},
+                    )
 
 
 if __name__ == "__main__":

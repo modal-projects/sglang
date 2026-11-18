@@ -7,6 +7,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.host_encryption import HostPoolEncryption
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
 
@@ -55,6 +56,7 @@ class L2TransferEngine:
         self.io_backend = io_backend
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+        self.host_encryption = HostPoolEncryption.maybe_create()
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -129,15 +131,26 @@ class L2TransferEngine:
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        with self._submission(
-            transfers, self.device_to_host_stream, "device_to_host"
-        ) as (transfers, completion):
-            for transfer in transfers:
-                transfer.host_pool.backup_from_device_all_layer_physical(
-                    transfer.device_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    self.io_backend,
+        encryption = self.host_encryption
+        ticket = encryption.begin_backup(transfers) if encryption else None
+        completion = None
+        try:
+            with self._submission(
+                transfers, self.device_to_host_stream, "device_to_host"
+            ) as (transfers, completion):
+                for transfer in transfers:
+                    transfer.host_pool.backup_from_device_all_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        self.io_backend,
+                    )
+        finally:
+            if ticket is not None:
+                # A failed submission synchronized its stream, so there is no
+                # event to wait for before encrypting what reached the host.
+                encryption.finish_backup(
+                    ticket, completion.finish_event if completion else None
                 )
         return completion
 
@@ -149,33 +162,42 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        with self._submission(
-            transfers, self.host_to_device_stream, "host_to_device", start_event
-        ) as (transfers, completion):
-            primary = transfers[0] if transfers else None
-            for layer_id in range(transfer_layer_id_max):
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
-                if on_layer_done is not None:
-                    on_layer_done(layer_id)
+        encryption = self.host_encryption
+        ticket = encryption.begin_load(transfers) if encryption else None
+        completion = None
+        try:
+            with self._submission(
+                transfers, self.host_to_device_stream, "host_to_device", start_event
+            ) as (transfers, completion):
+                primary = transfers[0] if transfers else None
+                for layer_id in range(transfer_layer_id_max):
+                    for transfer in transfers:
+                        local_layer_id = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local_layer_id is None or (
+                            transfer is not primary
+                            and transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        transfer.host_pool.load_to_device_per_layer_physical(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+                    if on_layer_done is not None:
+                        on_layer_done(layer_id)
+        finally:
+            if ticket is not None:
+                encryption.finish_load(
+                    ticket, completion.finish_event if completion else None
+                )
         return completion
 
     @staticmethod

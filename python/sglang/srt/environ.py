@@ -766,6 +766,18 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Keep HiCache host (L2) pages AES-256-GCM encrypted in host memory except
+    # while a device transfer reads or writes them. The key is per process.
+    SGLANG_ENABLE_HICACHE_HOST_ENCRYPTION = EnvBool(False)
+    # CPU threads that encrypt and decrypt host pages.
+    SGLANG_HICACHE_HOST_ENCRYPTION_THREADS = EnvInt(8)
+    # Encryption of finished transfers waits until no transfer has been
+    # submitted for this long, so it does not compete with a burst of them,
+    # but never longer than the maximum delay.
+    SGLANG_HICACHE_HOST_ENCRYPTION_QUIET_MS = EnvInt(20)
+    SGLANG_HICACHE_HOST_ENCRYPTION_MAX_DELAY_MS = EnvInt(250)
+    # Log the host pools and indices of HiCache transfers instead of encrypting.
+    SGLANG_TEST_HICACHE_HOST_ENCRYPTION_OBSERVE = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

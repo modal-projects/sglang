@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.host_encryption import CPU_INDICES_ATTR
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -543,6 +544,12 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if self.l2_transfer_engine.host_encryption is not None:
+            raise ValueError(
+                "SGLANG_ENABLE_HICACHE_HOST_ENCRYPTION does not support a HiCache "
+                "storage backend: storage I/O reads host pages directly and would "
+                "persist ciphertext it cannot decrypt."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -888,7 +895,10 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
+                cpu_host_indices = host_indices
                 host_indices = host_indices.to(self.device, non_blocking=True)
+                if self.l2_transfer_engine.host_encryption is not None:
+                    setattr(host_indices, CPU_INDICES_ATTR, cpu_host_indices)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":

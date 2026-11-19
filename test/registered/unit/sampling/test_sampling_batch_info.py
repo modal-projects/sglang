@@ -465,10 +465,12 @@ class TestFilterBatch(CustomTestCase):
             batch_size=3,
             top_ks=torch.tensor([10, 50, 30], dtype=torch.int32),
             max_top_k=50,
+            max_bounded_top_k=50,
         )
         info.filter_batch([0, 2], torch.tensor([0, 2]))
         self.assertEqual(info.max_top_k, 50)
         self.assertGreaterEqual(info.max_top_k, int(info.top_ks.max()))
+        self.assertEqual(info.max_bounded_top_k, 50)
 
     def test_filter_with_custom_logit_processor(self):
         proc = MagicMock()
@@ -618,9 +620,10 @@ class TestMergeBatch(CustomTestCase):
         cases = (((20, 50), 50), ((50, 20), 50), ((20, None), None), ((None, 20), None))
         for (lhs, rhs), expected in cases:
             with self.subTest(lhs=lhs, rhs=rhs):
-                info1 = _make_info(max_top_k=lhs)
-                info1.merge_batch(_make_info(max_top_k=rhs))
+                info1 = _make_info(max_top_k=lhs, max_bounded_top_k=lhs)
+                info1.merge_batch(_make_info(max_top_k=rhs, max_bounded_top_k=rhs))
                 self.assertEqual(info1.max_top_k, expected)
+                self.assertEqual(info1.max_bounded_top_k, expected)
 
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
@@ -812,11 +815,12 @@ class TestFromScheduleBatch(CustomTestCase):
 
     def test_max_top_k_uses_request_params(self):
         cases = (
-            ((20, 50), 50),
-            ((1, 20), 20),
-            ((20, TOP_K_ALL), None),
+            ((20, 50), 50, 20),
+            ((1, 20), 20, 20),
+            ((20, TOP_K_ALL), None, 20),
+            ((TOP_K_ALL, TOP_K_ALL), None, 0),
         )
-        for top_ks, expected in cases:
+        for top_ks, expected, bounded in cases:
             with self.subTest(top_ks=top_ks):
                 batch = MagicMock()
                 batch.reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
@@ -825,6 +829,7 @@ class TestFromScheduleBatch(CustomTestCase):
                 info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
                 self.assertEqual(info.max_top_k, expected)
+                self.assertEqual(info.max_bounded_top_k, bounded)
 
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""

@@ -122,6 +122,8 @@ class SamplingBatchInfo:
     # from the whole vocabulary. Any value >= the true max stays exact, so
     # filter_batch keeps it unchanged.
     max_top_k: Optional[int] = None
+    # Upper bound ignoring whole-vocabulary rows; None means unknown, 0 means none.
+    max_bounded_top_k: Optional[int] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -302,6 +304,14 @@ class SamplingBatchInfo:
                 max(r.sampling_params.top_k for r in reqs)
                 if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
                 else None
+            ),
+            max_bounded_top_k=max(
+                (
+                    r.sampling_params.top_k
+                    for r in reqs
+                    if 1 <= r.sampling_params.top_k < vocab_size
+                ),
+                default=0,
             ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
@@ -640,6 +650,12 @@ class SamplingBatchInfo:
             None
             if self.max_top_k is None or other.max_top_k is None
             else max(self.max_top_k, other.max_top_k)
+        )
+
+        self.max_bounded_top_k = (
+            None
+            if self.max_bounded_top_k is None or other.max_bounded_top_k is None
+            else max(self.max_bounded_top_k, other.max_bounded_top_k)
         )
 
         self.adjusted_merge_batch(other)

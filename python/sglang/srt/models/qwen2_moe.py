@@ -242,6 +242,12 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        # A LoRA backend may compute gate/up + LoRA + SiLU*mul in one pass (None if not).
+        fused_swiglu = getattr(self.gate_up_proj, "forward_swiglu", None)
+        act = fused_swiglu(x) if fused_swiglu is not None else None
+        if act is not None:
+            x, _ = self.down_proj(act)
+            return x
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))

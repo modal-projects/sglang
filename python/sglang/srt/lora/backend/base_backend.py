@@ -106,6 +106,18 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         of the LoRA buffers refresh them here."""
         pass
 
+    def forward_gate_up_swiglu(self, layer, x: torch.Tensor):
+        """silu(gate) * up of a merged gate/up LoRA linear (base GEMM + LoRA + activation in
+        one pass), or None when the backend does not fuse it for this batch."""
+        return None
+
+    def forward_attention_inputs(self, layer, x: torch.Tensor, spec):
+        """QKV LoRA linear followed by q/k RMSNorm, RoPE, the gated-query split and the KV
+        cache write, in one pass. Returns (q, gate) - gate is None without an output gate -
+        with K/V already stored, or None when the backend does not fuse it for this batch.
+        ``spec`` is an ``AttentionInputSpec``."""
+        return None
+
     def forward_with_base(
         self,
         layer,

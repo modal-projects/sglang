@@ -19,6 +19,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sglang.srt.lora.utils import AttentionInputSpec
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -318,6 +319,32 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
+
+        if forward_batch.forward_mode.is_decode() and hasattr(
+            self.qkv_proj, "forward_attention_inputs"
+        ):
+            # A LoRA backend may finish the attention inputs in the QKV projection:
+            # q/k norm, RoPE and the K/V cache write (None if it does not for this batch).
+            fused = self.qkv_proj.forward_attention_inputs(
+                hidden_states,
+                AttentionInputSpec(
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.attn.layer_id,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    rotary_emb=self.rotary_emb,
+                ),
+            )
+            if fused is not None:
+                attn_output = self.attn(
+                    fused[0], None, None, forward_batch, save_kv_cache=False
+                )
+                output, _ = self.o_proj(attn_output)
+                return output
 
         save_kv_cache = True
         use_aiter_fused = False

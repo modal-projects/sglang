@@ -266,8 +266,11 @@ class TLinear:
         assert epi != "silu_mul" or pairing == "halves"
         assert epi != "resnorm" or pairing == "none"
         self.units = {"linear": self.nacc, "silu_mul": 1, "resnorm": 2, "qkv": 0}[epi]
-        if epi == "qkv":  # qkv = (q heads, kv heads, head dim, rotary dim, gated query)
-            self.qh, self.kvh, self.hd, self.rot, self.gated = qkv
+        self.mrope = False
+        if epi == "qkv":  # qkv = (q heads, kv heads, head dim, rotary dim, gated query[, mrope])
+            self.qh, self.kvh, self.hd, self.rot, self.gated = qkv[:5]
+            # multi-axis RoPE: positions [3, T]; rotary pair i uses axis axis_map[i]
+            self.mrope = len(qkv) > 5 and bool(qkv[5])
             assert self.hd == 128 * self.nacc and self.rot in (64, 128) and self.rot <= self.hd
             self.qheads = self.qh * (2 if self.gated else 1)  # stored q (+gate) heads
             assert (self.qheads + 2 * self.kvh) * self.hd == n_out
@@ -371,7 +374,7 @@ class TLinear:
                  gamma: cute.Tensor, ss_out: cute.Tensor, ss_in: cute.Tensor,
                  qn_w: cute.Tensor, kn_w: cute.Tensor, cs: cute.Tensor, pos: cute.Tensor,
                  kc: cute.Tensor, vc: cute.Tensor, loc: cute.Tensor, qo: cute.Tensor,
-                 gate_o: cute.Tensor, stream):
+                 gate_o: cute.Tensor, axis: cute.Tensor, stream):
         f8, e8, bf = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, cutlass.BFloat16
         major = tcgen05.OperandMajorMode.K
         S = self.stages
@@ -457,7 +460,7 @@ class TLinear:
             tslot: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.n_mma], 16]
             srstd: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, self.n_mma], 16]
             qconst: cute.struct.Align[cute.struct.MemRange[
-                cutlass.Int32, 2 * self.n_mma + 2 * (self.hd if epi_qkv else 0)], 16]
+                cutlass.Int32, 4 * self.n_mma + 2 * (self.hd if epi_qkv else 0) + 128], 16]
             sZd: cute.struct.Align[cute.struct.MemRange[cutlass.Int8,
                                                         self.zbytes if self.zded else 1024], 1024]
             sO: cute.struct.Align[cute.struct.MemRange[bf, WGS * self.obuf * self.chunk * 128],
@@ -467,7 +470,7 @@ class TLinear:
         self.kernel(mma, mma_sfb, mma16, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb,
                     tma_bm, tbm, tma_aa, taa, tma_xb, txb, tma_y, ty, tma_r, trr, z, slots,
                     ranks, scales, ready, epoch, tr, res, gamma, ss_out, ss_in, qn_w, kn_w, cs,
-                    pos, kc, vc, loc, qo, gate_o, sA_l, sB_l,
+                    pos, kc, vc, loc, qo, gate_o, axis, sA_l, sB_l,
                     sSFA_l, sSFB_l, sA16_l, sB16_l, sO_l).launch(
             grid=(self.grid, 1, 1), block=(256, 1, 1), cluster=(self.C, 1, 1),
             smem=Storage.size_in_bytes(), stream=stream, use_pdl=True)
@@ -484,7 +487,7 @@ class TLinear:
                gamma: cute.Tensor, ss_out: cute.Tensor, ss_in: cute.Tensor,
                qn_w: cute.Tensor, kn_w: cute.Tensor, cs: cute.Tensor, pos: cute.Tensor,
                kc: cute.Tensor, vc: cute.Tensor, loc: cute.Tensor, qo: cute.Tensor,
-               gate_o: cute.Tensor, sA_l: cute.ComposedLayout, sB_l: cute.ComposedLayout, sSFA_l, sSFB_l,
+               gate_o: cute.Tensor, axis: cute.Tensor, sA_l: cute.ComposedLayout, sB_l: cute.ComposedLayout, sSFA_l, sSFB_l,
                sA16_l: cute.ComposedLayout, sB16_l: cute.ComposedLayout, sO_l: cute.Layout):
         S = self.stages
         NA = self.nacc
@@ -564,7 +567,7 @@ class TLinear:
                                cute.make_layout((128, self.n_mma, NA),
                                                 stride=(1, 128, 128 * self.n_mma)))
         one = cute.make_layout(1)
-        qx = (qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o,
+        qx = (qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, axis,
               cutlass.Int32(st.sA.data_ptr().toint()) + self.qs_off,
               cutlass.Int32(st.qconst.data_ptr().toint()))
 
@@ -1450,17 +1453,42 @@ class TLinear:
     def stage_qconst(self, qx, head, et):
         """SMEM copies the QKV epilogue needs per token (position, cache slot) and per feature
         (this head's q or k norm weight), loaded while the main loop runs."""
-        qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, qs0, qc = qx
+        qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, axis, qs0, qc = qx
+        P1 = 2 * self.n_mma + self.hd
+        # padded / graph-warm-up rows can carry any position or cache slot: positions are
+        # clamped into the cos/sin table, slots outside the KV cache are skipped like -1
+        p_max = cutlass.Int64(cs.shape[0] - 1)
+        n_slots = cutlass.Int64(kc.shape[0])
         for i in cutlass.range_constexpr((self.n_mma + 127) // 128):
             t = et + i * 128
             if t < self.n_mma:
                 p = cutlass.Int32(0)
+                p1 = cutlass.Int32(0)
+                p2 = cutlass.Int32(0)
                 l = cutlass.Int32(-1)
                 if t < self.T:
-                    p = cutlass.Int32(pos[t])
-                    l = cutlass.Int32(loc[t])
+                    l64 = cutlass.Int64(loc[t])
+                    if (l64 >= 0) & (l64 < n_slots):
+                        l = cutlass.Int32(l64)
+                    if cutlass.const_expr(self.mrope):
+                        p = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[0, t]), 0),
+                                                      p_max))
+                        p1 = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[1, t]), 0),
+                                                       p_max))
+                        p2 = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[2, t]), 0),
+                                                       p_max))
+                    else:
+                        p = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[t]), 0),
+                                                      p_max))
+                # every row of the MMA tile, padding included, gets defined positions
                 st_shared_i32(qc + t * 4, p)
                 st_shared_i32(qc + (self.n_mma + t) * 4, l)
+                if cutlass.const_expr(self.mrope):
+                    st_shared_i32(qc + (P1 + t) * 4, p1)
+                    st_shared_i32(qc + (P1 + self.n_mma + t) * 4, p2)
+        if cutlass.const_expr(self.mrope):
+            if et < self.rot // 2:
+                st_shared_i32(qc + (P1 + 2 * self.n_mma + et) * 4, cutlass.Int32(axis[et]))
         is_key = (head >= self.qheads) & (head < self.qheads + self.kvh)
         for i in cutlass.range_constexpr((self.hd + 127) // 128):
             n = et + i * 128
@@ -1479,7 +1507,7 @@ class TLinear:
         lane l ^ rot/8), then q -> qo, gate (raw) -> gate_o, k / v -> the KV cache at loc[t].
         Loads are batched: norm weights once, positions / cache slots one per lane, and the
         SMEM rows and cos/sin of 4 tokens before any of their math."""
-        qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, qs0, qc = qx
+        qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, axis, qs0, qc = qx
         qs = qs0 + wg * (self.chunk * self.hd * 4)
         qbar = 6 - 2 * wg  # warpgroup 1: barrier 4, warpgroup 0: barrier 6
         NA = self.nacc
@@ -1513,6 +1541,15 @@ class TLinear:
         l_l = ld_shared_i32(qc + (self.n_mma + t_l) * 4)
         rope_lane = lane * 4 < self.rot
         cidx = (lane * 4) % half
+        P1 = 2 * self.n_mma + self.hd
+        p_l1 = p_l
+        p_l2 = p_l
+        axr = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32)
+        if cutlass.const_expr(self.mrope):
+            p_l1 = ld_shared_i32(qc + (P1 + t_l) * 4)
+            p_l2 = ld_shared_i32(qc + (P1 + self.n_mma + t_l) * 4)
+            for e in cutlass.range_constexpr(4):
+                axr[e] = ld_shared_i32(qc + (P1 + 2 * self.n_mma + cidx + e) * 4)
         named_barrier_r(qbar, 128)  # staged rows visible
         for g0 in cutlass.range_constexpr(0, TW, G):
             raw = cute.make_rmem_tensor(cute.make_layout((G, 4 * NA)), cutlass.Float32)
@@ -1528,7 +1565,19 @@ class TLinear:
                 for e in cutlass.range_constexpr(4):
                     cosv[b, e] = cutlass.Float32(1)
                     sinv[b, e] = cutlass.Float32(0)
-                if normed & rope_lane:
+                if cutlass.const_expr(self.mrope):
+                    p1 = shfl_idx_i32(p_l1, g0 + b)
+                    p2 = shfl_idx_i32(p_l2, g0 + b)
+                    if normed & rope_lane:
+                        for e in cutlass.range_constexpr(4):
+                            pe = p
+                            if axr[e] == 1:
+                                pe = p1
+                            if axr[e] == 2:
+                                pe = p2
+                            cosv[b, e] = cs[pe, cidx + e]
+                            sinv[b, e] = cs[pe, half + cidx + e]
+                elif normed & rope_lane:
                     c4 = load_nc4(cs.iterator + cute.crd2idx((p, cidx), cs.layout))
                     s4 = load_nc4(cs.iterator + cute.crd2idx((p, half + cidx), cs.layout))
                     for e in cutlass.range_constexpr(4):
@@ -1730,13 +1779,16 @@ def make(w, w_sf, x_bf, x_q, x_sf, a_buf, bm, slots, ranks, scales, slice_rows, 
         if io.get("gate") is None:
             io["gate"] = io["q"]
         refs += [io["qn_w"], io["kn_w"], io["cs"], io["pos"], io["kc"], io["vc"], io["loc"],
-                 io["q"], io["gate"]]
+                 io["q"], io["gate"],
+                 io["axis"] if io.get("axis") is not None else torch.zeros(
+                     64, device=dev, dtype=torch.int32)]
     else:
         f1 = torch.zeros(16, device=dev, dtype=torch.float32)
         i1 = torch.zeros(16, device=dev, dtype=torch.int64)
         b3 = torch.zeros(1, 1, 16, device=dev, dtype=torch.bfloat16)
         b2 = torch.zeros(1, 16, device=dev, dtype=torch.bfloat16)
-        refs += [f1, f1, f1.view(1, 16), i1, b3, b3, i1, b2, b2]
+        refs += [f1, f1, f1.view(1, 16), i1, b3, b3, i1, b2, b2,
+                 torch.zeros(64, device=dev, dtype=torch.int32)]
     args = [from_dlpack(t, assumed_align=16) for t in refs]
     stream = lambda: cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = compiled or cute.compile(op, *args, stream())

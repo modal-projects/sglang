@@ -49,6 +49,24 @@ class MoELoRABatchInfo:
 
 
 @dataclass
+class AttentionInputSpec:
+    """What a fused QKV LoRA path needs to finish the attention inputs itself: q/k RMSNorm,
+    RoPE (``positions`` [T], or [3, T] with ``rotary_emb.axis_map`` for multi-axis RoPE), the
+    gated-query split and the K/V write into the cache of attention layer ``layer_id``."""
+
+    positions: torch.Tensor
+    forward_batch: object
+    layer_id: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    q_norm: torch.nn.Module
+    k_norm: torch.nn.Module
+    rotary_emb: torch.nn.Module
+    gated: bool = False
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool

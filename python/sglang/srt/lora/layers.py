@@ -564,6 +564,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+    def forward_swiglu(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """silu(gate) * up computed with the gate/up projection and its LoRA in one pass,
+        when the LoRA backend fuses it for this batch; None otherwise."""
+        if not self.lora_active:
+            return None
+        return self.lora_backend.forward_gate_up_swiglu(self, x)
+
     def __init__(
         self,
         base_layer: MergedColumnParallelLinear,
@@ -712,6 +719,13 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+    def forward_attention_inputs(self, x: torch.Tensor, spec):
+        """(q, gate) with q/k normalized and rotated and K/V written to the cache, when the
+        LoRA backend fuses the attention inputs for this batch; None otherwise."""
+        if not self.lora_active:
+            return None
+        return self.lora_backend.forward_attention_inputs(self, x, spec)
+
     def __init__(
         self,
         base_layer: QKVParallelLinear,

@@ -113,7 +113,12 @@ class Qwen2MLP(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        if self.dual_gemm.can_run(x, self.gate_up_proj):
+        # A LoRA backend may compute gate/up + LoRA + SiLU*mul in one pass (None if not).
+        fused_swiglu = getattr(self.gate_up_proj, "forward_swiglu", None)
+        act = fused_swiglu(x) if fused_swiglu is not None else None
+        if act is not None:
+            x = act
+        elif self.dual_gemm.can_run(x, self.gate_up_proj):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)

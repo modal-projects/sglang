@@ -103,6 +103,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.lora.utils import AttentionInputSpec
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -1626,6 +1627,33 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if forward_batch.forward_mode.is_decode() and hasattr(
+            self.qkv_proj, "forward_attention_inputs"
+        ):
+            # A LoRA backend may finish the attention inputs in the QKV projection:
+            # q/k norm, RoPE, the gate split and the K/V cache write (None if not).
+            fused = self.qkv_proj.forward_attention_inputs(
+                hidden_states,
+                AttentionInputSpec(
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.attn.layer_id,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    rotary_emb=self.rotary_emb,
+                    gated=bool(self.attn_output_gate),
+                ),
+            )
+            if fused is not None:
+                q, gate = fused
+                attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
+                if gate is not None:
+                    attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+                output, _ = self.o_proj(attn_output)
+                return output
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,

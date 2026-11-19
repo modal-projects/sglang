@@ -141,3 +141,125 @@ def test_prefill_uses_csgmv():
                                                        bias=None))
     x = torch.zeros(4, 256, device=DEVICE, dtype=torch.bfloat16)
     assert be._fused(layer, x, None, None, (0, 256)) is None
+
+
+# ---------------------------------------------------------------------- fused layer kinds
+def _merged_layer(N, K, offsets, seed):
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    w = (torch.randn(N, K, generator=g, device=DEVICE) * K ** -0.5).bfloat16()
+    a, b = _pool(len(offsets) - 1, K, N, seed + 1)
+    layer = SimpleNamespace(base_layer=SimpleNamespace(weight=w, bias=None), lora_a=a,
+                            lora_b=b, lora_offsets=tuple(offsets))
+    return layer, w, a, b
+
+
+@pytest.mark.parametrize("T", [1, 8, 128, 256])
+def test_gate_up_swiglu(T):
+    I, K = 4864, 2560
+    layer, w, a, b = _merged_layer(2 * I, K, (0, I, 2 * I), 5)
+    g = torch.Generator(device=DEVICE).manual_seed(6)
+    x = torch.randn(T, K, generator=g, device=DEVICE).bfloat16()
+    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
+    act = _backend(T, slots).forward_gate_up_swiglu(layer, x)
+    gu = _reference(x, w.float(), a, b, slots, (0, I, 2 * I))
+    ref = torch.nn.functional.silu(gu[:, :I]) * gu[:, I:]
+    rel = float((act.float() - ref).norm() / ref.norm())
+    assert act.shape == (T, I) and rel < 5e-3, rel
+
+
+class RMSNorm(SimpleNamespace):
+    pass
+
+
+class GemmaRMSNorm(SimpleNamespace):
+    pass
+
+
+def _rope_cache(rot, positions=4096):
+    inv = 1.0 / (1e6 ** (torch.arange(0, rot, 2, device=DEVICE).float() / rot))
+    ang = torch.arange(positions, device=DEVICE).float()[:, None] * inv[None]
+    return torch.cat([ang.cos(), ang.sin()], -1).contiguous()
+
+
+def _interleaved_axis_map(rot, section=(11, 11, 10)):
+    pairs = rot // 2
+    axes = [0] * pairs
+    for axis in (1, 2):
+        for lane in range(axis, min(3 * section[axis], pairs), 3):
+            axes[lane] = axis
+    return torch.tensor(axes, device=DEVICE)
+
+
+@pytest.mark.parametrize(
+    "T,qh,kvh,hd,rot,gated,mrope",
+    [(8, 32, 8, 128, 128, False, False), (128, 32, 8, 128, 128, False, False),
+     (1, 16, 4, 256, 64, True, False), (64, 16, 4, 256, 64, True, False),
+     (256, 16, 4, 256, 64, True, False), (32, 16, 4, 256, 64, True, True)])
+def test_attention_inputs(T, qh, kvh, hd, rot, gated, mrope):
+    from sglang.srt.lora.utils import AttentionInputSpec
+
+    K = 4096 if hd == 256 else 2560
+    qw = qh * hd * (2 if gated else 1)
+    N = qw + 2 * kvh * hd
+    offsets = (0, qw, qw + kvh * hd, N)
+    layer, w, a, b = _merged_layer(N, K, offsets, 9)
+    g = torch.Generator(device=DEVICE).manual_seed(10)
+    x = torch.randn(T, K, generator=g, device=DEVICE).bfloat16()
+    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
+    pos1 = torch.randint(0, 4000, (T,), generator=g, device=DEVICE)
+    positions = torch.stack([pos1, (pos1 + 7) % 4000, (pos1 * 3) % 4000]) if mrope else pos1
+    cache = 4 * T + 64
+    kc = torch.zeros(cache, kvh, hd, device=DEVICE, dtype=torch.bfloat16)
+    vc = torch.zeros_like(kc)
+    loc = torch.randperm(cache, device=DEVICE)[:T]
+    norm_cls = GemmaRMSNorm if gated else RMSNorm
+    qn = norm_cls(weight=(0.1 * torch.randn(hd, generator=g, device=DEVICE)).bfloat16(),
+                  variance_epsilon=1e-6)
+    kn = norm_cls(weight=(0.1 * torch.randn(hd, generator=g, device=DEVICE)).bfloat16(),
+                  variance_epsilon=1e-6)
+    cos_sin = _rope_cache(rot)
+    axis_map = _interleaved_axis_map(rot) if mrope else None
+    rope = SimpleNamespace(rotary_dim=rot, is_neox_style=True, cos_sin_cache=cos_sin,
+                           axis_map=axis_map)
+    fb = SimpleNamespace(token_to_kv_pool=SimpleNamespace(get_kv_buffer=lambda lid: (kc, vc)),
+                         out_cache_loc=loc)
+    spec = AttentionInputSpec(positions=positions, forward_batch=fb, layer_id=0, num_heads=qh,
+                              num_kv_heads=kvh, head_dim=hd, q_norm=qn, k_norm=kn,
+                              rotary_emb=rope, gated=gated)
+    q, gate = _backend(T, slots).forward_attention_inputs(layer, x, spec)
+
+    proj = _reference(x, w.float(), a, b, slots, offsets).bfloat16().float()
+    if gated:
+        qg = proj[:, :qw].view(T, qh, 2, hd)
+        q_r, g_r = qg[:, :, 0], qg[:, :, 1]
+    else:
+        q_r, g_r = proj[:, :qw].view(T, qh, hd), None
+    k_r = proj[:, qw: qw + kvh * hd].view(T, kvh, hd)
+    v_r = proj[:, qw + kvh * hd:].view(T, kvh, hd)
+
+    def gamma(n):
+        return n.weight.float() + (1.0 if isinstance(n, GemmaRMSNorm) else 0.0)
+
+    def norm_rope(t, n):
+        t = (t * torch.rsqrt((t * t).mean(-1, keepdim=True) + 1e-6) * gamma(n)).bfloat16().float()
+        h = rot // 2
+        if mrope:
+            p = positions[axis_map, :].T  # [T, rot/2]: each pair's own axis
+        else:
+            p = positions[:, None].expand(T, h)
+        idx = torch.arange(h, device=DEVICE)[None].expand(T, h)
+        co = cos_sin[p, idx][:, None]
+        si = cos_sin[p, h + idx][:, None]
+        x1, x2 = t[..., :h].clone(), t[..., h:rot].clone()
+        t[..., :h] = x1 * co - x2 * si
+        t[..., h:rot] = x2 * co + x1 * si
+        return t
+
+    def rel(u, v):
+        return float((u.float() - v).norm() / v.norm())
+
+    assert rel(q, norm_rope(q_r, qn).reshape(T, -1)) < 6e-3
+    if gated:
+        assert rel(gate, g_r.reshape(T, -1)) < 6e-3
+    assert rel(kc[loc], norm_rope(k_r, kn)) < 6e-3
+    assert rel(vc[loc], v_r) < 6e-3

@@ -30,6 +30,13 @@ def create_triton_csgmv_backend():
     return ChunkedSgmvLoRABackend
 
 
+@register_lora_backend("blackwell")
+def create_blackwell_backend():
+    from sglang.srt.lora.backend.blackwell_backend import BlackwellLoRABackend
+
+    return BlackwellLoRABackend
+
+
 @register_lora_backend("triton_v2")
 def create_triton_v2_backend():
     from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend

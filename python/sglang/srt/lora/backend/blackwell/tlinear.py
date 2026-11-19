@@ -1455,21 +1455,37 @@ class TLinear:
         (this head's q or k norm weight), loaded while the main loop runs."""
         qn_w, kn_w, cs, pos, kc, vc, loc, qo, gate_o, axis, qs0, qc = qx
         P1 = 2 * self.n_mma + self.hd
+        # padded / graph-warm-up rows can carry any position or cache slot: positions are
+        # clamped into the cos/sin table, slots outside the KV cache are skipped like -1
+        p_max = cutlass.Int64(cs.shape[0] - 1)
+        n_slots = cutlass.Int64(kc.shape[0])
         for i in cutlass.range_constexpr((self.n_mma + 127) // 128):
             t = et + i * 128
             if t < self.n_mma:
                 p = cutlass.Int32(0)
+                p1 = cutlass.Int32(0)
+                p2 = cutlass.Int32(0)
                 l = cutlass.Int32(-1)
                 if t < self.T:
-                    l = cutlass.Int32(loc[t])
+                    l64 = cutlass.Int64(loc[t])
+                    if (l64 >= 0) & (l64 < n_slots):
+                        l = cutlass.Int32(l64)
                     if cutlass.const_expr(self.mrope):
-                        p = cutlass.Int32(pos[0, t])
-                        st_shared_i32(qc + (P1 + t) * 4, cutlass.Int32(pos[1, t]))
-                        st_shared_i32(qc + (P1 + self.n_mma + t) * 4, cutlass.Int32(pos[2, t]))
+                        p = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[0, t]), 0),
+                                                      p_max))
+                        p1 = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[1, t]), 0),
+                                                       p_max))
+                        p2 = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[2, t]), 0),
+                                                       p_max))
                     else:
-                        p = cutlass.Int32(pos[t])
+                        p = cutlass.Int32(cutlass.min(cutlass.max(cutlass.Int64(pos[t]), 0),
+                                                      p_max))
+                # every row of the MMA tile, padding included, gets defined positions
                 st_shared_i32(qc + t * 4, p)
                 st_shared_i32(qc + (self.n_mma + t) * 4, l)
+                if cutlass.const_expr(self.mrope):
+                    st_shared_i32(qc + (P1 + t) * 4, p1)
+                    st_shared_i32(qc + (P1 + self.n_mma + t) * 4, p2)
         if cutlass.const_expr(self.mrope):
             if et < self.rot // 2:
                 st_shared_i32(qc + (P1 + 2 * self.n_mma + et) * 4, cutlass.Int32(axis[et]))

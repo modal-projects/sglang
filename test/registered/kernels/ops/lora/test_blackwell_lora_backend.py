@@ -191,14 +191,18 @@ def _interleaved_axis_map(rot, section=(11, 11, 10)):
 
 
 @pytest.mark.parametrize(
-    "T,qh,kvh,hd,rot,gated,mrope",
-    [(8, 32, 8, 128, 128, False, False), (128, 32, 8, 128, 128, False, False),
-     (1, 16, 4, 256, 64, True, False), (64, 16, 4, 256, 64, True, False),
-     (256, 16, 4, 256, 64, True, False), (32, 16, 4, 256, 64, True, True)])
-def test_attention_inputs(T, qh, kvh, hd, rot, gated, mrope):
+    "T,qh,kvh,hd,rot,gated,mrope,K",
+    [(8, 32, 8, 128, 128, False, False, 2560), (128, 32, 8, 128, 128, False, False, 2560),
+     (1, 16, 4, 256, 64, True, False, 4096), (64, 16, 4, 256, 64, True, False, 4096),
+     (256, 16, 4, 256, 64, True, False, 4096), (32, 16, 4, 256, 64, True, True, 4096),
+     # Qwen3.5-9B / Qwen3.8-27B attention layers as served (multi-axis RoPE)
+     (64, 16, 4, 256, 64, True, True, 4096), (8, 24, 4, 256, 64, True, False, 5120),
+     (8, 24, 4, 256, 64, True, True, 5120), (1, 16, 4, 256, 64, True, True, 4096),
+     (40, 24, 4, 256, 64, True, True, 5120),
+     (128, 24, 4, 256, 64, True, True, 5120)])
+def test_attention_inputs(T, qh, kvh, hd, rot, gated, mrope, K):
     from sglang.srt.lora.utils import AttentionInputSpec
 
-    K = 4096 if hd == 256 else 2560
     qw = qh * hd * (2 if gated else 1)
     N = qw + 2 * kvh * hd
     offsets = (0, qw, qw + kvh * hd, N)
@@ -263,3 +267,36 @@ def test_attention_inputs(T, qh, kvh, hd, rot, gated, mrope):
         assert rel(gate, g_r.reshape(T, -1)) < 6e-3
     assert rel(kc[loc], norm_rope(k_r, kn)) < 6e-3
     assert rel(vc[loc], v_r) < 6e-3
+
+
+def test_attention_inputs_ignore_padded_rows():
+    """Rows past the real batch (graph warm-up, padding) may carry any position or cache
+    slot: positions are clamped into the cos/sin table, out-of-range slots are not written."""
+    from sglang.srt.lora.utils import AttentionInputSpec
+
+    T, qh, kvh, hd, rot, K = 16, 24, 4, 256, 64, 5120
+    qw = qh * hd * 2
+    N = qw + 2 * kvh * hd
+    layer, w, a, b = _merged_layer(N, K, (0, qw, qw + kvh * hd, N), 11)
+    x = torch.randn(T, K, device=DEVICE).bfloat16()
+    slots = torch.zeros(T, device=DEVICE, dtype=torch.int32)
+    positions = torch.full((3, T), 1 << 40, device=DEVICE, dtype=torch.int64)
+    positions[:, ::2] = -(1 << 40)
+    kc = torch.zeros(64, kvh, hd, device=DEVICE, dtype=torch.bfloat16)
+    vc = torch.zeros_like(kc)
+    loc = torch.full((T,), 1 << 33, device=DEVICE, dtype=torch.int64)
+    loc[0] = 3
+    norm = GemmaRMSNorm(weight=torch.zeros(hd, device=DEVICE, dtype=torch.bfloat16),
+                        variance_epsilon=1e-6)
+    rope = SimpleNamespace(rotary_dim=rot, is_neox_style=True, cos_sin_cache=_rope_cache(rot),
+                           axis_map=_interleaved_axis_map(rot))
+    fb = SimpleNamespace(token_to_kv_pool=SimpleNamespace(get_kv_buffer=lambda lid: (kc, vc)),
+                         out_cache_loc=loc)
+    spec = AttentionInputSpec(positions=positions, forward_batch=fb, layer_id=0, num_heads=qh,
+                              num_kv_heads=kvh, head_dim=hd, q_norm=norm, k_norm=norm,
+                              rotary_emb=rope, gated=True)
+    q, _ = _backend(T, slots).forward_attention_inputs(layer, x, spec)
+    torch.cuda.synchronize()
+    assert torch.isfinite(q.float()).all()
+    written = (kc.float().abs().sum((1, 2)) > 0).nonzero().flatten().tolist()
+    assert written == [3]

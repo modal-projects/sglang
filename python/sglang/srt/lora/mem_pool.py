@@ -215,6 +215,9 @@ class LoRAMemoryPool:
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
+        # Bumped whenever a slot's weights change, so backends holding derived copies of
+        # the buffers know to refresh them (BaseLoRABackend.sync_lora_weights).
+        self.weights_version = 0
 
         # Buffer idx -> lora uid in memory pool
         # All uids are initialized as `EmptySlot` for empty buffer slots
@@ -924,6 +927,7 @@ class LoRAMemoryPool:
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
+        self.weights_version += 1
         for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
             for tensor in buffers:
                 if tensor is not None:
@@ -959,6 +963,8 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        self.weights_version += 1
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):

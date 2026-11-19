@@ -100,6 +100,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """Raise before wrapping when this backend cannot execute its targets."""
         pass
 
+    def sync_lora_weights(self, version) -> None:
+        """Called before each batch is prepared with the memory pool's weights version, which
+        changes whenever a pool slot is loaded or cleared. Backends that keep derived copies
+        of the LoRA buffers refresh them here."""
+        pass
+
     def forward_with_base(
         self,
         layer,

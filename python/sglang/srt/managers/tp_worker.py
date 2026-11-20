@@ -246,6 +246,7 @@ class BaseTpWorker(ABC):
             prepared=all(reply.prepared for reply in replies),
             message=" | ".join(dict.fromkeys(r.message for r in replies if r.message)),
             stats=slowest.stats,
+            unsupported=any(reply.unsupported for reply in replies),
         )
 
     def apply_lora_adapter(self, recv_req: ApplyLoRAAdapterReqInput):

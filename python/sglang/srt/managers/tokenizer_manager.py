@@ -96,7 +96,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
-    LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
@@ -4122,13 +4121,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "trainer instead of implicitly reloaded."
                 )
             logger.info(f"Reloading evicted adapter: {lora_path}")
-            load_result = await self.load_lora_adapter(
-                LoadLoRAAdapterReqInput(
-                    lora_name=new_lora_ref.lora_name,
-                    lora_path=new_lora_ref.lora_path,
-                    pinned=new_lora_ref.pinned,
-                )
-            )
+            load_result = await self._load_lora_adapter_on_demand(new_lora_ref)
             if (
                 not load_result.success
                 and "already loaded" not in load_result.error_message

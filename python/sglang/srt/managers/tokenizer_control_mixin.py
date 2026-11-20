@@ -6,7 +6,6 @@ import hashlib
 import logging
 import time
 import uuid
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -187,6 +186,10 @@ def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) ->
         result.success or lora_name in (result.loaded_adapters or {})
         for result in results
     )
+
+
+class _LoRAPrepareUnsupported(ValueError):
+    """The server cannot read adapters while serving: its layout or its config."""
 
 
 class TokenizerControlMixin:
@@ -845,103 +848,168 @@ class TokenizerControlMixin:
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
             )
-            logger.info(
-                "Start update Lora adapter. Lora name=%s, path=%s",
-                obj.lora_name,
-                obj.lora_path,
+            return await self._update_lora_adapter(obj)
+        except ValueError as e:
+            return LoadLoRAAdapterReqOutput(
+                success=False,
+                error_message=str(e),
             )
-            # Prepare while serving: generation and new requests go on.
-            async with self.lora_update_lock:
-                self._check_lora_update_allowed(obj.lora_name)
-                # A loaded name keeps its lora_id; a new one mints an id.
-                adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path=obj.lora_path,
-                        pinned=obj.pinned,
+
+    async def _load_lora_adapter_on_demand(
+        self: TokenizerManager, lora_ref: LoRARef
+    ) -> LoadLoRAAdapterReqOutput:
+        """Load an adapter a request names and the server does not hold. It is read
+        while serving, so only the requests that need it wait; a server that cannot
+        read adapters that way loads it in the scheduler loop."""
+        # The update resolves the name by upsert, which several tokenizer workers
+        # cannot do consistently (_validate_lora_upsert_supported).
+        if get_serving().tokenizer_worker_num == 1:
+            try:
+                return await self._update_lora_adapter(
+                    UpdateLoRAAdapterReqInput(
+                        lora_name=lora_ref.lora_name,
+                        lora_path=lora_ref.lora_path,
+                        pinned=bool(lora_ref.pinned),
                     ),
-                    upsert=True,
+                    new_name_only=True,
                 )
-                if reused and get_parallel().pp_size > 1:
-                    raise ValueError(
-                        "Replacing LoRA weights is not supported with pipeline "
-                        "parallelism"
-                    )
-                load = LoadLoRAAdapterReqInput(
+            except _LoRAPrepareUnsupported:
+                pass
+            except ValueError as e:
+                return LoadLoRAAdapterReqOutput(success=False, error_message=str(e))
+        return await self.load_lora_adapter(
+            LoadLoRAAdapterReqInput(
+                lora_name=lora_ref.lora_name,
+                lora_path=lora_ref.lora_path,
+                pinned=lora_ref.pinned,
+            )
+        )
+
+    async def _update_lora_adapter(
+        self: TokenizerManager,
+        obj: UpdateLoRAAdapterReqInput,
+        new_name_only: bool = False,
+    ) -> LoadLoRAAdapterReqOutput:
+        """Prepare on every rank while serving, then switch at one step. Without a
+        pause, lora_update_lock is held from the prepare to the switch, so no other
+        update comes between them. With new_name_only, a name loaded meanwhile stays
+        as it is."""
+        logger.info(
+            "Start update Lora adapter. Lora name=%s, path=%s",
+            obj.lora_name,
+            obj.lora_path,
+        )
+        # Prepare while serving: generation and new requests go on.
+        async with self.lora_update_lock:
+            self._check_lora_update_allowed(obj.lora_name)
+            # A loaded name keeps its lora_id; a new one mints an id.
+            adapter, reused = await self.lora_registry.register_or_reuse(
+                LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
                     pinned=obj.pinned,
-                    lora_id=adapter.lora_id,
-                    # A new name loads with ordinary failure cleanup: it has no
-                    # readers whose weights could disagree across ranks.
-                    upsert=reused,
-                )
-                prepare_id = uuid.uuid4().hex
-                # Shielded: a cancelled caller still takes its own replies, which
-                # would otherwise reach the next caller.
-                replies = await asyncio.shield(
-                    self.prepare_lora_adapter_communicator(
-                        PrepareLoRAAdapterReqInput(load=load, prepare_id=prepare_id)
-                    )
-                )
-            not_prepared = dict.fromkeys(r.message for r in replies if not r.prepared)
-            if not_prepared:
+                ),
+                upsert=True,
+            )
+            if reused and new_name_only:
+                return LoadLoRAAdapterReqOutput(success=True)
+            if reused and get_parallel().pp_size > 1:
                 raise ValueError(
+                    "Replacing LoRA weights is not supported with pipeline parallelism"
+                )
+            load = LoadLoRAAdapterReqInput(
+                lora_name=obj.lora_name,
+                lora_path=obj.lora_path,
+                pinned=obj.pinned,
+                lora_id=adapter.lora_id,
+                # A new name loads with ordinary failure cleanup: it has no readers
+                # whose weights could disagree across ranks.
+                upsert=reused,
+            )
+            prepare_id = uuid.uuid4().hex
+            # Shielded: a cancelled caller still takes its own replies, which would
+            # otherwise reach the next caller.
+            replies = await asyncio.shield(
+                self.prepare_lora_adapter_communicator(
+                    PrepareLoRAAdapterReqInput(load=load, prepare_id=prepare_id)
+                )
+            )
+            not_prepared = [r for r in replies if not r.prepared]
+            if not_prepared:
+                reasons = " | ".join(dict.fromkeys(r.message for r in not_prepared))
+                error = (
+                    _LoRAPrepareUnsupported
+                    if any(r.unsupported for r in not_prepared)
+                    else ValueError
+                )
+                raise error(
                     f"LoRA adapter '{obj.lora_name}' was not prepared while serving; "
-                    f"nothing changed. {' | '.join(not_prepared)}"
+                    f"nothing changed. {reasons}"
                 )
             logger.info(
                 "LoRA adapter %s prepared while serving: %s",
                 obj.lora_name,
                 replies[0].stats,
             )
-
-            # Switch. A retract takes is_pause_cond before lora_update_lock, never
-            # inside it: an abort pause holds is_pause_cond until requests release the
-            # model lock, and a request reloading an evicted adapter waits for
-            # lora_update_lock while holding it.
             retract = reused and obj.pause_mode == "retract"
-            pause_scope = self.is_pause_cond if retract else nullcontext()
-            async with pause_scope, self.lora_update_lock:
-                self._check_lora_update_allowed(obj.lora_name)
-                expected_id = adapter.lora_id if reused else None
-                if await self.lora_registry.get_lora_id(obj.lora_name) != expected_id:
-                    raise ValueError(
-                        f"LoRA adapter '{obj.lora_name}' changed while it was being "
-                        "prepared; nothing changed."
-                    )
-                rank_results = await self._switch_lora_adapter_on_ranks(
-                    ApplyLoRAAdapterReqInput(
-                        load=load,
-                        prepare_id=prepare_id,
-                        weight_version=obj.weight_version,
-                    ),
-                    retract,
+            if not retract:
+                return await self._switch_to_prepared_lora_adapter(
+                    obj, adapter, reused, load, prepare_id, retract=False
                 )
-                result = _merge_lora_update_results(rank_results)
-                if result.success:
-                    self._update_weight_version_if_provided(obj.weight_version)
-                    if reused:
-                        await self.lora_registry.refresh(adapter)
-                    else:
-                        await self.lora_registry.register(adapter)
-                    self.lora_ref_cache[obj.lora_name] = adapter
-                elif (
-                    not reused
-                    and obj.lora_name not in self.lora_registry.get_all_adapters()
-                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
-                ):
-                    self.pending_lora_unloads[obj.lora_name] = adapter.lora_id
 
-                for evicted in await self._evict_lru_over_cap():
-                    del result.loaded_adapters[evicted]
-
-                return result
-        except ValueError as e:
-            return LoadLoRAAdapterReqOutput(
-                success=False,
-                error_message=str(e),
+        # A retract takes is_pause_cond before lora_update_lock, never inside it: an
+        # abort pause holds is_pause_cond until requests release the model lock, and a
+        # request reloading an evicted adapter waits for lora_update_lock while
+        # holding it.
+        async with self.is_pause_cond, self.lora_update_lock:
+            self._check_lora_update_allowed(obj.lora_name)
+            if await self.lora_registry.get_lora_id(obj.lora_name) != adapter.lora_id:
+                raise ValueError(
+                    f"LoRA adapter '{obj.lora_name}' changed while it was being "
+                    "prepared; nothing changed."
+                )
+            return await self._switch_to_prepared_lora_adapter(
+                obj, adapter, reused, load, prepare_id, retract=True
             )
+
+    async def _switch_to_prepared_lora_adapter(
+        self: TokenizerManager,
+        obj: UpdateLoRAAdapterReqInput,
+        adapter: LoRARef,
+        reused: bool,
+        load: LoadLoRAAdapterReqInput,
+        prepare_id: str,
+        retract: bool,
+    ) -> LoadLoRAAdapterReqOutput:
+        """Switch every rank to what prepare_id prepared, then record the adapter.
+        The caller holds lora_update_lock."""
+        rank_results = await self._switch_lora_adapter_on_ranks(
+            ApplyLoRAAdapterReqInput(
+                load=load,
+                prepare_id=prepare_id,
+                weight_version=obj.weight_version,
+            ),
+            retract,
+        )
+        result = _merge_lora_update_results(rank_results)
+        if result.success:
+            self._update_weight_version_if_provided(obj.weight_version)
+            if reused:
+                await self.lora_registry.refresh(adapter)
+            else:
+                await self.lora_registry.register(adapter)
+            self.lora_ref_cache[obj.lora_name] = adapter
+        elif (
+            not reused
+            and obj.lora_name not in self.lora_registry.get_all_adapters()
+            and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+        ):
+            self.pending_lora_unloads[obj.lora_name] = adapter.lora_id
+
+        for evicted in await self._evict_lru_over_cap():
+            del result.loaded_adapters[evicted]
+
+        return result
 
     def _check_lora_update_allowed(self: TokenizerManager, lora_name: str) -> None:
         if lora_name in self.pending_lora_unloads:

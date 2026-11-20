@@ -3,8 +3,8 @@ then switch on every rank at one step.
 
 Covers:
   * the tokenizer: prepare before apply, the retract pause scope, a pause someone else
-    started, a failed flush, a pause asked for during an update, and the weight version
-    switching with the adapter
+    started, a failed flush, a pause asked for during an update, the weight version
+    switching with the adapter, and adapters a request names loaded while serving
   * the ranks: they apply what they prepared only when every rank holds it, and
     otherwise load as /load_lora_adapter does
   * the scheduler: one prepare at a time, no prepare where control requests reach the
@@ -23,7 +23,7 @@ import time
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 import torch
@@ -75,6 +75,7 @@ def _tokenizer(
     registry,
     *,
     prepared=True,
+    unsupported=False,
     flush_ok=True,
     applied=True,
     during_prepare=None,
@@ -91,7 +92,11 @@ def _tokenizer(
         events.append(_event(obj))
         if during_prepare is not None:
             await during_prepare()
-        return [PrepareLoRAAdapterReqOutput(prepared=prepared, message="declined")]
+        return [
+            PrepareLoRAAdapterReqOutput(
+                prepared=prepared, message="declined", unsupported=unsupported
+            )
+        ]
 
     async def update(obj):
         events.append(_event(obj))
@@ -122,16 +127,18 @@ def _tokenizer(
         _weight_update_session_open=False,
         record_config_updates=Mock(),
         applies=applies,
+        load_lora_adapter=AsyncMock(return_value=LoRAUpdateOutput(success=True)),
+        _evict_lru_over_cap=AsyncMock(return_value=[]),
     )
     return tm, events
 
 
-def _patched_tokenizer_context():
+def _patched_tokenizer_context(tokenizer_workers=1):
     return patch.multiple(
         "sglang.srt.managers.tokenizer_control_mixin",
         get_lora=lambda: SimpleNamespace(enable_lora=True, max_loaded_loras=None),
         get_parallel=lambda: SimpleNamespace(dp_size=1, pp_size=1),
-        get_serving=lambda: SimpleNamespace(tokenizer_worker_num=1),
+        get_serving=lambda: SimpleNamespace(tokenizer_worker_num=tokenizer_workers),
     )
 
 
@@ -301,6 +308,89 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
                 tm.record_config_updates.assert_not_called()
 
 
+class TestLoadOnDemand(CustomTestCase):
+    """An adapter a request names and the server does not hold."""
+
+    def _load(self, registry, name="b", tokenizer_workers=1, **kwargs):
+        tm, events = _tokenizer(registry, **kwargs)
+        with _patched_tokenizer_context(tokenizer_workers):
+            result = asyncio.run(
+                tm._load_lora_adapter_on_demand(
+                    LoRARef(lora_name=name, lora_path=f"/{name}", pinned=False)
+                )
+            )
+        return result, tm, events
+
+    def test_it_is_prepared_while_serving_and_switched_without_a_pause(self):
+        registry = LoRARegistry()
+        result, tm, events = self._load(registry)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, ["prepare", "apply"])
+        self.assertEqual(registry.get_all_adapters()["b"].lora_path, "/b")
+        tm.load_lora_adapter.assert_not_called()
+
+    def test_a_name_loaded_meanwhile_is_left_as_it_is(self):
+        registry = _registry_with_a()
+        result, _, events = self._load(registry, name="a")
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, [])
+        self.assertEqual(registry.get_all_adapters()["a"].lora_path, "/v1")
+
+    def test_a_server_that_cannot_prepare_loads_it_in_the_loop(self):
+        result, tm, events = self._load(
+            LoRARegistry(), prepared=False, unsupported=True
+        )
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, ["prepare"])
+        tm.load_lora_adapter.assert_called_once()
+        self.assertEqual(tm.load_lora_adapter.call_args.args[0].lora_path, "/b")
+
+    def test_several_tokenizer_workers_load_it_in_the_loop(self):
+        result, tm, events = self._load(LoRARegistry(), tokenizer_workers=2)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, [])
+        tm.load_lora_adapter.assert_called_once()
+
+    def test_a_failed_prepare_fails_with_the_reason(self):
+        registry = LoRARegistry()
+        result, tm, events = self._load(registry, prepared=False)
+        self.assertFalse(result.success)
+        self.assertIn("declined", result.error_message)
+        self.assertEqual(events, ["prepare"])
+        self.assertNotIn("b", registry.get_all_adapters())
+        tm.load_lora_adapter.assert_not_called()
+
+    def test_a_request_naming_it_with_its_path_has_it_loaded(self):
+        registry = LoRARegistry()
+        tm, events = _tokenizer(registry)
+        obj = SimpleNamespace(lora_path="b", lora_backfill_paths={"b": "/b"})
+        with (
+            _patched_tokenizer_context(),
+            patch(
+                "sglang.srt.managers.tokenizer_manager.get_lora",
+                return_value=SimpleNamespace(max_loaded_loras=None),
+            ),
+        ):
+            asyncio.run(TokenizerManager._resolve_lora_path(tm, obj))
+        self.assertEqual(events, ["prepare", "apply"])
+        self.assertEqual(obj.lora_id, registry.get_all_adapters()["b"].lora_id)
+
+    def test_an_update_without_a_pause_switches_before_the_next_prepares(self):
+        async def scenario():
+            tm, events = _tokenizer(
+                LoRARegistry(), during_prepare=lambda: asyncio.sleep(0)
+            )
+            await asyncio.gather(
+                tm._load_lora_adapter_on_demand(LoRARef(lora_name="b", lora_path="/b")),
+                tm._load_lora_adapter_on_demand(LoRARef(lora_name="c", lora_path="/c")),
+            )
+            return events
+
+        with _patched_tokenizer_context():
+            events = asyncio.run(scenario())
+        self.assertEqual(events, ["prepare", "apply", "prepare", "apply"])
+
+
 def _worker(manager):
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(
@@ -384,6 +474,20 @@ class TestApplyOnRanks(CustomTestCase):
         self.assertTrue(reply.prepared)
         self.assertEqual(reply.stats, {"prepare_s": 0.5})
 
+    def test_prepare_reply_says_when_the_server_cannot_prepare(self):
+        manager = Mock()
+        manager.prepare_reply.return_value = PrepareLoRAAdapterReqOutput(
+            prepared=False, message="no CPU copy", unsupported=True
+        )
+        request = PrepareLoRAAdapterReqInput(load=_apply().load, prepare_id="p1")
+        with patch(
+            "sglang.srt.managers.tp_worker.get_parallel",
+            return_value=SimpleNamespace(tp_group=MagicMock(world_size=1)),
+        ):
+            reply = BaseTpWorker.lora_prepare_reply(_worker(manager), request)
+        self.assertFalse(reply.prepared)
+        self.assertTrue(reply.unsupported)
+
 
 def _scheduler(*, pp_size=1, per_dp_group=False):
     scheduler = object.__new__(Scheduler)
@@ -435,6 +539,7 @@ class TestSchedulerPrepare(CustomTestCase):
                 with context:
                     reply = scheduler.prepare_lora_adapter(_prepare())
                 self.assertFalse(reply.prepared)
+                self.assertTrue(reply.unsupported)
                 self.assertIn("/load_lora_adapter", reply.message)
                 self.assertIsNone(scheduler.pending_lora_prepare)
                 scheduler.tp_worker.prepare_lora_adapter.assert_not_called()
@@ -470,6 +575,7 @@ class TestPreparedRecord(CustomTestCase):
             manager.prepare_lora_adapter(ref, "p1", "/tmp/node.sock")
             reply = manager.prepare_reply("p1")
             self.assertFalse(reply.prepared)
+            self.assertTrue(reply.unsupported)
             self.assertTrue(reply.message)
 
     def test_another_prepare_is_not_held(self):

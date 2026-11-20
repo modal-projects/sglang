@@ -81,11 +81,29 @@ class LoRAUpdater:
             req.set_lora_cache_epoch(self.manager.lora_cache_epochs[uid])
             req.lora_weight_version = self.manager.lora_weight_versions[uid]
 
-    def reject_failed(self, req: Req) -> bool:
-        if req.lora_id not in self.failed:
-            return False
-        self.scheduler.fail_lora_request(req, self.failed[req.lora_id])
-        return True
+    @staticmethod
+    def validate_request(req: Req) -> None:
+        if (
+            req.input_embeds is not None
+            or req.multimodal_inputs is not None
+            or req.session is not None
+            or req.beam_group is not None
+        ):
+            raise ValueError(
+                "In-place LoRA updates support text requests without sessions or beam search"
+            )
+
+    def reject_request(self, req: Req) -> bool:
+        if req.lora_id in self.failed:
+            self.scheduler.fail_lora_request(req, self.failed[req.lora_id])
+            return True
+        if req.lora_id in self.paused or req.lora_id in self.manager.lora_cache_epochs:
+            try:
+                self.validate_request(req)
+            except ValueError as exc:
+                self.scheduler.fail_lora_request(req, str(exc), status_code=400)
+                return True
+        return False
 
     def _all_ready(self, ready: bool) -> bool:
         if not torch.distributed.is_initialized():
@@ -187,7 +205,7 @@ class LoRAUpdater:
                 for req in list(self.scheduler.waiting_queue):
                     if req.lora_id == uid:
                         self.scheduler.waiting_queue.remove(req)
-                        self.reject_failed(req)
+                        self.reject_request(req)
             else:
                 self.paused.discard(uid)
             self._finish(pending.error)

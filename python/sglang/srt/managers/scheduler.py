@@ -3552,7 +3552,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if updater := getattr(self, "lora_updater", None):
-            if updater.reject_failed(req):
+            if updater.reject_request(req):
                 return
             updater.stamp(req)
         if not self._set_or_validate_priority(req):
@@ -3645,7 +3645,7 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
-        if self.enable_priority_scheduling:
+        if self.enable_priority_scheduling and queued:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
@@ -6202,7 +6202,11 @@ class Scheduler(
         unsupported = (
             not is_cuda()
             or not get_lora().enable_lora
+            or not self.is_generation
+            or self.dllm_config is not None
             or get_parallel().pp_size != 1
+            or get_parallel().attn_cp_size != 1
+            or get_parallel().dcp_size != 1
             or get_parallel().attn_dp_enabled
             or self.disaggregation_mode != DisaggregationMode.NULL
             or not self.spec_algorithm.is_none()
@@ -6214,7 +6218,7 @@ class Scheduler(
             self.send_control_output(
                 LoRAUpdateOutput(
                     success=False,
-                    error_message="In-place LoRA updates require NVIDIA CUDA and standard TP serving without PP, DP attention, speculation, continuous input polling or hierarchical cache",
+                    error_message="In-place LoRA updates require NVIDIA CUDA and standard TP serving without PP, CP, DP attention, speculation, continuous input polling or hierarchical cache",
                 ),
                 request,
             )
@@ -6228,15 +6232,8 @@ class Scheduler(
         if self.chunked_req is not None:
             requests.add(self.chunked_req)
         for req in requests:
-            if req.lora_id == uid and (
-                req.input_embeds is not None
-                or req.multimodal_inputs is not None
-                or req.session is not None
-                or req.beam_group is not None
-            ):
-                raise ValueError(
-                    "In-place LoRA updates support text requests without sessions or beam search"
-                )
+            if req.lora_id == uid:
+                LoRAUpdater.validate_request(req)
         if self.enable_overlap:
             while self.result_queue:
                 batch, result = self.result_queue.popleft()
@@ -6244,15 +6241,18 @@ class Scheduler(
         requests = self.collect_inflight_reqs() | set(self.waiting_queue)
         if self.chunked_req is not None:
             requests.add(self.chunked_req)
-        affected = [
-            req for req in requests if req.lora_id == uid and not req.finished()
-        ]
+        affected = sorted(
+            (req for req in requests if req.lora_id == uid and not req.finished()),
+            key=lambda req: req.rid,
+        )
+        affected_set = set(affected)
         seen = set()
         for batch in (self.running_batch, self.last_batch):
             if batch is not None and id(batch) not in seen:
                 seen.add(id(batch))
-                batch.filter_batch(reqs_to_exclude=affected)
-        if self.chunked_req in affected:
+                if any(req in affected_set for req in batch.reqs):
+                    batch.filter_batch(reqs_to_exclude=affected_set)
+        if self.chunked_req in affected_set:
             self.chunked_req = None
         manager = self.tp_worker.model_runner.lora_manager
         event = manager.pending_lora_load_events.pop(uid, None)
@@ -6283,8 +6283,10 @@ class Scheduler(
                 req.arrival_processed_tokens = self.processed_tokens_counter
         self.running_batch.batch_is_full = False
 
-    def fail_lora_request(self, req: Req, message: str) -> None:
-        prepare_abort(req, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+    def fail_lora_request(
+        self, req: Req, message: str, status_code: int = HTTPStatus.SERVICE_UNAVAILABLE
+    ) -> None:
+        prepare_abort(req, message, status_code=status_code)
         self._release_aborted_request(req)
         self.output_streamer.stream_output([req], req.return_logprob)
 

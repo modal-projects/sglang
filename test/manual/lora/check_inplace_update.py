@@ -105,7 +105,8 @@ def stream(
                 continue
             last = json.loads(line[6:])
             count = last["meta_info"]["completion_tokens"]
-            samples.append((time.monotonic(), count))
+            if not samples or count > samples[-1][1]:
+                samples.append((time.monotonic(), count))
             if count >= 32:
                 started.set()
     assert last is not None
@@ -172,8 +173,15 @@ def run(url: str, root: Path, tokens: int) -> dict[str, Any]:
             a, b = [future.result(timeout=180) for future in futures]
         assert len(token_ids(a)) == len(token_ids(b)) == tokens
         b_gaps = [right[0] - left[0] for left, right in zip(samples[1], samples[1][1:])]
+        left, right = max(
+            zip(samples[1], samples[1][1:]), key=lambda pair: pair[1][0] - pair[0][0]
+        )
         result = {
             "update": update,
+            "b_max_gap_from_token": left[1],
+            "b_max_gap_to_token": right[1],
+            "b_max_gap_start_relative_to_update_s": left[0] - started,
+            "b_max_gap_end_relative_to_update_s": right[0] - started,
             "window_s": ended - started,
             "b_tokens_during_window": sum(
                 started <= timestamp <= ended for timestamp, _ in samples[1]
@@ -238,7 +246,86 @@ def run(url: str, root: Path, tokens: int) -> dict[str, Any]:
             result["version_spans"] = spans
             result["fresh_prefix_tokens_verified"] = count
         results.append(result)
-    return {"model": MODEL, "tokens_per_request": tokens, "cases": results}
+    migration = check_version_migration(url, prompt, root, tokens)
+    return {
+        "model": MODEL,
+        "tokens_per_request": tokens,
+        "cases": results,
+        "migration": migration,
+    }
+
+
+def check_version_migration(
+    url: str, prompt: list[int], root: Path, tokens: int
+) -> dict[str, Any]:
+    print("Streaming case: requests starting on different policy versions", flush=True)
+    events = [threading.Event() for _ in range(3)]
+    samples: list[list[tuple[float, int]]] = [[], [], []]
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        old = executor.submit(stream, url, "A", prompt, tokens, events[0], samples[0])
+        peer = executor.submit(stream, url, "B", prompt, tokens, events[1], samples[1])
+        assert events[0].wait(120) and events[1].wait(120)
+        post(
+            url,
+            "/update_lora_adapter",
+            {
+                "lora_name": "A",
+                "lora_path": str(root / "a1"),
+                "version": "v3",
+                "expected_version": "v2",
+            },
+        )
+        new = executor.submit(stream, url, "A", prompt, tokens, events[2], samples[2])
+        assert events[2].wait(120)
+        started = time.monotonic()
+        updated = post(
+            url,
+            "/update_lora_adapter",
+            {
+                "lora_name": "A",
+                "lora_path": str(root / "a2"),
+                "version": "v4",
+                "expected_version": "v3",
+            },
+        )
+        ended = time.monotonic()
+        assert set(updated["loaded_adapters"]) == {"A", "B", "reference"}
+        a_old, a_new, b = [future.result(timeout=180) for future in (old, new, peer)]
+    for result, versions in ((a_old, ["v2", "v3", "v4"]), (a_new, ["v3", "v4"])):
+        spans = result["meta_info"]["weight_versions"]
+        assert [span["version"] for span in spans] == versions, spans
+        assert len(token_ids(result)) == tokens
+        boundary = spans[-1]["start"]
+        count = min(8, tokens - boundary)
+        reference = post(
+            url,
+            "/generate",
+            {
+                "input_ids": prompt + token_ids(result)[:boundary],
+                "lora_path": "reference",
+                "return_logprob": True,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": count,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        assert token_ids(result)[boundary : boundary + count] == token_ids(reference)
+    assert b["meta_info"]["num_retractions"] == 0
+    assert all(
+        span["version"] not in ("v3", "v4")
+        for span in b["meta_info"].get("weight_versions", [])
+    )
+    return {
+        "old_request_spans": a_old["meta_info"]["weight_versions"],
+        "new_request_spans": a_new["meta_info"]["weight_versions"],
+        "update_s": ended - started,
+        "b_tokens_during_update": sum(
+            started <= timestamp <= ended for timestamp, _ in samples[1]
+        ),
+        "b_retractions": b["meta_info"]["num_retractions"],
+    }
 
 
 def main() -> None:

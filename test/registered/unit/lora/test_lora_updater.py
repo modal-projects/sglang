@@ -58,6 +58,9 @@ class Request:
 class Req:
     def __init__(self, uid: str) -> None:
         self.lora_id = uid
+        self.input_embeds = self.multimodal_inputs = self.session = self.beam_group = (
+            None
+        )
         self.output_ids = [1, 2]
         self.lora_weight_version = None
         self.cache_epoch = "original"
@@ -131,7 +134,7 @@ class Scheduler:
             if req.lora_id == uid:
                 req.kv = None
 
-    def fail_lora_request(self, req: Req, message: str) -> None:
+    def fail_lora_request(self, req: Req, message: str, status_code: int = 503) -> None:
         req.error = message
 
 
@@ -219,7 +222,7 @@ def test_partial_upload_rolls_back_or_blocks_only_the_failed_adapter(
         assert updater.is_paused("a")
         assert scheduler.a.error
         new = Req("a")
-        assert updater.reject_failed(new) and new.error
+        assert updater.reject_request(new) and new.error
         manager.upload_error = manager.rollback_error = False
         updater.submit(Request(version="v3", cache_epoch="epoch3"))
         updater.executor.run()
@@ -290,3 +293,14 @@ def test_unload_releases_failed_adapter_state(runtime: tuple) -> None:
     assert not updater.is_paused("a") and updater.is_paused("b")
     assert updater.failed == {"b": "failed B"}
     assert set(updater.retained) == {scheduler.b}
+
+
+def test_updated_adapter_rejects_stale_session_state_without_restricting_peers(
+    runtime: tuple,
+) -> None:
+    scheduler, updater = runtime
+    scheduler.manager.lora_cache_epochs["a"] = "epoch2"
+    a, b = Req("a"), Req("b")
+    a.session = b.session = object()
+    assert updater.reject_request(a) and a.error
+    assert not updater.reject_request(b) and b.error is None

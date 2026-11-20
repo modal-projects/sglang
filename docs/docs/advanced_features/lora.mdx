@@ -574,7 +574,7 @@ trajectory that spans policy versions.
 
 Updates require unchanged rank, alpha, target modules, tensor keys, shapes and
 dtypes. The supported configuration is a single serving replica with tensor
-parallelism, standard text generation, and no pipeline parallelism, DP
+parallelism, autoregressive text generation, and no pipeline or context parallelism, DP
 attention, speculative decoding, continuous input polling, hierarchical cache,
 sessions or beam search. Existing `/load_lora_adapter` and immutable adapter
 names retain their behavior; this endpoint updates only the named adapter.

@@ -15,6 +15,7 @@
 
 import json
 import logging
+from sglang.srt.observability.log_redaction import redact_content, redact_exception
 from typing import Dict, List, Optional, Tuple, Union
 
 import interegular
@@ -154,7 +155,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
-            logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            logger.error(
+                f"Hit invalid regex schema: regex={redact_content(regex)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
 
         jump_forward_map = None
@@ -178,7 +182,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             json.decoder.JSONDecodeError,
             ValueError,
         ) as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._compile_regex(regex)
 

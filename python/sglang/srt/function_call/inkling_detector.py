@@ -1,5 +1,6 @@
 import json
 import logging
+from sglang.srt.observability.log_redaction import redact_text
 from collections.abc import Mapping
 from typing import List, Optional
 
@@ -300,7 +301,9 @@ class InklingDetector(BaseFormatDetector):
         name = payload.get("name")
         args = payload.get("args")
         if not isinstance(name, str) or not isinstance(args, Mapping):
-            logger.warning("Invalid Inkling tool call payload: %s", payload)
+            logger.warning(
+                "Invalid Inkling tool call payload: %s", redact_text(payload)
+            )
             return None
 
         if not hasattr(self, "_tool_indices"):

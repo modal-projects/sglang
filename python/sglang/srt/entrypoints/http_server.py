@@ -68,6 +68,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from uvicorn.supervisors.multiprocess import Multiprocess
 
+from sglang.srt.observability.log_redaction import redact_exception, redact_text
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -583,7 +584,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
-    logger.info("%s %s: %.500s", exc.status_code, request.url.path, exc.detail)
+    logger.info(
+        "%s %s: %.500s", exc.status_code, request.url.path, redact_text(exc.detail)
+    )
     if request.url.path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
         anthropic_type = {
@@ -643,8 +646,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
-    # Log field paths and messages only; error inputs can hold request content.
-    reasons = [(e.get("loc"), e.get("msg")) for e in exc.errors()]
+    # Field paths and error types are safe; messages and inputs can hold request content.
+    reasons = [
+        (e.get("loc"), e.get("type"), redact_text(e.get("msg"))) for e in exc.errors()
+    ]
     logger.info("400 %s: %.500s", request.url.path, reasons)
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
@@ -974,7 +979,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                         "retryable": False,
                     }
                 }
-                logger.error(f"[http_server] Error: {e}")
+                logger.error(f"[http_server] Error: {redact_exception(e)}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -990,7 +995,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return orjson_response(ret)
         except ValueError as e:
-            logger.error(f"[http_server] Error: {e}")
+            logger.error(f"[http_server] Error: {redact_exception(e)}")
             return _create_error_response(e)
 
 

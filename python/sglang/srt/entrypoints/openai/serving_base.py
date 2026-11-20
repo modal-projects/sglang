@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
+from sglang.srt.observability.log_redaction import redact_text
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
@@ -210,7 +211,7 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
-        logger.info("%s %s: %.500s", status_code, err_type, message)
+        logger.info("%s %s: %.500s", status_code, err_type, redact_text(message))
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",

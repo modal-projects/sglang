@@ -15,6 +15,7 @@
 
 import json
 import logging
+from sglang.srt.observability.log_redaction import redact_content
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -216,7 +217,9 @@ class BaseGrammarBackend:
         return None
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
-        logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+        logger.warning(
+            f"Skip unsupported {key_type=}, key_string={redact_content(key_string)}"
+        )
         return InvalidGrammarObject()
 
     @property

@@ -34,6 +34,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.observability.log_redaction import redact_content
 from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
 from sglang.srt.parser.chat_parsing.response_parser import ResponseParser
 from sglang.srt.parser.chat_parsing.response_templates import (
@@ -404,7 +405,7 @@ class ResponseTemplateStreamAdapter:
             return value
         value = value[_RAW_MEMBERS_KEY]
         if not isinstance(value, list):
-            logger.warning("response_template: malformed tool call value: %r", value)
+            logger.warning("response_template: malformed tool call value: %s", redact_content(value))
             return []
         members = []
         for member in value:
@@ -414,7 +415,8 @@ class ResponseTemplateStreamAdapter:
                 members.append(self._parser._coerce_tool_calls(call))
             except (KeyError, TypeError, ValueError):
                 logger.warning(
-                    "response_template: malformed tool call value: %r", member
+                    "response_template: malformed tool call value: %s",
+                    redact_content(member),
                 )
         return members
 
@@ -586,7 +588,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             name = function["name"]
             arguments = function["arguments"]
         except (TypeError, KeyError):
-            logger.warning("response_template: malformed tool call value: %r", value)
+            logger.warning("response_template: malformed tool call value: %s", redact_content(value))
             return None
 
         if not isinstance(name, str):

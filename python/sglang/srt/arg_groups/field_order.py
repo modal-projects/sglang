@@ -551,5 +551,6 @@ POSITIONAL_FIELD_ORDER = (
     "unified_cache_external_linker_config",
     "layernorm_sp_graph_min_tokens",
     "speculative_draft_kv_bundling",
+    "log_request_content_on_error",
 )
 # fmt: on

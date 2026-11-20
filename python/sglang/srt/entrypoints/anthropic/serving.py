@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.observability.log_redaction import redact_content, redact_text
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -759,7 +760,9 @@ class AnthropicServing:
             raise
         except HTTPException as e:
             logger.warning(
-                "Non-streaming request rejected: %s %s", e.status_code, e.detail
+                "Non-streaming request rejected: %s %s",
+                e.status_code,
+                redact_text(e.detail),
             )
             return self._error_response(
                 status_code=e.status_code,
@@ -1223,8 +1226,8 @@ class AnthropicServing:
                         if content_block_type != "tool_use":
                             logger.warning(
                                 "Dropping tool_call argument delta with no "
-                                "open tool_use block: %r",
-                                (tc_func.arguments or "")[:100],
+                                "open tool_use block: %s",
+                                redact_content(tc_func.arguments[:100]),
                             )
                             continue
                         yield _emit(

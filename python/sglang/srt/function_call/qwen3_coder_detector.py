@@ -1,5 +1,6 @@
 import json
 import logging
+from sglang.srt.observability.log_redaction import redact_text
 import re
 from typing import Any, List, Optional
 
@@ -128,7 +129,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 param_value = int(param_value)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
+                    f"Parsed value '{redact_text(param_value)}' of parameter '{param_name}' is not an integer in tool "
                     f"'{func_name}', degenerating to string."
                 )
             return param_value
@@ -142,7 +143,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_value = int(param_value)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
+                    f"Parsed value '{redact_text(param_value)}' of parameter '{param_name}' is not a float in tool "
                     f"'{func_name}', degenerating to string."
                 )
             return param_value
@@ -150,7 +151,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             param_value = param_value.lower()
             if param_value not in ["true", "false"]:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
+                    f"Parsed value '{redact_text(param_value)}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
                 )
             return param_value == "true"
         else:
@@ -164,14 +165,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     return param_value
                 except Exception:
                     logger.warning(
-                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
+                        f"Parsed value '{redact_text(param_value)}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
                     )
             try:
                 param_value = safe_literal_eval(param_value)
             except Exception:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                    f"Parsed value '{redact_text(param_value)}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
                 )
             return param_value
 

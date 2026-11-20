@@ -15,6 +15,11 @@ from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObjec
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.observability.log_redaction import (
+    redact_content,
+    redact_exception,
+    redact_text,
+)
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -189,7 +194,11 @@ class GrammarManager:
                         error_msg = (
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
-                        req.set_finish_with_abort(error_msg)
+                        req.set_finish_with_abort(
+                            error_msg,
+                            log_msg=f"Failed to compile {key[0]} grammar: "
+                            f"{redact_text(value.error_message)}",
+                        )
                     else:
                         self._apply_request_reasoning_config(req)
         elif self._enable_strict_thinking:
@@ -303,15 +312,19 @@ class GrammarManager:
                 req.grammar = req.grammar.result()
             except Exception as e:
                 logger.error(
-                    f"Grammar compilation raised an exception: {e}, "
-                    f"grammar_key={req.grammar_key}"
+                    f"Grammar compilation raised an exception: {redact_exception(e)}, "
+                    f"grammar_key=({req.grammar_key[0]!r}, {redact_content(req.grammar_key[1])})"
                 )
                 req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
-                req.set_finish_with_abort(error_msg)
+                req.set_finish_with_abort(
+                    error_msg,
+                    log_msg=f"Failed to compile {req.grammar_key[0]} grammar: "
+                    f"{redact_text(req.grammar.error_message)}",
+                )
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -324,7 +337,11 @@ class GrammarManager:
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
+            req.set_finish_with_abort(
+                error_msg,
+                log_msg="Grammar preprocessing timed out: "
+                f"grammar_key=({req.grammar_key[0]!r}, {redact_content(req.grammar_key[1])})",
+            )
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

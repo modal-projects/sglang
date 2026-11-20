@@ -55,6 +55,10 @@ class Observability(msgspec.Struct):
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
     ] = None
+    log_request_content_on_error: A[
+        bool,
+        "Include request and output content (token ids, grammars, tool arguments) in error and watchdog logs. When off, these logs report sizes only. Independent of --log-requests.",
+    ] = False
     uvicorn_access_log_exclude_prefixes: A[
         List[str],
         Arg(

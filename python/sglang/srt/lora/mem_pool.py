@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import re
 from typing import (
@@ -25,6 +26,12 @@ from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.lora_slot_weights import (
+    LoRASlotWeights,
+    SlotBufferKey,
+    TracedSlotWrite,
+    slot_regions,
+)
 from sglang.srt.lora.utils import (
     ATTN_TP_LORA_MODULE_NAMES,
     EMBEDDING_NAMES,
@@ -141,6 +148,19 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
 
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
+
+    _LAYER_SLOT_BUFFERS = ("A_buffer", "B_buffer")
+    _MODULE_SLOT_BUFFERS = (
+        "embedding_A_buffer",
+        "embedding_B_buffer",
+        "lm_head_A_buffer",
+        "lm_head_B_buffer",
+        "new_embeddings_buffer",
+    )
+    _trace_slot_write: Optional[
+        Callable[[torch.Tensor, Optional[torch.Tensor]], None]
+    ] = None
+    _fused_shared_moes: Optional[Dict[int, torch.nn.Module]] = None
 
     supports_dp_attention_overlap_loading = False
 
@@ -870,7 +890,7 @@ class LoRAMemoryPool:
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
-        lora_adapters: Dict[str, LoRAAdapter],
+        lora_adapters: Dict[str, Union[LoRAAdapter, LoRASlotWeights]],
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_refs: Dict[str, LoRARef],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
@@ -1041,17 +1061,99 @@ class LoRAMemoryPool:
         self.invalid_uids.discard(uid)
         return buffer_id
 
+    def _iter_slot_buffers(self) -> Iterator[Tuple[SlotBufferKey, torch.Tensor]]:
+        for attr in self._LAYER_SLOT_BUFFERS:
+            for name, per_layer in getattr(self, attr).items():
+                for layer_id, tensor in enumerate(per_layer):
+                    yield (attr, name, layer_id), tensor
+        for attr in self._MODULE_SLOT_BUFFERS:
+            for name, tensor in getattr(self, attr).items():
+                yield (attr, name, None), tensor
+
+    def _slot_buffer(self, key: SlotBufferKey) -> torch.Tensor:
+        attr, name, layer_id = key
+        buffers = getattr(self, attr)[name]
+        return buffers if layer_id is None else buffers[layer_id]
+
+    @contextlib.contextmanager
+    def tracing_writes(self) -> Iterator[List[TracedSlotWrite]]:
+        """Record the install's slot writes instead, on meta stand-in buffers."""
+        saved = {
+            attr: getattr(self, attr)
+            for attr in self._LAYER_SLOT_BUFFERS + self._MODULE_SLOT_BUFFERS
+        }
+        keys: Dict[int, SlotBufferKey] = {}
+        stand_ins: Dict[str, Dict] = {attr: {} for attr in saved}
+        for key, tensor in self._iter_slot_buffers():
+            attr, name, layer = key
+            stand_in = torch.empty(
+                (1, *tensor.shape[1:]), dtype=tensor.dtype, device="meta"
+            )
+            keys[id(stand_in)] = key
+            if layer is None:
+                stand_ins[attr][name] = stand_in
+            else:
+                stand_ins[attr].setdefault(name, []).append(stand_in)
+        writes: List[TracedSlotWrite] = []
+
+        def trace(buffer_view: torch.Tensor, weight: Optional[torch.Tensor]):
+            buffer = buffer_view if buffer_view._base is None else buffer_view._base
+            writes.append(
+                TracedSlotWrite(
+                    key=keys[id(buffer)],
+                    slot_numel=buffer.numel(),
+                    offset=buffer_view.storage_offset(),
+                    strides=tuple(buffer_view.stride()),
+                    shape=tuple(buffer_view.shape),
+                    weight=weight,
+                )
+            )
+
+        pin_memory_available = self.pin_memory_available
+        for attr, value in stand_ins.items():
+            setattr(self, attr, value)
+        self._trace_slot_write = trace
+        self.pin_memory_available = False
+        try:
+            yield writes
+        finally:
+            self._trace_slot_write = None
+            self.pin_memory_available = pin_memory_available
+            for attr, value in saved.items():
+                setattr(self, attr, value)
+
+    def load_slot_weights(self, buffer_id: int, weights: LoRASlotWeights) -> None:
+        """Copy each region of `weights` into slot `buffer_id` on the current stream."""
+        sources = weights.regions
+        if self.pin_memory_available and not all(s.is_pinned() for s in sources):
+            placement = weights.placement
+            pinned = torch.empty(
+                placement.numel, dtype=placement.dtype, pin_memory=True
+            )
+            for target, source in zip(slot_regions(placement, pinned), sources):
+                target.copy_(source)
+            sources = slot_regions(placement, pinned)
+            if self.enable_lora_overlap_loading:
+                # Overlap loading keeps CPU copies pinned, as
+                # _get_maybe_cached_weight_for_transfer does; this copy replaces it.
+                weights.regions = sources
+        for region, source in zip(weights.placement.regions, sources):
+            self._slot_buffer(region.key)[buffer_id].view(-1).copy_(
+                source, non_blocking=True
+            )
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
         buffer_id: int,
-        lora_adapter: LoRAAdapter,
+        lora_adapter: Union[LoRAAdapter, LoRASlotWeights],
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
         *,
         validate_only: bool = False,
     ):
+        # Every slot write goes through here: tracing_writes records placements from it.
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
@@ -1060,6 +1162,9 @@ class LoRAMemoryPool:
                     f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 )
             if validate_only:
+                return
+            if self._trace_slot_write is not None:
+                self._trace_slot_write(buffer_view, weight)
                 return
             if weight is None:
                 buffer_view.zero_()
@@ -1072,6 +1177,10 @@ class LoRAMemoryPool:
             return
 
         assert lora_adapter is not None
+        if isinstance(lora_adapter, LoRASlotWeights):
+            if not validate_only:
+                self.load_slot_weights(buffer_id, lora_adapter)
+            return
         lora_rank = lora_adapter.config.r
 
         # Pre-validate weight names against target modules across all layers
@@ -1094,7 +1203,7 @@ class LoRAMemoryPool:
                 matched_modules.add(target_module)
             except ValueError:
                 skipped_weight_names.add(name)
-        if matched_modules:
+        if matched_modules and self._trace_slot_write is None:
             logger.info(
                 "LoRA adapter '%s': loaded weights for target modules %s.",
                 uid,

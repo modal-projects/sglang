@@ -53,6 +53,149 @@ def _mxfp8_base(base) -> bool:
     )
 
 
+def block_fp8_e8(base):
+    """Per row, per 32 K UE8M0 exponents [N, K/32] (uint8) of a 128x128 block-FP8 linear whose
+    scales are UE8M0: SGLang's DeepGEMM requant on Blackwell (packed int32, 4 K-groups per
+    word, MN major) or power-of-two FP32 block scales. None when they are not UE8M0."""
+    w = getattr(base, "weight", None)
+    s = getattr(base, "weight_scale_inv", None)
+    if w is None or s is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2:
+        return None
+    N, K = w.shape
+    kg = -(-K // 128)
+    if s.dtype == torch.int32 and getattr(s, "format_ue8m0", False) and s.dim() == 2:
+        # a fresh row-major copy: DeepGEMM keeps a TMA-aligned stride even on a size-1 dim
+        e8 = s.new_empty(s.shape).copy_(s).view(torch.uint8).reshape(s.shape[0], -1)
+        if e8.shape[0] < N or e8.shape[1] < kg:
+            return None
+        e8 = e8[:N, :kg]
+    elif s.dtype == torch.float32 and tuple(s.shape) == (-(-N // 128), kg):
+        if not bool((torch.frexp(s)[0] == 0.5).all()):
+            return None
+        e8 = ((s.contiguous().view(torch.int32) >> 23) & 255).to(torch.uint8)
+        e8 = e8.repeat_interleave(128, dim=0)[:N]
+    else:
+        return None
+    return e8.repeat_interleave(4, dim=1)[:, : K // 32].contiguous()
+
+
+def _block_fp8_sf(base):
+    """Swizzled MX scales (per row, per 32 K) of a UE8M0 block-FP8 linear (block_fp8_e8),
+    cached on the layer (the weights are read in place); None when not UE8M0."""
+    cached = getattr(base, "_bw_mx_sf", None)
+    if cached is not None:
+        return cached
+    e8 = block_fp8_e8(base)
+    if e8 is None:
+        return None
+    N, K = base.weight.shape
+    rows, cols = -(-N // 128) * 128, -(-(K // 32) // 4) * 4
+    sf = torch.full((rows, cols), 127, dtype=torch.uint8, device=e8.device)
+    sf[:N, : K // 32] = e8
+    base._bw_mx_sf = _swizzle_sf(sf)
+    return base._bw_mx_sf
+
+
+def _swizzle_sf(sf):
+    """[R, C] UE8M0 (R % 128 == 0, C % 4 == 0) -> FlashInfer's 128x4 swizzled layout (flat)."""
+    R, C = sf.shape
+    return sf.view(R // 128, 4, 32, C // 4, 4).permute(0, 3, 2, 1, 4).reshape(-1).contiguous()
+
+
+def _unswizzle_sf(sf, rows, cols):
+    """Inverse of _swizzle_sf for a [rows, cols] matrix stored padded to 128 x 4 atoms."""
+    R, C = -(-rows // 128) * 128, -(-cols // 4) * 4
+    flat = sf.reshape(-1).view(torch.uint8)[: R * C]
+    return flat.view(R // 128, C // 4, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(R, C)[:rows, :cols]
+
+
+class _SplitPiece:
+    pass
+
+
+class _SplitState:
+    """Per-layer copies for _fused_split: slice weights (K padded), re-swizzled scales, and
+    the slice's LoRA A [slots, 32, Kp] / B mirror [rows, slots * 32] (refreshed per adapter
+    load)."""
+
+    def __init__(self, base, rows):
+        w = base.weight
+        self.N, self.K = w.shape
+        self.Kp = -(-self.K // 128) * 128
+        kc, kcp = self.K // 32, self.Kp // 32
+        sf_lin = _unswizzle_sf(base.weight_scale_inv_swizzled, self.N, kc)
+        self.pieces = []
+        sizes = [b - a for a, b in zip((0,) + tuple(rows[:-1]), rows)]
+        # merged: every slice padded to a 128-row multiple inside one weight copy, so a single
+        # standard multi-slice launch covers them; the output columns are gathered back
+        self.merged = len(rows) > 1 and len(set(sizes)) == 1 and sizes[0] % 128 != 0
+        if self.merged:
+            n = sizes[0]
+            npad = -(-n // 128) * 128
+            pc = _SplitPiece()
+            pc.r0, pc.r1, pc.n_pad = 0, self.N, npad * len(rows)
+            pc.slice_n, pc.slice_pad = n, npad
+            wp = torch.zeros(pc.n_pad, self.Kp, dtype=torch.uint8, device=w.device)
+            sfp = torch.full((pc.n_pad, kcp), 127, dtype=torch.uint8, device=w.device)
+            for i in range(len(rows)):
+                wp[i * npad:i * npad + n, : self.K] = w[i * n:(i + 1) * n].view(torch.uint8)
+                sfp[i * npad:i * npad + n, :kc] = sf_lin[i * n:(i + 1) * n]
+            pc.w = wp.view(torch.float8_e4m3fn)
+            pc.sf = _swizzle_sf(sfp)
+            pc.a = pc.b = None
+            self.pieces.append(pc)
+            self.version = None
+            return
+        r0 = 0
+        for r1 in rows:
+            pc = _SplitPiece()
+            pc.r0, pc.r1, n = r0, r1, r1 - r0
+            pc.n_pad = -(-n // 128) * 128
+            wp = torch.zeros(n, self.Kp, dtype=torch.uint8, device=w.device)
+            wp[:, : self.K] = w[r0:r1].view(torch.uint8)
+            pc.w = wp.view(torch.float8_e4m3fn)
+            sfp = torch.full((pc.n_pad, kcp), 127, dtype=torch.uint8, device=w.device)
+            sfp[:n, :kc] = sf_lin[r0:r1]
+            pc.sf = _swizzle_sf(sfp)
+            pc.a = pc.b = None
+            self.pieces.append(pc)
+            r0 = r1
+        self.lora_a = self.lora_b = None
+
+    def bind(self, lora_a, lora_b):
+        """First use: allocate the slice copies once (CUDA graphs keep these addresses)."""
+        self.lora_a, self.lora_b = lora_a, lora_b
+        if self.merged:
+            pc = self.pieces[0]
+            pc.a = torch.zeros(lora_a.shape[0], lora_a.shape[1], self.Kp, dtype=lora_a.dtype,
+                               device=lora_a.device)
+            pc.b = torch.zeros(pc.n_pad, lora_b.shape[0] * RANK, dtype=lora_b.dtype,
+                               device=lora_b.device)
+            self.refresh()
+            return
+        for pc in self.pieces:
+            pc.a = torch.zeros(lora_a.shape[0], RANK, self.Kp, dtype=lora_a.dtype,
+                               device=lora_a.device)
+            pc.b = torch.empty(pc.r1 - pc.r0, lora_b.shape[0] * RANK, dtype=lora_b.dtype,
+                               device=lora_b.device)
+        self.refresh()
+
+    def refresh(self):
+        """In place, from the pool buffers (after an adapter load or clear)."""
+        if self.merged:
+            pc = self.pieces[0]
+            n, npad = pc.slice_n, pc.slice_pad
+            pc.a[:, :, : self.K].copy_(self.lora_a[:, :, : self.K])
+            for i in range(self.N // n):
+                pc.b[i * npad:i * npad + n].copy_(
+                    self.lora_b[:, i * n:(i + 1) * n].permute(1, 0, 2).reshape(n, -1))
+            return
+        for i, pc in enumerate(self.pieces):
+            pc.a[:, :, : self.K].copy_(self.lora_a[:, i * RANK:(i + 1) * RANK, : self.K])
+            pc.b.copy_(self.lora_b[:, pc.r0:pc.r1].permute(1, 0, 2)
+                       .reshape(pc.r1 - pc.r0, -1))
+
+
 class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
     name = "blackwell"
 
@@ -64,6 +207,7 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         self._mirrored = []  # layers holding a LoRA-B mirror
         self._weights_version = None
         self._rejected = set()
+        self._split_layers = []
 
     # ------------------------------------------------------------------ pool sync
     def sync_lora_weights(self, version) -> None:
@@ -71,6 +215,11 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         if version == self._weights_version:
             return
         self._weights_version = version
+        from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+        bw_experts.refresh_mirrors(version)
+        for st in self._split_layers:
+            st.refresh()
         for layer in self._mirrored:
             b = layer.lora_b
             layer._blackwell_b_mirror.copy_(b.permute(1, 0, 2).reshape(b.shape[1], -1))
@@ -140,12 +289,24 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
             return self._reject(layer, f"A {tuple(lora_a.shape)} B {tuple(lora_b.shape)}")
         slices = lora_a.shape[1] // RANK
         rows = tuple(int(o) for o in offsets[1:])
-        if len(rows) != slices or rows[-1] != N or any(r % 128 for r in rows[:-1]) or N % 128:
+        if len(rows) != slices or rows[-1] != N:
             return self._reject(layer, f"slices {rows} N={N}")
         mx = w.dtype == torch.float8_e4m3fn
+        if any(r % 128 for r in rows[:-1]) or N % 128 or K % 128:
+            if mx and _mxfp8_base(base):
+                return self._fused_split(layer, x, T, lora_a, lora_b, rows)
+            return self._reject(layer, f"slices {rows} N={N} K={K}")
+        w_sf = None
         if mx:
-            if not _mxfp8_base(base):
-                return self._reject(layer, "unsupported FP8 layout")
+            if _mxfp8_base(base):
+                w_sf = base.weight_scale_inv_swizzled
+            else:
+                if torch.cuda.is_current_stream_capturing() and \
+                        getattr(base, "_bw_mx_sf", None) is None:
+                    return self._reject(layer, "first block-FP8 use during graph capture")
+                w_sf = _block_fp8_sf(base)  # UE8M0 block FP8 (DeepGEMM requant)
+                if w_sf is None:
+                    return self._reject(layer, "unsupported FP8 layout")
         elif w.dtype != torch.bfloat16 or not w.is_contiguous():
             return self._reject(layer, f"base {w.dtype}")
         if K % 128:
@@ -165,9 +326,61 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
             from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
             x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
-            extra = dict(w_sf=base.weight_scale_inv_swizzled, x_q=x_q, x_sf=x_sf)
+            extra = dict(w_sf=w_sf, x_q=x_q, x_sf=x_sf)
         kern(w, x, lora_a, self._b_mirror(layer, lora_b), slots,
              info.lora_ranks.to(torch.int32), info.scalings.float(), y, **extra)
+        return y[:T] if T != n_rows else y
+
+    # ---------------------------------------------------- unaligned MXFP8 shapes (split / pad)
+    def _fused_split(self, layer, x, T, lora_a, lora_b, rows):
+        """MXFP8 projections whose slices or K are not 128-aligned (DeepSeek-V4.1's TP8
+        shared expert: gate/up slices of 288 rows, down K = 288): one fused launch per slice,
+        each slice's weight rows and scales re-swizzled on their own (rows past the slice are
+        TMA zero fill, stores past it are clipped), and K zero-padded to a 128 multiple."""
+        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+
+        info = self.batch_info
+        st = getattr(layer, "_blackwell_split", None)
+        if st is None:
+            if torch.cuda.is_current_stream_capturing():
+                return self._reject(layer, "first split use during graph capture")
+            st = _SplitState(layer.base_layer, rows)
+            st.bind(lora_a, lora_b)
+            layer._blackwell_split = st
+            self._split_layers.append(st)
+        K, Kp = st.K, st.Kp
+        if Kp != K:
+            x = torch.nn.functional.pad(x, (0, Kp - K))
+        x = self._pad(x.contiguous(), T)
+        slots = self._slots(T)
+        n_rows = x.shape[0]
+        x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
+        y = torch.empty(n_rows, st.N, device=x.device, dtype=torch.bfloat16)
+        if st.merged:
+            pc = st.pieces[0]
+            ns = len(rows)
+            srows = tuple(pc.slice_pad * (i + 1) for i in range(ns))
+            kern = self._kernel(pc.n_pad, Kp, T, srows, True, lora_a.shape[0])
+            if kern is None:
+                return self._reject(layer, f"no plan for merged N={pc.n_pad} K={Kp} T={T}")
+            if not kern.compiled and torch.cuda.is_current_stream_capturing():
+                return self._reject(layer, "first use during graph capture")
+            yp = torch.empty(n_rows, pc.n_pad, device=x.device, dtype=torch.bfloat16)
+            kern(pc.w, x, pc.a, pc.b, slots, info.lora_ranks.to(torch.int32),
+                 info.scalings.float(), yp, w_sf=pc.sf, x_q=x_q, x_sf=x_sf)
+            y = yp.view(n_rows, ns, pc.slice_pad)[:, :, : pc.slice_n].reshape(n_rows, st.N)
+            return y[:T] if T != n_rows else y
+        kerns = []
+        for pc in st.pieces:
+            kern = self._kernel(pc.n_pad, Kp, T, (pc.n_pad,), True, lora_a.shape[0])
+            if kern is None:
+                return self._reject(layer, f"no plan for split N={pc.n_pad} K={Kp} T={T}")
+            if not kern.compiled and torch.cuda.is_current_stream_capturing():
+                return self._reject(layer, "first use during graph capture")
+            kerns.append(kern)
+        for pc, kern in zip(st.pieces, kerns):
+            kern(pc.w, x, pc.a, pc.b, slots, info.lora_ranks.to(torch.int32),
+                 info.scalings.float(), y[:, pc.r0:pc.r1], w_sf=pc.sf, x_q=x_q, x_sf=x_sf)
         return y[:T] if T != n_rows else y
 
     def _kernel(self, N, K, T, rows, mx, n_slots, epi="linear", pairings=None, qkv=None,

@@ -355,6 +355,26 @@ class Glm5NextLinearAttention(nn.Module):
         "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
     }
 
+    @staticmethod
+    def _adapter_target_names(lora_paths):
+        """Last name component of every target module of the configured adapters, or an
+        empty set when any adapter config cannot be read (then nothing is fused)."""
+        import json
+        import os
+
+        names = set()
+        for ref in lora_paths or ():
+            path = getattr(ref, "lora_path", ref)
+            try:
+                with open(os.path.join(path, "adapter_config.json")) as f:
+                    mods = json.load(f).get("target_modules") or []
+            except Exception:
+                return set()
+            if isinstance(mods, str):
+                return set()  # a regex: cannot tell which modules it matches
+            names.update(m.rsplit(".", 1)[-1] for m in mods)
+        return names
+
     @classmethod
     def _can_fuse_proj(
         cls,
@@ -362,8 +382,23 @@ class Glm5NextLinearAttention(nn.Module):
         prefix: str,
         *fused_projs: str,
     ) -> bool:
-        if get_lora().enable_lora or get_lora().lora_paths:
-            return False
+        lora = get_lora()
+        if lora.enable_lora or lora.lora_paths:
+            # Keep the projections LoRA adapts separate. The b/f/g gate projections are not
+            # LoRA targets in practice: fuse them (one GEMM instead of five per layer) when
+            # none of their sources is a configured target.
+            targets = set(getattr(lora, "lora_target_modules", None) or ())
+            if not targets:  # inferred from the adapters: read their configs
+                targets = cls._adapter_target_names(lora.lora_paths)
+            if "fused_qkvbfg_a_proj" in fused_projs or not targets or "all" in targets:
+                return False
+            sources = {
+                proj
+                for fused_proj in fused_projs
+                for proj in cls._PACKED_MODULES_MAPPING[fused_proj]
+            }
+            if sources & targets:
+                return False
         if quant_config is None:
             return True
         if quant_config.get_name() not in {

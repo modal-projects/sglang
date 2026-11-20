@@ -659,6 +659,28 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     lora_info,
     base_layer,
 ) -> StandardCombineInput:
+    """--lora-backend blackwell may fold the MoE block's shared expert into the routed
+    kernels (SHARED_BLOCK); when the routed path below does not take it, it runs here."""
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+    block = bw_experts.SHARED_BLOCK[0]
+    bw_experts.SHARED_USED[0] = False
+    out = _mxfp4_lora_routed(
+        dispatch_output, quant_info, runner_config, lora_info, base_layer
+    )
+    if block is not None and not bw_experts.SHARED_USED[0]:
+        shared = block._forward_shared_experts(dispatch_output.hidden_states)
+        out.hidden_states.add_(shared)
+    return out
+
+
+def _mxfp4_lora_routed(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    lora_info,
+    base_layer,
+) -> StandardCombineInput:
     """MXFP4-expert (DeepSeek-V4.1) MoE-LoRA on the decomposed TRT-LLM pipeline.
 
     The op quantizes the routed input to MXFP8 itself, runs the raw gate/up GEMM,
@@ -694,6 +716,17 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     topk_weights = topk_output.topk_weights
     top_k = runner_config.top_k
 
+    # --lora-backend blackwell: fused MXFP4 expert GEMMs with the BF16 LoRA in-kernel (decode)
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+    if bw_experts.enabled() and lora_info.lora_use_virtual_experts:
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            fused_out = torch.empty_like(hidden_states)
+        if bw_experts.forward(hidden_states, topk_ids, topk_weights, quant_info, lora_info,
+                              base_layer, fused_out) is not None:
+            return StandardCombineInput(hidden_states=fused_out)
     assert bool(lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0), (
         "MXFP4 trtllm LoRA requires --lora-use-virtual-experts."
     )

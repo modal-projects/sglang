@@ -586,6 +586,44 @@ class TestPreparedRecord(CustomTestCase):
         manager.discard_prepared_lora_adapter("p1")
         self.assertIsNone(manager._prepared)
 
+    def _tracing(self, steps):
+        """A manager whose prepare gets the tensor list of a new signature."""
+        manager = self._manager()
+        manager._slot_placements = {}
+        manager._prepared = _PreparedLoRA(
+            "p1", config=SimpleNamespace(r=8), placement_key=("key",)
+        )
+        manager._prepare_client = Mock()
+        manager._prepare_client.poll.return_value = {"tensors": [["a", "f", [2, 2]]]}
+        manager._trace_slot_placement = lambda config, tensors: steps
+        manager._read_prepared = Mock()
+        return manager
+
+    def test_a_new_signature_is_traced_one_layer_per_poll(self):
+        placement = SimpleNamespace(
+            copies=(), regions=(), numel=0, dtype=torch.bfloat16
+        )
+        manager = self._tracing(iter([None, None, placement]))
+        for _ in range(2):
+            self.assertIsNone(manager.poll_prepare("p1"))
+            manager._read_prepared.assert_not_called()
+        manager.poll_prepare("p1")
+        manager._read_prepared.assert_called_once_with(manager._prepared, placement)
+        self.assertIs(manager._slot_placements[("key",)], placement)
+        # The tensor list came once; the later polls only traced.
+        manager._prepare_client.poll.assert_called_once()
+
+    def test_an_install_that_does_not_fit_has_no_placement(self):
+        def steps():
+            yield None
+            raise ValueError("LoRA install writes overlap")
+
+        manager = self._tracing(steps())
+        manager.poll_prepare("p1")
+        manager.poll_prepare("p1")
+        manager._read_prepared.assert_called_once_with(manager._prepared, None)
+        self.assertIsNone(manager._slot_placements[("key",)])
+
 
 class _Done:
     @staticmethod
@@ -734,34 +772,6 @@ class TestNodePrepareProcess(CustomTestCase):
                 gpus[0]._process.wait()
                 os.unlink(address)
 
-
-class TestNodeBuffer(CustomTestCase):
-    def test_space_is_first_fit_and_merged_when_freed(self):
-        page = mmap.PAGESIZE
-        buffer = lora_prepare_process._Buffer()
-        with patch.object(lora_prepare_process, "_SEGMENT_MIN", 8 * page):
-            first = [buffer.allocate(page) for _ in range(3)]
-            self.assertEqual(first, [(0, 0), (0, page), (0, 2 * page)])
-            buffer.free(0, 0, page)
-            buffer.free(0, page, page)
-            self.assertEqual(buffer.allocate(2 * page), (0, 0))
-            # Nothing fits: a new segment.
-            self.assertEqual(buffer.allocate(6 * page), (1, 0))
-
-    @patch.object(lora_prepare_process, "_SEGMENT_MIN", mmap.PAGESIZE)
-    def test_a_client_gone_without_releasing_loses_its_holds(self):
-        node = lora_prepare_process._Node()
-        gone = subprocess.Popen(["true"])
-        gone.wait()
-        node.connect("gone", gone.pid)
-        version, _ = node.use("p1", create=True)
-        version.claim("region", 64)
-        node.done(version, holder="gone")
-        node.disconnect("gone")
-        node.use("p2", create=True)
-        self.assertNotIn("p1", node.versions)
-
-
     def test_a_version_maps_its_files_only_while_a_request_reads_them(self):
         bf16 = torch.bfloat16
         a = torch.randn(3, 4).to(bf16)
@@ -809,6 +819,34 @@ class TestNodeBuffer(CustomTestCase):
                 gpus[0]._process.kill()
                 gpus[0]._process.wait()
                 os.unlink(address)
+
+
+class TestNodeBuffer(CustomTestCase):
+    def test_space_is_first_fit_and_merged_when_freed(self):
+        page = mmap.PAGESIZE
+        buffer = lora_prepare_process._Buffer()
+        with patch.object(lora_prepare_process, "_SEGMENT_MIN", 8 * page):
+            first = [buffer.allocate(page) for _ in range(3)]
+            self.assertEqual(first, [(0, 0), (0, page), (0, 2 * page)])
+            buffer.free(0, 0, page)
+            buffer.free(0, page, page)
+            self.assertEqual(buffer.allocate(2 * page), (0, 0))
+            # Nothing fits: a new segment.
+            self.assertEqual(buffer.allocate(6 * page), (1, 0))
+
+    @patch.object(lora_prepare_process, "_SEGMENT_MIN", mmap.PAGESIZE)
+    def test_a_client_gone_without_releasing_loses_its_holds(self):
+        node = lora_prepare_process._Node()
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        node.connect("gone", gone.pid)
+        version, _ = node.use("p1", create=True)
+        version.claim("region", 64)
+        node.done(version, holder="gone")
+        node.disconnect("gone")
+        node.use("p2", create=True)
+        self.assertNotIn("p1", node.versions)
+
 
 @_without_cuda
 class TestPrepareTimeout(CustomTestCase):

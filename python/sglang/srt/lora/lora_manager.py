@@ -18,11 +18,10 @@
 import hashlib
 import logging
 import re
-import time
 import weakref
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
+import msgspec
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -83,20 +82,14 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _PreparedLoRA:
-    """What one prepare holds on this rank, until its apply or the next prepare: the
-    process lists the files, then reads them once the placement is known."""
-
+class _PreparedLoRA(msgspec.Struct):
     prepare_id: str
+    # Filled in as the prepare advances; reply stays None until it is done.
     config: Optional[LoRAConfig] = None
-    # Set once the files are listed: what the placement depends on.
     placement_key: Optional[tuple] = None
-    # Set once the read is under way.
+    tracing: Optional[Iterator[Optional[LoRASlotPlacement]]] = None
     placement: Optional[LoRASlotPlacement] = None
-    # Set once the read is done: views of its regions in the node's pinned buffer.
     weights: Optional[LoRASlotWeights] = None
-    # None while the prepare process runs.
     reply: Optional[PrepareLoRAAdapterReqOutput] = None
 
 
@@ -331,38 +324,34 @@ class LoRAManager:
         )
         return result
 
-    def _get_slot_placement(
-        self, key: tuple, config: LoRAConfig, tensors: List[AdapterFileTensor]
-    ) -> Optional[LoRASlotPlacement]:
-        """This rank's slot placement for an adapter signature, traced on first use."""
-        if key not in self._slot_placements:
-            started = time.perf_counter()
-            try:
-                self._slot_placements[key] = self._trace_slot_placement(config, tensors)
-            except ValueError:
-                # The install's writes do not fit slot weights: the same for every
-                # adapter of this signature.
-                logger.warning(
-                    "Adapters of this LoRA signature have no slot placement; they load "
-                    "through /load_lora_adapter.",
-                    exc_info=True,
-                )
-                self._slot_placements[key] = None
-            placement = self._slot_placements[key]
-            if placement is not None:
-                logger.info(
-                    f"Traced the LoRA slot placement of a rank-{config.r} adapter: "
-                    f"{len(placement.copies)} copies into {len(placement.regions)} buffers, "
-                    f"{placement.numel * placement.dtype.itemsize / 2**20:.1f} MiB "
-                    f"per adapter, in {time.perf_counter() - started:.2f} s."
-                )
-        return self._slot_placements[key]
+    def _trace_step(self, prepared: _PreparedLoRA) -> None:
+        try:
+            placement = next(prepared.tracing)
+        except ValueError:
+            # Every adapter of this signature would fail the same way.
+            logger.warning(
+                "Adapters of this LoRA signature have no slot placement; they load "
+                "through /load_lora_adapter.",
+                exc_info=True,
+            )
+            placement = self._slot_placements[prepared.placement_key] = None
+        else:
+            if placement is None:
+                return
+            self._slot_placements[prepared.placement_key] = placement
+            logger.info(
+                f"Traced the LoRA slot placement of a rank-{prepared.config.r} adapter: "
+                f"{len(placement.copies)} copies into {len(placement.regions)} "
+                f"buffers, {placement.numel * placement.dtype.itemsize / 2**20:.1f} MiB "
+                "per adapter."
+            )
+        prepared.tracing = None
+        self._read_prepared(prepared, placement)
 
     def _trace_slot_placement(
         self, config: LoRAConfig, tensors: List[AdapterFileTensor]
-    ) -> LoRASlotPlacement:
-        """Run the pool's install on placeholder adapters one layer at a time,
-        recording its writes."""
+    ) -> Iterator[Optional[LoRASlotPlacement]]:
+        """Traced install: None after each layer, then the placement."""
         tracer = SlotPlacementTracer(tensors, self.memory_pool.num_layer)
         embedding_layer_names = ()
         for layer_id in tracer.layer_ids:
@@ -388,7 +377,8 @@ class LoRAManager:
                     self.lm_head_module,
                 )
             tracer.add(writes, layer_id)
-        return tracer.placement(self.memory_pool.dtype, embedding_layer_names)
+            yield None
+        yield tracer.placement(self.memory_pool.dtype, embedding_layer_names)
 
     def prepare_lora_adapter(
         self, lora_ref: LoRARef, prepare_id: str, node_address: str
@@ -440,6 +430,12 @@ class LoRAManager:
             )
         if prepared.reply is not None:
             return prepared.reply
+        if prepared.tracing is not None:
+            try:
+                self._trace_step(prepared)
+            except Exception as e:
+                self._not_prepared(prepared, f"{type(e).__name__}: {e}")
+            return prepared.reply
         result = self._prepare_client.poll()
         if result is None:
             return None
@@ -453,10 +449,8 @@ class LoRAManager:
                     AdapterFileTensor(name, file, tuple(shape))
                     for name, file, shape in result["tensors"]
                 ]
-                placement = self._get_slot_placement(
-                    prepared.placement_key, prepared.config, tensors
-                )
-                self._read_prepared(prepared, placement)
+                prepared.tracing = self._trace_slot_placement(prepared.config, tensors)
+                self._trace_step(prepared)
             else:
                 placement = prepared.placement
                 itemsize = placement.dtype.itemsize

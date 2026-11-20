@@ -94,7 +94,7 @@ class _PreparedLoRA:
     placement_key: Optional[tuple] = None
     # Set once the read is under way.
     placement: Optional[LoRASlotPlacement] = None
-    # Set once the read is done: views of the version's copy the node's GPUs share.
+    # Set once the read is done: views of its regions in the node's pinned buffer.
     weights: Optional[LoRASlotWeights] = None
     # None while the prepare process runs.
     reply: Optional[PrepareLoRAAdapterReqOutput] = None

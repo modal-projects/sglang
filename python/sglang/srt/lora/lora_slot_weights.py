@@ -1,0 +1,296 @@
+"""A LoRA adapter's weights laid out as one memory-pool buffer slot on this rank.
+
+LoRAMemoryPool.load_lora_weight_to_buffer decides where each adapter element goes:
+TP and EP slicing, fused members, rank padding, scaling. Traced once per adapter
+signature on placeholder weights valued by their own file positions, it yields a
+LoRASlotPlacement. Every later adapter of that signature is read (only the rows
+this rank uses) straight into slot order and loaded with one copy per buffer
+region.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+import torch
+
+from sglang.srt.layers.utils import get_layer_id
+
+if TYPE_CHECKING:
+    from sglang.srt.lora.lora_config import LoRAConfig
+
+# (buffer dict attribute, module name, layer id or None for the non-layer buffers)
+SlotBufferKey = Tuple[str, str, Optional[int]]
+
+
+class TracedSlotWrite(NamedTuple):
+    """One install write into a slot buffer: where its view sits in the buffer's slot
+    row, and the weight it writes (None writes zeros)."""
+
+    key: SlotBufferKey
+    slot_numel: int
+    offset: int
+    strides: Tuple[int, ...]
+    shape: Tuple[int, ...]
+    weight: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class AdapterFileTensor:
+    name: str
+    path: str
+    shape: Tuple[int, ...]
+
+    @property
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+
+class _SlotRegion(NamedTuple):
+    """A buffer's slot row, at `offset` in LoRASlotWeights.data."""
+
+    key: SlotBufferKey
+    offset: int
+    numel: int
+
+
+class _SlotCopy(NamedTuple):
+    """Elements of one file tensor placed by one install write, as two matching
+    strided views."""
+
+    tensor_index: int
+    src_offset: int
+    src_strides: Tuple[int, ...]
+    dst_offset: int
+    dst_strides: Tuple[int, ...]
+    shape: Tuple[int, ...]
+    scaled: bool
+
+
+@dataclass(frozen=True)
+class LoRASlotPlacement:
+    """Where this rank's buffer slot takes each element of an adapter from, for one
+    adapter signature."""
+
+    dtype: torch.dtype
+    regions: Tuple[_SlotRegion, ...]
+    copies: Tuple[_SlotCopy, ...]
+    numel: int
+    embedding_layer_names: Tuple[str, ...]
+
+
+class SlotPlacementTracer:
+    """Turns the install's writes on placeholder adapters into a LoRASlotPlacement.
+
+    A placeholder element holds its file element index + 1 and the scaling is SCALING,
+    so a written value names the file element it came from and whether it was scaled;
+    zero is a written zero.
+    """
+
+    UID = "slot-placement"
+    SCALING = -1
+    # Beyond this many copies for one write, the LoRAAdapter path is the faster one.
+    MAX_COPIES_PER_WRITE = 1024
+
+    def __init__(self, tensors: Sequence[AdapterFileTensor], num_layers: int):
+        self.tensors = tensors
+        self._starts = torch.tensor([0] + [t.numel for t in tensors]).cumsum(0)
+        self._by_layer: Dict[Optional[int], List[int]] = {}
+        for index, tensor in enumerate(tensors):
+            self._by_layer.setdefault(get_layer_id(tensor.name), []).append(index)
+        self.layer_ids: List[Optional[int]] = [None, *range(num_layers)]
+        beyond = set(self._by_layer) - set(self.layer_ids)
+        if beyond:
+            raise ValueError(f"LoRA adapter has weights for layers {sorted(beyond)}")
+        self._regions: Dict[SlotBufferKey, _SlotRegion] = {}
+        self._copies: List[_SlotCopy] = []
+        self._numel = 0
+
+    def placeholders(self, layer_id: Optional[int]) -> Dict[str, torch.Tensor]:
+        return {
+            self.tensors[i].name: (
+                torch.arange(self.tensors[i].numel) + int(self._starts[i]) + 1
+            ).view(self.tensors[i].shape)
+            for i in self._by_layer.get(layer_id, [])
+        }
+
+    def add(self, writes: Sequence[TracedSlotWrite], layer_id: Optional[int]) -> None:
+        """Take the writes to `layer_id`'s buffers (None: the non-layer buffers).
+
+        Raises when a write lands on positions an earlier write copied to: zeros are
+        not part of the copies, so the result would depend on write order.
+        """
+        copied: Dict[SlotBufferKey, torch.Tensor] = {}
+        for write in writes:
+            if write.key[2] != layer_id:
+                continue
+            region = self._regions.get(write.key)
+            if region is None:
+                region = _SlotRegion(write.key, self._numel, write.slot_numel)
+                self._regions[write.key] = region
+                self._numel += write.slot_numel
+            if write.key not in copied:
+                copied[write.key] = torch.zeros(write.slot_numel, dtype=torch.bool)
+            written = strided(
+                copied[write.key], write.offset, write.strides, write.shape
+            )
+            if bool(written.any()):
+                raise ValueError(f"LoRA install writes overlap in {write.key}")
+            if write.weight is None or write.weight.numel() == 0:
+                continue
+            written.fill_(True)
+            self._copies.extend(self._copies_of(write, region.offset))
+
+    def placement(
+        self, dtype: torch.dtype, embedding_layer_names: Tuple[str, ...]
+    ) -> LoRASlotPlacement:
+        return LoRASlotPlacement(
+            dtype=dtype,
+            regions=tuple(self._regions.values()),
+            copies=tuple(self._copies),
+            numel=self._numel,
+            embedding_layer_names=embedding_layer_names,
+        )
+
+    def _copies_of(self, write: TracedSlotWrite, region_offset: int) -> List[_SlotCopy]:
+        """One strided copy per block of rows from one file tensor (a write may join
+        several, e.g. gate and up); element runs where a block is not strided."""
+        values = write.weight
+        first_of_row = values.reshape(values.shape[0], -1)[:, 0].abs() - 1
+        tensor_of_row = (
+            torch.searchsorted(self._starts, first_of_row.clamp(min=0), right=True) - 1
+        )
+        breaks = (torch.nonzero(torch.diff(tensor_of_row)).flatten() + 1).tolist()
+        bounds = [0, *breaks, values.shape[0]]
+        copies = []
+        for start, end in zip(bounds, bounds[1:]):
+            block = write._replace(
+                offset=write.offset + start * write.strides[0],
+                shape=(end - start, *write.shape[1:]),
+                weight=values[start:end],
+            )
+            copy = self._strided_copy(block, region_offset)
+            if copy is not None:
+                copies.append(copy)
+            else:
+                copies.extend(self._element_copies(block, region_offset))
+            if len(copies) > self.MAX_COPIES_PER_WRITE:
+                raise ValueError(f"LoRA install write to {write.key} is not strided")
+        return copies
+
+    def _strided_copy(
+        self, write: TracedSlotWrite, region_offset: int
+    ) -> Optional[_SlotCopy]:
+        """The write as one copy, when its values step through one file tensor at
+        fixed non-negative strides."""
+        values = write.weight
+        scaled = values < 0
+        mixed = bool(scaled.any()) and not bool(scaled.all())
+        if mixed or bool((values == 0).any()):
+            return None
+        src = values.abs() - 1
+        origin = int(src.reshape(-1)[0])
+        strides = []
+        for dim, size in enumerate(src.shape):
+            step = [0] * src.dim()
+            step[dim] = 1
+            stride = int(src[tuple(step)]) - origin if size > 1 else 0
+            if stride < 0:
+                return None
+            strides.append(stride)
+        expected = origin + strided(_index(strides, src.shape), 0, strides, src.shape)
+        if not torch.equal(src, expected):
+            return None
+        tensor_index = (
+            int(torch.searchsorted(self._starts, torch.tensor(origin), right=True)) - 1
+        )
+        if int(src.max()) >= int(self._starts[tensor_index + 1]):
+            return None
+        return _SlotCopy(
+            tensor_index=tensor_index,
+            src_offset=origin - int(self._starts[tensor_index]),
+            src_strides=tuple(strides),
+            dst_offset=region_offset + write.offset,
+            dst_strides=write.strides,
+            shape=write.shape,
+            scaled=bool(scaled.any()),
+        )
+
+    def _element_copies(
+        self, write: TracedSlotWrite, region_offset: int
+    ) -> List[_SlotCopy]:
+        """The write as runs of consecutive slot elements taken from consecutive
+        elements of one file tensor; written zeros need no copy."""
+        index = _index(write.strides, write.shape)
+        dst = write.offset + strided(index, 0, write.strides, write.shape).reshape(-1)
+        values = write.weight.reshape(-1)
+        dst, values = dst[values != 0], values[values != 0]
+        if dst.numel() == 0:
+            return []
+        order = torch.argsort(dst)
+        dst, values = dst[order], values[order]
+        scaled = values < 0
+        src = values.abs() - 1
+        tensor = torch.searchsorted(self._starts, src, right=True) - 1
+        breaks = torch.nonzero(
+            (torch.diff(dst) != 1)
+            | (torch.diff(src) != 1)
+            | (torch.diff(scaled.int()) != 0)
+            | (torch.diff(tensor) != 0)
+        ).flatten()
+        first = torch.cat([torch.zeros(1, dtype=torch.long), breaks + 1])
+        length = torch.diff(torch.cat([first, torch.tensor([dst.numel()])]))
+        return [
+            _SlotCopy(
+                tensor_index=int(tensor[f]),
+                src_offset=int(src[f] - self._starts[tensor[f]]),
+                src_strides=(1,),
+                dst_offset=region_offset + int(dst[f]),
+                dst_strides=(1,),
+                shape=(n,),
+                scaled=bool(scaled[f]),
+            )
+            for f, n in zip(first.tolist(), length.tolist())
+        ]
+
+
+class LoRASlotWeights:
+    """One adapter's weights in this rank's buffer-slot order: a tensor per region of
+    its placement.
+
+    The CPU copy LoRAMemoryPool loads with one copy per buffer region, in place of a
+    LoRAAdapter's staged weights. Positions the install leaves unwritten inside a
+    region hold zeros. The regions are views of one buffer in slot order
+    (slot_regions), or of a copy the node's GPUs share.
+    """
+
+    def __init__(
+        self,
+        config: LoRAConfig,
+        placement: LoRASlotPlacement,
+        regions: Sequence[torch.Tensor],
+    ):
+        self.config = config
+        self.scaling: float = config.lora_alpha / config.r
+        self.placement = placement
+        self.regions = list(regions)
+
+
+def slot_regions(
+    placement: LoRASlotPlacement, data: torch.Tensor
+) -> List[torch.Tensor]:
+    """Views of `data`, which holds a slot in order, one per region of `placement`."""
+    return [data[r.offset : r.offset + r.numel] for r in placement.regions]
+
+
+def _index(strides: Sequence[int], shape: Sequence[int]) -> torch.Tensor:
+    """0..n-1 covering every element a view of `shape` and `strides` reaches."""
+    return torch.arange(sum((n - 1) * s for n, s in zip(shape, strides)) + 1)
+
+
+def strided(
+    flat: torch.Tensor, offset: int, strides: Sequence[int], shape: Sequence[int]
+) -> torch.Tensor:
+    return flat.as_strided(tuple(shape), tuple(strides), flat.storage_offset() + offset)

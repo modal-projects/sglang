@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
+    is_sm100_supported,
     is_sm120,
     make_pp_layers,
 )
@@ -851,7 +852,7 @@ class NemotronHModel(nn.Module):
 
     @property
     def supports_hybrid_prefill_graph(self) -> bool:
-        return is_sm120()
+        return is_sm100_supported() or is_sm120()
 
     def forward(
         self,

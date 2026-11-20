@@ -41,6 +41,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
+    lora_weight_version: str | None = None
+
     def __init__(
         self,
         rid,

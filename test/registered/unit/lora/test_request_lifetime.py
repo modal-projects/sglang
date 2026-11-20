@@ -8,7 +8,13 @@ import pytest
 from fastapi import HTTPException
 
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
-from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenIDOutput,
+    GenerateReqInput,
+    LoRAUpdateOutput,
+    UpdateLoRAAdapterReqInput,
+)
 from sglang.srt.managers.tokenizer_manager import (
     LoRARequestRef,
     ReqState,
@@ -433,3 +439,54 @@ def test_registry_cancelled_partial_acquisition_rolls_back():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_cancelled_update_keeps_its_transaction_and_live_acquisitions(
+    success: bool,
+) -> None:
+    async def run() -> None:
+        adapter = LoRARef(lora_name="A", lora_path="/old")
+        registry = LoRARegistry([adapter])
+        acquired = await registry.acquire("A")
+        m = manager(registry)
+        m.lora_ref_cache["A"] = adapter
+        m.lora_update_lock = asyncio.Lock()
+        m.pending_lora_unloads = {}
+        m.auto_create_handle_loop = lambda: None
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def communicate(obj: UpdateLoRAAdapterReqInput) -> list[LoRAUpdateOutput]:
+            entered.set()
+            await release.wait()
+            return [
+                LoRAUpdateOutput(
+                    success=success, error_message="" if success else "read failed"
+                )
+            ]
+
+        m.update_lora_adapter_communicator = communicate
+        with get_context().override_server_args(enable_lora=True):
+            call = asyncio.create_task(
+                m.update_lora_adapter(
+                    UpdateLoRAAdapterReqInput(
+                        lora_name="A", lora_path="/new", version="v2"
+                    )
+                )
+            )
+            await entered.wait()
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert m.lora_update_lock.locked()
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*m._lora_tasks), timeout=2)
+        assert not m.lora_update_lock.locked()
+        assert m.lora_ref_cache["A"].lora_path == ("/new" if success else "/old")
+        assert await registry.acquire("A") == acquired
+        await registry.release(acquired)
+        await registry.release(acquired)
+        assert await registry.unregister("A") == acquired
+        await registry.wait_for_unload(acquired)
+
+    asyncio.run(run())

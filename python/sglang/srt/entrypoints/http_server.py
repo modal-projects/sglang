@@ -160,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1694,6 +1695,17 @@ async def load_lora_adapter(
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/update_lora_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_lora_adapter(
+    obj: Annotated[UpdateLoRAAdapterReqInput, Body()], request: Request
+) -> ORJSONResponse:
+    """Replace a named adapter and continue its active requests with fresh KV."""
+    result = await _global_state.tokenizer_manager.update_lora_adapter(obj, request)
+    status = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])

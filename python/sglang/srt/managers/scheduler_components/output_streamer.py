@@ -542,7 +542,8 @@ class _GenerationStreamAccumulator:
             self.weight_versions.append(
                 compute_weight_version_spans(
                     req.weight_version_events,
-                    current_version=self.current_weight_version,
+                    current_version=req.lora_weight_version
+                    or self.current_weight_version,
                     num_output_tokens=len(output_ids_),
                 )
             )

@@ -111,6 +111,59 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
 
+    def test_lora_quiescence_preserves_other_rows_and_commits_pending_tokens(
+        self,
+    ) -> None:
+        scheduler = self._new_scheduler()
+        scheduler.enable_continuous_input_polling = False
+        a, b = self._make_req("a"), self._make_req("b")
+        a.lora_id, b.lora_id = "adapter-a", "adapter-b"
+        a.output_ids.extend([4, 5])
+        b.output_ids.append(6)
+        a.kv.req_pool_idx = 0
+        a.kv.kv_committed_len = a.kv.kv_allocated_len = 4
+        b.kv.req_pool_idx = 1
+        b.kv.kv_committed_len = b.kv.kv_allocated_len = 3
+        scheduler.tree_cache.claim_kv_row.return_value = False
+        scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda req: setattr(
+            req.kv, "req_pool_idx", None
+        )
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.tree_cache.token_to_kv_pool_allocator = (
+            scheduler.token_to_kv_pool_allocator
+        )
+        manager = SimpleNamespace(
+            pending_lora_load_events={},
+            lora_weight_versions={},
+            lora_refs={"adapter-a": SimpleNamespace(lora_name="v1")},
+        )
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(lora_manager=manager)
+        )
+        batch = self._make_batch(scheduler, [a, b], with_tensors=True)
+        scheduler.running_batch = scheduler.last_batch = batch
+        scheduler.enable_overlap = True
+        scheduler.result_queue.append((batch, None))
+
+        def complete(batch: ScheduleBatch, result: object) -> None:
+            a.output_ids.append(7)
+            b.output_ids.append(8)
+
+        scheduler.process_batch_result = complete
+        scheduler.quiesce_lora_requests("adapter-a")
+        self.assertFalse(scheduler._engine_paused)
+        self.assertEqual(batch.reqs, [b])
+        self.assertEqual(batch.req_pool_indices.tolist(), [1])
+        self.assertEqual(scheduler.waiting_queue, [a])
+        self.assertEqual(list(a.output_ids), [4, 5, 7])
+        self.assertEqual(list(b.output_ids), [6, 8])
+        self.assertFalse(a.kv.holds_kv)
+        self.assertTrue(b.kv.holds_kv)
+        self.assertEqual(a.weight_version_events[-1].num_output_tokens, 3)
+        self.assertEqual(a.weight_version_events[-1].old_version, "v1")
+        self.assertFalse(b.weight_version_events)
+        self.assertFalse(scheduler.result_queue)
+
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(
             rid=rid,

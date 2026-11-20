@@ -404,20 +404,15 @@ class LoRAMemoryPool:
             for name, module in base_model.named_modules()
         )
 
-    @staticmethod
-    def _get_fused_shared_moe(base_model: torch.nn.Module, layer_idx: int):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    def _get_fused_shared_moe(self, base_model: torch.nn.Module, layer_idx: int):
+        if self._fused_shared_moes is None:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        return next(
-            (
-                module
-                for module in base_model.modules()
-                if isinstance(module, FusedMoE)
-                and module.layer_id == layer_idx
-                and module.num_fused_shared_experts > 0
-            ),
-            None,
-        )
+            self._fused_shared_moes = {}
+            for module in base_model.modules():
+                if isinstance(module, FusedMoE) and module.num_fused_shared_experts > 0:
+                    self._fused_shared_moes.setdefault(module.layer_id, module)
+        return self._fused_shared_moes.get(layer_idx)
 
     def _get_moe_pool_expert_dim(self, base_model, layer_idx):
         fused_moe = self._get_fused_shared_moe(base_model, layer_idx)

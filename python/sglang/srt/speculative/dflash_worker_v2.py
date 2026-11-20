@@ -839,6 +839,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        self._draft_kv_cache_buffers = None
+        self._draft_kv_cache_uses_window = False
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -1124,8 +1126,41 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        self._bind_draft_kv_cache_buffers()
         if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
+
+    def _bind_draft_kv_cache_buffers(self) -> None:
+        """Bind direct prefix writes after draft KV placement, before graph capture."""
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+
+        self._draft_kv_cache_buffers = None
+        helper = self._fused_kv_helper
+        if helper is None:
+            return
+        router = self.draft_model_runner.token_to_kv_pool.layer_router
+        routes = [
+            router.layer(layer.self_attn.attn.layer_id)
+            for layer in self.draft_model.layers
+        ]
+        view = routes[0].view
+        if (
+            isinstance(view, DraftMHAView)
+            and view.dtype in (torch.bfloat16, torch.float16)
+            and view.dtype == helper.flat_kv_weight.dtype
+            and view.head_num == helper.num_kv_heads
+            and view.head_dim == view.v_head_dim == helper.head_dim
+            and all(r.view is view and r.owner == routes[0].owner for r in routes)
+        ):
+            self._draft_kv_cache_buffers = view.stacked_kv_buffers(
+                [r.view_layer_id for r in routes]
+            )
+            self._draft_kv_cache_uses_window = not routes[0].owner
+            if self._draft_kv_cache_buffers is not None and get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH fused prefix writes bound to %s.",
+                    router.storage_name(routes[0].route.sub_pool),
+                )
 
     def _init_draft_kv_ring(self) -> None:
         parallel = get_parallel()
@@ -2988,6 +3023,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
 
+        if (
+            self._draft_kv_cache_buffers is not None
+            and ctx_cache_loc_2d is not None
+            and commit_lens is not None
+        ):
+            locs = (
+                ctx_swa_cache_loc
+                if self._draft_kv_cache_uses_window
+                else ctx_cache_loc_2d
+            )
+            if locs is not None:
+                self._fused_kv_helper.materialize(
+                    ctx_hidden,
+                    ctx_positions,
+                    cache_buffers=self._draft_kv_cache_buffers,
+                    cache_locs=locs.reshape_as(ctx_cache_loc_2d),
+                    commit_lens=commit_lens,
+                )
+                return
+
         def _write_layer_kv(
             layer_idx: int,
             cache_k: torch.Tensor,
@@ -3938,43 +3993,49 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        target_ids = self.target_worker.model_runner.runner_ids
+        draft_ids = self.draft_model_runner.runner_ids
+        plan_lens_cpu = (
+            batch.seq_lens_cpu
+            if batch.seq_lens_cpu is not None
+            else draft_input.nxt_kv_lens_cpu
+        )
+        iteration_ids = None
         if self._use_triton_prepare_block:
             try:
-                _prepare_dflash_draft_block_unchecked(
-                    bonus_tokens=draft_input.bonus_tokens.view(-1),
-                    prefix_lens=prefix_lens.view(-1),
-                    req_pool_indices=batch.req_pool_indices.view(-1),
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    block_ids_out=block_ids,
-                    positions_out=positions_2d,
-                    cache_loc_out=verify_out_cache_loc_2d,
-                    mask_token_id=int(self._mask_token_id),
-                )
+                if prefix_lens.is_cuda and target_ids.reads_are_translated:
+                    iteration_ids = target_ids.plan_uniform_extend(
+                        req_pool_indices=batch.req_pool_indices,
+                        seq_lens=prefix_lens,
+                        seq_lens_cpu=plan_lens_cpu,
+                        width=block_size,
+                        positions_out=positions_2d,
+                        anchor_src=draft_input.bonus_tokens.view(-1),
+                        anchor_out=block_ids,
+                        mask_token_id=int(self._mask_token_id),
+                    )
+                    verify_out_cache_loc_2d = iteration_ids.write_virtual.view(
+                        bs, block_size
+                    )
+                else:
+                    _prepare_dflash_draft_block_unchecked(
+                        bonus_tokens=draft_input.bonus_tokens.view(-1),
+                        prefix_lens=prefix_lens.view(-1),
+                        req_pool_indices=batch.req_pool_indices.view(-1),
+                        req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        block_ids_out=block_ids,
+                        positions_out=positions_2d,
+                        cache_loc_out=verify_out_cache_loc_2d,
+                        mask_token_id=int(self._mask_token_id),
+                    )
             except Exception as e:
                 self._use_triton_prepare_block = False
+                iteration_ids = None
                 logger.warning(
                     "DFLASH Triton prepare_block failed; falling back to eager path: %s",
                     e,
                 )
-                block_ids.fill_(int(self._mask_token_id))
-                block_ids[:, 0].copy_(draft_input.bonus_tokens)
-                torch.add(
-                    prefix_lens.unsqueeze(1),
-                    self._block_pos_offsets,
-                    out=positions_2d,
-                )
-                end_offset = prefix_lens + block_size
-                verify_out_cache_loc = assign_extend_cache_locs_func(
-                    req_pool_indices=batch.req_pool_indices,
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    start_offset=prefix_lens,
-                    end_offset=end_offset,
-                    batch_size=bs,
-                    draft_token_num=block_size,
-                    device=device,
-                )
-                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
-        else:
+        if not self._use_triton_prepare_block:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
             torch.add(
@@ -4015,17 +4076,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
         # The iteration's window -- the draft block, the verify and the
         # target-hidden KV writes all write it -- planned once.
-        iteration_ids = self.target_worker.model_runner.runner_ids.plan(
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=prefix_lens,
-            seq_lens_cpu=(
-                batch.seq_lens_cpu
-                if batch.seq_lens_cpu is not None
-                else draft_input.nxt_kv_lens_cpu
-            ),
-            write_virtual=verify_out_cache_loc,
-            read_extent=block_size,
-        )
+        if iteration_ids is None:
+            iteration_ids = target_ids.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=prefix_lens,
+                seq_lens_cpu=plan_lens_cpu,
+                write_virtual=verify_out_cache_loc,
+                read_extent=block_size,
+            )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -4090,10 +4148,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
-        draft_translator = self.draft_model_runner.runner_ids
         draft_plan = (
             iteration_ids.reads_from(
-                draft_translator,
+                draft_ids,
                 seq_lens=draft_seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 read_extent=block_size,
@@ -4101,7 +4158,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.use_compact_draft_cache
             else iteration_ids
         )
-        draft_plan.bind(forward_batch, draft_translator)
+        draft_plan.bind(forward_batch, draft_ids)
         ring_block_locs = None
         if self.draft_kv_ring is not None:
             ring_block_locs = self.draft_kv_ring.block_locs(

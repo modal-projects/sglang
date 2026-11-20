@@ -6110,7 +6110,9 @@ class Scheduler(
         """Start reading an adapter while serving; replies once every rank is done."""
         unsupported = self._lora_prepare_unsupported()
         if unsupported is not None:
-            return PrepareLoRAAdapterReqOutput(prepared=False, message=unsupported)
+            return PrepareLoRAAdapterReqOutput(
+                prepared=False, message=unsupported, unsupported=True
+            )
         if self.pending_lora_prepare is not None:
             return PrepareLoRAAdapterReqOutput(
                 prepared=False, message="another LoRA prepare is running"

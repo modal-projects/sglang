@@ -32,8 +32,6 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# The node buffer grows by segments of at least this, or a quarter of its size, so the
-# schedulers pin new memory rarely.
 _SEGMENT_MIN = 256 << 20
 _PREPARE_TIMEOUT_S = 600
 # One call maps every page: the threads of one process would take each fault in turn.
@@ -484,8 +482,6 @@ class _Buffer:
         self._lock = threading.Lock()
 
     def allocate(self, nbytes: int) -> Tuple[int, int]:
-        """(segment, offset) of free page-aligned space for `nbytes`: the first fit, or
-        a new segment."""
         nbytes = _pages(nbytes)
         with self._lock:
             for segment, free in enumerate(self._free):
@@ -498,7 +494,10 @@ class _Buffer:
                             free.remove(extent)
                         return segment, offset
             total = sum(data.numel() for _, data in self.segments)
-            size = max(nbytes, _pages(max(total // 4, _SEGMENT_MIN)))
+            in_use = total - sum(size for free in self._free for _, size in free)
+            # Twice what is in use, as the GPU-delta host arenas grow: every GPU
+            # pins each new segment, which can stall serving.
+            size = _pages(max(nbytes, 2 * (in_use + nbytes) - total, _SEGMENT_MIN))
             fd = os.memfd_create("sglang-lora-node-buffer")
             os.ftruncate(fd, size)
             self.segments.append((fd, _map(fd, size, populate=True)))

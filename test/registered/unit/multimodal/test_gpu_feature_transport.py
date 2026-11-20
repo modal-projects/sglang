@@ -732,6 +732,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
         scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
+        scheduler.pending_lora_prepare = None
         scheduler.external_corpus_manager = None
 
     @staticmethod

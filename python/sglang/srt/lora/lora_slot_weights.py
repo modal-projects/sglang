@@ -114,7 +114,8 @@ class SlotPlacementTracer:
 
     A placeholder element holds its file element index + 1 and the scaling is SCALING,
     so a written value names the file element it came from and whether it was scaled;
-    zero is a written zero.
+    zero is a written zero. Placeholders are int32 when every index fits, halving what
+    the trace writes and reads.
     """
 
     UID = "slot-placement"
@@ -128,6 +129,14 @@ class SlotPlacementTracer:
         # The same, for the per-write bookkeeping: small index arrays, kept in numpy.
         self._starts_np = self._starts.numpy()
         self._starts_list = self._starts.tolist()
+        self._dtype = (
+            torch.int32
+            if self._starts_list[-1] < torch.iinfo(torch.int32).max
+            else torch.int64
+        )
+        # The current layer's placeholders by tensor index: (the arange they view, as
+        # numpy, and the file index of its first element).
+        self._placeholder_runs: Dict[int, Tuple[np.ndarray, int]] = {}
         self._by_layer: Dict[Optional[int], List[int]] = {}
         for index, tensor in enumerate(tensors):
             self._by_layer.setdefault(get_layer_id(tensor.name), []).append(index)
@@ -143,11 +152,15 @@ class SlotPlacementTracer:
         """The layer's tensors, each element valued by its file element index + 1:
         views of one arange per run of consecutive tensors."""
         placeholders = {}
+        self._placeholder_runs = {}
         indices = self._by_layer.get(layer_id, [])
         starts = self._starts_list
         for first, last in _consecutive_runs(indices):
-            values = torch.arange(starts[first] + 1, starts[last + 1] + 1)
+            values = torch.arange(
+                starts[first] + 1, starts[last + 1] + 1, dtype=self._dtype
+            )
             for i in range(first, last + 1):
+                self._placeholder_runs[i] = (values.numpy(), starts[first])
                 begin, end = starts[i] - starts[first], starts[i + 1] - starts[first]
                 placeholders[self.tensors[i].name] = values[begin:end].view(
                     self.tensors[i].shape
@@ -196,7 +209,10 @@ class SlotPlacementTracer:
         """One strided copy per block of rows from one file tensor (a write may join
         several, e.g. gate and up); element runs where a block is not strided."""
         values = write.weight
-        first_of_row = np.abs(values.numpy().reshape(values.shape[0], -1)[:, 0]) - 1
+        # Each row's first element, as a view of the write.
+        first_of_row = (
+            np.abs(values.numpy()[(slice(None),) + (0,) * (values.dim() - 1)]) - 1
+        )
         tensor_of_row = (
             np.searchsorted(self._starts_np, first_of_row.clip(min=0), side="right") - 1
         )
@@ -222,34 +238,35 @@ class SlotPlacementTracer:
         self, write: TracedSlotWrite, region_offset: int
     ) -> Optional[_SlotCopy]:
         """The write as one copy, when its values step through one file tensor at
-        fixed non-negative strides."""
+        fixed non-negative strides: then they equal (or, scaled, negate) that strided
+        view of the tensor's placeholder, which one comparison checks."""
         values = write.weight.numpy()
-        # All negative: scaled; all positive: not; zeros or both: not one copy.
-        low, high = values.min(), values.max()
-        if low > 0:
-            scaled, src = False, values - 1
-        elif high < 0:
-            scaled, src = True, -values - 1
-        else:
+        first = int(values.flat[0])
+        if first == 0:
             return None
-        origin = int(src.flat[0])
+        scaled, origin = first < 0, abs(first) - 1
         strides = []
-        for dim, size in enumerate(src.shape):
-            step = [0] * src.ndim
+        for dim, size in enumerate(values.shape):
+            step = [0] * values.ndim
             step[dim] = 1
-            stride = int(src[tuple(step)]) - origin if size > 1 else 0
+            stride = abs(int(values[tuple(step)])) - 1 - origin if size > 1 else 0
             if stride < 0:
                 return None
             strides.append(stride)
-        last = origin + sum((n - 1) * s for n, s in zip(src.shape, strides))
-        span = np.arange(origin, last + 1, dtype=src.dtype)
-        expected = np.lib.stride_tricks.as_strided(
-            span, src.shape, [s * span.itemsize for s in strides]
-        )
-        if not np.array_equal(src, expected):
-            return None
         tensor_index = bisect.bisect_right(self._starts_list, origin) - 1
+        last = origin + sum((n - 1) * s for n, s in zip(values.shape, strides))
         if last >= self._starts_list[tensor_index + 1]:
+            return None
+        if tensor_index not in self._placeholder_runs:
+            return None
+        run, run_start = self._placeholder_runs[tensor_index]
+        expected = np.lib.stride_tricks.as_strided(
+            run[origin - run_start :],
+            values.shape,
+            [s * run.itemsize for s in strides],
+            writeable=False,
+        )
+        if not np.array_equal(-values if scaled else values, expected):
             return None
         return _SlotCopy(
             tensor_index=tensor_index,
@@ -275,7 +292,7 @@ class SlotPlacementTracer:
         order = torch.argsort(dst)
         dst, values = dst[order], values[order]
         scaled = values < 0
-        src = values.abs() - 1
+        src = values.abs().long() - 1
         tensor = torch.searchsorted(self._starts, src, right=True) - 1
         breaks = torch.nonzero(
             (torch.diff(dst) != 1)

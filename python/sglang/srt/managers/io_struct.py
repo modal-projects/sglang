@@ -2685,6 +2685,8 @@ class PrepareLoRAAdapterReqInput(BaseReq, kw_only=True):
 class PrepareLoRAAdapterReqOutput(BaseReq, kw_only=True):
     prepared: bool
     message: str = ""
+    # The server cannot prepare any adapter: its layout or its config.
+    unsupported: bool = False
 
 
 class ApplyLoRAAdapterReqInput(BaseReq, kw_only=True):

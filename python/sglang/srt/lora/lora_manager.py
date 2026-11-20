@@ -401,7 +401,9 @@ class LoRAManager:
         # Staging is pinned with cudaHostRegister.
         if self.lora_no_cpu_backup or self.device.type != "cuda":
             prepared.reply = PrepareLoRAAdapterReqOutput(
-                prepared=False, message="no CPU copy or no CUDA staging"
+                prepared=False,
+                message="no CPU copy or no CUDA staging",
+                unsupported=True,
             )
             return
         uid = lora_ref.lora_id

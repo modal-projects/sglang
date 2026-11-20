@@ -17,7 +17,8 @@
 
 import logging
 import re
-from typing import Dict, Iterable, List, Optional, Sequence
+import time
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import torch
 
@@ -35,6 +36,12 @@ from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.lora_slot_weights import (
+    AdapterFileTensor,
+    LoRASlotPlacement,
+    LoRASlotWeights,
+    SlotPlacementTracer,
+)
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     _KNOWN_LORA_TARGET_MODULES,
@@ -298,6 +305,65 @@ class LoRAManager:
             f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
         )
         return result
+
+    def _get_slot_placement(
+        self, key: tuple, config: LoRAConfig, tensors: List[AdapterFileTensor]
+    ) -> Optional[LoRASlotPlacement]:
+        """This rank's slot placement for an adapter signature, traced on first use."""
+        if key not in self._slot_placements:
+            started = time.perf_counter()
+            try:
+                self._slot_placements[key] = self._trace_slot_placement(config, tensors)
+            except ValueError:
+                # The install's writes do not fit slot weights: the same for every
+                # adapter of this signature.
+                logger.warning(
+                    "Adapters of this LoRA signature have no slot placement; they load "
+                    "through /load_lora_adapter.",
+                    exc_info=True,
+                )
+                self._slot_placements[key] = None
+            placement = self._slot_placements[key]
+            if placement is not None:
+                logger.info(
+                    f"Traced the LoRA slot placement of a rank-{config.r} adapter: "
+                    f"{len(placement.copies)} copies into {len(placement.regions)} buffers, "
+                    f"{placement.numel * placement.dtype.itemsize / 2**20:.1f} MiB "
+                    f"per adapter, in {time.perf_counter() - started:.2f} s."
+                )
+        return self._slot_placements[key]
+
+    def _trace_slot_placement(
+        self, config: LoRAConfig, tensors: List[AdapterFileTensor]
+    ) -> LoRASlotPlacement:
+        """Run the pool's install on placeholder adapters one layer at a time,
+        recording its writes."""
+        tracer = SlotPlacementTracer(tensors, self.memory_pool.num_layer)
+        embedding_layer_names = ()
+        for layer_id in tracer.layer_ids:
+            adapter = LoRAAdapter(
+                SlotPlacementTracer.UID,
+                config,
+                self.base_hf_config,
+                self.load_config,
+                self.lora_backend,
+                base_model=self.base_model,
+            )
+            adapter.initialize_weights_from_tensors(tracer.placeholders(layer_id))
+            adapter.scaling = SlotPlacementTracer.SCALING
+            if layer_id is None:
+                embedding_layer_names = tuple(adapter.embedding_layers)
+            with self.memory_pool.tracing_writes() as writes:
+                self.memory_pool.load_lora_weight_to_buffer(
+                    SlotPlacementTracer.UID,
+                    0,
+                    adapter,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            tracer.add(writes, layer_id)
+        return tracer.placement(self.memory_pool.dtype, embedding_layer_names)
 
     def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
@@ -800,7 +866,7 @@ class LoRAManager:
         self.configs: Dict[str, LoRAConfig] = {}
 
         # LoRA adapter weights cached in CPU memory, indexed by LoRA ID.
-        self.loras: Dict[str, LoRAAdapter] = {}
+        self.loras: Dict[str, Union[LoRAAdapter, LoRASlotWeights]] = {}
 
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
@@ -1180,50 +1246,78 @@ class LoRAManager:
             and getattr(self, "memory_pool", None) is not None
             and uid in self.memory_pool.uid_to_buffer_id
         ):
-            buffer_id = self.memory_pool.uid_to_buffer_id[uid]
+            failure = self._rewrite_resident_slot(
+                lora_ref, new_lora, old_config, old_lora
+            )
+            if failure is not None:
+                return failure
+
+        self._commit_lora_adapter(lora_ref, new_config, new_lora, is_update, old_ref)
+        return self.create_lora_update_result(success=True)
+
+    def _rewrite_resident_slot(
+        self,
+        lora_ref: LoRARef,
+        new_lora: Union[LoRAAdapter, LoRASlotWeights],
+        old_config: LoRAConfig,
+        old_lora: Union[LoRAAdapter, LoRASlotWeights],
+    ) -> Optional[LoRAUpdateOutput]:
+        """Rewrite a resident slot; on failure restore it and return the error."""
+        uid = lora_ref.lora_id
+        buffer_id = self.memory_pool.uid_to_buffer_id[uid]
+        try:
+            # The served buffer slot is rewritten in place. Wait for
+            # already-launched kernels first: under overlap scheduling /
+            # CUDA-graph replay a forward pass can still be executing on
+            # another stream, and it must not read a half-rewritten slot.
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self.memory_pool.load_lora_weight_to_buffer(
+                uid,
+                buffer_id,
+                new_lora,
+                self.lora_modules,
+                self.embed_tokens_module,
+                self.lm_head_module,
+            )
+            self._notify_lora_slots_updated({buffer_id})
+        except Exception as e:
+            # Roll back so the adapter keeps serving its previous weights
+            # instead of a torn half-old/half-new buffer.
+            self.configs[uid] = old_config
+            self.loras[uid] = old_lora
             try:
-                # The served buffer slot is rewritten in place. Wait for
-                # already-launched kernels first: under overlap scheduling /
-                # CUDA-graph replay a forward pass can still be executing on
-                # another stream, and it must not read a half-rewritten slot.
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize(self.device)
                 self.memory_pool.load_lora_weight_to_buffer(
                     uid,
                     buffer_id,
-                    new_lora,
+                    old_lora,
                     self.lora_modules,
                     self.embed_tokens_module,
                     self.lm_head_module,
                 )
                 self._notify_lora_slots_updated({buffer_id})
-            except Exception as e:
-                # Roll back so the adapter keeps serving its previous weights
-                # instead of a torn half-old/half-new buffer.
-                self.configs[uid] = old_config
-                self.loras[uid] = old_lora
-                try:
-                    self.memory_pool.load_lora_weight_to_buffer(
-                        uid,
-                        buffer_id,
-                        old_lora,
-                        self.lora_modules,
-                        self.embed_tokens_module,
-                        self.lm_head_module,
-                    )
-                    self._notify_lora_slots_updated({buffer_id})
-                except Exception:
-                    self.memory_pool.invalid_uids.add(uid)
-                    logger.exception(
-                        f"Failed to restore previous weights for LoRA adapter "
-                        f"{lora_ref.lora_name} (buffer slot {buffer_id}) after a "
-                        "failed upsert; the served buffer may be corrupted."
-                    )
-                return self.create_lora_update_result(
-                    success=False,
-                    error_message=str(e),
+            except Exception:
+                self.memory_pool.invalid_uids.add(uid)
+                logger.exception(
+                    f"Failed to restore previous weights for LoRA adapter "
+                    f"{lora_ref.lora_name} (buffer slot {buffer_id}) after a "
+                    "failed upsert; the served buffer may be corrupted."
                 )
+            return self.create_lora_update_result(
+                success=False,
+                error_message=str(e),
+            )
+        return None
 
+    def _commit_lora_adapter(
+        self,
+        lora_ref: LoRARef,
+        new_config: LoRAConfig,
+        new_lora: Union[LoRAAdapter, LoRASlotWeights],
+        is_update: bool,
+        old_ref: Optional[LoRARef],
+    ) -> None:
+        uid = lora_ref.lora_id
         self.configs[uid] = new_config
         self.loras[uid] = new_lora
         self.lora_refs[uid] = lora_ref
@@ -1234,10 +1328,10 @@ class LoRAManager:
         if getattr(self, "memory_pool", None) is not None:
             self.memory_pool.invalid_uids.discard(uid)
 
-        return self.create_lora_update_result(success=True)
-
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
+        # Placements describe this pool's slots, keyed by adapter signature.
+        self._slot_placements: Dict[tuple, Optional[LoRASlotPlacement]] = {}
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,

@@ -83,7 +83,8 @@ class TestSlotPlacementTracer(CustomTestCase):
                 self.assertEqual(tuple(value.shape), TENSORS[i].shape)
                 self.assertTrue(
                     torch.equal(
-                        value.reshape(-1), torch.arange(starts[i], starts[i + 1]) + 1
+                        value.reshape(-1).long(),
+                        torch.arange(starts[i], starts[i + 1]) + 1,
                     )
                 )
 

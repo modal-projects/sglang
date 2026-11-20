@@ -6,13 +6,13 @@ The process is a clean interpreter running this file, so this module imports no 
 code: only the standard library and torch, for the install's arithmetic. It sees no GPU.
 
 Each GPU's scheduler connects over a Unix socket in a directory only this user can use,
-and sends JSON requests; bulk data is shared memory, passed as file descriptors:
-- per GPU, staging, which its scheduler pins once and copies into the slot from, reused
-  by every update and only grown, because pinning host memory stalls the GPU's work;
-- per adapter version, one shared copy holding each distinct buffer region once. A
-  region several GPUs hold alike (a replicated module) is built by the first request
-  that needs it, and every GPU maps the copy for the regions it uses as its
-  LoRASlotWeights.
+and sends JSON requests. The adapters' weights live in the node buffer: shared memory
+segments, passed as file descriptors, that every GPU's scheduler maps and pins once,
+because pinning host memory can stall the GPU's work. A version's distinct buffer regions
+take free space in it: a region several GPUs hold alike (a replicated module) is built
+once, by the first request that needs it. Each GPU uses its regions in place as its
+LoRASlotWeights, copying from them into the slot, and holds them until it drops that
+adapter; then the space is reused.
 
 The scheduler that binds the node's socket first starts the process and hands it the
 listening socket, so the process's exit resets every connection; that scheduler starts
@@ -41,16 +41,18 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from multiprocessing.connection import Connection
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-# Staging grows in whole steps, with a quarter of headroom, so it is re-pinned rarely.
-_STAGING_STEP = 64 << 20
+# The node buffer grows by segments of at least this, or a quarter of its size, so the
+# schedulers pin new memory rarely.
+_SEGMENT_MIN = 256 << 20
 # A request still running after this is answered as failed, and its connection closed.
 _PREPARE_TIMEOUT_S = 600
 # The process maps what it reads and writes with every page up front.
@@ -79,21 +81,31 @@ def node_address(instance_id: str) -> str:
 
 
 class LoRAPrepareClient:
-    """A scheduler's side: connects to the node's process, owns this GPU's staging."""
+    """A scheduler's side: connects to the node's process, and maps and pins the segments
+    of the node buffer this GPU reads adapters from."""
 
     def __init__(self, address: str):
         self._address = address
-        self._staging_fd = os.memfd_create("sglang-lora-staging")
-        self._staging: Optional[torch.Tensor] = None
-        # Recorded after the GPU's reads of staging are queued; a read waits for it.
-        self._staging_read: Optional[torch.cuda.Event] = None
+        # Names this scheduler to the process: its holds outlive a connection.
+        self._client_id = uuid.uuid4().hex
         self._process: Optional[subprocess.Popen] = None
         self._listener: Optional[socket.socket] = None
         self._connection: Optional[Connection] = None
         self._socket: Optional[socket.socket] = None
         # Layouts the process holds for this connection.
         self._layouts_sent: set = set()
+        self._request: Optional[dict] = None
         self._started: Optional[float] = None
+        # A read's reply waiting for its new segments to be pinned, and the thread.
+        self._pinning: Optional[Tuple[dict, threading.Thread]] = None
+        # The node buffer's segments mapped here, by (buffer id, segment).
+        self._segments: Dict[Tuple[str, int], _Segment] = {}
+        self._buffer_id: Optional[str] = None
+        # Versions this GPU holds, by prepare_id: their buffer and segments.
+        self._holds: Dict[str, Tuple[str, List[int]]] = {}
+        # Released versions, each told to the process once the GPU work queued before
+        # its release, its copies from the regions included, is done.
+        self._releases: List[Tuple[str, Any]] = []
         self._owner = False
         self._unavailable: Optional[str] = None
         try:
@@ -115,16 +127,11 @@ class LoRAPrepareClient:
         prepare_id: str,
         layout_id: str,
         layout: SlotLayout,
-        numel: int,
         dtype: torch.dtype,
         scaling: float,
     ) -> None:
-        """Ask to read the listed files into this GPU's slot regions, in staging and in
-        the version's shared copy, which poll replies with."""
-        if self._staging_read is not None:
-            self._staging_read.synchronize()
-            self._staging_read = None
-        self._fit_staging(numel * dtype.itemsize)
+        """Ask to read the listed files into this GPU's slot regions in the node buffer;
+        poll replies with where they are, and region_views maps them."""
         # A new connection holds no layouts: decide what to send once connected.
         self._connect()
         self._send(
@@ -139,42 +146,117 @@ class LoRAPrepareClient:
         )
         self._layouts_sent.add(layout_id)
 
-    def poll(self) -> Optional[Tuple[dict, Optional[torch.Tensor]]]:
-        """The reply to the request in flight once it is done, else None. A read's
-        reply comes with the version's shared copy, mapped as bytes."""
+    def poll(self) -> Optional[dict]:
+        """The reply to the request in flight once it is done, else None. A read is done
+        once the segments it uses are mapped and pinned here; this GPU then holds its
+        regions until release."""
         if self._started is None:
             return None
-        shared = None
         try:
             if time.monotonic() - self._started > _PREPARE_TIMEOUT_S:
                 raise TimeoutError(f"no reply in {_PREPARE_TIMEOUT_S} s")
-            if not self._connection.poll(0):
-                return None
-            reply = json.loads(self._connection.recv_bytes())
-            if "region_offsets" in reply:
-                _, fds, _, _ = socket.recv_fds(self._socket, 1, 1)
-                if not fds:
-                    raise RuntimeError("the shared copy did not arrive")
-                try:
-                    shared = _map(fds[0])
-                finally:
-                    for fd in fds:
-                        os.close(fd)
+            if self._pinning is not None:
+                reply, thread = self._pinning
+                if thread.is_alive():
+                    return None
+                self._pinning = None
+            else:
+                if not self._connection.poll(0):
+                    return None
+                reply = json.loads(self._connection.recv_bytes())
+                if "regions" in reply:
+                    thread = self._receive_segments(reply)
+                    if thread is not None:
+                        self._pinning = (reply, thread)
+                        return None
+            if "regions" in reply:
+                self._hold(reply)
         except Exception as error:
             self._disconnect()
-            reply, shared = {"error": f"LoRA prepare process: {error!r}"}, None
-        self._started = None
-        return reply, shared
+            reply = {"error": f"LoRA prepare process: {error!r}"}
+        self._started = self._request = None
+        return reply
 
-    def staged(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
-        """Pinned view of what the last read staged. Call record_staging_reads after
-        queuing the copies from it: the next read waits for them before writing."""
-        return self._staging[: numel * dtype.itemsize].view(dtype)
+    def region_views(self, reply: dict, sizes: Sequence[int]) -> List[torch.Tensor]:
+        """The read's regions in the pinned node buffer, as bytes of the given sizes."""
+        buffer_id = reply["buffer"]
+        return [
+            self._segments[(buffer_id, segment)].data[offset : offset + size]
+            for (segment, offset), size in zip(reply["regions"], sizes)
+        ]
 
-    def record_staging_reads(self) -> None:
-        event = torch.cuda.Event()
-        event.record()
-        self._staging_read = event
+    def release(self, prepare_id: str) -> None:
+        """This GPU no longer uses the regions of prepare_id's version: the process may
+        reuse them once the GPU work queued so far is done."""
+        self._releases.append((prepare_id, _reads_fence()))
+
+    def _receive_segments(self, reply: dict) -> Optional[threading.Thread]:
+        """Map the segments new to this connection; a thread pins the ones new here."""
+        new = reply["segments"]
+        fds: List[int] = []
+        if new:
+            _, fds, _, _ = socket.recv_fds(self._socket, 1, len(new))
+            if len(fds) != len(new):
+                for fd in fds:
+                    os.close(fd)
+                raise RuntimeError("the node buffer's segments did not arrive")
+        if reply["buffer"] != self._buffer_id:
+            # A new process: the old one's segments go once no version uses them.
+            self._buffer_id = reply["buffer"]
+            self._drop_unused_segments()
+        to_pin = []
+        for (segment, size), fd in zip(new, fds):
+            key = (reply["buffer"], segment)
+            if key in self._segments:
+                os.close(fd)
+            else:
+                self._segments[key] = _Segment(fd, size)
+                to_pin.append(self._segments[key])
+        if not to_pin:
+            return None
+        thread = threading.Thread(
+            target=lambda: [segment.pin() for segment in to_pin], daemon=True
+        )
+        thread.start()
+        return thread
+
+    def _hold(self, reply: dict) -> None:
+        prepare_id = self._request["prepare_id"]
+        used = sorted({segment for segment, _ in reply["regions"]})
+        segments = [self._segments[(reply["buffer"], s)] for s in used]
+        self._holds[prepare_id] = (reply["buffer"], used)
+        for segment in segments:
+            segment.versions += 1
+        errors = [segment.error for segment in segments if segment.error is not None]
+        if errors:
+            self._releases.append((prepare_id, None))
+            raise RuntimeError(f"pinning the node buffer failed: {errors[0]}")
+
+    def _send_releases(self) -> None:
+        """Tell the process the releases whose GPU work is done."""
+        done = [p for p, fence in self._releases if fence is None or fence.query()]
+        if not done:
+            return
+        self._releases = [(p, f) for p, f in self._releases if p not in done]
+        current = []
+        for prepare_id in done:
+            buffer_id, used = self._holds.pop(prepare_id, (self._buffer_id, []))
+            for segment in used:
+                self._segments[(buffer_id, segment)].versions -= 1
+            if buffer_id == self._buffer_id:
+                current.append(prepare_id)
+        self._drop_unused_segments()
+        if current:
+            self._connection.send_bytes(
+                json.dumps({"op": "release", "prepare_ids": current}).encode()
+            )
+
+    def _drop_unused_segments(self) -> None:
+        """Unpin the segments of an earlier process no held version uses."""
+        for key, segment in list(self._segments.items()):
+            if key[0] != self._buffer_id and segment.versions == 0:
+                segment.unpin()
+                del self._segments[key]
 
     def _bind(self) -> bool:
         """Whether this scheduler owns the node's process: the first to bind does."""
@@ -196,8 +278,9 @@ class LoRAPrepareClient:
         if self._unavailable is not None:
             raise RuntimeError(self._unavailable)
         self._connect()
+        self._send_releases()
         self._connection.send_bytes(json.dumps(request).encode())
-        self._started = time.monotonic()
+        self._request, self._started = request, time.monotonic()
 
     def _connect(self) -> None:
         if self._owner and (self._process is None or self._process.poll() is not None):
@@ -222,9 +305,11 @@ class LoRAPrepareClient:
                 time.sleep(0.001)
         self._socket = sock
         self._connection = Connection(os.dup(sock.fileno()))
-        # Staging goes once per connection; the process maps it for every read.
-        self._connection.send_bytes(json.dumps({"op": "staging"}).encode())
-        socket.send_fds(sock, [b"\0"], [self._staging_fd])
+        self._connection.send_bytes(
+            json.dumps(
+                {"op": "hello", "client_id": self._client_id, "pid": os.getpid()}
+            ).encode()
+        )
 
     def _start_process(self) -> None:
         if self._process is not None:
@@ -269,39 +354,58 @@ class LoRAPrepareClient:
             self._socket.close()
         self._connection = self._socket = None
         self._layouts_sent.clear()
-        if self._started is not None:
-            # The process may still be writing the old staging: take a new one.
-            self._started = None
-            self._drop_staging()
-            os.close(self._staging_fd)
-            self._staging_fd = os.memfd_create("sglang-lora-staging")
+        if self._request is not None and self._request["op"] == "read":
+            # Its reply, and the hold it gave, may never be read here.
+            self._releases.append((self._request["prepare_id"], None))
+        self._started = self._request = None
+        self._pinning = None
 
-    def _drop_staging(self) -> None:
-        if self._staging_read is not None:
-            self._staging_read.synchronize()
-            self._staging_read = None
-        if self._staging is not None:
-            err = torch.cuda.cudart().cudaHostUnregister(self._staging.data_ptr())
-            if int(err) != 0:
-                logger.warning(f"cudaHostUnregister of LoRA staging failed: {err}")
-            # The old mapping closes once no view of it is left.
-            self._staging = None
 
-    def _fit_staging(self, nbytes: int) -> None:
-        capacity = 0 if self._staging is None else self._staging.numel()
-        if nbytes <= capacity:
-            return
-        capacity = math.ceil(nbytes * 1.25 / _STAGING_STEP) * _STAGING_STEP
-        self._drop_staging()
-        os.ftruncate(self._staging_fd, capacity)
-        staging = torch.frombuffer(
-            mmap.mmap(self._staging_fd, capacity), dtype=torch.uint8
-        )
-        err = torch.cuda.cudart().cudaHostRegister(staging.data_ptr(), capacity, 0)
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({capacity} bytes) failed: {err}")
-        self._staging = staging
-        logger.info(f"LoRA staging grew to {capacity / 2**30:.2f} GiB")
+class _Segment:
+    """A segment of the node buffer mapped here, pinned for the GPU to copy from."""
+
+    def __init__(self, fd: int, size: int):
+        self.fd = fd
+        self.size = size
+        self.data: Optional[torch.Tensor] = None
+        self.error: Optional[str] = None
+        # Versions this GPU holds with regions in it.
+        self.versions = 0
+
+    def pin(self) -> None:
+        try:
+            data = _map(self.fd, self.size, populate=True)
+            _host_register(data)
+            self.data = data
+        except Exception as error:
+            self.error = f"{type(error).__name__}: {error}"
+        finally:
+            os.close(self.fd)
+
+    def unpin(self) -> None:
+        if self.data is not None:
+            _host_unregister(self.data)
+            # The mapping closes once no view of it is left.
+            self.data = None
+
+
+def _host_register(data: torch.Tensor) -> None:
+    err = int(torch.cuda.cudart().cudaHostRegister(data.data_ptr(), data.numel(), 0))
+    if err != 0:
+        raise RuntimeError(f"cudaHostRegister({data.numel()} bytes) failed: {err}")
+
+
+def _host_unregister(data: torch.Tensor) -> None:
+    err = int(torch.cuda.cudart().cudaHostUnregister(data.data_ptr()))
+    if err != 0:
+        logger.warning(f"cudaHostUnregister of the LoRA node buffer failed: {err}")
+
+
+def _reads_fence():
+    """Done once the GPU work queued so far, its copies from host memory included, ran."""
+    event = torch.cuda.Event()
+    event.record()
+    return event
 
 
 def _unlink_quietly(path: str) -> None:
@@ -416,20 +520,74 @@ def _map(
     )
 
 
-class _Region:
-    """A buffer region of one version in the shared copy, built by its first reader."""
+def _pages(nbytes: int) -> int:
+    return -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
 
-    def __init__(self, offset: int):
+
+class _Buffer:
+    """The node's memory for every version's regions: memfd segments, each mapped and
+    pinned once by every GPU's scheduler. Freed space is reused."""
+
+    def __init__(self):
+        # Names this process's buffer: an earlier process's segments are other memory.
+        self.id = uuid.uuid4().hex
+        # (fd, bytes mapped here) per segment.
+        self.segments: List[Tuple[int, torch.Tensor]] = []
+        # Per segment, its free [offset, size] extents in offset order.
+        self._free: List[List[List[int]]] = []
+        self._lock = threading.Lock()
+
+    def allocate(self, nbytes: int) -> Tuple[int, int]:
+        """(segment, offset) of free page-aligned space for `nbytes`: the first fit, or
+        a new segment."""
+        nbytes = _pages(nbytes)
+        with self._lock:
+            for segment, free in enumerate(self._free):
+                for extent in free:
+                    if extent[1] >= nbytes:
+                        offset = extent[0]
+                        extent[0] += nbytes
+                        extent[1] -= nbytes
+                        if extent[1] == 0:
+                            free.remove(extent)
+                        return segment, offset
+            total = sum(data.numel() for _, data in self.segments)
+            size = max(nbytes, _pages(max(total // 4, _SEGMENT_MIN)))
+            fd = os.memfd_create("sglang-lora-node-buffer")
+            os.ftruncate(fd, size)
+            self.segments.append((fd, _map(fd, size, populate=True)))
+            self._free.append([[nbytes, size - nbytes]] if size > nbytes else [])
+            return len(self.segments) - 1, 0
+
+    def free(self, segment: int, offset: int, nbytes: int) -> None:
+        with self._lock:
+            extents = sorted(self._free[segment] + [[offset, _pages(nbytes)]])
+            merged = [extents[0]]
+            for start, size in extents[1:]:
+                if merged[-1][0] + merged[-1][1] == start:
+                    merged[-1][1] += size
+                else:
+                    merged.append([start, size])
+            self._free[segment] = merged
+
+
+class _Region:
+    """A buffer region of one version in the node buffer, built by its first reader."""
+
+    def __init__(self, segment: int, offset: int, nbytes: int):
+        self.segment = segment
         self.offset = offset
+        self.nbytes = nbytes
         self.built = threading.Event()
         self.error: Optional[str] = None
 
 
 class _Version:
-    """One update's listing and shared copy; its regions are found by digest."""
+    """One update's listing and its regions in the node buffer, found by digest."""
 
-    def __init__(self, prepare_id: str):
+    def __init__(self, prepare_id: str, buffer: _Buffer):
         self.prepare_id = prepare_id
+        self.buffer = buffer
         self.listed = threading.Event()
         self.tensors: Optional[List[FileTensor]] = None
         # Each tensor as a flat view of its file, mapped read-only: the page cache's
@@ -438,13 +596,11 @@ class _Version:
         self.digest: Optional[str] = None
         self.listed_s = 0.0
         self.error: Optional[str] = None
-        self.shared_fd = os.memfd_create("sglang-lora-weights")
-        self.size = 0
         self.regions: Dict[str, _Region] = {}
         self.lock = threading.Lock()
-        # Requests using it; a retired version closes when the last one ends.
+        # Requests using it now, and the clients whose GPUs hold its regions.
         self.users = 0
-        self.retired = False
+        self.holders: Set[str] = set()
 
     def claim(self, digest: str, nbytes: int) -> Tuple[_Region, bool]:
         """The region of `digest`, and whether the caller builds it."""
@@ -452,43 +608,100 @@ class _Version:
             region = self.regions.get(digest)
             if region is not None:
                 return region, False
-            # Page-aligned, so a region maps on its own.
-            region = _Region(self.size)
-            self.size += -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
-            os.ftruncate(self.shared_fd, self.size)
+            region = _Region(*self.buffer.allocate(nbytes), nbytes)
             self.regions[digest] = region
             return region, True
+
+    def free(self) -> None:
+        for region in self.regions.values():
+            self.buffer.free(region.segment, region.offset, region.nbytes)
+        self.regions.clear()
+        self.sources = []
 
 
 class _Node:
     def __init__(self):
         self.lock = threading.Lock()
-        self.version: Optional[_Version] = None
+        self.buffer = _Buffer()
+        self.versions: Dict[str, _Version] = {}
+        # The newest update's version stays until the next update: its GPUs read it
+        # one request at a time.
+        self.latest: Optional[str] = None
+        # Each client's pid and open connections: a client gone with none releases
+        # its holds.
+        self.clients: Dict[str, Tuple[int, int]] = {}
+
+    def connect(self, client_id: str, pid: int) -> None:
+        with self.lock:
+            _, connections = self.clients.get(client_id, (pid, 0))
+            self.clients[client_id] = (pid, connections + 1)
+
+    def disconnect(self, client_id: str) -> None:
+        with self.lock:
+            pid, connections = self.clients[client_id]
+            self.clients[client_id] = (pid, connections - 1)
 
     def use(self, prepare_id: str, create: bool) -> Tuple[Optional[_Version], bool]:
-        """The version of `prepare_id`, held for the caller until release, and whether
-        the caller lists it (only with `create`). A newer update retires the older
-        one; the GPUs' maps of its shared copy keep that memory until they drop it."""
+        """The version of `prepare_id`, used by the caller until done, and whether the
+        caller lists it (only with `create`)."""
         with self.lock:
-            version = self.version
-            if version is not None and version.prepare_id == prepare_id:
+            version = self.versions.get(prepare_id)
+            if version is not None:
                 version.users += 1
                 return version, False
             if not create:
                 return None, False
-            if version is not None:
-                version.retired = True
-                if version.users == 0:
-                    os.close(version.shared_fd)
-            self.version = _Version(prepare_id)
-            self.version.users = 1
-            return self.version, True
+            self._reap()
+            previous, self.latest = self.versions.get(self.latest), prepare_id
+            version = self.versions[prepare_id] = _Version(prepare_id, self.buffer)
+            version.users = 1
+            if previous is not None:
+                self._free_if_unused(previous)
+            return version, True
 
-    def release(self, version: _Version) -> None:
+    def done(self, version: _Version, holder: Optional[str]) -> None:
+        """A request on `version` ended; `holder`'s GPU now holds its regions."""
         with self.lock:
             version.users -= 1
-            if version.retired and version.users == 0:
-                os.close(version.shared_fd)
+            if holder is not None:
+                version.holders.add(holder)
+            self._free_if_unused(version)
+
+    def release(self, client_id: str, prepare_ids: Sequence[str]) -> None:
+        with self.lock:
+            for prepare_id in prepare_ids:
+                version = self.versions.get(prepare_id)
+                if version is not None:
+                    version.holders.discard(client_id)
+                    self._free_if_unused(version)
+
+    def _reap(self) -> None:
+        """Release the holds of clients gone without releasing them."""
+        for client_id, (pid, connections) in list(self.clients.items()):
+            if connections == 0 and not _alive(pid):
+                del self.clients[client_id]
+                for version in list(self.versions.values()):
+                    version.holders.discard(client_id)
+                    self._free_if_unused(version)
+
+    def _free_if_unused(self, version: _Version) -> None:
+        if (
+            version.users == 0
+            and not version.holders
+            and version.prepare_id != self.latest
+        ):
+            version.free()
+            del self.versions[version.prepare_id]
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 
 class _Layout:
@@ -518,22 +731,25 @@ class _Layout:
 def _serve(node: _Node, sock: socket.socket) -> None:
     """One GPU's requests, in order."""
     connection = Connection(os.dup(sock.fileno()))
-    staging_fd: Optional[int] = None
-    staging = torch.empty(0, dtype=torch.uint8)
+    client_id: Optional[str] = None
+    # Segments whose fds went over this connection.
+    sent: Set[int] = set()
     layouts: Dict[str, _Layout] = {}
     while True:
         try:
             request = json.loads(connection.recv_bytes())
         except (EOFError, OSError):
             break
-        if request["op"] == "staging":
-            _, fds, _, _ = socket.recv_fds(sock, 1, 1)
-            if staging_fd is not None:
-                os.close(staging_fd)
-            staging_fd, staging = fds[0], torch.empty(0, dtype=torch.uint8)
+        if request["op"] == "hello":
+            client_id = request["client_id"]
+            node.connect(client_id, request["pid"])
+            continue
+        if request["op"] == "release":
+            node.release(client_id, request["prepare_ids"])
             continue
         started = time.perf_counter()
         version, lists = node.use(request["prepare_id"], create=request["op"] == "list")
+        holder = None
         try:
             if version is None:
                 raise RuntimeError("the LoRA adapter was not listed for this request")
@@ -551,27 +767,33 @@ def _serve(node: _Node, sock: socket.socket) -> None:
                     layouts[request["layout_id"]] = _Layout(request["layout"])
                 layout = layouts[request["layout_id"]]
                 dtype = getattr(torch, request["dtype"])
-                nbytes = sum(numel for _, numel in layout.regions) * dtype.itemsize
-                if staging.numel() < nbytes:
-                    staging = _map(staging_fd, populate=True)
-                reply = _read(version, layout, dtype, request["scaling"], staging)
+                reply = _read(version, layout, dtype, request["scaling"])
                 reply["listed_s"] = version.listed_s
+                holder = client_id
         except Exception as error:
             reply = {"error": f"{type(error).__name__}: {error}"}
         reply["request_s"] = time.perf_counter() - started
+        new: List[int] = []
+        if "regions" in reply:
+            new = sorted({segment for segment, _ in reply["regions"]} - sent)
+            reply["buffer"] = node.buffer.id
+            reply["segments"] = [(s, node.buffer.segments[s][1].numel()) for s in new]
         try:
             connection.send_bytes(json.dumps(reply).encode())
-            if "region_offsets" in reply:
-                socket.send_fds(sock, [b"\0"], [version.shared_fd])
+            if new:
+                socket.send_fds(
+                    sock, [b"\0"], [node.buffer.segments[s][0] for s in new]
+                )
+                sent.update(new)
         except OSError:
             break
         finally:
             if version is not None:
-                node.release(version)
+                node.done(version, holder)
     connection.close()
     sock.close()
-    if staging_fd is not None:
-        os.close(staging_fd)
+    if client_id is not None:
+        node.disconnect(client_id)
 
 
 def _list(version: _Version, files: Sequence[str]) -> None:
@@ -612,26 +834,26 @@ def _list(version: _Version, files: Sequence[str]) -> None:
 
 
 def _read(
-    version: _Version,
-    layout: _Layout,
-    dtype: torch.dtype,
-    scaling: float,
-    staging: torch.Tensor,
+    version: _Version, layout: _Layout, dtype: torch.dtype, scaling: float
 ) -> dict:
-    """Build this GPU's regions that no request has built yet into the version's shared
-    copy, wait for the ones another request builds, copy all of them into this GPU's
-    staging, and reply where they sit in the copy. A request builds each region it
-    claims at once, so it never waits while holding an unbuilt one."""
-    offsets, built, reused = [], 0, 0
-    for (offset, numel), copies, digest in zip(
+    """Build this GPU's regions that no request has built yet into the node buffer, wait
+    for the ones another request builds, and reply where they are. A request builds each
+    region it claims at once, so it never waits while holding an unbuilt one."""
+    regions, built, reused = [], 0, 0
+    for (_, numel), copies, digest in zip(
         layout.regions, layout.copies, layout.digests
     ):
         nbytes = numel * dtype.itemsize
         region, builds = version.claim(digest, nbytes)
         if builds:
             try:
-                shared = _map(version.shared_fd, nbytes, region.offset, populate=True)
-                read_slot_weights(shared.view(dtype), copies, version.sources, scaling)
+                data = version.buffer.segments[region.segment][1]
+                read_slot_weights(
+                    data[region.offset : region.offset + nbytes].view(dtype),
+                    copies,
+                    version.sources,
+                    scaling,
+                )
             except Exception as error:
                 region.error = f"{type(error).__name__}: {error}"
             finally:
@@ -642,12 +864,8 @@ def _read(
             reused += nbytes
         if region.error is not None:
             raise RuntimeError(region.error)
-        if not builds:
-            shared = _map(version.shared_fd, nbytes, region.offset, populate=True)
-        start = offset * dtype.itemsize
-        staging[start : start + nbytes].copy_(shared)
-        offsets.append(region.offset)
-    return {"region_offsets": offsets, "built_bytes": built, "reused_bytes": reused}
+        regions.append((region.segment, region.offset))
+    return {"regions": regions, "built_bytes": built, "reused_bytes": reused}
 
 
 def main() -> None:

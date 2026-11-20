@@ -19,6 +19,7 @@ import hashlib
 import logging
 import re
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
@@ -46,7 +47,6 @@ from sglang.srt.lora.lora_slot_weights import (
     SlotPlacementTracer,
     adapter_files,
     slot_placement_key,
-    slot_regions,
 )
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
@@ -401,11 +401,11 @@ class LoRAManager:
             "a LoRA prepare is still running"
         )
         self._prepared = prepared = _PreparedLoRA(prepare_id)
-        # Staging is pinned with cudaHostRegister.
+        # The adapter's CPU copy is its regions in the node buffer, pinned for CUDA.
         if self.lora_no_cpu_backup or self.device.type != "cuda":
             prepared.reply = PrepareLoRAAdapterReqOutput(
                 prepared=False,
-                message="no CPU copy or no CUDA staging",
+                message="no CPU copy, or no CUDA to pin the node buffer for",
                 unsupported=True,
             )
             return
@@ -443,10 +443,9 @@ class LoRAManager:
             )
         if prepared.reply is not None:
             return prepared.reply
-        polled = self._prepare_client.poll()
-        if polled is None:
+        result = self._prepare_client.poll()
+        if result is None:
             return None
-        result, shared = polled
         try:
             if "error" in result:
                 self._not_prepared(prepared, result["error"])
@@ -464,15 +463,31 @@ class LoRAManager:
             else:
                 placement = prepared.placement
                 itemsize = placement.dtype.itemsize
-                regions = [
-                    shared[offset : offset + r.numel * itemsize].view(placement.dtype)
-                    for offset, r in zip(
-                        result.pop("region_offsets"), placement.regions
-                    )
-                ]
-                prepared.weights = LoRASlotWeights(prepared.config, placement, regions)
+                views = self._prepare_client.region_views(
+                    result, [r.numel * itemsize for r in placement.regions]
+                )
+                weights = LoRASlotWeights(
+                    prepared.config,
+                    placement,
+                    [view.view(placement.dtype) for view in views],
+                )
+                # Its regions in the node buffer stay this GPU's until it drops them;
+                # at exit the process sees this scheduler gone instead.
+                weakref.finalize(
+                    weights, self._prepare_client.release, prepared.prepare_id
+                ).atexit = False
+                prepared.weights = weights
                 prepared.reply = PrepareLoRAAdapterReqOutput(
-                    prepared=True, stats=result
+                    prepared=True,
+                    stats={
+                        key: result[key]
+                        for key in (
+                            "listed_s",
+                            "request_s",
+                            "built_bytes",
+                            "reused_bytes",
+                        )
+                    },
                 )
         except Exception as e:
             self._not_prepared(prepared, f"{type(e).__name__}: {e}")
@@ -518,7 +533,6 @@ class LoRAManager:
         self._prepare_client.read(
             prepared.prepare_id,
             *layout,
-            placement.numel,
             placement.dtype,
             config.lora_alpha / config.r,
         )
@@ -549,8 +563,8 @@ class LoRAManager:
     def apply_prepared_lora_adapter(
         self, lora_ref: LoRARef, upsert: bool
     ) -> LoRAUpdateOutput:
-        """Make the prepared adapter serve; a resident one is rewritten in its slot
-        from pinned staging, at this step boundary."""
+        """Make the prepared adapter serve; a resident one is rewritten in its slot from
+        the node's pinned buffer, at this step boundary."""
         new_lora, self._prepared = self._prepared.weights, None
         uid = lora_ref.lora_id
         is_update = upsert and uid in self.loras
@@ -563,21 +577,9 @@ class LoRAManager:
             speculative_algorithm=self.speculative_algorithm,
         )
         if is_update and uid in self.memory_pool.uid_to_buffer_id:
-            placement = new_lora.placement
-            staged = LoRASlotWeights(
-                new_lora.config,
-                placement,
-                slot_regions(
-                    placement,
-                    self._prepare_client.staged(placement.numel, placement.dtype),
-                ),
+            failure = self._rewrite_resident_slot(
+                lora_ref, new_lora, self.configs[uid], self.loras[uid]
             )
-            try:
-                failure = self._rewrite_resident_slot(
-                    lora_ref, staged, self.configs[uid], self.loras[uid]
-                )
-            finally:
-                self._prepare_client.record_staging_reads()
             if failure is not None:
                 return failure
         self._commit_lora_adapter(

@@ -1,23 +1,9 @@
-"""Unit tests for /update_lora_adapter: read the adapter on every rank while serving,
-then switch on every rank at one step.
-
-Covers:
-  * the tokenizer: prepare before apply, the retract pause scope, a pause someone else
-    started, a failed flush, a pause asked for during an update, the weight version
-    switching with the adapter, and adapters a request names loaded while serving
-  * the ranks: they apply what they prepared only when every rank holds it, and
-    otherwise load as /load_lora_adapter does
-  * the scheduler: one prepare at a time, no prepare where control requests reach the
-    ranks at different steps, and the weight version recorded at the switch
-  * the manager's prepare record
-  * the prepare process: a clean interpreter that lists an adapter's files and reads
-    them into slot order, casting at the copy as the install does
-  * the new requests over msgpack IPC
-"""
+"""Unit tests for /update_lora_adapter: read while serving, then switch at one step."""
 
 import asyncio
 import mmap
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -34,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.lora import lora_prepare_process  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager, _PreparedLoRA  # noqa: E402
 from sglang.srt.lora.lora_prepare_process import (  # noqa: E402
     LoRAPrepareClient,
@@ -600,12 +587,21 @@ class TestPreparedRecord(CustomTestCase):
         self.assertIsNone(manager._prepared)
 
 
-def _unpinned_staging(self, nbytes):
-    if self._staging is None or self._staging.numel() < nbytes:
-        os.ftruncate(self._staging_fd, nbytes)
-        self._staging = torch.frombuffer(
-            mmap.mmap(self._staging_fd, nbytes), dtype=torch.uint8
-        )
+class _Done:
+    @staticmethod
+    def query():
+        return True
+
+
+def _without_cuda(cls):
+    """Pinning and GPU fences are CUDA calls: the CPU tests stand them in."""
+    for name, value in (
+        ("_host_register", lambda data: None),
+        ("_host_unregister", lambda data: None),
+        ("_reads_fence", lambda: _Done),
+    ):
+        cls = patch(f"sglang.srt.lora.lora_prepare_process.{name}", value)(cls)
+    return cls
 
 
 def _replies(*clients: LoRAPrepareClient) -> list:
@@ -621,17 +617,14 @@ def _replies(*clients: LoRAPrepareClient) -> list:
     return replies
 
 
-def _regions(reply, layout, dtype):
-    result, shared = reply
-    return [
-        shared[offset : offset + numel * dtype.itemsize].view(dtype)
-        for offset, (_, numel) in zip(result["region_offsets"], layout[0])
-    ]
+def _regions(gpu, reply, layout, dtype):
+    views = gpu.region_views(reply, [numel * dtype.itemsize for _, numel in layout[0]])
+    return [view.view(dtype) for view in views]
 
 
-@patch.object(LoRAPrepareClient, "_fit_staging", _unpinned_staging)
+@_without_cuda
 class TestNodePrepareProcess(CustomTestCase):
-    def test_gpus_share_alike_regions_and_read_their_own(self):
+    def test_gpus_share_alike_regions_and_hold_them_until_released(self):
         bf16 = torch.bfloat16
         a = torch.randn(3, 4, dtype=torch.float32)
         b = torch.randn(2, 3).to(bf16)
@@ -671,20 +664,25 @@ class TestNodePrepareProcess(CustomTestCase):
                 self.assertIsNotNone(gpus[0]._listener)
                 self.assertIsNone(gpus[1]._listener)
 
-                def update(prepare_id, trace):
+                def update(prepare_id, trace=False):
                     for gpu in gpus:
                         gpu.list_tensors(prepare_id, [file])
-                    listed = [result for result, _ in _replies(*gpus)]
+                    listed = _replies(*gpus)
                     tensors = None
                     if trace:
                         for gpu in gpus:
                             gpu.request_tensors(prepare_id)
-                        tensors = [result["tensors"] for result, _ in _replies(*gpus)]
-                    for gpu, layout, slot in zip(gpus, layouts, expected):
-                        gpu.read(prepare_id, "layout", layout, slot.numel(), bf16, 0.3)
-                    return listed, tensors, _replies(*gpus)
+                        tensors = [reply["tensors"] for reply in _replies(*gpus)]
+                    for gpu, layout in zip(gpus, layouts):
+                        gpu.read(prepare_id, "layout", layout, bf16, 0.3)
+                    read = _replies(*gpus)
+                    for gpu, reply, layout, slot in zip(gpus, read, layouts, expected):
+                        self.assertNotIn("error", reply)
+                        views = _regions(gpu, reply, layout, bf16)
+                        self.assertTrue(torch.equal(torch.cat(views), slot))
+                    return listed, tensors, read
 
-                listed, tensors, read = update("p1", True)
+                listed, tensors, p1 = update("p1", trace=True)
                 self.assertEqual(listed[0]["digest"], listed[1]["digest"])
                 self.assertEqual(
                     tensors[0],
@@ -695,33 +693,40 @@ class TestNodePrepareProcess(CustomTestCase):
                         ["z", file, [0, 4]],
                     ],
                 )
-                for gpu, reply, layout, slot in zip(gpus, read, layouts, expected):
-                    self.assertNotIn("error", reply[0])
-                    views = _regions(reply, layout, bf16)
-                    self.assertTrue(torch.equal(torch.cat(views), slot))
-                    staged = gpu.staged(slot.numel(), bf16)
-                    self.assertTrue(torch.equal(staged, slot))
-                # `a` was built once, at one place in the shared copy.
-                self.assertEqual(
-                    read[0][0]["region_offsets"][0], read[1][0]["region_offsets"][0]
-                )
+                # `a` was built once, at one place in the node buffer.
+                self.assertEqual(p1[0]["regions"][0], p1[1]["regions"][0])
+                self.assertEqual(p1[0]["segments"], [[0, p1[0]["segments"][0][1]]])
 
-                # The next update builds a new version; the layouts went once.
-                _, _, read = update("p2", False)
-                for gpu, reply, layout, slot in zip(gpus, read, layouts, expected):
-                    self.assertIn("layout", gpu._layouts_sent)
-                    views = _regions(reply, layout, bf16)
-                    self.assertTrue(torch.equal(torch.cat(views), slot))
+                # A held version keeps its space; the layouts went once.
+                _, _, p2 = update("p2")
+                self.assertTrue(all("layout" in gpu._layouts_sent for gpu in gpus))
+                self.assertNotEqual(p2[0]["regions"], p1[0]["regions"])
+                self.assertEqual(p2[0]["segments"], [])
 
-                # The process exits: every connection resets, the owner starts a
-                # new one, and both GPUs connect and send their layouts again.
+                # Released by both GPUs, p1's space takes the next version.
+                for gpu in gpus:
+                    gpu.release("p1")
+                _, _, p3 = update("p3")
+
+                def places(read):
+                    return {tuple(r) for reply in read for r in reply["regions"]}
+
+                self.assertEqual(places(p3), places(p1))
+
+                # The process exits: the owner starts a new one with a new buffer, and
+                # the GPUs keep the old segments while they hold versions in them.
+                old = p3[0]["buffer"]
                 gpus[0]._process.kill()
                 gpus[0]._process.wait()
-                _, _, read = update("p3", False)
-                for reply, layout, slot in zip(read, layouts, expected):
-                    self.assertNotIn("error", reply[0])
-                    views = _regions(reply, layout, bf16)
-                    self.assertTrue(torch.equal(torch.cat(views), slot))
+                _, _, p4 = update("p4")
+                self.assertNotEqual(p4[0]["buffer"], old)
+                for gpu in gpus:
+                    self.assertTrue(any(key[0] == old for key in gpu._segments))
+                    gpu.release("p2")
+                    gpu.release("p3")
+                update("p5")
+                for gpu in gpus:
+                    self.assertFalse(any(key[0] == old for key in gpu._segments))
             finally:
                 for gpu in gpus:
                     gpu._disconnect()
@@ -730,62 +735,32 @@ class TestNodePrepareProcess(CustomTestCase):
                 os.unlink(address)
 
 
-@patch.object(LoRAPrepareClient, "_fit_staging", _unpinned_staging)
-class TestPrepareTimeout(CustomTestCase):
-    def test_a_timed_out_request_leaves_its_staging_behind(self):
-        address = node_address(uuid.uuid4().hex[:12])
-        gpu = LoRAPrepareClient(address)
-        staging = os.fstat(gpu._staging_fd).st_ino
-        try:
-            with patch("sglang.srt.lora.lora_prepare_process._PREPARE_TIMEOUT_S", -1):
-                gpu.list_tensors("p1", ["/nonexistent"])
-                result, _ = gpu.poll()
-            self.assertIn("TimeoutError", result["error"])
-            # The process may still write the old staging; the next read gets a new one.
-            self.assertNotEqual(os.fstat(gpu._staging_fd).st_ino, staging)
-            self.assertIsNone(gpu._connection)
-        finally:
-            gpu._disconnect()
-            gpu._process.kill()
-            gpu._process.wait()
-            os.unlink(address)
+class TestNodeBuffer(CustomTestCase):
+    def test_space_is_first_fit_and_merged_when_freed(self):
+        page = mmap.PAGESIZE
+        buffer = lora_prepare_process._Buffer()
+        with patch.object(lora_prepare_process, "_SEGMENT_MIN", 8 * page):
+            first = [buffer.allocate(page) for _ in range(3)]
+            self.assertEqual(first, [(0, 0), (0, page), (0, 2 * page)])
+            buffer.free(0, 0, page)
+            buffer.free(0, page, page)
+            self.assertEqual(buffer.allocate(2 * page), (0, 0))
+            # Nothing fits: a new segment.
+            self.assertEqual(buffer.allocate(6 * page), (1, 0))
 
+    @patch.object(lora_prepare_process, "_SEGMENT_MIN", mmap.PAGESIZE)
+    def test_a_client_gone_without_releasing_loses_its_holds(self):
+        node = lora_prepare_process._Node()
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        node.connect("gone", gone.pid)
+        version, _ = node.use("p1", create=True)
+        version.claim("region", 64)
+        node.done(version, holder="gone")
+        node.disconnect("gone")
+        node.use("p2", create=True)
+        self.assertNotIn("p1", node.versions)
 
-class TestListFileTensors(CustomTestCase):
-    def test_an_incomplete_file_is_named_as_such(self):
-        with tempfile.TemporaryDirectory() as directory:
-            file = os.path.join(directory, "adapter_model.safetensors")
-            save_file({"a": torch.ones(64, dtype=torch.bfloat16)}, file)
-            tensors, _ = list_file_tensors([file])
-            self.assertEqual(tensors, [("a", file, (64,))])
-            for size in (os.path.getsize(file) - 2, 20, 4):
-                with self.subTest(size=size):
-                    os.truncate(file, size)
-                    with self.assertRaisesRegex(ValueError, "incomplete file"):
-                        list_file_tensors([file])
-
-    def test_a_non_float_tensor_is_not_carried(self):
-        with tempfile.TemporaryDirectory() as directory:
-            file = os.path.join(directory, "adapter_model.safetensors")
-            save_file({"a": torch.ones(4, dtype=torch.int32)}, file)
-            self.assertIsNone(list_file_tensors([file]))
-
-
-class TestUpdateRequestsOverIpc(CustomTestCase):
-    def test_round_trip(self):
-        load = _apply(upsert=True).load
-        for obj in (
-            _update("retract", weight_version="7"),
-            PrepareLoRAAdapterReqInput(load=load, prepare_id="p1"),
-            ApplyLoRAAdapterReqInput(load=load, prepare_id="p1", weight_version="7"),
-            PrepareLoRAAdapterReqOutput(prepared=False, message="m", unsupported=True),
-        ):
-            with self.subTest(type=type(obj).__name__):
-                self.assertEqual(msgpack_decode(msgpack_encode(obj)), obj)
-
-    def test_abort_is_not_a_pause_mode(self):
-        with self.assertRaises(msgspec.ValidationError):
-            msgpack_decode(msgpack_encode(_update("abort")))
 
     def test_a_version_maps_its_files_only_while_a_request_reads_them(self):
         bf16 = torch.bfloat16
@@ -834,6 +809,69 @@ class TestUpdateRequestsOverIpc(CustomTestCase):
                 gpus[0]._process.kill()
                 gpus[0]._process.wait()
                 os.unlink(address)
+
+@_without_cuda
+class TestPrepareTimeout(CustomTestCase):
+    def test_a_timed_out_read_gives_up_its_hold(self):
+        address = node_address(uuid.uuid4().hex[:12])
+        gpu = LoRAPrepareClient(address)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                file = os.path.join(directory, "adapter_model.safetensors")
+                save_file({"a": torch.ones(4, dtype=torch.bfloat16)}, file)
+                gpu.list_tensors("p1", [file])
+                _replies(gpu)
+                with patch(
+                    "sglang.srt.lora.lora_prepare_process._PREPARE_TIMEOUT_S", -1
+                ):
+                    gpu.read("p1", "l", ([(0, 4)], []), torch.bfloat16, 1.0)
+                    result = gpu.poll()
+            self.assertIn("TimeoutError", result["error"])
+            self.assertIsNone(gpu._connection)
+            # The reply, and the hold it may give, are never read here.
+            self.assertEqual(gpu._releases, [("p1", None)])
+        finally:
+            gpu._disconnect()
+            gpu._process.kill()
+            gpu._process.wait()
+            os.unlink(address)
+
+
+class TestListFileTensors(CustomTestCase):
+    def test_an_incomplete_file_is_named_as_such(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = os.path.join(directory, "adapter_model.safetensors")
+            save_file({"a": torch.ones(64, dtype=torch.bfloat16)}, file)
+            tensors, _ = list_file_tensors([file])
+            self.assertEqual(tensors, [("a", file, (64,))])
+            for size in (os.path.getsize(file) - 2, 20, 4):
+                with self.subTest(size=size):
+                    os.truncate(file, size)
+                    with self.assertRaisesRegex(ValueError, "incomplete file"):
+                        list_file_tensors([file])
+
+    def test_a_non_float_tensor_is_not_carried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = os.path.join(directory, "adapter_model.safetensors")
+            save_file({"a": torch.ones(4, dtype=torch.int32)}, file)
+            self.assertIsNone(list_file_tensors([file]))
+
+
+class TestUpdateRequestsOverIpc(CustomTestCase):
+    def test_round_trip(self):
+        load = _apply(upsert=True).load
+        for obj in (
+            _update("retract", weight_version="7"),
+            PrepareLoRAAdapterReqInput(load=load, prepare_id="p1"),
+            ApplyLoRAAdapterReqInput(load=load, prepare_id="p1", weight_version="7"),
+            PrepareLoRAAdapterReqOutput(prepared=False, message="m", unsupported=True),
+        ):
+            with self.subTest(type=type(obj).__name__):
+                self.assertEqual(msgpack_decode(msgpack_encode(obj)), obj)
+
+    def test_abort_is_not_a_pause_mode(self):
+        with self.assertRaises(msgspec.ValidationError):
+            msgpack_decode(msgpack_encode(_update("abort")))
 
 
 if __name__ == "__main__":

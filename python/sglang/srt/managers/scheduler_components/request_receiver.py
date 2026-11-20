@@ -160,6 +160,15 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    @staticmethod
+    def broadcasts_control_per_dp_group() -> bool:
+        """Whether each DP group's leader receives control requests and broadcasts them
+        within its group only, so TP ranks see them at different steps."""
+        return get_parallel().attn_dp_enabled and (
+            get_parallel().enable_dp_attention_local_control_broadcast
+            or get_exec().moe.is_ep_scale_joiner
+        )
+
     def _broadcast_reqs_across_ranks(
         self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
     ) -> List:
@@ -183,11 +192,7 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = (
-                get_parallel().enable_dp_attention_local_control_broadcast
-                or get_exec().moe.is_ep_scale_joiner
-            )
-            if _local_ctrl:
+            if self.broadcasts_control_per_dp_group():
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group

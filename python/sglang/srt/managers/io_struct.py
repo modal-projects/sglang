@@ -2666,6 +2666,45 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
         )
 
 
+class UpdateLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Load an adapter, or replace the weights of a loaded one under the same name,
+    reading it while serving and switching between two steps."""
+
+    lora_name: str
+    lora_path: str
+    pinned: bool = False
+    # How a replacement treats running requests. "in_place": they continue on the new
+    # weights from the next step, keeping their KV and the adapter's cached prefixes.
+    # "retract": generation pauses, running requests are retracted and the cache
+    # flushed, then generation resumes on the new weights. On an engine already
+    # paused, it only switches: the pause, and what it did to running requests and
+    # the cache, stay with whoever paused it.
+    pause_mode: Literal["in_place", "retract"] = "in_place"
+
+
+class PrepareLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Read the adapter of a load as LoRASlotWeights while serving, ahead of its apply."""
+
+    load: LoadLoRAAdapterReqInput
+    # Names this prepare to the apply that uses it.
+    prepare_id: str
+
+
+class PrepareLoRAAdapterReqOutput(BaseReq, kw_only=True):
+    # Not prepared, the update fails and nothing changes; message says why.
+    prepared: bool
+    message: str = ""
+    stats: Optional[Dict[str, float]] = None
+
+
+class ApplyLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Serve what prepare_id prepared, on every rank at the same step, when every rank
+    holds it; otherwise nothing changes."""
+
+    load: LoadLoRAAdapterReqInput
+    prepare_id: str
+
+
 class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of lora module to unload.
     lora_name: str

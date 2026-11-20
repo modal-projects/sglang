@@ -26,11 +26,14 @@ from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    ApplyLoRAAdapterReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareLoRAAdapterReqInput,
+    PrepareLoRAAdapterReqOutput,
     RegisterLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -210,36 +213,63 @@ class BaseTpWorker(ABC):
         result = self.model_runner.load_lora_adapter(
             recv_req.to_ref(), upsert=recv_req.upsert
         )
-        if recv_req.upsert:
-            manager = self.model_runner.lora_manager
-            pool = manager.memory_pool
-            uid = recv_req.lora_id
-            states = [(result.success, uid in pool.invalid_uids)]
-            tp_group = get_parallel().tp_group
-            if tp_group.world_size > 1:
-                try:
-                    states = tp_group.all_gather_object(states[0])
-                except Exception:
-                    pool.invalid_uids.add(uid)
-                    raise
-            succeeded = [success for success, _ in states]
-            if any(invalid for _, invalid in states) or (
-                any(succeeded) and not all(succeeded)
-            ):
-                # Registry publication cannot undo a peer's resident-slot write.
-                # Fail closed on every TP rank. An inference attempt while
-                # invalid terminates the scheduler and shuts down the engine.
-                pool.invalid_uids.add(uid)
-                return manager.create_lora_update_result(
-                    success=False,
-                    error_message=(
-                        f"LoRA adapter '{recv_req.lora_name}' has an incomplete update "
-                        "across TP ranks. The next inference attempt shuts down "
-                        "the engine; recover before any further inference or "
-                        f"restart the engine. {result.error_message}"
-                    ).strip(),
-                )
-        return result
+        return _agree_on_lora_upsert(self.model_runner.lora_manager, recv_req, result)
+
+    def prepare_lora_adapter(
+        self, recv_req: PrepareLoRAAdapterReqInput, node_address: str
+    ) -> None:
+        self.model_runner.lora_manager.prepare_lora_adapter(
+            recv_req.load.to_ref(), recv_req.prepare_id, node_address
+        )
+
+    def lora_prepare_reply(
+        self, recv_req: PrepareLoRAAdapterReqInput
+    ) -> Optional[PrepareLoRAAdapterReqOutput]:
+        """Every rank's outcome once every rank is done, else None. Every rank calls
+        this at the same step, so the apply never waits for a rank still reading."""
+        own = self.model_runner.lora_manager.prepare_reply(recv_req.prepare_id)
+        replies = [own]
+        tp_group = get_parallel().tp_group
+        if tp_group.world_size > 1:
+            done = torch.tensor([own is not None], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                done, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
+            )
+            if not done.item():
+                return None
+            replies = tp_group.all_gather_object(own)
+        elif own is None:
+            return None
+        # The slowest rank's stats: the reply waits for every rank.
+        slowest = max(replies, key=lambda r: (r.stats or {}).get("request_s", 0.0))
+        return PrepareLoRAAdapterReqOutput(
+            prepared=all(reply.prepared for reply in replies),
+            message=" | ".join(dict.fromkeys(r.message for r in replies if r.message)),
+            stats=slowest.stats,
+        )
+
+    def apply_lora_adapter(self, recv_req: ApplyLoRAAdapterReqInput):
+        """Serve what was prepared, when every rank holds it; otherwise nothing
+        changes. Every rank reaches this at the same step."""
+        manager = self.model_runner.lora_manager
+        outcome = manager.prepared_outcome(recv_req.prepare_id)
+        states = [(outcome.prepared, outcome.message)]
+        tp_group = get_parallel().tp_group
+        if tp_group.world_size > 1:
+            states = tp_group.all_gather_object(states[0])
+        load = recv_req.load
+        if not all(prepared for prepared, _ in states):
+            manager.discard_prepared_lora_adapter(recv_req.prepare_id)
+            reasons = dict.fromkeys(message for _, message in states if message)
+            return manager.create_lora_update_result(
+                success=False,
+                error_message=(
+                    f"LoRA adapter '{load.lora_name}' is not prepared on every rank; "
+                    f"nothing changed. {' | '.join(reasons)}"
+                ).strip(),
+            )
+        result = manager.apply_prepared_lora_adapter(load.to_ref(), upsert=load.upsert)
+        return _agree_on_lora_upsert(manager, load, result)
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
@@ -786,3 +816,35 @@ class TpModelWorker(BaseTpWorker):
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result
+
+
+def _agree_on_lora_upsert(manager, recv_req: LoadLoRAAdapterReqInput, result):
+    if recv_req.upsert:
+        pool = manager.memory_pool
+        uid = recv_req.lora_id
+        states = [(result.success, uid in pool.invalid_uids)]
+        tp_group = get_parallel().tp_group
+        if tp_group.world_size > 1:
+            try:
+                states = tp_group.all_gather_object(states[0])
+            except Exception:
+                pool.invalid_uids.add(uid)
+                raise
+        succeeded = [success for success, _ in states]
+        if any(invalid for _, invalid in states) or (
+            any(succeeded) and not all(succeeded)
+        ):
+            # Registry publication cannot undo a peer's resident-slot write.
+            # Fail closed on every TP rank. An inference attempt while
+            # invalid terminates the scheduler and shuts down the engine.
+            pool.invalid_uids.add(uid)
+            return manager.create_lora_update_result(
+                success=False,
+                error_message=(
+                    f"LoRA adapter '{recv_req.lora_name}' has an incomplete update "
+                    "across TP ranks. The next inference attempt shuts down "
+                    "the engine; recover before any further inference or "
+                    f"restart the engine. {result.error_message}"
+                ).strip(),
+            )
+    return result

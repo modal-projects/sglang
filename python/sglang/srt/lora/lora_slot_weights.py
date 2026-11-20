@@ -4,8 +4,8 @@ LoRAMemoryPool.load_lora_weight_to_buffer decides where each adapter element goe
 TP and EP slicing, fused members, rank padding, scaling. Traced once per adapter
 signature on placeholder weights valued by their own file positions, it yields a
 LoRASlotPlacement. Every later adapter of that signature is read (only the rows
-this rank uses) straight into slot order and loaded with one copy per buffer
-region.
+this rank uses) straight into slot order, by lora_prepare_process, and loaded with one
+copy per buffer region.
 """
 
 from __future__ import annotations
@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.lora.lora_prepare_process import strided
+from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.runtime_context import get_model
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_config import LoRAConfig
@@ -46,6 +50,28 @@ class AdapterFileTensor:
     @property
     def numel(self) -> int:
         return math.prod(self.shape)
+
+
+def adapter_files(path: str, load_config: LoadConfig) -> Optional[List[str]]:
+    """The safetensors files the default loader reads for an adapter; None when it reads
+    other files or may not memory-map them."""
+    if get_model().weight_loader_disable_mmap:
+        return None
+    _, files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
+        path, None, True
+    )
+    return files if use_safetensors else None
+
+
+def slot_placement_key(config: LoRAConfig, inventory_digest: str) -> Tuple:
+    """What a placement depends on besides the engine: rank, targets, and the files'
+    tensor names and shapes."""
+    targets = config.target_modules
+    return (
+        config.r,
+        targets if isinstance(targets, str) else tuple(sorted(targets)),
+        inventory_digest,
+    )
 
 
 class _SlotRegion(NamedTuple):
@@ -288,9 +314,3 @@ def slot_regions(
 def _index(strides: Sequence[int], shape: Sequence[int]) -> torch.Tensor:
     """0..n-1 covering every element a view of `shape` and `strides` reaches."""
     return torch.arange(sum((n - 1) * s for n, s in zip(shape, strides)) + 1)
-
-
-def strided(
-    flat: torch.Tensor, offset: int, strides: Sequence[int], shape: Sequence[int]
-) -> torch.Tensor:
-    return flat.as_strided(tuple(shape), tuple(strides), flat.storage_offset() + offset)

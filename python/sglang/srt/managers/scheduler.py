@@ -119,6 +119,9 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.lora.lora_prepare_process import (
+    node_address as lora_prepare_node_address,
+)
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -126,6 +129,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    ApplyLoRAAdapterReqInput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -165,6 +169,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrepareLoRAAdapterReqInput,
+    PrepareLoRAAdapterReqOutput,
     ProfileReq,
     PullWeightsReqInput,
     RegisterLoRAAdapterReqInput,
@@ -490,6 +496,8 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        # The node's LoRA prepare process, shared by this server's schedulers here.
+        self.lora_prepare_address = lora_prepare_node_address(port_args.instance_id)
         self.schedule_policy = get_schedule().schedule_policy
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -1348,6 +1356,9 @@ class Scheduler(
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        # The LoRA prepare running on every rank; set and cleared at the same step on
+        # all of them.
+        self.pending_lora_prepare: Optional[PrepareLoRAAdapterReqInput] = None
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1927,6 +1938,8 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (PrepareLoRAAdapterReqInput, self.prepare_lora_adapter),
+                (ApplyLoRAAdapterReqInput, self.apply_lora_adapter),
                 (RegisterLoRAAdapterReqInput, self.register_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -2271,6 +2284,7 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.check_pending_lora_prepare()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -6085,6 +6099,57 @@ class Scheduler(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
             )
         return result
+
+    def prepare_lora_adapter(
+        self, recv_req: PrepareLoRAAdapterReqInput
+    ) -> Optional[PrepareLoRAAdapterReqOutput]:
+        """Start reading an adapter on every rank while serving; the reply follows
+        once every rank is done."""
+        unsupported = self._lora_prepare_unsupported()
+        if unsupported is not None:
+            return PrepareLoRAAdapterReqOutput(prepared=False, message=unsupported)
+        if self.pending_lora_prepare is not None:
+            return PrepareLoRAAdapterReqOutput(
+                prepared=False, message="another LoRA prepare is running"
+            )
+        self.tp_worker.prepare_lora_adapter(recv_req, self.lora_prepare_address)
+        self.pending_lora_prepare = recv_req
+        return None
+
+    def check_pending_lora_prepare(self) -> None:
+        if self.pending_lora_prepare is None:
+            return
+        result = self.tp_worker.lora_prepare_reply(self.pending_lora_prepare)
+        if result is not None:
+            self.send_control_output(result, self.pending_lora_prepare)
+            self.pending_lora_prepare = None
+
+    def apply_lora_adapter(
+        self, recv_req: ApplyLoRAAdapterReqInput
+    ) -> LoadLoRAAdapterReqOutput:
+        """Serve what was prepared, at this step on every rank, when every rank
+        holds it."""
+        result = self.tp_worker.apply_lora_adapter(recv_req)
+        if result.success:
+            self.kv_event_lora_names.register(
+                lora_id=recv_req.load.lora_id, lora_name=recv_req.load.lora_name
+            )
+        return result
+
+    def _lora_prepare_unsupported(self) -> Optional[str]:
+        """Why this layout cannot prepare LoRA adapters while serving, if it cannot:
+        the ranks agree on a prepare through TP-group collectives in their handlers."""
+        if get_parallel().pp_size > 1:
+            return (
+                "/update_lora_adapter does not support pipeline parallelism; use "
+                "/load_lora_adapter"
+            )
+        if self.request_receiver.broadcasts_control_per_dp_group():
+            return (
+                "control requests reach the DP groups at different steps, so the ranks "
+                "cannot agree on a prepare; use /load_lora_adapter"
+            )
+        return None
 
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput

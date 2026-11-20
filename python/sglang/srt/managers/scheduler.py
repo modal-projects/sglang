@@ -6134,6 +6134,9 @@ class Scheduler(
             self.kv_event_lora_names.register(
                 lora_id=recv_req.load.lora_id, lora_name=recv_req.load.lora_name
             )
+            self.weight_updater.record_weight_version_after_update(
+                recv_req.weight_version
+            )
         return result
 
     def _lora_prepare_unsupported(self) -> Optional[str]:

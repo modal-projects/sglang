@@ -911,10 +911,16 @@ class TokenizerControlMixin:
                         "prepared; nothing changed."
                     )
                 rank_results = await self._switch_lora_adapter_on_ranks(
-                    ApplyLoRAAdapterReqInput(load=load, prepare_id=prepare_id), retract
+                    ApplyLoRAAdapterReqInput(
+                        load=load,
+                        prepare_id=prepare_id,
+                        weight_version=obj.weight_version,
+                    ),
+                    retract,
                 )
                 result = _merge_lora_update_results(rank_results)
                 if result.success:
+                    self._update_weight_version_if_provided(obj.weight_version)
                     if reused:
                         await self.lora_registry.refresh(adapter)
                     else:

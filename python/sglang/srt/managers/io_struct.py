@@ -2680,6 +2680,8 @@ class UpdateLoRAAdapterReqInput(BaseReq, kw_only=True):
     # paused, it only switches: the pause, and what it did to running requests and
     # the cache, stay with whoever paused it.
     pause_mode: Literal["in_place", "retract"] = "in_place"
+    # Optional: update weight version along with the adapter, at the step it switches
+    weight_version: Optional[str] = None
 
 
 class PrepareLoRAAdapterReqInput(BaseReq, kw_only=True):
@@ -2703,6 +2705,7 @@ class ApplyLoRAAdapterReqInput(BaseReq, kw_only=True):
 
     load: LoadLoRAAdapterReqInput
     prepare_id: str
+    weight_version: Optional[str] = None
 
 
 class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):

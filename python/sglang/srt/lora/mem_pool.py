@@ -129,6 +129,27 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return False
 
 
+def _uses_mxfp4_trtllm_lora(base_model: torch.nn.Module) -> bool:
+    """True when MXFP4 experts run the experimental TRT-LLM LoRA pipeline, whose
+    LoRA dispatch remaps routes to EP-local expert ids (so per-expert buffers and
+    adapter loading cover only this rank's experts)."""
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+    try:
+        if not get_moe_runner_backend().is_experimental_sgl_trtllm():
+            return False
+    except Exception:  # pragma: no cover - backend not initialized
+        return False
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+        Mxfp4FlashinferTrtllmMoEMethod,
+    )
+
+    return any(
+        isinstance(getattr(m, "quant_method", None), Mxfp4FlashinferTrtllmMoEMethod)
+        for m in base_model.modules()
+    )
+
+
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
@@ -174,7 +195,10 @@ class LoRAMemoryPool:
         num_experts_global = self._get_num_experts(base_model)
         self.moe_use_local_expert_ids = (
             self.moe_ep_size > 1
-            and not _moe_runner_keeps_global_expert_ids()
+            and (
+                not _moe_runner_keeps_global_expert_ids()
+                or _uses_mxfp4_trtllm_lora(base_model)
+            )
             and num_experts_global % self.moe_ep_size == 0
         )
 

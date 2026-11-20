@@ -374,8 +374,10 @@ def get_normalized_target_modules(
             result.add(qualified_name)
             continue
         base_name = name.split(".")[-1]
-        normalized_name = aliases.get(base_name) or params_mapping.get(
-            base_name, base_name
+        normalized_name = (
+            aliases.get(qualified_name)
+            or aliases.get(base_name)
+            or params_mapping.get(base_name, base_name)
         )
         result.add(normalized_name)
     return result

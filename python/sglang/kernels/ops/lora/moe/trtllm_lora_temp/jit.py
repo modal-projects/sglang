@@ -46,15 +46,46 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
 
+    try:
+        from flashinfer.jit.fused_moe import (
+            BLACKWELL_CUBIN_ARCHS,
+            write_filtered_metainfo,
+        )
+    except ImportError:  # FlashInfer < 0.7.2 includes the full artifact header.
+        write_filtered_metainfo = None
+    if write_filtered_metainfo is not None:
+        # Mirror FlashInfer's own module: a per-module export root holding the
+        # BMM header symlink and a metainfo filtered to reachable architectures.
+        # The full 30 MB artifact header crashes cc1plus.
+        metainfo_root = (
+            jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / "sgl_fused_moe_trtllm_sm100"
+        )
+        write_filtered_metainfo(
+            metainfo_root / f"{header_name}.h", metainfo, BLACKWELL_CUBIN_ARCHS
+        )
+        bmm_include_paths = [metainfo_root]
+    else:
+        metainfo_root = jit_env.FLASHINFER_CUBIN_DIR
+        bmm_include_paths = [
+            jit_env.FLASHINFER_CUBIN_DIR,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        ]
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
+        metainfo_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
+    # FlashInfer 0.7.2 split the custom routing kernels into several translation
+    # units; the overlay runner still defines Routing::Runner, so routing_runner.cu
+    # stays out.
+    trtllm_backend_dir = flashinfer_csrc_dir / "fused_moe/trtllm_backend"
+    routing_custom = trtllm_backend_dir / "trtllm_fused_moe_routing_custom.cu"
+    routing_custom_sources = (
+        [routing_custom]
+        if routing_custom.exists()
+        else sorted(trtllm_backend_dir.glob("trtllm_fused_moe_routing_custom_*.cu"))
+    )
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 12]
@@ -75,8 +106,7 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             flashinfer_csrc_dir
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
-            flashinfer_csrc_dir
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            *routing_custom_sources,
             flashinfer_csrc_dir
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
             overlay_csrc_dir
@@ -102,7 +132,6 @@ def gen_sgl_trtllm_gen_fused_moe_sm100_module():
             flashinfer_csrc_dir,
             flashinfer_csrc_dir / "nv_internal",
             flashinfer_csrc_dir / "nv_internal/include",
-            jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            *bmm_include_paths,
         ],
     )

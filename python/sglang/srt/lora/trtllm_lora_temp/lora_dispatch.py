@@ -623,3 +623,184 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         local_num_experts=quant_info.local_num_experts,
     )
     return StandardCombineInput(hidden_states=output)
+
+
+def _mxfp4_two_stream(hidden_states: torch.Tensor) -> bool:
+    """Overlap the gate/up LoRA with the base gate/up GEMM for decode-shaped batches
+    (SGLANG_MXFP4_LORA_TWO_STREAM=0 keeps everything on one stream)."""
+    import os
+
+    from sglang.srt.lora.trtllm_lora_temp import is_two_stream_active
+
+    return os.environ.get(
+        "SGLANG_MXFP4_LORA_TWO_STREAM", "1"
+    ) != "0" and is_two_stream_active(hidden_states)
+
+
+def _ep_local_lora_routes(topk_ids: torch.Tensor, quant_info, per_expert_weight):
+    """Expert ids and EP scope for the virtual-experts LoRA kernels.
+
+    EP-local LoRA buffers ([slots, local_experts, ...]) are indexed by local expert
+    id; routes to experts on other ranks become -1, which the kernels drop. Buffers
+    that span every expert keep global ids and the kernels' own EP mask.
+    """
+    local_n = quant_info.local_num_experts
+    if per_expert_weight.shape[1] != local_n or local_n == quant_info.global_num_experts:
+        return topk_ids, quant_info.local_expert_offset, local_n
+    local = topk_ids - quant_info.local_expert_offset
+    local = torch.where((local >= 0) & (local < local_n), local, -1).to(topk_ids.dtype)
+    return local, 0, None
+
+
+def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    lora_info,
+    base_layer,
+) -> StandardCombineInput:
+    """MXFP4-expert (DeepSeek-V4.1) MoE-LoRA on the decomposed TRT-LLM pipeline.
+
+    The op quantizes the routed input to MXFP8 itself, runs the raw gate/up GEMM,
+    adds the BF16 gate/up LoRA delta before the clamped SwiGLU, requantizes to MXFP8
+    for the down GEMM and returns the finalized output; the BF16 down-LoRA delta is
+    merged afterwards. The routed scaling factor is already in the top-k weights.
+    """
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp import (
+        trtllm_fp4_block_scale_routed_moe_lora,
+    )
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "MXFP4 trtllm LoRA supports the gated SwiGLU path only."
+    )
+    assert base_layer.should_fuse_routed_scaling_factor_in_topk, (
+        "MXFP4 trtllm LoRA expects the routed scaling factor in the top-k weights."
+    )
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return base_layer.quant_method.apply(base_layer, dispatch_output)
+
+    hidden_states = dispatch_output.hidden_states
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    top_k = runner_config.top_k
+
+    assert bool(lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0), (
+        "MXFP4 trtllm LoRA requires --lora-use-virtual-experts."
+    )
+    token_lora_mapping = lora_info.token_lora_mapping
+    inter = quant_info.intermediate_size_per_partition
+    lora_ids, lora_offset, lora_local_n = _ep_local_lora_routes(
+        topk_ids, quant_info, lora_info.gate_up_lora_b_weights
+    )
+    routing_cache: dict = {}
+
+    gate_up_delta = hidden_states.new_empty(hidden_states.shape[0], top_k, 2 * inter)
+    gate_up_args = dict(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=lora_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=routing_cache,
+        local_expert_offset=lora_offset,
+        local_num_experts=lora_local_n,
+    )
+    lora_ready_handle = 0
+    if _mxfp4_two_stream(hidden_states):
+        # Gate/up LoRA on the side stream, concurrent with the op's permute + MXFP8
+        # quant + gate/up GEMM; the op waits on the event right before its
+        # activation, the only consumer of the delta. Routing tables and the rank
+        # intermediate are allocated on the main stream (CUDA-graph allocator safety).
+        from sglang.srt.lora.trtllm_lora_temp import get_lora_side_stream
+        from sglang.srt.lora.trtllm_lora_temp.moe_overlap import _LORA_OVERLAP_EVENTS
+
+        merged_experts_fused_moe_lora_add(**gate_up_args, stage="routing")
+        intermediate = hidden_states.new_empty(
+            hidden_states.shape[0], top_k, lora_info.gate_up_lora_a_weights.shape[2]
+        )
+        side_stream = get_lora_side_stream()
+        lora_event = torch.cuda.Event()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            merged_experts_fused_moe_lora_add(
+                **gate_up_args,
+                fuse_add_to_output=False,
+                use_direct_expand_add=lora_info.max_lora_rank <= 64,
+                intermediate_buffer=intermediate,
+            )
+            lora_event.record()
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(lora_event)
+        lora_ready_handle = lora_event.cuda_event
+    else:
+        merged_experts_fused_moe_lora_add(
+            **gate_up_args,
+            fuse_add_to_output=False,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        )
+    activation_lora_input = hidden_states.new_empty(hidden_states.shape[0], top_k, inter)
+    packed_topk_ids = fused_pack_topk(topk_ids=topk_ids, topk_weights=topk_weights)
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        output = torch.empty_like(hidden_states)
+    output = trtllm_fp4_block_scale_routed_moe_lora(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale,
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale,
+        output1_scales_scalar=quant_info.g1_scale_c,
+        output1_scales_gate_scalar=quant_info.g1_alphas,
+        output2_scales_scalar=quant_info.g2_alphas,
+        gate_up_lora_delta=gate_up_delta,
+        activation_lora_input=activation_lora_input,
+        num_experts=quant_info.global_num_experts,
+        top_k=top_k,
+        intermediate_size=inter,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+        routed_scaling_factor=1.0,
+        routing_method_type=quant_info.routing_method_type,
+        do_finalize=True,
+        output=output,
+        lora_ready_event=lora_ready_handle,
+        gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+    )
+    merged_experts_fused_moe_lora_add(
+        output=output,
+        hidden_states=activation_lora_input.view(-1, inter),
+        lora_a=lora_info.down_lora_a_weights,
+        lora_b=lora_info.down_lora_b_weights,
+        topk_ids=lora_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=True,
+        experts_shared_outer_loras_a=False,
+        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+        routing_cache=routing_cache,
+        fuse_add_to_output=False,
+        fuse_sum_all_reduce=True,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=lora_offset,
+        local_num_experts=lora_local_n,
+    )
+    return StandardCombineInput(hidden_states=output)

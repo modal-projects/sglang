@@ -407,8 +407,14 @@ def trtllm_fp4_block_scale_routed_moe_lora(
     norm_topk_prob: bool = True,
     lora_ready_event: int = 0,
     gemm2_done_event: int = 0,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """NVFP4 sibling of :func:`trtllm_fp8_block_scale_routed_moe_lora`.
+
+    Also serves MXFP4 experts (one UE8M0 scale per 32 weights, DeepSeek-V4.1):
+    the op then quantizes the routed input and the activation to MXFP8, and
+    ``gemm1_clamp_limit`` (fp32, per local expert, uniform) clamps the SwiGLU
+    inputs after the LoRA delta is added.
 
     Decomposed (unfused-activation) MoE-LoRA on the flashinfer-trtllm backend:
     routing -> gather -> gate_up grouped GEMM (raw 2*inter) -> activation that
@@ -458,7 +464,7 @@ def trtllm_fp4_block_scale_routed_moe_lora(
         None,  # gemm1_bias
         None,  # gemm1_alpha
         None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         None,  # gemm2_bias

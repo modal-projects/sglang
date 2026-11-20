@@ -97,6 +97,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
     get_num_fused_shared_experts,
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
@@ -199,6 +200,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
 )
@@ -4959,6 +4961,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             attn_cp_size=get_parallel().attn_cp_size,
             fuse_wqa_wkv=envs.SGLANG_OPT_FUSE_WQA_WKV.get(),
             fused_shared_experts=bool(self.num_fused_shared_experts),
+            routed_lora_runner=(
+                get_moe_runner_backend().is_experimental_sgl_trtllm()
+                and get_lora().lora_use_virtual_experts
+            ),
         )
 
     def prepare_language_model_inputs(

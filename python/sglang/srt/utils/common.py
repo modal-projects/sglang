@@ -4739,6 +4739,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "ffn.shared_experts.w1",
     "ffn.shared_experts.w2",
     "ffn.shared_experts.w3",
+    # DeepSeek-V4 routed experts.
+    "ffn.experts.w1",
+    "ffn.experts.w2",
+    "ffn.experts.w3",
     # GDN (GatedDeltaNet) projections
     "in_proj_qkvz",
     "in_proj_ba",

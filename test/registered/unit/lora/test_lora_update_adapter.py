@@ -606,6 +606,44 @@ class TestPreparedRecord(CustomTestCase):
         manager.discard_prepared_lora_adapter("p1")
         self.assertIsNone(manager._prepared)
 
+    def _tracing(self, steps):
+        """A manager whose prepare gets the tensor list of a new signature."""
+        manager = self._manager()
+        manager._slot_placements = {}
+        manager._prepared = _PreparedLoRA(
+            "p1", config=SimpleNamespace(r=8), placement_key=("key",)
+        )
+        manager._prepare_client = Mock()
+        manager._prepare_client.poll.return_value = {"tensors": [["a", "f", [2, 2]]]}
+        manager._trace_slot_placement = lambda config, tensors: steps
+        manager._read_prepared = Mock()
+        return manager
+
+    def test_a_new_signature_is_traced_one_layer_per_poll(self):
+        placement = SimpleNamespace(
+            copies=(), regions=(), numel=0, dtype=torch.bfloat16
+        )
+        manager = self._tracing(iter([None, None, placement]))
+        for _ in range(2):
+            self.assertIsNone(manager.prepare_reply("p1"))
+            manager._read_prepared.assert_not_called()
+        manager.prepare_reply("p1")
+        manager._read_prepared.assert_called_once_with(manager._prepared, placement)
+        self.assertIs(manager._slot_placements[("key",)], placement)
+        # The tensor list came once; the later polls only traced.
+        manager._prepare_client.poll.assert_called_once()
+
+    def test_an_install_that_does_not_fit_has_no_placement(self):
+        def steps():
+            yield None
+            raise ValueError("LoRA install writes overlap")
+
+        manager = self._tracing(steps())
+        manager.prepare_reply("p1")
+        manager.prepare_reply("p1")
+        manager._read_prepared.assert_called_once_with(manager._prepared, None)
+        self.assertIsNone(manager._slot_placements[("key",)])
+
 
 class _Done:
     @staticmethod

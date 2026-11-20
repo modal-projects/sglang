@@ -34,6 +34,7 @@ def _backend(T, slots):
 
     be = BlackwellLoRABackend.__new__(BlackwellLoRABackend)  # no server context needed
     be._kernels, be._mirrored, be._weights_version, be._rejected = {}, [], None, set()
+    be._split_layers = []
     be.batch_info = SimpleNamespace(
         bs=T, is_prefill=False, req_weight_indices=slots,
         lora_ranks=torch.tensor(RANKS, device=DEVICE, dtype=torch.int32),
@@ -129,6 +130,72 @@ def test_qkv_256_heads(T):
 @pytest.mark.parametrize("T", [8, 128])
 def test_mxfp8_base(T):
     assert _run(4096, 1280, (0, 4096), T, mx=True) < 5e-3
+
+
+@pytest.mark.parametrize("T", [1, 8, 64, 128])
+def test_mxfp8_split_gate_up(T):
+    # DeepSeek-V4.1 shared expert at TP8: gate/up slices of 288 rows (not 128-aligned)
+    assert _run(576, 5120, (0, 288, 576), T, mx=True) < 5e-3
+
+
+@pytest.mark.parametrize("T", [1, 8, 64, 128])
+def test_mxfp8_padded_k(T):
+    # ... and its down projection, K = 288
+    assert _run(5120, 288, (0, 5120), T, mx=True) < 5e-3
+
+
+def _run_block_fp8(N, K, offsets, T, packed, seed=0):
+    """128x128 block-FP8 base with UE8M0 scales (GLM-5.3 Flash after SGLang's DeepGEMM requant
+    on Blackwell): FP32 power-of-two scales or DeepGEMM's packed int32 layout."""
+    from sglang.srt.lora.backend import blackwell_backend as bb
+    from sglang.srt.lora.dense.plan import DenseLoraKind
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl as pack)
+    import flashinfer
+
+    bb._mxfp8_base = lambda layer: False
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    wf = torch.randn(N, K, generator=g, device=DEVICE) * K ** -0.5
+    blk = wf.view(N // 128, 128, K // 128, 128)
+    sc = torch.exp2(torch.ceil(torch.log2(blk.abs().amax(dim=(1, 3)) / 448.0)))
+    wq = (blk / sc[:, None, :, None]).to(torch.float8_e4m3fn).view(N, K)
+    w_ref = (wq.float().view(N // 128, 128, K // 128, 128) * sc[:, None, :, None]).view(N, K)
+    x = torch.randn(T, K, generator=g, device=DEVICE).bfloat16()
+    a, b = _pool(len(offsets) - 1, K, N, seed + 1)
+    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
+    if packed:
+        s_in = pack(sc.repeat_interleave(128, dim=0)[:N].contiguous())
+        s_in.format_ue8m0 = True
+    else:
+        s_in = sc
+    layer = SimpleNamespace(base_layer=SimpleNamespace(weight=wq, bias=None,
+                                                       weight_scale_inv=s_in),
+                            lora_a=a, lora_b=b)
+    xq, _ = flashinfer.mxfp8_quantize(x, True)
+    _, xl = flashinfer.mxfp8_quantize(x, False)
+    xl = xl.view(torch.uint8).reshape(-1)[: T * (K // 32)].reshape(T, K // 32)
+    x_base = xq.float() * torch.pow(2.0, xl.float() - 127).repeat_interleave(32, dim=1)
+    be = _backend(T, slots)
+
+    def base_fn():
+        raise AssertionError("the fused path must not call the base GEMM")
+
+    y = be.forward_with_base(layer, x, base_fn, a, b, None, tuple(offsets),
+                             kind=DenseLoraKind.LINEAR)
+    assert y is not None
+    ref = _reference(x, w_ref, a, b, slots, offsets) - x.float() @ w_ref.T + x_base @ w_ref.T
+    torch.cuda.synchronize()
+    return float((y.float() - ref).norm() / ref.norm())
+
+
+@pytest.mark.parametrize("T", [1, 8, 64])
+@pytest.mark.parametrize("packed", [False, True])
+def test_block_fp8_ue8m0(T, packed):
+    # GLM-5.3 Flash TP8 shapes: o_proj (N 4096, K 2048), shared expert gate/up (2 x 256, K 4096)
+    assert _run_block_fp8(4096, 2048, (0, 4096), T, packed) < 5e-3
+    assert _run_block_fp8(512, 4096, (0, 256, 512), T, packed, seed=3) < 5e-3
+    # shared expert down: K = 256, one packed scale word per row (size-1 dim, aligned stride)
+    assert _run_block_fp8(4096, 256, (0, 4096), T, packed, seed=4) < 5e-3
 
 
 def test_prefill_uses_csgmv():

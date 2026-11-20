@@ -23,6 +23,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import msgspec
+import regex as re
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import ToolStrictLevel, envs
@@ -40,10 +41,16 @@ from sglang.srt.function_call.response_template_structural_tag import (
     message_start_openers,
     typed_parameters,
 )
-from sglang.srt.parser.chat_parsing.content_parsers import _apply_transform
+from sglang.srt.parser.chat_parsing.content_parsers import (
+    _apply_transform,
+    _json_advance,
+    _json_tag,
+    parse_content,
+)
 from sglang.srt.parser.chat_parsing.response_parser import (
     ResponseParser,
     _json_valued,
+    _schema_types,
 )
 from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplate,
@@ -269,6 +276,215 @@ class _ReasoningResult:
         self.reasoning_text = reasoning_text
 
 
+# Schema types the parser casts a raw argument to; any other keeps its text.
+_CAST_TYPES = frozenset({"integer", "number", "boolean", "null", "object", "array"})
+
+
+def _group_end(pattern: str, start: int) -> int:
+    """The index just past the regex group that opens at `pattern[start]`."""
+    depth, index, in_class = 0, start, False
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if in_class:
+            in_class = char != "]"
+        elif char == "[":
+            in_class = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    raise ValueError(f"unbalanced group in {pattern!r}")
+
+
+def _escape_json_text(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+class _ArgumentStream:
+    """Stream the JSON arguments of one `xml-inline` tool call as its tags
+    arrive, sending only text the call's parsed arguments start with.
+
+    A parameter is sent with its cast value once its tag ends. A parameter whose
+    value stays its raw text streams that text as it is written, holding back
+    what may start the tag end. Tags are found as the content parser finds
+    them: each starts at the first opener after the previous one, and its value
+    ends at the first tag end, or for `json_keys` after its JSON value."""
+
+    def __init__(
+        self,
+        tag_pattern: str,
+        *,
+        parse: Callable[[str], dict[str, Any]],
+        cast: Callable[[dict[str, Any]], dict[str, Any]],
+        streams_text: Callable[[str], bool],
+        json_keys: frozenset[str] = frozenset(),
+    ) -> None:
+        value_at = tag_pattern.index("(?P<value>")
+        self._tag = re.compile(tag_pattern, re.DOTALL)
+        self._head = re.compile(tag_pattern[:value_at], re.DOTALL)
+        self._tail = re.compile(
+            tag_pattern[_group_end(tag_pattern, value_at) :], re.DOTALL
+        )
+        self._parse = parse
+        self._cast = cast
+        self._streams_text = streams_text
+        self._json_keys = json_keys
+        self._body = ""
+        self.sent = ""
+        self._keys: set[str] = set()
+        self._next = 0  # where the next tag may start
+        self._open: tuple[int, str, int] | None = None  # tag start, key, value start
+        self._open_sent = ""  # what was sent of the open parameter
+        self._scan = 0  # where the open tag's end may start
+        self._diverged = False
+
+    def feed(self, text: str) -> str:
+        """Take more of the region body; return the next arguments text."""
+        self._body += text
+        if self._diverged:
+            return ""
+        out: list[str] = []
+        while True:
+            if self._open is None:
+                head = self._head.search(self._body, self._next, partial=True)
+                if head is None or head.partial:
+                    break
+                key = head.group("key")
+                self._open = (head.start(), key, head.end())
+                self._scan = head.end()
+                self._open_sent = ""
+                if self._text_streams(key):
+                    opener = json.dumps(key, ensure_ascii=False)
+                    self._send(f'{self._separator()}{opener}: "', out)
+            start, key, value_start = self._open
+            tail = self._tail.search(self._body, self._scan, partial=True)
+            if tail is None or tail.partial:
+                held = len(self._body) if tail is None else tail.start()
+                if self._text_streams(key) and held > self._scan:
+                    self._send(_escape_json_text(self._body[self._scan : held]), out)
+                self._scan = held
+                break
+            end = tail.end()
+            if key in self._json_keys:
+                end = self._json_tag_end(start, value_start)
+                if end is None:
+                    # The tag end is inside the JSON value, which goes on.
+                    self._scan = tail.start() + 1
+                    continue
+            # A tag end may look ahead at the next tag, so parse on from here.
+            first = next(iter(self._parse(self._body[start:]).items()), None)
+            if first is None or first[0] != key or key in self._keys:
+                # The call parses to something this stream cannot extend.
+                self._diverged = True
+                break
+            separator = self._separator()
+            self._keys.add(key)
+            cast = self._cast(dict([first]))
+            piece = separator + json.dumps(cast, ensure_ascii=False)[1:-1]
+            if not piece.startswith(self._open_sent):
+                self._diverged = True
+                break
+            self._send(piece[len(self._open_sent) :], out)
+            self._open, self._next = None, end
+        return "".join(out)
+
+    def finish(self, arguments: str) -> str | None:
+        """The rest of the call's parsed `arguments`, or `None` if what was
+        sent does not start them."""
+        if not arguments.startswith(self.sent):
+            return None
+        return arguments[len(self.sent) :]
+
+    def _text_streams(self, key: str) -> bool:
+        return key not in self._json_keys and self._streams_text(key)
+
+    def _json_tag_end(self, start: int, value_start: int) -> int | None:
+        """Where the tag at `start` ends once its JSON value is complete."""
+        tag = _json_tag(self._tag, self._body, start, value_start, len(self._body))
+        if tag is None:
+            return None
+        scan = {"pos": value_start, "string": False}
+        if not _json_advance(self._body, scan, tag.end("value")):
+            return None
+        return tag.end()
+
+    def _separator(self) -> str:
+        return ", " if self._keys else "{"
+
+    def _send(self, text: str, out: list[str]) -> None:
+        self.sent += text
+        if self._open is not None:
+            self._open_sent += text
+        out.append(text)
+
+
+def _argument_stream(
+    parser: ResponseParser, field: ResponseTemplateField, name: str
+) -> _ArgumentStream | None:
+    """An argument stream for calls of `field` to the tool `name`, if its
+    calls parse from inline tags into their arguments."""
+    transform = field.transform
+    function = transform.get("function") if isinstance(transform, dict) else None
+    args = field.content_args
+    value_parser = args.get("value_parser") or {
+        "name": "text",
+        "args": {"strip": False},
+    }
+    if (
+        field.content != "xml-inline"
+        or field.transform_each
+        or not isinstance(function, dict)
+        or function.get("arguments") != "{content}"
+        or set(args) - {"tag_pattern", "value_parser", "merge_duplicates"}
+        or args.get("merge_duplicates")
+        or "(?P<value>" not in args.get("tag_pattern", "")
+        or value_parser.get("name") == "json"
+    ):
+        return None
+    # Raw text is the value only if the parser keeps it whole.
+    keeps_text = value_parser.get("name") == "text" and not value_parser.get(
+        "args", {}
+    ).get("strip", True)
+    properties = parser._tool_params.get(name) if parser._tool_params else None
+    # A grammar holds the non-string arguments of strict tools to JSON.
+    strict = parser._strict_params.get(name) if parser._constrained else None
+    json_keys = frozenset(
+        key
+        for key, schema in (strict or {}).items()
+        if (types := _schema_types(schema)) and "string" not in types
+    )
+
+    def streams_text(key: str) -> bool:
+        if not keeps_text:
+            return False
+        if not properties or key not in properties:
+            return True
+        return not set(_schema_types(properties[key])) & _CAST_TYPES
+
+    def cast(arguments: dict[str, Any]) -> dict[str, Any]:
+        if not parser._tool_params:
+            return arguments
+        value = {"function": {"name": name, "arguments": arguments}}
+        return parser._coerce_tool_calls(value)["function"]["arguments"]
+
+    try:
+        return _ArgumentStream(
+            args["tag_pattern"],
+            parse=lambda text: parse_content(text, "xml-inline", args, json_keys),
+            cast=cast,
+            streams_text=streams_text,
+            json_keys=json_keys,
+        )
+    except (ValueError, re.error):
+        return None
+
+
 class ResponseTemplateStreamAdapter:
     """Parse one response with a template and route its generic region events."""
 
@@ -467,12 +683,14 @@ class ResponseTemplateStreamAdapter:
         on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
         on_tool_dropped: Callable[[], None] | None = None,
+        on_tool_chunk: Callable[[str], None] | None = None,
     ) -> str:
         """Route tool regions to the callbacks and return the passthrough text.
 
         A tool call is emitted only when it ends with its closer, parses, and is
         accepted by `on_tool_close`. Otherwise it is dropped, and a name that was
-        already streamed stays an incomplete call."""
+        already streamed stays an incomplete call. The body of a call whose name
+        was streamed goes to `on_tool_chunk` as it arrives."""
         normal_parts: list[str] = []
         unusable_opens: set[int] = set()
         open_index = None
@@ -497,8 +715,11 @@ class ResponseTemplateStreamAdapter:
                     if etype == "region_chunk"
                     else self._output_text(event)
                 )
-            elif field != _TOOL_FIELD or etype == "region_chunk":
+            elif field != _TOOL_FIELD:
                 continue
+            elif etype == "region_chunk":
+                if self._pending_tool_streamed and on_tool_chunk is not None:
+                    on_tool_chunk(event["text"])
             elif etype == "region_open":
                 self._open_tool_captures = event.get("captures") or {}
                 name = self._open_tool_name(event.get("captures"))
@@ -508,6 +729,15 @@ class ResponseTemplateStreamAdapter:
                     and on_tool_open is not None
                     and on_tool_open(name)
                 )
+                # Body the prompt already wrote, which no chunk carries.
+                if (
+                    self._pending_tool_streamed
+                    and on_tool_chunk is not None
+                    and event["end"] < self._prefix_end
+                ):
+                    on_tool_chunk(
+                        self._parser.input_text[event["end"] : self._prefix_end]
+                    )
             else:
                 if self._is_unusable_tool_end(event):
                     logger.warning(
@@ -783,6 +1013,8 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
         self._tool_indices: dict[str, int] | None = None
+        # The arguments of the open call, streamed as they are written.
+        self._arguments: _ArgumentStream | None = None
 
     def _new_adapter(self) -> ResponseTemplateStreamAdapter:
         return ResponseTemplateStreamAdapter(
@@ -846,8 +1078,13 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         ]
 
     def _emit_tool_call(
-        self, item: ToolCallItem, pending_calls: list[ToolCallItem]
+        self,
+        item: ToolCallItem,
+        pending_calls: list[ToolCallItem],
+        arguments: _ArgumentStream | None = None,
     ) -> None:
+        """Emit a parsed call, or the rest of one whose name and the
+        `arguments` stream so far were already sent."""
         name_was_streamed = self.current_tool_name_sent
         self._ensure_tool_slot()
         try:
@@ -860,8 +1097,20 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         }
         self.streamed_args_for_tool[self.current_tool_id] = item.parameters
         if name_was_streamed:
-            item = item.model_copy(update={"name": None})
-        pending_calls.append(item)
+            update: dict[str, Any] = {"name": None}
+            if arguments is not None:
+                rest = arguments.finish(item.parameters)
+                if rest is None:
+                    logger.warning(
+                        "response_template: streamed arguments of tool call %d "
+                        "do not match its parsed arguments",
+                        self.current_tool_id,
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = arguments.sent
+                update["parameters"] = rest or ""
+            item = item.model_copy(update=update)
+        if item.name is not None or item.parameters or arguments is None:
+            pending_calls.append(item)
         self.incomplete_tool_call_indices.discard(self.current_tool_id)
         self.current_tool_id += 1
         self.current_tool_name_sent = False
@@ -887,6 +1136,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
     def _drop_streamed_tool_call(self) -> None:
         """Leave the streamed name as an incomplete call and move to the next."""
+        self._arguments = None
         self.current_tool_id += 1
         self.current_tool_name_sent = False
 
@@ -929,7 +1179,23 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             if name not in tool_indices and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return False
             self._emit_tool_name(name, pending_calls)
+            parser = self._adapter._parser
+            self._arguments = (
+                None
+                if parser is None
+                else _argument_stream(parser, self._tool_field_of(parser), name)
+            )
             return True
+
+        def on_chunk(text: str) -> None:
+            if self._arguments is None:
+                return
+            if arguments := self._arguments.feed(text):
+                item = ToolCallItem(
+                    tool_index=self.current_tool_id, name=None, parameters=arguments
+                )
+                self.streamed_args_for_tool[self.current_tool_id] += arguments
+                pending_calls.append(item)
 
         def on_close(value: Any) -> bool:
             items = self._to_tool_call_items(
@@ -937,8 +1203,11 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             )
             if not items:
                 return False
+            arguments, self._arguments = self._arguments, None
+            if len(items) != 1:
+                arguments = None
             for item in items:
-                self._emit_tool_call(item, pending_calls)
+                self._emit_tool_call(item, pending_calls, arguments)
             return True
 
         normal_text = self._adapter.route_tool_events(
@@ -946,8 +1215,13 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             on_tool_open=on_open,
             on_tool_close=on_close,
             on_tool_dropped=self._drop_streamed_tool_call,
+            on_tool_chunk=on_chunk,
         )
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
+
+    @staticmethod
+    def _tool_field_of(parser: ResponseParser) -> ResponseTemplateField:
+        return parser._spec.fields[_TOOL_FIELD]
 
     def supports_structural_tag(self) -> bool:
         return False

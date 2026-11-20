@@ -2666,6 +2666,30 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
         )
 
 
+class UpdateLoRAAdapterReqInput(BaseReq, kw_only=True):
+    lora_name: str
+    lora_path: str
+    pinned: bool = False
+    # "in_place": running requests go on with the new weights and their KV; "retract":
+    # they are retracted and the cache flushed. A paused engine only switches.
+    pause_mode: Literal["in_place", "retract"] = "in_place"
+
+
+class PrepareLoRAAdapterReqInput(BaseReq, kw_only=True):
+    load: LoadLoRAAdapterReqInput
+    prepare_id: str
+
+
+class PrepareLoRAAdapterReqOutput(BaseReq, kw_only=True):
+    prepared: bool
+    message: str = ""
+
+
+class ApplyLoRAAdapterReqInput(BaseReq, kw_only=True):
+    load: LoadLoRAAdapterReqInput
+    prepare_id: str
+
+
 class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of lora module to unload.
     lora_name: str

@@ -15,9 +15,11 @@
 # Integrates "S-LoRA: Serving Thousands of Concurrent LoRA Adapters"
 # and "Punica: Multi-Tenant LoRA Serving"
 
+import hashlib
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 import torch
@@ -35,12 +37,16 @@ from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.lora_prepare_process import LoRAPrepareClient
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.lora_slot_weights import (
     AdapterFileTensor,
     LoRASlotPlacement,
     LoRASlotWeights,
     SlotPlacementTracer,
+    adapter_files,
+    slot_placement_key,
+    slot_regions,
 )
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
@@ -54,7 +60,7 @@ from sglang.srt.lora.utils import (
     kv_b_lora_prefix_cache_error,
     warn_if_adapter_targets_embeddings,
 )
-from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.managers.io_struct import LoRAUpdateOutput, PrepareLoRAAdapterReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import (
@@ -75,6 +81,23 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PreparedLoRA:
+    """What one prepare holds on this rank, until its apply or the next prepare: the
+    process lists the files, then reads them once the placement is known."""
+
+    prepare_id: str
+    config: Optional[LoRAConfig] = None
+    # Set once the files are listed: what the placement depends on.
+    placement_key: Optional[tuple] = None
+    # Set once the read is under way.
+    placement: Optional[LoRASlotPlacement] = None
+    # Set once the read is done: views of the version's copy the node's GPUs share.
+    weights: Optional[LoRASlotWeights] = None
+    # None while the prepare process runs.
+    reply: Optional[PrepareLoRAAdapterReqOutput] = None
 
 
 class LoRAManager:
@@ -140,6 +163,8 @@ class LoRAManager:
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
         self.lora_no_cpu_backup: bool = get_lora().lora_no_cpu_backup
+        self._prepare_client: Optional[LoRAPrepareClient] = None
+        self._prepared: Optional[_PreparedLoRA] = None
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels
@@ -364,6 +389,191 @@ class LoRAManager:
                 )
             tracer.add(writes, layer_id)
         return tracer.placement(self.memory_pool.dtype, embedding_layer_names)
+
+    def prepare_lora_adapter(
+        self, lora_ref: LoRARef, prepare_id: str, node_address: str
+    ) -> None:
+        """Start reading the adapter in the prepare process; see poll_prepare."""
+        assert self._prepared is None or self._prepared.reply is not None, (
+            "a LoRA prepare is still running"
+        )
+        self._prepared = prepared = _PreparedLoRA(prepare_id)
+        # Staging is pinned with cudaHostRegister.
+        if self.lora_no_cpu_backup or self.device.type != "cuda":
+            prepared.reply = PrepareLoRAAdapterReqOutput(
+                prepared=False, message="no CPU copy or no CUDA staging"
+            )
+            return
+        uid = lora_ref.lora_id
+        try:
+            config = LoRAConfig(
+                lora_ref.lora_path, base_vocab_size=self.base_hf_config.vocab_size
+            )
+            self.validate_new_adapter(
+                config,
+                lora_ref,
+                is_update=uid in self.loras,
+                old_ref=self.lora_refs.get(uid),
+            )
+            files = adapter_files(lora_ref.lora_path, self.load_config)
+            if files is None:
+                prepared.reply = PrepareLoRAAdapterReqOutput(
+                    prepared=False, message="not memory-mapped safetensors files"
+                )
+                return
+            if self._prepare_client is None:
+                self._prepare_client = LoRAPrepareClient(node_address)
+            self._prepare_client.list_tensors(prepare_id, files)
+        except Exception as e:
+            prepared.reply = PrepareLoRAAdapterReqOutput(prepared=False, message=str(e))
+            return
+        prepared.config = config
+
+    def poll_prepare(self, prepare_id: str) -> Optional[PrepareLoRAAdapterReqOutput]:
+        """This rank's outcome of prepare `prepare_id` once it is done, else None."""
+        prepared = self._prepared
+        if prepared is None or prepared.prepare_id != prepare_id:
+            return PrepareLoRAAdapterReqOutput(
+                prepared=False, message=f"LoRA prepare {prepare_id} is not held"
+            )
+        if prepared.reply is not None:
+            return prepared.reply
+        polled = self._prepare_client.poll()
+        if polled is None:
+            return None
+        result, shared = polled
+        try:
+            if "error" in result:
+                self._not_prepared(prepared, result["error"])
+            elif prepared.placement_key is None:
+                self._place_prepared(prepared, result["digest"])
+            elif prepared.placement is None:
+                tensors = [
+                    AdapterFileTensor(name, file, tuple(shape))
+                    for name, file, shape in result["tensors"]
+                ]
+                placement = self._get_slot_placement(
+                    prepared.placement_key, prepared.config, tensors
+                )
+                self._read_prepared(prepared, placement)
+            else:
+                placement = prepared.placement
+                itemsize = placement.dtype.itemsize
+                regions = [
+                    shared[offset : offset + r.numel * itemsize].view(placement.dtype)
+                    for offset, r in zip(
+                        result.pop("region_offsets"), placement.regions
+                    )
+                ]
+                prepared.weights = LoRASlotWeights(prepared.config, placement, regions)
+                prepared.reply = PrepareLoRAAdapterReqOutput(prepared=True)
+        except Exception as e:
+            self._not_prepared(prepared, f"{type(e).__name__}: {e}")
+        return prepared.reply
+
+    def _place_prepared(self, prepared: _PreparedLoRA, digest: Optional[str]) -> None:
+        if digest is None:
+            self._not_prepared(
+                prepared,
+                "its files hold tensors other than uniquely named floats; use "
+                "/load_lora_adapter",
+            )
+            return
+        prepared.placement_key = slot_placement_key(prepared.config, digest)
+        if prepared.placement_key in self._slot_placements:
+            self._read_prepared(prepared, self._slot_placements[prepared.placement_key])
+        else:
+            self._prepare_client.request_tensors(prepared.prepare_id)
+
+    def _read_prepared(
+        self, prepared: _PreparedLoRA, placement: Optional[LoRASlotPlacement]
+    ) -> None:
+        if placement is None:
+            self._not_prepared(
+                prepared,
+                "its install has no slot placement (logged when traced); use "
+                "/load_lora_adapter",
+            )
+            return
+        config = prepared.config
+        layout = self._slot_layouts.get(prepared.placement_key)
+        if layout is None:
+            layout = self._slot_layouts[prepared.placement_key] = (
+                hashlib.sha256(repr(prepared.placement_key).encode()).hexdigest(),
+                (
+                    [(r.offset, r.numel) for r in placement.regions],
+                    [tuple(c) for c in placement.copies],
+                ),
+            )
+        self._prepare_client.read(
+            prepared.prepare_id,
+            *layout,
+            placement.numel,
+            placement.dtype,
+            config.lora_alpha / config.r,
+        )
+        prepared.placement = placement
+
+    @staticmethod
+    def _not_prepared(prepared: _PreparedLoRA, message: str) -> None:
+        prepared.reply = PrepareLoRAAdapterReqOutput(prepared=False, message=message)
+
+    def prepared_outcome(self, prepare_id: str) -> PrepareLoRAAdapterReqOutput:
+        """What prepare `prepare_id` left on this rank, without advancing it."""
+        prepared = self._prepared
+        if prepared is None or prepared.prepare_id != prepare_id:
+            return PrepareLoRAAdapterReqOutput(
+                prepared=False, message=f"LoRA prepare {prepare_id} is not held"
+            )
+        return prepared.reply or PrepareLoRAAdapterReqOutput(
+            prepared=False, message=f"LoRA prepare {prepare_id} is still running"
+        )
+
+    def discard_prepared_lora_adapter(self, prepare_id: str) -> None:
+        """Drop what prepare `prepare_id` holds, unless it still runs."""
+        prepared = self._prepared
+        if prepared is not None and prepared.prepare_id == prepare_id:
+            if prepared.reply is not None:
+                self._prepared = None
+
+    def apply_prepared_lora_adapter(
+        self, lora_ref: LoRARef, upsert: bool
+    ) -> LoRAUpdateOutput:
+        """Make the prepared adapter serve; a resident one is rewritten in its slot
+        from pinned staging, at this step boundary."""
+        new_lora, self._prepared = self._prepared.weights, None
+        uid = lora_ref.lora_id
+        is_update = upsert and uid in self.loras
+        assert is_update or uid not in self.loras, (
+            f"LoRA adapter with ID {uid} is already loaded. This should have been verified before request is sent to the backend."
+        )
+        warn_if_adapter_targets_embeddings(
+            lora_name=lora_ref.lora_name,
+            embedding_layer_names=new_lora.placement.embedding_layer_names,
+            speculative_algorithm=self.speculative_algorithm,
+        )
+        if is_update and uid in self.memory_pool.uid_to_buffer_id:
+            placement = new_lora.placement
+            staged = LoRASlotWeights(
+                new_lora.config,
+                placement,
+                slot_regions(
+                    placement,
+                    self._prepare_client.staged(placement.numel, placement.dtype),
+                ),
+            )
+            try:
+                failure = self._rewrite_resident_slot(
+                    lora_ref, staged, self.configs[uid], self.loras[uid]
+                )
+            finally:
+                self._prepare_client.record_staging_reads()
+            if failure is not None:
+                return failure
+        self._commit_lora_adapter(
+            lora_ref, new_lora.config, new_lora, is_update, self.lora_refs.get(uid)
+        )
+        return self.create_lora_update_result(success=True)
 
     def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
@@ -1332,6 +1542,7 @@ class LoRAManager:
         """(Re)initialize the LoRA memory pool based on the current configurations."""
         # Placements describe this pool's slots, keyed by adapter signature.
         self._slot_placements: Dict[tuple, Optional[LoRASlotPlacement]] = {}
+        self._slot_layouts: Dict[tuple, tuple] = {}
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,

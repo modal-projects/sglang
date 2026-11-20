@@ -837,6 +837,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
+        elif not defer_finalize and _blackwell_shared_fold(self, hidden_states):
+            # --lora-backend blackwell: the fused expert path computes the shared expert (with
+            # its LoRA and gate) as one more expert of the same kernels
+            from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+            bw_experts.SHARED_BLOCK[0] = self
+            try:
+                final_hidden_states = self._forward_router_experts(hidden_states)
+            finally:
+                bw_experts.SHARED_BLOCK[0] = None
+            shared_output = None
         elif (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -894,6 +905,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+def _blackwell_shared_fold(block, hidden_states) -> bool:
+    if not hasattr(block.experts, "_lora_runner_backend"):
+        return False  # no LoRA on this MoE
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+    return bw_experts.shared_fold_ok(block, hidden_states)
 
 
 class Qwen2MoeAttention(nn.Module):

@@ -3,11 +3,12 @@ then switch on every rank at one step.
 
 Covers:
   * the tokenizer: prepare before apply, the retract pause scope, a pause someone else
-    started, a failed flush, and a pause asked for during an update
+    started, a failed flush, a pause asked for during an update, and the weight version
+    switching with the adapter
   * the ranks: they apply what they prepared only when every rank holds it, and
     otherwise load as /load_lora_adapter does
-  * the scheduler: one prepare at a time, and no prepare where control requests reach
-    the ranks at different steps
+  * the scheduler: one prepare at a time, no prepare where control requests reach the
+    ranks at different steps, and the weight version recorded at the switch
   * the manager's prepare record
   * the prepare process: a clean interpreter that lists an adapter's files and reads
     them into slot order, casting at the copy as the install does
@@ -71,10 +72,16 @@ def _event(obj) -> str:
 
 
 def _tokenizer(
-    registry, *, prepared=True, flush_ok=True, during_prepare=None, during_apply=None
+    registry,
+    *,
+    prepared=True,
+    flush_ok=True,
+    applied=True,
+    during_prepare=None,
+    during_apply=None,
 ):
-    """A TokenizerManager whose scheduler side is recorded in `events`."""
-    events = []
+    """A TokenizerManager recording its scheduler calls in `events`."""
+    events, applies = [], []
 
     async def dispatch(obj):
         events.append(_event(obj))
@@ -87,9 +94,10 @@ def _tokenizer(
 
     async def update(obj):
         events.append(_event(obj))
+        applies.append(obj)
         if during_apply is not None:
             await during_apply()
-        return [LoRAUpdateOutput(success=True, loaded_adapters={})]
+        return [LoRAUpdateOutput(success=applied, loaded_adapters={})]
 
     async def flush_cache():
         events.append("flush")
@@ -110,6 +118,9 @@ def _tokenizer(
         update_lora_adapter_communicator=update,
         _async_dispatch_to_scheduler=dispatch,
         flush_cache=flush_cache,
+        _weight_update_session_open=False,
+        record_config_updates=Mock(),
+        applies=applies,
     )
     return tm, events
 
@@ -129,9 +140,12 @@ def _registry_with_a() -> LoRARegistry:
     return registry
 
 
-def _update(pause_mode="in_place") -> UpdateLoRAAdapterReqInput:
+def _update(pause_mode="in_place", weight_version=None) -> UpdateLoRAAdapterReqInput:
     return UpdateLoRAAdapterReqInput(
-        lora_name="a", lora_path="/v2", pause_mode=pause_mode
+        lora_name="a",
+        lora_path="/v2",
+        pause_mode=pause_mode,
+        weight_version=weight_version,
     )
 
 
@@ -260,6 +274,31 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
         )
         self.assertTrue(is_pause)
 
+    def test_the_weight_version_switches_with_the_adapter(self):
+        for pause_mode in ("in_place", "retract"):
+            with self.subTest(pause_mode=pause_mode):
+                tm, _ = _tokenizer(_registry_with_a())
+                with _patched_tokenizer_context():
+                    result = asyncio.run(
+                        tm.update_lora_adapter(_update(pause_mode, weight_version="7"))
+                    )
+                self.assertTrue(result.success, result.error_message)
+                self.assertEqual([a.weight_version for a in tm.applies], ["7"])
+                tm.record_config_updates.assert_called_once_with(
+                    "tokenizer.weight_version", weight_version="7"
+                )
+
+    def test_a_failed_update_keeps_the_weight_version(self):
+        for kwargs in ({"prepared": False}, {"applied": False}):
+            with self.subTest(**kwargs):
+                tm, _ = _tokenizer(_registry_with_a(), **kwargs)
+                with _patched_tokenizer_context():
+                    result = asyncio.run(
+                        tm.update_lora_adapter(_update(weight_version="7"))
+                    )
+                self.assertFalse(result.success)
+                tm.record_config_updates.assert_not_called()
+
 
 def _worker(manager):
     worker = SimpleNamespace(
@@ -351,6 +390,7 @@ def _scheduler(*, pp_size=1, per_dp_group=False):
     scheduler.tp_worker = Mock()
     scheduler.tp_worker.load_lora_adapter.return_value = LoRAUpdateOutput(success=True)
     scheduler.kv_event_lora_names = Mock()
+    scheduler.weight_updater = Mock()
     scheduler.send_control_output = Mock()
     scheduler.request_receiver = SimpleNamespace(
         broadcasts_control_per_dp_group=lambda: per_dp_group
@@ -396,6 +436,22 @@ class TestSchedulerPrepare(CustomTestCase):
                 self.assertIn("/load_lora_adapter", reply.message)
                 self.assertIsNone(scheduler.pending_lora_prepare)
                 scheduler.tp_worker.prepare_lora_adapter.assert_not_called()
+
+    def test_the_weight_version_is_recorded_at_a_successful_switch(self):
+        for success in (True, False):
+            with self.subTest(success=success):
+                scheduler, _ = _scheduler()
+                scheduler.tp_worker.apply_lora_adapter.return_value = LoRAUpdateOutput(
+                    success=success
+                )
+                apply = _apply()
+                apply.weight_version = "7"
+                scheduler.apply_lora_adapter(apply)
+                record = scheduler.weight_updater.record_weight_version_after_update
+                if success:
+                    record.assert_called_once_with("7")
+                else:
+                    record.assert_not_called()
 
 
 class TestPreparedRecord(CustomTestCase):
@@ -615,9 +671,9 @@ class TestUpdateRequestsOverIpc(CustomTestCase):
     def test_round_trip(self):
         load = _apply(upsert=True).load
         for obj in (
-            _update("retract"),
+            _update("retract", weight_version="7"),
             PrepareLoRAAdapterReqInput(load=load, prepare_id="p1"),
-            ApplyLoRAAdapterReqInput(load=load, prepare_id="p1"),
+            ApplyLoRAAdapterReqInput(load=load, prepare_id="p1", weight_version="7"),
             PrepareLoRAAdapterReqOutput(prepared=False, message="m", unsupported=True),
         ):
             with self.subTest(type=type(obj).__name__):

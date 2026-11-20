@@ -2673,6 +2673,8 @@ class UpdateLoRAAdapterReqInput(BaseReq, kw_only=True):
     # "in_place": running requests go on with the new weights and their KV; "retract":
     # they are retracted and the cache flushed. A paused engine only switches.
     pause_mode: Literal["in_place", "retract"] = "in_place"
+    # Optional: update weight version along with the adapter
+    weight_version: Optional[str] = None
 
 
 class PrepareLoRAAdapterReqInput(BaseReq, kw_only=True):
@@ -2688,6 +2690,7 @@ class PrepareLoRAAdapterReqOutput(BaseReq, kw_only=True):
 class ApplyLoRAAdapterReqInput(BaseReq, kw_only=True):
     load: LoadLoRAAdapterReqInput
     prepare_id: str
+    weight_version: Optional[str] = None
 
 
 class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):

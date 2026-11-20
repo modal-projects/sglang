@@ -63,6 +63,45 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
 
     _warm_sgl_trtllm_moe_module()
 
+    # ---- MXFP4 experts on MXFP8 activations (DeepSeek-V4.1) ----
+    # The base Mxfp4FlashinferTrtllmMoEMethod already prepared the weights for the
+    # TRT-LLM kernels (w3/w1 order, gated-interleaved and shuffled rows, interleaved
+    # UE8M0 scales); the decomposed LoRA op runs the same kernels on them.
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+        Mxfp4FlashinferTrtllmMoEMethod,
+    )
+
+    if isinstance(base_layer.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
+        import torch
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmFp4MoeQuantInfo,
+        )
+
+        qm = base_layer.quant_method
+        w2 = base_layer.w2_weight
+        layer._lora_runner = None
+        layer._mxfp4_lora = True
+        layer._quant_info = FlashInferTrtllmFp4MoeQuantInfo(
+            w13_weight=base_layer.w13_weight.data.view(torch.uint8),
+            w2_weight=w2.data.view(torch.uint8),
+            w13_weight_scale=base_layer.w13_weight_scale_inv.data,
+            w2_weight_scale=base_layer.w2_weight_scale_inv.data,
+            g1_scale_c=base_layer.output1_scale_scalar,
+            g1_alphas=base_layer.output1_scale_gate_scalar,
+            g2_alphas=base_layer.output2_scale_scalar,
+            w13_input_scale_quant=None,
+            global_num_experts=int(base_layer.num_experts),
+            local_expert_offset=int(base_layer.moe_ep_rank)
+            * int(base_layer.num_local_experts),
+            local_num_experts=int(base_layer.num_local_experts),
+            intermediate_size_per_partition=int(w2.shape[2]) * 2,
+            routing_method_type=int(RoutingMethodType.TopK),
+            gemm1_clamp_limit=qm._gemm1_clamp_limit_tensor,
+        )
+        base_layer._lora_mxfp4_quant_info = layer._quant_info
+        return
+
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see
     # ModelOptNvFp4FusedMoEMethod.apply). Mirror the non-LoRA construction in
@@ -195,6 +234,15 @@ def dispatch_experimental_sgl_trtllm_lora(
         FlashInferTrtllmBf16MoeQuantInfo,
         FlashInferTrtllmFp4MoeQuantInfo,
     )
+
+    if getattr(base_layer, "_lora_mxfp4_quant_info", None) is quant_info:
+        return ft.fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
+            dispatch_output,
+            quant_info,
+            base_layer.moe_runner_config,
+            lora_info,
+            base_layer,
+        )
 
     # Resolve the fused-experts fn on the module at CALL TIME so the install-time
     # two-stream monkey-patch (sglang.srt.lora.trtllm_lora_temp) takes effect. Route by

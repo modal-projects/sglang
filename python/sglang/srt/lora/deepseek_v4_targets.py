@@ -13,8 +13,14 @@ WQ_B = "self_attn.wq_b"
 WO_B = "self_attn.wo_b"
 SHARED_GATE_UP = "shared_experts.gate_up_proj"
 SHARED_DOWN = "shared_experts.down_proj"
+# Routed experts: the FusedMoE layer takes the generic MoE targets.
+ROUTED_GATE_UP = "gate_up_proj"
+ROUTED_DOWN = "down_proj"
+ROUTED_TARGET_MODULES = frozenset({ROUTED_GATE_UP, ROUTED_DOWN})
 
-SUPPORTED_TARGET_MODULES = frozenset({WQKV_A, WQ_B, WO_B, SHARED_GATE_UP, SHARED_DOWN})
+SUPPORTED_TARGET_MODULES = frozenset(
+    {WQKV_A, WQ_B, WO_B, SHARED_GATE_UP, SHARED_DOWN} | ROUTED_TARGET_MODULES
+)
 
 TARGET_MODULE_ALIASES = {
     "wq_a": WQKV_A,
@@ -28,6 +34,14 @@ TARGET_MODULE_ALIASES = {
     "gate_up_proj": SHARED_GATE_UP,
     "w2": SHARED_DOWN,
     "down_proj": SHARED_DOWN,
+    # Parent-qualified routed-expert names (``ffn.experts.w1`` and the like).
+    "experts.w1": ROUTED_GATE_UP,
+    "experts.w3": ROUTED_GATE_UP,
+    "experts.gate_proj": ROUTED_GATE_UP,
+    "experts.up_proj": ROUTED_GATE_UP,
+    "experts.gate_up_proj": ROUTED_GATE_UP,
+    "experts.w2": ROUTED_DOWN,
+    "experts.down_proj": ROUTED_DOWN,
 }
 
 STACKED_MULTIPLY = {WQKV_A: 2, SHARED_GATE_UP: 2}
@@ -105,14 +119,27 @@ def validate_target_modules(
     attn_cp_size: int,
     fuse_wqa_wkv: bool,
     fused_shared_experts: bool,
+    routed_lora_runner: bool = False,
 ) -> None:
     target_modules = set(target_modules)
     unsupported = target_modules - SUPPORTED_TARGET_MODULES
     if unsupported:
         raise ValueError(
             f"DeepSeek-V4 LoRA does not support target modules {sorted(unsupported)}; "
-            "supported targets are wq_a, wkv, wq_b, wo_b and the shared-expert "
-            "w1, w2, w3."
+            "supported targets are wq_a, wkv, wq_b, wo_b, the shared-expert "
+            "w1, w2, w3 and the routed experts.w1, experts.w2, experts.w3."
+        )
+    routed = target_modules & ROUTED_TARGET_MODULES
+    if routed and routed != ROUTED_TARGET_MODULES:
+        raise ValueError(
+            "DeepSeek-V4 routed-expert LoRA needs both the gate/up (experts.w1, "
+            "experts.w3) and down (experts.w2) targets."
+        )
+    if routed and not routed_lora_runner:
+        raise ValueError(
+            "DeepSeek-V4 routed-expert LoRA runs on the MXFP4 TRT-LLM LoRA pipeline: "
+            "use --moe-runner-backend experimental_sgl_trtllm with "
+            "--lora-use-virtual-experts on SM100."
         )
     if quantized and not cuda:
         # ROCm and NPU fuse FP8 activation quantization into the norms ahead of

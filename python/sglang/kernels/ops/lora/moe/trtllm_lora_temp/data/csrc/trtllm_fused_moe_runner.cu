@@ -23,6 +23,13 @@
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
+
+// FlashInfer >= 0.7.2 takes an NVFP4 recipe before the stream argument.
+#if __has_include("tensorrt_llm/kernels/nvfp4Recipe.h")
+#define SGL_NVFP4_RECIPE_ARG tensorrt_llm::kernels::NVFP4RecipeSpec{},
+#else
+#define SGL_NVFP4_RECIPE_ARG
+#endif
 #include <iostream>
 
 namespace tensorrt_llm {
@@ -888,7 +895,7 @@ void Runner::run(MoERunnerArgs const &args, MoEWorkspace const &workspace,
         reinterpret_cast<uint8_t *>(workspace.activation_output),
         reinterpret_cast<uint8_t *>(workspace.activation_output_scale),
         reinterpret_cast<float *>(workspace.token_scales_fc2), sfLayout,
-        stream);
+        SGL_NVFP4_RECIPE_ARG stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

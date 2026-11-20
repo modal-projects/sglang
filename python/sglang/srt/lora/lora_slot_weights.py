@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -107,6 +109,8 @@ class SlotPlacementTracer:
     def __init__(self, tensors: Sequence[AdapterFileTensor], num_layers: int):
         self.tensors = tensors
         self._starts = torch.tensor([0] + [t.numel for t in tensors]).cumsum(0)
+        self._starts_np = self._starts.numpy()
+        self._starts_list = self._starts.tolist()
         self._by_layer: Dict[Optional[int], List[int]] = {}
         for index, tensor in enumerate(tensors):
             self._by_layer.setdefault(get_layer_id(tensor.name), []).append(index)
@@ -119,16 +123,21 @@ class SlotPlacementTracer:
         self._numel = 0
 
     def placeholders(self, layer_id: Optional[int]) -> Dict[str, torch.Tensor]:
-        return {
-            self.tensors[i].name: (
-                torch.arange(self.tensors[i].numel) + int(self._starts[i]) + 1
-            ).view(self.tensors[i].shape)
-            for i in self._by_layer.get(layer_id, [])
-        }
+        placeholders = {}
+        indices = self._by_layer.get(layer_id, [])
+        starts = self._starts_list
+        for first, last in _consecutive_runs(indices):
+            values = torch.arange(starts[first] + 1, starts[last + 1] + 1)
+            for i in range(first, last + 1):
+                begin, end = starts[i] - starts[first], starts[i + 1] - starts[first]
+                placeholders[self.tensors[i].name] = values[begin:end].view(
+                    self.tensors[i].shape
+                )
+        return placeholders
 
     def add(self, writes: Sequence[TracedSlotWrite], layer_id: Optional[int]) -> None:
         """Take the writes to `layer_id`'s buffers; overlapping writes raise."""
-        copied: Dict[SlotBufferKey, torch.Tensor] = {}
+        copied: Dict[SlotBufferKey, np.ndarray] = {}
         for write in writes:
             if write.key[2] != layer_id:
                 continue
@@ -138,15 +147,15 @@ class SlotPlacementTracer:
                 self._regions[write.key] = region
                 self._numel += write.slot_numel
             if write.key not in copied:
-                copied[write.key] = torch.zeros(write.slot_numel, dtype=torch.bool)
-            written = strided(
-                copied[write.key], write.offset, write.strides, write.shape
+                copied[write.key] = np.zeros(write.slot_numel, dtype=np.bool_)
+            written = np.lib.stride_tricks.as_strided(
+                copied[write.key][write.offset :], write.shape, write.strides
             )
-            if bool(written.any()):
+            if written.any():
                 raise ValueError(f"LoRA install writes overlap in {write.key}")
             if write.weight is None or write.weight.numel() == 0:
                 continue
-            written.fill_(True)
+            written[...] = True
             self._copies.extend(self._copies_of(write, region.offset))
 
     def placement(
@@ -163,11 +172,11 @@ class SlotPlacementTracer:
     def _copies_of(self, write: TracedSlotWrite, region_offset: int) -> List[_SlotCopy]:
         """A strided copy per block of rows of one file tensor, else element runs."""
         values = write.weight
-        first_of_row = values.reshape(values.shape[0], -1)[:, 0].abs() - 1
+        first_of_row = np.abs(values.numpy().reshape(values.shape[0], -1)[:, 0]) - 1
         tensor_of_row = (
-            torch.searchsorted(self._starts, first_of_row.clamp(min=0), right=True) - 1
+            np.searchsorted(self._starts_np, first_of_row.clip(min=0), side="right") - 1
         )
-        breaks = (torch.nonzero(torch.diff(tensor_of_row)).flatten() + 1).tolist()
+        breaks = (np.flatnonzero(np.diff(tensor_of_row)) + 1).tolist()
         bounds = [0, *breaks, values.shape[0]]
         copies = []
         for start, end in zip(bounds, bounds[1:]):
@@ -190,37 +199,42 @@ class SlotPlacementTracer:
     ) -> Optional[_SlotCopy]:
         """The write as one copy, when its values step through one file tensor at
         fixed non-negative strides."""
-        values = write.weight
-        scaled = values < 0
-        mixed = bool(scaled.any()) and not bool(scaled.all())
-        if mixed or bool((values == 0).any()):
+        values = write.weight.numpy()
+        # All negative: scaled; all positive: not; zeros or both: not one copy.
+        low, high = values.min(), values.max()
+        if low > 0:
+            scaled, src = False, values - 1
+        elif high < 0:
+            scaled, src = True, -values - 1
+        else:
             return None
-        src = values.abs() - 1
-        origin = int(src.reshape(-1)[0])
+        origin = int(src.flat[0])
         strides = []
         for dim, size in enumerate(src.shape):
-            step = [0] * src.dim()
+            step = [0] * src.ndim
             step[dim] = 1
             stride = int(src[tuple(step)]) - origin if size > 1 else 0
             if stride < 0:
                 return None
             strides.append(stride)
-        expected = origin + strided(_index(strides, src.shape), 0, strides, src.shape)
-        if not torch.equal(src, expected):
-            return None
-        tensor_index = (
-            int(torch.searchsorted(self._starts, torch.tensor(origin), right=True)) - 1
+        last = origin + sum((n - 1) * s for n, s in zip(src.shape, strides))
+        span = np.arange(origin, last + 1, dtype=src.dtype)
+        expected = np.lib.stride_tricks.as_strided(
+            span, src.shape, [s * span.itemsize for s in strides]
         )
-        if int(src.max()) >= int(self._starts[tensor_index + 1]):
+        if not np.array_equal(src, expected):
+            return None
+        tensor_index = bisect.bisect_right(self._starts_list, origin) - 1
+        if last >= self._starts_list[tensor_index + 1]:
             return None
         return _SlotCopy(
             tensor_index=tensor_index,
-            src_offset=origin - int(self._starts[tensor_index]),
+            src_offset=origin - self._starts_list[tensor_index],
             src_strides=tuple(strides),
             dst_offset=region_offset + write.offset,
             dst_strides=write.strides,
             shape=write.shape,
-            scaled=bool(scaled.any()),
+            scaled=scaled,
         )
 
     def _element_copies(
@@ -287,6 +301,17 @@ def slot_regions(
 ) -> List[torch.Tensor]:
     """Views of `data`, which holds a slot in order, one per region of `placement`."""
     return [data[r.offset : r.offset + r.numel] for r in placement.regions]
+
+
+def _consecutive_runs(indices: Sequence[int]) -> List[Tuple[int, int]]:
+    """(first, last) of each run of consecutive ints in ascending `indices`."""
+    runs: List[Tuple[int, int]] = []
+    for i in indices:
+        if runs and runs[-1][1] == i - 1:
+            runs[-1] = (runs[-1][0], i)
+        else:
+            runs.append((i, i))
+    return runs
 
 
 def _index(strides: Sequence[int], shape: Sequence[int]) -> torch.Tensor:

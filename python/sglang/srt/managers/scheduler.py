@@ -3628,10 +3628,18 @@ class Scheduler(
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
-        if (
-            self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
-        ):
+        if self.max_queued_requests is None:
+            return False
+        candidates = None
+        queued = len(self.waiting_queue)
+        if (updater := getattr(self, "lora_updater", None)) and updater.retained:
+            candidates = [
+                (index, req)
+                for index, req in enumerate(self.waiting_queue)
+                if req not in updater.retained
+            ]
+            queued = len(candidates)
+        if queued + 1 <= self.max_queued_requests:
             return False
 
         # Reject the incoming request by default.
@@ -3647,7 +3655,10 @@ class Scheduler(
                 direction * item[1].priority,
                 item[1].time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            idx, candidate_req = max(
+                candidates if candidates is not None else enumerate(self.waiting_queue),
+                key=key_fn,
+            )
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
@@ -6203,7 +6214,7 @@ class Scheduler(
             self.send_control_output(
                 LoRAUpdateOutput(
                     success=False,
-                    error_message="In-place LoRA updates require standard TP serving without PP, DP attention, speculation, continuous input polling or hierarchical cache",
+                    error_message="In-place LoRA updates require NVIDIA CUDA and standard TP serving without PP, DP attention, speculation, continuous input polling or hierarchical cache",
                 ),
                 request,
             )
@@ -6266,7 +6277,10 @@ class Scheduler(
             req.lora_weight_version = version
             if req not in self.waiting_queue:
                 self.waiting_queue.append(req)
+                self.lora_updater.retained.add(req)
                 req.time_stats.set_retract_time()
+                req.time_stats.set_wait_queue_entry_time()
+                req.arrival_processed_tokens = self.processed_tokens_counter
         self.running_batch.batch_is_full = False
 
     def fail_lora_request(self, req: Req, message: str) -> None:
@@ -6358,11 +6372,23 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        updater = getattr(self, "lora_updater", None)
+        if (
+            updater
+            and updater.pending
+            and updater.pending.request.lora_id == recv_req.lora_id
+        ):
+            return updater.manager.create_lora_update_result(
+                False, "LoRA replacement is still in progress"
+            )
         for request, future, _ in getattr(self, "_pending_lora_prepares", ()):
             if request.lora_id == recv_req.lora_id:
                 self._cancelled_lora_prepares.add(request.lora_id)
                 future.cancel()
-        return self.tp_worker.unload_lora_adapter(recv_req)
+        result = self.tp_worker.unload_lora_adapter(recv_req)
+        if updater and result.success:
+            updater.forget(recv_req.lora_id)
+        return result
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

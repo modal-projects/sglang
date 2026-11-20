@@ -100,7 +100,7 @@ def stream(
         url + "/generate", json=payload, stream=True, timeout=180
     ) as response:
         response.raise_for_status()
-        for line in response.iter_lines(chunk_size=1):
+        for line in response.iter_lines(chunk_size=None):
             if not line.startswith(b"data: ") or line == b"data: [DONE]":
                 continue
             last = json.loads(line[6:])
@@ -134,6 +134,7 @@ def run(url: str, root: Path, tokens: int) -> dict[str, Any]:
         )
     results = []
     for update in (False, True):
+        print(f"Streaming case: update={update}", flush=True)
         events = [threading.Event(), threading.Event()]
         samples: list[list[tuple[float, int]]] = [[], []]
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -179,9 +180,11 @@ def run(url: str, root: Path, tokens: int) -> dict[str, Any]:
             ),
             "b_max_inter_chunk_s": max(b_gaps),
             "b_median_inter_chunk_s": sorted(b_gaps)[len(b_gaps) // 2],
-            "a_retractions": a["meta_info"].get("retraction_counts"),
+            "a_retractions": a["meta_info"].get("num_retractions"),
         }
         if update:
+            assert a["meta_info"]["num_retractions"] >= 1
+            assert b["meta_info"]["num_retractions"] == 0
             spans = a["meta_info"]["weight_versions"]
             assert [span["version"] for span in spans] == ["A", "v2"], spans
             assert spans[0]["start"] == 0 and spans[0]["end"] == spans[1]["start"]

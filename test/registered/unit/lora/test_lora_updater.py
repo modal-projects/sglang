@@ -279,3 +279,14 @@ def test_preparation_captures_runtime_context(runtime: tuple) -> None:
     updater.executor.run()
     updater.poll()
     assert updater.is_paused("a")
+
+
+def test_unload_releases_failed_adapter_state(runtime: tuple) -> None:
+    scheduler, updater = runtime
+    updater.paused.update(("a", "b"))
+    updater.failed.update(a="failed A", b="failed B")
+    updater.retained.update((scheduler.a, scheduler.b))
+    updater.forget("a")
+    assert not updater.is_paused("a") and updater.is_paused("b")
+    assert updater.failed == {"b": "failed B"}
+    assert set(updater.retained) == {scheduler.b}

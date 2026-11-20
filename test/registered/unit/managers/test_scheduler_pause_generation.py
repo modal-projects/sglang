@@ -116,6 +116,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     ) -> None:
         scheduler = self._new_scheduler()
         scheduler.enable_continuous_input_polling = False
+        scheduler.processed_tokens_counter = 0
+        scheduler.lora_updater = SimpleNamespace(retained=set())
         a, b = self._make_req("a"), self._make_req("b")
         a.lora_id, b.lora_id = "adapter-a", "adapter-b"
         a.output_ids.extend([4, 5])
@@ -163,6 +165,21 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(a.weight_version_events[-1].old_version, "v1")
         self.assertFalse(b.weight_version_events)
         self.assertFalse(scheduler.result_queue)
+
+    def test_lora_retained_requests_do_not_consume_new_request_queue_capacity(
+        self,
+    ) -> None:
+        scheduler = self._new_scheduler()
+        retained, waiting, incoming = [self._make_req(rid) for rid in ("a", "b", "c")]
+        scheduler.lora_updater = SimpleNamespace(retained={retained})
+        scheduler.max_queued_requests = 1
+        scheduler.enable_priority_scheduling = False
+        scheduler.send_abort_output = MagicMock()
+        scheduler.waiting_queue = [retained]
+        self.assertFalse(scheduler._abort_on_queued_limit(waiting))
+        scheduler.waiting_queue.append(waiting)
+        self.assertTrue(scheduler._abort_on_queued_limit(incoming))
+        self.assertEqual(scheduler.waiting_queue, [retained, waiting])
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(

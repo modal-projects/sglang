@@ -6,6 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
+from weakref import WeakSet
 
 import torch
 
@@ -35,6 +36,7 @@ class LoRAUpdater:
         )
         self.pending: PendingUpdate | None = None
         self.paused: set[str] = set()
+        self.retained: WeakSet[Req] = WeakSet()
         self.failed: dict[str, str] = {}
 
     def submit(self, request: UpdateLoRAAdapterReqInput) -> None:
@@ -198,6 +200,13 @@ class LoRAUpdater:
         pending, self.pending = self.pending, None
         self.manager.updating_loras.discard(pending.request.lora_id)
         self._reply(pending.request, error)
+
+    def forget(self, uid: str) -> None:
+        self.paused.discard(uid)
+        self.failed.pop(uid, None)
+        for req in list(self.retained):
+            if req.lora_id == uid:
+                self.retained.discard(req)
 
     def close(self) -> None:
         self.executor.shutdown(wait=True, cancel_futures=True)

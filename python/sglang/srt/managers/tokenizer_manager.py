@@ -2566,24 +2566,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
-            self.is_pause = True
-            if obj.mode != "abort":
-                await self._async_dispatch_to_scheduler(obj)
-            else:
-                # we are using the model_update_lock to check if there is still on-going requests.
-                while True:
-                    # TODO: maybe make it async instead of fire-and-forget
-                    self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
-                    if not is_locked:
-                        break
-                    await asyncio.sleep(1.0)
+            await self._pause_generation_locked(obj)
+
+    async def _pause_generation_locked(self, obj: PauseGenerationReqInput):
+        self.is_pause = True
+        if obj.mode != "abort":
+            await self._async_dispatch_to_scheduler(obj)
+        else:
+            # we are using the model_update_lock to check if there is still on-going requests.
+            while True:
+                # TODO: maybe make it async instead of fire-and-forget
+                self.abort_request(abort_all=True)
+                is_locked = await self.model_update_lock.is_locked()
+                if not is_locked:
+                    break
+                await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
-            self.is_pause = False
-            await self._async_dispatch_to_scheduler(obj)
-            self.is_pause_cond.notify_all()
+            await self._continue_generation_locked(obj)
+
+    async def _continue_generation_locked(self, obj: ContinueGenerationReqInput):
+        self.is_pause = False
+        await self._async_dispatch_to_scheduler(obj)
+        self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
         self,

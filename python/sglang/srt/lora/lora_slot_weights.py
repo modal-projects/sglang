@@ -275,14 +275,7 @@ class SlotPlacementTracer:
 
 
 class LoRASlotWeights:
-    """One adapter's weights in this rank's buffer-slot order: a tensor per region of
-    its placement.
-
-    The CPU copy LoRAMemoryPool loads with one copy per buffer region, in place of a
-    LoRAAdapter's staged weights. Positions the install leaves unwritten inside a
-    region hold zeros. The regions are views of one buffer in slot order
-    (slot_regions), or of a copy the node's GPUs share.
-    """
+    """An adapter's weights in this rank's slot order, a tensor per region."""
 
     def __init__(
         self,

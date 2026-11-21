@@ -462,6 +462,12 @@ def inventory_digest(tensors: Sequence[FileTensor]) -> str:
     return hashlib.sha256(json.dumps(inventory).encode()).hexdigest()
 
 
+# Building a read's views is Python: the process runs it one thread at a time anyway.
+# Taking turns explicitly keeps the GPUs' requests from convoying on the GIL between
+# their copies, which run in parallel without it.
+_VIEWS_LOCK = threading.Lock()
+
+
 def read_slot_weights(
     data: torch.Tensor,
     copies: Sequence[SlotCopy],
@@ -476,19 +482,20 @@ def read_slot_weights(
     operation per copy would hold the GIL that the process's other GPUs share."""
     data.zero_()
     groups: Dict[Tuple[torch.dtype, bool], Tuple[list, list]] = {}
-    for (
-        tensor_index,
-        src_offset,
-        src_strides,
-        dst_offset,
-        dst_strides,
-        shape,
-        scaled,
-    ) in copies:
-        source = sources[tensor_index]
-        dsts, srcs = groups.setdefault((source.dtype, scaled), ([], []))
-        dsts.append(strided(data, dst_offset, dst_strides, shape))
-        srcs.append(strided(source, src_offset, src_strides, shape))
+    with _VIEWS_LOCK:
+        for (
+            tensor_index,
+            src_offset,
+            src_strides,
+            dst_offset,
+            dst_strides,
+            shape,
+            scaled,
+        ) in copies:
+            source = sources[tensor_index]
+            dsts, srcs = groups.setdefault((source.dtype, scaled), ([], []))
+            dsts.append(strided(data, dst_offset, dst_strides, shape))
+            srcs.append(strided(source, src_offset, src_strides, shape))
     for (_, scaled), (dsts, srcs) in groups.items():
         if scaled:
             # The install's op for scaled weights: weight * scaling on CPU, in the

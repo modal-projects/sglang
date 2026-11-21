@@ -417,6 +417,11 @@ def inventory_digest(tensors: Sequence[FileTensor]) -> str:
     return hashlib.sha256(json.dumps(inventory).encode()).hexdigest()
 
 
+# Building views is Python, one thread at a time anyway; taking turns keeps the GPUs'
+# requests from convoying on the GIL between their copies.
+_VIEWS_LOCK = threading.Lock()
+
+
 def read_slot_weights(
     data: torch.Tensor,
     copies: Sequence[SlotCopy],
@@ -426,19 +431,21 @@ def read_slot_weights(
     """Fill `data` as the copies place `sources`, cast as the install casts."""
     data.zero_()
     groups: Dict[Tuple[torch.dtype, bool], Tuple[list, list]] = {}
-    for (
-        tensor_index,
-        src_offset,
-        src_strides,
-        dst_offset,
-        dst_strides,
-        shape,
-        scaled,
-    ) in copies:
-        source = sources[tensor_index]
-        dsts, srcs = groups.setdefault((source.dtype, scaled), ([], []))
-        dsts.append(strided(data, dst_offset, dst_strides, shape))
-        srcs.append(strided(source, src_offset, src_strides, shape))
+    with _VIEWS_LOCK:
+        for (
+            tensor_index,
+            src_offset,
+            src_strides,
+            dst_offset,
+            dst_strides,
+            shape,
+            scaled,
+        ) in copies:
+            source = sources[tensor_index]
+            dsts, srcs = groups.setdefault((source.dtype, scaled), ([], []))
+            dsts.append(strided(data, dst_offset, dst_strides, shape))
+            srcs.append(strided(source, src_offset, src_strides, shape))
+    # A foreach call per group: an op per copy would hold the GIL the GPUs share.
     for (_, scaled), (dsts, srcs) in groups.items():
         if scaled:
             # The install's op: weight * scaling on CPU, in the file's dtype.
@@ -552,18 +559,18 @@ class _Version:
             self.regions[digest] = region
             return region, True
 
+    def map_sources(self) -> List[torch.Tensor]:
+        with self.lock:
+            if self.sources is None:
+                self.sources = _map_file_tensors(self.tensors, self.locations)
+            return self.sources
+
     def free(self) -> None:
         for region in self.regions.values():
             self.buffer.free(region.segment, region.offset, region.nbytes)
         self.regions.clear()
         self.sources = None
 
-
-    def map_sources(self) -> List[torch.Tensor]:
-        with self.lock:
-            if self.sources is None:
-                self.sources = _map_file_tensors(self.tensors, self.locations)
-            return self.sources
 
 class _Node:
     def __init__(self):

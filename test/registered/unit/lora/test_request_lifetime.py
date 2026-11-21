@@ -437,10 +437,6 @@ def test_registry_cancelled_partial_acquisition_rolls_back():
     asyncio.run(scenario())
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.parametrize("success", [False, True])
 def test_cancelled_update_keeps_its_transaction_and_live_acquisitions(
     success: bool,
@@ -488,5 +484,16 @@ def test_cancelled_update_keeps_its_transaction_and_live_acquisitions(
         await registry.release(acquired)
         assert await registry.unregister("A") == acquired
         await registry.wait_for_unload(acquired)
+        with get_context().override_server_args(enable_lora=True):
+            result = await m.update_lora_adapter(
+                UpdateLoRAAdapterReqInput(lora_name="A", lora_path="/new", version="v3")
+            )
+        assert not result.success
+        assert "not loaded" in result.error_message
+        assert registry.num_registered_loras == 0
 
     asyncio.run(run())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

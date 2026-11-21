@@ -682,7 +682,7 @@ class TokenizerControlMixin:
                     success=False,
                     error_message="LoRA updates require LoRA enabled and dp_size=1",
                 )
-            ref = self.lora_ref_cache.get(obj.lora_name)
+            ref = self.lora_registry.get_all_adapters().get(obj.lora_name)
             if ref is None or obj.lora_name in self.pending_lora_unloads:
                 return LoRAUpdateOutput(
                     success=False,

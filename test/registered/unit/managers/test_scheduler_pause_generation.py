@@ -23,7 +23,11 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     UpdateLoRAAdapterReqInput,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    compute_extend_logprob_start_len,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -122,6 +126,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         a, b, c = self._make_req("z"), self._make_req("b"), self._make_req("a")
         a.lora_id, b.lora_id, c.lora_id = "adapter-a", "adapter-b", "adapter-a"
         a.output_ids.extend([4, 5])
+        a.logprob_start_len = 1
+        a.logprob.input_token_logprobs_val = [-0.1, -0.2]
+        a.logprob.input_token_logprobs_idx = [2, 3]
+        c.logprob_start_len = 1
         b.output_ids.append(6)
         c.output_ids.append(9)
         a.kv.req_pool_idx = 0
@@ -170,6 +178,18 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(a.weight_version_events[-1].old_version, "v1")
         self.assertFalse(b.weight_version_events)
         self.assertFalse(scheduler.result_queue)
+        self.assertEqual(a.logprob.input_token_logprobs_val, [-0.1, -0.2])
+        self.assertEqual(a.logprob.input_token_logprobs_idx, [2, 3])
+        self.assertEqual(
+            compute_extend_logprob_start_len(
+                logprob_start_len=a.logprob_start_len,
+                prefix_len=0,
+                extend_len=6,
+                full_untruncated_fill_len=6,
+            ),
+            6,
+        )
+        self.assertEqual(c.logprob_start_len, 1)
 
     def test_lora_retained_requests_do_not_consume_new_request_queue_capacity(
         self,

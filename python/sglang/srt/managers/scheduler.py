@@ -6274,6 +6274,9 @@ class Scheduler(
         )
         record_weight_version_events(affected, old_version=version)
         for req in affected:
+            if req.logprob.input_token_logprobs_val is not None:
+                # Rebuild KV without scoring tokens whose behavior logprobs are retained.
+                req.logprob_start_len = -1
             req.lora_weight_version = version
             if req not in self.waiting_queue:
                 self.waiting_queue.append(req)

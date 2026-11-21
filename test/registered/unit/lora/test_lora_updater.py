@@ -1,5 +1,7 @@
 """Adapter replacement isolates requests, slots and cache generations."""
 
+import sys
+from collections.abc import Iterator
 from concurrent.futures import Future
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -139,7 +141,7 @@ class Scheduler:
 
 
 @pytest.fixture
-def runtime(monkeypatch: pytest.MonkeyPatch) -> tuple[Scheduler, LoRAUpdater]:
+def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Scheduler, LoRAUpdater]]:
     monkeypatch.setattr(lora_updater, "ThreadPoolExecutor", Executor)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     scheduler = Scheduler()
@@ -304,3 +306,7 @@ def test_updated_adapter_rejects_stale_session_state_without_restricting_peers(
     a.session = b.session = object()
     assert updater.reject_request(a) and a.error
     assert not updater.reject_request(b) and b.error is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

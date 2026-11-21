@@ -365,6 +365,40 @@ class TestHandlerRequestSemantics(CustomTestCase):
             (None, " world"),
         )
 
+    def test_logprob_bytes_are_the_token_bytes(self):
+        """The vocabulary is byte-level even though its first ids are special tokens,
+        also behind fastokens' backend, whose decoder carries no type, and when the
+        ByteLevel decoder sits in a Sequence (LFM2)."""
+        from tokenizers import decoders
+        from transformers import PreTrainedTokenizerFast
+
+        for backend in ("huggingface", "fastokens", "sequence decoder"):
+            with self.subTest(backend):
+                tokenizer = self.tokenizer
+                if backend == "sequence decoder":
+                    tokenizer = PreTrainedTokenizerFast(
+                        tokenizer_file=_tokenizer_file()
+                    )
+                    tokenizer.backend_tokenizer.decoder = decoders.Sequence(
+                        [decoders.ByteLevel()]
+                    )
+                if backend == "fastokens":
+                    try:
+                        from sglang.srt.hf_transformers.tokenizer import (
+                            _shim_fastokens_backend,
+                        )
+
+                        tokenizer = _shim_fastokens_backend(
+                            PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file())
+                        )
+                    except ImportError:
+                        self.skipTest("fastokens is not installed")
+                chat = _serving(self, tokenizer)
+                [logprob] = chat._build_token_logprobs_from_raw(
+                    [(-0.1, self._token("ð"), "�")], None
+                )
+                self.assertEqual(logprob.bytes, [0xF0])
+
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 

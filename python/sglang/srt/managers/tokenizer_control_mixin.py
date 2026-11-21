@@ -80,6 +80,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateLoRAAdapterReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -661,6 +662,47 @@ class TokenizerControlMixin:
         if result.success:
             self.pending_lora_unloads.pop(obj.lora_name)
         return result
+
+    async def update_lora_adapter(
+        self: TokenizerManager,
+        obj: UpdateLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoRAUpdateOutput:
+        self.auto_create_handle_loop()
+        return await asyncio.shield(
+            self._track_lora_task(self._replace_lora_adapter(obj))
+        )
+
+    async def _replace_lora_adapter(
+        self: TokenizerManager, obj: UpdateLoRAAdapterReqInput
+    ) -> LoRAUpdateOutput:
+        async with self.lora_update_lock:
+            if not get_lora().enable_lora or get_parallel().dp_size != 1:
+                return LoRAUpdateOutput(
+                    success=False,
+                    error_message="LoRA updates require LoRA enabled and dp_size=1",
+                )
+            ref = self.lora_registry.get_all_adapters().get(obj.lora_name)
+            if ref is None or obj.lora_name in self.pending_lora_unloads:
+                return LoRAUpdateOutput(
+                    success=False,
+                    error_message="LoRA adapter is not loaded or is being unloaded",
+                )
+            if not obj.version:
+                return LoRAUpdateOutput(
+                    success=False, error_message="LoRA update version must not be empty"
+                )
+            obj.lora_id = ref.lora_id
+            obj.pinned = ref.pinned
+            obj.cache_epoch = uuid.uuid4().hex
+            result = _merge_lora_update_results(
+                await self.update_lora_adapter_communicator(obj)
+            )
+            if result.success:
+                replacement = obj.to_ref()
+                await self.lora_registry.replace(replacement)
+                self.lora_ref_cache[obj.lora_name] = replacement
+            return result
 
     async def load_lora_adapter(
         self: TokenizerManager,

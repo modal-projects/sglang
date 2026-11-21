@@ -1161,6 +1161,9 @@ class Req(ReqDllmMixin):
             return_hidden_states
         )
 
+        self.lora_weight_version: Optional[str] = None
+        self.lora_base_extra_key = extra_key
+
         # Extra key for caller-defined request classification.
         if lora_id is not None:
             extra_key = (
@@ -2063,6 +2066,9 @@ class Req(ReqDllmMixin):
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
+
+    def set_lora_cache_epoch(self, epoch: str) -> None:
+        self.extra_key = f"{self.lora_base_extra_key or ''}{self.lora_id}:{epoch}"
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
@@ -3851,7 +3857,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        reqs_to_exclude: Optional[Union[Req, List[Req], set[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)

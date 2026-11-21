@@ -2557,6 +2557,12 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
         )
 
 
+class UpdateLoRAAdapterReqInput(LoadLoRAAdapterReqInput, kw_only=True):
+    version: str
+    expected_version: Optional[str] = None
+    cache_epoch: str = ""
+
+
 class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The name of lora module to unload.
     lora_name: str

@@ -118,6 +118,9 @@ class LoRAManager:
                 f"size {get_parallel().attn_cp_size})"
             )
         self.pending_lora_load_events = {}
+        self.updating_loras: set[str] = set()
+        self.lora_weight_versions: dict[str, str] = {}
+        self.lora_cache_epochs: dict[str, str] = {}
 
         self.eviction_policy = get_lora().lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
@@ -347,6 +350,55 @@ class LoRAManager:
         logger.info("LoRA prepared id=%s cpu_bytes=%d", lora_ref.lora_id, cpu_bytes)
         return self.create_lora_update_result(True)
 
+    def validate_lora_replacement(
+        self, lora_ref: LoRARef, prepared: tuple[LoRAConfig, LoRAAdapter]
+    ) -> None:
+        old = self.loras[lora_ref.lora_id]
+        config, adapter = prepared
+        if (
+            config.r != old.config.r
+            or config.lora_alpha != old.config.lora_alpha
+            or set(config.target_modules) != set(old.config.target_modules)
+        ):
+            raise ValueError(
+                "In-place LoRA updates require unchanged rank, alpha and targets"
+            )
+        old_weights = [layer.weights for layer in old.layers] + [old.embedding_layers]
+        new_weights = [layer.weights for layer in adapter.layers] + [
+            adapter.embedding_layers
+        ]
+        if len(old_weights) != len(new_weights):
+            raise ValueError("LoRA replacement layer count differs")
+        for before, after in zip(old_weights, new_weights, strict=True):
+            if before.keys() != after.keys() or any(
+                before[key].shape != after[key].shape
+                or before[key].dtype != after[key].dtype
+                for key in before
+            ):
+                raise ValueError(
+                    "LoRA replacement tensor keys, shapes or dtypes differ"
+                )
+
+    def copy_lora_replacement(self, uid: str, adapter: LoRAAdapter) -> None:
+        slot = self.memory_pool.uid_to_buffer_id.get(uid)
+        if slot is None:
+            return
+        with (
+            torch.cuda.device(self.device),
+            torch.cuda.stream(torch.cuda.Stream(device=self.device)),
+        ):
+            try:
+                self.memory_pool.load_lora_weight_to_buffer(
+                    uid,
+                    slot,
+                    adapter,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            finally:
+                torch.cuda.current_stream().synchronize()
+
     def _validate_replicated_q_targets(self, target_modules):
         # q_proj adapter targets normalize to qkv_proj.
         unsupported = set(target_modules) & {"q_b_proj", "qkv_proj", "kv_b_proj"}
@@ -436,6 +488,8 @@ class LoRAManager:
             self.configs.pop(lora_ref.lora_id, None)
             self.loras.pop(lora_ref.lora_id, None)
             self.lora_refs.pop(lora_ref.lora_id, None)
+            self.lora_weight_versions.pop(lora_ref.lora_id, None)
+            self.lora_cache_epochs.pop(lora_ref.lora_id, None)
             if loaded_lora_ref is not None:
                 self.num_pinned_loras -= int(loaded_lora_ref.pinned)
         except Exception as e:
@@ -450,6 +504,7 @@ class LoRAManager:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
+        lora_ids = lora_ids | self.updating_loras
         if len(lora_ids) > self.max_loras_per_batch:
             return False
 
@@ -481,7 +536,7 @@ class LoRAManager:
         self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
     ):
         # Load active loras into lora memory pool
-        cur_uids = new_loras | running_loras
+        cur_uids = new_loras | running_loras | self.updating_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
         new_uids = {

@@ -26,6 +26,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReqStub:
+    lora_weight_version: str | None = None
+
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []

@@ -355,6 +355,9 @@ class _FakeMemoryPool:
 def _new_manager(pool, layer, *, uids):
     """A ``LoRAManager`` carrying only the fields the tested methods touch."""
     manager = lora_manager_module.LoRAManager.__new__(lora_manager_module.LoRAManager)
+    manager.updating_loras = set()
+    manager.lora_weight_versions = {}
+    manager.lora_cache_epochs = {}
     manager.device = torch.device("cpu")
     manager.max_loras_per_batch = pool.max_loras_per_batch
     manager.memory_pool = pool

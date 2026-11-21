@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from safetensors.torch import save_file
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqInput,
@@ -25,6 +27,43 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_replacement_copy_drains_queued_writes_before_returning(fail: bool) -> None:
+    slots = torch.tensor([[1.0], [3.0]])
+    pending: list[torch.Tensor] = []
+
+    def enqueue(*args: object) -> None:
+        pending.append(torch.tensor([2.0]))
+        if fail:
+            raise RuntimeError("copy interrupted")
+
+    def synchronize() -> None:
+        for value in pending:
+            slots[0].copy_(value)
+        pending.clear()
+
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.device = torch.device("cuda:0")
+    manager.memory_pool = SimpleNamespace(
+        uid_to_buffer_id={"a": 0, "b": 1}, load_lora_weight_to_buffer=enqueue
+    )
+    manager.lora_modules = {}
+    manager.embed_tokens_module = manager.lm_head_module = None
+    stream = SimpleNamespace(synchronize=synchronize)
+    with (
+        patch.object(torch.cuda, "device", return_value=nullcontext()),
+        patch.object(torch.cuda, "Stream", return_value=stream),
+        patch.object(torch.cuda, "stream", return_value=nullcontext()),
+        patch.object(torch.cuda, "current_stream", return_value=stream),
+        pytest.raises(RuntimeError, match="copy interrupted")
+        if fail
+        else nullcontext(),
+    ):
+        manager.copy_lora_replacement("a", None)
+    torch.testing.assert_close(slots, torch.tensor([[2.0], [3.0]]))
+    assert not pending
 
 
 def test_expert_local_loading_and_collective_async_install():

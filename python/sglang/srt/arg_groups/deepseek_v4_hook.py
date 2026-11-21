@@ -382,6 +382,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     incompatible = (
+        # The late layers run each request's last SWA_WINDOW rows only, while the
+        # LoRA backends keep the batch info of the whole extend: their kernels
+        # would index rows past the trimmed activations.
+        # (--lora-paths turns LoRA on unless --enable-lora is explicitly false.)
+        (
+            "LoRA",
+            bool(cfg.enable_lora or (cfg.enable_lora is None and cfg.lora_paths)),
+        ),
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend

@@ -579,6 +579,60 @@ class TestEncoderReplayPrefillGraphGate(CustomTestCase):
             self._validate(Backend.BREAKABLE)
 
 
+class TestDecoderReplayLoRAGate(CustomTestCase):
+    """The late-layer tail trims each request to its last SWA_WINDOW rows; the
+    LoRA backends' batch info describes the whole extend, so the two exclude
+    each other."""
+
+    def _args(self, **kwargs):
+        args = ServerArgs(
+            model_path="local-deepseek-v41",
+            attention_backend="dsv4",
+            enable_encoder_swa_bounded_replay=False,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+            **kwargs,
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        return args
+
+    def _validate(self, args):
+        with patch(f"{_ENV_GATE}.is_unified_kv_triton", return_value=False):
+            deepseek_v4_hook.validate_deepseek_v41_features(args)
+        return args
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_replay_with_lora_is_rejected(self):
+        for lora in (dict(enable_lora=True), dict(lora_paths=["a0=/adapters/a0"])):
+            with (
+                self.subTest(**lora),
+                self.assertRaisesRegex(ValueError, "cannot be combined with LoRA"),
+            ):
+                self._validate(
+                    self._args(enable_decoder_swa_bounded_replay=True, **lora)
+                )
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_default_resolves_off_with_lora_and_on_without(self):
+        for enable_lora, expected in ((True, False), (None, True)):
+            with self.subTest(enable_lora=enable_lora):
+                args = self._validate(
+                    self._args(
+                        enable_decoder_swa_bounded_replay=None,
+                        enable_lora=enable_lora,
+                    )
+                )
+                self.assertIs(
+                    deepseek_v4_hook.resolving_view(
+                        args
+                    ).enable_decoder_swa_bounded_replay,
+                    expected,
+                )
+
+
 class TestFoldMlpSync(CustomTestCase):
     """Pure TP that still syncs the MLP (e.g. TP4 with --moe-dense-tp-size 1)."""
 

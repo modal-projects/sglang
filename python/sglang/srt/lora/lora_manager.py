@@ -387,15 +387,17 @@ class LoRAManager:
             torch.cuda.device(self.device),
             torch.cuda.stream(torch.cuda.Stream(device=self.device)),
         ):
-            self.memory_pool.load_lora_weight_to_buffer(
-                uid,
-                slot,
-                adapter,
-                self.lora_modules,
-                self.embed_tokens_module,
-                self.lm_head_module,
-            )
-            torch.cuda.current_stream().synchronize()
+            try:
+                self.memory_pool.load_lora_weight_to_buffer(
+                    uid,
+                    slot,
+                    adapter,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            finally:
+                torch.cuda.current_stream().synchronize()
 
     def _validate_replicated_q_targets(self, target_modules):
         # q_proj adapter targets normalize to qkv_proj.

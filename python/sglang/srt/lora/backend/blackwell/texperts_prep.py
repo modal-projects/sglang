@@ -1,5 +1,5 @@
-"""Routing, activation quantization, gate/up LoRA shrink and finalize around the fused
-routed-expert kernels (texperts). All buffers are preallocated: every launch is CUDA-graph safe.
+"""Routing, activation quantization and finalize around the fused routed-expert kernels
+(texperts; the gate/up LoRA-A shrink runs inside them). All buffers are preallocated: every launch is CUDA-graph safe.
 
 Rows are routed (token, k) pairs owned by this rank, grouped by local expert into 16-row
 blocks: expert e's rows start at 16 * (number of blocks of experts < e).
@@ -10,7 +10,6 @@ import triton
 import triton.language as tl
 
 NT = tl.constexpr(16)
-_SKIP_PAD = __import__("os").environ.get("SGLANG_TEXPERTS_QUANT_SKIP_PAD", "1") != "0"
 
 
 # BLOCK takes a few fixed sizes (Prep.route_block), and Prep.precompile_route compiles each
@@ -108,10 +107,7 @@ def _route_kernel(topk_ids, topk_w, slots, scratch, row_of, rtok, rslot, rw, blk
 
 @triton.jit
 def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.constexpr,
-                  N_SF_KT: tl.constexpr, R: tl.constexpr, BF: tl.constexpr,
-                  MX: tl.constexpr = True, SHARED: tl.constexpr = False, blk_expert=None,
-                  blk_mask=None, rslot=None, a_s=None, a_ss=0, z=None, E_SH=0,
-                  SL: tl.constexpr = 8, SKIP_PAD: tl.constexpr = True):
+                  N_SF_KT: tl.constexpr, R: tl.constexpr, BF: tl.constexpr):
     """Block b (16 rows), K-part p: MXFP8 of the rows' x[:, p*PART : +PART] into xq / x_sf
     (128x4 swizzle, one 128-row group per block); part 0 also clears the rows' down-LoRA Z.
     Padding rows (no token) are not written: they only feed MMA columns and LoRA rows that are
@@ -127,31 +123,12 @@ def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.c
     cols = p * PART + tl.arange(0, PART)
     xv = tl.load(x + tok.to(tl.int64)[:, None] * H + cols[None, :], mask=(tok >= 0)[:, None],
                  other=0.0)
-    if SKIP_PAD:
-        live = (tok >= 0)[:, None]
-    else:
-        live = ((tok >= 0) | (tok < 0))[:, None]
+    live = (tok >= 0)[:, None]
     if BF:  # the permuted BF16 rows (folded LoRA-A shrink; the BF16-base GEMM input)
         tl.store(x_bf + rows.to(tl.int64)[:, None] * H + cols[None, :], xv, mask=live)
     if p == 0:
         jd = tl.arange(0, R)
         tl.store(zd + rows[:, None] * R + jd[None, :], tl.zeros((16, R), tl.int64))
-    if SHARED:  # folded shared expert: its gate/up LoRA-A (dense buffer, raw) for this part
-        if tl.load(blk_expert + blk) == E_SH:
-            msk = tl.load(blk_mask + blk)
-            sl = tl.load(rslot + rows)
-            j = tl.arange(0, 2 * R)
-            for si in tl.static_range(SL):
-                if ((msk >> si) & 1) != 0:
-                    a = tl.load(a_s + si * a_ss + j[:, None] * H + cols[None, :])
-                    zz = tl.dot(xv, tl.trans(a))
-                    zz = tl.where(zz == zz, zz, 0.0)  # past-rank garbage: masked later
-                    zz = tl.minimum(tl.maximum(zz, -1.0e9), 1.0e9)
-                    zi = tl.floor(zz * 4294967296.0 + 0.5).to(tl.int64)
-                    tl.atomic_add(z + rows[:, None] * (2 * R) + j[None, :], zi,
-                                  mask=(sl == si)[:, None], sem="relaxed")
-    if not MX:
-        return
     g = tl.reshape(xv.to(tl.float32), (16, PART // 32, 32))
     amax = tl.max(tl.abs(g), axis=2)
     sfv = amax * (1.0 / 448.0)
@@ -172,47 +149,11 @@ def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.c
 
 
 @triton.jit
-def _shrink_kernel(x, rtok, rslot, blk_expert, blk_mask, nblk, a_gu, a_ss, a_es, z,
-                   H: tl.constexpr, KS: tl.constexpr, BK: tl.constexpr, R2: tl.constexpr,
-                   E_SH: tl.constexpr = -1):
-    """(block b, slot s, K quarter q): z[row] += A_gu[s, expert] (2R x H/KS) . x[row] for the
-    block's rows on slot s (tensor-core dots over BK chunks; Q32.32 atomics, exact and
-    order independent). Programs whose slot is not in the block exit at once."""
-    blk = tl.program_id(0)
-    s = tl.program_id(1)
-    q = tl.program_id(2)
-    if blk >= tl.load(nblk):
-        return
-    if ((tl.load(blk_mask + blk) >> s) & 1) == 0:
-        return
-    n = tl.arange(0, 16)
-    rows = blk * 16 + n
-    tok = tl.load(rtok + rows)
-    sl = tl.load(rslot + rows)
-    mine = (sl == s) & (tok >= 0)
-    ex_id = tl.load(blk_expert + blk)
-    if ex_id == E_SH:  # the folded shared expert's Z comes from the quant kernel
-        return
-    base = s.to(tl.int64) * a_ss + ex_id.to(tl.int64) * a_es
-    j = tl.arange(0, R2)
-    acc = tl.zeros((16, R2), tl.float32)
-    k0 = q * (H // KS)
-    for kk in range(0, H // KS, BK):
-        cols = k0 + kk + tl.arange(0, BK)
-        xv = tl.load(x + tok.to(tl.int64)[:, None] * H + cols[None, :], mask=mine[:, None],
-                     other=0.0)
-        a = tl.load(a_gu + base + j[:, None] * H + cols[None, :])
-        acc += tl.dot(xv, tl.trans(a))
-    zi = tl.floor(acc * 4294967296.0 + 0.5).to(tl.int64)
-    tl.atomic_add(z + rows[:, None] * R2 + j[None, :], zi, mask=mine[:, None], sem="relaxed")
-
-
-@triton.jit
 def _finalize_kernel(y, row_of, topk_w, out, TOPK: tl.constexpr, KP: tl.constexpr,
-                     H: tl.constexpr, BH: tl.constexpr, SHARED: tl.constexpr = False, x=None,
-                     gw=None, n_routes=0, GATED: tl.constexpr = True, rscale=1.0):
-    """out[t] = sum_k w_tk y[row(t, k)] (+ the folded shared expert's row, sigmoid(x . g)
-    gated or not): every route row of the token in one [KP, BH] gather."""
+                     H: tl.constexpr, BH: tl.constexpr, SHARED: tl.constexpr = False,
+                     n_routes=0, rscale=1.0):
+    """out[t] = sum_k w_tk y[row(t, k)] (+ the folded shared expert's row): every route row
+    of the token in one [KP, BH] gather."""
     t = tl.program_id(0)
     hb = tl.program_id(1)
     cols = hb * BH + tl.arange(0, BH)
@@ -225,15 +166,9 @@ def _finalize_kernel(y, row_of, topk_w, out, TOPK: tl.constexpr, KP: tl.constexp
     v = tl.load(y + rows.to(tl.int64)[:, None] * H + cols[None, :],
                 mask=ok[:, None] & cm[None, :], other=0.0)
     acc = tl.sum(ws[:, None] * v.to(tl.float32), 0) * rscale  # routed scaling factor
-    if SHARED:  # folded shared expert: (sigmoid(x . g) *) its row
+    if SHARED:  # folded shared expert: its row
         r = tl.load(row_of + n_routes + t)
-        vs = tl.load(y + r.to(tl.int64) * H + cols, mask=cm, other=0.0).to(tl.float32)
-        if GATED:
-            hh = tl.arange(0, H)
-            gx = tl.sum(tl.load(x + t.to(tl.int64) * H + hh).to(tl.float32) *
-                        tl.load(gw + hh).to(tl.float32), 0)
-            vs = vs * tl.sigmoid(gx)
-        acc += vs
+        acc += tl.load(y + r.to(tl.int64) * H + cols, mask=cm, other=0.0).to(tl.float32)
     tl.store(out + t.to(tl.int64) * H + cols, acc.to(out.dtype.element_ty), mask=cm)
 
 
@@ -246,11 +181,11 @@ class Prep:
     """Buffers and launches for one (max tokens, top_k, local experts, H, I) configuration."""
 
     def __init__(self, tokens, top_k, n_local, local_off, H, I, n_slots, rank, device,
-                 part=512, shrink_warps=4, mx=True, shared=False):
+                 part=512, mx=True, shared=False):
         self.T, self.K, self.E, self.off = tokens, top_k, n_local, local_off
         self.H, self.I, self.R, self.n_slots = H, I, rank, n_slots
         self.shared = shared
-        self.route_warps = int(__import__("os").environ.get("SGLANG_TEXPERTS_ROUTE_WARPS", "8"))
+        self.route_warps = 8
         # route BLOCK sizes: decode-sized (<= 42 tokens at top-6), larger decode / small
         # prefill, and the whole capacity; each compiled once (precompile_route)
         top = max(16, triton.next_power_of_2(tokens * top_k + (tokens if shared else 0)))
@@ -260,7 +195,6 @@ class Prep:
         self.rows = self.MB * 16
         self.part = min(part, H)
         self.mx = mx
-        self.shrink_warps = shrink_warps
         self.n_parts = H // self.part
         dev = device
         i32 = dict(dtype=torch.int32, device=dev)
@@ -283,15 +217,11 @@ class Prep:
         self.y = torch.zeros(self.rows, H, dtype=torch.bfloat16, device=dev)
         # folded gate/up shrink (texperts fold_a): BF16 rows, FP32 Z, A-item tables
         self.x_bf = torch.zeros(self.rows, H, dtype=torch.bfloat16, device=dev)
-        self.zf = torch.zeros(self.rows, 1, 2 * rank, dtype=torch.float32, device=dev)
         self.a_blk = torch.zeros(self.MB * 4, **i32)
         self.a_s = torch.zeros(self.MB * 8, **i32)
         self.n_a = torch.zeros(1, **i32)
         self.npairs = torch.zeros(self.MB, **i32)
         self.zcnt = torch.zeros(self.MB, **i32)
-        # split-K workspace / counters of the texperts kernels (sequential on one stream)
-        self.ws = torch.zeros(2048 * 128 * 16, dtype=torch.float32, device=dev)
-        self.cnt = torch.zeros(self.MB * max(2 * I, H) // 128, dtype=torch.int32, device=dev)
 
     def route_block(self, routes):
         return next(b for b in self.route_blocks if b >= routes)
@@ -330,33 +260,18 @@ class Prep:
             n_tok=n_tok, E_TOT=self.E + (1 if self.shared else 0), zd=self.zd,
             ZERO_ZD=zero_zd, num_warps=self.route_warps)
 
-    def quant_shrink(self, x, a_gu, shrink=True, ks=4, bk=256, keep_bf=False, a_shared=None):
-        """x [T, H] BF16; a_gu [slots, E or 1 (shared-outer), 2R, H] BF16 (gate rows first),
-        each [2R, H] matrix contiguous."""
+    def quant(self, x):
+        """x [T, H] BF16 -> the routed rows' MXFP8 (xq, x_sf) and BF16 copies (x_bf, the
+        in-kernel gate/up LoRA-A shrink's input); clears the rows' down-LoRA Z."""
+        assert self.mx
         _quant_kernel[(self.MB, self.n_parts)](
             x, self.rtok, self.nblk, self.xq, self.x_sf, self.zd, self.x_bf, H=self.H,
-            PART=self.part, N_SF_KT=(self.H // 32 + 3) // 4, R=self.R, BF=keep_bf or not self.mx,
-            MX=self.mx, SHARED=a_shared is not None, blk_expert=self.blk_expert,
-            blk_mask=self.mask_gu, rslot=self.rslot,
-            a_s=a_shared if a_shared is not None else self.x_bf,
-            a_ss=a_shared.stride(0) if a_shared is not None else 0, z=self.z, E_SH=self.E,
-            SL=self.n_slots, SKIP_PAD=_SKIP_PAD)
-        if shrink:
-            assert a_gu.stride(3) == 1 and a_gu.stride(2) == a_gu.shape[3]
-            a_es = a_gu.stride(1) if a_gu.shape[1] > 1 else 0
-            _shrink_kernel[(self.MB, self.n_slots, ks)](
-                x, self.rtok, self.rslot, self.blk_expert, self.mask_gu, self.nblk, a_gu,
-                a_gu.stride(0), a_es, self.z, H=self.H, KS=ks, BK=bk, R2=2 * self.R,
-                E_SH=self.E if a_shared is not None else -1, num_warps=self.shrink_warps)
+            PART=self.part, N_SF_KT=(self.H // 32 + 3) // 4, R=self.R, BF=True)
 
-    def finalize(self, n_tokens, topk_w, out, x=None, gate_w=None, shared_plain=False,
-                 rscale=1.0):
-        """out[t] = sum_k w_tk y[row(t, k)] (+ sigmoid(x_t . gate_w) or 1 times the shared
-        expert's row when it is folded)."""
+    def finalize(self, n_tokens, topk_w, out, shared=False, rscale=1.0):
+        """out[t] = sum_k w_tk y[row(t, k)] (+ the folded shared expert's row)."""
         BH = 1024
-        sh = gate_w is not None or shared_plain
         _finalize_kernel[(n_tokens, triton.cdiv(self.H, BH))](
             self.y, self.row_of, topk_w.reshape(-1), out, TOPK=self.K,
-            KP=max(2, triton.next_power_of_2(self.K)), H=self.H, BH=BH,
-            SHARED=sh, x=x if x is not None else out, gw=gate_w if gate_w is not None else out,
-            n_routes=n_tokens * self.K, GATED=gate_w is not None, rscale=float(rscale))
+            KP=max(2, triton.next_power_of_2(self.K)), H=self.H, BH=BH, SHARED=shared,
+            n_routes=n_tokens * self.K, rscale=float(rscale))

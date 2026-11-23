@@ -1392,14 +1392,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         from sglang.srt.lora.backend.blackwell import experts as bw_experts
 
         shared_block = bw_experts.SHARED_BLOCK[0]
-        if (
-            shared_block is not None
-            and fused is None
-            # the TRT-LLM / Marlin dispatchers handle a handed-over shared expert themselves
-            and not self._lora_runner_backend.is_experimental_sgl_trtllm()
-            and not self._lora_runner_backend.is_experimental_sgl_marlin()
-        ):
-            # the block handed us its shared expert but the fused path declined this batch
+        if shared_block is not None and fused is None:
+            # GLM's MoE block handed us its shared expert but the fused path declined this batch
             final_hidden_states = final_hidden_states + shared_block._forward_shared_experts(
                 hidden_states
             )

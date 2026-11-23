@@ -659,19 +659,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     lora_info,
     base_layer,
 ) -> StandardCombineInput:
-    """--lora-backend blackwell may fold the MoE block's shared expert into the routed
-    kernels (SHARED_BLOCK); when the routed path below does not take it, it runs here."""
-    from sglang.srt.lora.backend.blackwell import experts as bw_experts
-
-    block = bw_experts.SHARED_BLOCK[0]
-    bw_experts.SHARED_USED[0] = False
-    out = _mxfp4_lora_routed(
+    return _mxfp4_lora_routed(
         dispatch_output, quant_info, runner_config, lora_info, base_layer
     )
-    if block is not None and not bw_experts.SHARED_USED[0]:
-        shared = block._forward_shared_experts(dispatch_output.hidden_states)
-        out.hidden_states.add_(shared)
-    return out
 
 
 _DECOMPOSED_WARMED: set = set()

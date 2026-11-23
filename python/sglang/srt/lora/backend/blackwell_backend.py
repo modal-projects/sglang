@@ -198,10 +198,6 @@ class _SplitState:
 
 class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
     name = "blackwell"
-    # A model may set ``layer.mxfp8_hint = (x, x_q, x_sf)`` before calling an MXFP8 LoRA
-    # linear on x: the MXFP8 quant of x (FlashInfer's 128x4 scale layout) its producer already
-    # made (DeepSeek-V4.1's fused q_norm). _fused uses it instead of quantizing x again.
-    takes_mxfp8_hint = os.environ.get("SGLANG_BLACKWELL_LORA_MX_HINT", "1") != "0"
 
     def __init__(self, max_loras_per_batch, device, server_args):
         super().__init__(max_loras_per_batch, device, server_args)
@@ -281,11 +277,6 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
 
     def _fused(self, layer, x, lora_a, lora_b, offsets):
         info = self.batch_info
-        hint = getattr(layer, "mxfp8_hint", None)
-        if hint is not None:
-            layer.mxfp8_hint = None
-            if hint[0] is not x:
-                hint = None
         T = self._decode_tokens(x)
         if T is None:
             return None
@@ -334,11 +325,7 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         if mx:
             from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-            if hint is not None and n_rows == T:
-                x_q, x_sf = hint[1], hint[2]
-            else:
-                x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True,
-                                                      alignment=32)
+            x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
             extra = dict(w_sf=w_sf, x_q=x_q, x_sf=x_sf)
         kern(w, x, lora_a, self._b_mirror(layer, lora_b), slots,
              info.lora_ranks.to(torch.int32), info.scalings.float(), y, **extra)
@@ -403,7 +390,7 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         return st
 
     # A model's MLP may hand both projections to forward_mlp_mx (DeepSeek-V4.1's shared expert)
-    takes_mlp_mx = os.environ.get("SGLANG_BLACKWELL_LORA_MLP_MX", "1") != "0"
+    takes_mlp_mx = True
 
     def forward_mlp_mx(self, gu, dn, x, limit):
         """down(clamped_swiglu(gate_up(x))) for an MLP whose MXFP8 gate/up slices and down K
@@ -412,7 +399,7 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         the down launch. None when the layers or the batch do not fit (the caller runs the
         unfused path)."""
         T = self._decode_tokens(x)
-        if T is None or not self.takes_mlp_mx:
+        if T is None:
             return None
         bg, bd = gu.base_layer, dn.base_layer
         if not (_mxfp8_base(bg) and _mxfp8_base(bd)):

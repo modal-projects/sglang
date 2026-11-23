@@ -619,22 +619,19 @@ class MoEGate(nn.Module):
 
 
 def _blackwell_shared_fold(block, hidden_states) -> bool:
-    """--lora-backend blackwell with routed LoRA on the TRT-LLM MXFP4 experts: hand the
-    TP shared expert to the fused routed path (decode batches)."""
+    """--lora-backend blackwell with routed LoRA on GLM-5.3 Flash's FP8 block-scaled experts
+    (Triton runner): hand the TP shared expert to the fused routed path (decode batches);
+    FusedMoEWithLoRA adds it itself when the fused path declines a batch."""
     experts = getattr(block, "experts", None)
     runner = getattr(experts, "_lora_runner_backend", None)
-    if runner is None:
+    if runner is None or getattr(experts, "_mxfp4_lora", False):
         return False
-    mxfp4 = getattr(experts, "_mxfp4_lora", False)
-    # GLM-5.3 Flash: FP8 block-scaled experts on the Triton runner (FusedMoEWithLoRA's fused
-    # blackwell path, which adds the shared expert itself when it declines a batch)
     fp8b = (
-        not mxfp4
-        and runner.is_triton()
+        runner.is_triton()
         and getattr(experts.base_layer, "w13_weight", None) is not None
         and experts.base_layer.w13_weight.dtype == torch.float8_e4m3fn
     )
-    if not (mxfp4 or fp8b):
+    if not fp8b:
         return False
     from sglang.srt.lora.backend.blackwell import experts as bw_experts
     from sglang.srt.runtime_context import LoRABatchLayout
@@ -645,9 +642,7 @@ def _blackwell_shared_fold(block, hidden_states) -> bool:
         experts.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None
     ):
         return False
-    if fp8b:
-        return bw_experts.shared_fold_ok_fp8b(block, hidden_states)
-    return bw_experts.shared_fold_ok_mx(block, hidden_states)
+    return bw_experts.shared_fold_ok_fp8b(block, hidden_states)
 
 
 class MoEOutput(NamedTuple):

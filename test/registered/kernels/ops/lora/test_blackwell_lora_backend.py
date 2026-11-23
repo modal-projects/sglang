@@ -157,31 +157,6 @@ def _mx_layer(N, K, slices, seed, **base_kw):
 
 
 @pytest.mark.parametrize("T", [1, 8, 100, 128])
-def test_mxfp8_quant_hint(T):
-    """DeepSeek-V4.1's fused q_norm hands wq_b its MXFP8 quant (``layer.mxfp8_hint``): the
-    result equals quantizing the BF16 row in the backend, and the hint is consumed."""
-    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
-    from sglang.srt.lora.backend import blackwell_backend as bb
-
-    bb._mxfp8_base = lambda layer: True
-    layer = _mx_layer(4096, 1280, 1, 21)
-    g = torch.Generator(device=DEVICE).manual_seed(22)
-    q = torch.randn(T, 1280, generator=g, device=DEVICE).bfloat16() * 3
-    gamma = (1 + 0.1 * torch.randn(1280, generator=g, device=DEVICE)).bfloat16()
-    y, yq, ys = rmsnorm_mxfp8(q, gamma, 1e-6)
-    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
-    be = _backend(T, slots)
-    plain = be._fused(layer, y, layer.lora_a, layer.lora_b, layer.lora_offsets)
-    layer.mxfp8_hint = (y, yq, ys)
-    hinted = be._fused(layer, y, layer.lora_a, layer.lora_b, layer.lora_offsets)
-    assert layer.mxfp8_hint is None
-    assert torch.equal(plain, hinted)
-    layer.mxfp8_hint = (y.clone(), yq, ys)  # another tensor: ignored
-    assert torch.equal(plain, be._fused(layer, y, layer.lora_a, layer.lora_b,
-                                        layer.lora_offsets))
-
-
-@pytest.mark.parametrize("T", [1, 8, 100, 128])
 def test_mlp_mx_shared_expert(T):
     """DeepSeek-V4.1's TP8 shared expert (gate/up slices of 288, down K 288, swiglu limit 10)
     through forward_mlp_mx (gate/up launch, fused activation + K pad + MXFP8, down launch)

@@ -34,7 +34,7 @@ from .tlinear import (
 )
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
-from .tlinear import st_global_v2, st_global_v4f
+from .tlinear import st_global_v2
 from .ptx import atomic_add_acq_rel, wait_count
 
 
@@ -134,10 +134,9 @@ class TExperts:
 
     def __init__(self, n_experts, n_rows, k, max_blocks, base="mxfp4", n_slots=8, w_slice=64,
                  n_parts=1, epi="raw", stages=None, clamp=10.0, fp4_tx="gmem", sms=148,
-                 zfix=False, ktile=128, ks_max=1, units_cap=2048, ks_force=0, fold_a=False,
-                 a_experts=0, zd_fix=None, a_ks=4, pair=False, shared_e=-1, a2_experts=None,
-                 lora32=False, m_tiles_sh=None, k_tiles_sh=None, dyn=None, xg=None,
-                 order="m", grid_cap=0, a_mode="fused", gu32=None):
+                 zfix=False, ktile=128, fold_a=False, a_experts=0, zd_fix=None, a_ks=4,
+                 pair=False, shared_e=-1, a2_experts=None, lora32=False, m_tiles_sh=None,
+                 k_tiles_sh=None, order="m", grid_cap=0, gu32=True):
         assert base in ("mxfp4", "mxfp8", "bf16")
         self.mx = base != "bf16"  # block-scaled MMA with MXFP8 activations
         # mxfp8: FP8 weights with UE8M0 scales (per row, per 32 K), read in place; the gate/up
@@ -161,11 +160,8 @@ class TExperts:
         # row's own B_gate or B_up row), run as a 32-column MMA against [Z_gate; Z_up] into a
         # separate accumulator; the epilogue adds each row's half. The 64-wide tile it
         # replaces (gate32 | up32 for every row) was half zeros.
-        import os as _os0
-        if gu32 is None:
-            gu32 = _os0.environ.get("SGLANG_TEXPERTS_GU32", "1") != "0"
         self.gu32 = bool(gu32 and epi == "swiglu" and base == "mxfp4" and w_slice == 64
-                         and not lora32 and not pair and ks_max == 1 and ks_force == 0)
+                         and not lora32 and not pair)
         self.kl = 32 if (lora32 or self.gu32) else 64
         self.spt = 1 if self.gu32 else self.kl // w_slice  # slots per LoRA K-tile
         self.lora_tiles = (n_slots + self.spt - 1) // self.spt
@@ -202,9 +198,7 @@ class TExperts:
         self.AP = 2 if (pair and fold_a and base == "bf16") else 1
         # BF16 gate/up: the producer warp gathers the block's activation rows straight from
         # the token-ordered hidden states (cp.async by token index), no permuted copy
-        import os as _os
-        self.xg = (base == "bf16" and fold_a and pair and
-                   _os.environ.get("SGLANG_TEXPERTS_XG", "1") != "0") if xg is None else xg
+        self.xg = base == "bf16" and fold_a and pair
         self.x_tile = NT * self.ke if self.mx else NT * self.kb * 2 * self.AP
         # bytes of one Zblk tile (gu32: [2 NT rows (gate rows, then up rows), 32])
         self.ztile = NT * self.kl * 2 * (2 if self.gu32 else 1)
@@ -229,34 +223,17 @@ class TExperts:
         self.tiler_sfb = (128, 128, self.ke)
         # persistent: one CTA per SM walks items j = bid, bid + grid, ... over
         # n_blocks * m_tiles (block = j % n_blocks, row tile = j // n_blocks)
-        import os as _os2
         # work order: "m" = row tile major (a wave spans many experts' same tile), "e" = expert
-        # (block) major, consecutive units are consecutive row tiles of one block
-        # (env overrides for experiments). Expert-major on fewer CTAs than SMs, as SGLang's
-        # cutedsl grouped GEMM does, streams the BF16 experts 2-5% faster than row-tile major.
-        self.order = _os2.environ.get("SGLANG_TEXPERTS_ORDER", order)
-        # fold_a work split: "fused" (A-items and GEMM units in this kernel), "only" (just the
-        # A-items: a small concurrent kernel), "external" (GEMM units only; each block's LoRA
-        # tiles still wait for its A-items' release counter, written by the "only" kernel)
-        assert a_mode in ("fused", "only", "external") and (a_mode == "fused" or fold_a)
-        self.a_mode = a_mode
-        cap = int(_os2.environ.get("SGLANG_TEXPERTS_GRID", "0")) or grid_cap
-        self.grid = min(cap or sms, max_blocks * self.m_tiles)
-        # dynamic tile scheduler: CTAs take their next unit from a global counter (two int32
-        # at the end of cnt, one pair per kernel kind, reset by the last CTA to finish)
-        import os
-        self.dyn = (os.environ.get("SGLANG_TEXPERTS_DYN", "0") != "0") if dyn is None else dyn
-        self.sched_id = 1 if epi == "down" else 0
+        # (block) major, consecutive units are consecutive row tiles of one block.
+        # Expert-major on fewer CTAs than SMs, as SGLang's cutedsl grouped GEMM does, streams
+        # the BF16 experts 2-5% faster than row-tile major.
+        self.order = order
+        self.grid = min(grid_cap or sms, max_blocks * self.m_tiles)
         self.m_tiles_sh = self.m_tiles if m_tiles_sh is None else m_tiles_sh
         self.k_tiles_sh = self.k_tiles if k_tiles_sh is None else k_tiles_sh
         self.rows_sh = self.m_tiles_sh * 128 * self.NA
         self.K_sh = self.k_tiles_sh * self.ke
         self.mx_sh = self.mx and shared_e >= 0  # FP8 shared expert next to FP4 routed ones
-        # dynamic split-K: an item's base K-tiles may be shared by ks CTAs (chosen on the device
-        # from the item count to fill the last wave); the last to finish sums the FP32
-        # partials (fixed order) and runs the epilogue. Workspace: units_cap x [128, NT] FP32.
-        self.ks_max = ks_max
-        self.ks_force = ks_force
         # fold_a (gate/up): the LoRA-A shrink runs in this kernel as "A-items" ahead of the
         # GEMM items. A-item (block, slot pair): Z^T [2 x 64, 16 rows] = A_gu[slot, expert] .
         # x^T over K (BF16, the same tcgen05 pipeline, two 64-row TMA boxes per A tile). Each
@@ -269,14 +246,11 @@ class TExperts:
         assert (k // self.kb) % a_ks == 0
         self.a_ktiles = k // self.kb // a_ks // self.AP  # stages per A-item
         assert not fold_a or a_ks == 1 or zfix, "split A-items accumulate fixed-point Z"
-        self.units_cap = units_cap
 
     def __repr__(self):
         return (f"TExperts_{('mx8' if self.a8 else 'mx4') if self.mx else 'bf'}_E{self.E}_N{self.N}_K{self.K}"
                 f"_B{self.max_blocks}_W{self.W}_P{self.n_parts}_{self.epi}_st{self.stages}"
-                f"{'_dyn' if self.dyn else ''}{'_xg' if self.xg else ''}"
-                f"{'_oe' if self.order == 'e' else ''}_g{self.grid}"
-                f"{'' if self.a_mode == 'fused' else '_a' + self.a_mode}"
+                f"{'_xg' if self.xg else ''}{'_oe' if self.order == 'e' else ''}_g{self.grid}"
                 f"{'_gu32' if self.gu32 else ''}")
 
     @cute.jit
@@ -284,8 +258,7 @@ class TExperts:
                  bm: cute.Tensor, z: cute.Tensor, rslot: cute.Tensor, blk_expert: cute.Tensor,
                  blk_mask: cute.Tensor, ranks: cute.Tensor, scales: cute.Tensor,
                  out: cute.Tensor, lut: cute.Tensor, a2: cute.Tensor, out_q: cute.Tensor,
-                 out_sf: cute.Tensor, zd: cute.Tensor, nblk: cute.Tensor, ws: cute.Tensor,
-                 cnt: cute.Tensor, x_bf: cute.Tensor, a_gu: cute.Tensor, a_blk: cute.Tensor,
+                 out_sf: cute.Tensor, zd: cute.Tensor, nblk: cute.Tensor, x_bf: cute.Tensor, a_gu: cute.Tensor, a_blk: cute.Tensor,
                  a_s: cute.Tensor, n_a: cute.Tensor, npairs: cute.Tensor, zcnt: cute.Tensor,
                  a2s: cute.Tensor, a_gu_s: cute.Tensor, w_sh: cute.Tensor, sf_sh: cute.Tensor,
                  rtok: cute.Tensor, stream):
@@ -352,7 +325,6 @@ class TExperts:
             tma_sfb, tsfb = cute.nvgpu.make_tiled_tma_atom_B(
                 op_sfb, sfb, sl(sSFB_l), self.tiler_sfb, mma_sfb, one4,
                 internal_type=cutlass.Int16)
-            tma_ws, tws = tma_bm, tbm  # (BF16-only shared weights; unused here)
             mma8 = mma
             tma_as, tas, tma_sfas, tsfas = tma_a, ta, tma_sfa, tsfa
             if cutlass.const_expr(self.mx_sh):
@@ -388,10 +360,6 @@ class TExperts:
                                                          mma16, one4)
             tma_b, tb = cute.nvgpu.make_tiled_tma_atom_B(op_b, xb, sl(sB16_l), self.tiler16,
                                                          mma16, one4)
-            # the folded shared expert's own weights (never re-homed: graphs captured on the
-            # stock path keep pointing at the model's buffers)
-            tma_ws, tws = cute.nvgpu.make_tiled_tma_atom_A(op_a, w_sh, sl(sA16_l),
-                                                           self.tiler16, mma16, one4)
             tma_sfa, tsfa, tma_sfb, tsfb = tma_a, ta, tma_b, tb
             self.w_bytes = cute.size_in_bytes(bf, sl(sA16_l))
             self.x_bytes = cute.size_in_bytes(bf, sl(sB16_l))
@@ -448,7 +416,6 @@ class TExperts:
             sSFB: cute.struct.Align[cute.struct.MemRange[e8, sfb_cos], 128]
             sZd: cute.struct.Align[cute.struct.MemRange[cutlass.Int8, 2 * self.zbuf], 1024]
             tslot: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, NT], 16]
-            flag: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
             uq: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, QD], 16]
             uq_full: cute.struct.MemRange[cutlass.Int64, QD]
             uq_empty: cute.struct.MemRange[cutlass.Int64, QD]
@@ -456,8 +423,8 @@ class TExperts:
         self.storage = Storage
         self.kernel(mma, mma_sfb, mma16, tma_a, ta, tma_b, tb, tma_sfa, tsfa, tma_sfb, tsfb,
                     tma_bm, tbm, z, rslot, blk_expert, blk_mask, ranks, scales, out,
-                    lut, a2, out_q, out_sf, zd, nblk, ws, cnt, tma_ah, tah, tma_xb, txb, half_l,
-                    a_blk, a_s, n_a, npairs, zcnt, a2s, tma_ahs, tahs, tma_ws, tws, mma8, tma_as,
+                    lut, a2, out_q, out_sf, zd, nblk, tma_ah, tah, tma_xb, txb, half_l,
+                    a_blk, a_s, n_a, npairs, zcnt, a2s, tma_ahs, tahs, mma8, tma_as,
                     tas, tma_sfas, tsfas, x_bf, rtok, tma_wh, twh, half8_l, sA_l, sB_l, sSFA_l,
                     sSFB_l, sA16_l, sB16_l, sAL_l, sZL_l, mma32).launch(
             grid=(self.grid, 1, 1), block=(256, 1, 1), cluster=(1, 1, 1),
@@ -471,12 +438,10 @@ class TExperts:
                rslot: cute.Tensor, blk_expert: cute.Tensor, blk_mask: cute.Tensor,
                ranks: cute.Tensor, scales: cute.Tensor, out: cute.Tensor,
                lut: cute.Tensor, a2: cute.Tensor, out_q: cute.Tensor, out_sf: cute.Tensor,
-               zd: cute.Tensor, nblk: cute.Tensor, ws: cute.Tensor, cnt: cute.Tensor,
-               tma_ah: cute.CopyAtom, tah: cute.Tensor, tma_xb: cute.CopyAtom, txb: cute.Tensor,
+               zd: cute.Tensor, nblk: cute.Tensor, tma_ah: cute.CopyAtom, tah: cute.Tensor, tma_xb: cute.CopyAtom, txb: cute.Tensor,
                half_l: cute.ComposedLayout, a_blk: cute.Tensor, a_s: cute.Tensor,
                n_a: cute.Tensor, npairs: cute.Tensor, zcnt: cute.Tensor, a2s: cute.Tensor,
-               tma_ahs: cute.CopyAtom, tahs: cute.Tensor, tma_ws: cute.CopyAtom,
-               tws: cute.Tensor, mma8: cute.TiledMma, tma_as: cute.CopyAtom, tas: cute.Tensor,
+               tma_ahs: cute.CopyAtom, tahs: cute.Tensor, mma8: cute.TiledMma, tma_as: cute.CopyAtom, tas: cute.Tensor,
                tma_sfas: cute.CopyAtom, tsfas: cute.Tensor, xsrc: cute.Tensor,
                rtok: cute.Tensor, tma_wh: cute.CopyAtom, twh: cute.Tensor, half8_l,
                sA_l: cute.ComposedLayout,
@@ -548,13 +513,10 @@ class TExperts:
             nbs = nblk[1]
         n_items = (nb - nbs) * self.m_tiles + nbs * self.m_tiles_sh
         G = self.grid
-        ks = self.choose_ks(n_items)
         na = cutlass.Int32(0)
-        if cutlass.const_expr(self.fold_a and self.a_mode != "external"):
+        if cutlass.const_expr(self.fold_a):
             na = n_a[0] * self.a_ks
-        n_units = na + n_items * ks
-        if cutlass.const_expr(self.a_mode == "only"):
-            n_units = na
+        n_units = na + n_items
 
         if warp == 0:
             one = cute.make_layout(1)
@@ -563,21 +525,16 @@ class TExperts:
             c = cutlass.Int32(0)  # ring position, continuous across items
             lane = tidx % 32
             sb_u32 = cutlass.Int32(st.sB.data_ptr().toint())
-            sched = cnt.iterator + (cute.size(cnt) - 2 - 2 * self.sched_id)
             qk = cutlass.Int32(0)  # units published to the queue
             cur = cutlass.Int32(n_units)
             if bid < n_units:
                 cur = bid
-            # unit after the next one: fetched one unit early, so the atomic's latency hides
-            # behind this unit's loads (lane 0 only)
+            # the unit after the next one (lane 0 only)
             pend = cutlass.Int32(n_units)
             if lane == 0:
                 uq[0] = cur
                 cute.arch.mbarrier_arrive(uq_full)
-                if cutlass.const_expr(self.dyn):
-                    pend = G + atomic_add_acq_rel(sched, cutlass.Int32(1))
-                else:
-                    pend = cur + G
+                pend = cur + G
             qk = qk + 1
             while cur < n_units:
               # publish the next unit before loading this one (the epilogue stages its Zblk)
@@ -589,10 +546,7 @@ class TExperts:
                   uq[slot] = nv
                   cute.arch.mbarrier_arrive(uq_full + slot)
                   if nv < n_units:
-                      if cutlass.const_expr(self.dyn):
-                          pend = G + atomic_add_acq_rel(sched, cutlass.Int32(1))
-                      else:
-                          pend = nv + G
+                      pend = nv + G
               cute.arch.sync_warp()
               nxt = uq[slot]
               qk = qk + 1
@@ -603,19 +557,13 @@ class TExperts:
                                lane, sb_u32)
                 c = c + self.a_ktiles
               else:
-                u = uu - na
-                item = u // ks
-                part = u % ks
-                blk, m_tile = self.decode(item, nb, nbs)
+                blk, m_tile = self.decode(uu - na, nb, nbs)
                 expert = blk_expert[blk]
                 mask = blk_mask[blk]
                 tokl = cutlass.Int32(-1)
                 if cutlass.const_expr(self.xg):
                     tokl = rtok[blk * NT + lane // 2]
-                if part != ks - 1:
-                    mask = cutlass.Int32(0)  # LoRA tiles ride on the last K part
-                kt0 = part * self.k_tiles // ks
-                nbase = (part + 1) * self.k_tiles // ks - kt0
+                nbase = cutlass.Int32(self.k_tiles)
                 if cutlass.const_expr(self.mx_sh):
                     if expert == self.shared_e:
                         nbase = cutlass.Int32(self.k_tiles_sh)
@@ -631,20 +579,6 @@ class TExperts:
                 _, tAgA1 = cpasync.tma_partition(tma_a, 0, one, cute.group_modes(sA, 0, 3),
                                                  cute.group_modes(thr.partition_A(gA1), 0, 3))
                 is_sh = cutlass.Int32(0)
-                tAgS = tAgA
-                tAgS1 = tAgA1
-                if cutlass.const_expr(self.shared_e >= 0 and not self.mx):
-                    if expert == self.shared_e:
-                        is_sh = cutlass.Int32(1)
-                    gS = cute.local_tile(tws, cute.slice_(til, (None, 0, None)),
-                                         (m_tile, None, 0))
-                    gS1 = cute.local_tile(tws, cute.slice_(til, (None, 0, None)),
-                                          (m_tile + self.m_tiles * (self.NA - 1), None, 0))
-                    _, tAgS = cpasync.tma_partition(tma_ws, 0, one, cute.group_modes(sA, 0, 3),
-                                                    cute.group_modes(thr.partition_A(gS), 0, 3))
-                    _, tAgS1 = cpasync.tma_partition(tma_ws, 0, one, cute.group_modes(sA, 0, 3),
-                                                     cute.group_modes(thr.partition_A(gS1), 0,
-                                                                      3))
                 tBsB, tBgB = cpasync.tma_partition(tma_b, 0, one, cute.group_modes(sB, 0, 3),
                                                    cute.group_modes(thr.partition_B(gB), 0, 3))
                 bm_tile = row_tile
@@ -694,7 +628,7 @@ class TExperts:
                     tAgSFA8 = cute.filter_zeros(tAgSFA8)
                 j = cutlass.Int32(0)
                 for i in cutlass.range(total, unroll=1):
-                    kt = kt0 + i
+                    kt = i
                     s = c % S
                     if c >= S:
                         cute.arch.mbarrier_wait(empty + s, (c // S - 1) % 2)
@@ -718,18 +652,11 @@ class TExperts:
                                 cute.copy(tma_sfa, tAgSFA[(None, kt)], tAsSFA[(None, s)],
                                           tma_bar_ptr=full + s)
                         else:
-                            if is_sh != 0:
-                                cute.copy(tma_ws, tAgS[(None, kt)], tAsA[(None, s * self.NA)],
+                            self.copy_a(tma_a, tAgA, tAsA, tma_wh, twh, half8_l, st, s, kt,
+                                        expert, m_tile, full)
+                            if cutlass.const_expr(self.pair):
+                                cute.copy(tma_a, tAgA1[(None, kt)], tAsA[(None, s * 2 + 1)],
                                           tma_bar_ptr=full + s)
-                                if cutlass.const_expr(self.pair):
-                                    cute.copy(tma_ws, tAgS1[(None, kt)],
-                                              tAsA[(None, s * 2 + 1)], tma_bar_ptr=full + s)
-                            else:
-                                self.copy_a(tma_a, tAgA, tAsA, tma_wh, twh, half8_l, st, s, kt,
-                                            expert, m_tile, full)
-                                if cutlass.const_expr(self.pair):
-                                    cute.copy(tma_a, tAgA1[(None, kt)], tAsA[(None, s * 2 + 1)],
-                                              tma_bar_ptr=full + s)
                             if cutlass.const_expr(self.mx):
                                 cute.copy(tma_sfa, tAgSFA[(None, kt)], tAsSFA[(None, s)],
                                           tma_bar_ptr=full + s)
@@ -769,7 +696,7 @@ class TExperts:
         elif warp == 1:
             self.mma_warp(mma, mma16, sA, sB, sA16, sB16, sSFA_l, sSFB_l, full, empty,
                           zready, zfree, acc_full, acc_empty, acc_fake, acc16_fake, acc_ptr, st,
-                          sZd, blk_mask, bid, nb, n_units, ks, na, sAL, mma8, nbs, blk_expert,
+                          sZd, blk_mask, bid, nb, n_units, na, sAL, mma8, nbs, blk_expert,
                           uq, uq_full, uq_empty, mma32)
         elif warp >= 4:
             # Zblk of unit it+1 is built before the epilogue of unit it, so the MMA warp never
@@ -777,7 +704,7 @@ class TExperts:
             cute.arch.mbarrier_wait(uq_full, 0)
             uu = uq[0]
             if uu < n_units:
-                self.stage_z(st, z, rslot, ranks, scales, tslot, uu, ks, nb, nbs, zfree, zready,
+                self.stage_z(st, z, rslot, ranks, scales, tslot, uu, nb, nbs, zfree, zready,
                              cutlass.Int32(0), et, na, npairs, zcnt, blk_expert)
             it = cutlass.Int32(0)
             while uu < n_units:
@@ -791,17 +718,14 @@ class TExperts:
                     tAcc = cute.make_tensor(acc_ptr + zb * self.NA * NT, acc_fake.layout)
                     self.epilogue_a(tAcc, z, rslot, a_blk, a_s, zcnt, uu, et, acc_empty + zb)
                     if un < n_units:
-                        self.stage_z(st, z, rslot, ranks, scales, tslot, un, ks, nb, nbs, zfree,
+                        self.stage_z(st, z, rslot, ranks, scales, tslot, un, nb, nbs, zfree,
                                      zready, it + 1, et, na, npairs, zcnt,
                                      blk_expert)
                 else:
-                    u = uu - na
-                    item = u // ks
-                    part = u % ks
-                    blk, m_tile = self.decode(item, nb, nbs)
+                    blk, m_tile = self.decode(uu - na, nb, nbs)
                     expert = blk_expert[blk]
                     if un < n_units:
-                        self.stage_z(st, z, rslot, ranks, scales, tslot, un, ks, nb, nbs, zfree,
+                        self.stage_z(st, z, rslot, ranks, scales, tslot, un, nb, nbs, zfree,
                                      zready, it + 1, et, na, npairs, zcnt,
                                      blk_expert)
                     cute.arch.mbarrier_wait(acc_full + zb, (it // 2) % 2)
@@ -810,24 +734,14 @@ class TExperts:
                                              acc_fake.layout)
                     has_l = cutlass.Int32(0)
                     if cutlass.const_expr(self.gu32):
-                        if part == ks - 1:
-                            has_l = cutlass.Int32(blk_mask[blk] != 0)
+                        has_l = cutlass.Int32(blk_mask[blk] != 0)
                     self.epilogue(st, tAcc, out, lut, a2, out_q, out_sf, zd, rslot, expert,
-                                  blk, m_tile, et, acc_empty + zb, zb, ws, cnt, u, item, part,
-                                  ks, a2s, tAccL, has_l)
+                                  blk, m_tile, et, acc_empty + zb, zb, a2s, tAccL, has_l)
                 if et == 0:
                     cute.arch.mbarrier_arrive(uq_empty + it % QD)
                 it = it + 1
                 uu = un
         cute.arch.barrier()
-        if cutlass.const_expr(self.dyn):
-            if tidx == 0:  # the last CTA to finish resets the counters for the next launch
-                sched = cnt.iterator + (cute.size(cnt) - 2 - 2 * self.sched_id)
-                done = atomic_add_acq_rel(sched + 1, cutlass.Int32(1))
-                if done == G - 1:
-                    sch = cute.make_tensor(sched, cute.make_layout(2))
-                    sch[0] = cutlass.Int32(0)
-                    sch[1] = cutlass.Int32(0)
         if warp == 1:
             cute.arch.relinquish_tmem_alloc_permit()
             cute.arch.dealloc_tmem(acc_ptr, self.tmem_cols)
@@ -835,24 +749,20 @@ class TExperts:
             cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
-    def stage_z(self, st, z, rslot, ranks, scales, tslot, uu, ks, nb, nbs, zfree, zready, it,
-                et,
+    def stage_z(self, st, z, rslot, ranks, scales, tslot, uu, nb, nbs, zfree, zready, it, et,
                 na, npairs, zcnt, blk_expert):
-        """Zblk of unit uu (local index it) into buffer it % 2: only the last K part of a GEMM
-        item runs LoRA tiles (A-items none); every unit signals zready so both sides count
-        phases alike. With fold_a, the block's A-items must have released its Z first."""
+        """Zblk of unit uu (local index it) into buffer it % 2 (A-items have none); every unit
+        signals zready so both sides count phases alike. With fold_a, the block's A-items must
+        have released its Z first."""
         zb = it % 2
         if it >= 2:
             cute.arch.mbarrier_wait(zfree + zb, (it // 2 - 1) % 2)
         if uu >= na:
-            u = uu - na
-            if u % ks == ks - 1:
-                blk, _mt = self.decode(u // ks, nb, nbs)
-                if cutlass.const_expr(self.fold_a):
-                    if et == 0:
-                        wait_count(zcnt.iterator + blk, npairs[blk] * self.a_ks)
-                self.build_zblk(st, z, rslot, ranks, scales, tslot, blk, zb, et,
-                                blk_expert[blk])
+            blk, _mt = self.decode(uu - na, nb, nbs)
+            if cutlass.const_expr(self.fold_a):
+                if et == 0:
+                    wait_count(zcnt.iterator + blk, npairs[blk] * self.a_ks)
+            self.build_zblk(st, z, rslot, ranks, scales, tslot, blk, zb, et, blk_expert[blk])
         if et == 0:
             cute.arch.mbarrier_arrive(zready + zb)
 
@@ -1039,21 +949,6 @@ class TExperts:
                 m_tile = sh * (j // cutlass.max(nbs, 1)) + (1 - sh) * m_tile
         return blk, m_tile
 
-    def choose_ks(self, n_items):
-        """K split minimizing ceil(n_items * ks / grid) / ks (ties: smaller ks), with at least
-        4 base K-tiles per part and the workspace bound."""
-        if self.ks_force:
-            return cutlass.Int32(self.ks_force)
-        ks = cutlass.Int32(1)
-        best = (n_items + self.grid - 1) // self.grid * 12
-        for k in range(2, self.ks_max + 1):
-            if self.k_tiles // k >= 4:
-                cost = (n_items * k + self.grid - 1) // self.grid * (12 // k)
-                take = cutlass.Int32((cost < best) & (n_items * k <= self.units_cap))
-                best = take * cost + (1 - take) * best
-                ks = take * k + (1 - take) * ks
-        return ks
-
     def popc(self, mask):
         n = cutlass.Int32(0)
         for j in range(self.lora_tiles):
@@ -1063,7 +958,7 @@ class TExperts:
     @cute.jit
     def mma_warp(self, mma, mma16, sA, sB, sA16, sB16, sSFA_l, sSFB_l, full, empty, zready,
                  zfree, acc_full, acc_empty, acc_fake, acc16_fake, acc_ptr, st, sZd, blk_mask,
-                 bid, nb, n_units, ks, na, sAL, mma8, nbs, blk_expert, uq, uq_full, uq_empty,
+                 bid, nb, n_units, na, sAL, mma8, nbs, blk_expert, uq, uq_full, uq_empty,
                  mma32):
         S = self.stages
         tCrA = mma.make_fragment_A(sA)
@@ -1109,18 +1004,13 @@ class TExperts:
         while uu < n_units:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(uq_empty + it % QD)
-            u = uu - na
-            item = u // ks
-            part = u % ks
-            blk, _mt = self.decode(item, nb, nbs)
+            blk, _mt = self.decode(uu - na, nb, nbs)
             mask = cutlass.Int32(0)
             nbase = cutlass.Int32(self.a_ktiles)
             is_sh = cutlass.Int32(0)
             if uu >= na:
                 mask = blk_mask[blk]
-                if part != ks - 1:
-                    mask = cutlass.Int32(0)
-                nbase = (part + 1) * self.k_tiles // ks - part * self.k_tiles // ks
+                nbase = cutlass.Int32(self.k_tiles)
                 if cutlass.const_expr(self.mx_sh):
                     if blk_expert[blk] == self.shared_e:
                         nbase = cutlass.Int32(self.k_tiles_sh)
@@ -1304,7 +1194,7 @@ class TExperts:
 
     @cute.jit
     def epilogue(self, st, tAcc, out, lut, a2, out_q, out_sf, zd, rslot, expert, blk, m_tile,
-                 et, acc_empty, zb, ws, cnt, u, item, part, ks, a2s, tAccL, has_l):
+                 et, acc_empty, zb, a2s, tAccL, has_l):
         epi = (128, NT)
         t2r_atom = sm100_utils.get_tmem_load_op(
             (128, NT, 64), utils.LayoutEnum.ROW_MAJOR, cutlass.Float32, cutlass.Float32, epi,
@@ -1343,38 +1233,8 @@ class TExperts:
                         r[i] = r[i] + ru[i]
                     else:
                         r[i] = r[i] + rg[i]
-        last = cutlass.Int32(1)
-        if ks > 1:
-            # park this part's FP32 tile; the last part to arrive sums all parts in order
-            wbase = ws.iterator + (u * 128 + et) * NT
-            for q in cutlass.range_constexpr(NT // 4):
-                st_global_v4f(wbase + 4 * q, [r[4 * q], r[4 * q + 1], r[4 * q + 2],
-                                              r[4 * q + 3]])
-            named_barrier(4, 128)
-            fl = st.flag.get_tensor(cute.make_layout(4))
-            if et == 0:
-                _asm(None, [], "fence.acq_rel.gpu;", "~{memory}")
-                old = atomic_add_acq_rel(cnt.iterator + item, cutlass.Int32(1))
-                fl[0] = old
-            named_barrier(4, 128)
-            last = cutlass.Int32(fl[0] == ks - 1)
-            if last != 0:
-                if et == 0:
-                    cnt[item] = 0  # ready for the next launch
-                acc = cute.make_rmem_tensor(cute.make_layout(NT), cutlass.Float32)
-                acc.fill(0.0)
-                for p in cutlass.range(ks, unroll=1):
-                    pbase = ws.iterator + ((item * ks + p) * 128 + et) * NT
-                    for q in cutlass.range_constexpr(NT // 4):
-                        v4 = load_cg4(pbase + 4 * q)
-                        for e in cutlass.range_constexpr(4):
-                            acc[4 * q + e] = acc[4 * q + e] + v4[e]
-                for i in cutlass.range_constexpr(NT):
-                    r[i] = acc[i]
-            named_barrier(4, 128)  # fl is reused by the next unit
-        if last != 0:
-            self.finish(st, r, cd, out, lut, a2, out_q, out_sf, zd, rslot, expert, blk,
-                        m_tile, et, zb, r1, a2s)
+        self.finish(st, r, cd, out, lut, a2, out_q, out_sf, zd, rslot, expert, blk, m_tile, et,
+                    zb, r1, a2s)
 
     @cute.jit
     def finish(self, st, r, cd, out, lut, a2, out_q, out_sf, zd, rslot, expert, blk, m_tile,
@@ -1516,7 +1376,7 @@ class TExperts:
 
 
 def fold_refs(op, dev, x_bf=None, a_gu=None, a_blk=None, a_s=None, n_a=None, npairs=None,
-              zcnt=None, a2s=None, a_gu_s=None, ws=None):
+              zcnt=None, a2s=None, a_gu_s=None, w_shared=None):
     """fold_a / shared-expert tensors (x_bf [rows_max, K] BF16, a_gu [slots * experts * 64, K]
     BF16, the A-item tables, the shared expert's down A [slots * 32, I] and gate/up A
     [slots * 64, K]) or placeholders shaped for the TMA descriptors."""
@@ -1531,23 +1391,22 @@ def fold_refs(op, dev, x_bf=None, a_gu=None, a_blk=None, a_s=None, n_a=None, npa
     if a_gu_s is None:
         a_gu_s = torch.zeros(128, op.K, dtype=torch.bfloat16, device=dev)
     if op.mx:  # MXFP8 shared expert: (FP8 [rows_sh, K_sh], swizzled UE8M0 SF) or placeholders
-        if ws is None:
-            ws = (torch.zeros(op.rows_sh * op.K_sh, dtype=torch.uint8, device=dev),
-                  torch.full((op.rows_sh * op.K_sh // 32,), 127, dtype=torch.uint8, device=dev))
-        w8, sf8 = ws
+        if w_shared is None:
+            w_shared = (torch.zeros(op.rows_sh * op.K_sh, dtype=torch.uint8, device=dev),
+                        torch.full((op.rows_sh * op.K_sh // 32,), 127, dtype=torch.uint8,
+                                   device=dev))
+        w8, sf8 = w_shared
         tail = [w8.view(torch.uint8).reshape(-1), sf8.view(torch.uint8).reshape(-1)]
     else:
-        if ws is None:  # the shared expert's base weights [rows, K] (BF16), placeholder
-            ws = torch.zeros(128 * op.NA, op.K, dtype=torch.bfloat16, device=dev)
-        tail = [ws.reshape(-1, op.K).unsqueeze(-1), torch.zeros(16, dtype=torch.uint8,
-                                                                device=dev)]
+        # BF16: unused shared-weight operands (placeholders)
+        tail = [torch.zeros(128 * op.NA, op.K, dtype=torch.bfloat16, device=dev).unsqueeze(-1),
+                torch.zeros(16, dtype=torch.uint8, device=dev)]
     return [x_bf, a_gu.reshape(-1, op.K), a_blk, a_s, n_a, npairs, zcnt, a2s,
             a_gu_s.reshape(-1, op.K)] + tail
 
 
 def make(op, w, w_sf, x_q, x_sf, bm, z, rslot, blk_expert, blk_mask, ranks, scales, out,
-         lut=None, a2=None, out_q=None, out_sf=None, zd=None, nblk=None, ws=None, cnt=None,
-         x_bf=None, a_gu=None, a_blk=None, a_s=None, n_a=None, npairs=None, zcnt=None,
+         lut=None, a2=None, out_q=None, out_sf=None, zd=None, nblk=None, x_bf=None, a_gu=None, a_blk=None, a_s=None, n_a=None, npairs=None, zcnt=None,
          a2s=None, a_gu_s=None, w_shared=None, compiled=None, rtok=None):
     """Test/runner helper: w [E, rows, K/2] uint8 (FP4) or [E, rows, K] BF16; w_sf the
     swizzled per-expert UE8M0 scales (flat); x_q [rows_max, K] FP8 (or BF16); x_sf flat
@@ -1575,10 +1434,7 @@ def make(op, w, w_sf, x_q, x_sf, bm, z, rslot, blk_expert, blk_mask, ranks, scal
              out_sf.view(torch.uint8).reshape(-1) if out_sf is not None else torch.zeros(
                  16, dtype=torch.uint8, device=dev),
              zd if zd is not None else torch.zeros(1, 1, 16, dtype=torch.float32, device=dev),
-             nblk, ws if ws is not None else torch.zeros(op.units_cap * 128 * NT,
-                                                          dtype=torch.float32, device=dev),
-             cnt if cnt is not None else torch.zeros(op.max_blocks * op.m_tiles,
-                                                     dtype=torch.int32, device=dev)]
+             nblk]
     refs += fold_refs(op, dev, x_bf, a_gu, a_blk, a_s, n_a, npairs, zcnt, a2s, a_gu_s,
                       w_shared)
     refs.append(rtok if rtok is not None else torch.full((op.rows_max,), -1, dtype=torch.int32,

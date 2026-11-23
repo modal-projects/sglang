@@ -198,6 +198,10 @@ class _SplitState:
 
 class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
     name = "blackwell"
+    # A model may set ``layer.mxfp8_hint = (x, x_q, x_sf)`` before calling an MXFP8 LoRA
+    # linear on x: the MXFP8 quant of x (FlashInfer's 128x4 scale layout) its producer already
+    # made (DeepSeek-V4.1's fused q_norm). _fused uses it instead of quantizing x again.
+    takes_mxfp8_hint = os.environ.get("SGLANG_BLACKWELL_LORA_MX_HINT", "1") != "0"
 
     def __init__(self, max_loras_per_batch, device, server_args):
         super().__init__(max_loras_per_batch, device, server_args)
@@ -277,6 +281,11 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
 
     def _fused(self, layer, x, lora_a, lora_b, offsets):
         info = self.batch_info
+        hint = getattr(layer, "mxfp8_hint", None)
+        if hint is not None:
+            layer.mxfp8_hint = None
+            if hint[0] is not x:
+                hint = None
         T = self._decode_tokens(x)
         if T is None:
             return None
@@ -325,7 +334,11 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         if mx:
             from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-            x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
+            if hint is not None and n_rows == T:
+                x_q, x_sf = hint[1], hint[2]
+            else:
+                x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True,
+                                                      alignment=32)
             extra = dict(w_sf=w_sf, x_q=x_q, x_sf=x_sf)
         kern(w, x, lora_a, self._b_mirror(layer, lora_b), slots,
              info.lora_ranks.to(torch.int32), info.scalings.float(), y, **extra)
@@ -340,14 +353,9 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
         info = self.batch_info
-        st = getattr(layer, "_blackwell_split", None)
+        st = self._split_state(layer, lora_a, lora_b, rows)
         if st is None:
-            if torch.cuda.is_current_stream_capturing():
-                return self._reject(layer, "first split use during graph capture")
-            st = _SplitState(layer.base_layer, rows)
-            st.bind(lora_a, lora_b)
-            layer._blackwell_split = st
-            self._split_layers.append(st)
+            return self._reject(layer, "first split use during graph capture")
         K, Kp = st.K, st.Kp
         if Kp != K:
             x = torch.nn.functional.pad(x, (0, Kp - K))
@@ -383,6 +391,79 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
                  info.scalings.float(), y[:, pc.r0:pc.r1], w_sf=pc.sf, x_q=x_q, x_sf=x_sf)
         return y[:T] if T != n_rows else y
 
+    def _split_state(self, layer, lora_a, lora_b, rows):
+        st = getattr(layer, "_blackwell_split", None)
+        if st is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            st = _SplitState(layer.base_layer, rows)
+            st.bind(lora_a, lora_b)
+            layer._blackwell_split = st
+            self._split_layers.append(st)
+        return st
+
+    # A model's MLP may hand both projections to forward_mlp_mx (DeepSeek-V4.1's shared expert)
+    takes_mlp_mx = os.environ.get("SGLANG_BLACKWELL_LORA_MLP_MX", "1") != "0"
+
+    def forward_mlp_mx(self, gu, dn, x, limit):
+        """down(clamped_swiglu(gate_up(x))) for an MLP whose MXFP8 gate/up slices and down K
+        are not 128-aligned (DeepSeek-V4.1's TP8 shared expert: 288 features): the merged
+        gate/up launch, one kernel for the activation (padded K, BF16 + MXFP8: mx_act), and
+        the down launch. None when the layers or the batch do not fit (the caller runs the
+        unfused path)."""
+        T = self._decode_tokens(x)
+        if T is None or not self.takes_mlp_mx:
+            return None
+        bg, bd = gu.base_layer, dn.base_layer
+        if not (_mxfp8_base(bg) and _mxfp8_base(bd)):
+            return None
+        if getattr(bg, "bias", None) is not None or getattr(bd, "bias", None) is not None:
+            return None
+        if getattr(bd, "reduce_results", True) or not getattr(bd, "input_is_parallel", False) \
+                or hasattr(bd, "lora_input_transform"):
+            return None
+        a1, b1, a2, b2 = gu.lora_a, gu.lora_b, dn.lora_a, dn.lora_b
+        for a, b, sl in ((a1, b1, 2), (a2, b2, 1)):
+            if b.shape[-1] != RANK or a.shape[0] > 8 or a.shape[1] != sl * RANK:
+                return None
+        N, K = bg.weight.shape
+        Nd, Kd = bd.weight.shape
+        rows = tuple(int(o) for o in gu.lora_offsets[1:])
+        rows_d = tuple(int(o) for o in dn.lora_offsets[1:])
+        Is = N // 2
+        if rows != (Is, N) or Is % 128 == 0 or Kd != Is or rows_d != (Nd,) or Nd % 128 \
+                or K % 128:
+            return None
+        st = self._split_state(gu, a1, b1, rows)
+        std = self._split_state(dn, a2, b2, rows_d)
+        if st is None or std is None or not st.merged or std.merged or len(std.pieces) != 1:
+            return None
+        pc, pd = st.pieces[0], std.pieces[0]
+        Kp = std.Kp
+        srows = tuple(pc.slice_pad * (i + 1) for i in range(2))
+        kg = self._kernel(pc.n_pad, K, T, srows, True, a1.shape[0])
+        kd = self._kernel(pd.n_pad, Kp, T, (pd.n_pad,), True, a2.shape[0])
+        if kg is None or kd is None:
+            return None
+        if (not kg.compiled or not kd.compiled) and torch.cuda.is_current_stream_capturing():
+            return None
+        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+
+        from .blackwell.mx_act import swiglu_pad_mxfp8
+
+        info = self.batch_info
+        slots = self._slots(T)
+        ranks, scales = info.lora_ranks.to(torch.int32), info.scalings.float()
+        x = self._pad(x.contiguous(), T)
+        n_rows = x.shape[0]
+        x_q, x_sf = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
+        yp = torch.empty(n_rows, pc.n_pad, device=x.device, dtype=torch.bfloat16)
+        kg(pc.w, x, pc.a, pc.b, slots, ranks, scales, yp, w_sf=pc.sf, x_q=x_q, x_sf=x_sf)
+        act, act_q, act_sf = swiglu_pad_mxfp8(yp, n_rows, Is, pc.slice_pad, Kp, limit)
+        y = torch.empty(n_rows, Nd, device=x.device, dtype=torch.bfloat16)
+        kd(pd.w, act, pd.a, pd.b, slots, ranks, scales, y, w_sf=pd.sf, x_q=act_q, x_sf=act_sf)
+        return y[:T] if T != n_rows else y
+
     def _kernel(self, N, K, T, rows, mx, n_slots, epi="linear", pairings=None, qkv=None,
                 eps=1e-6):
         from sglang.srt.lora.backend.blackwell import plans, tlinear
@@ -403,7 +484,7 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         op = None
         for pairing in pairings:
             cands = []
-            t_ = plans.tuned(N, K, slices, pairing, T_run)
+            t_ = plans.tuned(N, K, slices, pairing, T_run, mx)
             if t_:
                 cands.append(t_)
             try:

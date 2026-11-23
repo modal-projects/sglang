@@ -1769,8 +1769,12 @@ class MQALayer(MqaAttentionBase):
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
-        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
-        method = getattr(self.wq_b, "quant_method", None)
+        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row; a LoRA
+        # backend that also takes the fused quant (blackwell) gets it as a hint
+        wq_b = self.wq_b
+        hint = getattr(getattr(wq_b, "lora_backend", None), "takes_mxfp8_hint", False)
+        wq_b_base = wq_b.base_layer if hint else wq_b
+        method = getattr(wq_b_base, "quant_method", None)
         if (
             _is_cuda
             and self.is_dsv41
@@ -1784,7 +1788,7 @@ class MQALayer(MqaAttentionBase):
             == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
             and (
                 getattr(method, "use_mxfp8", False)
-                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+                or getattr(wq_b_base, "block_fp8_mxfp8_ready", False)
             )
         ):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
@@ -1799,6 +1803,9 @@ class MQALayer(MqaAttentionBase):
                 y, quant, scale = rmsnorm_mxfp8(
                     q, self.q_norm.weight, self.q_norm.variance_epsilon
                 )
+                if hint:
+                    wq_b.mxfp8_hint = (y, quant, scale)
+                    return y, y
                 return y, Mxfp8SwizzledInput(quant, scale)
         q = self.q_norm(q)
         return q, q

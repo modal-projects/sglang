@@ -137,7 +137,7 @@ class TExperts:
                  zfix=False, ktile=128, ks_max=1, units_cap=2048, ks_force=0, fold_a=False,
                  a_experts=0, zd_fix=None, a_ks=4, pair=False, shared_e=-1, a2_experts=None,
                  lora32=False, m_tiles_sh=None, k_tiles_sh=None, dyn=None, xg=None,
-                 order="m", grid_cap=0, a_mode="fused"):
+                 order="m", grid_cap=0, a_mode="fused", gu32=None):
         assert base in ("mxfp4", "mxfp8", "bf16")
         self.mx = base != "bf16"  # block-scaled MMA with MXFP8 activations
         # mxfp8: FP8 weights with UE8M0 scales (per row, per 32 K), read in place; the gate/up
@@ -157,8 +157,17 @@ class TExperts:
         # one slot of a pair; else 64-wide tiles covering 64 / w_slice slots
         self.l32 = lora32
         assert not lora32 or w_slice == 32
-        self.kl = 32 if lora32 else 64
-        self.spt = self.kl // w_slice  # slots per LoRA K-tile
+        # gu32 (MXFP4 gate/up, w_slice 64): a slot's LoRA-B is one dense 32-wide tile (each
+        # row's own B_gate or B_up row), run as a 32-column MMA against [Z_gate; Z_up] into a
+        # separate accumulator; the epilogue adds each row's half. The 64-wide tile it
+        # replaces (gate32 | up32 for every row) was half zeros.
+        import os as _os0
+        if gu32 is None:
+            gu32 = _os0.environ.get("SGLANG_TEXPERTS_GU32", "1") != "0"
+        self.gu32 = bool(gu32 and epi == "swiglu" and base == "mxfp4" and w_slice == 64
+                         and not lora32 and not pair and ks_max == 1 and ks_force == 0)
+        self.kl = 32 if (lora32 or self.gu32) else 64
+        self.spt = 1 if self.gu32 else self.kl // w_slice  # slots per LoRA K-tile
         self.lora_tiles = (n_slots + self.spt - 1) // self.spt
         self.n_parts = n_parts
         # zfix: Z arrives as one Q32.32 int64 vector per row (summed with integer atomics, so
@@ -197,7 +206,8 @@ class TExperts:
         self.xg = (base == "bf16" and fold_a and pair and
                    _os.environ.get("SGLANG_TEXPERTS_XG", "1") != "0") if xg is None else xg
         self.x_tile = NT * self.ke if self.mx else NT * self.kb * 2 * self.AP
-        self.ztile = NT * self.kl * 2  # bytes of one Zblk tile
+        # bytes of one Zblk tile (gu32: [2 NT rows (gate rows, then up rows), 32])
+        self.ztile = NT * self.kl * 2 * (2 if self.gu32 else 1)
         self.zbytes = self.NA * self.lora_tiles * self.ztile
         self.stage_bytes = self.w_tile + self.x_tile + (2 * 128 * self.ke // 32 if self.mx else 0)
         # epilogue scratch (SwiGLU): gate/up staging [2, 64, NT+1] + activation [NT, 65] FP32,
@@ -209,11 +219,13 @@ class TExperts:
         fit = (SMEM_LIMIT - fixed) // self.stage_bytes
         self.stages = min(12, fit) if stages is None else stages
         assert self.stages >= 2
-        self.tmem_cols = 64
+        self.tmem_cols = 128 if self.gu32 else 64
         self.sf_col = 2 * NT  # accumulators at columns 0 and NT; SFA / SFB after them
+        self.l_col = 64  # gu32: LoRA accumulators [128, 2 NT] at columns 64 and 64 + 2 NT
         self.tiler = (128, NT, self.ke)
         self.tiler16 = (128, NT, self.kb)
         self.tilerL = (128, NT, self.kl)  # LoRA-B K-tile
+        self.tilerZ = (128, 2 * NT, 32)  # gu32 LoRA MMA: N = gate rows | up rows
         self.tiler_sfb = (128, 128, self.ke)
         # persistent: one CTA per SM walks items j = bid, bid + grid, ... over
         # n_blocks * m_tiles (block = j % n_blocks, row tile = j // n_blocks)
@@ -264,7 +276,8 @@ class TExperts:
                 f"_B{self.max_blocks}_W{self.W}_P{self.n_parts}_{self.epi}_st{self.stages}"
                 f"{'_dyn' if self.dyn else ''}{'_xg' if self.xg else ''}"
                 f"{'_oe' if self.order == 'e' else ''}_g{self.grid}"
-                f"{'' if self.a_mode == 'fused' else '_a' + self.a_mode}")
+                f"{'' if self.a_mode == 'fused' else '_a' + self.a_mode}"
+                f"{'_gu32' if self.gu32 else ''}")
 
     @cute.jit
     def __call__(self, w: cute.Tensor, w_sf: cute.Tensor, x_q: cute.Tensor, x_sf: cute.Tensor,
@@ -293,8 +306,14 @@ class TExperts:
         tma_bm, tbm = cute.nvgpu.make_tiled_tma_atom_A(op_a, bm, sl(sAL_l), self.tilerL, mma16,
                                                        one4)
         assert self.zbuf % self.ztile == 0
-        sZL_l = sm100_utils.make_smem_layout_b(mma16, self.tilerL, bf,
-                                               2 * (self.zbuf // self.ztile))
+        mma32 = sm100_utils.make_trivial_tiled_mma(bf, bf, major, major, cutlass.Float32,
+                                                   tcgen05.CtaGroup.ONE, self.tilerZ[:2])
+        if cutlass.const_expr(self.gu32):
+            sZL_l = sm100_utils.make_smem_layout_b(mma32, self.tilerZ, bf,
+                                                   2 * (self.zbuf // self.ztile))
+        else:
+            sZL_l = sm100_utils.make_smem_layout_b(mma16, self.tilerL, bf,
+                                                   2 * (self.zbuf // self.ztile))
         rows_all = self.E * self.N
         af = f8 if self.a8 else f4
         if cutlass.const_expr(self.mx):
@@ -440,7 +459,7 @@ class TExperts:
                     lut, a2, out_q, out_sf, zd, nblk, ws, cnt, tma_ah, tah, tma_xb, txb, half_l,
                     a_blk, a_s, n_a, npairs, zcnt, a2s, tma_ahs, tahs, tma_ws, tws, mma8, tma_as,
                     tas, tma_sfas, tsfas, x_bf, rtok, tma_wh, twh, half8_l, sA_l, sB_l, sSFA_l,
-                    sSFB_l, sA16_l, sB16_l, sAL_l, sZL_l).launch(
+                    sSFB_l, sA16_l, sB16_l, sAL_l, sZL_l, mma32).launch(
             grid=(self.grid, 1, 1), block=(256, 1, 1), cluster=(1, 1, 1),
             smem=Storage.size_in_bytes(), stream=stream, use_pdl=True)
 
@@ -463,7 +482,8 @@ class TExperts:
                sA_l: cute.ComposedLayout,
                sB_l: cute.ComposedLayout, sSFA_l, sSFB_l,
                sA16_l: cute.ComposedLayout, sB16_l: cute.ComposedLayout,
-               sAL_l: cute.ComposedLayout, sZL_l: cute.ComposedLayout):
+               sAL_l: cute.ComposedLayout, sZL_l: cute.ComposedLayout,
+               mma32: cute.TiledMma):
         S = self.stages
         LI = self.w_tile // (128 * self.kl * 2)
         bf = cutlass.BFloat16
@@ -750,7 +770,7 @@ class TExperts:
             self.mma_warp(mma, mma16, sA, sB, sA16, sB16, sSFA_l, sSFB_l, full, empty,
                           zready, zfree, acc_full, acc_empty, acc_fake, acc16_fake, acc_ptr, st,
                           sZd, blk_mask, bid, nb, n_units, ks, na, sAL, mma8, nbs, blk_expert,
-                          uq, uq_full, uq_empty)
+                          uq, uq_full, uq_empty, mma32)
         elif warp >= 4:
             # Zblk of unit it+1 is built before the epilogue of unit it, so the MMA warp never
             # waits on an epilogue for its LoRA operand.
@@ -786,9 +806,15 @@ class TExperts:
                                      blk_expert)
                     cute.arch.mbarrier_wait(acc_full + zb, (it // 2) % 2)
                     tAcc = cute.make_tensor(acc_ptr + zb * self.NA * NT, acc_fake.layout)
+                    tAccL = cute.make_tensor(acc_ptr + self.l_col + zb * 2 * NT,
+                                             acc_fake.layout)
+                    has_l = cutlass.Int32(0)
+                    if cutlass.const_expr(self.gu32):
+                        if part == ks - 1:
+                            has_l = cutlass.Int32(blk_mask[blk] != 0)
                     self.epilogue(st, tAcc, out, lut, a2, out_q, out_sf, zd, rslot, expert,
                                   blk, m_tile, et, acc_empty + zb, zb, ws, cnt, u, item, part,
-                                  ks, a2s)
+                                  ks, a2s, tAccL, has_l)
                 if et == 0:
                     cute.arch.mbarrier_arrive(uq_empty + it % QD)
                 it = it + 1
@@ -1037,14 +1063,20 @@ class TExperts:
     @cute.jit
     def mma_warp(self, mma, mma16, sA, sB, sA16, sB16, sSFA_l, sSFB_l, full, empty, zready,
                  zfree, acc_full, acc_empty, acc_fake, acc16_fake, acc_ptr, st, sZd, blk_mask,
-                 bid, nb, n_units, ks, na, sAL, mma8, nbs, blk_expert, uq, uq_full, uq_empty):
+                 bid, nb, n_units, ks, na, sAL, mma8, nbs, blk_expert, uq, uq_full, uq_empty,
+                 mma32):
         S = self.stages
         tCrA = mma.make_fragment_A(sA)
         tCrA8 = mma8.make_fragment_A(sA)
         tCrB = mma.make_fragment_B(sB)
         tCrBM = mma16.make_fragment_A(sA16)
-        tCrZd = mma16.make_fragment_B(sZd)
-        tCrBL = mma16.make_fragment_A(sAL)
+        if cutlass.const_expr(self.gu32):
+            tCrZd = mma32.make_fragment_B(sZd)
+            tCrBL = mma32.make_fragment_A(sAL)
+            accL_fake = mma32.make_fragment_C(mma32.partition_shape_C(self.tilerZ[:2]))
+        else:
+            tCrZd = mma16.make_fragment_B(sZd)
+            tCrBL = mma16.make_fragment_A(sAL)
         nkbL = cute.size(tCrBL, mode=[2])
         LI = self.w_tile // (128 * self.kl * 2)
         tCrX16 = mma16.make_fragment_B(sB16)
@@ -1146,7 +1178,21 @@ class TExperts:
                         cute.arch.mbarrier_wait(zready + ab, (it // 2) % 2)
                     t0 = (kt - nbase) * LI
                     nin = cutlass.min(nlt - t0, LI)
-                    for pp in cutlass.range_constexpr(LI):
+                    if cutlass.const_expr(self.gu32):
+                      tAccL = cute.make_tensor(acc_ptr + self.l_col + ab * 2 * NT,
+                                               accL_fake.layout)
+                      for pp in cutlass.range_constexpr(LI):
+                        if pp < nin:
+                            while ((mask >> j) & 1) == 0:
+                                j = j + 1
+                            zi = ab * (self.zbuf // self.ztile) + j
+                            for kb in cutlass.range_constexpr(nkbL):
+                                mma32.set(tcgen05.Field.ACCUMULATE,
+                                          (kt != nbase) | (pp != 0) | (kb != 0))
+                                cute.gemm(mma32, tAccL, tCrBL[(None, None, kb, s * LI + pp)],
+                                          tCrZd[(None, None, kb, zi)], tAccL)
+                            j = j + 1
+                    for pp in cutlass.range_constexpr(0 if self.gu32 else LI):
                         if pp < nin:
                             hh = (t0 + pp) % self.NA
                             if hh == 0:
@@ -1242,7 +1288,12 @@ class TExperts:
                               "cvt.rn.bf16x2.f32 $0,$1,$2;", "=r,f,f")))
                       jt = sl // self.spt
                       gg = (sl % self.spt) * G + g
-                      if cutlass.const_expr(self.l32):
+                      if cutlass.const_expr(self.gu32):
+                          # gate columns -> row n, up columns -> row NT + n (64-byte rows, SW64)
+                          zr = n + NT * (g // 4)
+                          st_shared_v4(base + jt * tile + zr * 64 +
+                                       (((g % 4) ^ ((zr >> 1) & 3)) << 4), words)
+                      elif cutlass.const_expr(self.l32):
                           st_shared_v4(base + (hz * self.lora_tiles + jt) * tile + n * rowb +
                                        ((gg ^ ((n >> 1) & 3)) << 4), words)
                       else:
@@ -1253,7 +1304,7 @@ class TExperts:
 
     @cute.jit
     def epilogue(self, st, tAcc, out, lut, a2, out_q, out_sf, zd, rslot, expert, blk, m_tile,
-                 et, acc_empty, zb, ws, cnt, u, item, part, ks, a2s):
+                 et, acc_empty, zb, ws, cnt, u, item, part, ks, a2s, tAccL, has_l):
         epi = (128, NT)
         t2r_atom = sm100_utils.get_tmem_load_op(
             (128, NT, 64), utils.LayoutEnum.ROW_MAJOR, cutlass.Float32, cutlass.Float32, epi,
@@ -1270,11 +1321,28 @@ class TExperts:
             tAcc1 = cute.make_tensor(tAcc.iterator + NT, tAcc.layout)
             src1 = thr_t2r.partition_S(cute.flat_divide(tAcc1[((None, None), 0, 0)], epi))
             cute.copy(t2r, src1[(None, None, None, 0, 0)], r1)
+        rg = cute.make_rmem_tensor(coords[(None, None, None, 0, 0)].shape, cutlass.Float32)
+        ru = cute.make_rmem_tensor(coords[(None, None, None, 0, 0)].shape, cutlass.Float32)
+        if cutlass.const_expr(self.gu32):  # LoRA accumulator: gate-Z columns | up-Z columns
+            if has_l != 0:
+                tAccU = cute.make_tensor(tAccL.iterator + NT, tAccL.layout)
+                srcg = thr_t2r.partition_S(cute.flat_divide(tAccL[((None, None), 0, 0)], epi))
+                srcu = thr_t2r.partition_S(cute.flat_divide(tAccU[((None, None), 0, 0)], epi))
+                cute.copy(t2r, srcg[(None, None, None, 0, 0)], rg)
+                cute.copy(t2r, srcu[(None, None, None, 0, 0)], ru)
         cute.arch.fence_view_async_tmem_load()
         named_barrier(4, 128)
         if et == 0:
             cute.arch.mbarrier_arrive(acc_empty)  # the MMA warp may reuse this accumulator
         cd = coords[(None, None, None, 0, 0)]
+        if cutlass.const_expr(self.gu32):
+            if has_l != 0:
+                for i in cutlass.range_constexpr(cute.size(r)):
+                    mm, t = cd[i]
+                    if (lut[m_tile * 128 + mm] >> 8) != 0:
+                        r[i] = r[i] + ru[i]
+                    else:
+                        r[i] = r[i] + rg[i]
         last = cutlass.Int32(1)
         if ks > 1:
             # park this part's FP32 tile; the last part to arrive sums all parts in order
@@ -1417,26 +1485,32 @@ class TExperts:
                 ((rr % 128) // 32) * 4 + c % 4
             out_sf[off] = cutlass.Uint8(e8)
         named_barrier(3, 128)
-        # down-LoRA shrink partial for this tile's 64 features: 4 ranks per thread
-        slot = rslot[row]
-        if (slot >= 0) & (slot < self.n_slots):
-            for jj in cutlass.range_constexpr(4):
-                j = fg * 4 + jj
-                arow = (slot * self.a2_experts + expert) * 32 + j
-                accz = f32(0)
+        # down-LoRA shrink partial for this tile's 64 features. Only a block's routed rows
+        # (often 1-3 of 16) carry a slot: warp w takes rows w, w + 4, ...; lane = rank j loads
+        # its A2 row's 64 features at once (one memory round trip per row instead of four)
+        # and adds the dot product to zd[row, j] (same products and order per rank as before).
+        wq = et // 32
+        lane = et % 32
+        for rr in cutlass.range_constexpr(NT // 4):
+            t2 = wq + rr * 4
+            row2 = blk * NT + t2
+            slot = rslot[row2]
+            if (slot >= 0) & (slot < self.n_slots):
+                arow = (slot * self.a2_experts + expert) * 32 + lane
                 abase = a2.iterator + cute.crd2idx((arow, m_tile * 64), a2.layout)
                 if cutlass.const_expr(self.shared_e >= 0):
                     if expert == self.shared_e:  # the shared expert's dense down-LoRA A
-                        abase = a2s.iterator + cute.crd2idx((slot * 32 + j, m_tile * 64),
+                        abase = a2s.iterator + cute.crd2idx((slot * 32 + lane, m_tile * 64),
                                                             a2s.layout)
+                wv = [load_bf16x8(abase + f8i * 8) for f8i in range(8)]
+                accz = f32(0)
                 for f8i in cutlass.range_constexpr(8):
-                    wv = load_bf16x8(abase + f8i * 8)
                     for q in cutlass.range_constexpr(8):
-                        accz = accz + wv[q] * act[t, f8i * 8 + q]
+                        accz = accz + wv[f8i][q] * act[t2, f8i * 8 + q]
                 if cutlass.const_expr(self.zd_fix):
-                    red_add_fix(zd.iterator + cute.crd2idx((row, j), zd.layout), accz)
+                    red_add_fix(zd.iterator + cute.crd2idx((row2, lane), zd.layout), accz)
                 else:
-                    zd[row, m_tile, j] = accz
+                    zd[row2, m_tile, lane] = accz
         named_barrier(3, 128)
 
 

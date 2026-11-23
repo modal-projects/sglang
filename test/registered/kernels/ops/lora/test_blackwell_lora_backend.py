@@ -144,6 +144,69 @@ def test_mxfp8_padded_k(T):
     assert _run(5120, 288, (0, 5120), T, mx=True) < 5e-3
 
 
+def _mx_layer(N, K, slices, seed, **base_kw):
+    import flashinfer
+
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    w = (torch.randn(N, K, generator=g, device=DEVICE) * K ** -0.5).bfloat16()
+    wq, wsf = flashinfer.mxfp8_quantize(w, True)
+    a, b = _pool(slices, K, N, seed + 1)
+    offsets = tuple(N // slices * i for i in range(slices + 1))
+    base = SimpleNamespace(weight=wq, bias=None, weight_scale_inv_swizzled=wsf, **base_kw)
+    return SimpleNamespace(base_layer=base, lora_a=a, lora_b=b, lora_offsets=offsets)
+
+
+@pytest.mark.parametrize("T", [1, 8, 100, 128])
+def test_mxfp8_quant_hint(T):
+    """DeepSeek-V4.1's fused q_norm hands wq_b its MXFP8 quant (``layer.mxfp8_hint``): the
+    result equals quantizing the BF16 row in the backend, and the hint is consumed."""
+    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+    from sglang.srt.lora.backend import blackwell_backend as bb
+
+    bb._mxfp8_base = lambda layer: True
+    layer = _mx_layer(4096, 1280, 1, 21)
+    g = torch.Generator(device=DEVICE).manual_seed(22)
+    q = torch.randn(T, 1280, generator=g, device=DEVICE).bfloat16() * 3
+    gamma = (1 + 0.1 * torch.randn(1280, generator=g, device=DEVICE)).bfloat16()
+    y, yq, ys = rmsnorm_mxfp8(q, gamma, 1e-6)
+    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
+    be = _backend(T, slots)
+    plain = be._fused(layer, y, layer.lora_a, layer.lora_b, layer.lora_offsets)
+    layer.mxfp8_hint = (y, yq, ys)
+    hinted = be._fused(layer, y, layer.lora_a, layer.lora_b, layer.lora_offsets)
+    assert layer.mxfp8_hint is None
+    assert torch.equal(plain, hinted)
+    layer.mxfp8_hint = (y.clone(), yq, ys)  # another tensor: ignored
+    assert torch.equal(plain, be._fused(layer, y, layer.lora_a, layer.lora_b,
+                                        layer.lora_offsets))
+
+
+@pytest.mark.parametrize("T", [1, 8, 100, 128])
+def test_mlp_mx_shared_expert(T):
+    """DeepSeek-V4.1's TP8 shared expert (gate/up slices of 288, down K 288, swiglu limit 10)
+    through forward_mlp_mx (gate/up launch, fused activation + K pad + MXFP8, down launch)
+    equals the unfused LoRA path bit for bit."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+    from sglang.srt.lora.backend import blackwell_backend as bb
+
+    bb._mxfp8_base = lambda layer: True
+    H, Is, L = 5120, 288, 10.0
+    gu = _mx_layer(2 * Is, H, 2, 31)
+    dn = _mx_layer(H, Is, 1, 33, reduce_results=False, input_is_parallel=True)
+    g = torch.Generator(device=DEVICE).manual_seed(35)
+    x = torch.randn(T, H, generator=g, device=DEVICE).bfloat16() * 4
+    slots = torch.randint(0, SLOTS, (T,), generator=g, device=DEVICE, dtype=torch.int32)
+    be = _backend(T, slots)
+    fused = be.forward_mlp_mx(gu, dn, x, L)
+    act = torch.empty(T, Is, device=DEVICE, dtype=torch.bfloat16)
+    silu_and_mul_clamp(be._fused(gu, x, gu.lora_a, gu.lora_b, gu.lora_offsets), act, L)
+    unfused = be._fused(dn, act, dn.lora_a, dn.lora_b, dn.lora_offsets)
+    torch.cuda.synchronize()
+    assert fused is not None and fused.shape == (T, H)
+    assert torch.isfinite(fused.float()).all()
+    assert torch.equal(fused, unfused)
+
+
 def _run_block_fp8(N, K, offsets, T, packed, seed=0):
     """128x128 block-FP8 base with UE8M0 scales (GLM-5.3 Flash after SGLang's DeepGEMM requant
     on Blackwell): FP32 power-of-two scales or DeepGEMM's packed int32 layout."""

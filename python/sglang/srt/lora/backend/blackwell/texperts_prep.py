@@ -10,9 +10,15 @@ import triton
 import triton.language as tl
 
 NT = tl.constexpr(16)
+_SKIP_PAD = __import__("os").environ.get("SGLANG_TEXPERTS_QUANT_SKIP_PAD", "1") != "0"
 
 
-@triton.jit
+# BLOCK takes a few fixed sizes (Prep.route_block), and Prep.precompile_route compiles each
+# for both divisibility-by-16 classes of the route count that Triton specializes on (the
+# alignment hint keeps the route loads vectorized). New variants compiling mid-serve
+# stalled every rank for tens of seconds on the first single-request prefill of an unseen
+# size. The folded-token count is not specialized on.
+@triton.jit(do_not_specialize=["n_tok"])
 def _route_kernel(topk_ids, topk_w, slots, scratch, row_of, rtok, rslot, rw, blk_expert,
                   blk_mask_gu, blk_mask_d, nblk, z, a_blk, a_s, n_a, npairs, zcnt,
                   n_routes, top_k, local_off,
@@ -105,9 +111,12 @@ def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.c
                   N_SF_KT: tl.constexpr, R: tl.constexpr, BF: tl.constexpr,
                   MX: tl.constexpr = True, SHARED: tl.constexpr = False, blk_expert=None,
                   blk_mask=None, rslot=None, a_s=None, a_ss=0, z=None, E_SH=0,
-                  SL: tl.constexpr = 8):
+                  SL: tl.constexpr = 8, SKIP_PAD: tl.constexpr = True):
     """Block b (16 rows), K-part p: MXFP8 of the rows' x[:, p*PART : +PART] into xq / x_sf
-    (128x4 swizzle, one 128-row group per block); part 0 also clears the rows' down-LoRA Z."""
+    (128x4 swizzle, one 128-row group per block); part 0 also clears the rows' down-LoRA Z.
+    Padding rows (no token) are not written: they only feed MMA columns and LoRA rows that are
+    never stored, so their stale (finite) contents are harmless, and most of a decode block's
+    16 rows are padding."""
     blk = tl.program_id(0)
     p = tl.program_id(1)
     if blk >= tl.load(nblk):
@@ -118,8 +127,12 @@ def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.c
     cols = p * PART + tl.arange(0, PART)
     xv = tl.load(x + tok.to(tl.int64)[:, None] * H + cols[None, :], mask=(tok >= 0)[:, None],
                  other=0.0)
+    if SKIP_PAD:
+        live = (tok >= 0)[:, None]
+    else:
+        live = ((tok >= 0) | (tok < 0))[:, None]
     if BF:  # the permuted BF16 rows (folded LoRA-A shrink; the BF16-base GEMM input)
-        tl.store(x_bf + rows.to(tl.int64)[:, None] * H + cols[None, :], xv)
+        tl.store(x_bf + rows.to(tl.int64)[:, None] * H + cols[None, :], xv, mask=live)
     if p == 0:
         jd = tl.arange(0, R)
         tl.store(zd + rows[:, None] * R + jd[None, :], tl.zeros((16, R), tl.int64))
@@ -150,12 +163,12 @@ def _quant_kernel(x, rtok, nblk, xq, x_sf, zd, x_bf, H: tl.constexpr, PART: tl.c
     q = (g * inv[:, :, None]).to(tl.float8e4nv)
     q = tl.reshape(q, (16, PART))
     tl.store(xq + rows.to(tl.int64)[:, None] * H + cols[None, :],
-             q.to(tl.uint8, bitcast=True))
+             q.to(tl.uint8, bitcast=True), mask=live)
     rr = blk * 128 + n
     c = p * (PART // 32) + tl.arange(0, PART // 32)
     off = (rr[:, None] // 128) * (N_SF_KT * 512) + (c[None, :] // 4) * 512 + \
         (rr[:, None] % 32) * 16 + ((rr[:, None] % 128) // 32) * 4 + c[None, :] % 4
-    tl.store(x_sf + off, e8.to(tl.uint8))
+    tl.store(x_sf + off, e8.to(tl.uint8), mask=live)
 
 
 @triton.jit
@@ -238,6 +251,11 @@ class Prep:
         self.H, self.I, self.R, self.n_slots = H, I, rank, n_slots
         self.shared = shared
         self.route_warps = int(__import__("os").environ.get("SGLANG_TEXPERTS_ROUTE_WARPS", "8"))
+        # route BLOCK sizes: decode-sized (<= 42 tokens at top-6), larger decode / small
+        # prefill, and the whole capacity; each compiled once (precompile_route)
+        top = max(16, triton.next_power_of_2(tokens * top_k + (tokens if shared else 0)))
+        self.route_blocks = tuple(sorted({min(256, top), min(1024, top), top}))
+        self._route_compiled = set()
         self.MB = max_blocks(tokens, top_k, n_local, shared)
         self.rows = self.MB * 16
         self.part = min(part, H)
@@ -275,11 +293,31 @@ class Prep:
         self.ws = torch.zeros(2048 * 128 * 16, dtype=torch.float32, device=dev)
         self.cnt = torch.zeros(self.MB * max(2 * I, H) // 128, dtype=torch.int32, device=dev)
 
+    def route_block(self, routes):
+        return next(b for b in self.route_blocks if b >= routes)
+
     def route(self, topk_ids, topk_w, slots, fold=False, zero_zd=False):
         n = topk_ids.numel()
         assert n <= self.T * self.K
         n_tok = topk_ids.shape[0] if self.shared else 0
-        BLOCK = max(16, triton.next_power_of_2(n + n_tok))
+        if (fold, zero_zd) not in self._route_compiled:
+            self.precompile_route(topk_ids, topk_w, slots, fold, zero_zd)
+        self._launch_route(topk_ids, topk_w, slots, fold, zero_zd, n, n_tok,
+                           self.route_block(n + n_tok))
+
+    def precompile_route(self, topk_ids, topk_w, slots, fold, zero_zd):
+        """Compile every BLOCK size of this (fold, zero_zd) variant now, for a route count
+        divisible by 16 (0) and one that is not (3, at most the routes of any call), by
+        launching each on those first routes: the real launch that follows rewrites every
+        table they touch. Skipped under graph capture, where the launches would be recorded."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        for block in self.route_blocks:
+            for n in (0, min(3, topk_ids.numel())):
+                self._launch_route(topk_ids, topk_w, slots, fold, zero_zd, n, 0, block)
+        self._route_compiled.add((fold, zero_zd))
+
+    def _launch_route(self, topk_ids, topk_w, slots, fold, zero_zd, n, n_tok, BLOCK):
         zrows = 64
         _route_kernel[(1 + triton.cdiv(self.rows, zrows),)](
             topk_ids.reshape(-1), topk_w.reshape(-1).float(), slots, self.scratch, self.row_of,
@@ -302,7 +340,7 @@ class Prep:
             blk_mask=self.mask_gu, rslot=self.rslot,
             a_s=a_shared if a_shared is not None else self.x_bf,
             a_ss=a_shared.stride(0) if a_shared is not None else 0, z=self.z, E_SH=self.E,
-            SL=self.n_slots)
+            SL=self.n_slots, SKIP_PAD=_SKIP_PAD)
         if shrink:
             assert a_gu.stride(3) == 1 and a_gu.stride(2) == a_gu.shape[3]
             a_es = a_gu.stride(1) if a_gu.shape[1] > 1 else 0

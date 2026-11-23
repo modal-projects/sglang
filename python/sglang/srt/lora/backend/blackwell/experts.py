@@ -31,6 +31,8 @@ _PREPS = {}
 _MIRRORED = []  # layer states holding LoRA-B mirrors
 _VERSION = [None]
 _REJECTED = set()
+# True while lora_dispatch warms the decomposed path: forward() then declines every batch
+FORCE_DECOMPOSED = [False]
 # The MoE block's shared expert while the block hands it to the fused path (one forward), and
 # whether the fused path took it (the caller computes it otherwise).
 SHARED_BLOCK = [None]
@@ -44,6 +46,11 @@ def _fold_shared(default=False):
     on by default for GLM-5.3 Flash's small TP8 FP8 shared expert (default=True)."""
     v = os.environ.get("SGLANG_BLACKWELL_MOE_SHARED_FOLD")
     return default if v is None else v == "1"
+
+
+def _gu32(shared=None):
+    """Dense 32-wide gate/up LoRA-B mirror (texperts gu32), folded shared expert included."""
+    return os.environ.get("SGLANG_TEXPERTS_GU32", "1") != "0"
 
 
 def enabled():
@@ -151,7 +158,7 @@ class _SharedMX:
         self.a2s = None
         self.limit = float(se.swiglu_limit) if se.swiglu_limit is not None else 1e30
 
-    def refresh(self, bm_gu, bm_d, E, I, H, SL, p2):
+    def refresh(self, bm_gu, bm_d, E, I, H, SL, p2, gu32=False):
         """Shared rows of the LoRA-B mirrors and the K-padded down LoRA-A (dense buffers are
         unscaled and may hold garbage past each adapter's rank: made finite here, masked
         by rank in the kernels)."""
@@ -159,12 +166,13 @@ class _SharedMX:
         nan0 = lambda t: torch.nan_to_num(t.float(), 0.0, 0.0, 0.0)
         bs = nan0(self.gu.lora_b)  # [SL, 2Is, R]
         rows = self.mts * 128
-        dst = bm_gu.view(-1, SL, 64)[E * 2 * I: E * 2 * I + rows]
-        dst.zero_()
+        W = 32 if gu32 else 64
+        dst = bm_gu.view(-1, SL, W)[E * 2 * I: E * 2 * I + rows]
         b = bs[:, self.src].permute(1, 0, 2).to(torch.bfloat16)  # [rows valid, SL, R]
         up = (self.src >= Is).view(-1, 1, 1)
-        full = torch.zeros(rows, SL, 64, dtype=torch.bfloat16, device=bm_gu.device)
-        full[self.rows_valid] = torch.cat([torch.where(up, 0, b), torch.where(up, b, 0)], -1)
+        full = torch.zeros(rows, SL, W, dtype=torch.bfloat16, device=bm_gu.device)
+        full[self.rows_valid] = b if gu32 else \
+            torch.cat([torch.where(up, 0, b), torch.where(up, b, 0)], -1)
         dst.copy_(full)
         bds = nan0(self.dn.lora_b)  # [SL, H, R]
         bm_d.view(-1, SL, 32)[E * H:(E + 1) * H] = \
@@ -218,7 +226,9 @@ class _LayerState:
         self.SL = SL
         self.shared = shared
         ES = E + (1 if shared is not None else 0)
-        self.bm_gu = torch.empty(ES * 2 * I, SL * 64, dtype=torch.bfloat16, device=device)
+        self.gu32 = _gu32(shared)
+        self.bm_gu = torch.empty(ES * 2 * I, SL * (32 if self.gu32 else 64),
+                                 dtype=torch.bfloat16, device=device)
         self.bm_d = torch.empty(ES * H, SL * 32, dtype=torch.bfloat16, device=device)
         self.refresh()
 
@@ -243,13 +253,16 @@ class _LayerState:
         for e0 in range(0, E, 8):  # bounded temporaries
             e1 = min(E, e0 + 8)
             src = b_gu[:, e0:e1].permute(1, 2, 0, 3)[:, self.full13]  # [e, 2I, SL, R]
-            dst = self.bm_gu.view(-1, 2 * I, SL, 64)[e0:e1]
-            dst[..., :32] = torch.where(is_up, 0, src)
-            dst[..., 32:] = torch.where(is_up, src, 0)
+            if self.gu32:  # each row's own B row (gate rows: B_gate, up rows: B_up)
+                self.bm_gu.view(-1, 2 * I, SL, 32)[e0:e1] = src
+            else:
+                dst = self.bm_gu.view(-1, 2 * I, SL, 64)[e0:e1]
+                dst[..., :32] = torch.where(is_up, 0, src)
+                dst[..., 32:] = torch.where(is_up, src, 0)
             self.bm_d.view(-1, self.H, SL, 32)[e0:e1] = \
                 b_d[:, e0:e1].permute(1, 2, 0, 3)[:, self.p2.long()]
         if self.shared is not None:
-            self.shared.refresh(self.bm_gu, self.bm_d, E, I, self.H, SL, self.p2)
+            self.shared.refresh(self.bm_gu, self.bm_d, E, I, self.H, SL, self.p2, self.gu32)
 
 
 def refresh_mirrors(version):
@@ -261,9 +274,10 @@ def refresh_mirrors(version):
         st.refresh()
 
 
-def _kernels(E, I, H, MB, SL, clamp, device, EA, sh=None):
-    """sh: (gate/up row tiles, down K) of a folded MXFP8 shared expert (expert E), or None."""
-    key = (E, I, H, MB, SL, clamp, EA, sh)
+def _kernels(E, I, H, MB, SL, clamp, device, EA, sh=None, gu32=False):
+    """sh: (gate/up row tiles, down K) of a folded MXFP8 shared expert (expert E), or None.
+    gu32: the gate/up LoRA-B mirror is the dense 32-wide one (_LayerState.gu32)."""
+    key = (E, I, H, MB, SL, clamp, EA, sh, gu32)
     if key not in _KERNELS:
         from . import texperts
         sms = torch.cuda.get_device_properties(device).multi_processor_count
@@ -271,7 +285,8 @@ def _kernels(E, I, H, MB, SL, clamp, device, EA, sh=None):
         gu = texperts.TExperts(ES, 2 * I, H, MB, n_slots=SL, w_slice=64, epi="swiglu",
                                clamp=clamp, zfix=True, sms=sms, fold_a=True, a_experts=EA,
                                zd_fix=True, shared_e=se, a2_experts=E,
-                               m_tiles_sh=sh[0] if sh else None)
+                               m_tiles_sh=sh[0] if sh else None, gu32=gu32)
+        assert gu.gu32 == gu32
         dn = texperts.TExperts(ES, H, I, MB, n_slots=SL, w_slice=32, epi="down", zfix=True,
                                sms=sms, lora32=True, shared_e=se,
                                k_tiles_sh=sh[1] // 128 if sh else None)
@@ -306,6 +321,8 @@ def _launch(k, name, op, refs):
 def forward(hidden_states, topk_ids, topk_weights, quant_info, lora_info, base_layer, output):
     """Fused routed-expert LoRA into ``output`` [T, H]; returns it, or None to fall back."""
     T, H = hidden_states.shape
+    if FORCE_DECOMPOSED[0]:
+        return None
     if T == 0 or T > MAX_TOKENS:
         return _reject(f"T={T}")
     if hidden_states.dtype != torch.bfloat16:
@@ -361,7 +378,8 @@ def forward(hidden_states, topk_ids, topk_weights, quant_info, lora_info, base_l
     sh = st.shared
     prep = _prep(T_max, K, E, off, H, I, SL, R, dev, shared=sh is not None)
     EA = a_gu.shape[1]  # experts in the gate/up A buffer (1: shared-outer)
-    k = _kernels(E, I, H, prep.MB, SL, st.clamp, dev, EA, (sh.mts, sh.Kd) if sh else None)
+    k = _kernels(E, I, H, prep.MB, SL, st.clamp, dev, EA, (sh.mts, sh.Kd) if sh else None,
+                 st.gu32)
     if k.get("dn_fold") is None:  # placeholders for the down kernel's fold_a inputs
         if torch.cuda.is_current_stream_capturing():
             return _reject("first use during graph capture")

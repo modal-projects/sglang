@@ -372,6 +372,24 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
+        # LoRA (blackwell backend) on an MXFP8 MLP with unaligned slices (DeepSeek-V4.1's TP
+        # shared expert): both projections and the clamped SwiGLU between them in 3 launches
+        lora_be = getattr(self.gate_up_proj, "lora_backend", None)
+        if (
+            self.swiglu_limit is not None
+            and gateup_pre_quant is None
+            and isinstance(x, torch.Tensor)
+            and getattr(lora_be, "takes_mlp_mx", False)
+            and getattr(self.down_proj, "lora_backend", None) is lora_be
+            and self.gate_up_proj.lora_active
+            and self.down_proj.lora_active
+        ):
+            out = lora_be.forward_mlp_mx(
+                self.gate_up_proj, self.down_proj, x, float(self.swiglu_limit)
+            )
+            if out is not None:
+                return out
+
         if gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing

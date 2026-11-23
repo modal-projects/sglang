@@ -79,9 +79,10 @@ def check_one_wave(name, grid, smem, sms, tmem_cols=256, threads=256, cluster=1)
 _TABLE = None
 
 
-def tuned(n_out, k, slices, pairing, tokens):
+def tuned(n_out, k, slices, pairing, tokens, mx=False):
     """Autotuned (ksplit, a_splits, cluster) for a projection shape, for the smallest tuned batch
-    >= tokens (or the largest), from plans.json; None when the shape was not tuned."""
+    >= tokens (or the largest), from plans.json; None when the shape was not tuned. MXFP8 bases
+    have their own entries (",mx" keys), used only up to the largest tuned batch."""
     global _TABLE
     if _TABLE is None:
         try:
@@ -89,9 +90,11 @@ def tuned(n_out, k, slices, pairing, tokens):
                 _TABLE = json.load(f)
         except OSError:
             _TABLE = {}
-    entry = _TABLE.get(f"{n_out},{k},{slices},{pairing}")
+    entry = _TABLE.get(f"{n_out},{k},{slices},{pairing}" + (",mx" if mx else ""))
     if not entry:
         return None
     keys = sorted(int(t) for t in entry)
+    if mx and tokens > keys[-1]:
+        return None
     pick = next((t for t in keys if t >= tokens), keys[-1])
     return tuple(entry[str(pick)])

@@ -186,7 +186,11 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         gated_marlin_activation(
             runner_config.activation,
             runner_config.gemm1_alpha,
-            runner_config.gemm1_clamp_limit,
+            (
+                runner_config.gemm1_clamp_limit
+                if runner_config.gemm1_alpha is not None
+                else runner_config.swiglu_limit
+            ),
             intermediate_cache1.view(-1, 2 * N),
             intermediate_cache2,
         )

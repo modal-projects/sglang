@@ -30,8 +30,10 @@ import os
 
 import torch
 
-from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+from sglang.srt.lora.backend.chunked_backend import MIN_CHUNK_SIZE, ChunkedSgmvLoRABackend
 from sglang.srt.lora.dense.plan import DenseLoraKind
+from sglang.srt.lora.utils import LoRABatchInfo, MoELoRABatchInfo, generate_sequence_lengths
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +210,166 @@ class BlackwellLoRABackend(ChunkedSgmvLoRABackend):
         self._weights_version = None
         self._rejected = set()
         self._split_layers = []
+        self._bw_global_info = None
+        self._bw_graph_global = None
+        self._bw_req = None
+
+    # ------------------------------------------------------------------ DP attention
+    # Under DP attention (attention TP1; LoRAManager enforces it) each rank's attention runs
+    # its own requests (DP_LOCAL) and the FFN / MoE section runs every rank's tokens gathered
+    # in rank order (TP_GLOBAL). ``batch_info`` resolves to the rows of the section being run,
+    # so the fused kernels, the inherited csgmv path and the MoE paths read the right batch.
+    supports_dp_attention = True
+
+    @property
+    def batch_info(self):
+        d = self.__dict__
+        g = d.get("_bw_global_info")
+        if g is not None and get_forward().lora_batch_layout is LoRABatchLayout.TP_GLOBAL:
+            return g
+        return d.get("_bw_local_info")
+
+    @batch_info.setter
+    def batch_info(self, info):
+        self.__dict__["_bw_local_info"] = info
+
+    def get_batch_info(self, layout=None):
+        if layout is None:
+            return self.batch_info
+        g = self.__dict__.get("_bw_global_info")
+        if layout is LoRABatchLayout.TP_GLOBAL and g is not None:
+            return g
+        return self.__dict__.get("_bw_local_info")
+
+    def reset_batch_state(self):
+        super().reset_batch_state()
+        self._bw_global_info = None
+
+    def prepare_lora_batch(self, forward_batch, weight_indices, lora_ranks, scalings,
+                           use_cuda_graph, use_prefill_cuda_graph=False):
+        self._bw_global_info = None
+        super().prepare_lora_batch(forward_batch, weight_indices, lora_ranks, scalings,
+                                   use_cuda_graph, use_prefill_cuda_graph=use_prefill_cuda_graph)
+        self._bw_req = (list(weight_indices), list(lora_ranks))
+
+    def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
+        """Static TP_GLOBAL batch for decode graphs: one segment per gathered token."""
+        from sglang.srt.runtime_context import get_parallel
+
+        local = self.cuda_graph_batch_info
+        T = max_num_tokens * get_parallel().attn_dp_size
+        with torch.device(self.device):
+            self._bw_arange = torch.arange(T + 1, dtype=torch.int32)
+            self._bw_graph_global = LoRABatchInfo(
+                bs=T, use_cuda_graph=True, num_segments=T, max_len=MIN_CHUNK_SIZE,
+                seg_lens=None, seg_indptr=self._bw_arange.clone(),
+                weight_indices=torch.zeros(T, dtype=torch.int32),
+                permutation=self._bw_arange[:T].clone(), lora_ranks=local.lora_ranks,
+                scalings=local.scalings, req_seg_indptr=self._bw_arange.clone(),
+                req_weight_indices=torch.zeros(T, dtype=torch.int32), expected_tokens=T)
+
+    def prepare_global_lora_batch(self, forward_batch) -> None:
+        """Every DP rank's per-token adapter slots in rank order (the FFN's row order) and the
+        TP_GLOBAL batch built from them: tokens sorted by adapter and chunked like csgmv's own
+        batches, written into static buffers for decode graphs (slots from the manager's CPU
+        gather, no GPU sync) and into fresh tensors otherwise (slots gathered on the GPU)."""
+        from sglang.srt.layers.dp_attention import dp_gather_replicate, dp_slot_in
+
+        self._bw_global_info = None
+        local = self.__dict__.get("_bw_local_info")
+        g_num = forward_batch.global_num_tokens_cpu
+        if local is None or self._bw_req is None or g_num is None or len(g_num) <= 1:
+            return
+        weight_indices, lora_ranks = self._bw_req
+        no_lora = next((i for i, r in enumerate(lora_ranks) if r == 0), -1)
+        n_local = int(g_num[dp_slot_in(g_num)])
+        if forward_batch.forward_mode.is_idle() or not weight_indices:
+            tok = torch.empty(0, dtype=torch.int32)
+        else:
+            tok = torch.repeat_interleave(torch.tensor(weight_indices, dtype=torch.int32),
+                                          generate_sequence_lengths(forward_batch, "cpu"))
+        tok = tok[:n_local]
+        if tok.numel() < n_local:  # graph padding rows: no adapter
+            tok = torch.cat([tok, torch.full((n_local - tok.numel(),), no_lora,
+                                             dtype=torch.int32)])
+        Tg = int(sum(g_num))
+        gg = self._bw_graph_global
+        graph = local.use_cuda_graph and gg is not None and Tg <= gg.weight_indices.shape[0]
+        w = gg.req_weight_indices[:Tg] if graph else torch.empty(Tg, dtype=torch.int32,
+                                                                 device=self.device)
+        # Decode graphs: one row per request, each rank's block padded to its token count, so
+        # the gathered slots come from the manager's CPU gather of the requests' adapters (a
+        # GPU gather would need a sync here to build the csgmv segments). Else gather rows.
+        gs = getattr(self, "dp_gathered_slots", None)
+        w_cpu = None
+        if (graph and gs is not None and len(gs) == len(g_num)
+                and forward_batch.forward_mode.is_decode()
+                and all(len(s_) <= int(n_) for s_, n_ in zip(gs, g_num))):
+            rows = []
+            for s_, n_ in zip(gs, g_num):
+                rows += s_ + [no_lora] * (int(n_) - len(s_))
+            w_cpu = torch.tensor(rows, dtype=torch.int32).clamp_(min=0)
+            w.copy_(w_cpu.pin_memory(), non_blocking=True)
+        else:
+            local_w = tok.pin_memory().to(self.device, non_blocking=True)
+            dp_gather_replicate(w, local_w, forward_batch)
+            w.clamp_(min=0)  # padding with every slot holding an adapter: any slot (unused rows)
+        ranks = local.lora_ranks
+        tmap = torch.where(ranks[w.long()] > 0, w, torch.full_like(w, -1))
+        if graph:
+            # csgmv segments: tokens sorted by adapter, chunked (one segment per token would make
+            # every token reload its adapter's LoRA-A). The chunk size depends only on Tg, which
+            # a captured graph fixes, so replays match the BLOCK_M the capture compiled.
+            info = gg
+            Tm = info.weight_indices.shape[0]
+            if w_cpu is None:
+                w_cpu = w.cpu()
+            perm = torch.argsort(w_cpu, stable=True)
+            chunk = self._determine_chunk_size_for_tokens(Tg)
+            seg_w, seg_indptr = self._get_segments_info(w_cpu[perm], chunk)
+            ns = len(seg_w)
+            info.weight_indices[:ns].copy_(seg_w, non_blocking=True)
+            info.weight_indices[ns:].zero_()
+            info.seg_indptr[:ns + 1].copy_(seg_indptr, non_blocking=True)
+            info.seg_indptr[ns + 1:].fill_(Tg)
+            info.permutation[:Tg].copy_(perm.to(torch.int32), non_blocking=True)
+            info.req_weight_indices[Tg:].zero_()
+            info.req_seg_indptr.copy_(self._bw_arange)
+            info.req_seg_indptr[Tg + 1:].fill_(Tg)
+            info.bs = info.expected_tokens = Tg
+            info.num_segments, info.max_len = ns, chunk
+            if self.is_moe_lora:
+                bufs = self.moe_cg_buffers
+                bufs["token_lora_mapping"][:Tg].copy_(tmap)
+                bufs["token_lora_mapping"][Tg:].fill_(-1)
+                bufs["adapter_enabled"][:ranks.shape[0]].copy_((ranks > 0).to(torch.int32))
+                info.moe_lora_info = MoELoRABatchInfo(
+                    seg_indptr=info.req_seg_indptr[:Tg + 1], req_to_lora=w,
+                    adapter_enabled=bufs["adapter_enabled"],
+                    token_lora_mapping=bufs["token_lora_mapping"][:Tm])
+        else:
+            if w_cpu is None:
+                w_cpu = w.cpu()
+            perm = torch.argsort(w_cpu, stable=True)
+            chunk = self._determine_chunk_size_for_tokens(Tg)
+            seg_w, seg_indptr = self._get_segments_info(w_cpu[perm], chunk)
+            dev = self.device
+            info = LoRABatchInfo(
+                bs=Tg, use_cuda_graph=False, num_segments=len(seg_w), max_len=chunk,
+                seg_lens=None, seg_indptr=seg_indptr.to(dev, non_blocking=True),
+                weight_indices=seg_w.to(dev, non_blocking=True),
+                permutation=perm.to(torch.int32).to(dev, non_blocking=True),
+                lora_ranks=ranks, scalings=local.scalings,
+                req_seg_indptr=torch.arange(Tg + 1, dtype=torch.int32, device=dev),
+                req_weight_indices=w, expected_tokens=Tg)
+            if self.is_moe_lora:
+                info.moe_lora_info = MoELoRABatchInfo(
+                    seg_indptr=info.req_seg_indptr, req_to_lora=w,
+                    adapter_enabled=(ranks > 0).to(torch.int32), token_lora_mapping=tmap)
+        info.has_active_lora = any(r > 0 for r in lora_ranks)
+        # graph replays pass a batch view without is_extend_in_batch (always decode)
+        info.is_prefill = not graph and bool(getattr(forward_batch, "is_extend_in_batch", True))
+        self._bw_global_info = info
 
     # ------------------------------------------------------------------ pool sync
     def sync_lora_weights(self, version) -> None:

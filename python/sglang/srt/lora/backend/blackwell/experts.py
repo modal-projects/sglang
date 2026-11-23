@@ -22,7 +22,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = int(os.environ.get("SGLANG_BLACKWELL_MOE_LORA_MAX_TOKENS", "256"))
+# 1024: DP attention gathers every rank's decode tokens into the MoE (8 x 128 at most)
+MAX_TOKENS = int(os.environ.get("SGLANG_BLACKWELL_MOE_LORA_MAX_TOKENS", "1024"))
 NT = 16
 
 _LUTS = {}
@@ -233,6 +234,16 @@ def _kernels(E, I, H, MB, SL, clamp, device, EA):
     return _KERNELS[key]
 
 
+def _t_max(T):
+    """Capacity bucket of the routing buffers (and of the kernels compiled against their block
+    count) for a T-token batch: the power of two >= T, at least 256, at most MAX_TOKENS. One
+    capacity for every T would make small batches pay for the largest."""
+    t = 256
+    while t < T:
+        t *= 2
+    return min(t, MAX_TOKENS)
+
+
 def _prep(T_max, K, E, off, H, I, SL, R, device, mx=True, shared=False):
     key = (T_max, K, E, off, H, I, SL, R, mx, shared)
     if key not in _PREPS:
@@ -302,7 +313,7 @@ def forward(hidden_states, topk_ids, topk_weights, quant_info, lora_info, base_l
         base_layer._blackwell_moe_lora = st
         _MIRRORED.append(st)
     st.lora_info = lora_info  # buffers are stable; keep the latest handle
-    prep = _prep(MAX_TOKENS, K, E, off, H, I, SL, R, dev)
+    prep = _prep(_t_max(T), K, E, off, H, I, SL, R, dev)
     EA = a_gu.shape[1]  # experts in the gate/up A buffer (1: shared-outer)
     k = _kernels(E, I, H, prep.MB, SL, st.clamp, dev, EA)
     if k.get("dn_fold") is None:  # placeholders for the down kernel's fold_a inputs
@@ -433,7 +444,7 @@ def forward_bf16(dispatch_output, lora_layer, token_slots):
         lora_layer._blackwell_moe_lora = st
         _MIRRORED.append(st)
     K = topk.topk_ids.shape[1]
-    prep = _prep(MAX_TOKENS, K, E, 0, H, I, SL, R, dev, mx=False)
+    prep = _prep(_t_max(T), K, E, 0, H, I, SL, R, dev, mx=False)
     EA = a_gu.shape[1]
     rc = getattr(base, "moe_runner_config", None)
     if rc is not None and (getattr(rc, "activation", "silu") != "silu"
@@ -653,7 +664,7 @@ def forward_fp8b(dispatch_output, lora_layer, token_slots):
     if sh is not None and abs(sh.limit - clamp) > 1e-6 * max(1.0, abs(clamp)):
         return _reject(f"shared swiglu limit {sh.limit} != routed {clamp}")
     K = topk.topk_ids.shape[1]
-    prep = _prep(MAX_TOKENS, K, E, 0, H, I, SL, R, dev, shared=sh is not None)
+    prep = _prep(_t_max(T), K, E, 0, H, I, SL, R, dev, shared=sh is not None)
     EA = a_gu.shape[1]
     k = _kernels_fp8(E, I, H, prep.MB, SL, EA, clamp, dev, (sh.mts, sh.Kd) if sh else None)
     if k["dn_fold"] is None:

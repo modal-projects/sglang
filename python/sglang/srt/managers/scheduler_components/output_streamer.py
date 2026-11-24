@@ -74,6 +74,7 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    weight_version_of: Callable[[Optional[str]], str]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -194,7 +195,7 @@ class SchedulerOutputStreamer:
                 self.is_request_level_customized_info_key
             ),
             rust_server_mode=self.rust_server is not None,
-            current_weight_version=get_serving().weight_version,
+            weight_version_of=self.weight_version_of,
         )
         for req in reqs:
             if req is skip_req:
@@ -350,7 +351,7 @@ class _GenerationStreamAccumulator:
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
     is_request_level_customized_info_key: Callable[[str], bool]
-    current_weight_version: Optional[str]
+    weight_version_of: Callable[[Optional[str]], str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -546,7 +547,7 @@ class _GenerationStreamAccumulator:
             self.weight_versions.append(
                 compute_weight_version_spans(
                     req.weight_version_events,
-                    current_version=self.current_weight_version,
+                    current_version=self.weight_version_of(req.lora_id),
                     num_output_tokens=len(output_ids_),
                 )
             )

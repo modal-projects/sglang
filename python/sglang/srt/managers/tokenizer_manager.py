@@ -902,6 +902,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
+        # By lora_id; kept across eviction, like lora_ref_cache, so a reload keeps it.
+        self.lora_weight_versions: Dict[str, str] = {}
         # Preserve the adapter ID across incomplete cleanup retries.
         self.pending_lora_unloads: Dict[str, str] = {}
         if get_lora().lora_paths is not None:
@@ -2817,7 +2819,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.config_value("weight_version"),
+                "weight_version": self.weight_version_of(state.obj.lora_id),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -3933,7 +3935,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": self.config_value("weight_version"),
+            "weight_version": self.weight_version_of(state.obj.lora_id),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
         if recv_obj.weight_versions is not None:

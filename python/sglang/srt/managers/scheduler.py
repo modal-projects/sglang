@@ -2680,6 +2680,7 @@ class Scheduler(
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
             ),
+            weight_version_of=self.weight_version_of,
             rust_server=self.rust_server,
         )
 
@@ -3169,7 +3170,7 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = _make_abort_req(
+            abort_req = self._make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3569,7 +3570,7 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = _make_abort_req(
+            abort_req = self._make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3622,7 +3623,7 @@ class Scheduler(
                 message = "The request is aborted by a higher priority request."
 
         self.send_abort_output(
-            _make_abort_req(
+            self._make_abort_req(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
@@ -3863,7 +3864,7 @@ class Scheduler(
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
         self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+            self._make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4554,7 +4555,7 @@ class Scheduler(
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
+                    self._make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
             for req in reqs_to_abort:
@@ -5676,12 +5677,21 @@ class Scheduler(
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 
-    def record_weight_version_change(self, new_version: Optional[str]) -> None:
-        if new_version is None or new_version == get_serving().weight_version:
+    def record_weight_version_change(
+        self, new_version: Optional[str], lora_id: Optional[str] = None
+    ) -> None:
+        if new_version is None:
             return
 
-        old_version = get_serving().weight_version
-        get_context().override("scheduler.weight_version", weight_version=new_version)
+        old_version = self.weight_version_of(lora_id)
+        if lora_id is None:
+            get_context().override(
+                "scheduler.weight_version", weight_version=new_version
+            )
+        else:
+            self._lora_weight_versions()[lora_id] = new_version
+        if new_version == old_version:
+            return
 
         live_reqs = {
             *self.collect_inflight_reqs(),
@@ -5692,9 +5702,41 @@ class Scheduler(
             live_reqs.update(
                 act.req for act in self.hisparse_coordinator.ack_staging_queue
             )
-        num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
+        if lora_id is not None:
+            affected = [req for req in live_reqs if req.lora_id == lora_id]
+        else:
+            # A request on an adapter with a version of its own reports that version.
+            adapter_versions = self._lora_weight_versions()
+            affected = [req for req in live_reqs if req.lora_id not in adapter_versions]
+        num_recorded = record_weight_version_events(affected, old_version=old_version)
         logger.info(
-            f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+            f"Weight version changed. {lora_id=} {old_version=} {new_version=} "
+            f"{num_recorded=}"
+        )
+
+    def weight_version_of(self, lora_id: Optional[str]) -> str:
+        engine = get_serving().weight_version
+        if lora_id is None:
+            return engine
+        return self._lora_weight_versions().get(lora_id, engine)
+
+    def _lora_weight_versions(self) -> Dict[str, str]:
+        if not self.enable_lora:
+            return {}
+        return self.tp_worker.model_runner.lora_manager.weight_versions
+
+    def _make_abort_req(
+        self, req: Req, finished_reason: Optional[FinishReasonDict] = None
+    ) -> AbortReq:
+        return AbortReq(
+            rid=req.rid,
+            finished_reason=finished_reason,
+            weight_versions=compute_weight_version_spans(
+                req.weight_version_events,
+                current_version=self.weight_version_of(req.lora_id),
+                num_output_tokens=len(req.output_ids),
+            ),
+            prefill_weight_versions=req.prefill_weight_versions,
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
@@ -5742,7 +5784,7 @@ class Scheduler(
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.send_abort_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                self._make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -5769,7 +5811,7 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req)
-                self.send_abort_output(_make_abort_req(req), req)
+                self.send_abort_output(self._make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -5832,7 +5874,9 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
+                        self.send_abort_output(
+                            self._make_abort_req(decode_req), decode_req
+                        )
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
@@ -6102,6 +6146,9 @@ class Scheduler(
             self.kv_event_lora_names.register(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
             )
+            self.record_weight_version_change(
+                new_version=recv_req.weight_version, lora_id=recv_req.lora_id
+            )
         return result
 
     def prepare_lora_adapter(
@@ -6140,8 +6187,8 @@ class Scheduler(
             self.kv_event_lora_names.register(
                 lora_id=recv_req.load.lora_id, lora_name=recv_req.load.lora_name
             )
-            self.weight_updater.record_weight_version_after_update(
-                recv_req.weight_version
+            self.record_weight_version_change(
+                new_version=recv_req.weight_version, lora_id=recv_req.load.lora_id
             )
         return result
 
@@ -6492,18 +6539,3 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[FinishReasonDict] = None
-) -> AbortReq:
-    return AbortReq(
-        rid=req.rid,
-        finished_reason=finished_reason,
-        weight_versions=compute_weight_version_spans(
-            req.weight_version_events,
-            current_version=get_serving().weight_version,
-            num_output_tokens=len(req.output_ids),
-        ),
-        prefill_weight_versions=req.prefill_weight_versions,
-    )

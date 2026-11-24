@@ -47,23 +47,53 @@ class TestKvWeightVersionRecord(CustomTestCase):
     def test_capture_without_a_version_fails(self) -> None:
         """A forward cannot publish KV provenance without a weight version."""
         with self.assertRaises(AssertionError):
-            KvWeightVersionRecord.capture(slot_indices=_slots(1), version=None)
+            KvWeightVersionRecord.capture(slot_indices=_slots(1), versions=[None])
 
     def test_capture_survives_source_reuse_and_tensor_mapping(self) -> None:
         """Reusing forward buffers cannot change a pending record's slots."""
         slots = _slots(4, 5, 6)
-        record = KvWeightVersionRecord.capture(slot_indices=slots, version="v0")
+        record = KvWeightVersionRecord.capture(slot_indices=slots, versions=["v0"])
         slots.fill_(9)
         record.map_device_tensors(lambda tensor: tensor.to(dtype=torch.int32))
         table = _table()
 
-        table.record(slot_indices=record.slot_indices, version=record.version)
+        record.finalize(tracker=table)
 
         self.assertEqual(
             table._lookup_spans(_slots(4, 5, 6)),
             [WeightVersionSpan(version="v0", start=0, end=3)],
         )
         self.assertEqual(record.slot_indices.dtype, torch.int32)
+
+    def test_rows_record_their_own_versions(self) -> None:
+        """Each row's slots are recorded under that row's version."""
+        table = _table()
+        record = KvWeightVersionRecord.capture(
+            slot_indices=_slots(4, 5, 6, 7, 8, 9),
+            versions=["v0", "x3", "x3", "v0"],
+            extend_seq_lens=[1, 2, 2, 1],
+        )
+
+        record.finalize(tracker=table)
+
+        self.assertEqual(record.versions, ["v0", "x3", "v0"])
+        self.assertEqual(
+            table._lookup_spans(_slots(4, 5, 6, 7, 8, 9)),
+            [
+                WeightVersionSpan(version="v0", start=0, end=1),
+                WeightVersionSpan(version="x3", start=1, end=5),
+                WeightVersionSpan(version="v0", start=5, end=6),
+            ],
+        )
+
+    def test_rows_without_lengths_split_slots_evenly(self) -> None:
+        """A decode row writes as many slots as every other row."""
+        record = KvWeightVersionRecord.capture(
+            slot_indices=_slots(4, 5, 6, 7), versions=["v0", "x3"]
+        )
+
+        self.assertEqual(record.versions, ["v0", "x3"])
+        self.assertEqual(record.segment_lens, [2, 2])
 
 
 class TestKvWeightVersionTracker(CustomTestCase):

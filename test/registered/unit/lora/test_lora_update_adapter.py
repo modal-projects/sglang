@@ -57,6 +57,7 @@ def _event(obj) -> str:
         ContinueGenerationReqInput: "continue",
         PrepareLoRAAdapterReqInput: "prepare",
         ApplyLoRAAdapterReqInput: "apply",
+        LoadLoRAAdapterReqInput: "load",
     }[type(obj)]
 
 
@@ -108,6 +109,8 @@ def _tokenizer(
         _pending_lora_publications={},
         lora_registry=registry,
         lora_ref_cache={},
+        lora_weight_versions={},
+        config_value=lambda key: {"weight_version": "v0"}[key],
         prepare_lora_adapter_communicator=prepare,
         update_lora_adapter_communicator=update,
         _async_dispatch_to_scheduler=dispatch,
@@ -284,9 +287,11 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
                     )
                 self.assertTrue(result.success, result.error_message)
                 self.assertEqual([a.weight_version for a in tm.applies], ["7"])
-                tm.record_config_updates.assert_called_once_with(
-                    "tokenizer.weight_version", weight_version="7"
+                self.assertEqual(
+                    tm.weight_version_of(tm.lora_ref_cache["a"].lora_id), "7"
                 )
+                self.assertEqual(tm.weight_version_of(None), "v0")
+                tm.record_config_updates.assert_not_called()
 
     def test_a_failed_update_keeps_the_weight_version(self):
         for kwargs in ({"prepared": False}, {"applied": False}):
@@ -297,6 +302,7 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
                         tm.update_lora_adapter(_update(weight_version="7"))
                     )
                 self.assertFalse(result.success)
+                self.assertEqual(tm.lora_weight_versions, {})
                 tm.record_config_updates.assert_not_called()
 
 
@@ -309,12 +315,15 @@ def _adapter_dir(root: str, name: str, rank: int = 8) -> str:
 
 
 class TestUpdateFollowsResidency(CustomTestCase):
-    def _update_x(self, tm, path, pinned=False):
+    def _update_x(self, tm, path, pinned=False, weight_version=None):
         with _patched_tokenizer_context():
             return asyncio.run(
                 tm.update_lora_adapter(
                     UpdateLoRAAdapterReqInput(
-                        lora_name="x", lora_path=path, pinned=pinned
+                        lora_name="x",
+                        lora_path=path,
+                        pinned=pinned,
+                        weight_version=weight_version,
                     )
                 )
             )
@@ -337,6 +346,18 @@ class TestUpdateFollowsResidency(CustomTestCase):
             ("x-id", new),
         )
         tm._evict_lru_over_cap.assert_not_called()
+
+    def test_a_re_pointed_adapter_reports_its_new_version(self):
+        with tempfile.TemporaryDirectory() as root:
+            tm, _ = _tokenizer(LoRARegistry())
+            tm.lora_ref_cache["x"] = LoRARef(
+                lora_id="x-id", lora_name="x", lora_path=_adapter_dir(root, "v1")
+            )
+            tm.lora_weight_versions["x-id"] = "1"
+            self._update_x(tm, _adapter_dir(root, "v2"), weight_version="2")
+
+        self.assertEqual(tm.weight_version_of("x-id"), "2")
+        self.assertEqual(tm.lora_weight_versions_by_name(), {"x": "2"})
 
     def test_a_name_never_defined_is_defined_without_loading(self):
         with tempfile.TemporaryDirectory() as root:
@@ -368,9 +389,10 @@ class TestUpdateFollowsResidency(CustomTestCase):
         self.assertIn("--max-lora-rank", too_wide.error_message)
         self.assertNotIn("x", tm.lora_ref_cache)
 
-    def test_a_reload_keeps_the_adapters_lora_id(self):
+    def test_a_reload_keeps_the_adapters_lora_id_and_version(self):
         tm, events = _tokenizer(LoRARegistry())
         tm.lora_ref_cache["x"] = LoRARef(lora_id="x-id", lora_name="x", lora_path="/v2")
+        tm.lora_weight_versions["x-id"] = "2"
         with _patched_tokenizer_context():
             result = asyncio.run(
                 tm._load_lora_adapter_on_demand(tm.lora_ref_cache["x"])
@@ -379,10 +401,33 @@ class TestUpdateFollowsResidency(CustomTestCase):
         self.assertTrue(result.success, result.error_message)
         self.assertEqual(events, ["prepare", "apply"])
         self.assertEqual(tm.applies[0].load.lora_id, "x-id")
+        self.assertEqual(tm.applies[0].weight_version, "2")
         self.assertEqual(tm.lora_registry.get_all_adapters()["x"].lora_id, "x-id")
 
+    def test_a_reload_in_the_loop_carries_the_adapters_version(self):
+        tm, _ = _tokenizer(LoRARegistry(), prepared=False, unsupported=True)
+        tm.lora_ref_cache["x"] = LoRARef(lora_id="x-id", lora_name="x", lora_path="/v2")
+        tm.lora_weight_versions["x-id"] = "2"
+        with _patched_tokenizer_context():
+            asyncio.run(tm._load_lora_adapter_on_demand(tm.lora_ref_cache["x"]))
 
-class TestLoadOnDemand(CustomTestCase):
+        self.assertEqual(tm.load_lora_adapter.call_args.args[0].weight_version, "2")
+
+    def test_a_load_records_the_version_it_carries(self):
+        tm, _ = _tokenizer(LoRARegistry())
+        with _patched_tokenizer_context():
+            result = asyncio.run(
+                TokenizerManager.load_lora_adapter(
+                    tm,
+                    LoadLoRAAdapterReqInput(
+                        lora_name="x", lora_path="/v1", weight_version="1"
+                    ),
+                )
+            )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(tm.lora_weight_versions_by_name(), {"x": "1"})
+
     def _delete_x(self, loaded: bool):
         x = LoRARef(lora_id="x-id", lora_name="x", lora_path="/v2")
         registry = LoRARegistry()
@@ -390,6 +435,7 @@ class TestLoadOnDemand(CustomTestCase):
             asyncio.run(registry.register(x))
         tm, events = _tokenizer(registry)
         tm.lora_ref_cache["x"] = x
+        tm.lora_weight_versions["x-id"] = "2"
         if loaded:
             tm._unload_lora_adapter_locked = AsyncMock(
                 return_value=UnloadLoRAAdapterReqOutput(success=True)
@@ -402,13 +448,22 @@ class TestLoadOnDemand(CustomTestCase):
             )
         return result, tm, events
 
+    def test_a_deleted_adapter_forgets_its_version(self):
+        result, tm, _ = self._delete_x(loaded=True)
+
+        self.assertTrue(result.success, result.error_message)
+        tm._unload_lora_adapter_locked.assert_called_once()
+        self.assertEqual((tm.lora_ref_cache, tm.lora_weight_versions), ({}, {}))
+
     def test_an_adapter_not_loaded_is_deleted_without_an_unload(self):
         result, tm, events = self._delete_x(loaded=False)
 
         self.assertTrue(result.success, result.error_message)
         self.assertEqual(events, [])
-        self.assertEqual(tm.lora_ref_cache, {})
+        self.assertEqual((tm.lora_ref_cache, tm.lora_weight_versions), ({}, {}))
 
+
+class TestLoadOnDemand(CustomTestCase):
     def _load(self, registry, name="b", tokenizer_workers=1, **kwargs):
         tm, events = _tokenizer(registry, **kwargs)
         with _patched_tokenizer_context(tokenizer_workers):
@@ -594,6 +649,7 @@ def _scheduler(*, pp_size=1, per_dp_group=False):
     scheduler.tp_worker.load_lora_adapter.return_value = LoRAUpdateOutput(success=True)
     scheduler.kv_event_lora_names = Mock()
     scheduler.weight_updater = Mock()
+    scheduler.record_weight_version_change = Mock()
     scheduler.send_control_output = Mock()
     scheduler.request_receiver = SimpleNamespace(
         broadcasts_control_per_dp_group=lambda: per_dp_group
@@ -651,11 +707,22 @@ class TestSchedulerPrepare(CustomTestCase):
                 apply = _apply()
                 apply.weight_version = "7"
                 scheduler.apply_lora_adapter(apply)
-                record = scheduler.weight_updater.record_weight_version_after_update
+                record = scheduler.record_weight_version_change
                 if success:
-                    record.assert_called_once_with("7")
+                    record.assert_called_once_with(new_version="7", lora_id="id-a")
                 else:
                     record.assert_not_called()
+
+    def test_a_load_records_its_adapters_version(self):
+        scheduler, _ = _scheduler()
+        load = _apply().load
+        load.weight_version = "7"
+
+        scheduler.load_lora_adapter(load)
+
+        scheduler.record_weight_version_change.assert_called_once_with(
+            new_version="7", lora_id="id-a"
+        )
 
 
 class TestPreparedRecord(CustomTestCase):

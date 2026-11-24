@@ -2656,6 +2656,8 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     # The caller coordinates generation and KV/prefix-cache invalidation around
     # the swap; same-name path updates currently require PP=1.
     upsert: bool = False
+    # The version of the adapter's weights, reported on the tokens it produces.
+    weight_version: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(

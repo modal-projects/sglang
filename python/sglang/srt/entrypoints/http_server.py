@@ -851,6 +851,10 @@ async def model_info():
         "architectures": getattr(model_config.hf_config, "architectures", None),
         # "hf_config": model_config.hf_config.to_dict(),
     }
+    if get_lora().enable_lora:
+        result["lora_weight_versions"] = (
+            _global_state.tokenizer_manager.lora_weight_versions_by_name()
+        )
     embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
     if embedding_model_spec is not None:
         result["embedding"] = resolved_embedding_plan(

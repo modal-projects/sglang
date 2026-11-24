@@ -46,6 +46,15 @@ class _ContextStub:
         self.serving.weight_version = fields["weight_version"]
 
 
+class _ReqStub:
+    def __init__(self, lora_id=None, num_output_tokens: int = 0):
+        self.rid = f"{lora_id}-{id(self)}"
+        self.lora_id = lora_id
+        self.output_ids = [0] * num_output_tokens
+        self.weight_version_events = []
+        self.prefill_weight_versions = None
+
+
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _serving(self, version: str) -> _ServingStub:
         serving = _ServingStub(version)
@@ -59,9 +68,14 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         return serving
 
     def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
+        self, *, inflight=(), waiting=(), chunked=None, staging=(), adapters=None
     ) -> SimpleNamespace:
-        return SimpleNamespace(
+        lora_manager = SimpleNamespace(weight_versions=dict(adapters or {}))
+        scheduler = SimpleNamespace(
+            enable_lora=adapters is not None,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(lora_manager=lora_manager)
+            ),
             collect_inflight_reqs=lambda: set(inflight),
             waiting_queue=list(waiting),
             chunked_req=chunked,
@@ -73,11 +87,18 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
                 else None
             ),
         )
+        scheduler.weight_version_of = lambda lora_id: Scheduler.weight_version_of(
+            scheduler, lora_id
+        )
+        scheduler._lora_weight_versions = lambda: Scheduler._lora_weight_versions(
+            scheduler
+        )
+        return scheduler
 
     def test_every_source_of_live_requests_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
         self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
+        inflight, queued, chunked, staged = (_ReqStub() for _ in range(4))
         scheduler = self._scheduler(
             inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
         )
@@ -91,6 +112,55 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         self.assertEqual(
             set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
         )
+
+    def test_adapter_update_changes_only_its_requests_versions(self):
+        """Base and other adapters' requests keep their versions through X's update."""
+        serving = self._serving("v1")
+        base, x, y = _ReqStub(), _ReqStub("x", 3), _ReqStub("y", 3)
+        base.output_ids = [0] * 3
+        scheduler = self._scheduler(inflight=[base, x, y], adapters={"x": "x1"})
+
+        Scheduler.record_weight_version_change(scheduler, new_version="x2", lora_id="x")
+        for req in (base, x, y):
+            req.output_ids.extend([0, 0])
+
+        spans = {
+            req: [
+                (span.version, span.start, span.end)
+                for span in Scheduler._make_abort_req(scheduler, req).weight_versions
+            ]
+            for req in (base, x, y)
+        }
+        self.assertEqual(spans[x], [("x1", 0, 3), ("x2", 3, 5)])
+        self.assertEqual(spans[base], [("v1", 0, 5)])
+        self.assertEqual(spans[y], [("v1", 0, 5)])
+        self.assertEqual(serving.weight_version, "v1")
+
+    def test_engine_update_skips_requests_on_adapters_with_their_own_version(self):
+        """An engine change reaches only requests running on the engine's version."""
+        serving = self._serving("v1")
+        base, x, y = _ReqStub(None, 2), _ReqStub("x", 2), _ReqStub("y", 2)
+        scheduler = self._scheduler(inflight=[base, x, y], adapters={"x": "x1"})
+
+        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+
+        self.assertEqual(serving.weight_version, "v2")
+        self.assertEqual(x.weight_version_events, [])
+        for req in (base, y):
+            self.assertEqual(
+                [event.old_version for event in req.weight_version_events], ["v1"]
+            )
+
+    def test_an_adapter_owns_a_version_equal_to_the_engines(self):
+        """An adapter's version equal to the engine's stays when the engine moves on."""
+        self._serving("v1")
+        scheduler = self._scheduler(adapters={})
+
+        Scheduler.record_weight_version_change(scheduler, new_version="v1", lora_id="x")
+        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+
+        self.assertEqual(scheduler.weight_version_of("x"), "v1")
+        self.assertEqual(scheduler.weight_version_of(None), "v2")
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
@@ -222,7 +292,10 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             result = GenerationBatchResult(
                 next_token_ids=torch.tensor([], dtype=torch.int64),
                 kv_weight_version_record=KvWeightVersionRecord.maybe_capture(
-                    model_runner=runner, forward_batch=batch
+                    model_runner=runner,
+                    forward_batch=SimpleNamespace(
+                        out_cache_loc=batch.out_cache_loc, lora_ids=None
+                    ),
                 ),
             )
             queued_batch = batch.copy()
@@ -256,7 +329,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
                         accept_lens=torch.tensor([], dtype=torch.int32),
                         speculative_num_draft_tokens=3,
                         kv_weight_version_record=KvWeightVersionRecord.capture(
-                            slot_indices=forward_slots, version="v1"
+                            slot_indices=forward_slots, versions=["v1"]
                         ),
                     )
                     forward_slots.fill_(7)
@@ -273,7 +346,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler = self._scheduler()
         batch = self._batch()
         record = KvWeightVersionRecord.capture(
-            slot_indices=torch.tensor([0]), version="v0"
+            slot_indices=torch.tensor([0]), versions=["v0"]
         )
         synchronize = MagicMock(side_effect=lambda: record.slot_indices.fill_(3))
         result = GenerationBatchResult(

@@ -23,36 +23,73 @@ _UNWRITTEN_VERSION_ID = -1
 
 class KvWeightVersionRecord(msgspec.Struct):
     slot_indices: torch.Tensor
-    version: str
+    versions: List[str]
+    segment_lens: List[int]
 
     @classmethod
     def maybe_capture(
         cls, model_runner: ModelRunner, forward_batch: ForwardBatch
     ) -> Optional[KvWeightVersionRecord]:
         if (
-            not model_runner.is_draft_worker
-            and model_runner.server_args.enable_prefill_weight_versions
-            and forward_batch.out_cache_loc is not None
+            model_runner.is_draft_worker
+            or not model_runner.server_args.enable_prefill_weight_versions
+            or forward_batch.out_cache_loc is None
         ):
+            return None
+        engine = get_serving().weight_version
+        if not forward_batch.lora_ids:
             return cls.capture(
-                slot_indices=forward_batch.out_cache_loc,
-                version=get_serving().weight_version,
+                slot_indices=forward_batch.out_cache_loc, versions=[engine]
             )
-        return None
+        adapter_versions = model_runner.lora_manager.weight_versions
+        versions = [
+            engine if lora_id is None else adapter_versions.get(lora_id, engine)
+            for lora_id in forward_batch.lora_ids
+        ]
+        return cls.capture(
+            slot_indices=forward_batch.out_cache_loc,
+            versions=versions,
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+        )
 
     @classmethod
     def capture(
-        cls, *, slot_indices: torch.Tensor, version: Optional[str]
+        cls,
+        *,
+        slot_indices: torch.Tensor,
+        versions: List[Optional[str]],
+        extend_seq_lens: Optional[List[int]] = None,
     ) -> KvWeightVersionRecord:
-        assert version is not None
-        return cls(slot_indices=slot_indices.clone(), version=version)
+        assert None not in versions
+        if len(set(versions)) == 1:
+            return cls(slot_indices.clone(), [versions[0]], [len(slot_indices)])
+        if extend_seq_lens is None:
+            # Decode and verify rows each write the same number of slots.
+            per_row, rest = divmod(len(slot_indices), len(versions))
+            assert rest == 0, f"{len(slot_indices)} slots for {len(versions)} rows"
+            extend_seq_lens = [per_row] * len(versions)
+        assert len(extend_seq_lens) == len(versions)
+        assert sum(extend_seq_lens) <= len(slot_indices)
+        # DP padding appends dummy slots after the rows' own.
+        slot_indices = slot_indices[: sum(extend_seq_lens)]
+        merged_versions, segment_lens = [], []
+        for version, row_len in zip(versions, extend_seq_lens):
+            if merged_versions and merged_versions[-1] == version:
+                segment_lens[-1] += row_len
+            else:
+                merged_versions.append(version)
+                segment_lens.append(row_len)
+        return cls(slot_indices.clone(), merged_versions, segment_lens)
 
     def map_device_tensors(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
         self.slot_indices = fn(self.slot_indices)
 
     def finalize(self, *, tracker: Optional[KvWeightVersionTracker]) -> None:
         assert tracker is not None
-        tracker.record(slot_indices=self.slot_indices, version=self.version)
+        for segment, version in zip(
+            torch.split(self.slot_indices, self.segment_lens), self.versions
+        ):
+            tracker.record(slot_indices=segment, version=version)
 
 
 class KvWeightVersionTracker:

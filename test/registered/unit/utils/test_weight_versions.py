@@ -1,11 +1,12 @@
 import random
 import unittest
 from collections import deque
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -28,6 +29,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _ReqStub:
     def __init__(self, output_len: int):
+        self.lora_id = None
         self.output_ids = [0] * output_len
         self.weight_version_events = []
         self.prefill_weight_versions = None
@@ -300,6 +302,8 @@ class _ContextStub:
 class _SchedulerStub:
     _collect_inflight_batches = Scheduler._collect_inflight_batches
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
+    weight_version_of = Scheduler.weight_version_of
+    _lora_weight_versions = Scheduler._lora_weight_versions
 
     def __init__(
         self,
@@ -311,6 +315,7 @@ class _SchedulerStub:
         hisparse=None,
     ):
         self.serving = _ServingStub(version)
+        self.enable_lora = False
         self.enable_continuous_input_polling = False
         self.result_queue = deque()
         self.running_batch = SimpleNamespace(reqs=running)
@@ -482,6 +487,8 @@ class TestSpanlessAbortPaths(CustomTestCase):
             abort_on_priority_when_disabled=True,
             send_abort_output=lambda obj, req_arg: sent.append(obj),
         )
+        scheduler.weight_version_of = partial(Scheduler.weight_version_of, scheduler)
+        scheduler._make_abort_req = partial(Scheduler._make_abort_req, scheduler)
 
         with patch(
             "sglang.srt.managers.scheduler.get_serving",
@@ -503,11 +510,13 @@ class TestMakeAbortReq(CustomTestCase):
         req.weight_version_events.append(
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
+        scheduler = SimpleNamespace()
+        scheduler.weight_version_of = partial(Scheduler.weight_version_of, scheduler)
         with patch(
             "sglang.srt.managers.scheduler.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = Scheduler._make_abort_req(scheduler, req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")

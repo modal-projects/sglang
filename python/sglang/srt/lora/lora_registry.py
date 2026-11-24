@@ -106,6 +106,14 @@ class LoRARegistry:
         async with self._registry_lock.writer_lock:
             self._register_adapter(lora_ref)
 
+    async def replace(self, lora_ref: LoRARef) -> None:
+        """Replace metadata without changing acquisitions held by live requests."""
+        async with self._registry_lock.writer_lock:
+            current = self._registry[lora_ref.lora_name]
+            if current.lora_id != lora_ref.lora_id:
+                raise ValueError("LoRA replacement must retain its execution ID")
+            self._registry[lora_ref.lora_name] = lora_ref
+
     async def unregister(self, lora_name: str) -> str:
         """
         Unregister a LoRARef object from the registry and returns the removed LoRA ID.

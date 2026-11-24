@@ -532,3 +532,54 @@ In this scenario, overlap loading reduces adapter-load overhead, but the loss of
 ## Future Works
 
 The development roadmap for LoRA-related features can be found in this [issue](https://github.com/sgl-project/sglang/issues/2929). Other features, including Embedding Layer, Unified Paging, Cutlass backend are still under development.
+
+
+## Update an adapter in place
+
+On NVIDIA CUDA, `POST /update_lora_adapter` replaces the weights of an already
+loaded adapter. Requests using its name continue with the new weights, including
+requests that started before the update. Use this operation only when your
+application accepts policy changes within a generation.
+
+First load an adapter with a stable name, such as `A`, through
+`/load_lora_adapter`. Send generations with `"lora_path": "A"`. Then update it:
+
+```bash
+curl -X POST "http://HOST:PORT/update_lora_adapter" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "lora_name": "A",
+    "lora_path": "/adapters/A/version-42",
+    "version": "42",
+    "expected_version": "A"
+  }'
+```
+
+The initial version is the adapter's loaded name. After this update it is `42`.
+`expected_version` is optional and rejects an update if another version is
+already active. Retrying the active version with the same path is idempotent;
+version paths must be immutable.
+
+The server prepares CPU weights before pausing the adapter's requests. It
+finishes their submitted GPU work, reuses the same GPU slot, and rebuilds their
+KV cache from the original prompt and retained output tokens. Other adapters
+remain schedulable, and their active KV and prefix-cache namespaces are not
+reset. Upload bandwidth and re-prefill compute can still increase their latency.
+A paused adapter retains its GPU slot until replacement completes. LoRA control
+operations remain serialized, including load and unload.
+
+Final response metadata reports `weight_versions` as token spans with `version`,
+`start`, and `end`. Keep the sampled token log probabilities when training on a
+trajectory that spans policy versions.
+
+Updates require unchanged rank, alpha, target modules, tensor keys, shapes and
+dtypes. The supported configuration is a single serving replica with tensor
+parallelism, autoregressive text generation, and no pipeline or context parallelism, DP
+attention, speculative decoding, continuous input polling, hierarchical cache,
+sessions or beam search. Existing `/load_lora_adapter` and immutable adapter
+names retain their behavior; this endpoint updates only the named adapter.
+
+Preparation failure leaves the active adapter unchanged. An interrupted upload
+attempts to restore its previous CPU weights. If restoration fails, requests for
+that adapter fail and it stays blocked until a successful replacement repairs
+it. Other adapters are not explicitly paused.

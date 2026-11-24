@@ -122,6 +122,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.lora.lora_updater import LoRAUpdater
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -167,6 +168,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAUpdateOutput,
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
@@ -191,6 +193,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -224,6 +227,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    release_req,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -1927,6 +1931,7 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (UpdateLoRAAdapterReqInput, self.update_lora_adapter),
                 (
                     LoadLoRAAdapterFromTensorsReqInput,
                     self.load_lora_adapter_from_tensors,
@@ -2102,8 +2107,10 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+            has_pending_result = bool(self.result_queue)
+            disable_overlap_for_batch = (
+                has_pending_result
+                and self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch)
             )
 
             # If we do not need to overlap the current batch with the last batch,
@@ -2130,7 +2137,7 @@ class Scheduler(
                 self._sched_idled = True
 
             # Process the last batch
-            if self.last_batch:
+            if has_pending_result:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -2274,6 +2281,8 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self._poll_lora_prepares()
+        if updater := getattr(self, "lora_updater", None):
+            updater.poll()
         self.flush_wrapper.check_pending()
         if self.weight_updater.weight_update_staging is not None:
             self.weight_updater.check_pending_weight_preparation()
@@ -3542,6 +3551,10 @@ class Scheduler(
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if updater := getattr(self, "lora_updater", None):
+            if updater.reject_request(req):
+                return
+            updater.stamp(req)
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
             return
@@ -3615,16 +3628,24 @@ class Scheduler(
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
-        if (
-            self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
-        ):
+        if self.max_queued_requests is None:
+            return False
+        candidates = None
+        queued = len(self.waiting_queue)
+        if (updater := getattr(self, "lora_updater", None)) and updater.retained:
+            candidates = [
+                (index, req)
+                for index, req in enumerate(self.waiting_queue)
+                if req not in updater.retained
+            ]
+            queued = len(candidates)
+        if queued + 1 <= self.max_queued_requests:
             return False
 
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
-        if self.enable_priority_scheduling:
+        if self.enable_priority_scheduling and queued:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
@@ -3634,7 +3655,10 @@ class Scheduler(
                 direction * item[1].priority,
                 item[1].time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            idx, candidate_req = max(
+                candidates if candidates is not None else enumerate(self.waiting_queue),
+                key=key_fn,
+            )
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
@@ -4256,10 +4280,12 @@ class Scheduler(
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
-                self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
-                    running_batch.reqs,
-                )
+                waiting = self.waiting_queue
+                if updater := getattr(self, "lora_updater", None):
+                    waiting = [
+                        req for req in waiting if not updater.is_paused(req.lora_id)
+                    ]
+                self.lora_drainer.update_draining_state(waiting, running_batch.reqs)
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
@@ -4488,6 +4514,10 @@ class Scheduler(
         1. The drainer allows scheduling (based on draining state)
         2. The LoRA adapter can be loaded (either already running or can be added)
         """
+        if (updater := getattr(self, "lora_updater", None)) and updater.is_paused(
+            req.lora_id
+        ):
+            return False
         if self.lora_drainer and not self.lora_drainer.can_schedule(req):
             return False
 
@@ -6168,6 +6198,101 @@ class Scheduler(
             scale_phase=ElasticEPStateManager.get_scale_phase(),
         )
 
+    def update_lora_adapter(self, request: UpdateLoRAAdapterReqInput) -> None:
+        unsupported = (
+            not is_cuda()
+            or not get_lora().enable_lora
+            or not self.is_generation
+            or self.dllm_config is not None
+            or get_parallel().pp_size != 1
+            or get_parallel().attn_cp_size != 1
+            or get_parallel().dcp_size != 1
+            or get_parallel().attn_dp_enabled
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or not self.spec_algorithm.is_none()
+            or self.enable_continuous_input_polling
+            or self.enable_hierarchical_cache
+            or self.hisparse_coordinator is not None
+        )
+        if unsupported:
+            self.send_control_output(
+                LoRAUpdateOutput(
+                    success=False,
+                    error_message="In-place LoRA updates require NVIDIA CUDA and standard TP serving without PP, CP, DP attention, speculation, continuous input polling or hierarchical cache",
+                ),
+                request,
+            )
+            return
+        if not hasattr(self, "lora_updater"):
+            self.lora_updater = LoRAUpdater(self)
+        self.lora_updater.submit(request)
+
+    def quiesce_lora_requests(self, uid: str) -> None:
+        requests = self.collect_inflight_reqs() | set(self.waiting_queue)
+        if self.chunked_req is not None:
+            requests.add(self.chunked_req)
+        for req in requests:
+            if req.lora_id == uid:
+                LoRAUpdater.validate_request(req)
+        if self.enable_overlap:
+            while self.result_queue:
+                batch, result = self.result_queue.popleft()
+                self.process_batch_result(batch, result)
+        requests = self.collect_inflight_reqs() | set(self.waiting_queue)
+        if self.chunked_req is not None:
+            requests.add(self.chunked_req)
+        affected = sorted(
+            (req for req in requests if req.lora_id == uid and not req.finished()),
+            key=lambda req: req.rid,
+        )
+        affected_set = set(affected)
+        seen = set()
+        for batch in (self.running_batch, self.last_batch):
+            if batch is not None and id(batch) not in seen:
+                seen.add(id(batch))
+                if any(req in affected_set for req in batch.reqs):
+                    batch.filter_batch(reqs_to_exclude=affected_set)
+        if self.chunked_req in affected_set:
+            self.chunked_req = None
+        manager = self.tp_worker.model_runner.lora_manager
+        event = manager.pending_lora_load_events.pop(uid, None)
+        if event is not None:
+            event.synchronize()
+        for req in affected:
+            if req.kv.holds_kv:
+                release_req(
+                    req=req,
+                    remaing_req_count=0,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
+                    offload_kv=False,
+                )
+        version = manager.lora_weight_versions.get(
+            uid, manager.lora_refs[uid].lora_name
+        )
+        record_weight_version_events(affected, old_version=version)
+        for req in affected:
+            if req.logprob.input_token_logprobs_val is not None:
+                # Rebuild KV without scoring tokens whose behavior logprobs are retained.
+                req.logprob_start_len = -1
+            req.lora_weight_version = version
+            if req not in self.waiting_queue:
+                self.waiting_queue.append(req)
+                self.lora_updater.retained.add(req)
+                req.time_stats.set_retract_time()
+                req.time_stats.set_wait_queue_entry_time()
+                req.arrival_processed_tokens = self.processed_tokens_counter
+        self.running_batch.batch_is_full = False
+
+    def fail_lora_request(
+        self, req: Req, message: str, status_code: int = HTTPStatus.SERVICE_UNAVAILABLE
+    ) -> None:
+        prepare_abort(req, message, status_code=status_code)
+        self._release_aborted_request(req)
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
     ) -> LoadLoRAAdapterReqOutput:
@@ -6252,11 +6377,23 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        updater = getattr(self, "lora_updater", None)
+        if (
+            updater
+            and updater.pending
+            and updater.pending.request.lora_id == recv_req.lora_id
+        ):
+            return updater.manager.create_lora_update_result(
+                False, "LoRA replacement is still in progress"
+            )
         for request, future, _ in getattr(self, "_pending_lora_prepares", ()):
             if request.lora_id == recv_req.lora_id:
                 self._cancelled_lora_prepares.add(request.lora_id)
                 future.cancel()
-        return self.tp_worker.unload_lora_adapter(recv_req)
+        result = self.tp_worker.unload_lora_adapter(recv_req)
+        if updater and result.success:
+            updater.forget(recv_req.lora_id)
+        return result
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
@@ -6335,6 +6472,9 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        if (updater := getattr(self, "lora_updater", None)) and updater.pending:
+            time.sleep(0.001)
+            return
         if getattr(self, "_pending_lora_prepares", None):
             time.sleep(0.005)
             return
@@ -6352,6 +6492,8 @@ class Scheduler(
         executor = getattr(self, "_lora_prepare_executor", None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        if updater := getattr(self, "lora_updater", None):
+            updater.close()
         self.gracefully_exit = True
         return None
 
@@ -6586,7 +6728,7 @@ def _make_abort_req(
         finished_reason=finished_reason,
         weight_versions=compute_weight_version_spans(
             req.weight_version_events,
-            current_version=get_serving().weight_version,
+            current_version=req.lora_weight_version or get_serving().weight_version,
             num_output_tokens=len(req.output_ids),
         ),
     )

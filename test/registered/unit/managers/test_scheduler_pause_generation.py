@@ -21,12 +21,17 @@ from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
+    UpdateLoRAAdapterReqInput,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    compute_extend_logprob_start_len,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -110,6 +115,127 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
+
+    def test_lora_quiescence_preserves_other_rows_and_commits_pending_tokens(
+        self,
+    ) -> None:
+        scheduler = self._new_scheduler()
+        scheduler.enable_continuous_input_polling = False
+        scheduler.processed_tokens_counter = 0
+        scheduler.lora_updater = SimpleNamespace(retained=set())
+        a, b, c = self._make_req("z"), self._make_req("b"), self._make_req("a")
+        a.lora_id, b.lora_id, c.lora_id = "adapter-a", "adapter-b", "adapter-a"
+        a.output_ids.extend([4, 5])
+        a.logprob_start_len = 1
+        a.logprob.input_token_logprobs_val = [-0.1, -0.2]
+        a.logprob.input_token_logprobs_idx = [2, 3]
+        c.logprob_start_len = 1
+        b.output_ids.append(6)
+        c.output_ids.append(9)
+        a.kv.req_pool_idx = 0
+        a.kv.kv_committed_len = a.kv.kv_allocated_len = 4
+        c.kv.req_pool_idx = 2
+        c.kv.kv_committed_len = c.kv.kv_allocated_len = 3
+        b.kv.req_pool_idx = 1
+        b.kv.kv_committed_len = b.kv.kv_allocated_len = 3
+        scheduler.tree_cache.claim_kv_row.return_value = False
+        scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda req: setattr(
+            req.kv, "req_pool_idx", None
+        )
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.tree_cache.token_to_kv_pool_allocator = (
+            scheduler.token_to_kv_pool_allocator
+        )
+        manager = SimpleNamespace(
+            pending_lora_load_events={},
+            lora_weight_versions={},
+            lora_refs={"adapter-a": SimpleNamespace(lora_name="v1")},
+        )
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(lora_manager=manager)
+        )
+        batch = self._make_batch(scheduler, [a, b, c], with_tensors=True)
+        scheduler.running_batch = scheduler.last_batch = batch
+        scheduler.enable_overlap = True
+        scheduler.result_queue.append((batch, None))
+
+        def complete(batch: ScheduleBatch, result: object) -> None:
+            a.output_ids.append(7)
+            b.output_ids.append(8)
+
+        scheduler.process_batch_result = complete
+        scheduler.quiesce_lora_requests("adapter-a")
+        self.assertFalse(scheduler._engine_paused)
+        self.assertEqual(batch.reqs, [b])
+        self.assertEqual(batch.req_pool_indices.tolist(), [1])
+        self.assertEqual(scheduler.waiting_queue, [c, a])
+        self.assertEqual(list(a.output_ids), [4, 5, 7])
+        self.assertEqual(list(b.output_ids), [6, 8])
+        self.assertFalse(a.kv.holds_kv)
+        self.assertFalse(c.kv.holds_kv)
+        self.assertTrue(b.kv.holds_kv)
+        self.assertEqual(a.weight_version_events[-1].num_output_tokens, 3)
+        self.assertEqual(a.weight_version_events[-1].old_version, "v1")
+        self.assertFalse(b.weight_version_events)
+        self.assertFalse(scheduler.result_queue)
+        self.assertEqual(a.logprob.input_token_logprobs_val, [-0.1, -0.2])
+        self.assertEqual(a.logprob.input_token_logprobs_idx, [2, 3])
+        self.assertEqual(
+            compute_extend_logprob_start_len(
+                logprob_start_len=a.logprob_start_len,
+                prefix_len=0,
+                extend_len=6,
+                full_untruncated_fill_len=6,
+            ),
+            6,
+        )
+        self.assertEqual(c.logprob_start_len, 1)
+
+    def test_lora_retained_requests_do_not_consume_new_request_queue_capacity(
+        self,
+    ) -> None:
+        scheduler = self._new_scheduler()
+        retained, waiting, incoming = [self._make_req(rid) for rid in ("a", "b", "c")]
+        scheduler.lora_updater = SimpleNamespace(retained={retained})
+        scheduler.max_queued_requests = 1
+        scheduler.enable_priority_scheduling = False
+        scheduler.send_abort_output = MagicMock()
+        scheduler.waiting_queue = [retained]
+        self.assertFalse(scheduler._abort_on_queued_limit(waiting))
+        scheduler.waiting_queue.append(waiting)
+        self.assertTrue(scheduler._abort_on_queued_limit(incoming))
+        self.assertEqual(scheduler.waiting_queue, [retained, waiting])
+        scheduler.waiting_queue = [retained]
+        scheduler.max_queued_requests = 0
+        scheduler.enable_priority_scheduling = True
+        self.assertTrue(scheduler._abort_on_queued_limit(incoming))
+        self.assertEqual(scheduler.waiting_queue, [retained])
+
+    def test_lora_update_rejects_unsupported_parallelism_before_mutation(self) -> None:
+        scheduler = self._new_scheduler()
+        scheduler.is_generation = True
+        scheduler.dllm_config = None
+        scheduler.enable_continuous_input_polling = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.send_control_output = MagicMock()
+        request = UpdateLoRAAdapterReqInput(
+            lora_name="A", lora_path="/new", version="v2"
+        )
+        for flags in ({"pp_size": 2}, {"attn_cp_size": 2}, {"dcp_size": 2}):
+            with (
+                self.subTest(flags=flags),
+                get_context().override_server_args(
+                    enable_lora=True, tp_size=2, **flags
+                ),
+                patch("sglang.srt.managers.scheduler.is_cuda", return_value=True),
+            ):
+                scheduler.update_lora_adapter(request)
+                output = scheduler.send_control_output.call_args.args[0]
+                self.assertFalse(output.success)
+                self.assertIn("standard TP", output.error_message)
+                self.assertFalse(hasattr(scheduler, "lora_updater"))
+                self.assertFalse(scheduler._engine_paused)
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(

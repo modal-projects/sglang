@@ -51,6 +51,7 @@ class _FakeReq:
         sampling_mask_rows=None,
     ):
         self.rid = rid
+        self.lora_id = None
         self.http_worker_ipc = None
         self._finished = finished
         self.finished_reason = (
@@ -121,7 +122,7 @@ def _accumulator(
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
         is_request_level_customized_info_key=request_level_keys.__contains__,
-        current_weight_version=current_weight_version,
+        weight_version_of=lambda lora_id: current_weight_version,
         rust_server_mode=rust_server_mode,
     )
 
@@ -294,6 +295,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -326,6 +328,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
@@ -363,6 +366,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
         terminal = _FakeReq("terminal", [20], finished=True)
         quiet = _FakeReq("quiet", [10, 11])
@@ -403,6 +407,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
         first = _FakeReq("duplicate", [10], finished=True)
         second = _FakeReq("duplicate", [20], finished=True)
@@ -427,6 +432,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -452,6 +458,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -473,6 +480,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
                 enable_hicache_storage=lambda: False,
+                weight_version_of=lambda lora_id: "default",
                 rust_server=object(),
             )
 
@@ -538,6 +546,7 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
+            weight_version_of=lambda lora_id: "default",
             rust_server=rust_server,
         )
         streamer._stream_output_generation(
@@ -640,6 +649,7 @@ class TestOutputStreamerIndexerTopk(unittest.TestCase):
                     spec_algorithm=SpeculativeAlgorithm.NONE,
                     disaggregation_mode=DisaggregationMode.NULL,
                     enable_hicache_storage=lambda: False,
+                    weight_version_of=lambda lora_id: "default",
                 )
                 req = _FakeReq("r0", array("q", [10]), finished=True)
                 req.return_indexer_topk = True

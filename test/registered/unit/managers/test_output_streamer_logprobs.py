@@ -81,7 +81,7 @@ def _make_accumulator(
         get_cached_tokens_details=lambda req: None,
         rust_server_mode=rust_server_mode,
         is_request_level_customized_info_key=lambda key: False,
-        current_weight_version=None,
+        weight_version_of=lambda lora_id: None,
     )
 
 

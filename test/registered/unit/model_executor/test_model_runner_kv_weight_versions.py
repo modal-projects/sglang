@@ -30,7 +30,8 @@ class TestModelRunnerKvWeightVersions(CustomTestCase):
                     enable_prefill_weight_versions=enabled
                 )
                 batch = SimpleNamespace(
-                    out_cache_loc=torch.tensor([4, 5]) if has_slots else None
+                    out_cache_loc=torch.tensor([4, 5]) if has_slots else None,
+                    lora_ids=None,
                 )
                 with patch(
                     "sglang.srt.mem_cache.kv_weight_version_tracker.get_serving",
@@ -43,14 +44,38 @@ class TestModelRunnerKvWeightVersions(CustomTestCase):
                 if enabled and not draft and has_slots:
                     batch.out_cache_loc.fill_(9)
                     self.assertEqual(record.slot_indices.tolist(), [4, 5])
-                    self.assertEqual(record.version, "v0")
+                    self.assertEqual(record.versions, ["v0"])
                 else:
                     self.assertIsNone(record)
+
+    def test_each_row_records_the_version_of_its_adapter(self) -> None:
+        """Each row records its adapter's own version, or else the engine's."""
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.is_draft_worker = False
+        runner.server_args = SimpleNamespace(enable_prefill_weight_versions=True)
+        runner.lora_manager = SimpleNamespace(weight_versions={"x": "x3"})
+        padded_slots = torch.tensor([10, 11, 12, 13, 14, 15, 0, 0])
+        batch = SimpleNamespace(
+            out_cache_loc=padded_slots,
+            lora_ids=[None, "x", "y"],
+            extend_seq_lens_cpu=[2, 3, 1],
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_weight_version_tracker.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        ):
+            record = KvWeightVersionRecord.maybe_capture(
+                model_runner=runner, forward_batch=batch
+            )
+
+        self.assertEqual(record.slot_indices.tolist(), [10, 11, 12, 13, 14, 15])
+        self.assertEqual(record.versions, ["v0", "x3", "v0"])
+        self.assertEqual(record.segment_lens, [2, 3, 1])
 
     def test_target_worker_preserves_forward_provenance(self) -> None:
         """TP result construction retains the target forward record."""
         record = KvWeightVersionRecord.capture(
-            slot_indices=torch.tensor([4, 5]), version="v0"
+            slot_indices=torch.tensor([4, 5]), versions=["v0"]
         )
         output = ModelRunnerOutput(
             logits_output=None,
@@ -75,7 +100,7 @@ class TestModelRunnerKvWeightVersions(CustomTestCase):
     def test_result_copies_record_before_publishing_completion(self) -> None:
         """The shared result-copy path includes KV slots before its completion event."""
         record = KvWeightVersionRecord.capture(
-            slot_indices=torch.tensor([4, 5]), version="v0"
+            slot_indices=torch.tensor([4, 5]), versions=["v0"]
         )
         source = record.slot_indices
         completed: list[bool] = []

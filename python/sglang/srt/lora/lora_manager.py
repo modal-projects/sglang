@@ -731,6 +731,7 @@ class LoRAManager:
             self.configs.pop(lora_ref.lora_id, None)
             self.loras.pop(lora_ref.lora_id, None)
             self.lora_refs.pop(lora_ref.lora_id, None)
+            self.weight_versions.pop(lora_ref.lora_id, None)
             if loaded_lora_ref is not None:
                 self.num_pinned_loras -= int(loaded_lora_ref.pinned)
         except Exception as e:
@@ -1067,6 +1068,9 @@ class LoRAManager:
 
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
+
+        # By LoRA ID; an adapter without an entry runs on the engine's weight version.
+        self.weight_versions: Dict[str, str] = {}
 
         # Count of pinned LoRA adapters.
         self.num_pinned_loras: int = 0

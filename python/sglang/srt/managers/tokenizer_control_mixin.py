@@ -811,6 +811,9 @@ class TokenizerControlMixin:
                 rank_results = await self.update_lora_adapter_communicator(obj)
                 result = _merge_lora_update_results(rank_results)
                 if result.success:
+                    self._record_lora_weight_version(
+                        lora_id=new_adapter.lora_id, weight_version=obj.weight_version
+                    )
                     if reused:
                         await self.lora_registry.refresh(new_adapter)
                     else:
@@ -870,6 +873,7 @@ class TokenizerControlMixin:
                         lora_name=lora_ref.lora_name,
                         lora_path=lora_ref.lora_path,
                         pinned=bool(lora_ref.pinned),
+                        weight_version=self.lora_weight_versions.get(lora_ref.lora_id),
                     ),
                     new_name_only=True,
                 )
@@ -882,6 +886,7 @@ class TokenizerControlMixin:
                 lora_name=lora_ref.lora_name,
                 lora_path=lora_ref.lora_path,
                 pinned=lora_ref.pinned,
+                weight_version=self.lora_weight_versions.get(lora_ref.lora_id),
             )
         )
 
@@ -913,6 +918,9 @@ class TokenizerControlMixin:
                     lora_name=obj.lora_name, lora_path=obj.lora_path
                 )
                 self.lora_ref_cache[obj.lora_name] = adapter
+                self._record_lora_weight_version(
+                    lora_id=adapter.lora_id, weight_version=obj.weight_version
+                )
                 return LoadLoRAAdapterReqOutput(success=True)
             if reused and get_parallel().pp_size > 1:
                 raise ValueError(
@@ -986,7 +994,9 @@ class TokenizerControlMixin:
         )
         result = _merge_lora_update_results(rank_results)
         if result.success:
-            self._update_weight_version_if_provided(obj.weight_version)
+            self._record_lora_weight_version(
+                lora_id=adapter.lora_id, weight_version=obj.weight_version
+            )
             if reused:
                 await self.lora_registry.refresh(adapter)
             else:
@@ -1012,6 +1022,27 @@ class TokenizerControlMixin:
         return LoRARef(
             lora_name=lora_name, lora_path=lora_path, pinned=pinned, **identity
         )
+
+    def _record_lora_weight_version(
+        self: TokenizerManager, lora_id: str, weight_version: Optional[str]
+    ) -> None:
+        if weight_version is not None:
+            self.lora_weight_versions[lora_id] = weight_version
+
+    def weight_version_of(self: TokenizerManager, lora_id: Optional[str]) -> str:
+        engine = self.config_value("weight_version")
+        return (
+            engine
+            if lora_id is None
+            else self.lora_weight_versions.get(lora_id, engine)
+        )
+
+    def lora_weight_versions_by_name(self: TokenizerManager) -> Dict[str, str]:
+        return {
+            name: self.lora_weight_versions[ref.lora_id]
+            for name, ref in self.lora_ref_cache.items()
+            if ref.lora_id in self.lora_weight_versions
+        }
 
     def _check_lora_config(
         self: TokenizerManager, lora_name: str, lora_path: str
@@ -1247,7 +1278,9 @@ class TokenizerControlMixin:
                 # directly — an EVICT — and must keep the entry so disk-backed
                 # adapters can be implicitly reloaded later.
                 if result.success:
-                    self.lora_ref_cache.pop(obj.lora_name, None)
+                    defined = self.lora_ref_cache.pop(obj.lora_name, None)
+                    if defined is not None:
+                        self.lora_weight_versions.pop(defined.lora_id, None)
                 return result
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))

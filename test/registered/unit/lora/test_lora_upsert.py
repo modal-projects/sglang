@@ -62,6 +62,7 @@ def _make_manager(*, lora_no_cpu_backup=False) -> LoRAManager:
     manager.configs = {}
     manager.loras = {}
     manager.lora_refs = {}
+    manager.weight_versions = {}
     manager.num_pinned_loras = 0
     manager.lora_no_cpu_backup = lora_no_cpu_backup
     manager.attn_dp_enabled = False

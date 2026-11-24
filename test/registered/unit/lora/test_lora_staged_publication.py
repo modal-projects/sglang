@@ -53,6 +53,7 @@ def _manager():
         [LoRARef(lora_name=name, reloadable=False) for name in ("A@1", "B", "C")]
     )
     tm.lora_ref_cache = {}
+    tm.lora_weight_versions = {}
     tm._pending_lora_publications = {}
     tm.pending_lora_unloads = {}
     tm.update_lora_adapter_communicator = AsyncMock(

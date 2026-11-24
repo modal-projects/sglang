@@ -184,6 +184,7 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
             return_value=SimpleNamespace(success=success)
         )
         tm.lora_ref_cache = {"a": LoRARef(lora_name="a", lora_path="/x")}
+        tm.lora_weight_versions = {}
         return tm
 
     def test_explicit_unload_drops_ref_cache_entry(self):

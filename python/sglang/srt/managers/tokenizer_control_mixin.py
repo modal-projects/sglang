@@ -13,6 +13,7 @@ import msgspec
 from miles.backends.sglang_utils.gpu_delta import integration as gpu_delta
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -789,10 +790,8 @@ class TokenizerControlMixin:
                             f"LoRA adapter '{obj.lora_name}' is awaiting publication; "
                             "commit or abort its session before loading over it."
                         )
-                # A same-name adapter keeps its lora_id under upsert; otherwise
-                # the ref mints a new one.
                 new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
+                    self._catalog_ref(
                         lora_name=obj.lora_name,
                         lora_path=obj.lora_path,
                         pinned=obj.pinned,
@@ -900,14 +899,20 @@ class TokenizerControlMixin:
         async with self.lora_update_lock:
             self._check_lora_update_allowed(obj.lora_name)
             adapter, reused = await self.lora_registry.register_or_reuse(
-                LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path=obj.lora_path,
-                    pinned=obj.pinned,
+                self._catalog_ref(
+                    lora_name=obj.lora_name, lora_path=obj.lora_path, pinned=obj.pinned
                 ),
                 upsert=True,
             )
             if reused and new_name_only:
+                return LoadLoRAAdapterReqOutput(success=True)
+            if not reused and not new_name_only and not obj.pinned:
+                # Residency is the engine's: an adapter not loaded is only re-pointed,
+                # and the next request naming it loads the new version.
+                self._check_lora_config(
+                    lora_name=obj.lora_name, lora_path=obj.lora_path
+                )
+                self.lora_ref_cache[obj.lora_name] = adapter
                 return LoadLoRAAdapterReqOutput(success=True)
             if reused and get_parallel().pp_size > 1:
                 raise ValueError(
@@ -998,6 +1003,26 @@ class TokenizerControlMixin:
             del result.loaded_adapters[evicted]
 
         return result
+
+    def _catalog_ref(
+        self: TokenizerManager, lora_name: str, lora_path: str, pinned: Optional[bool]
+    ) -> LoRARef:
+        defined = self.lora_ref_cache.get(lora_name)
+        identity = {} if defined is None else {"lora_id": defined.lora_id}
+        return LoRARef(
+            lora_name=lora_name, lora_path=lora_path, pinned=pinned, **identity
+        )
+
+    def _check_lora_config(
+        self: TokenizerManager, lora_name: str, lora_path: str
+    ) -> None:
+        max_lora_rank = get_lora().max_lora_rank
+        rank = LoRAConfig(lora_path).r
+        if max_lora_rank is not None and rank > max_lora_rank:
+            raise ValueError(
+                f"LoRA adapter '{lora_name}' at {lora_path} has rank {rank}, above "
+                f"--max-lora-rank {max_lora_rank}"
+            )
 
     def _check_lora_update_allowed(self: TokenizerManager, lora_name: str) -> None:
         if lora_name in self.pending_lora_unloads:
@@ -1209,7 +1234,14 @@ class TokenizerControlMixin:
                 )
 
             async with self.lora_update_lock:
-                result = await self._unload_lora_adapter_locked(obj)
+                loaded = (
+                    obj.lora_name in self.pending_lora_unloads
+                    or await self.lora_registry.get_lora_id(obj.lora_name) is not None
+                )
+                if loaded or obj.lora_name not in self.lora_ref_cache:
+                    result = await self._unload_lora_adapter_locked(obj)
+                else:
+                    result = UnloadLoRAAdapterReqOutput(success=True)
                 # Explicit unload is a DELETE: drop the reload-catalog entry too.
                 # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked
                 # directly — an EVICT — and must keep the entry so disk-backed

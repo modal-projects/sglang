@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PauseGenerationReqInput,
     PrepareLoRAAdapterReqInput,
     PrepareLoRAAdapterReqOutput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateLoRAAdapterReqInput,
     msgpack_decode,
     msgpack_encode,
@@ -122,7 +124,9 @@ def _tokenizer(
 def _patched_tokenizer_context(tokenizer_workers=1):
     return patch.multiple(
         "sglang.srt.managers.tokenizer_control_mixin",
-        get_lora=lambda: SimpleNamespace(enable_lora=True, max_loaded_loras=None),
+        get_lora=lambda: SimpleNamespace(
+            enable_lora=True, max_loaded_loras=None, max_lora_rank=8
+        ),
         get_parallel=lambda: SimpleNamespace(dp_size=1, pp_size=1),
         get_serving=lambda: SimpleNamespace(tokenizer_worker_num=tokenizer_workers),
     )
@@ -182,10 +186,12 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
         self.assertFalse(tm.is_pause)
         self.assertEqual(registry.get_all_adapters()["a"].lora_path, "/v1")
 
-    def test_retract_of_a_new_name_does_not_pause(self):
+    def test_retract_of_a_new_pinned_name_does_not_pause(self):
         tm, events = _tokenizer(LoRARegistry())
+        update = _update("retract")
+        update.pinned = True
         with _patched_tokenizer_context():
-            result = asyncio.run(tm.update_lora_adapter(_update("retract")))
+            result = asyncio.run(tm.update_lora_adapter(update))
         self.assertTrue(result.success, result.error_message)
         self.assertEqual(events, ["prepare", "apply"])
 
@@ -294,7 +300,115 @@ class TestUpdateLoRAAdapterTokenizer(CustomTestCase):
                 tm.record_config_updates.assert_not_called()
 
 
+def _adapter_dir(root: str, name: str, rank: int = 8) -> str:
+    path = os.path.join(root, name)
+    os.makedirs(path)
+    with open(os.path.join(path, "adapter_config.json"), "w") as f:
+        f.write('{"r": %d, "lora_alpha": 16, "target_modules": ["q_proj"]}' % rank)
+    return path
+
+
+class TestUpdateFollowsResidency(CustomTestCase):
+    def _update_x(self, tm, path, pinned=False):
+        with _patched_tokenizer_context():
+            return asyncio.run(
+                tm.update_lora_adapter(
+                    UpdateLoRAAdapterReqInput(
+                        lora_name="x", lora_path=path, pinned=pinned
+                    )
+                )
+            )
+
+    def test_an_evicted_adapter_only_learns_where_its_new_version_is(self):
+        with tempfile.TemporaryDirectory() as root:
+            tm, events = _tokenizer(LoRARegistry())
+            tm.lora_ref_cache["x"] = LoRARef(
+                lora_id="x-id", lora_name="x", lora_path=_adapter_dir(root, "v1")
+            )
+            new = _adapter_dir(root, "v2")
+
+            result = self._update_x(tm, new)
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, [])
+        self.assertNotIn("x", tm.lora_registry.get_all_adapters())
+        self.assertEqual(
+            (tm.lora_ref_cache["x"].lora_id, tm.lora_ref_cache["x"].lora_path),
+            ("x-id", new),
+        )
+        tm._evict_lru_over_cap.assert_not_called()
+
+    def test_a_name_never_defined_is_defined_without_loading(self):
+        with tempfile.TemporaryDirectory() as root:
+            tm, events = _tokenizer(LoRARegistry())
+            result = self._update_x(tm, _adapter_dir(root, "v1"))
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, [])
+        self.assertIn("x", tm.lora_ref_cache)
+        self.assertNotIn("x", tm.lora_registry.get_all_adapters())
+
+    def test_a_pinned_update_loads_the_adapter(self):
+        with tempfile.TemporaryDirectory() as root:
+            tm, events = _tokenizer(LoRARegistry())
+            result = self._update_x(tm, _adapter_dir(root, "v1"), pinned=True)
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, ["prepare", "apply"])
+        self.assertIn("x", tm.lora_registry.get_all_adapters())
+
+    def test_a_version_without_a_readable_config_fails_at_the_update(self):
+        with tempfile.TemporaryDirectory() as root:
+            tm, _ = _tokenizer(LoRARegistry())
+            result = self._update_x(tm, os.path.join(root, "missing"))
+            too_wide = self._update_x(tm, _adapter_dir(root, "wide", rank=16))
+
+        self.assertFalse(result.success)
+        self.assertFalse(too_wide.success)
+        self.assertIn("--max-lora-rank", too_wide.error_message)
+        self.assertNotIn("x", tm.lora_ref_cache)
+
+    def test_a_reload_keeps_the_adapters_lora_id(self):
+        tm, events = _tokenizer(LoRARegistry())
+        tm.lora_ref_cache["x"] = LoRARef(lora_id="x-id", lora_name="x", lora_path="/v2")
+        with _patched_tokenizer_context():
+            result = asyncio.run(
+                tm._load_lora_adapter_on_demand(tm.lora_ref_cache["x"])
+            )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, ["prepare", "apply"])
+        self.assertEqual(tm.applies[0].load.lora_id, "x-id")
+        self.assertEqual(tm.lora_registry.get_all_adapters()["x"].lora_id, "x-id")
+
+
 class TestLoadOnDemand(CustomTestCase):
+    def _delete_x(self, loaded: bool):
+        x = LoRARef(lora_id="x-id", lora_name="x", lora_path="/v2")
+        registry = LoRARegistry()
+        if loaded:
+            asyncio.run(registry.register(x))
+        tm, events = _tokenizer(registry)
+        tm.lora_ref_cache["x"] = x
+        if loaded:
+            tm._unload_lora_adapter_locked = AsyncMock(
+                return_value=UnloadLoRAAdapterReqOutput(success=True)
+            )
+        with _patched_tokenizer_context():
+            result = asyncio.run(
+                TokenizerManager.unload_lora_adapter(
+                    tm, UnloadLoRAAdapterReqInput(lora_name="x")
+                )
+            )
+        return result, tm, events
+
+    def test_an_adapter_not_loaded_is_deleted_without_an_unload(self):
+        result, tm, events = self._delete_x(loaded=False)
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(events, [])
+        self.assertEqual(tm.lora_ref_cache, {})
+
     def _load(self, registry, name="b", tokenizer_workers=1, **kwargs):
         tm, events = _tokenizer(registry, **kwargs)
         with _patched_tokenizer_context(tokenizer_workers):

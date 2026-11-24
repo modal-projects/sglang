@@ -360,8 +360,14 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
-        assert not self.attn_dp_enabled or lora_ref.pinned, (
-            "DP-attention LoRA requires pinned adapters"
+        # Under DP attention every rank must make the same slot updates for the gathered batch.
+        # Pinning guarantees the gathered set always fits the pool; so does a pool that holds
+        # every adapter the server may load (slot order is sorted, eviction deterministic).
+        max_loaded = get_lora().max_loaded_loras
+        all_fit = max_loaded is not None and max_loaded <= self.max_loras_per_batch
+        assert not self.attn_dp_enabled or lora_ref.pinned or all_fit, (
+            "DP-attention LoRA requires pinned adapters, or --max-loaded-loras <= "
+            "--max-loras-per-batch"
         )
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
@@ -538,8 +544,15 @@ class LoRAManager:
         active_lora_ids = set(forward_batch.lora_ids)
         if self.attn_dp_enabled:
             get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
+            # Graph replays pad lora_ids with None up to the captured batch size; the
+            # padding rows need no slot (any slot will do), so gather only real requests'
+            # adapters. Otherwise a pool holding every adapter overflows on padding alone.
+            num_padding = getattr(forward_batch, "num_padding", 0) or 0
+            real_lora_ids = forward_batch.lora_ids[
+                : len(forward_batch.lora_ids) - num_padding
+            ]
             gathered_lora_ids = get_parallel().tp_group.all_gather_object(
-                forward_batch.lora_ids
+                real_lora_ids
             )
             active_lora_ids = {
                 lora_id
@@ -552,6 +565,13 @@ class LoRAManager:
                     "the memory pool can hold"
                 )
             self.fetch_new_loras(active_lora_ids)
+            # Every rank's request slots in rank order, for backends that build the TP-global
+            # routing on the CPU (decode: one row per request) instead of gathering it on the GPU.
+            base_slot = self.memory_pool.uid_to_buffer_id.get(None, 0)
+            self.lora_backend.dp_gathered_slots = [
+                [self.memory_pool.uid_to_buffer_id.get(uid, base_slot) for uid in ids]
+                for ids in gathered_lora_ids
+            ]
 
         base_weight_index = self.memory_pool.uid_to_buffer_id.get(None, 0)
         weight_indices = [base_weight_index] * len(forward_batch.lora_ids)

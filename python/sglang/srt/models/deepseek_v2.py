@@ -372,6 +372,24 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
+        # LoRA (blackwell backend) on an MXFP8 MLP with unaligned slices (DeepSeek-V4.1's TP
+        # shared expert): both projections and the clamped SwiGLU between them in 3 launches
+        lora_be = getattr(self.gate_up_proj, "lora_backend", None)
+        if (
+            self.swiglu_limit is not None
+            and gateup_pre_quant is None
+            and isinstance(x, torch.Tensor)
+            and getattr(lora_be, "takes_mlp_mx", False)
+            and getattr(self.down_proj, "lora_backend", None) is lora_be
+            and self.gate_up_proj.lora_active
+            and self.down_proj.lora_active
+        ):
+            out = lora_be.forward_mlp_mx(
+                self.gate_up_proj, self.down_proj, x, float(self.swiglu_limit)
+            )
+            if out is not None:
+                return out
+
         if gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
@@ -598,6 +616,33 @@ class MoEGate(nn.Module):
             logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
+
+
+def _blackwell_shared_fold(block, hidden_states) -> bool:
+    """--lora-backend blackwell with routed LoRA on GLM-5.3 Flash's FP8 block-scaled experts
+    (Triton runner): hand the TP shared expert to the fused routed path (decode batches);
+    FusedMoEWithLoRA adds it itself when the fused path declines a batch."""
+    experts = getattr(block, "experts", None)
+    runner = getattr(experts, "_lora_runner_backend", None)
+    if runner is None or getattr(experts, "_mxfp4_lora", False):
+        return False
+    fp8b = (
+        runner.is_triton()
+        and getattr(experts.base_layer, "w13_weight", None) is not None
+        and experts.base_layer.w13_weight.dtype == torch.float8_e4m3fn
+    )
+    if not fp8b:
+        return False
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+    from sglang.srt.runtime_context import LoRABatchLayout
+
+    # the routed experts must take the LoRA path, which runs the shared expert itself
+    # whenever the fused kernels do not
+    if runner.is_lora() or (
+        experts.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None
+    ):
+        return False
+    return bw_experts.shared_fold_ok_fp8b(block, hidden_states)
 
 
 class MoEOutput(NamedTuple):
@@ -1077,6 +1122,25 @@ class DeepseekV2MoE(nn.Module):
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
+            if not skip_shared_experts and _blackwell_shared_fold(self, hidden_states):
+                # --lora-backend blackwell: the shared expert runs inside the fused routed
+                # expert kernels (as one more expert); the MoE dispatch runs it otherwise
+                from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+                bw_experts.SHARED_BLOCK[0] = self
+                try:
+                    return self.forward_normal(
+                        hidden_states,
+                        gemm_output_zero_allocator,
+                        input_ids,
+                        input_ids_global=input_ids_global,
+                        skip_shared_experts=True,
+                        use_vision_topk=use_vision_topk,
+                        return_moe_output=return_moe_output,
+                        leave_output_sum=leave_output_sum,
+                    )
+                finally:
+                    bw_experts.SHARED_BLOCK[0] = None
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 if leave_output_sum:
@@ -1208,10 +1272,13 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
+        # A LoRA-wrapped expert layer finalizes inside its own MoE-LoRA pipeline.
+        can_defer = hasattr(self.experts, "forward_deferred_finalize")
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
+            and can_defer
             and self.experts.supports_deferred_finalize
             and (
                 self._deferred_finalize_max_tokens <= 0
@@ -1221,6 +1288,7 @@ class DeepseekV2MoE(nn.Module):
         # NOTE: if `return_moe_output`, always try to defer finalize
         deferred_finalize = deferred_finalize or (
             return_moe_output
+            and can_defer
             and isinstance(self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         )
         if deferred_finalize:

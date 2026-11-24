@@ -324,8 +324,12 @@ class TLinear:
         self.fixed_bytes = base_fixed + (self.zbytes if self.zded else 0)
         fit = (SMEM_LIMIT - self.fixed_bytes) // self.stage_bytes
         self.stages = min(8, fit) if stages is None else stages
+        if stages is None:  # the estimate undercounts past 128 tokens: fit the real layout
+            while self.stages > 2 and self.storage_bytes() > SMEM_LIMIT:
+                self.stages -= 1
         assert self.stages >= 2, self.stages
         assert self.stages * self.stage_bytes + self.fixed_bytes <= SMEM_LIMIT
+        assert self.storage_bytes() <= SMEM_LIMIT, (self.storage_bytes(), self.stages)
         # FP32 tiles parked in the drained ring for the cluster reductions
         ring = self.stages * (self.nacc * self.w_tile + self.n_mma * self.row_b)
         assert ring >= 128 * self.n_mma * 4  # LoRA-A
@@ -352,6 +356,26 @@ class TLinear:
         self.tiler = (128, self.n_mma, self.ke)
         self.tiler16 = (128, self.n_mma, self.kb)
         self.tiler_sfb = (128, max(128, self.n_mma), 128)
+
+    def storage_bytes(self):
+        """SMEM of the kernel's Storage struct (field order, sizes and alignments as in
+        __call__) at self.stages, plus allocator slack."""
+        S = self.stages
+        al = lambda o, a: (o + a - 1) // a * a
+        sf_k = self.ke // 32 if self.mx else 0
+        off = 4 * S * 8 + 8 + 8 + 4  # barriers, rbar, acc_full, tmem_holder
+        off = al(off, 1024) + S * self.nacc * self.w_tile
+        off = al(off, 1024) + S * self.n_mma * self.row_b
+        off = al(off, 128) + (S * 128 * sf_k if self.mx else 128)
+        off = al(off, 128) + (S * max(128, self.n_mma) * sf_k if self.mx else 128)
+        off = al(off, 128) + self.n_mma * 32 * self.zw * 2
+        off = al(off, 16) + self.n_mma * 4
+        off = al(off, 16) + self.n_mma * 4
+        hd = self.hd if self.epi == "qkv" else 0
+        off = al(off, 16) + 4 * (4 * self.n_mma + 2 * hd + 128)
+        off = al(off, 1024) + (self.zbytes if self.zded else 1024)
+        off = al(off, 1024) + WGS * self.obuf * self.chunk * 128 * 2
+        return off + 1024
 
     def __repr__(self):
         return (f"TLinear_{'mx' if self.mx else 'bf'}_N{self.N}_K{self.K}_T{self.T}"

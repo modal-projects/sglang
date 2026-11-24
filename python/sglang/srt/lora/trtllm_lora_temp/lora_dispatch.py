@@ -659,6 +659,109 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     lora_info,
     base_layer,
 ) -> StandardCombineInput:
+    return _mxfp4_lora_routed(
+        dispatch_output, quant_info, runner_config, lora_info, base_layer
+    )
+
+
+_DECOMPOSED_WARMED: set = set()
+
+
+def _decomposed_warm_tokens(lo: int, hi: int) -> list[int]:
+    """Token counts in (lo, hi] spaced finely where the virtual-expert kernels' configs
+    change (split-K, block M and the tuned expand configs all move with the token count),
+    coarsely past 4096 where they settle."""
+    ts = {*range(lo + 1, min(hi, 1024) + 1, 8), *range(1024, min(hi, 4096) + 1, 64),
+          *range(4096, hi + 1, 512), hi}
+    return sorted(t for t in ts if lo < t <= hi)
+
+
+def _warm_decomposed_mxfp4(
+    dispatch_output, quant_info, runner_config, lora_info, base_layer
+) -> None:
+    """--lora-backend blackwell sends batches past the fused kernels' token cap down the
+    decomposed path, whose Triton kernels compile per token-count class. Single-request
+    prefills of unseen sizes then compiled mid-serve, stalling every rank (and every
+    decoding request) for tens of seconds each. Compile them all once, at the first eager
+    call (server warmup / graph-capture warmup), by running the decomposed path on synthetic
+    inputs across the token range. No collectives run inside, so ranks warm independently.
+    SGLANG_BLACKWELL_MOE_LORA_WARM=0 skips it."""
+    import dataclasses
+    import logging
+    import os
+    import time
+
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+    from sglang.srt.runtime_context import get_server_args
+
+    hidden_states = dispatch_output.hidden_states
+    key = (tuple(hidden_states.shape[1:]), hidden_states.dtype, runner_config.top_k,
+           tuple(lora_info.gate_up_lora_a_weights.shape),
+           tuple(lora_info.down_lora_a_weights.shape))
+    if (
+        key in _DECOMPOSED_WARMED
+        or bw_experts.FORCE_DECOMPOSED[0]
+        or torch.cuda.is_current_stream_capturing()
+        or os.environ.get("SGLANG_BLACKWELL_MOE_LORA_WARM", "1") == "0"
+    ):
+        return
+    _DECOMPOSED_WARMED.add(key)
+    try:
+        args = get_server_args()
+    except Exception:  # no server (kernel tests): nothing serves mixed-size prefills
+        return
+    caps = [c for c in (args.chunked_prefill_size, args.max_prefill_tokens) if c and c > 0]
+    hi = min(caps) if caps else 8192
+    tokens = _decomposed_warm_tokens(bw_experts.MAX_TOKENS, hi)
+    if not tokens:
+        return
+    dev, top_k = hidden_states.device, runner_config.top_k
+    n_experts = quant_info.global_num_experts
+    slots = lora_info.gate_up_lora_a_weights.shape[0]
+    g = torch.Generator(device=dev).manual_seed(0)
+    t0 = time.perf_counter()
+    bw_experts.FORCE_DECOMPOSED[0] = True
+    try:
+        for T in tokens:
+            rows = torch.arange(T * top_k, device=dev)
+            topk_ids = ((rows * 7) % n_experts).view(T, top_k).to(
+                dispatch_output.topk_output.topk_ids.dtype)
+            topk = dispatch_output.topk_output._replace(
+                topk_ids=topk_ids,
+                topk_weights=torch.full((T, top_k), 1.0 / top_k, device=dev,
+                                        dtype=dispatch_output.topk_output.topk_weights.dtype),
+                router_logits=None,
+            )
+            x = torch.randn(T, *hidden_states.shape[1:], device=dev, generator=g,
+                            dtype=hidden_states.dtype) * 0.01
+            info = dataclasses.replace(
+                lora_info,
+                token_lora_mapping=(torch.arange(T, device=dev, dtype=torch.int32) % slots),
+                adapter_enabled=torch.ones(slots, device=dev, dtype=torch.int32),
+                has_active_lora=True,
+                cg_buffers=None,
+            )
+            _mxfp4_lora_routed(
+                dispatch_output._replace(hidden_states=x, hidden_states_scale=None,
+                                         topk_output=topk),
+                quant_info, runner_config, info, base_layer,
+            )
+        torch.cuda.synchronize()
+    finally:
+        bw_experts.FORCE_DECOMPOSED[0] = False
+    torch.cuda.empty_cache()
+    logging.getLogger(__name__).info(
+        "blackwell MoE LoRA: warmed the decomposed path at %d token counts in (%d, %d] "
+        "in %.1fs", len(tokens), bw_experts.MAX_TOKENS, hi, time.perf_counter() - t0)
+
+
+def _mxfp4_lora_routed(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    lora_info,
+    base_layer,
+) -> StandardCombineInput:
     """MXFP4-expert (DeepSeek-V4.1) MoE-LoRA on the decomposed TRT-LLM pipeline.
 
     The op quantizes the routed input to MXFP8 itself, runs the raw gate/up GEMM,
@@ -694,6 +797,20 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     topk_weights = topk_output.topk_weights
     top_k = runner_config.top_k
 
+    # --lora-backend blackwell: fused MXFP4 expert GEMMs with the BF16 LoRA in-kernel (decode)
+    from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+    if bw_experts.enabled() and lora_info.lora_use_virtual_experts:
+        _warm_decomposed_mxfp4(
+            dispatch_output, quant_info, runner_config, lora_info, base_layer
+        )
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            fused_out = torch.empty_like(hidden_states)
+        if bw_experts.forward(hidden_states, topk_ids, topk_weights, quant_info, lora_info,
+                              base_layer, fused_out) is not None:
+            return StandardCombineInput(hidden_states=fused_out)
     assert bool(lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0), (
         "MXFP4 trtllm LoRA requires --lora-use-virtual-experts."
     )

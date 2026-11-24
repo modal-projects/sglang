@@ -1281,6 +1281,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             return self._base_run_moe_core(dispatch_output=dispatch_output)
         from sglang.srt.lora.moe.runner import MoeLoraBatch
 
+        # --lora-backend blackwell: fused BF16 expert GEMMs with the LoRA in-kernel
+        from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+        if bw_experts.enabled():
+            out = bw_experts.forward_bf16(dispatch_output, self, batch_info.token_slots)
+            if out is not None:
+                from sglang.srt.layers.moe.token_dispatcher.standard import (
+                    StandardCombineInput,
+                )
+
+                return StandardCombineInput(hidden_states=out)
+
         return self._moe_lora_runner.run(
             dispatch_output,
             MoeLoraBatch(
@@ -1321,6 +1333,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 base_layer.num_experts if quant_info.expert_map is not None else -1
             )
 
+        fused = None
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():
             from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
@@ -1343,11 +1356,47 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
         # ===== END TO BE REFACTORED ====
         else:
-            combine_input = self._lora_runner.run(
-                dispatch_output, quant_info, lora_info=lora_info
-            )
+            # --lora-backend blackwell: fused BF16 expert GEMMs with the LoRA in-kernel
+            from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+            if bw_experts.enabled():
+                slots = lora_info.token_lora_mapping
+                if slots is None:
+                    # decode: one token per request, the request's adapter slot
+                    bi = getattr(self.lora_backend, "batch_info", None)
+                    T = dispatch_output.hidden_states.shape[0]
+                    if (bi is not None and not getattr(bi, "is_prefill", False)
+                            and getattr(bi, "bs", -1) == T
+                            and getattr(bi, "req_weight_indices", None) is not None):
+                        slots = bi.req_weight_indices
+                if slots is not None:
+                    if self.base_layer.w13_weight.dtype == torch.float8_e4m3fn:
+                        # FP8 experts with 128x128 block scales (GLM-5.3 Flash)
+                        fused = bw_experts.forward_fp8b(dispatch_output, self, slots)
+                    else:
+                        fused = bw_experts.forward_bf16(dispatch_output, self, slots)
+
+            if fused is not None:
+                from sglang.srt.layers.moe.token_dispatcher.standard import (
+                    StandardCombineInput,
+                )
+
+                combine_input = StandardCombineInput(hidden_states=fused)
+            else:
+                combine_input = self._lora_runner.run(
+                    dispatch_output, quant_info, lora_info=lora_info
+                )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
+
+        from sglang.srt.lora.backend.blackwell import experts as bw_experts
+
+        shared_block = bw_experts.SHARED_BLOCK[0]
+        if shared_block is not None and fused is None:
+            # GLM's MoE block handed us its shared expert but the fused path declined this batch
+            final_hidden_states = final_hidden_states + shared_block._forward_shared_experts(
+                hidden_states
+            )
 
         return final_hidden_states
 

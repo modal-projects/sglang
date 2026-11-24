@@ -224,14 +224,22 @@ def _kernels(E, I, H, MB, SL, clamp, device, EA):
     if key not in _KERNELS:
         from . import texperts
         sms = torch.cuda.get_device_properties(device).multi_processor_count
+        # Expert-major work order: consecutive items stream one expert's row tiles, 4-6%
+        # more weight bandwidth than row-tile major on DeepSeek-V4.1's EP-rank shapes
+        # (64-512 tokens, B300; texperts_check.py bw_sweep).
         gu = texperts.TExperts(E, 2 * I, H, MB, n_slots=SL, w_slice=64, epi="swiglu",
                                clamp=clamp, zfix=True, sms=sms, fold_a=True, a_experts=EA,
-                               zd_fix=True)
+                               zd_fix=True, order="m" if _LEGACY_SCHED else "e")
         assert gu.gu32
         dn = texperts.TExperts(E, H, I, MB, n_slots=SL, w_slice=32, epi="down", zfix=True,
-                               sms=sms, lora32=True)
+                               sms=sms, lora32=True, order="m" if _LEGACY_SCHED else "e")
         _KERNELS[key] = dict(gu=gu, dn=dn, gu_fn=None, dn_fn=None)
     return _KERNELS[key]
+
+
+# SGLANG_BLACKWELL_MOE_SCHED=legacy: the schedule before the bandwidth tuning (row-tile major
+# MXFP4 kernels, as many ring stages as fit for MXFP8), for A/B measurements.
+_LEGACY_SCHED = os.environ.get("SGLANG_BLACKWELL_MOE_SCHED") == "legacy"
 
 
 def _t_max(T):
@@ -602,13 +610,17 @@ def _kernels_fp8(E, I, H, MB, SL, EA, clamp, device, sh=None):
         # gate/up LoRA-A shrink inside the kernel (A-items). A separate Triton shrink is faster
         # in isolation, but with the folded shared expert its dense LoRA-A costs ~1.5 ms/step
         # at batch 64 (serving), vs ~0.15 ms for the A-items
+        # 8 ring stages, not the 10-11 that fit: 2-5% more weight bandwidth on GLM-5.3-Flash's
+        # EP-rank shapes (64-512 tokens, B300; texperts_check.py bw_sweep).
         gu = texperts.TExperts(ES, 2 * I, H, MB, base="mxfp8", n_slots=SL, w_slice=64,
                                epi="swiglu", clamp=clamp, zfix=True, sms=sms, fold_a=True,
                                a_experts=EA, zd_fix=True, a_ks=2, shared_e=se, a2_experts=E,
-                               m_tiles_sh=sh[0] if sh else None)
+                               m_tiles_sh=sh[0] if sh else None,
+                               stages=None if _LEGACY_SCHED else 8)
         dn = texperts.TExperts(ES, H, I, MB, base="mxfp8", n_slots=SL, w_slice=32, epi="down",
                                zfix=True, sms=sms, lora32=True, shared_e=se,
-                               k_tiles_sh=sh[1] // 128 if sh else None)
+                               k_tiles_sh=sh[1] // 128 if sh else None,
+                               stages=None if _LEGACY_SCHED else 8)
         _KERNELS[key] = dict(gu=gu, dn=dn, gu_fn=None, dn_fn=None, dn_fold=None)
     return _KERNELS[key]
 

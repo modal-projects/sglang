@@ -568,6 +568,7 @@ class LoRAManager:
             lora = self.loras[uid]
             lora_ranks[weight_index] = lora.config.r
             scalings[weight_index] = lora.scaling
+        self.lora_backend.sync_lora_weights(self.memory_pool.weights_version)
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(

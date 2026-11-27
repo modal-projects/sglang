@@ -348,7 +348,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
-from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts import (
+    ROUTED_EXPERTS_WIRE_DTYPES,
+    destroy_global_experts_capturer,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -3069,6 +3072,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
+                routed_experts_dtype=recv_req.routed_experts_dtype,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -3363,6 +3367,14 @@ class Scheduler(
 
         if recv_req.return_routed_experts:
             error_msg = None
+            if (
+                recv_req.routed_experts_dtype is not None
+                and recv_req.routed_experts_dtype not in ROUTED_EXPERTS_WIRE_DTYPES
+            ):
+                error_msg = (
+                    f"unsupported routed_experts_dtype={recv_req.routed_experts_dtype!r}; "
+                    f"choose from {sorted(ROUTED_EXPERTS_WIRE_DTYPES)}"
+                )
             if recv_req.routed_experts_start_len < 0:
                 error_msg = (
                     f"{recv_req.routed_experts_start_len=} is lower than 0. "

@@ -142,7 +142,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_experts = _infer_num_routed_experts(model_config)
         cache_dtype = (
             torch.int16
-            if num_experts is not None and num_experts <= _INT16_MAX
+            if num_experts is not None
+            and num_experts + num_fused_shared_experts <= _INT16_MAX
             else torch.int32
         )
 
@@ -158,6 +159,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         )
 
         # Rebuild the full token batch before routed-expert readback.
+        # Keep gather_buffer int32 because NCCL has no ncclInt16; super().capture
+        # narrows into the int16 device_cache after the all-gather.
         if _is_scattered_a2a_backend():
             attn_tp_size = (
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
@@ -167,7 +170,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                     self.device_cache.buffer.shape[0] * attn_tp_size,
                     self.device_cache.buffer.shape[2],
                 ),
-                dtype=self.device_cache.buffer.dtype,
+                dtype=torch.int32,
                 device=device,
             )
 
@@ -185,7 +188,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
         if _is_scattered_a2a_backend():
-            local_topk = topk_indices.to(self.gather_buffer.dtype)
+            local_topk = topk_indices.to(torch.int32)
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]

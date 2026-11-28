@@ -69,7 +69,7 @@ def encode_routed_experts_tensor(
         if requested == "uint8" and not (0 <= low and high <= _UINT8_MAX):
             actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
         elif requested == "uint16" and not (0 <= low and high <= _UINT16_MAX):
-            actual = "int32"
+            actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
         elif requested == "int16" and not (-32768 <= low and high <= _INT16_MAX):
             actual = "int32"
     target_dtype = ROUTED_EXPERTS_WIRE_DTYPES[actual]

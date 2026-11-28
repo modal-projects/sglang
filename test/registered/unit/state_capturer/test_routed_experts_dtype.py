@@ -1,3 +1,5 @@
+"""Unit tests for int16 routed-experts caches and compact wire dtypes."""
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +12,9 @@ from sglang.srt.state_capturer.routed_experts import (
     encode_routed_experts_tensor,
     extract_routed_experts_from_meta_info,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_device_cache_int16_halves_memory():
@@ -55,7 +60,7 @@ def test_encode_and_extract_routed_experts_wire_dtypes(
     np.testing.assert_array_equal(decoded, tensor.numpy().reshape(-1))
 
 
-def test_uint8_request_falls_back_safely_when_ids_exceed_255_or_negative():
+def test_unsigned_wire_dtypes_fall_back_safely_to_int16_or_int32():
     wide = torch.tensor([[[0, 287], [1, 255]]], dtype=torch.int16)
     b64, actual = encode_routed_experts_tensor(wide, "uint8")
     assert actual == "int16"
@@ -66,20 +71,35 @@ def test_uint8_request_falls_back_safely_when_ids_exceed_255_or_negative():
     np.testing.assert_array_equal(decoded, wide.numpy().reshape(-1))
 
     padded = torch.tensor([[[-1, -1], [2, 3]]], dtype=torch.int16)
-    b64_pad, actual_pad = encode_routed_experts_tensor(padded, "uint8")
-    assert actual_pad == "int16"
-    decoded_pad = extract_routed_experts_from_meta_info(
-        {"meta_info": {"routed_experts": b64_pad, "routed_experts_dtype": actual_pad}}
-    )
-    np.testing.assert_array_equal(decoded_pad, padded.numpy().reshape(-1))
+    for req_dtype in ("uint8", "uint16"):
+        b64_pad, actual_pad = encode_routed_experts_tensor(padded, req_dtype)
+        assert actual_pad == "int16"
+        decoded_pad = extract_routed_experts_from_meta_info(
+            {
+                "meta_info": {
+                    "routed_experts": b64_pad,
+                    "routed_experts_dtype": actual_pad,
+                }
+            }
+        )
+        assert decoded_pad.dtype == np.int16
+        np.testing.assert_array_equal(decoded_pad, padded.numpy().reshape(-1))
 
 
 def test_infer_num_routed_experts_and_invalid_dtype():
-    assert _infer_num_routed_experts(
-        SimpleNamespace(hf_text_config=SimpleNamespace(n_routed_experts=288))
-    ) == 288
-    assert _infer_num_routed_experts(
-        SimpleNamespace(hf_text_config=SimpleNamespace(num_experts=128))
-    ) == 128
+    assert (
+        _infer_num_routed_experts(
+            SimpleNamespace(hf_text_config=SimpleNamespace(n_routed_experts=288))
+        )
+        == 288
+    )
+    assert (
+        _infer_num_routed_experts(
+            SimpleNamespace(hf_text_config=SimpleNamespace(num_experts=128))
+        )
+        == 128
+    )
     with pytest.raises(ValueError, match="unsupported routed_experts_dtype"):
-        encode_routed_experts_tensor(torch.zeros((1, 1, 1), dtype=torch.int16), "float32")
+        encode_routed_experts_tensor(
+            torch.zeros((1, 1, 1), dtype=torch.int16), "float32"
+        )

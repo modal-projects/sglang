@@ -3390,6 +3390,7 @@ class Scheduler(
 
             if error_msg is not None:
                 req.routed_experts_start_len = 0
+                req.routed_experts_dtype = None
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return

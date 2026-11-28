@@ -150,6 +150,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.state_capturer.base import encode_tensor_b64
 from sglang.srt.runtime_context import (
     assert_published,
     get_context,
@@ -2653,11 +2654,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         req_dtype is not None or emitted_dtype != "int32"
                     ):
                         meta_info["routed_experts_dtype"] = emitted_dtype
+                    if getattr(recv_obj, "routed_experts_num_layers", None) is not None:
+                        meta_info["routed_experts_num_layers"] = (
+                            recv_obj.routed_experts_num_layers
+                        )
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
                     if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                        val = encode_tensor_b64(val)
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]

@@ -404,7 +404,7 @@ class InklingGate(nn.Module):
         # the standard path; the fused kernel's packed output never exposes them, so
         # bypass the fused shortcut whenever an experts capturer is active.
         if (
-            get_global_experts_capturer() is None
+            not get_exec().features.enable_return_routed_experts
             and envs.SGLANG_OPT_USE_FUSED_GATE_TOPK.get()
             and self.n_total_experts == _INKLING_FUSED_GATE_OUT_FEATURES
             and self.gate_activation == "sigmoid"

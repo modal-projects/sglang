@@ -33,15 +33,34 @@ _UINT16_MAX = 65535
 _UINT8_MAX = 255
 
 
-def _infer_num_routed_experts(model_config: ModelConfig) -> Optional[int]:
-    hf_cfg = getattr(model_config, "hf_text_config", None)
-    if hf_cfg is None:
+def _is_scattered_a2a_backend() -> bool:
+    """Return whether routed tokens are scattered across attention-TP ranks."""
+    backend = get_moe_a2a_backend()
+    return backend.is_deepep() or backend.is_deepep_v2()
+
+
+def _get_max_routed_expert_count(hf_text_config) -> Optional[int]:
+    if hf_text_config is None:
         return None
-    for attr in ("n_routed_experts", "num_experts", "num_local_experts", "moe_num_experts"):
-        val = getattr(hf_cfg, attr, None)
-        if isinstance(val, int) and val > 0:
-            return val
-    return None
+    counts = [
+        val
+        for attr in (
+            "max_n_routed_experts",
+            "n_routed_experts",
+            "num_experts",
+            "num_local_experts",
+            "moe_num_experts",
+        )
+        if isinstance((val := getattr(hf_text_config, attr, None)), int) and val > 0
+    ]
+    if not counts:
+        return None
+    extra = getattr(hf_text_config, "zero_expert_num", 0) or 0
+    return max(counts) + int(extra)
+
+
+def _infer_num_routed_experts(model_config: ModelConfig) -> Optional[int]:
+    return _get_max_routed_expert_count(getattr(model_config, "hf_text_config", None))
 
 
 def encode_routed_experts_tensor(
@@ -63,26 +82,25 @@ def encode_routed_experts_tensor(
         )
     arr = tensor.numpy()
     actual = requested
-    if arr.size > 0 and requested != "int32":
-        low = int(arr.min())
-        high = int(arr.max())
-        if requested == "uint8" and not (0 <= low and high <= _UINT8_MAX):
-            actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
-        elif requested == "uint16" and not (0 <= low and high <= _UINT16_MAX):
-            actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
-        elif requested == "int16" and not (-32768 <= low and high <= _INT16_MAX):
-            actual = "int32"
+    if arr.size > 0 and requested != "int32" and arr.dtype != np.uint8:
+        if not (arr.dtype == np.int16 and requested == "int16"):
+            low = int(arr.min())
+            high = int(arr.max())
+            if requested == "uint8" and not (0 <= low and high <= _UINT8_MAX):
+                actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
+            elif requested == "uint16" and not (0 <= low and high <= _UINT16_MAX):
+                actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
+            elif requested == "int16" and not (-32768 <= low and high <= _INT16_MAX):
+                actual = "int32"
     target_dtype = ROUTED_EXPERTS_WIRE_DTYPES[actual]
     if arr.dtype != target_dtype:
         arr = arr.astype(target_dtype, copy=False)
-    encoded = pybase64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("utf-8")
+    if arr.size == 0:
+        return "", actual
+    encoded = pybase64.b64encode_as_string(
+        memoryview(np.ascontiguousarray(arr)).cast("B")
+    )
     return encoded, actual
-
-
-def _is_scattered_a2a_backend() -> bool:
-    """Return whether routed tokens are scattered across attention-TP ranks."""
-    backend = get_moe_a2a_backend()
-    return backend.is_deepep() or backend.is_deepep_v2()
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -105,6 +123,13 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
+            return None
+        parallel = get_parallel()
+        if (
+            parallel.pp_rank != 0
+            or parallel.attn_tp_rank != 0
+            or parallel.attn_cp_rank != 0
+        ) and not _is_scattered_a2a_backend():
             return None
         # The loader attaches this to every entry model, including wrappers.
         # Size from the owner, independent of which runner is currently active.
@@ -139,13 +164,19 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests * get_parallel().num_dp_ranks,
         )
 
-        num_experts = _infer_num_routed_experts(model_config)
-        cache_dtype = (
+        max_experts = _infer_num_routed_experts(model_config)
+        device_dtype = (
             torch.int16
-            if num_experts is not None
-            and num_experts + num_fused_shared_experts <= _INT16_MAX
+            if max_experts is not None
+            and max_experts + num_fused_shared_experts <= _INT16_MAX
             else torch.int32
         )
+        if max_experts is not None and max_experts <= 256:
+            host_dtype = torch.uint8
+        elif max_experts is not None and max_experts <= _INT16_MAX:
+            host_dtype = torch.int16
+        else:
+            host_dtype = torch.int32
 
         super().__init__(
             num_tokens=num_tokens,
@@ -155,7 +186,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
-            dtype=cache_dtype,
+            host_dtype=host_dtype,
+            device_dtype=device_dtype,
         )
 
         # Rebuild the full token batch before routed-expert readback.

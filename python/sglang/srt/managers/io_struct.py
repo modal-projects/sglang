@@ -1706,6 +1706,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Number of layer columns in routed_experts, set when the batch returns
+    # routed experts. A model that runs a stored layer more than once reports
+    # one column per run, so a consumer cannot take the count from the checkpoint.
+    routed_experts_num_layers: Optional[int] = None
+
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1801,6 +1806,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Number of layer columns in routed_experts, set when the batch returns
+    # routed experts. A model that runs a stored layer more than once reports
+    # one column per run, so a consumer cannot take the count from the checkpoint.
+    routed_experts_num_layers: Optional[int] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None

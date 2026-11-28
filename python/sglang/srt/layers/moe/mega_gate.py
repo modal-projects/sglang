@@ -17,7 +17,6 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 # DeepGEMM bf16_mega_gate scores one token block per launch.
 _MEGA_GATE_MAX_ROWS = 2048
@@ -100,7 +99,7 @@ def _captures_routed_experts(moe) -> bool:
     return (
         not moe.is_hash
         and moe.topk.topk_config.allow_routed_experts_capture
-        and get_global_experts_capturer() is not None
+        and get_exec().features.enable_return_routed_experts
     )
 
 

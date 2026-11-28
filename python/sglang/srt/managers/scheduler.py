@@ -2709,6 +2709,7 @@ class Scheduler(
                 self.enable_hicache_storage or self.enable_lmcache
             ),
             rust_server=self.rust_server,
+            model_config=self.model_config,
         )
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:

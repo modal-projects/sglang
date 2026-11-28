@@ -78,6 +78,7 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    model_config: Optional[Any] = None
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -194,6 +195,7 @@ class SchedulerOutputStreamer:
             ),
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
+            model_config=self.model_config,
         )
         for req in reqs:
             if req is skip_req:
@@ -348,6 +350,7 @@ class _GenerationStreamAccumulator:
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
     is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
+    model_config: Optional[Any] = None
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -726,6 +729,21 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        routed_experts_num_layers = None
+        if self.return_routed_experts:
+            from sglang.srt.state_capturer.routed_experts import (
+                get_global_experts_capturer,
+            )
+
+            _experts_cap = get_global_experts_capturer()
+            if _experts_cap is not None:
+                routed_experts_num_layers = _experts_cap.num_layers
+            elif self.model_config is not None:
+                routed_experts_num_layers = getattr(
+                    getattr(self.model_config, "hf_text_config", None),
+                    "num_hidden_layers",
+                    None,
+                )
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
@@ -785,6 +803,7 @@ class _GenerationStreamAccumulator:
             output_token_sampling_mask=self.output_token_sampling_mask,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
+            routed_experts_num_layers=routed_experts_num_layers,
             routed_experts_dtypes=(
                 self.routed_experts_dtypes
                 if self.routed_experts_dtypes

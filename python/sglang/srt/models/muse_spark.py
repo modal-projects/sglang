@@ -95,7 +95,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
 from sglang.srt.utils.common import get_device_capability, is_cuda
@@ -848,7 +848,7 @@ class MuseSpark1xMoE(nn.Module):
                 if tensor is not None:
                     tensor.record_stream(main_stream)
 
-        if (capturer := get_global_experts_capturer()) is not None:
+        if get_exec().features.enable_return_routed_experts:
             # Capture on main after the router join, in full unpadded token order.
             # SP experts below still consume the local ids.
             capture_topk_ids = topk_ids
@@ -856,7 +856,8 @@ class MuseSpark1xMoE(nn.Module):
                 capture_topk_ids = layernorm_sp.sp_exit_gather(
                     topk_ids, num_tokens=layernorm_sp.sp_num_tokens()
                 )
-            capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
+            if (capturer := get_global_experts_capturer()) is not None:
+                capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
         if getattr(get_forward(), "sp_active", False):
             return self._forward_sp_experts(
                 expert_input, topk_scores, topk_ids, router_logits

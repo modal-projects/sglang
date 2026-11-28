@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_parallel,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -147,6 +148,13 @@ class SchedulerBatchResultProcessor:
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
         """
         if not req.return_routed_experts:
+            return
+        parallel = get_parallel()
+        if (
+            parallel.pp_rank != 0
+            or parallel.attn_tp_rank != 0
+            or parallel.attn_cp_rank != 0
+        ):
             return
         capturer = get_global_experts_capturer()
         if capturer is None:

@@ -128,10 +128,12 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
             seen.update(kwargs)
 
         features = SimpleNamespace(enable_return_routed_experts=True)
+        parallel = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         with (
             mock.patch.object(
                 re_mod, "get_exec", return_value=SimpleNamespace(features=features)
             ),
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
             mock.patch.object(re_mod.RoutedExpertsCapturer, "__init__", record),
         ):
             re_mod.RoutedExpertsCapturer.create(

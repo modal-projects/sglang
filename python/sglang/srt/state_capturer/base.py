@@ -2,6 +2,8 @@ import dataclasses
 import logging
 from typing import Optional
 
+import numpy as np
+import pybase64
 import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -24,6 +26,15 @@ _MB = 1024 * 1024
 
 def get_tensor_size_bytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
+
+
+def encode_tensor_b64(tensor: torch.Tensor) -> str:
+    """Zero-copy base64 encoding of a CPU tensor's raw bytes."""
+    if tensor.numel() == 0:
+        return ""
+    return pybase64.b64encode_as_string(
+        memoryview(tensor.contiguous().numpy()).cast("B")
+    )
 
 
 class BaseDeviceCache:
@@ -100,7 +111,7 @@ class BaseHostCache:
         size_gb = self.get_buffer_size_bytes() / _GB
         logger.info(
             f"HostCache[{self.name}] allocated: shape={tuple(self.buffer.shape)}, "
-            f"size={size_gb:.2f} GB"
+            f"dtype={self.buffer.dtype}, size={size_gb:.2f} GB"
         )
 
 
@@ -136,6 +147,8 @@ class BaseTopkCapturer:
         name: str,
         device_topk_size: Optional[int] = None,
         dtype: torch.dtype = torch.int32,
+        host_dtype: Optional[torch.dtype] = None,
+        device_dtype: Optional[torch.dtype] = None,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
@@ -143,9 +156,16 @@ class BaseTopkCapturer:
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
+        resolved_host_dtype = dtype if host_dtype is None else host_dtype
+        resolved_device_dtype = dtype if device_dtype is None else device_dtype
 
         self.host_cache = BaseHostCache(
-            num_tokens, num_layers, topk_size, name=name, device=device, dtype=dtype
+            num_tokens,
+            num_layers,
+            topk_size,
+            name=name,
+            device=device,
+            dtype=resolved_host_dtype,
         )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
@@ -153,7 +173,7 @@ class BaseTopkCapturer:
             device_topk_size if device_topk_size is not None else topk_size,
             device,
             name=name,
-            dtype=dtype,
+            dtype=resolved_device_dtype,
         )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
@@ -185,16 +205,59 @@ class BaseTopkCapturer:
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
-        start_len = min(start_len, seqlen - 1)
-        cache_pool_idx = (
-            req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
-            .cpu()
-            .clone()
-        )
-        return self.host_cache.buffer[cache_pool_idx]
+        end_len = max(0, seqlen - 1)
+        start_len = min(start_len, end_len)
+        buf = self.host_cache.buffer
+        target_dtype = buf.dtype if dtype is None else dtype
+        if target_dtype == torch.uint8 and buf.dtype != torch.uint8:
+            target_dtype = buf.dtype
+        num_rows = end_len - start_len
+        if num_rows == 0:
+            return torch.empty(
+                (0, self.num_layers, self.topk_size),
+                dtype=target_dtype,
+                device="cpu",
+            )
+
+        idx = req_to_token_pool.req_to_token[req_pool_idx][start_len:end_len]
+        if idx.device.type != "cpu":
+            idx = idx.cpu()
+        idx_np = idx.numpy()
+
+        if num_rows == 1:
+            start = int(idx_np[0])
+            out = buf[start : start + 1]
+            return out.to(target_dtype) if out.dtype != target_dtype else out.clone()
+
+        breaks = np.flatnonzero(idx_np[1:] != idx_np[:-1] + 1) + 1
+        if len(breaks) == 0:
+            start = int(idx_np[0])
+            out = buf[start : start + num_rows]
+            return out.to(target_dtype) if out.dtype != target_dtype else out.clone()
+
+        if len(breaks) < num_rows // 8:
+            out = torch.empty(
+                (num_rows, self.num_layers, self.topk_size),
+                dtype=target_dtype,
+                device="cpu",
+            )
+            starts = np.empty(len(breaks) + 1, dtype=np.intp)
+            starts[0] = 0
+            starts[1:] = breaks
+            ends = np.empty(len(breaks) + 1, dtype=np.intp)
+            ends[:-1] = breaks
+            ends[-1] = num_rows
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                src_start = int(idx_np[s])
+                out[s:e].copy_(buf[src_start : src_start + (e - s)])
+            return out
+
+        out = torch.index_select(buf, 0, idx.to(torch.int64))
+        return out.to(target_dtype) if out.dtype != target_dtype else out
 
     def on_forward_end(
         self,
@@ -218,11 +281,14 @@ class BaseTopkCapturer:
         else:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
+        casted = slice_gpu.dtype != self.host_cache.buffer.dtype
+        if casted:
+            slice_gpu = slice_gpu.to(self.host_cache.buffer.dtype)
         if no_copy_to_cpu:
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
                 out_cache_loc=out_cache_loc.clone(),
-                topk=slice_gpu.clone(),
+                topk=slice_gpu if casted else slice_gpu.clone(),
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = out_cache_loc.cpu()

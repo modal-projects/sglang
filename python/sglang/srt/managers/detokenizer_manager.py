@@ -21,7 +21,6 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
-import pybase64
 import setproctitle
 import torch
 import zmq
@@ -32,6 +31,7 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.state_capturer.base import encode_tensor_b64
 from sglang.srt.state_capturer.routed_experts import encode_routed_experts_tensor
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -440,12 +440,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if data_list is None:
             return None
         return [
-            (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
-            )
-            for item in data_list
+            encode_tensor_b64(item) if item is not None else None for item in data_list
         ]
 
     @staticmethod
@@ -533,6 +528,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            routed_experts_num_layers=recv_obj.routed_experts_num_layers,
             routed_experts_dtypes=routed_experts_dtypes,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,

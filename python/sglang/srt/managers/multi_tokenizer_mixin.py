@@ -272,6 +272,12 @@ def _handle_output_by_index(output, i):
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
+            routed_experts_num_layers=getattr(
+                output, "routed_experts_num_layers", None
+            ),
+            routed_experts_dtypes=_extract_field_by_index(
+                output, "routed_experts_dtypes", i, check_length=False
+            ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
@@ -396,6 +402,12 @@ def _handle_output_by_index(output, i):
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
+            routed_experts_num_layers=getattr(
+                output, "routed_experts_num_layers", None
+            ),
+            routed_experts_dtypes=_extract_field_by_index(
+                output, "routed_experts_dtypes", i, check_length=False
+            ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
@@ -481,6 +493,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "output_token_sampling_mask",
         "output_hidden_states",
         "routed_experts",
+        "routed_experts_dtypes",
         "indexer_topk",
         "token_steps",
         "customized_info",
@@ -488,7 +501,13 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
     }
 )
 _NOT_SPLIT_FIELDS = frozenset(
-    {"rids", "http_worker_ipcs", "placeholder_tokens_idx", "placeholder_tokens_val"}
+    {
+        "rids",
+        "http_worker_ipcs",
+        "placeholder_tokens_idx",
+        "placeholder_tokens_val",
+        "routed_experts_num_layers",
+    }
 )
 
 
@@ -512,6 +531,7 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         rids=[output.rids[index] for index in indices],
         placeholder_tokens_idx=None,
         placeholder_tokens_val=None,
+        routed_experts_num_layers=getattr(output, "routed_experts_num_layers", None),
         **split_fields,
     )
 

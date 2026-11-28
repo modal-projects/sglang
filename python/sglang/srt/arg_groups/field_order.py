@@ -555,5 +555,6 @@ POSITIONAL_FIELD_ORDER = (
     "weight_update_staging",
     "weight_update_local_checkpoint_dir",
     "weight_update_max_compile_group_gb",
+    "enable_async_lora_disk_loading",
 )
 # fmt: on

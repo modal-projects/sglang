@@ -6174,7 +6174,10 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         if (
-            os.environ.get("SPINDLE_GLM_ASYNC_LORA_LOADING") != "1"
+            not (
+                self.server_args.enable_async_lora_disk_loading
+                or os.environ.get("SPINDLE_GLM_ASYNC_LORA_LOADING") == "1"
+            )
             or get_parallel().pp_size != 1
             or get_parallel().attn_dp_enabled
         ):

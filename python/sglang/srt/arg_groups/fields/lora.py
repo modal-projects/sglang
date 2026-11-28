@@ -39,6 +39,10 @@ class Lora(msgspec.Struct):
         Optional[bool],
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
     ] = None
+    enable_async_lora_disk_loading: A[
+        bool,
+        "Prepare dynamically loaded LoRA adapters from disk on a background thread so the scheduler loop does not stall on disk I/O.",
+    ] = False
     max_lora_rank: A[
         Optional[int],
         "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",

@@ -339,10 +339,14 @@ class LoRAManager:
         self.loras[lora_ref.lora_id] = adapter
         self.lora_refs[lora_ref.lora_id] = lora_ref
         self.num_pinned_loras += int(lora_ref.pinned)
-        cpu_bytes = sum(
-            tensor.numel() * tensor.element_size()
+        unique_tensors = {
+            id(tensor): tensor
             for layer in adapter.layers
             for tensor in layer.weights.values()
+        }
+        cpu_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in unique_tensors.values()
         )
         logger.info("LoRA prepared id=%s cpu_bytes=%d", lora_ref.lora_id, cpu_bytes)
         return self.create_lora_update_result(True)

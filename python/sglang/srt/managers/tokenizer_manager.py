@@ -77,6 +77,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.state_capturer.routed_experts import encode_routed_experts_tensor
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1619,6 +1620,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
+                routed_experts_dtype=obj.routed_experts_dtype,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
@@ -2636,11 +2638,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
+                    dtypes = getattr(recv_obj, "routed_experts_dtypes", None)
+                    req_dtype = dtypes[i] if dtypes else None
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
                     if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                        val, emitted_dtype = encode_routed_experts_tensor(
+                            val, req_dtype
+                        )
+                    else:
+                        emitted_dtype = req_dtype
                     meta_info["routed_experts"] = val
+                    if emitted_dtype is not None and (
+                        req_dtype is not None or emitted_dtype != "int32"
+                    ):
+                        meta_info["routed_experts_dtype"] = emitted_dtype
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

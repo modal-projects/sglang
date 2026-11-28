@@ -266,6 +266,9 @@ class GenerateReqInput:
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
     routed_experts_start_len: int = 0
+    # Optional wire dtype for base64-encoded routed_experts: "int32" (default),
+    # "int16", "uint16", or "uint8".
+    routed_experts_dtype: Optional[str] = None
     return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -1000,6 +1003,7 @@ class GenerateReqInput:
             ),
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
+            routed_experts_dtype=self.routed_experts_dtype,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -1097,6 +1101,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
+    # See GenerateReqInput.routed_experts_dtype.
+    routed_experts_dtype: Optional[str] = None
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
@@ -1714,6 +1720,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+    # Requested per-request wire dtypes for routed_experts (None => "int32").
+    routed_experts_dtypes: Optional[List[Optional[str]]] = None
 
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
@@ -1814,6 +1822,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # Emitted per-request wire dtypes for routed_experts when requested.
+    routed_experts_dtypes: Optional[List[Optional[str]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

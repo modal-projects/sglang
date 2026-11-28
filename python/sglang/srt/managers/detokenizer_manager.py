@@ -32,6 +32,7 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.state_capturer.routed_experts import encode_routed_experts_tensor
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -447,6 +448,31 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    @staticmethod
+    def _encode_routed_experts_per_request(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+        dtypes_list: Optional[List[Optional[str]]],
+    ):
+        if data_list is None:
+            return None, None
+        encoded: List[Optional[str]] = []
+        emitted: List[Optional[str]] = []
+        any_explicit = False
+        for i, item in enumerate(data_list):
+            if item is None:
+                encoded.append(None)
+                emitted.append(None)
+                continue
+            req_dtype = dtypes_list[i] if dtypes_list else None
+            b64, actual = encode_routed_experts_tensor(item, req_dtype)
+            encoded.append(b64)
+            if req_dtype is not None or actual != "int32":
+                emitted.append(actual)
+                any_explicit = True
+            else:
+                emitted.append(None)
+        return encoded, (emitted if any_explicit else None)
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
@@ -463,7 +489,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts, routed_experts_dtypes = self._encode_routed_experts_per_request(
+            recv_obj.routed_experts,
+            recv_obj.routed_experts_dtypes,
+        )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -504,6 +533,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            routed_experts_dtypes=routed_experts_dtypes,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,

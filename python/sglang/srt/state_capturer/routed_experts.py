@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pybase64
@@ -20,6 +20,63 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+
+ROUTED_EXPERTS_WIRE_DTYPES: dict[str, np.dtype] = {
+    "int32": np.dtype("<i4"),
+    "int16": np.dtype("<i2"),
+    "uint16": np.dtype("<u2"),
+    "uint8": np.dtype("u1"),
+}
+
+_INT16_MAX = 32767
+_UINT16_MAX = 65535
+_UINT8_MAX = 255
+
+
+def _infer_num_routed_experts(model_config: ModelConfig) -> Optional[int]:
+    hf_cfg = getattr(model_config, "hf_text_config", None)
+    if hf_cfg is None:
+        return None
+    for attr in ("n_routed_experts", "num_experts", "num_local_experts", "moe_num_experts"):
+        val = getattr(hf_cfg, attr, None)
+        if isinstance(val, int) and val > 0:
+            return val
+    return None
+
+
+def encode_routed_experts_tensor(
+    tensor: torch.Tensor,
+    wire_dtype: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Encode captured routed-experts tensor as base64 in the requested wire dtype.
+
+    Defaults to ``"int32"`` when ``wire_dtype`` is omitted for backwards
+    compatibility. If values do not fit a requested narrower unsigned dtype
+    (e.g. ``"uint8"`` with expert IDs > 255 or ``-1`` padding), falls back to
+    ``"int16"`` (or ``"int32"``) and returns the actual emitted dtype name.
+    """
+    requested = wire_dtype or "int32"
+    if requested not in ROUTED_EXPERTS_WIRE_DTYPES:
+        raise ValueError(
+            f"unsupported routed_experts_dtype {requested!r}; "
+            f"choose from {sorted(ROUTED_EXPERTS_WIRE_DTYPES)}"
+        )
+    arr = tensor.numpy()
+    actual = requested
+    if arr.size > 0 and requested != "int32":
+        low = int(arr.min())
+        high = int(arr.max())
+        if requested == "uint8" and not (0 <= low and high <= _UINT8_MAX):
+            actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
+        elif requested == "uint16" and not (0 <= low and high <= _UINT16_MAX):
+            actual = "int16" if (-32768 <= low and high <= _INT16_MAX) else "int32"
+        elif requested == "int16" and not (-32768 <= low and high <= _INT16_MAX):
+            actual = "int32"
+    target_dtype = ROUTED_EXPERTS_WIRE_DTYPES[actual]
+    if arr.dtype != target_dtype:
+        arr = arr.astype(target_dtype, copy=False)
+    encoded = pybase64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("utf-8")
+    return encoded, actual
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -82,6 +139,14 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests * get_parallel().num_dp_ranks,
         )
 
+        num_experts = _infer_num_routed_experts(model_config)
+        cache_dtype = (
+            torch.int16
+            if num_experts is not None
+            and num_experts + num_fused_shared_experts <= _INT16_MAX
+            else torch.int32
+        )
+
         super().__init__(
             num_tokens=num_tokens,
             max_batch_size=max_batch_size,
@@ -90,9 +155,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            dtype=cache_dtype,
         )
 
         # Rebuild the full token batch before routed-expert readback.
+        # Keep gather_buffer int32 because NCCL has no ncclInt16; super().capture
+        # narrows into the int16 device_cache after the all-gather.
         if _is_scattered_a2a_backend():
             attn_tp_size = (
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
@@ -120,7 +188,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
         if _is_scattered_a2a_backend():
-            local_topk = topk_indices
+            local_topk = topk_indices.to(torch.int32)
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
@@ -164,12 +232,13 @@ def destroy_global_experts_capturer():
 
 
 def extract_routed_experts_from_meta_info(data):
-    # To solve the performance issue, we return the experts_ids in base64
-    # We left this function for user to change it back to normal int32
-    # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    # Decode base64 routed_experts honoring optional routed_experts_dtype (default int32).
+    meta = data["meta_info"]
+    routed_experts_base64 = meta.get("routed_experts", None)
+    dtype_name = meta.get("routed_experts_dtype", "int32")
+    dtype = ROUTED_EXPERTS_WIRE_DTYPES[dtype_name]
     routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=dtype
     )
     return routed_experts
 

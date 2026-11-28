@@ -379,6 +379,7 @@ class _GenerationStreamAccumulator:
     weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
+    routed_experts_dtypes: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
@@ -415,6 +416,7 @@ class _GenerationStreamAccumulator:
             self.output_hidden_states = []
         if self.return_routed_experts:
             self.routed_experts = []
+            self.routed_experts_dtypes = []
         if self.return_indexer_topk:
             self.indexer_topk = []
 
@@ -679,6 +681,9 @@ class _GenerationStreamAccumulator:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
             )
+            self.routed_experts_dtypes.append(
+                req.routed_experts_dtype if req.return_routed_experts else None
+            )
         if self.return_indexer_topk:
             self.indexer_topk.append(
                 req.indexer_topk if req.return_indexer_topk else None
@@ -780,6 +785,12 @@ class _GenerationStreamAccumulator:
             output_token_sampling_mask=self.output_token_sampling_mask,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
+            routed_experts_dtypes=(
+                self.routed_experts_dtypes
+                if self.routed_experts_dtypes
+                and any(d is not None for d in self.routed_experts_dtypes)
+                else None
+            ),
             indexer_topk=self.indexer_topk,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
